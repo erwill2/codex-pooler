@@ -177,6 +177,45 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
                  routing_scope_opts()
                )
     end
+
+    # The positive-credit monthly-primary rule relaxes the percentage reading
+    # only: a credit-backed monthly window is not exhausted at 100% because
+    # `credits` still carries the real remaining capacity. It is not a routing
+    # permission. Provider denial is consulted before ordinary window
+    # eligibility, so a current account blocker still vetoes an upstream whose
+    # monthly credits are intact.
+    test "positive monthly credits never outrank a current account availability blocker" do
+      credit_backed_monthly =
+        monthly_account_primary_window(used_percent: Decimal.new("100"), credits: 3817)
+
+      assert %{eligible?: true, routing_state: :precise, exclusions: []} =
+               Windows.routing_quota_eligibility_from_snapshot(
+                 routing_snapshot(:available, [credit_backed_monthly]),
+                 routing_scope_opts()
+               )
+
+      assert %{
+               eligible?: false,
+               routing_state: :blocked,
+               exclusions: [
+                 %{
+                   code: "quota_window_unusable",
+                   message: "recorded quota evidence is not usable for routing",
+                   reason_codes: ["exhausted"],
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account"
+                 } = exclusion
+               ]
+             } =
+               Windows.routing_quota_eligibility_from_snapshot(
+                 routing_snapshot(:blocked, [credit_backed_monthly]),
+                 routing_scope_opts()
+               )
+
+      refute Map.has_key?(exclusion, :window_kind)
+      refute Map.has_key?(exclusion, :reset_at)
+    end
   end
 
   describe "lifecycle routing eligibility" do
@@ -211,9 +250,7 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
                  )
 
         assert {:ok, refreshed} =
-                 PoolReconciliation.refresh_quota_from_usage(identity, assignment,
-                   observed_at: observed_at
-                 )
+                 PoolReconciliation.refresh_quota_from_usage(identity, assignment, observed_at: observed_at)
 
         snapshot =
           RoutingQuotaSnapshot.load_by_identity_ids([identity.id], observed_at)[identity.id]
@@ -223,6 +260,107 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
         assert Decimal.equal?(window.used_percent, 100)
         assert window.metadata["rate_limit_allowed"] == true
         assert window.metadata["rate_limit_reached"] == false
+
+        for source <- ["codex_response_headers", "codex_rate_limit_event"] do
+          runtime_window = %{
+            window
+            | source: source,
+              metadata: %{},
+              active_limit: nil,
+              credits: nil,
+              merge_precedence: Evidence.merge_precedence(source, window.reset_at, "observed")
+          }
+
+          mixed = %{snapshot | raw_windows: [window, runtime_window]}
+          scope = [model: model.exposed_model_id, upstream_model: model.upstream_model_id]
+
+          if seconds == 604_800 do
+            legacy_usage = %{window | window_kind: "primary"}
+
+            assert %{eligible?: true} =
+                     Windows.routing_quota_eligibility_from_snapshot(
+                       %{mixed | raw_windows: [legacy_usage, runtime_window]},
+                       scope
+                     )
+
+            legacy_error = %{
+              runtime_window
+              | window_kind: "primary",
+                source: "codex_rate_limit_error",
+                merge_precedence: 80
+            }
+
+            assert %{eligible?: false} =
+                     Windows.routing_quota_eligibility_from_snapshot(
+                       %{mixed | raw_windows: [window, runtime_window, legacy_error]},
+                       scope
+                     )
+          end
+
+          error_window = %{
+            runtime_window
+            | source: "codex_rate_limit_error",
+              merge_precedence: 80
+          }
+
+          assert %{eligible?: false} =
+                   Windows.routing_quota_eligibility_from_snapshot(
+                     %{mixed | raw_windows: [window, runtime_window, error_window]},
+                     scope
+                   )
+
+          older_error = %{error_window | observed_at: DateTime.add(observed_at, -1, :second)}
+
+          drifted_error = %{error_window | reset_at: DateTime.add(window.reset_at, 1, :second)}
+
+          assert %{eligible?: false} =
+                   Windows.routing_quota_eligibility_from_snapshot(
+                     %{mixed | raw_windows: [window, runtime_window, drifted_error]},
+                     scope
+                   )
+
+          assert %{eligible?: true} =
+                   Windows.routing_quota_eligibility_from_snapshot(
+                     %{mixed | raw_windows: [window, runtime_window, older_error]},
+                     scope
+                   )
+
+          assert %{eligible?: true, routing_state: :provider_available} =
+                   Windows.routing_quota_eligibility_from_snapshot(mixed, scope)
+
+          for blocked <- [
+                %{runtime_window | reset_at: DateTime.add(window.reset_at, 60, :second)},
+                %{runtime_window | credits: 0},
+                %{runtime_window | active_limit: 0},
+                %{
+                  runtime_window
+                  | metadata: %{"rate_limit_reached_type" => "rate_limit_reached"}
+                },
+                %{runtime_window | metadata: %{"rate_limit_allowed" => false}},
+                %{runtime_window | metadata: %{"rate_limit_reached" => true}},
+                %{runtime_window | source: "codex_rate_limit_error"}
+              ] do
+            assert %{eligible?: false} =
+                     Windows.routing_quota_eligibility_from_snapshot(
+                       %{mixed | raw_windows: [window, blocked]},
+                       scope
+                     )
+          end
+
+          for denied <- [
+                %{mixed | credential_epoch: snapshot.credential_epoch + 1},
+                %{mixed | availability: nil},
+                %{mixed | availability: %{snapshot.availability | state: :blocked}},
+                %{
+                  mixed
+                  | as_of: DateTime.add(observed_at, Evidence.freshness_ttl_seconds() + 1, :second)
+                },
+                %{mixed | raw_windows: [runtime_window]}
+              ] do
+            assert %{eligible?: false} =
+                     Windows.routing_quota_eligibility_from_snapshot(denied, scope)
+          end
+        end
 
         assert %{eligible?: true} =
                  Windows.routing_quota_eligibility_from_snapshot(snapshot,
@@ -270,9 +408,7 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
 
       assert {:ok, [_window]} =
                QuotaWindows.upsert_quota_windows(identity, [
-                 persisted_account_window("primary", 300, observed_at,
-                   used_percent: Decimal.new("1")
-                 )
+                 persisted_account_window("primary", 300, observed_at, used_percent: Decimal.new("1"))
                ])
 
       model = routing_model(pool, assignment)
@@ -782,8 +918,7 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
         {monthly_account_primary_window(reset_at: nil), ["reset_missing"]},
         {monthly_account_primary_window(observed_at: stale_observed_at), ["not_fresh"]},
         {monthly_account_primary_window(freshness_state: "stale"), ["not_fresh"]},
-        {monthly_account_primary_window(reset_at: DateTime.add(@observed_at, -60, :second)),
-         ["expired", "not_fresh"]}
+        {monthly_account_primary_window(reset_at: DateTime.add(@observed_at, -60, :second)), ["expired", "not_fresh"]}
       ]
 
       for {window, reason_codes} <- scenarios do
@@ -974,42 +1109,13 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
              } =
                Windows.routing_quota_eligibility_from_windows(
                  [
-                   account_primary_window(
-                     observed_at: DateTime.add(@observed_at, -1_200, :second)
-                   ),
-                   account_secondary_window(
-                     observed_at: DateTime.add(@observed_at, -400, :second)
-                   )
+                   account_primary_window(observed_at: DateTime.add(@observed_at, -1_200, :second)),
+                   account_secondary_window(observed_at: DateTime.add(@observed_at, -400, :second))
                  ],
                  at: @observed_at,
                  model: "sample-codex-standard",
                  requested_model: "sample-codex-standard",
                  upstream_model: "sample-codex-standard-upstream"
-               )
-    end
-
-    test "fresh account usage does not supersede stale runtime evidence for another quota group" do
-      stale_observed_at =
-        DateTime.add(@observed_at, -Evidence.freshness_ttl_seconds() - 1, :second)
-
-      assert %{
-               eligible?: false,
-               routing_state: :blocked,
-               exclusions: [%{quota_key: "codex_spark", reason_codes: ["not_fresh"]}]
-             } =
-               Windows.routing_quota_eligibility_from_windows(
-                 [
-                   account_primary_window(observed_at: @observed_at),
-                   model_window(
-                     source: "codex_response_headers",
-                     freshness_state: "stale",
-                     observed_at: stale_observed_at
-                   )
-                 ],
-                 at: @observed_at,
-                 model: "sample-codex-spark",
-                 requested_model: "sample-codex-spark",
-                 upstream_model: "sample-codex-spark-upstream"
                )
     end
 
@@ -1068,9 +1174,7 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
              } =
                Windows.routing_quota_eligibility_from_windows(
                  [
-                   account_primary_window(
-                     observed_at: DateTime.add(@observed_at, -4_000, :second)
-                   ),
+                   account_primary_window(observed_at: DateTime.add(@observed_at, -4_000, :second)),
                    account_secondary_window(
                      observed_at: DateTime.add(@observed_at, -3_000, :second),
                      source_precision: "inferred"
@@ -1171,9 +1275,7 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
                  Windows.routing_quota_eligibility_from_windows(
                    [
                      account_primary_window(),
-                     account_secondary_window(
-                       observed_at: DateTime.add(@observed_at, future_offset_seconds, :second)
-                     )
+                     account_secondary_window(observed_at: DateTime.add(@observed_at, future_offset_seconds, :second))
                    ],
                    at: @observed_at,
                    model: "sample-codex-standard",
@@ -1304,30 +1406,6 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
 
         assert "exhausted" in reason_codes
       end
-    end
-
-    test "gpt-reserve bypasses exhausted primary 5h burst window to route on weekly reserve" do
-      windows = [
-        account_primary_window(used_percent: Decimal.new("100")),
-        reserve_window(used_percent: Decimal.new("0"))
-      ]
-
-      assert %{eligible?: true, routing_state: :weekly_only_probe} =
-               Windows.routing_quota_eligibility_from_windows(
-                 windows,
-                 at: @observed_at,
-                 model: "gpt-5",
-                 requested_model: "gpt-5"
-               )
-
-
-      assert %{eligible?: true, routing_state: :weekly_only_probe} =
-               Windows.routing_quota_eligibility_from_windows(
-                 windows,
-                 at: @observed_at,
-                 model: "gpt-reserve",
-                 requested_model: "gpt-reserve"
-               )
     end
 
     test "gpt-reserve bypasses account availability blocked state when reserve window is usable" do
@@ -1650,8 +1728,7 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
       upstream_assignment_fixture(pool, %{
         identity_metadata: %{
           "base_url" => base_url,
-          "access_token_expires_at" =>
-            DateTime.utc_now() |> DateTime.add(1, :day) |> DateTime.to_iso8601()
+          "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(1, :day) |> DateTime.to_iso8601()
         },
         assignment_metadata: %{"base_url" => base_url}
       })

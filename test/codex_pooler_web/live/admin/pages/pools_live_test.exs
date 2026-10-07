@@ -1,5 +1,6 @@
 defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   use CodexPoolerWeb.ConnCase, async: false
+  use Oban.Testing, repo: CodexPooler.Repo
 
   import Phoenix.LiveViewTest
   import Ecto.Query
@@ -12,6 +13,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Accounts
+  alias CodexPooler.Accounts.Scope
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Catalog
   alias CodexPooler.Catalog.Model, as: CatalogModel
@@ -29,6 +31,10 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   alias CodexPoolerWeb.Admin.PoolForm
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias Ecto.Adapters.SQL.Sandbox
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
 
   setup :register_and_log_in_user
 
@@ -803,18 +809,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     refute has_element?(view, "#pool-row-#{pool.id}-compat-panel")
 
-    view |> element("#pool-row-#{pool.id}-compat-compression") |> render_click()
-
-    assert has_element?(view, "#pool-row-#{pool.id}-compat-panel", "Request compression")
-    assert has_element?(view, "#pool-row-#{pool.id}-compat-compression-toggle")
-    refute has_element?(view, "#pool-row-#{pool.id}-compat-compression-toggle[checked]")
-
-    html = view |> element("#pool-row-#{pool.id}-compat-compression-toggle") |> render_click()
-
-    assert html =~ "Request compression enabled on Compat Panel Pool"
-    assert PoolRouting.get_routing_settings(pool.id).request_compression_enabled
-    assert has_element?(view, "#pool-row-#{pool.id}-compat-compression-toggle[checked]")
-    assert has_element?(view, "#pool-row-#{pool.id}-compat-panel", "Request compression")
+    refute has_element?(view, "#pool-row-#{pool.id}-compat-compression")
+    refute has_element?(view, "#pool-row-#{pool.id}-compat-compression-toggle")
 
     view |> element("#pool-row-#{pool.id}-compat-v1") |> render_click()
     assert has_element?(view, "#pool-row-#{pool.id}-compat-panel", "/v1 compatibility")
@@ -822,12 +818,12 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(
              view,
-             ~s(#pool-row-#{pool.id}-compat-v1-docs-link[href="https://docs.codex-pooler.com/operators/pools/#compatibility"])
+             ~s(#pool-row-#{pool.id}-compat-v1-docs-link[href="https://www.codex-pooler.com/docs/operators/pools/#compatibility"])
            )
 
     assert has_element?(
              view,
-             "#pool-row-#{pool.id}-compat-v1 + #pool-row-#{pool.id}-compat-compression + #pool-row-#{pool.id}-compat-image-generation"
+             "#pool-row-#{pool.id}-compat-v1 + #pool-row-#{pool.id}-compat-image-generation"
            )
 
     refute has_element?(view, "#pool-row-#{pool.id}-compat-ws-bridge")
@@ -846,6 +842,17 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     view |> element("#pool-row-#{pool.id}-compat-image-generation") |> render_click()
     refute has_element?(view, "#pool-row-#{pool.id}-compat-panel")
+
+    assert has_element?(view, "#pool-row-#{pool.id}-compat-image-generation + #pool-row-#{pool.id}-compat-audio-transcription")
+    view |> element("#pool-row-#{pool.id}-compat-audio-transcription") |> render_click()
+    assert has_element?(view, "#pool-row-#{pool.id}-compat-audio-transcription-toggle[checked]")
+    view |> element("#pool-row-#{pool.id}-compat-audio-transcription-toggle") |> render_click()
+    refute PoolRouting.get_routing_settings(pool.id).allow_audio_transcription
+    refute has_element?(view, "#pool-row-#{pool.id}-compat-audio-transcription-toggle[checked]")
+    view |> element("#pool-row-#{pool.id}-compat-audio-transcription-toggle") |> render_click()
+    assert PoolRouting.get_routing_settings(pool.id).allow_audio_transcription
+    assert has_element?(view, "#pool-row-#{pool.id}-compat-audio-transcription-toggle[checked]")
+    refute PoolRouting.get_routing_settings(pool.id).allow_image_generation
     _ = await_pool_traffic(view)
   end
 
@@ -862,6 +869,10 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       })
 
     assert html =~ "unsupported pool option"
+    assert PoolRouting.get_routing_settings(pool.id) == nil
+
+    stale_html = render_click(view, "toggle_pool_compat_flag", %{"pool-id" => pool.id, "flag" => "request_compression_enabled"})
+    assert stale_html =~ "unsupported pool option"
     assert PoolRouting.get_routing_settings(pool.id) == nil
 
     render_click(view, "toggle_pool_compat_panel", %{
@@ -1021,12 +1032,9 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{pool.id} > footer.pool-card-metrics.border-t")
 
     metric_links = [
-      {"pool-upstream-count-cell", "pool-row-#{pool.id}-upstream-account-count",
-       "/admin/upstreams?pool_id=#{pool.id}", "Upstreams", "1"},
-      {"pool-api-key-count-cell", "pool-row-#{pool.id}-api-key-count",
-       "/admin/api-keys?pool_id=#{pool.id}", "API keys", "2"},
-      {"pool-request-count-cell", "pool-row-#{pool.id}-request-throughput",
-       "/admin/request-logs?pool_id=#{pool.id}", "Req/TPS 24h", "0 / 0"}
+      {"pool-upstream-count-cell", "pool-row-#{pool.id}-upstream-account-count", "/admin/upstreams?pool_id=#{pool.id}", "Upstreams", "1"},
+      {"pool-api-key-count-cell", "pool-row-#{pool.id}-api-key-count", "/admin/api-keys?pool_id=#{pool.id}", "API keys", "2"},
+      {"pool-request-count-cell", "pool-row-#{pool.id}-request-throughput", "/admin/request-logs?pool_id=#{pool.id}", "Req/TPS 24h", "0 / 0"}
     ]
 
     for {role, value_id, href, label, value} <- metric_links do
@@ -1460,7 +1468,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     holder_ref = make_ref()
     advisory_holder = hold_pool_traffic_advisory_lock(scope.user.id, holder_ref)
-    assert_receive {^holder_ref, :lock_held, holder_pid}, 1_000
+    assert_receive {^holder_ref, :lock_held, holder_pid}, @detection_timeout_ms
 
     # When: another PostgreSQL session owns the operator gate while viewport
     # eligibility changes.
@@ -1622,7 +1630,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     refute_receive {^handler_id, :query, _query_pid}, 0
 
     assert completed_cooldown_token == expire_pool_traffic_cooldown(view)
-    assert_receive {^handler_id, :query, followup_query_pid}, 1_000
+    assert_receive {^handler_id, :query, followup_query_pid}, @detection_timeout_ms
     _ = await_pool_traffic(view, activate_histograms?: false)
 
     completed_query_pids =
@@ -1712,7 +1720,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       "visible" => true
     })
 
-    assert_receive {^handler_id, :query, first_query_pid}, 1_000
+    assert_receive {^handler_id, :query, first_query_pid}, @detection_timeout_ms
 
     render_hook(second_view, "set_pool_traffic_visibility", %{
       "pool_id" => pool.id,
@@ -2125,7 +2133,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-create-routing-controls #pool_sticky_http_sessions")
     assert has_element?(view, "#pool-create-routing-controls #pool_prompt_cache_affinity_enabled")
     assert has_element?(view, "#pool-create-routing-controls #pool_v1_compatibility_enabled")
-    assert has_element?(view, "#pool-create-routing-controls #pool_request_compression_enabled")
+    refute has_element?(view, "#pool-create-routing-controls #pool_request_compression_enabled")
     assert has_element?(view, "#pool_routing_strategy")
     assert has_element?(view, "#pool_bridge_ring_size")
     assert has_element?(view, "#pool_sticky_websocket_sessions")
@@ -2170,7 +2178,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "Allow /v1 compatibility"
            )
 
-    assert has_element?(
+    refute has_element?(
              view,
              "#pool-create-routing-controls",
              "Shrinks eligible Responses tool outputs before upstream dispatch."
@@ -2324,7 +2332,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert created_pool.name == "Generated Slug Pool"
     assert settings.prompt_cache_affinity_enabled == true
     assert settings.v1_compatibility_enabled == true
-    assert settings.request_compression_enabled == false
+    refute Map.has_key?(settings, :request_compression_enabled)
     assert has_element?(view, "#pool-row-#{created_pool.id}", "Generated Slug Pool")
     refute has_element?(view, "#pool-row-#{created_pool.id}", "generated-slug-pool")
     refute has_element?(view, "#pool-create-dialog")
@@ -2407,7 +2415,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     _ = await_pool_traffic(view)
   end
 
-  test "creates pools with routing strategy, compatibility, compression, image generation, and upstream identities",
+  test "creates pools with routing strategy, compatibility, media permissions, and upstream identities",
        %{conn: conn} do
     first_identity =
       active_identity_fixture(account_label: "First create account", plan_label: "pro")
@@ -2433,7 +2441,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(
              view,
-             "#pool-create-upstream-identity-options-plan-badge-#{first_identity.id}.border-primary\\/20.bg-primary\\/10.text-primary"
+             "#pool-create-upstream-identity-options-plan-badge-#{first_identity.id}.admin-plan-badge.admin-plan-badge--pro"
            )
 
     view
@@ -2446,6 +2454,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         "v1_compatibility_enabled" => "false",
         "request_compression_enabled" => "true",
         "allow_image_generation" => "false",
+        "allow_audio_transcription" => "false",
         "upstream_identity_ids" => [first_identity.id, second_identity.id]
       }
     })
@@ -2458,8 +2467,9 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert settings.routing_strategy == "least_recent_success"
     assert settings.prompt_cache_affinity_enabled == false
     assert settings.v1_compatibility_enabled == false
-    assert settings.request_compression_enabled == true
+    refute Map.has_key?(settings, :request_compression_enabled)
     assert settings.allow_image_generation == false
+    assert settings.allow_audio_transcription == false
 
     assert Enum.map(assignments, & &1.upstream_identity_id) |> Enum.sort() ==
              [first_identity.id, second_identity.id] |> Enum.sort()
@@ -2528,7 +2538,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     refute has_element?(view, "#pool_prompt_cache_affinity_enabled[checked]")
     refute has_element?(view, "#pool_v1_compatibility_enabled[checked]")
-    assert has_element?(view, "#pool_request_compression_enabled[checked]")
+    refute has_element?(view, "#pool_request_compression_enabled")
 
     assert Repo.aggregate(Pool, :count, :id) == initial_pool_count
   end
@@ -2904,8 +2914,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     for request <- full_requests do
       expected = %{
-        "model_serving_mode_configured" =>
-          if(request == hd(full_requests), do: "lite", else: "full"),
+        "model_serving_mode_configured" => if(request == hd(full_requests), do: "lite", else: "full"),
         "model_serving_mode" => if(request == hd(full_requests), do: "lite", else: "full"),
         "model_serving_mode_source" => "override"
       }
@@ -3675,9 +3684,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       })
 
     _sync_run =
-      catalog_sync_run_fixture(pool, "succeeded",
-        finished_at: DateTime.add(DateTime.utc_now(), -2, :day)
-      )
+      catalog_sync_run_fixture(pool, "succeeded", finished_at: DateTime.add(DateTime.utc_now(), -2, :day))
 
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
     _ = await_pool_traffic(view)
@@ -3876,7 +3883,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(view, "#pool-edit-routing-controls #pool_edit_v1_compatibility_enabled")
 
-    assert has_element?(
+    refute has_element?(
              view,
              "#pool-edit-routing-controls #pool_edit_request_compression_enabled"
            )
@@ -3885,6 +3892,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              view,
              "#pool-edit-routing-controls #pool_edit_allow_image_generation"
            )
+
+    assert has_element?(view, "#pool-edit-routing-controls #pool_edit_allow_audio_transcription")
 
     assert has_element?(view, "#pool_edit_routing_strategy")
     assert has_element?(view, "#pool_edit_bridge_ring_size")
@@ -3930,7 +3939,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "Allow /v1 compatibility"
            )
 
-    assert has_element?(
+    refute has_element?(
              view,
              "#pool-edit-routing-controls",
              "Shrinks eligible Responses tool outputs before upstream dispatch."
@@ -4054,7 +4063,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert settings.sticky_http_sessions == true
     assert settings.prompt_cache_affinity_enabled == false
     assert settings.v1_compatibility_enabled == false
-    assert settings.request_compression_enabled == true
+    refute Map.has_key?(settings, :request_compression_enabled)
     assert Repo.get!(PoolUpstreamAssignment, removed_assignment.id).status == "deleted"
     assert Repo.get!(PoolUpstreamAssignment, kept_assignment.id).status == "active"
     assert Repo.get!(APIKey, linked_api_key.id).pool_id == pool.id
@@ -4534,8 +4543,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         "sticky_http_sessions" => true,
         "prompt_cache_affinity_enabled" => false,
         "request_compression_enabled" => true,
-        "allow_image_generation" => false
+        "allow_image_generation" => false,
+        "allow_audio_transcription" => false
       })
+
+    Repo.query!("UPDATE pool_routing_settings SET request_compression_enabled = true WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
 
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
     _ = await_pool_traffic(view)
@@ -4543,8 +4555,9 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     view |> element("#edit-pool-#{pool.id}") |> render_click()
 
     refute has_element?(view, "#pool_edit_prompt_cache_affinity_enabled[checked]")
-    assert has_element?(view, "#pool_edit_request_compression_enabled[checked]")
+    refute has_element?(view, "#pool_edit_request_compression_enabled")
     refute has_element?(view, "#pool_edit_allow_image_generation[checked]")
+    refute has_element?(view, "#pool_edit_allow_audio_transcription[checked]")
 
     view
     |> element("#pool-edit-form")
@@ -4558,6 +4571,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         "v1_compatibility_enabled" => "false",
         "request_compression_enabled" => "false",
         "allow_image_generation" => "true",
+        "allow_audio_transcription" => "true",
         "upstream_identity_ids" => []
       }
     })
@@ -4570,8 +4584,10 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert settings.sticky_http_sessions == true
     assert settings.prompt_cache_affinity_enabled == false
     assert settings.v1_compatibility_enabled == false
-    assert settings.request_compression_enabled == false
+    refute Map.has_key?(settings, :request_compression_enabled)
+    assert [[true]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
     assert settings.allow_image_generation == true
+    assert settings.allow_audio_transcription == true
     assert Repo.get!(Pool, pool.id).name == "Preserved Routing"
     assert has_element?(view, "#pool-edit-dialog[open]")
     _ = await_pool_traffic(view)
@@ -4676,7 +4692,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     refute has_element?(view, "#pool_edit_prompt_cache_affinity_enabled[checked]")
     refute has_element?(view, "#pool_edit_v1_compatibility_enabled[checked]")
-    assert has_element?(view, "#pool_edit_request_compression_enabled[checked]")
+    refute has_element?(view, "#pool_edit_request_compression_enabled")
 
     refute has_element?(
              view,
@@ -4764,6 +4780,158 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     refute has_element?(view, "#pool-row-#{pool.id}")
     refute has_element?(view, "#pool-delete-dialog")
     _ = await_pool_traffic(view)
+  end
+
+  test "a Pool with a large history shows as deleting until its deletion job removes it", context do
+    %{conn: conn, scope: scope} = committed_deletion_context!(context)
+    CodexPooler.TestAppEnv.restore_on_exit(:pool_deletion_immediate_request_limit)
+    Application.put_env(:codex_pooler, :pool_deletion_immediate_request_limit, 1)
+
+    pool = pool_fixture(%{slug: "large-history-pool", name: "Large History Pool", created_by_user_id: scope.user.id})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    _request = request_fixture(%{pool: pool, api_key: api_key})
+    pool = pool |> Ecto.Changeset.change(status: "archived") |> Repo.update!()
+
+    register_committed_pool_deletion_cleanup!(pool)
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+    register_committed_deletion_view!(view)
+    assert :ok = Events.subscribe_pool(pool.id, "pools")
+    _ = await_pool_traffic(view)
+
+    view |> element("#delete-pool-#{pool.id}") |> render_click()
+
+    view
+    |> element("#pool-delete-form")
+    |> render_submit(%{"pool_delete" => %{"id" => pool.id, "confirmation_slug" => pool.slug}})
+
+    assert has_element?(view, "#flash-info", "Pool deletion started")
+    refute has_element?(view, "#flash-info", "Pool deleted")
+    refute has_element?(view, "#pool-delete-dialog")
+    assert has_element?(view, "#pool-row-#{pool.id}-deletion", "deleting")
+    assert has_element?(view, "#delete-pool-#{pool.id}[disabled]")
+    assert has_element?(view, "#reactivate-pool-#{pool.id}[disabled]")
+    assert Repo.get(Pool, pool.id)
+    refute Repo.get_by(AuditEvent, action: "pool.delete", target_id: pool.id)
+
+    assert {:error, %{code: :pool_deletion_in_progress}} = Pools.change_pool_status(scope, pool, "active")
+
+    assert [job] = all_enqueued(worker: CodexPooler.Jobs.PoolDeletionWorker, args: %{"pool_id" => pool.id})
+    assert :ok = perform_job(CodexPooler.Jobs.PoolDeletionWorker, job.args)
+
+    refute Repo.get(Pool, pool.id)
+    assert Repo.get_by(AuditEvent, action: "pool.delete", target_id: pool.id)
+    assert_pool_removed_after_commit!(view, pool.id)
+  end
+
+  test "a deletion job that exhausts its attempts shows deletion failed, and deleting again resumes it", context do
+    %{conn: conn, scope: scope} = committed_deletion_context!(context)
+    CodexPooler.TestAppEnv.restore_on_exit(:pool_deletion_immediate_request_limit)
+    Application.put_env(:codex_pooler, :pool_deletion_immediate_request_limit, 1)
+
+    pool = pool_fixture(%{slug: "failing-deletion-pool", name: "Failing Deletion Pool", created_by_user_id: scope.user.id})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    _request = request_fixture(%{pool: pool, api_key: api_key})
+    pool = pool |> Ecto.Changeset.change(status: "archived") |> Repo.update!()
+
+    register_committed_pool_deletion_cleanup!(pool)
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+    register_committed_deletion_view!(view)
+    assert :ok = Events.subscribe_pool(pool.id, "pools")
+    _ = await_pool_traffic(view)
+
+    delete_from_card(view, pool)
+    assert has_element?(view, "#pool-row-#{pool.id}-deletion", "deleting")
+
+    # A run-owned trigger fails the job's last attempt across real connections.
+    trigger = "fail_request_delete_#{System.unique_integer([:positive])}"
+
+    CodexPooler.UnboxedFixture.register_unboxed_cleanup!(fn ->
+      Repo.query!("DROP TRIGGER IF EXISTS #{trigger} ON requests")
+      Repo.query!("DROP FUNCTION IF EXISTS #{trigger}()")
+    end)
+
+    Repo.query!("""
+    CREATE FUNCTION #{trigger}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF OLD.pool_id = '#{pool.id}'::uuid THEN RAISE EXCEPTION 'request batch failed'; END IF;
+      RETURN OLD;
+    END $$
+    """)
+
+    Repo.query!("CREATE TRIGGER #{trigger} BEFORE DELETE ON requests FOR EACH ROW EXECUTE FUNCTION #{trigger}()")
+
+    Repo.update_all(from(job in Oban.Job, where: fragment("?->>'pool_id'", job.args) == ^pool.id), set: [max_attempts: 1])
+    failure_log = capture_log(fn -> assert %{discard: 1} = Oban.drain_queue(queue: :jobs) end)
+    assert failure_log =~ "oban job discarded"
+
+    _ = await_pool_traffic(view)
+    assert has_element?(view, "#pool-row-#{pool.id}-deletion", "deletion failed")
+    refute has_element?(view, "#delete-pool-#{pool.id}[disabled]")
+    assert Repo.get!(Pool, pool.id).status == "archived"
+    refute Repo.get_by(AuditEvent, action: "pool.delete", target_id: pool.id)
+
+    Repo.query!("DROP TRIGGER #{trigger} ON requests")
+
+    delete_from_card(view, pool)
+    assert has_element?(view, "#pool-row-#{pool.id}-deletion", "deleting")
+    assert %{success: 1} = Oban.drain_queue(queue: :jobs)
+
+    refute Repo.get(Pool, pool.id)
+    assert [_one] = Repo.all(from(event in AuditEvent, where: event.action == "pool.delete" and event.target_id == ^pool.id))
+    assert_pool_removed_after_commit!(view, pool.id)
+  end
+
+  defp committed_deletion_context!(context) do
+    CodexPooler.DataCase.stop_sandbox(context.sandbox_owner, context.sandbox_settings_cache)
+    Sandbox.mode(Repo, :auto)
+    on_exit(fn -> Sandbox.mode(Repo, :manual) end)
+    %{user: owner, token: token} = committed_bootstrap_owner_fixture!()
+    %{conn: log_in_user(context.conn, owner, token), scope: Scope.for_user(owner, ["instance_owner"])}
+  end
+
+  defp register_committed_pool_deletion_cleanup!(pool) do
+    CodexPooler.UnboxedFixture.register_unboxed_cleanup!(fn ->
+      Repo.delete_all(from job in Oban.Job, where: fragment("? @> ?", job.args, ^%{"pool_id" => pool.id}))
+      Repo.delete_all(from event in AuditEvent, where: event.target_id == ^pool.id)
+    end)
+  end
+
+  defp register_committed_deletion_view!(view) do
+    on_exit(fn ->
+      if Process.alive?(view.pid) do
+        monitor = Process.monitor(view.pid)
+        GenServer.stop(view.pid, :normal)
+        assert_receive {:DOWN, ^monitor, :process, _, :normal}, @detection_timeout_ms
+      end
+    end)
+  end
+
+  defp assert_pool_removed_after_commit!(view, pool_id) do
+    assert_receive {Events, %{reason: "pool_deleted", pool_id: ^pool_id}}, @detection_timeout_ms
+    await_pool_removed!(view, pool_id, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+    _ = await_pool_traffic(view)
+    refute has_element?(view, "#pool-row-#{pool_id}")
+  end
+
+  defp await_pool_removed!(view, pool_id, deadline) do
+    if has_element?(view, "#pool-row-#{pool_id}") do
+      assert System.monotonic_time(:millisecond) < deadline, "committed deletion notification did not remove the Pool row"
+
+      receive do
+      after
+        10 -> await_pool_removed!(view, pool_id, deadline)
+      end
+    end
+  end
+
+  defp delete_from_card(view, pool) do
+    view |> element("#delete-pool-#{pool.id}") |> render_click()
+
+    view
+    |> element("#pool-delete-form")
+    |> render_submit(%{"pool_delete" => %{"id" => pool.id, "confirmation_slug" => pool.slug}})
+
+    assert has_element?(view, "#flash-info", "Pool deletion started")
   end
 
   test "rejects missing-scope pool mutations", %{scope: scope} do
@@ -4872,6 +5040,9 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   defp capture_repo_queries(query_pid, fun) when is_pid(query_pid) and is_function(fun, 0) do
     test_pid = self()
     handler_id = {__MODULE__, :repo_query, test_pid, System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -5063,7 +5234,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   defp assert_policy_editor_docs_link(view, dialog_id) do
     assert has_element?(
              view,
-             "##{dialog_id}-footer [data-role='policy-editor-docs-link'][href='https://docs.codex-pooler.com/operators/pools/'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "##{dialog_id}-footer [data-role='policy-editor-docs-link'][href='https://www.codex-pooler.com/docs/operators/pools/'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 
@@ -5120,7 +5291,6 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       discovered_model_count: 0,
       upserted_model_count: 0,
       stale_marked_count: 0,
-      retired_count: 0,
       error_message: if(status == "failed", do: "model catalog refresh failed"),
       stats: %{}
     })

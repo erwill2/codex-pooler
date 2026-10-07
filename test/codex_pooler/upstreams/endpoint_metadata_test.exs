@@ -24,6 +24,13 @@ defmodule CodexPooler.Upstreams.EndpointMetadataTest do
 
       assert EndpointMetadata.base_url(identity(%{}), assignment(%{}), nil) == nil
 
+      # Without an explicit default the configured provider base URL applies;
+      # the test environment points it at a closed local port.
+      assert EndpointMetadata.default_base_url() == "http://127.0.0.1:9"
+
+      assert EndpointMetadata.base_url(identity(%{}), assignment(%{})) ==
+               EndpointMetadata.default_base_url()
+
       assert EndpointMetadata.endpoint_url(
                identity(%{}),
                assignment(%{}),
@@ -49,6 +56,33 @@ defmodule CodexPooler.Upstreams.EndpointMetadataTest do
 
       assert EndpointMetadata.usage_base_url(identity, assignment) ==
                "https://assignment-usage.example.com"
+    end
+  end
+
+  test "rejects malformed HTTP bases before a transport can raise" do
+    for base <- [
+          "not-a-url",
+          "   ",
+          "https://",
+          "ftp://example.com",
+          "https://example.com:bad",
+          42
+        ] do
+      assert EndpointMetadata.endpoint_url(
+               identity(%{}),
+               assignment(%{"base_url" => base}),
+               "/backend-api/codex/models"
+             ) == {:error, :invalid_upstream_base_url}
+    end
+  end
+
+  test "retains valid HTTP bases including loopback, IPv6, ports and path prefixes" do
+    for base <- ["http://127.0.0.1:4000", "http://[::1]:4000", "https://example.com/prefix"] do
+      assert EndpointMetadata.endpoint_url(
+               identity(%{}),
+               assignment(%{"base_url" => " #{base}/backend-api/ "}),
+               "/backend-api/codex/models"
+             ) == {:ok, base <> "/backend-api/codex/models"}
     end
   end
 

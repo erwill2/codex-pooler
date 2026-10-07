@@ -2,6 +2,7 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBinding do
   @moduledoc false
   import Ecto.Query
 
+  alias CodexPooler.Access
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting.{Attempt, Metadata, Request}
   alias CodexPooler.Gateway.Payloads.RequestOptions
@@ -10,21 +11,44 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBinding do
 
   @spec bind(CodexPooler.Access.auth_context(), Request.t(), Attempt.t(), RequestOptions.t()) ::
           {:ok, Request.t()} | {:error, term()}
-  def bind(
-        %{pool: %{id: pool_id}, api_key: %APIKey{id: key_id} = authenticated_key},
-        %Request{id: request_id},
-        %Attempt{id: attempt_id},
-        %RequestOptions{
-          continuity: %{codex_session: %CodexSession{id: session_id}},
-          transport: %{websocket_owner: %{enabled?: true, lease_token: lease_token} = owner}
-        }
-      )
-      when is_binary(lease_token) do
+  def bind(auth, request, attempt, options) do
+    case bind_transaction(auth, request, attempt, options, nil) do
+      {:ok, %{request: request}} -> {:ok, request}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec bind_bridge(
+          CodexPooler.Access.auth_context(),
+          Request.t(),
+          Attempt.t(),
+          RequestOptions.t()
+        ) :: {:ok, %{request: Request.t(), attempt: Attempt.t()}} | {:error, term()}
+  def bind_bridge(
+        auth,
+        request,
+        attempt,
+        options
+      ) do
+    bind_transaction(auth, request, attempt, options, "websocket")
+  end
+
+  defp bind_transaction(
+         %{pool: %{id: pool_id}, api_key: %APIKey{id: key_id} = authenticated_key},
+         %Request{id: request_id},
+         %Attempt{id: attempt_id},
+         %RequestOptions{
+           continuity: %{codex_session: %CodexSession{id: session_id}},
+           transport: %{websocket_owner: %{enabled?: true, lease_token: lease_token} = owner}
+         },
+         upstream_transport
+       )
+       when is_binary(lease_token) do
     Repo.transaction(fn ->
       session =
         Repo.one(from row in CodexSession, where: row.id == ^session_id, lock: "FOR UPDATE")
 
-      key = Repo.one(from row in APIKey, where: row.id == ^key_id, lock: "FOR UPDATE")
+      key = Access.lock_api_key_for_read(key_id)
 
       turn =
         Repo.one(
@@ -72,21 +96,128 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBinding do
              completed_at: nil,
              replay_generation: 0
            } <- attempt,
-           true <- binding_compatible?(request.request_metadata, binding) do
-        persist_binding(request, binding)
+           true <- binding_compatible?(request.request_metadata, binding, rebind_attempt?(attempt, upstream_transport)) do
+        persist_binding(request, attempt, binding, upstream_transport)
       else
         _invalid -> Repo.rollback(:stale_websocket_owner_binding)
       end
     end)
   end
 
-  def bind(_auth, _request, _attempt, _options), do: {:error, :stale_websocket_owner_binding}
+  defp bind_transaction(_auth, _request, _attempt, _options, _upstream_transport),
+    do: {:error, :stale_websocket_owner_binding}
 
-  defp persist_binding(request, binding) do
-    case Metadata.merge_request_metadata(request, %{"websocket_owner_forwarding" => binding}) do
-      {:ok, request} -> request
+  @spec restore_http_fallback(
+          CodexPooler.Access.auth_context(),
+          Request.t(),
+          Attempt.t(),
+          RequestOptions.t()
+        ) :: {:ok, %{request: Request.t(), attempt: Attempt.t()}} | {:error, term()}
+  def restore_http_fallback(
+        %{pool: %{id: pool_id}, api_key: %APIKey{id: key_id} = authenticated_key},
+        %Request{id: request_id},
+        %Attempt{id: attempt_id},
+        %RequestOptions{
+          continuity: %{codex_session: %CodexSession{id: session_id}},
+          transport: %{websocket_owner: %{enabled?: true, lease_token: lease_token} = owner}
+        }
+      )
+      when is_binary(lease_token) do
+    Repo.transaction(fn ->
+      session =
+        Repo.one(from row in CodexSession, where: row.id == ^session_id, lock: "FOR UPDATE")
+
+      key = Access.lock_api_key_for_read(key_id)
+
+      turn =
+        Repo.one(
+          from row in CodexTurn,
+            where: row.codex_session_id == ^session_id and row.request_id == ^request_id,
+            lock: "FOR UPDATE"
+        )
+
+      request = Repo.one(from row in Request, where: row.id == ^request_id, lock: "FOR UPDATE")
+
+      attempt =
+        Repo.one(
+          from row in Attempt,
+            where: row.request_id == ^request_id,
+            order_by: [desc: row.attempt_number],
+            limit: 1,
+            lock: "FOR UPDATE"
+        )
+
+      binding = metadata(owner)
+
+      lease =
+        Repo.one(
+          from row in BridgeOwnerLease,
+            where:
+              row.codex_session_id == ^session_id and row.lease_token == ^lease_token and
+                row.status == "active",
+            lock: "FOR UPDATE"
+        )
+
+      with true <- current_session?(session, pool_id, key_id, owner),
+           true <- current_lease?(lease, session, owner),
+           %APIKey{status: "active", runtime_revocation_epoch: epoch} <- key,
+           true <- epoch == authenticated_key.runtime_revocation_epoch,
+           %CodexTurn{status: "in_progress"} <- turn,
+           %Request{
+             pool_id: ^pool_id,
+             api_key_id: ^key_id,
+             status: "in_progress",
+             completed_at: nil
+           } <- request,
+           %Attempt{
+             id: ^attempt_id,
+             status: "in_progress",
+             completed_at: nil,
+             replay_generation: 0,
+             transport: "websocket"
+           } <- attempt,
+           true <- request.request_metadata["websocket_owner_forwarding"] == binding do
+        restore_http_binding(request, attempt)
+      else
+        _invalid -> Repo.rollback(:stale_websocket_owner_binding)
+      end
+    end)
+  end
+
+  def restore_http_fallback(_auth, _request, _attempt, _options),
+    do: {:error, :stale_websocket_owner_binding}
+
+  defp persist_binding(request, attempt, binding, upstream_transport) do
+    with {:ok, attempt} <- maybe_update_attempt_transport(attempt, upstream_transport),
+         {:ok, request} <-
+           Metadata.merge_request_metadata(request, %{"websocket_owner_forwarding" => binding}) do
+      %{request: request, attempt: attempt}
+    else
       {:error, reason} -> Repo.rollback(reason)
     end
+  end
+
+  defp maybe_update_attempt_transport(attempt, nil), do: {:ok, attempt}
+
+  defp maybe_update_attempt_transport(attempt, transport),
+    do: update_attempt_transport(attempt, transport)
+
+  defp restore_http_binding(request, attempt) do
+    with {:ok, attempt} <- update_attempt_transport(attempt, "http_sse"),
+         {:ok, request} <-
+           request
+           |> Ecto.Changeset.change(request_metadata: Map.delete(request.request_metadata, "websocket_owner_forwarding"))
+           |> Repo.update() do
+      %{request: request, attempt: attempt}
+    else
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp update_attempt_transport(attempt, transport) do
+    attempt
+    |> Ecto.Changeset.change(transport: transport)
+    |> Repo.update()
   end
 
   defp current_session?(
@@ -123,12 +254,38 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBinding do
     }
   end
 
-  defp binding_compatible?(metadata, binding) when is_map(metadata) do
+  defp binding_compatible?(metadata, binding, rebind_attempt?) when is_map(metadata) do
     case Map.fetch(metadata, "websocket_owner_forwarding") do
       :error -> true
-      {:ok, existing} -> existing == binding
+      {:ok, existing} -> existing == binding or (rebind_attempt? and later_attach_of_same_owner?(existing, binding))
     end
   end
 
-  defp binding_compatible?(_metadata, _binding), do: false
+  defp binding_compatible?(_metadata, _binding, _rebind_attempt?), do: false
+
+  # Only a bridge binding of a later attempt the websocket has not carried yet
+  # can follow a newer attach: the same attempt re-attached by another
+  # downstream stays stale, as does every native owner binding.
+  defp rebind_attempt?(%Attempt{attempt_number: number, transport: transport}, "websocket")
+       when is_integer(number) and number > 1,
+       do: transport != "websocket"
+
+  defp rebind_attempt?(_attempt, _upstream_transport), do: false
+
+  # A bridged attempt that ended before output (a provider usage limit on its
+  # first frame) moves the request to its next candidate, and that attempt
+  # attaches to the same owner again under the same lease with the next
+  # downstream epoch (findings#206 row 206-582). The binding follows the
+  # newer attach; an older epoch or another owner or proxy instance stays
+  # stale. The caller already requires the bound attempt to be the request's
+  # latest, in progress, under the current session lease, and
+  # `rebind_attempt?/2` a later bridge attempt.
+  defp later_attach_of_same_owner?(
+         %{"enabled" => true, "owner_instance_id" => owner, "proxy_instance_id" => proxy, "downstream_epoch" => existing_epoch},
+         %{"enabled" => true, "owner_instance_id" => owner, "proxy_instance_id" => proxy, "downstream_epoch" => epoch}
+       )
+       when is_integer(existing_epoch) and is_integer(epoch),
+       do: epoch > existing_epoch
+
+  defp later_attach_of_same_owner?(_existing, _binding), do: false
 end

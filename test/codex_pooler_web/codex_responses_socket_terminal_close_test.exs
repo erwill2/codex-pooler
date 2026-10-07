@@ -38,7 +38,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
               receive do
                 {:deliver, type} ->
                   data =
-                    Jason.encode!(%{
+                    CodexPooler.JSON.encode!(%{
                       "type" => type,
                       "response" => %{"id" => "resp_terminal_close"}
                     })
@@ -63,9 +63,16 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
             activity_registry: registry
           )
 
+        # The unsettled-callback order never finishes its callback, so the
+        # post-cleanup drain is the scenario's own timer: shorten it through
+        # the transport option rather than waiting out the production budget.
+        # Every other order finishes on a signal and keeps the default as its
+        # failure-detection budget.
+        drain_ms = if order == :active_callback, do: 100, else: nil
+
         state = %{
           auth: nil,
-          opts: RequestOptions.for_websocket(%{}),
+          opts: RequestOptions.for_websocket(%{websocket_response_task_drain_ms: drain_ms}),
           codex_session: nil,
           upstream_websocket_session: nil,
           request_response_work_started?: true,
@@ -147,7 +154,10 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
       end
 
       defp completed_terminal do
-        Jason.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_stale"}})
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.completed",
+          "response" => %{"id" => "resp_stale"}
+        })
       end
     end
   end
@@ -184,8 +194,18 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
     assert_close_outcome(:active_callback, "response.completed", false, :failed)
   end
 
+  # The drain's cut of a task that did not settle within its time
+  # (`ActivityDrain`), forced past the delivered terminal.
   test "pending cancellation prevents cleanup from declaring natural completion" do
-    assert_close_outcome(:result_first, "response.completed", :cancel, :aborted)
+    assert_close_outcome(:result_first, "response.completed", :forced_cancel, :aborted)
+  end
+
+  # A drain meets the task only after its terminal reached the client: the
+  # registry sends no cancellation, and the task completes as answered
+  # (findings#287). Before, the cancellation went out and stayed pending, and
+  # the cleanup recorded the answered turn `aborted`.
+  test "a drain's cancellation after the terminal reached the client leaves its natural completion" do
+    assert_close_outcome(:result_first, "response.completed", :cancel_after_terminal, :completed)
   end
 
   test "completed terminal cannot convert a failed callback into completion" do
@@ -200,13 +220,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
     registry = start_supervised!({ActivityRegistry, name: nil})
 
     server =
-      start_supervised!(
-        {Bandit,
-         plug: {Endpoint, parent: self(), registry: registry, order: order},
-         port: 0,
-         ip: {127, 0, 0, 1},
-         startup_log: false}
-      )
+      start_supervised!({Bandit, plug: {Endpoint, parent: self(), registry: registry, order: order}, port: 0, ip: {127, 0, 0, 1}, startup_log: false})
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
     {conn, websocket, ref} = connect(port)
@@ -242,9 +256,13 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
     assert ActivityRegistry.activities(name: registry) == []
   end
 
-  defp apply_close_control(:cancel, _socket, _task, _monitor, registry, token) do
-    :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
+  defp apply_close_control(:forced_cancel, _socket, _task, _monitor, registry, token) do
+    :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry, force: true)
     assert_receive :cancellation_pending, @detection_timeout
+  end
+
+  defp apply_close_control(:cancel_after_terminal, _socket, _task, _monitor, registry, token) do
+    assert ActivityRegistry.cancel(token, :owner_drained, name: registry) == :terminal_delivered
   end
 
   defp apply_close_control(true, socket, task, monitor, _registry, _token) do
@@ -293,7 +311,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocketTerminalCloseTest do
     if frames == [] do
       receive_frames(conn, websocket, ref)
     else
-      {conn, Enum.map(frames, fn {:text, data} -> Jason.decode!(data)["type"] end)}
+      {conn, Enum.map(frames, fn {:text, data} -> CodexPooler.JSON.decode!(data)["type"] end)}
     end
   end
 end

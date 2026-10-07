@@ -2,6 +2,7 @@ defmodule CodexPooler.Accounting.MetadataTest do
   use CodexPooler.DataCase, async: false
 
   alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.ClientRetry
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
@@ -9,6 +10,36 @@ defmodule CodexPooler.Accounting.MetadataTest do
   import CodexPooler.AccountingTestSupport
 
   describe "sanitize_metadata/1" do
+    # findings#238: this is the sanitizer attempt settlement applies to
+    # response metadata. An allowlisted frame header name keeps its bounded
+    # value even when it carries a redaction fragment; a name outside the
+    # allowlist under the same map, and a key carrying the fragment anywhere
+    # else, are still redacted.
+    test "keeps allowlisted websocket frame header values while redacting token keys elsewhere" do
+      sanitized =
+        Accounting.sanitize_metadata(%{
+          "websocket_frame_headers" => %{
+            "x-ratelimit-limit-tokens" => "100000",
+            "x-ratelimit-reset-tokens" => "1717171717",
+            "x-oai-request-id" => "req_frame",
+            "x-custom-token-hint" => "must-not-persist-child"
+          },
+          "refresh_token_state" => "must-not-persist-top",
+          "nested" => %{"token" => "must-not-persist-nested"}
+        })
+
+      assert sanitized["websocket_frame_headers"] == %{
+               "x-ratelimit-limit-tokens" => "100000",
+               "x-ratelimit-reset-tokens" => "1717171717",
+               "x-oai-request-id" => "req_frame",
+               "x-custom-token-hint" => "[REDACTED]"
+             }
+
+      assert sanitized["refresh_token_state"] == "[REDACTED]"
+      assert sanitized["nested"]["token"] == "[REDACTED]"
+      refute inspect(sanitized) =~ "must-not-persist"
+    end
+
     test "preserves only complete versioned usage observation diagnostics" do
       for classification <- ~w(known missing null malformed candidate_limit parser_discontinuity),
           count <- [0, 255] do
@@ -23,6 +54,163 @@ defmodule CodexPooler.Accounting.MetadataTest do
         assert Accounting.sanitize_metadata(%{"usage_observation" => observation}) == %{
                  "usage_observation" => observation
                }
+      end
+    end
+
+    # The authority-loss key records why an observation was disqualified. It is
+    # not an admission witness, so the persisted shape is exactly the version
+    # and one reason the observation itself can produce; anything else is
+    # dropped whole rather than stored half-understood.
+    test "native client retry authority loss persists exactly the reasons the observation can produce" do
+      for reason <- ClientRetry.authority_poison_reasons() do
+        value = %{"version" => 1, "authority_lost_reason" => Atom.to_string(reason)}
+
+        assert Accounting.sanitize_metadata(%{"native_client_retry_authority_loss" => value}) ==
+                 %{"native_client_retry_authority_loss" => value}
+      end
+
+      invalid = [
+        %{"version" => 1, "authority_lost_reason" => "something_else"},
+        %{"version" => 2, "authority_lost_reason" => "malformed_event"},
+        %{"version" => 1, "authority_lost_reason" => "malformed_event", "authority_complete" => true},
+        %{"version" => 1, "authority_lost_reason" => nil},
+        %{"version" => 1},
+        %{}
+      ]
+
+      for value <- invalid do
+        assert Accounting.sanitize_metadata(%{"native_client_retry_authority_loss" => value}) ==
+                 %{"native_client_retry_authority_loss" => %{}},
+               "expected #{inspect(value)} to be dropped"
+      end
+    end
+
+    test "native client retry observation keeps a null first_visible_at without widening the shape" do
+      lifecycle_only = %{
+        "version" => 1,
+        "authority_complete" => true,
+        "output_item_done_count" => 0,
+        "output_item_done_count_saturated" => false,
+        "partial_reasoning_seen" => false,
+        "first_visible_at" => nil,
+        "terminal_seen" => false,
+        "terminal_candidate_seen" => false
+      }
+
+      assert Accounting.sanitize_metadata(%{"native_client_retry_observation" => lifecycle_only}) ==
+               %{"native_client_retry_observation" => lifecycle_only}
+
+      visible = Map.put(lifecycle_only, "first_visible_at", "2026-09-11T09:00:00.123456Z")
+
+      assert Accounting.sanitize_metadata(%{"native_client_retry_observation" => visible}) ==
+               %{"native_client_retry_observation" => visible}
+
+      for invalid <- ["not a timestamp", "2026-09-11T09:00:00+02:00", 0, false, %{}, []] do
+        sanitized =
+          Accounting.sanitize_metadata(%{
+            "native_client_retry_observation" =>
+              lifecycle_only
+              |> Map.put("first_visible_at", invalid)
+              |> Map.put("raw_frame", "private frame")
+          })
+
+        assert sanitized["native_client_retry_observation"] ==
+                 Map.delete(lifecycle_only, "first_visible_at")
+      end
+
+      for {key, value} <- [
+            {"version", nil},
+            {"authority_complete", nil},
+            {"output_item_done_count", nil},
+            {"terminal_seen", nil}
+          ] do
+        sanitized =
+          Accounting.sanitize_metadata(%{
+            "native_client_retry_observation" => Map.put(lifecycle_only, key, value)
+          })
+
+        refute Map.has_key?(sanitized["native_client_retry_observation"], key)
+      end
+    end
+
+    test "native HTTP mailbox prefixes retain only bounded item identities" do
+      progress = %{"version" => 1, "output_item_done_count" => 6, "item_digests" => List.duplicate("0123456789ab", 4)}
+      assert Accounting.sanitize_metadata(%{"native_http_mailbox_prefix" => progress}) == %{"native_http_mailbox_prefix" => progress}
+
+      for invalid <- [Map.put(progress, "version", 2), Map.put(progress, "output_item_done_count", 0), Map.put(progress, "output_item_done_count", 65_536), Map.put(progress, "item_digests", ["invalid"]), Map.put(progress, "item_digests", List.duplicate("0123456789ab", 5)), Map.put(progress, "raw_item", "synthetic")] do
+        assert Accounting.sanitize_metadata(%{"native_http_mailbox_prefix" => invalid}) == %{"native_http_mailbox_prefix" => %{}}
+      end
+    end
+
+    test "native HTTP resume progress keeps only a bounded HMAC receipt" do
+      digest = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+      progress = %{
+        "version" => 1,
+        "output_item_done_count" => 2,
+        "digest" => digest
+      }
+
+      assert Accounting.sanitize_metadata(%{"native_http_resume_progress" => progress}) == %{
+               "native_http_resume_progress" => progress
+             }
+
+      assert Accounting.sanitize_metadata(%{
+               "native_http_resume_progress" => Map.put(progress, "raw_item", "private")
+             }) == %{"native_http_resume_progress" => %{}}
+
+      for invalid <- [
+            Map.put(progress, "version", 2),
+            Map.put(progress, "output_item_done_count", -1),
+            Map.put(progress, "output_item_done_count", 65_536),
+            Map.put(progress, "digest", "invalid"),
+            Map.delete(progress, "digest")
+          ] do
+        assert Accounting.sanitize_metadata(%{"native_http_resume_progress" => invalid}) == %{
+                 "native_http_resume_progress" => %{}
+               }
+      end
+    end
+
+    # findings#206 rows 206-403 and 206-412: the turn progress a native request
+    # records is one 32-byte digest, whichever transport recorded it.
+    test "native turn progress keeps only the bounded digest on either transport's key" do
+      progress = %{"version" => 1, "digest" => Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)}
+
+      for key <- ["native_http_turn_progress", "native_turn_progress"] do
+        assert Accounting.sanitize_metadata(%{key => progress}) == %{key => progress}
+        assert Accounting.sanitize_metadata(%{key => Map.put(progress, "input", "private")}) == %{key => %{}}
+
+        for invalid <- [Map.put(progress, "version", 2), Map.put(progress, "digest", "invalid"), Map.put(progress, "digest", String.duplicate("a", 44)), Map.delete(progress, "digest")] do
+          assert Accounting.sanitize_metadata(%{key => invalid}) == %{key => %{}}
+        end
+      end
+    end
+
+    # findings#206 row 206-423: beside the digest, the position that orders a
+    # later request against the row: a bounded count and an optional pivot digest.
+    test "native turn progress keeps a bounded position beside the digest and nothing else" do
+      digest = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+      pivot = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+      for key <- ["native_http_turn_progress", "native_turn_progress"],
+          valid <- [
+            %{"version" => 1, "digest" => digest, "user_messages" => 0},
+            %{"version" => 1, "digest" => digest, "user_messages" => 3, "pivot" => pivot}
+          ] do
+        assert Accounting.sanitize_metadata(%{key => valid}) == %{key => valid}
+      end
+
+      for key <- ["native_http_turn_progress", "native_turn_progress"],
+          invalid <- [
+            %{"version" => 1, "digest" => digest, "pivot" => pivot},
+            %{"version" => 1, "digest" => digest, "user_messages" => -1},
+            %{"version" => 1, "digest" => digest, "user_messages" => 1_000_001},
+            %{"version" => 1, "digest" => digest, "user_messages" => "3"},
+            %{"version" => 1, "digest" => digest, "user_messages" => 3, "pivot" => "invalid"},
+            %{"version" => 1, "digest" => digest, "user_messages" => 3, "pivot" => pivot, "input" => "private"}
+          ] do
+        assert Accounting.sanitize_metadata(%{key => invalid}) == %{key => %{}}
       end
     end
 
@@ -238,41 +426,11 @@ defmodule CodexPooler.Accounting.MetadataTest do
       refute sanitized_text =~ "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
     end
 
-    test "payload compression metadata keeps allowlisted fields and redacts unknown raw fields" do
-      sanitized =
-        Accounting.sanitize_metadata(%{
-          "payload_compression" => %{
-            "attempted" => true,
-            "status" => "compressed",
-            "reason" => "tokenizer_input_limit",
-            "strategies" => [
-              "log_output",
-              "call_probe_secret",
-              "json_document_lossless",
-              "diff"
-            ],
-            "candidate_count" => 2,
-            "tokenizer_input_skipped_count" => 2,
-            "raw_candidate" => "Bearer sk-cxp-abcdef123456-secretValue",
-            "json_path" => "$.input[0].output"
-          }
-        })
-
-      compression = sanitized["payload_compression"]
-
-      assert compression["attempted"] == true
-      assert compression["status"] == "compressed"
-      assert compression["reason"] == "tokenizer_input_limit"
-      assert compression["strategies"] == ["log_output", "json_document_lossless", "diff"]
-      assert compression["candidate_count"] == 2
-      assert compression["tokenizer_input_skipped_count"] == 2
-      assert compression["raw_candidate"] == "[REDACTED]"
-      assert compression["json_path"] == "[REDACTED]"
-
-      compression_text = inspect(compression)
-      refute compression_text =~ "call_probe_secret"
-      refute compression_text =~ "secretValue"
-      refute compression_text =~ "$.input[0].output"
+    test "retired payload metadata uses generic container redaction" do
+      for value <- [%{"status" => "synthetic-history", "nested" => [%{"label" => "synthetic-history"}]}, [%{"label" => "synthetic-history"}], "synthetic-history"] do
+        metadata = %{"payload_compression" => value, "nested" => %{"payload_compression" => value}, "transport" => "websocket"}
+        assert Accounting.sanitize_metadata(metadata) == %{"payload_compression" => "[REDACTED]", "nested" => %{"payload_compression" => "[REDACTED]"}, "transport" => "websocket"}
+      end
     end
 
     test "public Responses stream summary keeps only allowlisted fields" do
@@ -347,7 +505,7 @@ defmodule CodexPooler.Accounting.MetadataTest do
       assert summary["finish_class"] == nil
       assert summary["terminal_kind"] == nil
       assert summary["terminal_status"] == nil
-      refute Jason.encode!(summary) =~ raw_value
+      refute CodexPooler.JSON.encode!(summary) =~ raw_value
     end
 
     test "public Responses stream summary rejects a raw binary value" do
@@ -359,7 +517,7 @@ defmodule CodexPooler.Accounting.MetadataTest do
         })
 
       assert sanitized["public_openai_responses_stream"] == %{}
-      refute Jason.encode!(sanitized) =~ raw_value
+      refute CodexPooler.JSON.encode!(sanitized) =~ raw_value
     end
 
     test "public Responses stream summary rejects a raw list value" do
@@ -371,7 +529,7 @@ defmodule CodexPooler.Accounting.MetadataTest do
         })
 
       assert sanitized["public_openai_responses_stream"] == %{}
-      refute Jason.encode!(sanitized) =~ raw_value
+      refute CodexPooler.JSON.encode!(sanitized) =~ raw_value
     end
 
     test "public Responses stream summary rejects a scalar value" do

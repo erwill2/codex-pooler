@@ -5,25 +5,40 @@ defmodule CodexPooler.Dev.MCPFixture do
   One reference-counted receipt owns the exact prior global gate, operator gate,
   and disposable token. The raw token exists only in the mode-0600 receipt and
   is never returned by the Mix task.
+
+  The fixture normally targets `codex_pooler_dev`. With
+  `allow_isolated_dev_database: true` it also accepts a disposable isolated QA
+  database (`codex_pooler_relqa_*`) reached over loopback TCP only, and scopes
+  its receipt below `tmp/mcp-fixture/<database>/` so a lease held against the
+  development database is never reused for, or restored into, another database.
+  `target_database: NAME` accepts any explicitly named local database reached
+  over loopback (for example a kind replica through a port-forward, see
+  `CodexPooler.Dev.LocalTarget`), with its receipt below
+  `tmp/mcp-fixture/target-NAME/`.
   """
 
+  alias CodexPooler.Dev.LocalTarget
   alias CodexPooler.Dev.MCPFixture.{Provisioner, Receipt, Snapshot}
   alias CodexPooler.MCP.Material
   alias CodexPooler.Repo
 
   @database "codex_pooler_dev"
-  @default_receipt_path Path.join(["tmp", "mcp-fixture", "setup.json"])
+  @receipt_root Path.join(["tmp", "mcp-fixture"])
+  @default_receipt_path Path.join(@receipt_root, "setup.json")
 
   @type options :: [
           environment: atom(),
           allow_test_database: boolean(),
+          allow_isolated_dev_database: boolean(),
+          target_database: String.t(),
           receipt_path: String.t(),
           repo_config: keyword()
         ]
   @type status :: %{
           required(:status) => String.t(),
           required(:leases) => non_neg_integer(),
-          required(:receipt_path) => String.t()
+          required(:receipt_path) => String.t(),
+          optional(:other_receipts) => [String.t()]
         }
 
   @spec receipt_path() :: String.t()
@@ -47,12 +62,14 @@ defmodule CodexPooler.Dev.MCPFixture do
 
   @spec status(options()) :: {:ok, status()} | {:error, String.t()}
   def status(options \\ []) do
-    path = resolved_receipt_path(options)
+    with :ok <- validate_isolated_status(options) do
+      path = resolved_receipt_path(options)
 
-    case Receipt.read(path) do
-      {:ok, setup} -> public_status(setup, path)
-      :missing -> {:ok, %{status: "absent", leases: 0, receipt_path: path}}
-      {:error, message} -> {:error, message}
+      case Receipt.read(path) do
+        {:ok, setup} -> public_status(setup, path)
+        :missing -> absent_status(path)
+        {:error, message} -> {:error, message}
+      end
     end
   end
 
@@ -62,12 +79,26 @@ defmodule CodexPooler.Dev.MCPFixture do
     repo_config = Keyword.get(options, :repo_config, Repo.config())
     allow_test_database? = Keyword.get(options, :allow_test_database, false)
 
+    target_database = Keyword.get(options, :target_database)
+
     cond do
-      environment == :dev and Keyword.get(repo_config, :database) == @database -> :ok
+      environment == :dev and is_binary(target_database) -> LocalTarget.validate_target_database(target_database, repo_config)
+      environment == :dev and development_database?(options, repo_config) -> :ok
       environment == :test and allow_test_database? -> :ok
       environment != :dev -> {:error, "MCP fixture runs only with MIX_ENV=dev"}
       true -> {:error, "MCP fixture requires database #{@database}"}
     end
+  end
+
+  defp development_database?(options, repo_config) do
+    Keyword.get(repo_config, :database) == @database or
+      (Keyword.get(options, :allow_isolated_dev_database, false) and LocalTarget.isolated_dev_database?(repo_config))
+  end
+
+  defp validate_isolated_status(options) do
+    if Keyword.get(options, :allow_isolated_dev_database, false) or Keyword.has_key?(options, :target_database),
+      do: validate_environment(options),
+      else: :ok
   end
 
   defp acquire_locked(path) do
@@ -143,7 +174,7 @@ defmodule CodexPooler.Dev.MCPFixture do
         {:error, "MCP fixture receipt has an invalid lease count"}
 
       :missing ->
-        {:ok, %{status: "absent", leases: 0, receipt_path: path}}
+        absent_status(path)
 
       {:error, message} ->
         {:error, message}
@@ -176,9 +207,55 @@ defmodule CodexPooler.Dev.MCPFixture do
     end
   end
 
+  defp absent_status(path) do
+    root = Path.expand(@receipt_root, File.cwd!())
+
+    other_receipts =
+      [Path.join(root, "setup.json") | Path.wildcard(Path.join([root, "*", "setup.json"]))]
+      |> Enum.reject(&(&1 == path))
+      |> Enum.filter(fn candidate ->
+        case File.lstat(candidate) do
+          {:ok, %{type: :regular}} -> true
+          _other -> false
+        end
+      end)
+      |> Enum.sort()
+
+    result = %{status: "absent", leases: 0, receipt_path: path}
+    {:ok, if(other_receipts == [], do: result, else: Map.put(result, :other_receipts, other_receipts))}
+  end
+
   defp resolved_receipt_path(options) do
     options
-    |> Keyword.get(:receipt_path, receipt_path())
+    |> Keyword.get_lazy(:receipt_path, fn -> default_receipt_path(options) end)
     |> Path.expand(File.cwd!())
+  end
+
+  # A target database's receipt path is derived only from a name that
+  # `LocalTarget` accepts as a single safe path segment.
+  defp default_receipt_path(options) do
+    target_database = Keyword.get(options, :target_database)
+
+    if is_binary(target_database) do
+      LocalTarget.receipt_path(receipt_path(), @receipt_root, target_database)
+    else
+      isolated_or_default_receipt_path(options)
+    end
+  end
+
+  # Only reached after `validate_environment/1` accepted the isolated database,
+  # so its name matches the `codex_pooler_relqa_*` pattern and is a safe single
+  # path segment.
+  defp isolated_or_default_receipt_path(options) do
+    if Keyword.get(options, :allow_isolated_dev_database, false) do
+      repo_config = Keyword.get(options, :repo_config, Repo.config())
+      database = Keyword.fetch!(repo_config, :database)
+
+      if database == @database,
+        do: receipt_path(),
+        else: Path.expand(Path.join([@receipt_root, database, "setup.json"]), File.cwd!())
+    else
+      receipt_path()
+    end
   end
 end

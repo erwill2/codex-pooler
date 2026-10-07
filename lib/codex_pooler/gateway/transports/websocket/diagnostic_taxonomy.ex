@@ -11,13 +11,47 @@ defmodule CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy do
   # clients/openai-compatible.mdx); anything else keeps the fingerprint.
   @unknown_code_allowlist ~r/\A[A-Za-z0-9_.-]+\z/
   @max_unknown_code_bytes 80
-  @known_error_codes OwnerErrorVocabulary.owner_error_codes() ++ ErrorCodes.known_error_codes()
+  # Internal lifecycle reasons that are not owner or provider codes but must
+  # render in cleartext: replay preflight rejections and the health-neutral
+  # finalizations that keep a byte-identical resend admissible.
+  @internal_lifecycle_reason_codes ~w(
+                                      lifecycle_conflict
+                                      owner_task_exception
+                                      orphaned_turn_closed
+                                    )
   @reconnect_dispositions ~w(
                              same_turn_replay
                              replacement_handoff
                              identity_rejected
                              owner_busy
+                             inherited_turn_taken_over
+                             inherited_turn_unsettled
                            )
+  # The predecessor shape a byte-identical websocket resend was admitted after:
+  # every shape `FailedPredecessorResend` admits, or the admission line reads
+  # `predecessor_shape=unknown` for a known fact.
+  @resend_predecessor_shapes ~w(
+    content_filter_retry
+                               identical_resend
+                               previsible_idle_timeout
+                               provider_terminal
+                               task_exception
+                               lifecycle_cut
+                               partial_reasoning_cut
+                               partial_http_tool_cut
+                               zero_output_http_failure
+                               resampled_completion
+                               quota_rejection
+                               advanced_http_resume
+                               previsible_disconnect
+                               undelivered_completion
+                               undelivered_partial_output
+                               completed_item_resend
+                               mailbox_continuation
+                               unreceived_compaction
+                               anchor_refusal
+                               compaction_cut
+                             )
   @handoff_outcomes ~w(
                         ready
                         timeout
@@ -65,6 +99,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy do
   @spec handoff_outcome(term()) :: String.t() | nil
   def handoff_outcome(value), do: fixed_vocabulary(value, @handoff_outcomes)
 
+  @spec resend_predecessor_shape(term()) :: String.t() | nil
+  def resend_predecessor_shape(value), do: fixed_vocabulary(value, @resend_predecessor_shapes)
+
   @spec safe_correlator(term()) :: String.t()
   def safe_correlator(value) when is_binary(value) do
     cond do
@@ -87,7 +124,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy do
 
   def safe_correlator(_value), do: "none"
 
-  defp known_error_code?(value), do: value in @known_error_codes
+  @spec internal_lifecycle_reason_codes() :: [String.t()]
+  def internal_lifecycle_reason_codes, do: @internal_lifecycle_reason_codes
+
+  defp known_error_code?(value),
+    do:
+      value in @internal_lifecycle_reason_codes or
+        value in OwnerErrorVocabulary.owner_error_codes() or
+        value in ErrorCodes.known_error_codes()
 
   defp fixed_vocabulary(value, vocabulary) when is_atom(value) do
     value

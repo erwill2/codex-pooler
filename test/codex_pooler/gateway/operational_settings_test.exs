@@ -4,14 +4,15 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
   import ExUnit.CaptureLog
 
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.{Cache, Settings}
 
   setup do
-    previous_instance_settings = Application.get_env(:codex_pooler, InstanceSettings, [])
-    previous_operational_settings = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous_instance_settings = CodexPooler.TestAppEnv.restore_on_exit(InstanceSettings)
+    previous_operational_settings = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -31,8 +32,6 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     InstanceSettings.reset_cache_for_test()
 
     on_exit(fn ->
-      Application.put_env(:codex_pooler, InstanceSettings, previous_instance_settings)
-      Application.put_env(:codex_pooler, OperationalSettings, previous_operational_settings)
       InstanceSettings.reset_cache_for_test()
     end)
 
@@ -58,8 +57,8 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     assert settings.trusted_proxies_compiled == {:ok, []}
     assert settings.decompression_algorithms == ["gzip", "deflate", "zstd"]
     assert settings.zstd_supported?
-    assert settings.max_compressed_body_bytes == 32 * 1024 * 1024
-    assert settings.max_decompressed_body_bytes == 64 * 1024 * 1024
+    assert settings.max_compressed_body_bytes == 128 * 1024 * 1024
+    assert settings.max_decompressed_body_bytes == 256 * 1024 * 1024
     assert settings.max_decompression_ratio == 200
     assert settings.decompression_timeout_ms == 10_000
     refute settings.gateway_debug?
@@ -88,6 +87,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     assert settings.upstream_connect_timeout_ms == 15_000
     assert settings.upstream_pool_timeout_ms == 15_000
     assert settings.upstream_receive_timeout_ms == 300_000
+    assert settings.upstream_conn_max_idle_time_ms == 45_000
     assert settings.websocket_idle_timeout_ms == 1_800_000
     assert Map.get(settings, :websocket_owner_idle_timeout_ms) == 1_800_000
     assert settings.model_context_window_overrides == %{}
@@ -141,6 +141,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
                  "upstream_connect_timeout_ms" => 111,
                  "upstream_pool_timeout_ms" => 222,
                  "upstream_receive_timeout_ms" => 333,
+                 "upstream_conn_max_idle_time_ms" => 30_000,
                  "websocket_idle_timeout_ms" => 444_000,
                  "websocket_owner_idle_timeout_ms" => 333_000,
                  "expired_alias_ttl_seconds" => 120,
@@ -190,6 +191,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     assert settings.upstream_connect_timeout_ms == 111
     assert settings.upstream_pool_timeout_ms == 222
     assert settings.upstream_receive_timeout_ms == 333
+    assert settings.upstream_conn_max_idle_time_ms == 30_000
     assert settings.websocket_idle_timeout_ms == 444_000
     assert Map.get(settings, :websocket_owner_idle_timeout_ms) == 333_000
     assert settings.model_context_window_overrides == %{"gpt-test-model" => 131_072}
@@ -205,6 +207,150 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
 
     assert OperationalSettings.current().websocket_idle_timeout_ms == 1_800_000
     assert InstanceSettings.current().gateway.websocket_idle_timeout_ms == 1_800_000
+  end
+
+  test "current/0 defaults a missing upstream connection idle bound" do
+    defaults = Settings.default()
+
+    stale_settings = %{
+      defaults
+      | gateway: Map.delete(defaults.gateway, :upstream_conn_max_idle_time_ms)
+    }
+
+    :ok = Cache.put_for_test(stale_settings)
+
+    assert OperationalSettings.current().upstream_conn_max_idle_time_ms == 45_000
+    assert Map.get(InstanceSettings.current().gateway, :upstream_conn_max_idle_time_ms) == 45_000
+  end
+
+  test "current/0 clamps malformed and out-of-range upstream connection idle bounds" do
+    defaults = Settings.default()
+
+    for {value, expected} <- [
+          {0, 1_000},
+          {-1, 1_000},
+          {3_600_001, 3_600_000},
+          {:infinity, 45_000},
+          {"30000", 45_000},
+          {nil, 45_000}
+        ] do
+      stale_settings = %{
+        defaults
+        | gateway: %{defaults.gateway | upstream_conn_max_idle_time_ms: value}
+      }
+
+      assert OperationalSettings.from_instance_settings(stale_settings).upstream_conn_max_idle_time_ms ==
+               expected
+    end
+  end
+
+  test "upstream_http_pool_options/0 carries the saved upstream connection idle bound for every provider Req caller" do
+    assert OperationalSettings.upstream_http_pool_options() == [conn_max_idle_time: 45_000]
+
+    assert {:ok, _settings} =
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+               "gateway" => %{"upstream_conn_max_idle_time_ms" => 12_345}
+             })
+
+    assert OperationalSettings.upstream_http_pool_options() == [conn_max_idle_time: 12_345]
+  end
+
+  test "current/0 raises a stored owner lease ttl below the minimum without rewriting it, and logs it once" do
+    minimum = OwnerRenewalSchedule.minimum_lease_ttl_seconds()
+    settings = InstanceSettings.ensure_singleton!()
+
+    # A value stored before the minimum existed: written past the changeset.
+    {1, _rows} =
+      Repo.update_all(
+        from(s in Settings,
+          where: s.singleton == true,
+          update: [set: [gateway: fragment("jsonb_set(?, '{bridge_owner_lease_ttl_seconds}', '5'::jsonb)", s.gateway)]]
+        ),
+        []
+      )
+
+    log =
+      capture_log([level: :warning], fn ->
+        InstanceSettings.reset_cache_for_test()
+        assert OperationalSettings.current().bridge_owner_lease_ttl_seconds == minimum
+        # A reload of the same stored value does not log again.
+        :ok = Cache.subscribe_applied()
+        send(Process.whereis(Cache), {Cache, {:updated, settings.lock_version}})
+        assert_receive {Cache, {:applied, _lock_version}}
+        assert OperationalSettings.current().bridge_owner_lease_ttl_seconds == minimum
+      end)
+
+    assert InstanceSettings.current().gateway.bridge_owner_lease_ttl_seconds == 5
+    assert InstanceSettings.get!().gateway.bridge_owner_lease_ttl_seconds == 5
+
+    assert [_one] =
+             Regex.scan(
+               ~r/instance setting clamped at read setting=bridge_owner_lease_ttl_seconds stored=5 effective=#{minimum}/,
+               log
+             )
+
+    for {value, expected} <- [{minimum - 1, minimum}, {minimum, minimum}, {45, 45}, {0, 45}, {nil, 45}, {"30", 45}] do
+      stale = %{settings | gateway: %{settings.gateway | bridge_owner_lease_ttl_seconds: value}}
+      assert OperationalSettings.from_instance_settings(stale).bridge_owner_lease_ttl_seconds == expected
+    end
+  end
+
+  test "current/0 lowers a stored owner lease renewal above a third of the ttl without rewriting it, and logs it once" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    # The defaults are unchanged: 15 s renewals of a 45 s lease.
+    assert {OperationalSettings.current().bridge_owner_lease_renewal_seconds, OperationalSettings.current().bridge_owner_lease_ttl_seconds} == {15, 45}
+
+    # A value stored before the bound existed: written past the changeset.
+    {1, _rows} =
+      Repo.update_all(
+        from(s in Settings,
+          where: s.singleton == true,
+          update: [set: [gateway: fragment("jsonb_set(?, '{bridge_owner_lease_renewal_seconds}', '60'::jsonb)", s.gateway)]]
+        ),
+        []
+      )
+
+    log =
+      capture_log([level: :warning], fn ->
+        InstanceSettings.reset_cache_for_test()
+        assert OperationalSettings.current().bridge_owner_lease_renewal_seconds == 15
+        # A reload of the same stored value does not log again.
+        :ok = Cache.subscribe_applied()
+        send(Process.whereis(Cache), {Cache, {:updated, settings.lock_version}})
+        assert_receive {Cache, {:applied, _lock_version}}
+        assert OperationalSettings.current().bridge_owner_lease_renewal_seconds == 15
+      end)
+
+    assert InstanceSettings.current().gateway.bridge_owner_lease_renewal_seconds == 60
+    assert InstanceSettings.get!().gateway.bridge_owner_lease_renewal_seconds == 60
+
+    assert [_one] =
+             Regex.scan(~r/instance setting clamped at read setting=bridge_owner_lease_renewal_seconds stored=60 effective=15/, log)
+
+    # An unrelated gateway save is not refused by the stored pair.
+    assert {:ok, saved} = InstanceSettings.update_system_settings(InstanceSettings.get!(), %{"gateway" => %{"expired_alias_ttl_seconds" => 7_200}})
+    assert saved.gateway.bridge_owner_lease_renewal_seconds == 60
+
+    # {stored renewal, stored ttl} => effective renewal; the ttl is raised to
+    # its minimum first.
+    for {{renewal, ttl}, expected} <- [
+          {{15, 45}, 15},
+          {{16, 45}, 15},
+          {{45, 45}, 15},
+          {{60, 45}, 15},
+          {{30, 90}, 30},
+          {{24, 24}, 8},
+          {{10, 5}, 8},
+          {{5, 5}, 5},
+          {{0, 45}, 15},
+          {{nil, 45}, 15},
+          {{"30", 45}, 15},
+          {{60, nil}, 15}
+        ] do
+      stale = %{settings | gateway: %{settings.gateway | bridge_owner_lease_renewal_seconds: renewal, bridge_owner_lease_ttl_seconds: ttl}}
+      assert OperationalSettings.from_instance_settings(stale).bridge_owner_lease_renewal_seconds == expected, "renewal=#{inspect(renewal)} ttl=#{inspect(ttl)}"
+    end
   end
 
   test "current/0 clamps legacy cached websocket idle timeout values above the safe maximum" do
@@ -355,20 +501,22 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     assert settings.file_max_size_bytes == 25 * 1024 * 1024
     refute settings.gateway_debug?
     assert settings.decompression_algorithms == ["gzip", "deflate", "zstd"]
-    assert settings.max_compressed_body_bytes == 32 * 1024 * 1024
-    assert settings.max_decompressed_body_bytes == 64 * 1024 * 1024
+    assert settings.max_compressed_body_bytes == 128 * 1024 * 1024
+    assert settings.max_decompressed_body_bytes == 256 * 1024 * 1024
     assert settings.decompression_timeout_ms == 10_000
     assert settings.bulkheads["proxy_control"].max_concurrency == 8
   end
 
   describe "websocket owner forwarding topology config" do
     test "defaults disabled when release env is absent and app env is unset" do
+      CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+
       with_websocket_owner_forwarding_env(nil, fn ->
         Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
 
         refute OperationalSettings.parse_websocket_owner_forwarding_env!()
-        refute OperationalSettings.websocket_owner_forwarding_enabled?()
-        refute Gateway.websocket_owner_forwarding_enabled?()
+        assert OperationalSettings.websocket_owner_forwarding_enabled?() === false
+        assert Gateway.websocket_owner_forwarding_enabled?() === false
 
         assert Gateway.require_websocket_owner_forwarding_enabled() ==
                  {:error, :owner_forwarding_disabled}
@@ -396,6 +544,14 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
           assert Gateway.require_websocket_owner_forwarding_enabled() == :ok
         end)
       end
+    end
+
+    test "explicit nil app config disables forwarding with a boolean result" do
+      with_websocket_owner_forwarding_app_env(nil, fn ->
+        assert OperationalSettings.websocket_owner_forwarding_enabled?() === false
+        assert Gateway.websocket_owner_forwarding_enabled?() === false
+        assert Gateway.require_websocket_owner_forwarding_enabled() == {:error, :owner_forwarding_disabled}
+      end)
     end
 
     test "parses disabled release env aliases" do
@@ -439,29 +595,46 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     env_name = OperationalSettings.websocket_owner_forwarding_env_name()
     previous = System.get_env(env_name)
 
+    restore = fn ->
+      if is_nil(previous),
+        do: System.delete_env(env_name),
+        else: System.put_env(env_name, previous)
+    end
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs.
+    on_exit(restore)
+
     if is_nil(value), do: System.delete_env(env_name), else: System.put_env(env_name, value)
 
     try do
       fun.()
     after
-      if is_nil(previous),
-        do: System.delete_env(env_name),
-        else: System.put_env(env_name, previous)
+      restore.()
     end
   end
 
   defp with_websocket_owner_forwarding_app_env(value, fun) do
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    previous = Application.fetch_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+
+    restore = fn ->
+      case previous do
+        {:ok, value} ->
+          Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
+
+        :error ->
+          Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+      end
+    end
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs.
+    on_exit(restore)
 
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
 
     try do
       fun.()
     after
-      case previous do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
+      restore.()
     end
   end
 
@@ -477,5 +650,5 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     {settings, log}
   end
 
-  defp string_keyed_map(map), do: map |> Jason.encode!() |> Jason.decode!()
+  defp string_keyed_map(map), do: map |> CodexPooler.JSON.encode!() |> CodexPooler.JSON.decode!()
 end

@@ -106,15 +106,14 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             required
           >
             <:label_content>
-              Type <span class="font-semibold text-base-content">{@deleting_pool.slug}</span>
-              to confirm
+              Type <span class="font-semibold text-base-content">{@deleting_pool.slug}</span> to confirm
             </:label_content>
           </.input>
         </.form>
 
         <AdminComponents.dialog_footer
           id="pool-delete-dialog-footer"
-          docs_url="https://docs.codex-pooler.com/operators/pools/"
+          docs_url="https://www.codex-pooler.com/docs/operators/pools/"
         >
           <:actions>
             <AdminComponents.action_button
@@ -130,9 +129,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
               type="submit"
               form="pool-delete-form"
               variant={:danger}
-              phx-click={
-                JS.dispatch("blur", to: "#pool_delete_confirmation_slug_#{@delete_form_version}")
-              }
+              phx-click={JS.dispatch("blur", to: "#pool_delete_confirmation_slug_#{@delete_form_version}")}
               disabled={@deleting_pool.status != "archived"}
             />
           </:actions>
@@ -226,7 +223,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       >
         <summary
           data-role="status-filter-trigger"
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name={@selected.icon} class={["size-4 shrink-0", @selected.icon_class]} />
           <span class="truncate">{@selected.label}</span>
@@ -318,7 +315,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       >
         <summary
           data-role="traffic-window-filter-trigger"
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
           <span class="truncate">{@selected.label}</span>
@@ -424,6 +421,22 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
                 class={AdminBadges.lifecycle_chip_class(@pool_row.pool.status)}
               >
                 {@pool_row.pool.status}
+              </span>
+              <span
+                :if={Map.get(@pool_row, :deletion) == :in_progress}
+                id={"pool-row-#{@pool_row.pool.id}-deletion"}
+                class={AdminBadges.lifecycle_chip_class("paused")}
+                title="A background job is removing this Pool's history; the Pool disappears when it finishes"
+              >
+                deleting
+              </span>
+              <span
+                :if={Map.get(@pool_row, :deletion) == :failed}
+                id={"pool-row-#{@pool_row.pool.id}-deletion"}
+                class={AdminBadges.lifecycle_chip_class("deleted")}
+                title="The last deletion attempt gave up; delete the Pool again to resume"
+              >
+                deletion failed
               </span>
               <.pool_action_menu
                 pool_row={@pool_row}
@@ -705,6 +718,19 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             label="Edit"
             phx-click="edit_pool"
             phx-value-id={@pool_row.pool.id}
+            disabled={@pool_row.pool.status != "active"}
+            title={PoolForm.edit_title(@pool_row.pool)}
+          />
+        </li>
+        <li :if={@can_manage_pools? && @pool_row.pool.status != "active"}>
+          <AdminComponents.dropdown_action_item
+            id={"reactivate-pool-#{@pool_row.pool.id}"}
+            icon="hero-play"
+            label="Reactivate"
+            variant={:positive}
+            phx-click="reactivate_pool"
+            phx-value-id={@pool_row.pool.id}
+            disabled={Map.get(@pool_row, :deletion) == :in_progress}
           />
         </li>
         <li :if={!@can_manage_pools? && @can_operate_pools?}>
@@ -724,7 +750,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             variant={:danger}
             phx-click="delete_pool"
             phx-value-id={@pool_row.pool.id}
-            disabled={@pool_row.pool.status != "archived"}
+            disabled={@pool_row.pool.status != "archived" or Map.get(@pool_row, :deletion) == :in_progress}
             title={PoolForm.delete_title(@pool_row.pool)}
           />
         </li>
@@ -739,24 +765,24 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       id_suffix: "v1",
       icon: "hero-code-bracket",
       label: "/v1 compatibility",
-      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
+      docs_url: "https://www.codex-pooler.com/docs/operators/pools/#compatibility",
       description: "OpenAI-style /v1 compatibility routes."
-    },
-    %{
-      key: :request_compression_enabled,
-      id_suffix: "compression",
-      icon: "hero-arrows-pointing-in",
-      label: "Request compression",
-      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
-      description: "Shrinks eligible Responses tool outputs before upstream dispatch."
     },
     %{
       key: :allow_image_generation,
       id_suffix: "image-generation",
       icon: "hero-photo",
       label: "Allow Image Generation",
-      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
+      docs_url: "https://www.codex-pooler.com/docs/operators/pools/#compatibility",
       description: "Permits image generation and edits for requests using this Pool."
+    },
+    %{
+      key: :allow_audio_transcription,
+      id_suffix: "audio-transcription",
+      icon: "hero-microphone",
+      label: "Allow Audio Transcription",
+      docs_url: "https://www.codex-pooler.com/docs/operators/pools/#compatibility",
+      description: "Permits speech-to-text transcription for requests using this Pool."
     }
   ]
 
@@ -929,25 +955,23 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       token_total_label: Format.token_count(token_total),
       request_total_label: format_integer(request_total),
       request_total_unit: request_total_unit(request_total),
-      total_label:
-        "#{Format.token_count(token_total)} tokens / #{format_request_count(request_total)}",
-      categories: Jason.encode!(Enum.map(points, & &1.label)),
+      total_label: "#{Format.token_count(token_total)} tokens / #{format_request_count(request_total)}",
+      categories: CodexPooler.JSON.encode!(Enum.map(points, & &1.label)),
       series:
-        Jason.encode!([
+        CodexPooler.JSON.encode!([
           %{name: "Tokens", type: "column", data: token_values},
           %{name: "Requests", type: "line", data: request_values}
         ]),
-      units: Jason.encode!(["tokens", "requests"]),
+      units: CodexPooler.JSON.encode!(["tokens", "requests"]),
       yaxis:
-        Jason.encode!([
+        CodexPooler.JSON.encode!([
           %{seriesName: "Tokens", title: "tokens"},
           %{seriesName: "Requests", title: "requests", opposite: true}
         ]),
-      colors: Jason.encode!(["var(--color-primary)", "var(--color-info)"]),
+      colors: CodexPooler.JSON.encode!(["var(--color-primary)", "var(--color-info)"]),
       points: points,
       empty?: token_total == 0 and request_total == 0,
-      aria_label:
-        "Traffic in the last #{window_label}: #{Format.token_count(token_total)} tokens and #{format_request_count(request_total)}"
+      aria_label: "Traffic in the last #{window_label}: #{Format.token_count(token_total)} tokens and #{format_request_count(request_total)}"
     }
   end
 

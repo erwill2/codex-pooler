@@ -75,6 +75,24 @@ defmodule CodexPooler.TestRuntimeDatabaseConfigTest do
     assert_serial_config(nil)
   end
 
+  test "an explicit test database overrides the fallback database" do
+    with_env(
+      %{
+        "CODEX_POOLER_TEST_POSTGRES_DB" => "explicit_test_database",
+        "POSTGRES_TEST_DB" => "fallback_test_database",
+        "MIX_TEST_PARTITION" => nil
+      },
+      fn -> assert read_repo_config()[:database] == "explicit_test_database" end
+    )
+  end
+
+  test "the fallback database applies when an explicit test database is absent" do
+    with_env(
+      %{"POSTGRES_TEST_DB" => "fallback_test_database", "MIX_TEST_PARTITION" => nil},
+      fn -> assert read_repo_config()[:database] == "fallback_test_database" end
+    )
+  end
+
   test "a run namespace without a numeric partition retains the serial database configuration" do
     with_env(
       %{
@@ -138,7 +156,23 @@ defmodule CodexPooler.TestRuntimeDatabaseConfigTest do
   end
 
   defp with_env(values, fun) when is_map(values) do
+    values =
+      Map.merge(
+        %{"CODEX_POOLER_TEST_POSTGRES_DB" => nil, "POSTGRES_TEST_DB" => nil},
+        values
+      )
+
     previous = Map.new(values, fn {key, _value} -> {key, System.get_env(key)} end)
+
+    restore = fn ->
+      Enum.each(previous, fn
+        {key, nil} -> System.delete_env(key)
+        {key, value} -> System.put_env(key, value)
+      end)
+    end
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs.
+    on_exit(restore)
 
     Enum.each(values, fn
       {key, nil} -> System.delete_env(key)
@@ -148,10 +182,7 @@ defmodule CodexPooler.TestRuntimeDatabaseConfigTest do
     try do
       fun.()
     after
-      Enum.each(previous, fn
-        {key, nil} -> System.delete_env(key)
-        {key, value} -> System.put_env(key, value)
-      end)
+      restore.()
     end
   end
 end

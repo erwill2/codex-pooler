@@ -1,12 +1,15 @@
 defmodule CodexPooler.Gateway.Metadata do
   @moduledoc false
 
+  require Logger
+
   alias CodexPooler.Access
   alias CodexPooler.Catalog
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Denials
   alias CodexPooler.Gateway.Metadata.Accounting, as: MetadataAccounting
+  alias CodexPooler.Gateway.Metadata.CatalogRepresentation
   alias CodexPooler.Gateway.Metadata.CodexCatalog
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
@@ -26,25 +29,64 @@ defmodule CodexPooler.Gateway.Metadata do
           required(:body) => CodexCatalog.body(),
           required(:etag) => String.t(),
           required(:visible_models) => [Model.t()],
+          required(:undecodable_models) => [CodexCatalog.undecodable_model()],
           required(:source_identity) => CodexPooler.Upstreams.Schemas.UpstreamIdentity.t() | nil
         }
 
-  @spec serve_codex_models(auth(), opts()) :: {:ok, gateway_result()} | {:error, gateway_error()}
+  # The request's `User-Agent` selects the instructions representation of the
+  # served body and therefore its ETag, with the same function a Responses
+  # turn uses for its `x-models-etag` (`codex_turn_catalog_snapshot/3`), so the
+  # two always agree for one client; the body varies with that header.
+  @spec serve_codex_models(auth(), opts()) ::
+          {:ok, gateway_result()} | {:error, gateway_error()}
   def serve_codex_models(auth, %RequestOptions{} = request_options) do
     endpoint = request_endpoint(request_options, "/backend-api/codex/models")
     request_options = request_options(request_options, endpoint, %{})
+    representation = CatalogRepresentation.for_request(request_options)
 
-    with {:ok, snapshot} <- codex_catalog_snapshot(auth, endpoint, request_options),
+    with {:ok, snapshot} <- codex_catalog_snapshot(auth, endpoint, request_options, representation),
          :ok <-
            record_metadata_request(auth, endpoint, request_options, snapshot) do
+      log_undecodable_models(auth, snapshot.undecodable_models)
+
       {:ok,
-       %{status: 200, headers: [{"etag", snapshot.etag} | json_headers()], body: snapshot.body}}
+       %{
+         status: 200,
+         headers: [{"etag", snapshot.etag}, {"vary", "user-agent"} | json_headers()],
+         body: snapshot.body
+       }}
     end
   end
 
-  @spec codex_catalog_snapshot(auth(), String.t(), opts()) ::
+  # An entry left out of the served catalog because the requesting client
+  # would fail to decode it (and so discard every other entry). Only the model
+  # slug and the field paths are named, never a value.
+  defp log_undecodable_models(auth, undecodable_models) do
+    Enum.each(undecodable_models, fn %{slug: slug, fields: fields, classes: classes} ->
+      Logger.warning(
+        "codex catalog entry left out: the requesting client cannot decode it " <>
+          "pool_id=#{auth.pool.id} model=#{log_slug(slug)} fields=#{fields |> Enum.take(10) |> Enum.join(",")} classes=#{Enum.join(classes, ",")}"
+      )
+    end)
+  end
+
+  # A slug outside the plain identifier alphabet is shown as a fingerprint.
+  defp log_slug(slug) do
+    if Regex.match?(~r/\A[A-Za-z0-9_.-]{1,80}\z/, slug) do
+      slug
+    else
+      "sha256:" <> (:crypto.hash(:sha256, slug) |> Base.encode16(case: :lower) |> String.slice(0, 12))
+    end
+  end
+
+  @spec codex_catalog_snapshot(auth(), String.t(), opts(), CatalogRepresentation.t()) ::
           {:ok, codex_catalog_snapshot()} | {:error, gateway_error()}
-  def codex_catalog_snapshot(auth, endpoint, %RequestOptions{} = request_options)
+  def codex_catalog_snapshot(
+        auth,
+        endpoint,
+        %RequestOptions{} = request_options,
+        representation \\ :verbatim
+      )
       when is_binary(endpoint) do
     with {:ok, policy} <- normalize_policy_or_log(auth, endpoint, request_options) do
       hydration = CandidateEligibility.hydrate_model_visibility(auth.pool)
@@ -52,7 +94,6 @@ defmodule CodexPooler.Gateway.Metadata do
       visible_models =
         CandidateEligibility.policy_visible_models(hydration.visible_models, policy)
 
-      pricing_buckets = Catalog.pricing_buckets_by_identifier(visible_models)
       context_window_overrides = OperationalSettings.current().model_context_window_overrides
 
       effective_model_serving_modes =
@@ -71,15 +112,16 @@ defmodule CodexPooler.Gateway.Metadata do
           visible_models,
           hydration.candidates_by_model_id,
           policy,
-          pricing_buckets,
           context_window_overrides,
           effective_model_serving_modes,
           routable_assignment_ids_by_model_id: fn ->
             PartitionRoutability.routable_assignment_ids_by_model_id(
               visible_models,
-              hydration.candidates_by_model_id
+              hydration.candidates_by_model_id,
+              %{}
             )
-          end
+          end,
+          representation: representation
         )
 
       {:ok,
@@ -88,6 +130,21 @@ defmodule CodexPooler.Gateway.Metadata do
          source_identity: CandidateEligibility.model_source_identity(hydration, visible_models)
        })}
     end
+  end
+
+  # The catalog a Responses turn (or the websocket upgrade) names in
+  # `x-models-etag`: the representation the same client's own catalog fetch
+  # received, selected by the same function from the same `User-Agent`.
+  @spec codex_turn_catalog_snapshot(auth(), String.t(), opts()) ::
+          {:ok, codex_catalog_snapshot()} | {:error, gateway_error()}
+  def codex_turn_catalog_snapshot(auth, endpoint, %RequestOptions{} = request_options)
+      when is_binary(endpoint) do
+    codex_catalog_snapshot(
+      auth,
+      endpoint,
+      request_options,
+      CatalogRepresentation.for_request(request_options)
+    )
   end
 
   @spec effective_model_serving_modes(
@@ -172,7 +229,6 @@ defmodule CodexPooler.Gateway.Metadata do
       endpoint: endpoint,
       transport: "http_json",
       correlation_id: RequestOptions.server_correlation_id(request_options),
-      idempotency_key: request_metadata.idempotency_key,
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
       response_status_code: 200,

@@ -6,8 +6,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamOAuthDialogComponents
 
-  @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
-  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+  @oauth_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#openai-oauth-upstream-linking"
+  @upstream_actions_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
 
   attr :account_label, :string, required: true
   attr :oauth_relinking, :boolean, required: true
@@ -63,9 +63,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
             device_event="start_oauth_relink_device"
           />
 
-          <section :if={
-            oauth_relink_browser_flow?(@oauth_relink_flow, @oauth_relink_authorization_url)
-          }>
+          <section :if={oauth_relink_browser_flow?(@oauth_relink_flow, @oauth_relink_authorization_url)}>
             <UpstreamOAuthDialogComponents.browser_authorization_step
               id_prefix="oauth-relink"
               authorization_url={@oauth_relink_authorization_url}
@@ -193,8 +191,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           <p class="text-sm font-semibold uppercase tracking-wide text-error">Upstream account</p>
           <h2 class="mt-1 text-2xl font-bold text-base-content">Delete {@account.label}?</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            It stops serving traffic immediately and leaves every routing surface with it.
-            This cannot be undone.
+            This permanently removes the account, credentials, quotas, Pool assignments, and account-specific statistics from the database.
+            Shared request accounting remains without an account association. This cannot be undone.
           </p>
         </div>
         <.form

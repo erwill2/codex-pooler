@@ -3,6 +3,8 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
+
   alias CodexPoolerWeb.Admin.SystemPageComponents.{
     BulkheadEditor,
     FormControls,
@@ -39,10 +41,20 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
                   form={gateway_form}
                   controls={gateway_debug_controls()}
                 />
+                <FormControls.scalar_controls
+                  form={gateway_form}
+                  controls={[
+                    %{
+                      type: :toggle,
+                      id: "instance-settings-upstream-token-refresh-proactive-enabled",
+                      field: :upstream_token_refresh_proactive_enabled,
+                      label: "Proactive credential refresh",
+                      hint: "Refresh active accounts near token expiry, including busy accounts. Disabling this leaves manual refresh, recovery, and refresh after authentication failure enabled."
+                    }
+                  ]}
+                />
               </div>
-              <GatewaySettingsMatrix.matrix groups={
-                gateway_setting_groups(gateway_form, files_form, transcription_form)
-              } />
+              <GatewaySettingsMatrix.matrix groups={gateway_setting_groups(gateway_form, files_form, transcription_form)} />
               <div class="grid gap-4">
                 <BulkheadEditor.editor
                   bulkheads={bulkhead_values(@form_params, @settings.gateway.bulkheads)}
@@ -97,6 +109,20 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
             />
           </div>
         </FormControls.settings_group>
+        <FormControls.settings_group
+          id="instance-settings-openai-status"
+          eyebrow="Status feed"
+          title="OpenAI status polling"
+          description="Check status.openai.com every five minutes for provider incident updates."
+          hint="Disable polling when outbound access is restricted. Existing incident history is retained."
+        >
+          <.input
+            id="instance-settings-openai-status-polling-enabled"
+            field={operator_form[:openai_status_polling_enabled]}
+            type="checkbox"
+            label="Enable OpenAI status polling"
+          />
+        </FormControls.settings_group>
       </.inputs_for>
     </FormControls.settings_card>
 
@@ -136,8 +162,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
         id: "instance-settings-gateway-debug",
         field: :gateway_debug,
         label: "Gateway debug logging",
-        hint:
-          "Adds sanitized request and routing details to gateway logs and attempt metadata for temporary troubleshooting. It increases log and stored-data volume; keep it disabled during normal production operation to minimize overhead."
+        hint: "Adds sanitized request and routing details to gateway logs and attempt metadata for temporary troubleshooting. It increases log and stored-data volume; keep it disabled during normal production operation to minimize overhead."
       }
     ]
   end
@@ -147,8 +172,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
       %{
         id: "streaming",
         label: "Streaming",
-        description:
-          "Bounds heartbeat and socket lifetime independently of route-class capacity.",
+        description: "Bounds heartbeat and socket lifetime independently of route-class capacity.",
         form: gateway_form,
         settings: [
           gateway_setting(%{
@@ -172,8 +196,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
             id: "instance-settings-websocket-owner-idle-timeout-ms",
             field: :websocket_owner_idle_timeout_ms,
             label: "Websocket owner post-detach retention (ms)",
-            hint:
-              "Post-detach retention for websocket owners. Running owners keep the value captured when they were created.",
+            hint: "Post-detach retention for websocket owners. Running owners keep the value captured when they were created.",
             minimum: 60_000,
             maximum: 3_600_000,
             unit: "ms"
@@ -183,8 +206,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
       %{
         id: "upstream",
         label: "Upstream timing",
-        description:
-          "Controls how long requests can acquire, connect to, and wait on upstream work.",
+        description: "Controls how long requests can acquire, connect to, and wait on upstream work.",
         form: gateway_form,
         settings: [
           gateway_setting(%{
@@ -210,14 +232,39 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
             hint: "Maximum idle receive window while waiting for upstream response data.",
             minimum: 1,
             unit: "ms"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-upstream-conn-max-idle-time-ms",
+            field: :upstream_conn_max_idle_time_ms,
+            label: "Connection idle bound (ms)",
+            hint: "Pooled upstream connections idle longer than this are replaced on their next use. Checked only when a connection is taken, so it never interrupts an in-flight or streaming request. Keep it below the idle timeout of any NAT, load balancer, or proxy on the egress path.",
+            minimum: 1_000,
+            maximum: 3_600_000,
+            unit: "ms"
+          })
+        ]
+      },
+      %{
+        id: "token_refresh",
+        label: "Credential refresh",
+        description: "Controls how early scheduled recovery refreshes upstream credentials based on expiry, including busy accounts.",
+        form: gateway_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-upstream-token-refresh-margin-seconds",
+            field: :upstream_token_refresh_margin_seconds,
+            label: "Proactive refresh margin (s)",
+            hint: "Scheduled recovery refreshes an active account once its access token is this close to expiring, so an account with no traffic cannot age into required re-authentication. Accounts already inside the margin are retried on a bounded cooldown, not on every recovery pass.",
+            minimum: 3_600,
+            maximum: 1_209_600,
+            unit: "s"
           })
         ]
       },
       %{
         id: "continuity",
         label: "Continuity",
-        description:
-          "Keeps response aliases and bridge ownership available while work moves between requests.",
+        description: "Keeps response aliases and bridge ownership available while work moves between requests.",
         form: gateway_form,
         settings: [
           gateway_setting(%{
@@ -232,15 +279,15 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
             id: "instance-settings-bridge-owner-lease-ttl-seconds",
             field: :bridge_owner_lease_ttl_seconds,
             label: "Owner lease TTL (s)",
-            hint: "How long a bridge owner lease remains valid without renewal.",
-            minimum: 1,
+            hint: "How long a bridge owner lease remains valid without renewal. At least #{OwnerRenewalSchedule.minimum_lease_ttl_seconds()} s, so a request's lease outlives its pre-dispatch work; a lower stored value is raised to it.",
+            minimum: OwnerRenewalSchedule.minimum_lease_ttl_seconds(),
             unit: "s"
           }),
           gateway_setting(%{
             id: "instance-settings-bridge-owner-lease-renewal-seconds",
             field: :bridge_owner_lease_renewal_seconds,
             label: "Owner lease renewal (s)",
-            hint: "How often active bridge owners renew their lease while work is running.",
+            hint: "How often active bridge owners renew their lease while work is running. At most a third of the owner lease TTL, so an owner renews well before its lease expires; a higher stored value is lowered to it.",
             minimum: 1,
             unit: "s"
           })
@@ -249,8 +296,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
       %{
         id: "circuit",
         label: "Circuit recovery",
-        description:
-          "Controls when failing upstreams leave normal routing and become eligible again.",
+        description: "Controls when failing upstreams leave normal routing and become eligible again.",
         form: gateway_form,
         settings: [
           gateway_setting(%{
@@ -347,8 +393,8 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
   defp param_json_value(params, group, field, fallback) do
     case get_in(params, [group, field]) do
       value when is_binary(value) -> value
-      value when is_map(value) -> Jason.encode!(value, pretty: true)
-      _missing -> Jason.encode!(fallback || %{}, pretty: true)
+      value when is_map(value) -> CodexPooler.JSON.encode!(value, pretty: true)
+      _missing -> CodexPooler.JSON.encode!(fallback || %{}, pretty: true)
     end
   end
 

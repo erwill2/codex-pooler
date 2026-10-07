@@ -5,8 +5,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   import CodexPooler.AccountingTestSupport
   import CodexPooler.PoolerFixtures
 
-  alias Ecto.Migration.Runner
-
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogFact, RequestLogFacts}
   alias CodexPooler.Accounting.RequestLogs.SettlementPresentation
@@ -221,94 +219,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert is_nil(log.token_counts.reasoning_tokens)
     assert is_nil(log.token_counts.total_tokens)
     assert is_nil(log.token_counts.cached_input_cost_usd)
-    assert log.cost.status == "unpriced"
-    assert is_nil(log.cost.usd)
-  end
-
-  test "automatic migration reprojects usage_unknown facts without altering ledger rows" do
-    %{pool: pool, api_key: api_key} = active_api_key_fixture()
-    %{assignment: assignment} = upstream_assignment_fixture(pool)
-    started_at = ~U[2026-06-16 10:00:00.000000Z]
-
-    request =
-      request_fixture(%{pool: pool, api_key: api_key}, %{
-        requested_model: "gpt-repair-facts-unknown-usage",
-        status: "failed",
-        usage_status: "usage_unknown",
-        response_status_code: 502,
-        last_error_code: "duplicate_downstream",
-        correlation_id: "facts-repair-unknown-usage",
-        request_metadata: %{"response" => %{"usage_source" => "websocket_usage_missing"}}
-      })
-      |> Ecto.Changeset.change(%{admitted_at: DateTime.add(started_at, 900, :second)})
-      |> Repo.update!()
-
-    attempt_fixture(request, assignment, %{
-      latency_ms: 44,
-      network_error_code: "safe_repair_code"
-    })
-
-    settlement =
-      ledger_entry_fixture(request, %{
-        usage_status: "usage_unknown",
-        occurred_at: DateTime.add(started_at, 1_200, :second),
-        input_tokens: 8_000,
-        cached_input_tokens: 500,
-        output_tokens: 1_400,
-        reasoning_tokens: 99,
-        total_tokens: 9_999,
-        settled_cost_micros: 9_999_999,
-        details: %{"pricing_status" => "priced", "settled_cost_micros" => "9999999"}
-      })
-
-    known_request =
-      request_fixture(%{pool: pool, api_key: api_key}, %{
-        requested_model: "gpt-repair-facts-known-usage",
-        status: "succeeded",
-        usage_status: "usage_known",
-        correlation_id: "facts-repair-known-usage"
-      })
-      |> Ecto.Changeset.change(%{admitted_at: DateTime.add(started_at, 1_800, :second)})
-      |> Repo.update!()
-
-    ledger_entry_fixture(known_request, %{
-      usage_status: "usage_known",
-      occurred_at: DateTime.add(started_at, 2_100, :second),
-      input_tokens: 700,
-      total_tokens: 700,
-      details: %{"pricing_status" => "priced", "settled_cost_micros" => "700000"}
-    })
-
-    poison_request_log_fact!(request.id, 8_000)
-    poison_request_log_fact!(known_request.id, 700)
-
-    run_unknown_usage_projection_migration!()
-    run_unknown_usage_projection_migration!()
-
-    repaired_fact = Repo.get!(RequestLogFact, request.id)
-    assert repaired_fact.latest_settlement_entry_id == settlement.id
-    assert repaired_fact.latest_settlement_usage_status == "usage_unknown"
-    assert repaired_fact.latest_settlement_pricing_status == "priced"
-    assert is_nil(repaired_fact.latest_input_tokens)
-    assert is_nil(repaired_fact.latest_total_tokens)
-    assert is_nil(repaired_fact.latest_settled_cost_micros)
-
-    unchanged_known_fact = Repo.get!(RequestLogFact, known_request.id)
-    assert unchanged_known_fact.latest_input_tokens == 700
-    assert unchanged_known_fact.latest_total_tokens == 700
-
-    unchanged_settlement = Repo.get!(LedgerEntry, settlement.id)
-    assert unchanged_settlement.input_tokens == 8_000
-    assert unchanged_settlement.total_tokens == 9_999
-    assert Decimal.equal?(unchanged_settlement.settled_cost_micros, Decimal.new(9_999_999))
-
-    assert %{items: [log], total: 1} =
-             Accounting.list_request_logs(pool, filters: [request_id: "facts-repair-unknown"])
-
-    assert log.id == request.id
-    assert log.token_counts.usage_status == "usage_unknown"
-    assert is_nil(log.token_counts.input_tokens)
-    assert is_nil(log.token_counts.total_tokens)
     assert log.cost.status == "unpriced"
     assert is_nil(log.cost.usd)
   end
@@ -591,48 +501,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     assert log.cost.status == "unpriced_missing_model"
     assert is_nil(log.cost.usd)
-  end
-
-  defp poison_request_log_fact!(request_id, token_count) do
-    Repo.update_all(
-      from(fact in RequestLogFact, where: fact.request_id == ^request_id),
-      set: [
-        latest_input_tokens: token_count,
-        latest_cached_input_tokens: 0,
-        latest_output_tokens: 0,
-        latest_reasoning_tokens: 0,
-        latest_total_tokens: token_count,
-        latest_settled_cost_micros: token_count,
-        latest_cached_input_cost_micros: token_count,
-        latest_cached_input_token_micros: token_count
-      ]
-    )
-  end
-
-  defp run_unknown_usage_projection_migration! do
-    Runner.run(
-      Repo,
-      Repo.config(),
-      20_260_626_133_501,
-      unknown_usage_projection_migration(),
-      :forward,
-      :up,
-      :up,
-      log: false
-    )
-  end
-
-  defp unknown_usage_projection_migration do
-    module = CodexPooler.Repo.Migrations.RepairUnknownUsageAccountingProjections
-
-    unless Code.ensure_loaded?(module) do
-      Code.require_file(
-        "../../../priv/repo/migrations/20260626133501_repair_unknown_usage_accounting_projections.exs",
-        __DIR__
-      )
-    end
-
-    module
   end
 
   test "usage total_cost_usd sums persisted 0.100000 and 0.200000 to 0.300000 while ignoring unpriced rows" do
@@ -1804,122 +1672,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     refute inspect(log) =~ "raw websocket prompt"
   end
 
-  test "request logs project HTTP and websocket compression metadata without raw candidate content" do
-    %{pool: pool, api_key: api_key} = active_api_key_fixture()
-    %{assignment: assignment} = upstream_assignment_fixture(pool)
-    sentinel = "SENTINEL_TOOL_OUTPUT_SHOULD_NOT_RENDER"
-    compressed_sentinel = "SENTINEL_COMPRESSED_OUTPUT_SHOULD_NOT_STORE"
-
-    assert {:ok, %{request: http_request}} =
-             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
-               endpoint: "/backend-api/codex/responses",
-               requested_model: "gpt-compression-http-log",
-               transport: "http_json",
-               status: "succeeded",
-               correlation_id: "compression-http-log",
-               request_metadata: %{
-                 "body" => %{"input" => sentinel}
-               }
-             })
-
-    assert {:ok, http_attempt} =
-             with_dispatchable_request(http_request, fn http_request ->
-               Accounting.create_attempt(http_request, assignment, %{
-                 status: "succeeded",
-                 response_metadata:
-                   compression_metadata(%{
-                     route_class: "proxy_http",
-                     transport: "http_json",
-                     candidate_count: 2,
-                     compressed_count: 1,
-                     skipped_count: 1,
-                     original_bytes: 4096,
-                     compressed_bytes: 1024,
-                     original_tokens: 1000,
-                     compressed_tokens: 400,
-                     raw_candidate: sentinel,
-                     original_output: sentinel,
-                     compressed_output: compressed_sentinel
-                   })
-               })
-             end)
-
-    assert {:ok, %{request: websocket_request}} =
-             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
-               endpoint: "/backend-api/codex/responses",
-               requested_model: "gpt-compression-websocket-log",
-               transport: "websocket",
-               status: "succeeded",
-               correlation_id: "compression-websocket-log",
-               request_metadata: %{
-                 "websocket_frame" => sentinel
-               }
-             })
-
-    assert {:ok, websocket_attempt} =
-             with_dispatchable_request(websocket_request, fn websocket_request ->
-               Accounting.create_attempt(websocket_request, assignment, %{
-                 status: "succeeded",
-                 response_metadata:
-                   compression_metadata(%{
-                     route_class: "proxy_websocket",
-                     transport: "websocket",
-                     candidate_count: 1,
-                     compressed_count: 1,
-                     skipped_count: 0,
-                     original_bytes: 8192,
-                     compressed_bytes: 4096,
-                     raw_candidate: sentinel,
-                     original_output: sentinel,
-                     compressed_output: compressed_sentinel
-                   })
-               })
-             end)
-
-    persisted_text =
-      inspect({
-        Repo.get!(Request, http_request.id).request_metadata,
-        Repo.get!(Request, websocket_request.id).request_metadata,
-        Repo.get!(Attempt, http_attempt.id).response_metadata,
-        Repo.get!(Attempt, websocket_attempt.id).response_metadata
-      })
-
-    refute persisted_text =~ sentinel
-    refute persisted_text =~ compressed_sentinel
-
-    assert %{items: logs, total: 2} =
-             Accounting.list_request_logs(pool, filters: [model: "compression-"])
-
-    logs_by_id = Map.new(logs, &{&1.id, &1})
-    http_log = Map.fetch!(logs_by_id, http_request.id)
-    websocket_log = Map.fetch!(logs_by_id, websocket_request.id)
-
-    assert http_log.metadata["payload_compression"]["status"] == "compressed"
-    assert http_log.metadata["payload_compression"]["reason"] == "rewritten"
-    assert http_log.metadata["payload_compression"]["candidate_count"] == 2
-    assert http_log.metadata["payload_compression"]["compressed_count"] == 1
-    assert http_log.metadata["payload_compression"]["skipped_count"] == 1
-    assert http_log.metadata["payload_compression"]["saved_bytes"] == 3072
-    assert http_log.metadata["payload_compression"]["saved_tokens"] == 600
-    assert http_log.payload_compression.saved_count == 600
-    assert http_log.payload_compression.unit == "tokens"
-    assert http_log.payload_compression.savings_percent == 60.0
-    assert http_log.payload_compression.compression_ratio == 0.4
-
-    assert websocket_log.metadata["payload_compression"]["status"] == "compressed"
-    assert websocket_log.metadata["payload_compression"]["reason"] == "rewritten"
-    assert websocket_log.metadata["payload_compression"]["saved_bytes"] == 4096
-    assert websocket_log.metadata["payload_compression"]["token_savings_percent"] == nil
-    assert websocket_log.payload_compression.saved_count == 4096
-    assert websocket_log.payload_compression.unit == "bytes"
-    assert websocket_log.payload_compression.savings_percent == 50.0
-    assert websocket_log.payload_compression.compression_ratio == 0.5
-
-    log_text = inspect(logs)
-    refute log_text =~ sentinel
-    refute log_text =~ compressed_sentinel
-  end
-
   test "request logs strictly project valid historical compaction bridge metadata" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
 
@@ -2069,92 +1821,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert Enum.all?(logs, &(not Map.has_key?(&1.metadata, "compaction_bridge")))
   end
 
-  test "request logs keep skipped and failure compression reasons as safe codes" do
-    %{pool: pool, api_key: api_key} = active_api_key_fixture()
-    %{assignment: assignment} = upstream_assignment_fixture(pool)
-    sentinel = "SENTINEL_TOOL_OUTPUT_SHOULD_NOT_RENDER"
-
-    assert {:ok, %{request: skipped_request}} =
-             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
-               endpoint: "/backend-api/codex/responses/compact",
-               requested_model: "gpt-compression-skipped-log",
-               transport: "http_compact_json",
-               status: "succeeded",
-               correlation_id: "compression-skipped-log"
-             })
-
-    assert {:ok, skipped_attempt} =
-             with_dispatchable_request(skipped_request, fn skipped_request ->
-               Accounting.create_attempt(skipped_request, assignment, %{
-                 status: "succeeded",
-                 response_metadata: %{
-                   "payload_compression" => %{
-                     "enabled" => true,
-                     "attempted" => true,
-                     "status" => "skipped",
-                     "reason" => "tokenizer_input_limit",
-                     "route_class" => "proxy_compact",
-                     "transport" => "http_compact_json",
-                     "candidate_count" => 2,
-                     "compressed_count" => 0,
-                     "skipped_count" => 2,
-                     "tokenizer_input_skipped_count" => 2,
-                     "raw_reason" => sentinel
-                   }
-                 }
-               })
-             end)
-
-    assert Repo.get!(Attempt, skipped_attempt.id).response_metadata["payload_compression"][
-             "tokenizer_input_skipped_count"
-           ] == 2
-
-    assert {:ok, %{request: failure_request}} =
-             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
-               endpoint: "/backend-api/codex/responses",
-               requested_model: "gpt-compression-failure-log",
-               transport: "http_json",
-               status: "failed",
-               correlation_id: "compression-failure-log",
-               last_error_code: "upstream_status"
-             })
-
-    assert {:ok, _attempt} =
-             with_dispatchable_request(failure_request, fn failure_request ->
-               Accounting.create_attempt(failure_request, assignment, %{
-                 status: "failed",
-                 response_metadata: %{
-                   "payload_compression" => %{
-                     "enabled" => true,
-                     "attempted" => true,
-                     "status" => "error_passthrough",
-                     "reason" => "compression_error",
-                     "route_class" => "proxy_http",
-                     "transport" => "http_json",
-                     "candidate_count" => 0,
-                     "compressed_count" => 0,
-                     "skipped_count" => 0,
-                     "error_message" => sentinel
-                   }
-                 }
-               })
-             end)
-
-    assert %{items: logs, total: 2} =
-             Accounting.list_request_logs(pool, filters: [model: "compression-"])
-
-    logs_by_id = Map.new(logs, &{&1.id, &1})
-    skipped_log = Map.fetch!(logs_by_id, skipped_request.id)
-    failure_log = Map.fetch!(logs_by_id, failure_request.id)
-
-    assert skipped_log.metadata["payload_compression"]["reason"] == "tokenizer_input_limit"
-    assert skipped_log.metadata["payload_compression"]["tokenizer_input_skipped_count"] == 2
-    assert skipped_log.payload_compression.reason == "tokenizer_input_limit"
-    assert skipped_log.payload_compression.tokenizer_input_skipped_count == 2
-    assert failure_log.metadata["payload_compression"]["reason"] == "compression_error"
-    refute inspect(logs) =~ sentinel
-  end
-
   test "request log status stays authoritative when the latest attempt reports owner_drained" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
     %{assignment: assignment} = upstream_assignment_fixture(pool)
@@ -2268,6 +1934,9 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     counter = :counters.new(1, [])
     handler_id = {:request_logs_query_counter, self(), System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :telemetry.attach(
       handler_id,
@@ -2388,6 +2057,9 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert [attempt_debug] = log.debug.attempts
 
     assert attempt_debug == %{
+             upstream_model: "upstream-gpt-6-luna",
+             served_model: nil,
+             model_observation: nil,
              attempt_ref: stable_attempt_ref(request.id, 1),
              attempt_number: 1,
              status: "failed",
@@ -2471,13 +2143,13 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     assert [attempt_debug] = log.debug.attempts
 
+    # No `stream_text_frame_count` was recorded, so the projection reports
+    # neither a count nor a visibility verdict (findings#165).
     assert attempt_debug.transport_failure == %{
              reason_class: "upstream_stream_interrupted",
              reason: "closed_before_terminal",
              phase: "upstream_close",
-             pre_visible_output: false,
-             terminal_seen: false,
-             text_frame_count: 1
+             terminal_seen: false
            }
 
     refute inspect(log.debug) =~ "session-http-sse-interrupted"
@@ -2568,6 +2240,75 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     refute debug =~ "Bearer sk-privacy-transport-sentinel"
   end
 
+  # findings#165: a sanitizer bounds a value, it never erases it, and it never
+  # invents one. `stream_text_frame_count` is absent on the large majority of
+  # production `stream_interrupted` attempts, and the projection used to answer
+  # that absence with a fabricated count of 1 -- which then derived
+  # `pre_visible_output: false`, the claim that the client had already seen
+  # output. A reader cannot tell that fabrication from a measured single frame,
+  # and it is the opposite of the modal truth: among attempts whose count is
+  # actually recorded, `text_frame_count: 0` with `pre_visible_output: true` is
+  # the single largest bucket. Absent must stay absent.
+  test "request log debug projection distinguishes an unrecorded stream frame count from a measured one" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-stream-visibility",
+        endpoint: "/backend-api/codex/responses",
+        transport: "http_sse",
+        status: "failed",
+        correlation_id: "debug-stream-visibility",
+        response_status_code: 200,
+        request_metadata: %{"codex_session_id" => "session-stream-visibility"}
+      })
+      |> Ecto.Changeset.change(last_error_code: "upstream_stream_error")
+      |> Repo.update!()
+
+    stream_family_attempt(request, assignment, 1, "client_disconnected", %{})
+
+    stream_family_attempt(request, assignment, 2, "client_disconnected", %{
+      "stream_text_frame_count" => 0
+    })
+
+    stream_family_attempt(request, assignment, 3, "client_disconnected", %{
+      "stream_text_frame_count" => 4
+    })
+
+    stream_family_attempt(request, assignment, 4, "client_disconnected", %{
+      "stream_text_frame_count" => "not-a-count"
+    })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    by_number = Map.new(log.debug.attempts, &{&1.attempt_number, &1.transport_failure})
+
+    # Unrecorded: both derived keys are absent, not defaulted.
+    refute Map.has_key?(by_number[1], :text_frame_count)
+    refute Map.has_key?(by_number[1], :pre_visible_output)
+
+    assert by_number[1] == %{
+             reason_class: "downstream_client_disconnect",
+             reason: "client_disconnected",
+             phase: "send_payload",
+             terminal_seen: false
+           }
+
+    # Measured zero: the client saw nothing, and the projection says so.
+    assert by_number[2][:text_frame_count] == 0
+    assert by_number[2][:pre_visible_output] == true
+
+    # Measured positive: the client had already seen output.
+    assert by_number[3][:text_frame_count] == 4
+    assert by_number[3][:pre_visible_output] == false
+
+    # Present but unusable is treated as unrecorded, never as a count of 1.
+    refute Map.has_key?(by_number[4], :text_frame_count)
+    refute Map.has_key?(by_number[4], :pre_visible_output)
+
+    refute inspect(log.debug) =~ "session-stream-visibility"
+  end
+
   test "request log debug projection classifies supported stream interruption families" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
     %{assignment: assignment} = upstream_assignment_fixture(pool)
@@ -2602,36 +2343,28 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              reason_class: "downstream_client_disconnect",
              reason: "client_disconnected",
              phase: "send_payload",
-             pre_visible_output: false,
-             terminal_seen: false,
-             text_frame_count: 1
+             terminal_seen: false
            }
 
     assert attempts_by_number[2] == %{
              reason_class: "upstream_terminal_failure",
              reason: "server_error",
              phase: "receive",
-             pre_visible_output: false,
-             terminal_seen: true,
-             text_frame_count: 1
+             terminal_seen: true
            }
 
     assert attempts_by_number[3] == %{
              reason_class: "upstream_stream_idle_timeout",
              reason: "idle_timeout",
              phase: "receive_timeout",
-             pre_visible_output: false,
-             terminal_seen: false,
-             text_frame_count: 1
+             terminal_seen: false
            }
 
     assert attempts_by_number[4] == %{
              reason_class: "stream_interrupted",
              reason: "interrupted",
              phase: "receive",
-             pre_visible_output: false,
-             terminal_seen: false,
-             text_frame_count: 1
+             terminal_seen: false
            }
 
     refute inspect(log.debug) =~ "session-stream-families"
@@ -2727,6 +2460,9 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     assert log.debug.attempts == [
              %{
+               upstream_model: "upstream-gpt-6-luna",
+               served_model: nil,
+               model_observation: nil,
                attempt_ref: stable_attempt_ref(request.id, 1),
                attempt_number: 1,
                status: "failed",
@@ -2818,7 +2554,154 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
       correlation_id: "model-list-other"
     })
 
+    blank =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-blank-later",
+        correlation_id: "model-list-blank"
+      })
+
+    blank |> Ecto.Changeset.change(requested_model: "") |> Repo.update!()
+
     assert Accounting.list_request_log_models(pool) == ["gpt-alpha", "gpt-beta"]
+
+    # The visible Pools bound the list, and a selected Pool the viewer cannot
+    # see lists nothing (findings#206 row 206-373 kept both rules).
+    assert Accounting.list_request_log_models(nil, visible_pool_ids: [pool.id]) == ["gpt-alpha", "gpt-beta"]
+    assert Accounting.list_request_log_models(nil, visible_pool_ids: [pool.id, other_pool.id]) == ["gpt-alpha", "gpt-beta", "gpt-other-pool"]
+    assert Accounting.list_request_log_models(pool, visible_pool_ids: [pool.id, other_pool.id]) == ["gpt-alpha", "gpt-beta"]
+    assert Accounting.list_request_log_models(pool, visible_pool_ids: [other_pool.id]) == []
+    assert Accounting.list_request_log_models(nil, visible_pool_ids: []) == []
+    assert Enum.filter(Accounting.list_request_log_models(nil), &(&1 in ["gpt-alpha", "gpt-beta", "gpt-other-pool", ""])) == ["gpt-alpha", "gpt-beta", "gpt-other-pool"]
+  end
+
+  test "request logs expose the model the latest attempt sent and the one the upstream served" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-6-astra",
+        endpoint: "/backend-api/codex/responses",
+        transport: "http_sse",
+        status: "succeeded",
+        correlation_id: "served-model-log"
+      })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 1,
+      upstream_model_id: "gpt-6-astra",
+      served_model: "gpt-6-astra",
+      status: "retryable_failed"
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      upstream_model_id: "gpt-6-astra",
+      served_model: "gpt-6-luna"
+    })
+
+    assert %{items: [log], total: 1} =
+             Accounting.list_request_logs(pool, filters: %{request_id: request.id})
+
+    assert log.requested_model == "gpt-6-astra"
+    assert log.upstream_model == "gpt-6-astra"
+    assert log.served_model == "gpt-6-luna"
+
+    blank =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-6-astra",
+        status: "succeeded",
+        correlation_id: "served-model-blank"
+      })
+
+    attempt_fixture(blank, assignment, %{upstream_model_id: " ", served_model: ""})
+
+    assert %{items: [blank_log], total: 1} =
+             Accounting.list_request_logs(pool, filters: %{request_id: blank.id})
+
+    assert blank_log.upstream_model == nil
+    assert blank_log.served_model == nil
+
+    unattempted =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-6-astra",
+        status: "rejected",
+        correlation_id: "served-model-unattempted"
+      })
+
+    assert %{items: [unattempted_log], total: 1} =
+             Accounting.list_request_logs(pool, filters: %{request_id: unattempted.id})
+
+    assert unattempted_log.upstream_model == nil
+    assert unattempted_log.served_model == nil
+  end
+
+  test "settlement persists the bounded served model on the attempt" do
+    setup = accounting_setup()
+
+    for {declared, persisted} <- [
+          {"gpt-6-luna", "gpt-6-luna"},
+          {"  gpt-6-luna  ", "gpt-6-luna"},
+          {nil, nil},
+          {"", nil},
+          {%{"id" => "gpt"}, nil}
+        ] do
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "input" => "redacted by policy"},
+                 %{correlation_id: "served-model-#{System.unique_integer([:positive])}"}
+               )
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, _result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 2,
+                   output_tokens: 1,
+                   total_tokens: 3,
+                   served_model: declared
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert Repo.get!(Attempt, attempt.id).served_model == persisted
+    end
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               setup.auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "redacted by policy"},
+               %{correlation_id: "served-model-fingerprint"}
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    unbounded = "gpt " <> String.duplicate("x", 120) <> " secret-looking value"
+
+    assert {:ok, _result} =
+             Accounting.finalize_success(
+               reserved.request,
+               attempt,
+               %{
+                 status: "usage_known",
+                 input_tokens: 2,
+                 output_tokens: 1,
+                 total_tokens: 3,
+                 served_model: unbounded
+               },
+               %{response_status_code: 200}
+             )
+
+    persisted = Repo.get!(Attempt, attempt.id)
+    assert "sha256_" <> digest = persisted.served_model
+    assert String.length(digest) == 12
+    refute inspect(persisted) =~ "secret-looking"
   end
 
   test "request rows persist non-nil snapshot fields" do
@@ -3111,7 +2994,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              })
 
     persisted = Repo.get!(Request, request.id)
-    assert is_nil(persisted.idempotency_key)
+    refute :idempotency_key in Request.__schema__(:fields)
     assert persisted.request_metadata["idempotency_key"] == "[REDACTED]"
     refute inspect(persisted) =~ raw_idempotency_key
 
@@ -3151,36 +3034,12 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              })
 
     persisted = Repo.get!(Request, request.id)
-    assert is_nil(persisted.idempotency_key)
+    refute :idempotency_key in Request.__schema__(:fields)
     assert persisted.request_metadata["idempotency_key"] == "[REDACTED]"
     refute inspect(persisted) =~ raw_idempotency_key
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     refute inspect(log) =~ raw_idempotency_key
-  end
-
-  defp compression_metadata(attrs) do
-    %{
-      "payload_compression" => %{
-        "enabled" => true,
-        "attempted" => true,
-        "status" => "compressed",
-        "reason" => "rewritten",
-        "route_class" => Map.fetch!(attrs, :route_class),
-        "transport" => Map.fetch!(attrs, :transport),
-        "candidate_count" => Map.fetch!(attrs, :candidate_count),
-        "compressed_count" => Map.fetch!(attrs, :compressed_count),
-        "skipped_count" => Map.fetch!(attrs, :skipped_count),
-        "original_bytes" => Map.fetch!(attrs, :original_bytes),
-        "compressed_bytes" => Map.fetch!(attrs, :compressed_bytes),
-        "original_tokens" => Map.get(attrs, :original_tokens),
-        "compressed_tokens" => Map.get(attrs, :compressed_tokens),
-        "strategies" => ["log_output"],
-        "raw_candidate" => Map.fetch!(attrs, :raw_candidate),
-        "original_output" => Map.fetch!(attrs, :original_output),
-        "compressed_output" => Map.fetch!(attrs, :compressed_output)
-      }
-    }
   end
 
   defp refresh_request_log_facts(requests) do
@@ -3228,6 +3087,9 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   defp capture_request_log_queries(fun) do
     parent = self()
     handler_id = {:request_logs_sql_shape, self(), System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :telemetry.attach(
       handler_id,
@@ -3313,7 +3175,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
         pool_id: pool.id,
         api_key_id: api_key.id,
         session_key: "session-key-#{request.correlation_id}",
-        conversation_key: "conversation-#{request.correlation_id}",
         pool_upstream_assignment_id: assignment.id,
         status: "active",
         owner_instance_id: "test-instance",

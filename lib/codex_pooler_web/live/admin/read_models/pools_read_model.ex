@@ -38,8 +38,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
         }
   @type compat_flags :: %{
           required(:v1_compatibility_enabled) => boolean(),
-          required(:request_compression_enabled) => boolean(),
-          required(:allow_image_generation) => boolean()
+          required(:allow_image_generation) => boolean(),
+          required(:allow_audio_transcription) => boolean()
         }
   @type pool_row :: %{
           required(:pool) => Pool.t(),
@@ -57,7 +57,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
           required(:traffic_window) => String.t(),
           required(:traffic_window_label) => String.t(),
           required(:routing_strategy) => String.t(),
-          required(:compat_flags) => compat_flags()
+          required(:compat_flags) => compat_flags(),
+          required(:deletion) => Pools.Deletion.state() | nil
         }
   @type traffic_usage :: Stats.pool_usage_result()
   @type traffic_result :: %{
@@ -231,6 +232,7 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
     api_key_counts = Access.count_api_keys_by_pool_ids(pool_ids)
     upstream_counts = UpstreamAssignments.count_pool_assignments_by_pool_ids(pool_ids)
     routing_settings = PoolRouting.routing_settings_by_pool_ids(pool_ids)
+    deletion_states = Pools.pool_deletion_states(Enum.flat_map(pools, &if(&1.status == "archived", do: [&1.id], else: [])))
     traffic_window_label = PoolForm.traffic_window_short_label(traffic_window)
 
     Enum.map(pools, fn pool ->
@@ -254,9 +256,10 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
         routing_strategy: settings.routing_strategy,
         compat_flags: %{
           v1_compatibility_enabled: settings.v1_compatibility_enabled,
-          request_compression_enabled: settings.request_compression_enabled,
-          allow_image_generation: settings.allow_image_generation
-        }
+          allow_image_generation: settings.allow_image_generation,
+          allow_audio_transcription: settings.allow_audio_transcription
+        },
+        deletion: Map.get(deletion_states, pool.id)
       }
     end)
   end

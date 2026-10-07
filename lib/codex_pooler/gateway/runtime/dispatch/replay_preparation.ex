@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
   alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Pools.RoutingSettings
 
@@ -42,11 +43,47 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
 
   def final_window_alias_hash(%RequestOptions{}, _payload), do: :none
 
+  @doc """
+  The session lookup hash of the window a native websocket turn frame carries
+  when it is not the window the socket's session is keyed by: a process that
+  compacted on its socket, or a resumed process whose upgrade lost the
+  client's startup prewarm race, keeps sending on the older window's socket
+  while its frames already name the next window, and its reconnect after a
+  cut names that next window (findings#206, P115). Only a released-client
+  window header of the same thread qualifies; anything else answers `:none`.
+  """
+  @spec frame_window_alias_hash(RequestOptions.t(), map()) :: :none | {:ok, <<_::256>>}
+  def frame_window_alias_hash(
+        %RequestOptions{
+          continuity: %{session_header: header, session_header_source: "x-codex-window-id"},
+          payload_context: %{native_codex_turn_metadata: %NativeCodexTurnMetadata{request_kind: :turn} = metadata},
+          openai_compatibility: %{source_endpoint: nil},
+          transport: %{transport: "websocket"}
+        },
+        payload
+      )
+      when is_binary(header) do
+    with {:ok, canonical} <- canonical_metadata(payload),
+         window when is_binary(window) <- canonical["window_id"],
+         window = String.trim(window),
+         true <- NativeCodexTurnMetadata.window_id_digest(window) == metadata.window_id_digest,
+         header = String.trim(header),
+         true <- window != header,
+         {:ok, thread} <- NativeCodexTurnMetadata.window_thread(window),
+         {:ok, ^thread} <- NativeCodexTurnMetadata.window_thread(header) do
+      {:ok, :crypto.hash(:sha256, window)}
+    else
+      _other -> :none
+    end
+  end
+
+  def frame_window_alias_hash(%RequestOptions{}, _payload), do: :none
+
   defp canonical_metadata(%{"client_metadata" => %{"x-codex-turn-metadata" => metadata}})
        when is_map(metadata), do: {:ok, metadata}
 
   defp canonical_metadata(%{"client_metadata" => %{"x-codex-turn-metadata" => metadata}})
-       when is_binary(metadata), do: Jason.decode(metadata)
+       when is_binary(metadata), do: CodexPooler.JSON.decode(metadata)
 
   defp canonical_metadata(_payload), do: {:error, :invalid_final_window}
 
@@ -66,7 +103,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
           {:ok, RequestOptions.t(), RoutingSettings.t()} | {:error, :invalid_replay_preparation}
   def restore(%RequestOptions{} = options, metadata) when is_map(metadata) do
     case sanitize(Map.get(metadata, @metadata_key)) do
-      %{"version" => 1} = snapshot ->
+      %{"version" => 1, "request_compression_enabled" => false} = snapshot ->
         options =
           options
           |> RequestOptions.put_model_serving_mode(%{
@@ -89,26 +126,49 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
               )
           )
 
-        {:ok, options,
-         %RoutingSettings{request_compression_enabled: snapshot["request_compression_enabled"]}}
+        {:ok, options, %RoutingSettings{}}
 
       _invalid ->
         {:error, :invalid_replay_preparation}
     end
   end
 
+  # The v1 marker is retained for old readers, but a historical preparation
+  # requiring the retired rewrite cannot authorize a differently prepared replay.
+  @spec replay_eligible?(term()) :: boolean()
+  def replay_eligible?(metadata) when is_map(metadata) do
+    match?(%{"version" => 1, "request_compression_enabled" => false}, sanitize(Map.get(metadata, @metadata_key)))
+  end
+
+  def replay_eligible?(_metadata), do: false
+
   @spec sanitize(term()) :: snapshot()
   def sanitize(%{"version" => 1} = snapshot) do
     if valid_mode?(snapshot) and valid_reasoning?(snapshot) and
          is_boolean(snapshot["supports_reasoning_summary"]) and
          is_boolean(snapshot["request_compression_enabled"]) do
-      Map.take(snapshot, @snapshot_keys)
+      snapshot
+      |> Map.take(@snapshot_keys)
+      |> put_valid_models_etag(snapshot["models_etag"])
     else
       %{}
     end
   end
 
   def sanitize(_snapshot), do: %{}
+
+  # The original turn's models ETag, preserved so a native replay re-emits the
+  # same Pooler-authored value (backend_responses_etag.snapshot_lifetime).
+  # Attempts written before the field existed, or with a malformed value, give nil.
+  @spec models_etag(term()) :: String.t() | nil
+  def models_etag(metadata) when is_map(metadata) do
+    case sanitize(Map.get(metadata, @metadata_key)) do
+      %{"models_etag" => models_etag} -> models_etag
+      _snapshot -> nil
+    end
+  end
+
+  def models_etag(_metadata), do: nil
 
   defp eligible?(%RequestOptions{
          transport: %{transport: "websocket", websocket_owner: %{enabled?: true}},
@@ -122,8 +182,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
   defp eligible?(%RequestOptions{}), do: false
 
   defp snapshot(%SelectedCandidateContext{request_options: options, route_state: route_state}) do
-    case {RequestOptions.model_serving_mode_snapshot(options),
-          options.routing.reasoning_effort_decision} do
+    case {RequestOptions.model_serving_mode_snapshot(options), options.routing.reasoning_effort_decision} do
       {%{} = mode, %Decision{} = decision} ->
         sanitize(%{
           "version" => 1,
@@ -134,10 +193,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
           "configured_effort" => decision.configured_effort,
           "requested_effort" => decision.requested_effort,
           "applied_effort" => decision.applied_effort,
-          "supports_reasoning_summary" =>
-            options.routing.supports_reasoning_summary_parameter? != false,
-          "request_compression_enabled" =>
-            Map.get(route_state.routing_settings || %{}, :request_compression_enabled) == true
+          "supports_reasoning_summary" => options.routing.supports_reasoning_summary_parameter? != false,
+          "request_compression_enabled" => false,
+          "models_etag" => route_state_models_etag(route_state)
         })
 
       _invalid ->
@@ -157,10 +215,30 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
 
   defp valid_mode?(_snapshot), do: false
 
+  defp route_state_models_etag(%RouteState{} = route_state),
+    do: RouteState.codex_models_etag(route_state)
+
+  defp route_state_models_etag(_route_state), do: nil
+
+  defp put_valid_models_etag(
+         sanitized,
+         <<"W/\"cp-models-v1-", digest::binary-size(64), "\"">> = models_etag
+       ) do
+    if String.match?(digest, ~r/\A[0-9a-f]{64}\z/),
+      do: Map.put(sanitized, "models_etag", models_etag),
+      else: sanitized
+  end
+
+  defp put_valid_models_etag(sanitized, _models_etag), do: sanitized
+
   defp valid_reasoning?(snapshot) do
     Map.has_key?(@modes, snapshot["reasoning_mode"]) and
-      Enum.all?(~w(configured_effort requested_effort applied_effort), fn key ->
-        Map.has_key?(snapshot, key) and snapshot[key] in @efforts
+      Map.has_key?(snapshot, "configured_effort") and snapshot["configured_effort"] in @efforts and
+      Enum.all?(~w(requested_effort applied_effort), fn key ->
+        Map.has_key?(snapshot, key) and valid_effort?(snapshot[key])
       end)
   end
+
+  defp valid_effort?(value) when is_integer(value) and value >= 0 and value <= 18_446_744_073_709_551_615, do: true
+  defp valid_effort?(value), do: value in @efforts
 end

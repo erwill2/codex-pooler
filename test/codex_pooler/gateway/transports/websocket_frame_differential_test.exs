@@ -15,15 +15,18 @@ defmodule CodexPooler.Gateway.Transports.WebsocketFrameDifferentialTest do
     alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponses
 
     def normalize_json_message(data) do
-      case Jason.decode(data) do
+      case CodexPooler.JSON.decode(data) do
         {:ok, %{"type" => "response.failed"} = decoded} ->
           "response.failed"
           |> PublicResponses.normalize_terminal_errors(decoded)
-          |> Jason.encode!()
+          |> CodexPooler.JSON.encode!()
 
         {:ok, %{} = decoded} ->
           prepared = suppress_incomplete_provider_error_types(decoded)
-          canonical_input = if prepared == decoded, do: data, else: Jason.encode!(prepared)
+
+          canonical_input =
+            if prepared == decoded, do: data, else: CodexPooler.JSON.encode!(prepared)
+
           normalize_canonical_message(canonical_input, data)
 
         _invalid ->
@@ -31,24 +34,34 @@ defmodule CodexPooler.Gateway.Transports.WebsocketFrameDifferentialTest do
       end
     end
 
+    # One `data:` line per text line, so a multi-line frame stays one whole
+    # SSE event (findings#254 row 254-53); a single-line frame keeps its bytes.
     def sse_block(text) do
-      case Jason.decode(text) do
+      data =
+        if String.contains?(text, ["\n", "\r"]),
+          do: text |> String.split(["\r\n", "\r", "\n"]) |> Enum.map_join("\n", &("data: " <> &1)),
+          else: "data: " <> text
+
+      case CodexPooler.JSON.decode(text) do
         {:ok, %{"type" => type}} when is_binary(type) and type != "" ->
-          "event: " <> type <> "\ndata: " <> text <> "\n\n"
+          "event: " <> type <> "\n" <> data <> "\n\n"
 
         _other ->
-          "data: " <> text <> "\n\n"
+          data <> "\n\n"
       end
     end
 
     defp normalize_canonical_message(canonical_input, original_data) do
       canonical_data = StreamProtocol.canonicalize_codex_responses_json_message(canonical_input)
 
-      case Jason.decode(canonical_data) do
+      case CodexPooler.JSON.decode(canonical_data) do
         {:ok, %{} = canonical} ->
           type = clean_string(Map.get(canonical, "type"))
           normalized = PublicResponses.normalize_terminal_errors(type, canonical)
-          if normalized == canonical, do: canonical_data, else: Jason.encode!(normalized)
+
+          if normalized == canonical,
+            do: canonical_data,
+            else: CodexPooler.JSON.encode!(normalized)
 
         _invalid ->
           original_data
@@ -154,23 +167,17 @@ defmodule CodexPooler.Gateway.Transports.WebsocketFrameDifferentialTest do
       {:delta, ~s({"type":"response.output_text.delta","delta":"sample"})},
       {:delta_whitespace, ~s( { "delta" : "sample", "type" : "response.output_text.delta" } )},
       {:large_delta, large_delta(parent)},
-      {:item_done,
-       ~s({"type":"response.output_item.done","item":{"type":"message","id":"item_sample"}})},
+      {:item_done, ~s({"type":"response.output_item.done","item":{"type":"message","id":"item_sample"}})},
       {:large_item_done, large_item_done(parent)},
       {:rate_limit, ~s({"type":"codex.rate_limits","rate_limits":{}})},
-      {:completed,
-       ~s({"type":"response.completed","response":{"id":"resp_sample","status":"completed"}})},
+      {:completed, ~s({"type":"response.completed","response":{"id":"resp_sample","status":"completed"}})},
       {:done, ~s({"type":"response.done","response":{"id":"resp_sample","status":"completed"}})},
-      {:failed,
-       ~s({"type":"response.failed","response":{"id":"resp_sample","status":"failed","error":{"code":"server_error"}}})},
-      {:incomplete,
-       ~s({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}})},
-      {:incomplete_provider_types,
-       ~s({"type":"response.incomplete","error":{"type":"provider_error"},"response":{"status":"incomplete","error":{"type":"provider_error"}}})},
+      {:failed, ~s({"type":"response.failed","response":{"id":"resp_sample","status":"failed","error":{"code":"server_error"}}})},
+      {:incomplete, ~s({"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}})},
+      {:incomplete_provider_types, ~s({"type":"response.incomplete","error":{"type":"provider_error"},"response":{"status":"incomplete","error":{"type":"provider_error"}}})},
       {:error, ~s({"type":"error","error":{"code":"server_error"}})},
       {:legacy_terminal, ~s({"id":"resp_legacy_sample"})},
-      {:malformed_terminal,
-       ~s({"type":"response.completed","response":{"id":"resp_sample","status":"failed"}})},
+      {:malformed_terminal, ~s({"type":"response.completed","response":{"id":"resp_sample","status":"failed"}})},
       {:typeless_detail, ~s({"detail":{"kind":"sample"}})},
       {:malformed_json, ~s({"type":"response.output_text.delta")},
       {:truncated_json, ~s({"type":"response.failed","response":)},

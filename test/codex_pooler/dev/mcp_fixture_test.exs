@@ -10,6 +10,7 @@ defmodule CodexPooler.Dev.MCPFixtureTest do
   alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings}
   alias CodexPooler.Pools.Membership
   alias CodexPooler.Repo
+  alias Mix.Tasks.Dev.McpFixture, as: MCPFixtureTask
 
   setup do
     Repo.delete_all(OperatorMCPKey)
@@ -47,7 +48,7 @@ defmodule CodexPooler.Dev.MCPFixtureTest do
     options: options
   } do
     assert {:ok, %{status: "ready", leases: 1}} = MCPFixture.acquire(options)
-    assert {:ok, receipt} = path |> File.read!() |> Jason.decode()
+    assert {:ok, receipt} = path |> File.read!() |> CodexPooler.JSON.decode()
     raw_token = receipt["mcp_token"]
     token_id = receipt["token_id"]
 
@@ -106,7 +107,7 @@ defmodule CodexPooler.Dev.MCPFixtureTest do
     noncanonical_setting = insert_operator_setting!(noncanonical_owner, false)
 
     assert {:ok, %{status: "ready", leases: 1}} = MCPFixture.acquire(options)
-    receipt = path |> File.read!() |> Jason.decode!()
+    receipt = path |> File.read!() |> CodexPooler.JSON.decode!()
     raw_token = receipt["mcp_token"]
 
     assert %OperatorMCPKey{operator_id: operator_id} =
@@ -178,8 +179,7 @@ defmodule CodexPooler.Dev.MCPFixtureTest do
     noncanonical_owner = insert_active_owner!("unusable-fallback")
     noncanonical_setting = insert_operator_setting!(noncanonical_owner, false)
 
-    assert {:error,
-            "MCP fixture canonical bootstrap owner is not usable: expected active, undeleted, password-ready instance owner"} =
+    assert {:error, "MCP fixture canonical bootstrap owner is not usable: expected active, undeleted, password-ready instance owner"} =
              MCPFixture.acquire(options)
 
     refute File.exists?(path)
@@ -192,7 +192,7 @@ defmodule CodexPooler.Dev.MCPFixtureTest do
   test "status never exposes the raw token", %{path: path, options: options} do
     assert {:ok, %{status: "absent", leases: 0}} = MCPFixture.status(options)
     assert {:ok, status} = MCPFixture.acquire(options)
-    raw_token = path |> File.read!() |> Jason.decode!() |> Map.fetch!("mcp_token")
+    raw_token = path |> File.read!() |> CodexPooler.JSON.decode!() |> Map.fetch!("mcp_token")
 
     refute inspect(status) =~ raw_token
     refute Map.has_key?(status, :mcp_token)
@@ -203,6 +203,121 @@ defmodule CodexPooler.Dev.MCPFixtureTest do
   test "refuses non-development use without the explicit test allowance", %{path: path} do
     assert {:error, "MCP fixture runs only with MIX_ENV=dev"} =
              MCPFixture.acquire(environment: :test, receipt_path: path)
+  end
+
+  test "allows only an explicitly authorized isolated loopback QA database in development" do
+    isolated = "codex_pooler_relqa_fixture_12345678"
+
+    assert :ok =
+             MCPFixture.validate_environment(
+               environment: :dev,
+               repo_config: [database: "codex_pooler_dev", hostname: "localhost"]
+             )
+
+    for hostname <- ["127.0.0.1", "localhost", "::1"] do
+      assert :ok =
+               MCPFixture.validate_environment(
+                 environment: :dev,
+                 allow_isolated_dev_database: true,
+                 repo_config: [database: isolated, hostname: hostname]
+               )
+    end
+
+    refused = [
+      {false, [database: isolated, hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_relqa_short", hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_relqa_upper_CASE_12345678", hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_relqa_../escape_12345678", hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_prod", hostname: "127.0.0.1"]},
+      {true, [database: isolated, hostname: "db.example.com"]},
+      {true, [database: isolated, hostname: "10.0.0.5"]},
+      {true, [database: isolated]},
+      {true, [database: isolated, hostname: "127.0.0.1", url: "ecto://user:pass@db.example.com/#{isolated}"]},
+      {true, [database: isolated, hostname: "127.0.0.1", socket_dir: "/var/run/postgresql"]}
+    ]
+
+    for {allow?, repo_config} <- refused do
+      assert {:error, "MCP fixture requires database codex_pooler_dev"} =
+               MCPFixture.validate_environment(environment: :dev, allow_isolated_dev_database: allow?, repo_config: repo_config)
+    end
+
+    assert {:error, "MCP fixture runs only with MIX_ENV=dev"} =
+             MCPFixture.validate_environment(
+               environment: :test,
+               allow_isolated_dev_database: true,
+               repo_config: [database: isolated, hostname: "127.0.0.1"]
+             )
+  end
+
+  test "an isolated database scopes the receipt so a development lease is never reused" do
+    isolated = "codex_pooler_relqa_fixture_#{System.unique_integer([:positive])}_abcdefgh"
+    options = [environment: :dev, allow_isolated_dev_database: true, repo_config: [database: isolated, hostname: "127.0.0.1"]]
+    scoped_root = Path.join([File.cwd!(), "tmp", "mcp-fixture", isolated])
+    on_exit(fn -> File.rm_rf(scoped_root) end)
+
+    assert {:ok, %{status: "absent", leases: 0, receipt_path: scoped}} = MCPFixture.status(options)
+    assert scoped == Path.join(scoped_root, "setup.json")
+    refute scoped == MCPFixture.receipt_path()
+    refute File.exists?(scoped_root)
+
+    assert {:ok, %{receipt_path: default}} = MCPFixture.status(environment: :dev, repo_config: [database: "codex_pooler_dev", hostname: "localhost"])
+    assert default == MCPFixture.receipt_path()
+
+    assert {:error, "MCP fixture requires database codex_pooler_dev"} =
+             MCPFixture.status(Keyword.put(options, :repo_config, database: isolated, hostname: "db.example.com"))
+  end
+
+  test "default absence is scoped to its receipt and cannot release another target", context do
+    root = Path.dirname(context.path)
+    File.mkdir_p!(root)
+    target = "codex_pooler_replica_test"
+    options = [environment: :dev, target_database: target, repo_config: [database: target, hostname: "localhost"]]
+
+    File.cd!(root, fn ->
+      assert {:ok, %{status: "ready", receipt_path: scoped}} = MCPFixture.acquire(options)
+      assert String.ends_with?(scoped, "/target-#{target}/setup.json")
+      assert {:ok, %{status: "absent", receipt_path: default, other_receipts: [^scoped]}} = MCPFixture.status()
+      assert default != scoped
+      assert {:ok, %{status: "absent", receipt_path: ^default, other_receipts: [^scoped]}} = MCPFixture.release(environment: :dev, repo_config: [database: "codex_pooler_dev"])
+      assert {:ok, %{status: "ready", leases: 1, receipt_path: ^scoped}} = MCPFixture.status(options)
+      assert InstanceSettings.current().mcp.enabled
+      assert {:ok, %{status: "released", receipt_path: ^scoped}} = MCPFixture.release(options)
+      refute InstanceSettings.current().mcp.enabled
+      assert Repo.aggregate(OperatorMCPKey, :count) == 0
+    end)
+  end
+
+  test "the Mix task accepts the isolated database flag and still applies the environment guard" do
+    assert_raise Mix.Error, "MCP fixture runs only with MIX_ENV=dev", fn ->
+      MCPFixtureTask.run(["status", "--allow-isolated-dev-database"])
+    end
+
+    assert_raise Mix.Error, ~r/use acquire, release, or status/, fn ->
+      MCPFixtureTask.run(["status", "--allow-isolated-dev-database", "extra"])
+    end
+  end
+
+  # The fixture VM boots the application only to write its lease; it must not
+  # also start Oban queues, plugins or the stager against the database it
+  # leases (232-24). `status` never boots the application.
+  test "the Mix task disables background jobs before it boots the application for acquire and release" do
+    CodexPooler.TestAppEnv.restore_on_exit(Oban)
+
+    for action <- ["acquire", "release"] do
+      enabled = Keyword.merge(Application.fetch_env!(:codex_pooler, Oban), queues: [default: 1], plugins: [Oban.Pruner], stager: [interval: 1_000])
+      Application.put_env(:codex_pooler, Oban, enabled)
+
+      assert_raise Mix.Error, "MCP fixture runs only with MIX_ENV=dev", fn -> MCPFixtureTask.run([action]) end
+
+      config = Application.fetch_env!(:codex_pooler, Oban)
+      assert {config[:queues], config[:plugins], config[:stager]} == {false, false, false}, action
+    end
+
+    enabled = Keyword.merge(Application.fetch_env!(:codex_pooler, Oban), queues: [default: 1], plugins: [Oban.Pruner], stager: [interval: 1_000])
+    Application.put_env(:codex_pooler, Oban, enabled)
+
+    assert_raise Mix.Error, "MCP fixture runs only with MIX_ENV=dev", fn -> MCPFixtureTask.run(["status", "--allow-isolated-dev-database"]) end
+    assert Application.fetch_env!(:codex_pooler, Oban) == enabled
   end
 
   defp fixture_options(path) do

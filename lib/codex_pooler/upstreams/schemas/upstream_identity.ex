@@ -17,6 +17,7 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
   @saved_reset_auto_redeem_trigger_modes ~w(blocked threshold)
   @plan_family_format ~r/^[a-z0-9]+(?:-[a-z0-9]+)*$/
   @codex_chatgpt_oauth "codex_chatgpt_oauth"
+  @synthetic_account_id_prefixes ~w(email_ local_)
 
   @type t :: %__MODULE__{}
   @type attrs :: map()
@@ -41,6 +42,7 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
     field :credential_provenance, :string
     field :last_successful_refresh_at, :utc_datetime_usec
     field :last_successful_sync_at, :utc_datetime_usec
+    field :allow_provider_credits, :boolean, default: true
     field :saved_reset_auto_redeem_enabled, :boolean, default: false
     field :saved_reset_auto_redeem_min_blocked_minutes, :integer, default: 60
     field :saved_reset_auto_redeem_keep_credits, :integer, default: 0
@@ -131,6 +133,80 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
       name: :upstream_identities_chatgpt_user_workspace_slot_uq
     )
   end
+
+  @doc """
+  Changes only the identity-wide provider credits policy.
+
+  The control is required even when unchanged. Ownership and provider metadata
+  are never accepted, and generic identity changesets cannot overwrite this policy.
+  """
+  @spec provider_credits_policy_changeset(t(), attrs()) :: Ecto.Changeset.t()
+  def provider_credits_policy_changeset(%__MODULE__{} = identity, attrs) when is_map(attrs) do
+    changeset = change(identity)
+
+    case attrs do
+      %{allow_provider_credits: value} when map_size(attrs) == 1 ->
+        put_provider_credits_policy(changeset, value)
+
+      %{"allow_provider_credits" => value} when map_size(attrs) == 1 ->
+        put_provider_credits_policy(changeset, value)
+
+      attrs when map_size(attrs) == 0 ->
+        add_error(changeset, :allow_provider_credits, "is required")
+
+      _attrs ->
+        add_error(changeset, :allow_provider_credits, "only the provider credits control may be changed")
+    end
+  end
+
+  defp put_provider_credits_policy(changeset, value) when value in [true, "true", "1"],
+    do: put_change(changeset, :allow_provider_credits, true)
+
+  defp put_provider_credits_policy(changeset, value) when value in [false, "false", "0"],
+    do: put_change(changeset, :allow_provider_credits, false)
+
+  defp put_provider_credits_policy(changeset, _value),
+    do: add_error(changeset, :allow_provider_credits, "must be a boolean")
+
+  @doc """
+  The provider-routable `chatgpt-account-id` scope for a stored account id, or `nil`.
+
+  This is the read-side counterpart of the `:chatgpt_account_id` trim above, and
+  it lives here so every caller that has to decide whether an account id can be
+  put on the wire asks the same question in the same place.
+
+  The value is provider-supplied, never minted by us: `Upstreams.Auth.CodexAuth`
+  reads it from the `chatgpt_account_id` id-token claim, and
+  `Upstreams.Auth.CodexAuthJson` reads `account_id` out of an imported Codex
+  `auth.json`. Some credentials carry a synthetic placeholder there instead of a
+  real account identifier — an `email_`-prefixed value derived from the signed-in
+  address, or a `local_`-prefixed value minted for a local login. Those are not
+  identifiers the provider can resolve, so sending one as `chatgpt-account-id`
+  scopes the request to an account the provider does not know instead of letting
+  the bearer token speak for itself. They are therefore not a scope at all, and
+  this returns `nil` for them.
+
+  The prefix test is deliberately case-sensitive: it matches the exact lowercase
+  spellings the provider mints, and anything else stays routable rather than
+  being guessed at.
+
+  Returns the trimmed binary when the id is routable, and `nil` for a non-binary
+  value, a blank value, or a synthetic placeholder. What `nil` means is the
+  caller's decision — omitting the header and substituting an empty scope are
+  both legitimate, and neither belongs in here.
+  """
+  @spec account_scope(term()) :: String.t() | nil
+  def account_scope(account_id) when is_binary(account_id) do
+    trimmed = String.trim(account_id)
+
+    if trimmed == "" or String.starts_with?(trimmed, @synthetic_account_id_prefixes) do
+      nil
+    else
+      trimmed
+    end
+  end
+
+  def account_scope(_account_id), do: nil
 
   @spec statuses() :: [status()]
   defdelegate statuses(), to: IdentityStatus

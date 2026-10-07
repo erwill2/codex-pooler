@@ -10,10 +10,11 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
     ComponentShowcaseCatalog,
     ComponentShowcaseData,
     ComponentShowcaseDialogs,
+    ComponentShowcasePlanBadges,
     ComponentShowcaseStats
   }
 
-  @review_states ~w(catalog dialogs flash oauth-browser-dialog policy-dialog request-drawer)
+  @review_states ~w(catalog dialogs flash oauth-browser-dialog policy-dialog request-drawer plan-badges)
 
   @oauth_browser_authorization_url "https://auth.example.com/oauth/authorize?client_id=dev-component-showcase&response_type=code&state=synthetic-review-state"
 
@@ -126,8 +127,7 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
     "browser"
     |> oauth_fixture()
     |> Map.put(:oauth_link_error, %{
-      message:
-        "That callback URL is from an earlier attempt. Open the page again and paste the new one."
+      message: "That callback URL is from an earlier attempt. Open the page again and paste the new one."
     })
   end
 
@@ -279,6 +279,10 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
 
   def handle_event("validate_oauth_link_pool", _params, socket), do: {:noreply, socket}
 
+  def handle_event(event, _params, socket)
+      when event in ["open_quota_observations", "close_quota_observations"],
+      do: {:noreply, socket}
+
   def handle_event("close_request_log", _params, socket),
     do: {:noreply, select_review_state(socket, "catalog")}
 
@@ -339,8 +343,9 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
           />
         </div>
 
+        <ComponentShowcasePlanBadges.gallery :if={@review_state == "plan-badges"} theme={@theme} />
         <ComponentShowcase.component_showcase
-          :if={@review_state not in ["oauth-browser-dialog", "dialogs"]}
+          :if={@review_state not in ["oauth-browser-dialog", "dialogs", "plan-badges"]}
           theme={@theme}
           paused={@paused}
           review_state={@review_state}
@@ -466,7 +471,6 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
       token_counts: nil,
       cost: nil,
       usage_status: "usage_unknown",
-      payload_compression: %{},
       debug: %{
         continuity: %{},
         failure: %{error_code: "invalid_compaction_response", error_source: "request_error"},

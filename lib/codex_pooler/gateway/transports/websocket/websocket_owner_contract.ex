@@ -8,12 +8,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
 
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Websocket.OwnerDefaults
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequest
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV2
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV3
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV4
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV5
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.CloseDiagnostics
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV8
 
   @type owner_key :: Ecto.UUID.t()
   @type owner_token :: Ecto.UUID.t()
@@ -21,13 +17,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
   @type downstream_epoch :: pos_integer()
   @type owner_turn_id :: pid()
   @type encoded_text_frame :: binary()
-  @type upstream_request ::
-          WebsocketOwnerRequest.t()
-          | WebsocketOwnerRequestV2.t()
-          | WebsocketOwnerRequestV3.t()
-          | WebsocketOwnerRequestV4.t()
-          | WebsocketOwnerRequestV6.t()
-          | WebsocketOwnerRequestV5.t()
+  @type upstream_request :: WebsocketOwnerRequestV8.t()
 
   @type owner_error ::
           :owner_unavailable
@@ -65,8 +55,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
 
   @type downstream_message ::
           {:websocket_owner_frame, correlation_id(), downstream_epoch(), downstream_payload()}
-          | {:websocket_owner_frame, correlation_id(), downstream_epoch(), owner_turn_id(),
-             downstream_payload()}
+          | {:websocket_owner_frame, correlation_id(), downstream_epoch(), owner_turn_id(), downstream_payload()}
 
   @type forwarding_result ::
           :ok
@@ -78,17 +67,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
   @type downstream_match_result ::
           {:ok, downstream_payload()} | :drop | {:error, :invalid_downstream_message}
   @type output_commit_probe ::
-          {:websocket_owner_output_commit_probe, correlation_id(), downstream_epoch(),
-           owner_turn_id(), reference(), pid(), reference()}
+          {:websocket_owner_output_commit_probe, correlation_id(), downstream_epoch(), owner_turn_id(), reference(), pid(), reference()}
   @type output_commit_ack ::
-          {:websocket_owner_output_commit_ack, correlation_id(), downstream_epoch(),
-           owner_turn_id(), reference(), reference(), boolean()}
+          {:websocket_owner_output_commit_ack, correlation_id(), downstream_epoch(), owner_turn_id(), reference(), reference(), boolean()}
   @type handoff_outcome :: :ready | {:failed, :owner_forward_timeout | :owner_drained}
   @type handoff_message ::
-          {:websocket_owner_handoff_ready, correlation_id(), downstream_epoch(), owner_turn_id(),
-           pid(), reference()}
-          | {:websocket_owner_handoff_failed, correlation_id(), downstream_epoch(),
-             owner_turn_id(), pid(), reference(), :owner_forward_timeout | :owner_drained}
+          {:websocket_owner_handoff_ready, correlation_id(), downstream_epoch(), owner_turn_id(), pid(), reference()}
+          | {:websocket_owner_handoff_failed, correlation_id(), downstream_epoch(), owner_turn_id(), pid(), reference(), :owner_forward_timeout | :owner_drained}
+  @type upstream_closed_signal :: %{
+          required(:cause) => CloseDiagnostics.cause(),
+          required(:lifecycle_id) => Ecto.UUID.t(),
+          required(:generation) => pos_integer()
+        }
+  @type upstream_closed_message ::
+          {:websocket_owner_upstream_closed, correlation_id(), downstream_epoch(), upstream_closed_signal()}
 
   @owner_errors CodexPooler.Gateway.Transports.Websocket.OwnerErrorVocabulary.owner_errors()
 
@@ -198,9 +190,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
       when is_binary(correlation_id) and is_integer(downstream_epoch) and downstream_epoch > 0,
       do: downstream_payload?(payload)
 
-  def downstream_message?(
-        {:websocket_owner_frame, correlation_id, downstream_epoch, owner_turn_id, payload}
-      )
+  def downstream_message?({:websocket_owner_frame, correlation_id, downstream_epoch, owner_turn_id, payload})
       when is_binary(correlation_id) and is_integer(downstream_epoch) and downstream_epoch > 0 and
              is_pid(owner_turn_id),
       do: downstream_payload?(payload)
@@ -291,10 +281,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
       do: {:error, :invalid_downstream_message}
 
   @spec output_commit_probe?(term()) :: boolean()
-  def output_commit_probe?(
-        {:websocket_owner_output_commit_probe, correlation_id, downstream_epoch, owner_turn_id,
-         active_turn_ref, owner_pid, probe_ref}
-      )
+  def output_commit_probe?({:websocket_owner_output_commit_probe, correlation_id, downstream_epoch, owner_turn_id, active_turn_ref, owner_pid, probe_ref})
       when is_binary(correlation_id) and is_integer(downstream_epoch) and downstream_epoch > 0 and
              is_pid(owner_turn_id) and is_reference(active_turn_ref) and is_pid(owner_pid) and
              is_reference(probe_ref),
@@ -309,8 +296,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
           owner_turn_id()
         ) :: {:ok, reference(), pid(), reference()} | :drop | {:error, :invalid_probe}
   def accept_output_commit_probe(
-        {:websocket_owner_output_commit_probe, correlation_id, downstream_epoch, owner_turn_id,
-         active_turn_ref, owner_pid, probe_ref} = message,
+        {:websocket_owner_output_commit_probe, correlation_id, downstream_epoch, owner_turn_id, active_turn_ref, owner_pid, probe_ref} = message,
         downstream_epoch,
         correlation_id,
         owner_turn_id
@@ -325,10 +311,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
   end
 
   @spec output_commit_ack?(term()) :: boolean()
-  def output_commit_ack?(
-        {:websocket_owner_output_commit_ack, correlation_id, downstream_epoch, owner_turn_id,
-         active_turn_ref, probe_ref, committed?}
-      )
+  def output_commit_ack?({:websocket_owner_output_commit_ack, correlation_id, downstream_epoch, owner_turn_id, active_turn_ref, probe_ref, committed?})
       when is_binary(correlation_id) and is_integer(downstream_epoch) and downstream_epoch > 0 and
              is_pid(owner_turn_id) and is_reference(active_turn_ref) and is_reference(probe_ref) and
              is_boolean(committed?),
@@ -345,8 +328,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
           reference()
         ) :: {:ok, boolean()} | :drop | {:error, :invalid_ack}
   def accept_output_commit_ack(
-        {:websocket_owner_output_commit_ack, correlation_id, downstream_epoch, owner_turn_id,
-         active_turn_ref, probe_ref, committed?} = message,
+        {:websocket_owner_output_commit_ack, correlation_id, downstream_epoch, owner_turn_id, active_turn_ref, probe_ref, committed?} = message,
         downstream_epoch,
         correlation_id,
         owner_turn_id,
@@ -376,8 +358,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
           reference()
         ) :: {:ok, handoff_outcome()} | :drop | {:error, :invalid_handoff_message}
   def accept_handoff_message(
-        {:websocket_owner_handoff_ready, correlation_id, epoch, owner_turn_id, downstream_pid,
-         control_ref},
+        {:websocket_owner_handoff_ready, correlation_id, epoch, owner_turn_id, downstream_pid, control_ref},
         downstream_pid,
         epoch,
         correlation_id,
@@ -389,8 +370,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
       do: {:ok, :ready}
 
   def accept_handoff_message(
-        {:websocket_owner_handoff_failed, correlation_id, epoch, owner_turn_id, downstream_pid,
-         control_ref, reason},
+        {:websocket_owner_handoff_failed, correlation_id, epoch, owner_turn_id, downstream_pid, control_ref, reason},
         downstream_pid,
         epoch,
         correlation_id,
@@ -406,24 +386,67 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
     if handoff_message?(message), do: :drop, else: {:error, :invalid_handoff_message}
   end
 
-  defp handoff_message?(
-         {:websocket_owner_handoff_ready, correlation_id, epoch, owner_turn_id, downstream_pid,
-          control_ref}
-       ),
-       do:
-         is_binary(correlation_id) and is_integer(epoch) and epoch > 0 and
-           is_pid(owner_turn_id) and is_pid(downstream_pid) and is_reference(control_ref)
+  defp handoff_message?({:websocket_owner_handoff_ready, correlation_id, epoch, owner_turn_id, downstream_pid, control_ref}),
+    do:
+      is_binary(correlation_id) and is_integer(epoch) and epoch > 0 and
+        is_pid(owner_turn_id) and is_pid(downstream_pid) and is_reference(control_ref)
 
-  defp handoff_message?(
-         {:websocket_owner_handoff_failed, correlation_id, epoch, owner_turn_id, downstream_pid,
-          control_ref, reason}
-       ),
-       do:
-         is_binary(correlation_id) and is_integer(epoch) and epoch > 0 and
-           is_pid(owner_turn_id) and is_pid(downstream_pid) and is_reference(control_ref) and
-           reason in [:owner_forward_timeout, :owner_drained]
+  defp handoff_message?({:websocket_owner_handoff_failed, correlation_id, epoch, owner_turn_id, downstream_pid, control_ref, reason}),
+    do:
+      is_binary(correlation_id) and is_integer(epoch) and epoch > 0 and
+        is_pid(owner_turn_id) and is_pid(downstream_pid) and is_reference(control_ref) and
+        reason in [:owner_forward_timeout, :owner_drained]
 
   defp handoff_message?(_message), do: false
+
+  @doc """
+  The part of an upstream session's connection close signal the owner passes
+  on to its downstream: a cause from
+  `CloseDiagnostics.anchor_invalidating_causes/0`, the closed connection's
+  lifecycle id and its generation (findings#270). Anything else is refused.
+
+  The cause is checked at run time against `CloseDiagnostics`, never against a
+  copy of its list: a module attribute read from that module would make this
+  contract a compile-connected dependency of it.
+  """
+  @spec upstream_closed_signal(term()) :: {:ok, upstream_closed_signal()} | :error
+  def upstream_closed_signal(%{cause: cause, lifecycle_id: lifecycle_id, generation: generation})
+      when is_atom(cause) and is_binary(lifecycle_id) and is_integer(generation) and generation > 0 do
+    if CloseDiagnostics.anchor_invalidating_cause?(cause) and uuid?(lifecycle_id),
+      do: {:ok, %{cause: cause, lifecycle_id: lifecycle_id, generation: generation}},
+      else: :error
+  end
+
+  def upstream_closed_signal(_signal), do: :error
+
+  @doc """
+  The owner's instruction to its attached downstream that the upstream
+  connection behind it closed between requests (findings#270). It is not an
+  owner frame: it carries no payload for the client, only the signal, and a
+  node of an earlier release drops its unknown tag.
+  """
+  @spec upstream_closed_message?(term()) :: boolean()
+  def upstream_closed_message?({:websocket_owner_upstream_closed, correlation_id, epoch, signal})
+      when is_binary(correlation_id) and is_integer(epoch) and epoch > 0,
+      do: upstream_closed_signal(signal) == {:ok, signal}
+
+  def upstream_closed_message?(_message), do: false
+
+  @spec accept_upstream_closed_message(term(), downstream_epoch(), correlation_id()) ::
+          {:ok, upstream_closed_signal()} | :drop | {:error, :invalid_upstream_closed_message}
+  def accept_upstream_closed_message({:websocket_owner_upstream_closed, correlation_id, epoch, signal} = message, epoch, correlation_id)
+      when is_binary(correlation_id) and is_integer(epoch) and epoch > 0 do
+    if upstream_closed_message?(message),
+      do: {:ok, signal},
+      else: {:error, :invalid_upstream_closed_message}
+  end
+
+  def accept_upstream_closed_message(message, _epoch, _correlation_id) do
+    if upstream_closed_message?(message), do: :drop, else: {:error, :invalid_upstream_closed_message}
+  end
+
+  defp uuid?(value),
+    do: Regex.match?(~r/\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z/, value)
 
   defp downstream_payload?({:data, encoded_text_frame}) when is_binary(encoded_text_frame),
     do: true

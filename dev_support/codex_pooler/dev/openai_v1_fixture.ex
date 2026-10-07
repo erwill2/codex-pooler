@@ -6,23 +6,31 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
   set, API key, and quota snapshot. Multiple local callers share a
   reference-counted receipt; only the final release restores the exact prior
   database state.
+
+  `target_database: NAME` runs every action against an explicitly named local
+  database, for example a kind replica's Postgres through a loopback
+  port-forward (`CodexPooler.Dev.LocalTarget`), and keeps that database's
+  receipt below `tmp/openai-v1-fixture/target-NAME/`. `upstream_base_url`
+  accepts a loopback origin or an in-cluster service origin the replica's pods
+  can reach.
   """
 
+  alias CodexPooler.Dev.LocalTarget
   alias CodexPooler.Dev.OpenAIV1Fixture.{Provisioner, Receipt, Snapshot}
   alias CodexPooler.Repo
 
   @database "codex_pooler_dev"
   @default_upstream_base_url "http://127.0.0.1:4057"
-  @default_receipt_path Path.join(["tmp", "openai-v1-fixture", "setup.json"])
+  @receipt_root Path.join(["tmp", "openai-v1-fixture"])
+  @default_receipt_path Path.join(@receipt_root, "setup.json")
 
-  @type request_compression_mode :: :preserve | :enabled
   @type options :: [
           environment: atom(),
           allow_test_database: boolean(),
           allow_isolated_dev_database: boolean(),
+          target_database: String.t(),
           receipt_path: String.t(),
           upstream_base_url: String.t(),
-          request_compression: request_compression_mode(),
           repo_config: keyword()
         ]
   @type status :: %{
@@ -41,12 +49,11 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
   @spec acquire(options()) :: {:ok, status()} | {:error, String.t()}
   def acquire(options \\ []) do
     with :ok <- validate_environment(options),
-         {:ok, upstream_base_url} <- upstream_base_url(options),
-         {:ok, request_compression_mode} <- request_compression_mode(options) do
+         {:ok, upstream_base_url} <- upstream_base_url(options) do
       path = resolved_receipt_path(options)
 
       Receipt.with_lock(path, fn ->
-        acquire_locked(path, upstream_base_url, request_compression_mode)
+        acquire_locked(path, upstream_base_url)
       end)
     end
   end
@@ -61,12 +68,14 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
 
   @spec status(options()) :: {:ok, status()} | {:error, String.t()}
   def status(options \\ []) do
-    path = resolved_receipt_path(options)
+    with :ok <- validate_target_status(options) do
+      path = resolved_receipt_path(options)
 
-    case Receipt.read(path) do
-      {:ok, setup} -> public_status(setup, path)
-      :missing -> {:ok, %{status: "absent", leases: 0, receipt_path: path}}
-      {:error, message} -> {:error, message}
+      case Receipt.read(path) do
+        {:ok, setup} -> public_status(setup, path)
+        :missing -> {:ok, %{status: "absent", leases: 0, receipt_path: path}}
+        {:error, message} -> {:error, message}
+      end
     end
   end
 
@@ -76,16 +85,13 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
     repo_config = Keyword.get(options, :repo_config, Repo.config())
     allow_test_database? = Keyword.get(options, :allow_test_database, false)
     allow_isolated_dev_database? = Keyword.get(options, :allow_isolated_dev_database, false)
-    database = Keyword.get(repo_config, :database)
+    target_database = Keyword.get(options, :target_database)
 
     cond do
-      environment == :dev and database == @database ->
-        :ok
+      environment == :dev and is_binary(target_database) ->
+        LocalTarget.validate_target_database(target_database, repo_config)
 
-      environment == :dev and allow_isolated_dev_database? and isolated_dev_database?(database) ->
-        :ok
-
-      environment == :test and allow_test_database? ->
+      allowed_environment?(environment, repo_config, allow_isolated_dev_database?, allow_test_database?) ->
         :ok
 
       environment != :dev ->
@@ -96,41 +102,42 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
     end
   end
 
-  defp isolated_dev_database?(database) when is_binary(database) do
-    Regex.match?(~r/^codex_pooler_relqa_[a-z0-9_]{8,63}$/, database)
+  defp validate_target_status(options) do
+    if Keyword.has_key?(options, :target_database), do: validate_environment(options), else: :ok
   end
 
-  defp isolated_dev_database?(_database), do: false
+  defp allowed_environment?(:dev, repo_config, allow_isolated_dev_database?, _allow_test_database?) do
+    Keyword.get(repo_config, :database) == @database or
+      (allow_isolated_dev_database? and LocalTarget.isolated_dev_database?(repo_config))
+  end
 
-  defp acquire_locked(path, upstream_base_url, request_compression_mode) do
+  defp allowed_environment?(:test, _repo_config, _allow_isolated_dev_database?, true), do: true
+  defp allowed_environment?(_environment, _repo_config, _allow_isolated_dev_database?, _allow_test_database?), do: false
+
+  defp acquire_locked(path, upstream_base_url) do
     case Receipt.read(path) do
       {:ok, %{"state" => "ready", "leases" => leases} = setup}
       when is_integer(leases) and leases > 0 ->
-        cond do
-          setup["upstream_base_url"] != upstream_base_url ->
-            {:error, "OpenAI V1 fixture is leased for another upstream origin"}
-
-          setup["request_compression_mode"] != Atom.to_string(request_compression_mode) ->
-            {:error, "OpenAI V1 fixture is leased with another request compression mode"}
-
-          true ->
-            updated = Map.put(setup, "leases", leases + 1)
-            Receipt.write!(path, updated)
-            public_status(updated, path)
+        if setup["upstream_base_url"] != upstream_base_url do
+          {:error, "OpenAI V1 fixture is leased for another upstream origin"}
+        else
+          updated = Map.put(setup, "leases", leases + 1)
+          Receipt.write!(path, updated)
+          public_status(updated, path)
         end
 
       {:ok, _setup} ->
         {:error, "OpenAI V1 fixture receipt requires cleanup before reuse"}
 
       :missing ->
-        provision_new(path, upstream_base_url, request_compression_mode)
+        provision_new(path, upstream_base_url)
 
       {:error, message} ->
         {:error, message}
     end
   end
 
-  defp provision_new(path, upstream_base_url, request_compression_mode) do
+  defp provision_new(path, upstream_base_url) do
     snapshot = Snapshot.capture()
 
     Receipt.write!(path, %{
@@ -138,13 +145,12 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
       "state" => "prepared",
       "leases" => 1,
       "upstream_base_url" => upstream_base_url,
-      "request_compression_mode" => Atom.to_string(request_compression_mode),
       "receipt" => Receipt.encode_snapshot(snapshot)
     })
 
     try do
-      provisioned = Provisioner.provision!(upstream_base_url, request_compression_mode)
-      setup = ready_setup(snapshot, upstream_base_url, request_compression_mode, provisioned)
+      provisioned = Provisioner.provision!(upstream_base_url)
+      setup = ready_setup(snapshot, upstream_base_url, provisioned)
       Receipt.write!(path, setup)
       public_status(setup, path)
     rescue
@@ -211,13 +217,12 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
 
   defp restore_setup(_setup), do: {:error, "OpenAI V1 fixture receipt has no snapshot"}
 
-  defp ready_setup(snapshot, upstream_base_url, request_compression_mode, provisioned) do
+  defp ready_setup(snapshot, upstream_base_url, provisioned) do
     %{
       "version" => 1,
       "state" => "ready",
       "leases" => 1,
       "upstream_base_url" => upstream_base_url,
-      "request_compression_mode" => Atom.to_string(request_compression_mode),
       "receipt" => Receipt.encode_snapshot(snapshot),
       "created" => %{
         "identity_id" => if(provisioned.identity_created?, do: provisioned.identity_id),
@@ -248,30 +253,13 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture do
     end
   end
 
-  defp upstream_base_url(options) do
-    value = Keyword.get(options, :upstream_base_url, @default_upstream_base_url)
-    uri = URI.parse(value)
-
-    if uri.scheme == "http" and uri.host in ["127.0.0.1", "localhost", "::1"] and
-         is_integer(uri.port) and is_nil(uri.userinfo) and is_nil(uri.query) and
-         is_nil(uri.fragment) and uri.path in [nil, "", "/"] do
-      {:ok, value |> String.trim_trailing("/")}
-    else
-      {:error, "upstream base URL must be an origin-only loopback HTTP URL with a port"}
-    end
-  end
-
-  defp request_compression_mode(options) do
-    case Keyword.get(options, :request_compression, :preserve) do
-      mode when mode in [:preserve, :enabled] -> {:ok, mode}
-      _mode -> {:error, "request compression mode must be :preserve or :enabled"}
-    end
-  end
+  defp upstream_base_url(options),
+    do: LocalTarget.upstream_base_url(Keyword.get(options, :upstream_base_url), @default_upstream_base_url)
 
   defp resolved_receipt_path(options) do
     case Keyword.fetch(options, :receipt_path) do
       {:ok, path} when is_binary(path) -> Path.expand(path)
-      :error -> receipt_path()
+      :error -> LocalTarget.receipt_path(receipt_path(), @receipt_root, Keyword.get(options, :target_database))
     end
   end
 

@@ -4,6 +4,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Logger 
   require Logger
 
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
+
+  # The owner-exit fence's fixed vocabularies (findings#327, findings#328,
+  # findings#329 row J): what a submission does with its turn when the owner
+  # it waits on exits, why, and how that owner went.
+  @exit_fence_decisions [:takeover, :settled]
+  @exit_fence_reasons [
+    :payload_unsent,
+    :reset_probe,
+    :owner_alive,
+    :exit_not_recoverable,
+    :payload_started,
+    :socket_turn,
+    :takeover_refused
+  ]
+  @owner_exit_classes [:killed, :noproc, :normal, :shutdown, :owner_crashed, :exception, :other]
 
   @spec owner_started(pid(), keyword()) :: :ok
   def owner_started(pid, opts) do
@@ -25,12 +41,43 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Logger 
     )
   end
 
-  @spec owner_stale_replaced(pid(), keyword()) :: :ok
-  def owner_stale_replaced(pid, opts) do
+  # `reuse_reason`: the owner answered as unfit (`answered_stale`), exited
+  # during the check (`owner_exited`), or did not answer in time and holds a
+  # lease the socket replaced (`lease_replaced`), has not started a renewal
+  # for longer than the lease TTL (`unresponsive`), or is registered with a
+  # value no owner writes (`unrecognized_registration`).
+  @spec owner_stale_replaced(pid(), keyword(), atom()) :: :ok
+  def owner_stale_replaced(pid, opts, reuse_reason) do
     owner_event(:info, "websocket owner stale replaced",
       codex_session_id: Keyword.get(opts, :codex_session_id),
       owner_instance_id: Keyword.get(opts, :owner_instance_id),
       owner_pid: pid,
+      reuse_reason: reuse_reason,
+      request_id: Keyword.get(opts, :request_id)
+    )
+  end
+
+  # A live owner that did not answer the reuse check within its call budget
+  # stays in place; the socket gets `owner_forward_timeout`
+  # (findings#285 row 270-247). The age is `none` for an owner still starting.
+  @spec owner_busy_left(pid(), keyword(), non_neg_integer() | nil) :: :ok
+  def owner_busy_left(pid, opts, last_renewal_age_ms) do
+    owner_event(:info, "websocket owner busy left in place",
+      codex_session_id: Keyword.get(opts, :codex_session_id),
+      owner_instance_id: Keyword.get(opts, :owner_instance_id),
+      owner_pid: pid,
+      owner_last_renewal_age_ms: last_renewal_age_ms || :none,
+      request_id: Keyword.get(opts, :request_id)
+    )
+  end
+
+  @spec owner_stale_killed(pid(), keyword(), pos_integer()) :: :ok
+  def owner_stale_killed(pid, opts, stop_budget_ms) do
+    owner_event(:warning, "websocket owner killed after its stop budget",
+      codex_session_id: Keyword.get(opts, :codex_session_id),
+      owner_instance_id: Keyword.get(opts, :owner_instance_id),
+      owner_pid: pid,
+      stop_budget_ms: stop_budget_ms,
       request_id: Keyword.get(opts, :request_id)
     )
   end
@@ -92,7 +139,173 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Logger 
     )
   end
 
+  # One line per turn whose owner exited under its submission
+  # (`WebsocketOwnerForwarder.do_submit_remote_owner_request/7`), on the
+  # owner's node: `takeover` hands the turn to a replacement owner, `settled`
+  # answers it without one, and `reason` says why. A refused takeover names
+  # its refusal from the owner error vocabulary (`other` outside it). Only
+  # internal correlators, never a provider identifier or a frame.
+  @spec owner_exit_fence(atom(), atom(), atom(), keyword()) :: :ok
+  def owner_exit_fence(decision, reason, owner_exit, fields)
+      when decision in @exit_fence_decisions and reason in @exit_fence_reasons and
+             owner_exit in @owner_exit_classes and is_list(fields) do
+    owner_event(:info, "websocket owner exit fence", [decision: decision, reason: reason, owner_exit: owner_exit] ++ Keyword.take(fields, [:refusal, :codex_session_id, :request_id, :attempt_id]))
+  end
+
+  # A different turn from the session's next socket retired the armed
+  # pre-visible replay (findings#206 row 206-348); `disposition` is `closed`
+  # when this call settled the interrupted request and `noop` when it was
+  # already settled (the entitlement expired first).
+  @spec replay_superseded(map(), map(), pos_integer(), :closed | :noop) :: :ok
+  def replay_superseded(state, armed, downstream_epoch, disposition) do
+    owner_event(:info, "websocket owner replay superseded",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      request_id: Map.get(armed.lifecycle, :request_id),
+      predecessor_epoch: armed.predecessor_epoch,
+      downstream_epoch: downstream_epoch,
+      disposition: disposition
+    )
+  end
+
+  # The socket that inherited a running visible turn at its attach sent another
+  # request, and the owner cancelled that turn as the socket's close would
+  # (findings#206 row 206-362).
+  @spec inherited_turn_taken_over(map(), pos_integer()) :: :ok
+  def inherited_turn_taken_over(state, downstream_epoch) do
+    owner_event(:info, "websocket owner inherited turn taken over",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      downstream_epoch: downstream_epoch
+    )
+  end
+
+  # The downstream's node became unreachable while its turn was still
+  # generating, no resend could rejoin that turn, and the owner cancelled it
+  # (findings#286).
+  @spec unreachable_downstream_turn_cancelled(map(), map()) :: :ok
+  def unreachable_downstream_turn_cancelled(state, downstream) do
+    owner_event(:info, "websocket owner cancelled the turn of an unreachable downstream",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      downstream_epoch: downstream_epoch(downstream)
+    )
+  end
+
+  # A turn kept for a resend after its downstream's node became unreachable
+  # showed its first output with nobody reattached, and the owner cancelled
+  # it (findings#290).
+  @spec unreachable_lost_turn_cancelled(map()) :: :ok
+  def unreachable_lost_turn_cancelled(state) do
+    owner_event(:info, "websocket owner cancelled a lost turn of an unreachable downstream at its first output",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self()
+    )
+  end
+
+  # The end of a forwarded generation could not be recorded (findings#290).
+  @spec generation_end_not_recorded(map(), String.t(), term()) :: :ok
+  def generation_end_not_recorded(state, reason, failure) do
+    owner_event(:warning, "websocket owner could not record a forwarded generation end",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      reason_code: reason,
+      failure: Metadata.safe_reason(failure)
+    )
+  end
+
+  # The retry of a collected compaction whose socket had closed took it over
+  # before that socket's own detach arrived, and was attached in its place
+  # (findings#206 row 206-454).
+  @spec closed_socket_collection_taken_over(map(), pos_integer(), pos_integer()) :: :ok
+  def closed_socket_collection_taken_over(state, closed_epoch, downstream_epoch) do
+    owner_event(:info, "websocket owner closed socket collection taken over",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      closed_downstream_epoch: closed_epoch,
+      downstream_epoch: downstream_epoch
+    )
+  end
+
+  # Why the owner did not tell its downstream that its upstream connection
+  # closed between requests (findings#270), in the order it checks them.
+  @upstream_close_skip_reasons [
+    :owner_invalidation,
+    :draining,
+    :no_downstream,
+    :downstream_replaced,
+    :downstream_closing,
+    :handoff,
+    :replay_armed,
+    :compaction,
+    :public_turn,
+    :turn_active,
+    :superseded_connection
+  ]
+
+  @doc false
+  @spec upstream_close_skip_reasons() :: [String.t()]
+  def upstream_close_skip_reasons, do: Enum.map(@upstream_close_skip_reasons, &Atom.to_string/1)
+
+  # The owner's upstream connection closed between requests and the owner
+  # did not tell its downstream. The same line and fields as the socket's
+  # (`CodexPoolerWeb.WebsocketConnectionLogger`), with `forwarding=on`, so a
+  # guard refusal that follows can be attributed through the closed
+  # connection's `lifecycle_id` and `generation`. A skip reason outside the
+  # owner's fixed vocabulary logs nothing.
+  @spec upstream_close_kept_open(%{cause: atom(), lifecycle_id: binary(), generation: pos_integer()}, atom(), binary() | nil) :: :ok
+  def upstream_close_kept_open(%{cause: cause, lifecycle_id: lifecycle_id, generation: generation}, skip_reason, codex_session_id)
+      when is_atom(cause) and skip_reason in @upstream_close_skip_reasons and is_integer(generation) do
+    Logger.info(
+      "websocket downstream kept open after upstream connection close " <>
+        "reason_code=#{cause} skip_reason=#{skip_reason} " <>
+        "lifecycle_id=#{DiagnosticTaxonomy.safe_correlator(lifecycle_id)} " <>
+        "generation=#{generation} forwarding=on " <>
+        "codex_session_id=#{DiagnosticTaxonomy.safe_correlator(codex_session_id)}"
+    )
+
+    :ok
+  end
+
+  def upstream_close_kept_open(_signal, _skip_reason, _codex_session_id), do: :ok
+
   @spec owner_exit_persistence_failure(atom(), map(), atom(), term()) :: :ok
+  # A later turn of the session (an HTTP fallback the owner never held) was
+  # already running when the owner exited, so the owner-scoped interrupt stood
+  # down on purpose and the lease stays with that turn: routine, not a failure
+  # (findings#225, row 225-85).
+  def owner_exit_persistence_failure(operation, state, owner_exit_reason, :superseded_owner_cleanup) do
+    Logger.info(
+      "websocket owner exit persistence superseded " <>
+        "codex_session_id=#{safe_log_value(state.codex_session_id)} " <>
+        "operation=#{operation} " <>
+        "owner_exit_reason=#{owner_exit_reason} " <>
+        "reason_code=replacement_turn_active"
+    )
+
+    :ok
+  end
+
+  # A takeover released the lease the owner held before it exited (findings#270
+  # row 270-313): the session is the new owner's, routine as well.
+  def owner_exit_persistence_failure(operation, state, owner_exit_reason, :taken_over_owner_cleanup) do
+    Logger.info(
+      "websocket owner exit persistence superseded " <>
+        "codex_session_id=#{safe_log_value(state.codex_session_id)} " <>
+        "operation=#{operation} " <>
+        "owner_exit_reason=#{owner_exit_reason} " <>
+        "reason_code=lease_taken_over"
+    )
+
+    :ok
+  end
+
   def owner_exit_persistence_failure(operation, state, owner_exit_reason, reason) do
     Logger.warning(
       "websocket owner exit persistence failed " <>

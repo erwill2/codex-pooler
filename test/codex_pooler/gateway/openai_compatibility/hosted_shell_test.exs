@@ -113,42 +113,84 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.HostedShellTest do
       assert_accepted(shell_call(%{"call_id" => identifier}))
       assert_accepted(shell_output(%{"call_id" => identifier}))
 
-      assert_accepted(
-        shell_call(%{"caller" => %{"type" => "program", "caller_id" => identifier}})
-      )
+      assert_accepted(shell_call(%{"caller" => %{"type" => "program", "caller_id" => identifier}}))
     end)
 
     for identifier <- ["", String.duplicate("x", 65), String.duplicate("🙂", 65)] do
       assert_rejected(shell_call(%{"call_id" => identifier}))
       assert_rejected(shell_output(%{"call_id" => identifier}))
 
-      assert_rejected(
-        shell_call(%{"caller" => %{"type" => "program", "caller_id" => identifier}})
-      )
+      assert_rejected(shell_call(%{"caller" => %{"type" => "program", "caller_id" => identifier}}))
     end
   end
 
   test "accepts 200 local skills and rejects 201" do
     skills = Enum.map(1..201, &skill("skill-#{&1}"))
 
-    assert_accepted(
-      shell_call(%{"environment" => %{"type" => "local", "skills" => Enum.take(skills, 200)}})
-    )
+    assert_accepted(shell_call(%{"environment" => %{"type" => "local", "skills" => Enum.take(skills, 200)}}))
 
     assert_rejected(shell_call(%{"environment" => %{"type" => "local", "skills" => skills}}))
   end
 
   @tag timeout: 120_000
+  @tag slow: "validates actual 10 MiB stdout and stderr boundary values and one-byte overflows"
   test "enforces stdout and stderr limits without materializing codepoint lists" do
     maximum = String.duplicate("x", 10_485_760)
     overflow = maximum <> "x"
 
-    assert_accepted(
-      shell_output(%{"output" => [output_chunk(maximum, maximum, exit_outcome(0))]})
-    )
+    assert_accepted(shell_output(%{"output" => [output_chunk(maximum, maximum, exit_outcome(0))]}))
 
     assert_rejected(shell_output(%{"output" => [output_chunk(overflow, "", exit_outcome(0))]}))
     assert_rejected(shell_output(%{"output" => [output_chunk("", overflow, exit_outcome(0))]}))
+  end
+
+  # The bound is code points, not bytes: two-byte text crosses the byte count
+  # of the limit at half the code points and must still be counted exactly.
+  @tag timeout: 120_000
+  @tag slow: "validates 10 million multibyte codepoints and the one-codepoint overflow without truncation"
+  test "enforces the output limit by code point when every code point is multi-byte" do
+    multibyte_maximum = String.duplicate("é", 10_485_760)
+    multibyte_overflow = multibyte_maximum <> "é"
+
+    assert_accepted(shell_output(%{"output" => [output_chunk(multibyte_maximum, "", exit_outcome(0))]}))
+
+    assert_rejected(shell_output(%{"output" => [output_chunk("", multibyte_overflow, exit_outcome(0))]}))
+  end
+
+  # Findings #119 item 5: a full-size output chunk used to cost ~400 ms of
+  # per-code-point scanning on the /v1 path. The claim is the work, not the
+  # runner's speed, so it is measured in reductions of this process, which a
+  # loaded scheduler does not change: classifying the chunk costs about one
+  # UTF-8 validity pass (1.50M reductions for 10 MiB), while a per-code-point
+  # walk adds about 10.9M and the old String.next_codepoint/1 scan about 37.9M.
+  test "classifies a 10 MiB output chunk with one validity pass instead of a per-code-point walk" do
+    stdout = String.duplicate("x", 10_485_760)
+    item = shell_output(%{"output" => [output_chunk(stdout, "", exit_outcome(0))]})
+
+    {validity_pass, true} = reductions(fn -> String.valid?(stdout, :fast_ascii) end)
+    {classification, result} = reductions(fn -> HostedShell.validate_item(item) end)
+
+    assert {:ok, ^item} = result
+
+    assert classification < 2 * validity_pass,
+           "10 MiB stdout classification took #{classification} reductions against #{validity_pass} for one validity pass"
+  end
+
+  test "rejects invalid UTF-8 in identifiers and output text" do
+    invalid_sequences = [
+      <<0xFF>>,
+      <<0xC3>>,
+      <<0xED, 0xA0, 0x80>>,
+      <<0xC0, 0x80>>,
+      "ok" <> <<0xFF>> <> "ok"
+    ]
+
+    Enum.each(invalid_sequences, fn bytes ->
+      assert_rejected(shell_call(%{"call_id" => bytes}))
+      assert_rejected(shell_call(%{"caller" => %{"type" => "program", "caller_id" => bytes}}))
+      assert_rejected(shell_output(%{"output" => [output_chunk(bytes, "", exit_outcome(0))]}))
+      assert_rejected(shell_output(%{"output" => [output_chunk("", bytes, exit_outcome(0))]}))
+    end)
   end
 
   test "rejects unknown keys at every object boundary including created_by" do
@@ -289,6 +331,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.HostedShellTest do
     do: %{"stdout" => stdout, "stderr" => stderr, "outcome" => outcome}
 
   defp exit_outcome(exit_code), do: %{"type" => "exit", "exit_code" => exit_code}
+
+  defp reductions(fun) do
+    {:reductions, before} = Process.info(self(), :reductions)
+    result = fun.()
+    {:reductions, after_call} = Process.info(self(), :reductions)
+    {after_call - before, result}
+  end
 
   defp assert_accepted(item), do: assert({:ok, ^item} = HostedShell.validate_item(item))
 

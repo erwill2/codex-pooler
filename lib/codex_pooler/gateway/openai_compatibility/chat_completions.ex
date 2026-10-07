@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   @moduledoc false
 
+  alias CodexPooler.Gateway.OpenAICompatibility.ChatCompletions.ToolArguments
   alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
@@ -8,7 +9,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   @spec normalize_response(map(), map()) :: map()
   def normalize_response(decoded, chat_payload) when is_map(decoded) do
     message = %{"role" => "assistant", "content" => output_text(decoded)}
-    message = put_if_present(message, "tool_calls", output_tool_calls(decoded))
+    calls = output_tool_calls(decoded)
+    calls = if calls, do: Enum.map(calls, &flat_custom_call(&1, flat_custom_names(chat_payload)))
+    message = put_if_present(message, "tool_calls", calls)
 
     %{
       "id" => response_id(decoded),
@@ -36,6 +39,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
           required(:service_tier) => String.t() | nil,
           required(:role_sent?) => boolean(),
           required(:visible_seen?) => boolean(),
+          required(:tool_call_seen?) => boolean(),
+          required(:tool_indexes) => %{optional(integer()) => non_neg_integer()},
+          required(:tool_arguments) => ToolArguments.t(),
+          required(:reconciliation_failed?) => boolean(),
+          required(:flat_custom_names) => MapSet.t(String.t()),
+          required(:flat_custom_indexes) => MapSet.t(non_neg_integer()),
           required(:terminal_seen?) => boolean(),
           required(:include_usage?) => boolean(),
           required(:discarding_oversized?) => boolean()
@@ -58,6 +67,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   def terminal_seen?(_state), do: false
 
+  @spec reconciliation_failed?(stream_state()) :: boolean()
+  def reconciliation_failed?(state), do: state.reconciliation_failed?
+
   @spec synthetic_terminal_failure_chunk(stream_state(), String.t()) ::
           {binary(), stream_state()}
   def synthetic_terminal_failure_chunk(state, message) when is_binary(message) do
@@ -70,7 +82,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       }
     }
 
-    chunk = ["data: ", Jason.encode!(payload), "\n\n"] |> IO.iodata_to_binary()
+    chunk = ["data: ", CodexPooler.JSON.encode!(payload), "\n\n"] |> IO.iodata_to_binary()
 
     {chunk, %{state | terminal_seen?: true}}
   end
@@ -207,7 +219,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   end
 
   defp normalize_stream_event("response.output_item.done", decoded, state) do
-    {[], sync_response_state(state, decoded)}
+    reconcile_tool_item(decoded["item"], decoded, sync_response_state(state, decoded))
+  end
+
+  defp normalize_stream_event("response.function_call_arguments.done", decoded, state) do
+    reconcile_tool_arguments(decoded, "function_call", "arguments", state)
+  end
+
+  defp normalize_stream_event("response.custom_tool_call_input.done", decoded, state) do
+    reconcile_tool_arguments(decoded, "custom_tool_call", "input", state)
   end
 
   defp normalize_stream_event("response.function_call_arguments.delta", decoded, state) do
@@ -227,8 +247,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
       terminal_event?(type) ->
         state = sync_response_state(state, decoded)
-        {data, state} = terminal_stream_chunk(type, decoded, state)
-        {data, %{state | terminal_seen?: true}}
+        {snapshots, state} = reconcile_completed_tools(type, decoded, state)
+
+        if state.reconciliation_failed? do
+          {snapshots, state}
+        else
+          {data, state} = terminal_stream_chunk(type, decoded, state)
+          {[snapshots, data], %{state | terminal_seen?: true}}
+        end
 
       moderation = moderation_metadata(decoded) ->
         moderation_stream_chunk(moderation, sync_response_state(state, decoded))
@@ -276,7 +302,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     do: {chat_sse_chunk(%{"content" => delta}, nil, state), mark_visible(state)}
 
   defp tool_call_item_chunk(%{"type" => "function_call"} = item, context, state) do
-    index = tool_call_index(item, context)
+    state = %{state | tool_call_seen?: true}
+    {index, state} = chat_tool_index(tool_call_index(item, context), state)
+    state = track_tool_item(state, index, item, "arguments")
 
     delta = %{
       "tool_calls" => [
@@ -296,7 +324,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   end
 
   defp tool_call_item_chunk(%{"type" => "custom_tool_call"} = item, context, state) do
-    index = tool_call_index(item, context)
+    state = %{state | tool_call_seen?: true}
+    {index, state} = chat_tool_index(tool_call_index(item, context), state)
+    state = track_tool_item(state, index, item, "input")
+
+    state =
+      if MapSet.member?(state.flat_custom_names, item["name"]),
+        do: %{state | flat_custom_indexes: MapSet.put(state.flat_custom_indexes, index)},
+        else: state
 
     delta = %{
       "tool_calls" => [
@@ -317,8 +352,91 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   defp tool_call_item_chunk(_item, _context, state), do: {[], state}
 
+  defp track_tool_item(state, index, item, field) do
+    tracked = ToolArguments.register(state.tool_arguments, index, item, decoded_string(item, field) || "")
+    %{state | tool_arguments: tracked}
+  end
+
+  defp track_tool_delta(state, index, delta),
+    do: %{state | tool_arguments: ToolArguments.append(state.tool_arguments, index, delta)}
+
+  defp reconcile_tool_arguments(%{"output_index" => output_index, "item_id" => item_id} = decoded, type, field, state)
+       when is_integer(output_index) and output_index >= 0 and is_binary(item_id) and item_id != "" do
+    with {:ok, index} <- Map.fetch(state.tool_indexes, output_index),
+         value when is_binary(value) <- decoded[field] do
+      reconcile_tool_snapshot(index, %{"type" => type, "id" => item_id}, value, state)
+    else
+      _unidentified -> {[], state}
+    end
+  end
+
+  defp reconcile_tool_arguments(_decoded, _type, _field, state), do: {[], state}
+
+  defp reconcile_tool_item(%{"type" => type} = item, %{"output_index" => output_index} = context, state)
+       when type in ["function_call", "custom_tool_call"] and is_integer(output_index) and output_index >= 0 do
+    field = if type == "function_call", do: "arguments", else: "input"
+
+    case {Map.fetch(state.tool_indexes, output_index), decoded_string(item, field)} do
+      {{:ok, index}, value} when is_binary(value) ->
+        reconcile_tool_snapshot(index, Map.take(item, ~w(type id call_id name)), value, state)
+
+      {:error, value} when is_binary(value) ->
+        if complete_tool_identity?(item), do: tool_call_item_chunk(item, context, state), else: {[], state}
+
+      _incomplete ->
+        {[], state}
+    end
+  end
+
+  defp reconcile_tool_item(_item, _context, state), do: {[], state}
+
+  defp complete_tool_identity?(item),
+    do: Enum.all?(~w(id call_id name), &(is_binary(item[&1]) and item[&1] != ""))
+
+  defp reconcile_tool_snapshot(index, identity, value, state) do
+    case ToolArguments.reconcile(state.tool_arguments, index, identity, value) do
+      {:ok, "", tracked} ->
+        {[], %{state | tool_arguments: tracked}}
+
+      {:ok, suffix, tracked} ->
+        state = %{state | tool_arguments: tracked}
+        field = if identity["type"] == "function_call", do: "function", else: "custom"
+        argument = if field == "function", do: "arguments", else: "input"
+        delta = %{"tool_calls" => [%{"index" => index, field => %{argument => suffix}}]}
+        {chat_sse_chunk(delta, nil, state), mark_visible(state)}
+
+      :unknown ->
+        {[], state}
+
+      {:error, :inconsistent_snapshot} ->
+        synthetic_terminal_failure_chunk(%{state | reconciliation_failed?: true}, "upstream tool call snapshot is inconsistent")
+    end
+  end
+
+  defp reconcile_completed_tools("response.completed", decoded, state) do
+    case response_map(decoded)["output"] do
+      output when is_list(output) ->
+        output
+        |> Enum.with_index()
+        |> Enum.reduce_while({[], state}, &reconcile_completed_tool/2)
+
+      _no_output ->
+        {[], state}
+    end
+  end
+
+  defp reconcile_completed_tools(_type, _decoded, state), do: {[], state}
+
+  defp reconcile_completed_tool({item, index}, {chunks, state}) do
+    {chunk, state} = reconcile_tool_item(item, %{"output_index" => index}, state)
+    result = {[chunks, chunk], state}
+    if state.reconciliation_failed?, do: {:halt, result}, else: {:cont, result}
+  end
+
   defp tool_call_arguments_chunk(decoded, state) do
-    index = Map.get(decoded, "output_index") || 0
+    state = %{state | tool_call_seen?: true}
+    {index, state} = chat_tool_index(Map.get(decoded, "output_index") || 0, state)
+    state = track_tool_delta(state, index, decoded_string(decoded, "delta") || "")
 
     delta = %{
       "tool_calls" => [
@@ -333,7 +451,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   end
 
   defp custom_tool_call_input_chunk(decoded, state) do
-    index = Map.get(decoded, "output_index") || 0
+    state = %{state | tool_call_seen?: true}
+    {index, state} = chat_tool_index(Map.get(decoded, "output_index") || 0, state)
+    state = track_tool_delta(state, index, decoded_string(decoded, "delta") || "")
 
     delta = %{
       "tool_calls" => [
@@ -350,7 +470,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   defp terminal_stream_chunk(type, decoded, %{role_sent?: false} = state)
        when type in ["response.failed", "error"] do
     state = sync_response_state(state, decoded)
-    {["data: ", Jason.encode!(%{"error" => public_error(decoded)}), "\n\n"], state}
+    {["data: ", CodexPooler.JSON.encode!(%{"error" => public_error(decoded)}), "\n\n"], state}
   end
 
   defp terminal_stream_chunk(_type, decoded, state), do: terminal_stream_chunk(decoded, state)
@@ -362,7 +482,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   defp terminal_stream_chunk(decoded, state) do
     response = response_map(decoded)
-    finish_reason = finish_reason(response)
+    finish_reason = finish_reason(response, state.tool_call_seen?)
 
     {[
        chat_sse_chunk(%{}, finish_reason, state),
@@ -383,10 +503,23 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       }
       |> put_if_present("service_tier", state.service_tier)
 
-    {["data: ", Jason.encode!(payload), "\n\n"], mark_visible(state)}
+    {["data: ", CodexPooler.JSON.encode!(payload), "\n\n"], mark_visible(state)}
   end
 
   defp chat_sse_chunk(delta, finish_reason, state) do
+    delta =
+      case delta do
+        %{"tool_calls" => calls} ->
+          Map.put(
+            delta,
+            "tool_calls",
+            Enum.map(calls, &stream_custom_call(&1, state))
+          )
+
+        _ ->
+          delta
+      end
+
     payload =
       %{
         "id" => state.id,
@@ -403,7 +536,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       }
       |> put_if_present("service_tier", state.service_tier)
 
-    ["data: ", Jason.encode!(payload), "\n\n"]
+    ["data: ", CodexPooler.JSON.encode!(payload), "\n\n"]
   end
 
   defp initial_state(chat_payload) do
@@ -416,6 +549,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       service_tier: nil,
       role_sent?: false,
       visible_seen?: false,
+      tool_call_seen?: false,
+      tool_indexes: %{},
+      tool_arguments: %{},
+      reconciliation_failed?: false,
+      flat_custom_names: flat_custom_names(chat_payload),
+      flat_custom_indexes: MapSet.new(),
       terminal_seen?: false,
       include_usage?: get_in(chat_payload, ["stream_options", "include_usage"]) == true,
       discarding_oversized?: false
@@ -436,7 +575,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
           }
           |> put_if_present("service_tier", state.service_tier)
 
-        ["data: ", Jason.encode!(payload), "\n\n"]
+        ["data: ", CodexPooler.JSON.encode!(payload), "\n\n"]
 
       _usage ->
         []
@@ -540,6 +679,36 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     end
   end
 
+  defp flat_custom_names(payload) do
+    payload
+    |> Map.get("tools", [])
+    |> Enum.flat_map(fn
+      %{"type" => "custom", "name" => name} when is_binary(name) -> [name]
+      _ -> []
+    end)
+    |> MapSet.new()
+  end
+
+  defp flat_custom_call(call, names, force? \\ false)
+
+  defp flat_custom_call(%{"custom" => custom} = call, names, force?) do
+    if force? or MapSet.member?(names, custom["name"]) do
+      function = custom |> Map.take(["name"]) |> Map.put("arguments", custom["input"] || "")
+      call = call |> Map.delete("custom") |> Map.put("function", function)
+      if Map.has_key?(call, "type"), do: Map.put(call, "type", "function"), else: call
+    else
+      call
+    end
+  end
+
+  defp flat_custom_call(call, _names, _force?), do: call
+
+  defp stream_custom_call(call, state) do
+    if MapSet.member?(state.flat_custom_indexes, call["index"]),
+      do: flat_custom_call(call, state.flat_custom_names, true),
+      else: call
+  end
+
   defp output_items(decoded) do
     decoded
     |> response_map()
@@ -561,14 +730,27 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
           "prompt_tokens" => prompt_tokens,
           "prompt_tokens_details" => Map.get(usage, "prompt_tokens_details"),
           "completion_tokens" => completion_tokens,
-          "total_tokens" =>
-            Map.get(usage, "total_tokens") || total_tokens(prompt_tokens, completion_tokens)
+          "total_tokens" => Map.get(usage, "total_tokens") || total_tokens(prompt_tokens, completion_tokens)
         }
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()
+        |> maybe_put_compute_units(usage)
 
       _usage ->
         nil
+    end
+  end
+
+  defp maybe_put_compute_units(projected, usage) do
+    case Map.fetch(usage, "compute_units") do
+      {:ok, nil} ->
+        Map.put(projected, "compute_units", nil)
+
+      {:ok, value} when is_integer(value) and value >= 0 ->
+        Map.put(projected, "compute_units", value)
+
+      _ ->
+        projected
     end
   end
 
@@ -578,10 +760,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   defp total_tokens(_prompt_tokens, _completion_tokens), do: nil
 
-  defp finish_reason(decoded) do
+  defp finish_reason(decoded, tool_call_seen? \\ false) do
     status = decoded_string(decoded, "status")
+    tool_call_seen? = tool_call_seen? or not is_nil(output_tool_calls(decoded))
 
     cond do
+      status in [nil, "completed"] and tool_call_seen? -> "tool_calls"
       status in [nil, "completed", "in_progress"] -> "stop"
       status == "incomplete" -> incomplete_finish_reason(decoded)
       status == "failed" -> "stop"
@@ -624,6 +808,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   defp tool_call_index(%{"output_index" => index}, _context) when is_integer(index), do: index
   defp tool_call_index(_item, %{"output_index" => index}) when is_integer(index), do: index
   defp tool_call_index(_item, _context), do: 0
+
+  defp chat_tool_index(output_index, state) do
+    case Map.fetch(state.tool_indexes, output_index) do
+      {:ok, index} ->
+        {index, state}
+
+      :error ->
+        index = map_size(state.tool_indexes)
+        {index, %{state | tool_indexes: Map.put(state.tool_indexes, output_index, index)}}
+    end
+  end
 
   defp effective_stream_type(event_type, data_type)
        when is_binary(event_type) and is_binary(data_type) and event_type != data_type,

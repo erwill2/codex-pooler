@@ -8,16 +8,276 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
   alias CodexPooler.Accounting.Reporting
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Admin.UpstreamCircuitReadiness
+  alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
+  alias CodexPooler.Jobs
+  alias CodexPooler.Jobs.SavedResetRedemptionWorker
+  alias CodexPooler.Pools.OperatorPoolAssignment
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.Windows
+  alias CodexPooler.Upstreams.Reconciliation.UsagePollCooldown
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
+  alias CodexPooler.Upstreams.Secrets
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.TokenBurnProjection
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
+  alias CodexPoolerWeb.DateTimeDisplay
 
   setup :register_and_log_in_user
+
+  test "equivalent_scoped_operation_snapshots keep a new request separate from the retained account result", %{scope: scope} do
+    pool = pool_fixture()
+    consumed_at = DateTime.add(DateTime.utc_now(), -600, :second)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 2,
+          "token_refresh" => %{"status" => "imported"},
+          "saved_resets" => %{"status" => "reported", "available_count" => 2},
+          "saved_reset_redemption" => %{
+            "status" => "succeeded",
+            "phase" => "confirmed_by_quota",
+            "generation" => 4,
+            "consumed_at" => DateTime.to_iso8601(consumed_at),
+            "result" => %{"applied" => true, "code" => "reset", "body" => "private-result-sentinel"}
+          }
+        }
+      })
+
+    assert {:ok, _secret} = Secrets.store_encrypted_secret(identity, %{secret_kind: "access_token", plaintext: "synthetic-test-secret"})
+    prefs = DateTimeDisplay.preferences_for_user(scope.user)
+    [before_request] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [identity.id]}, prefs)
+    assert before_request.saved_reset_redemption_action.available?
+    job = insert_saved_reset_request(assignment)
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [identity.id]}, prefs)
+    {cockpit_result, cockpit_queries} = count_repo_sources(fn -> UpstreamCockpitReadModel.load_visible_without_request_metrics(scope, identity.id) end)
+    assert {:ok, cockpit} = cockpit_result
+    assert Map.get(cockpit_queries, "requests", 0) == 0
+    assert Map.get(cockpit_queries, "attempts", 0) == 0
+    assert Map.drop(account.saved_reset_operation, [:last_checked_at]) == Map.drop(cockpit.saved_reset_operation, [:last_checked_at])
+    assert is_binary(account.saved_reset_operation.last_checked_at)
+    assert is_binary(cockpit.saved_reset_operation.last_checked_at)
+    assert account.saved_reset_operation.request.state == :queued
+    assert account.saved_reset_operation.provider_outcome == :applied
+    assert account.saved_reset_operation.verification == :quota_confirmed
+    assert account.saved_reset_operation.show_latest_receipt?
+    assert account.saved_reset_operation.serving_readiness == account.routing_readiness
+    assert account.quota_readiness == before_request.quota_readiness
+    assert account.routing_readiness == before_request.routing_readiness
+    assert account.quota_limits == before_request.quota_limits
+    refute account.saved_reset_redemption_action.available?
+    assert cockpit.actions.redeem_saved_reset == account.saved_reset_redemption_action
+    refute inspect(account.saved_reset_operation) =~ "private-result-sentinel"
+    refute inspect(cockpit.saved_reset_operation) =~ "manual_request_target"
+    assert cockpit.saved_reset_refresh_cursor == account.saved_reset_refresh_cursor
+    refute account.saved_reset_refresh_cursor.request_generation == before_request.saved_reset_refresh_cursor.request_generation
+
+    Repo.delete!(job)
+    [pruned] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [identity.id]}, prefs)
+    assert {:ok, pruned_cockpit} = UpstreamCockpitReadModel.load_visible_without_request_metrics(scope, identity.id)
+    assert Map.drop(pruned.saved_reset_operation, [:last_checked_at]) == Map.drop(pruned_cockpit.saved_reset_operation, [:last_checked_at])
+    assert pruned.saved_reset_operation.request.state == :none
+    assert pruned.saved_reset_operation.provider_outcome == :applied
+    assert pruned.saved_reset_operation.verification == :quota_confirmed
+    assert pruned.saved_reset_operation.show_latest_receipt?
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "equivalent_scoped_operation_snapshots", queued: account.saved_reset_operation, pruned: pruned.saved_reset_operation, readiness_unchanged: true, equivalent: true}))
+  end
+
+  test "read_model_visibility_and_no_network revalidates an assigned operator and preserves readiness", %{scope: owner_scope} do
+    %{user: operator} = operator_fixture(owner_scope)
+    pool = pool_fixture()
+    operator_pool_assignment_fixture(operator, pool)
+    operator_scope = Scope.for_user(operator)
+    {:ok, fake} = FakeUpstream.start_link({:json_response, 500, %{"error" => "private-provider-sentinel"}})
+    on_exit(fn -> FakeUpstream.stop(fake) end)
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool, %{identity_metadata: %{"usage_base_url" => FakeUpstream.url(fake)}})
+    job = insert_saved_reset_request(assignment)
+    job |> Ecto.Changeset.change(errors: [%{"error" => "private-job-sentinel"}]) |> Repo.update!()
+    [before_request] = UpstreamAccountsReadModel.list_visible_accounts(operator_scope, [pool])
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible_without_request_metrics(operator_scope, identity.id)
+    assert cockpit.saved_reset_operation.request.state == :queued
+    assert cockpit.quota_readiness == before_request.quota_readiness
+    assert Jobs.list_latest_jobs(operator_scope) == []
+    refute inspect(cockpit) =~ "private-job-sentinel"
+    refute inspect(cockpit) =~ "private-provider-sentinel"
+
+    import Ecto.Query
+
+    from(row in OperatorPoolAssignment, where: row.user_id == ^operator.id)
+    |> Repo.update_all(set: [status: "revoked"])
+
+    assert UpstreamAccountsReadModel.list_visible_accounts(operator_scope, [pool], %{identity_ids: [identity.id]}) == []
+    assert :error = UpstreamCockpitReadModel.load_visible_without_request_metrics(operator_scope, identity.id)
+    assert FakeUpstream.requests(fake) == []
+    counts = FakeUpstream.physical_counts(fake)
+    assert Enum.all?(Map.values(counts), &(&1 == 0))
+    assert :ok = FakeUpstream.stop(fake)
+    refute Process.alive?(fake.supervisor)
+    refute Process.alive?(fake.server)
+    refute Process.alive?(fake.pid)
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "read_model_visibility_and_no_network", revoked_list_empty: true, revoked_cockpit_error: true, physical_counts: counts, system_jobs_visible: false, owned_fake_stopped: true}))
+  end
+
+  test "pending reset composition keeps last verified quota and the existing provider pause", %{scope: scope} do
+    pool = pool_fixture()
+    now = DateTime.utc_now()
+    consumed_at = DateTime.add(now, -60, :second)
+    canonical_at = DateTime.add(consumed_at, -60, :second)
+    pause_until = DateTime.add(now, 120, :second)
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          "saved_reset_redemption" => %{
+            "status" => "redeeming",
+            "phase" => "consumed_pending_probe",
+            "generation" => 1,
+            "consumed_at" => DateTime.to_iso8601(consumed_at),
+            "deadline_at" => DateTime.to_iso8601(DateTime.add(now, 600, :second)),
+            "result" => %{"applied" => true, "code" => "reset"}
+          }
+        }
+      })
+
+    assert {:ok, [_]} = Windows.upsert_quota_windows(identity, [quota_projection_window_attrs(canonical_at, "Weekly")])
+    origin = UsagePollCooldown.origin_key("https://usage.example.com/api/codex/usage")
+    assert {:ok, ^pause_until} = UsagePollCooldown.record(identity.id, UsagePollCooldown.current_scope(identity), origin, 429, pause_until, now)
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [identity.id]})
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible_without_request_metrics(scope, identity.id)
+    assert account.saved_reset_operation.provider_outcome == :applied
+    assert account.saved_reset_operation.verification == :pending
+    assert account.saved_reset_operation.usage_poll_pause.state == :paused
+    assert account.saved_reset_operation.pause_until == account.usage_poll_pause.paused_until_label
+    assert Map.drop(account.saved_reset_operation, [:last_checked_at]) == Map.drop(cockpit.saved_reset_operation, [:last_checked_at])
+    weekly = Enum.find(account.quota_limits, &(&1.key == :weekly))
+    assert Decimal.equal?(weekly.percent, 0)
+    assert weekly.saved_reset_context.role == :last_verified
+    assert weekly.saved_reset_context.label == "Last verified quota"
+    refute weekly.saved_reset_context.candidate?
+    assert account.saved_reset_operation.serving_readiness == account.routing_readiness
+    refute account.quota_readiness.routing_ready_now?
+    assert cockpit.quota_limits == account.quota_limits
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "pending_quota_pause_composition", operation: Map.drop(account.saved_reset_operation, [:serving_readiness]), quota: Map.take(weekly, [:key, :percent, :reset_at, :saved_reset_context]), readiness: Map.take(account.routing_readiness, [:state, :routing_ready_now?, :reason_code]), readiness_unchanged: true}))
+  end
+
+  test "trusted batch identity filter narrows before projection and keeps one request summary query", %{scope: scope} do
+    pool = pool_fixture()
+
+    identities =
+      for _index <- 1..20 do
+        %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+        insert_saved_reset_request(assignment)
+        identity
+      end
+
+    ids = Enum.map(identities, & &1.id)
+    {single, single_queries} = capture_saved_reset_batch_queries(fn -> UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [hd(ids)]}) end)
+    {batch, batch_queries} = capture_saved_reset_batch_queries(fn -> UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: ids}) end)
+    assert length(single) == 1
+    assert length(batch) == 20
+    assert single_queries == 1
+    assert batch_queries == 1
+    assert Enum.all?(batch, &(&1.saved_reset_operation.request.state == :queued))
+    assert UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: []}) == []
+    assert UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: "malformed"}) == []
+    assert UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [hd(ids) | :malformed]}) == []
+    assert length(UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{"identity_ids" => []})) == 20
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(%{scenario: "constant_request_batch", single_accounts: length(single), batch_accounts: length(batch), single_query_count: single_queries, batch_query_count: batch_queries}))
+  end
+
+  defp insert_saved_reset_request(assignment) do
+    args = %{"trigger_kind" => "admin_manual", "pool_upstream_assignment_id" => assignment.id, "manual_request_target" => %{"pool_id" => assignment.pool_id, "upstream_identity_id" => assignment.upstream_identity_id}}
+    args |> SavedResetRedemptionWorker.new(unique: false) |> Oban.insert!()
+  end
+
+  defp capture_saved_reset_batch_queries(fun) do
+    parent = self()
+    handler = {__MODULE__, make_ref()}
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if self() == parent and is_binary(metadata[:query]) and String.contains?(metadata.query, "row_number()") and String.contains?(metadata.query, "oban_jobs") do
+            send(parent, {handler, :batch_query})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_saved_reset_batch_queries(handler, 0)}
+    after
+      :telemetry.detach(handler)
+    end
+  end
+
+  defp drain_saved_reset_batch_queries(handler, count) do
+    receive do
+      {^handler, :batch_query} -> drain_saved_reset_batch_queries(handler, count + 1)
+    after
+      0 -> count
+    end
+  end
+
+  test "Spark-only readiness survives account and cockpit projections", %{scope: scope} do
+    as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    pool = pool_fixture()
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:blocked, as_of, 1)
+        }
+      })
+
+    model_fixture(pool, %{
+      exposed_model_id: "gpt-5.3-codex-spark",
+      metadata: %{"source_assignment_models" => %{assignment.id => %{}}}
+    })
+
+    spark =
+      quota_projection_window_attrs(as_of, "Spark")
+      |> Map.merge(%{
+        quota_key: "codex_bengalfox",
+        quota_scope: "model",
+        quota_family: "codex_model",
+        model: "gpt-5.3-codex-spark",
+        upstream_model: "gpt-5.3-codex-spark",
+        raw_metered_feature: "codex_bengalfox",
+        used_percent: Decimal.new(0),
+        metadata: %{
+          "independent_spark_permission" => true,
+          "independent_spark_permission_observed_at" => DateTime.to_iso8601(as_of),
+          "independent_spark_permission_reset_at" => as_of |> DateTime.add(6, :day) |> DateTime.to_iso8601(),
+          "rate_limit_allowed" => true,
+          "rate_limit_reached" => false
+        }
+      })
+
+    assert {:ok, [_]} = Windows.upsert_quota_windows(identity, [spark])
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    assert account.routing_readiness.state == "model_limited"
+    refute account.quota_readiness.routing_ready_now?
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+
+    assert [%{routing_usable?: true, routing_readiness_state: "model_limited"}] =
+             cockpit.charts.pool_contribution.items
+
+    assert [%{routing_usable?: true, routing_readiness_state: "model_limited"}] =
+             cockpit.charts.quota_health.items
+
+    metrics = UpstreamCockpitReadModel.request_metrics(scope, cockpit)
+    assert [%{routing_usable?: true}] = metrics.pool_contribution.items
+  end
 
   test "account snapshot preserves fresh provider availability without fabricating quota rows", %{
     scope: scope
@@ -30,20 +290,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
         account_label: "Example Available Without Windows",
         identity_metadata: %{
           "credential_epoch" => 1,
-          AccountAvailabilityStore.metadata_key() =>
-            AccountAvailabilityStore.encode!(:available, as_of, 1)
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
         }
       })
 
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
 
     assert account.identity.id == identity.id
-    assert account.quota_readiness.state == "provider_available_no_windows"
-    assert account.quota_readiness.label == "Provider available"
+    assert account.quota_readiness.capacity_basis == :unknown_legacy
+    assert account.quota_readiness.conditional?
     assert account.quota_readiness.tone == :warning
     assert account.quota_readiness.routing_ready_now?
     assert account.quota_limits |> Enum.all?(&is_nil(&1.reset_at))
-    projected = Map.drop(account, [:identity])
+    projected = Map.drop(account, [:identity, :saved_reset_refresh_cursor])
+    assert account.saved_reset_refresh_cursor.credential_epoch == 1
     refute inspect(projected) =~ AccountAvailabilityStore.metadata_key()
     refute inspect(projected) =~ "credential_epoch"
 
@@ -347,8 +607,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
            ]) ==
              %{
                label: "x1",
-               title:
-                 "last 5m: 20 tokens; previous 1h: 0 tokens; settled usage reported for 1 of 2 requests; 1 usage record missing",
+               title: "last 5m: 20 tokens; previous 1h: 0 tokens; settled usage reported for 1 of 2 requests; 1 usage record missing",
                usage_state: :partial,
                recent_requests: 2,
                known_request_count: 1,
@@ -668,9 +927,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
         hidden_assignment: hidden_assignment.id
       )
 
-    assert [%{assignments: [snapshot]}] = accounts
+    assert [%{assignments: [snapshot]} = account] = accounts
     assert snapshot.pool_id == visible_pool.id
     assert Enum.map(snapshot.models, & &1.exposed_model_id) == ["gpt-example-visible"]
+    refute account.can_manage_provider_credits?
+
+    [owner_account] = UpstreamAccountsReadModel.list_visible_accounts(owner_scope, [visible_pool])
+    assert owner_account.can_manage_provider_credits?
 
     assert [
              %{
@@ -751,6 +1014,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
     projection = inspect(accounts)
     refute projection =~ hidden_identity.id
     refute projection =~ hidden_sentinel
+  end
+
+  test "a malformed saved reset redemption value reads as an unknown outcome instead of failing the page", %{conn: conn, scope: scope} do
+    pool = pool_fixture(%{created_by_user_id: scope.user.id})
+    %{identity: identity} = upstream_assignment_fixture(pool, %{identity_metadata: %{"saved_reset_redemption" => "malformed-redemption-value"}})
+    prefs = DateTimeDisplay.preferences_for_user(scope.user)
+
+    assert [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool], %{identity_ids: [identity.id]}, prefs)
+    assert account.saved_reset_refresh_cursor.lifecycle_generation == nil
+    assert account.saved_reset_operation.provider_outcome == :unknown
+    refute account.saved_reset_operation.show_latest_receipt?
+    refute inspect(account.saved_reset_operation) =~ "malformed-redemption-value"
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+    assert has_element?(view, "#upstream-account-#{identity.id}")
   end
 
   test "identity filter narrows the account snapshot after fleet model inventory", %{scope: scope} do
@@ -1072,7 +1350,44 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
     assert Map.get(filtered_queries, "routing_circuit_states", 0) == 0
   end
 
-  test "size-one account load issues one authorized circuit query with constant reads", %{
+  test "owner fleet view keeps unassigned accounts while a Pool filter excludes them", %{
+    scope: scope
+  } do
+    pool = pool_fixture(%{name: "Assigned Pool"})
+    %{identity: assigned} = upstream_assignment_fixture(pool, %{account_label: "Assigned"})
+    unassigned = active_upstream_identity_fixture(%{account_label: "Unassigned"})
+
+    accounts = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+
+    assert Enum.map(accounts, & &1.identity.id) == [assigned.id, unassigned.id]
+    assert Enum.find(accounts, &(&1.identity.id == unassigned.id)).assignments == []
+
+    assert [%{identity: %{id: assigned_id}}] =
+             UpstreamAccountsReadModel.list_visible_accounts(
+               scope,
+               [pool],
+               %{"pool_id" => pool.id}
+             )
+
+    assert assigned_id == assigned.id
+  end
+
+  test "unassigned account detail disables assignment-dependent actions", %{scope: scope} do
+    identity = active_upstream_identity_fixture(%{account_label: "Detached account"})
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assert cockpit.assignments.empty?
+
+    reason = "Assign this account to a Pool before using account actions."
+
+    for action <- [:rename, :pause, :reactivate, :refresh_token] do
+      assert %{available?: false, reason: ^reason} = Map.fetch!(cockpit.actions, action)
+    end
+
+    assert %{available?: true, reason: nil} = cockpit.actions.delete
+  end
+
+  test "size-one account load keeps the circuit batch authorized", %{
     scope: scope
   } do
     pool = pool_fixture()
@@ -1091,22 +1406,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
 
     assert [%{assignments: [%{id: assignment_id}]}] = accounts
     assert assignment_id == assignment.id
-    assert source_count(query_events, "models") == 1
-    assert source_count(query_events, "ledger_entries") == 2
 
-    assert [
-             %{
-               parameter_count: 1,
-               parameter_membership: %{authorized_assignment: true},
-               query_shape_signature: query_shape_signature
-             }
-           ] = source_events(query_events, "routing_circuit_states")
-
-    assert byte_size(query_shape_signature) == 64
-    refute query_shape_signature == String.duplicate("0", 64)
+    assert [%{parameter_membership: %{authorized_assignment: true}}] =
+             source_events(query_events, "routing_circuit_states")
   end
 
-  test "added model reads stay constant as assignment and model counts grow", %{
+  test "model, circuit and credit-policy reads stay constant as authorized assignments grow", %{
     scope: scope
   } do
     observations =
@@ -1127,6 +1432,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
 
         pools = Enum.map(pool_assignments, &elem(&1, 0))
         expected_identity_ids = MapSet.new(pool_assignments, &elem(&1, 1).id)
+        expected_assignment_ids = MapSet.new(pool_assignments, &elem(&1, 2).id)
+        expected_model_ids = MapSet.new(1..size, &"gpt-example-read-model-#{size}-#{&1}")
 
         parameter_probes =
           pool_assignments
@@ -1141,29 +1448,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
             parameter_probes
           )
 
-        assert length(accounts) == size
-        assert MapSet.new(accounts, & &1.identity.id) == expected_identity_ids
-        assert source_count(query_events, "pool_upstream_assignments") == 1
-        assert source_count(query_events, "models") == 1
-        assert source_count(query_events, "ledger_entries") == 2
+        assigned_accounts = Enum.reject(accounts, &(&1.assignments == []))
 
-        assert [
-                 %{
-                   parameter_count: 1,
-                   parameter_membership: parameter_membership,
-                   query_shape_signature: query_shape_signature
-                 }
-               ] = source_events(query_events, "routing_circuit_states")
+        assert length(assigned_accounts) == size
+        assert MapSet.new(assigned_accounts, & &1.identity.id) == expected_identity_ids
+        assert Enum.all?(assigned_accounts, & &1.can_manage_provider_credits?)
+
+        loaded_assignments = Enum.flat_map(assigned_accounts, & &1.assignments)
+        assert MapSet.new(loaded_assignments, & &1.id) == expected_assignment_ids
+
+        loaded_models = Enum.flat_map(loaded_assignments, & &1.models)
+        assert MapSet.new(loaded_models, & &1.exposed_model_id) == expected_model_ids
+
+        assert [%{parameter_membership: parameter_membership}] =
+                 source_events(query_events, "routing_circuit_states")
 
         assert map_size(parameter_membership) == size
         assert Enum.all?(parameter_membership, fn {_label, present?} -> present? end)
-        assert byte_size(query_shape_signature) == 64
-        refute query_shape_signature == String.duplicate("0", 64)
 
-        query_shape_signature
+        query_events
+        |> Enum.frequencies_by(& &1.source)
+        |> Map.take(["pools", "pool_upstream_assignments", "models", "ledger_entries", "routing_circuit_states"])
       end
 
-    assert length(Enum.uniq(observations)) == 1
+    [single_assignment_reads, fifty_assignment_reads] = observations
+    assert single_assignment_reads == fifty_assignment_reads
   end
 
   defp count_repo_sources(fun) do
@@ -1193,12 +1502,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
     parent = self()
     handler_id = "upstream-read-model-query-count-#{System.unique_integer([:positive])}"
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
         [:codex_pooler, :repo, :query],
         fn _event, _measurements, metadata, _config ->
-          if metadata[:repo] == Repo and is_binary(metadata[:source]) do
+          if self() == parent and metadata[:repo] == Repo and is_binary(metadata[:source]) do
             send(parent, {handler_id, repo_query_event(metadata, parameter_probes)})
           end
         end,
@@ -1277,24 +1589,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
 
     %{
       source: metadata.source,
-      query_shape_signature: query_shape_signature(metadata[:query]),
-      parameter_count: length(params),
       parameter_membership:
         Map.new(parameter_probes, fn {label, value} ->
           {label, parameter_member?(params, value)}
         end)
     }
   end
-
-  defp query_shape_signature(query) when is_binary(query) do
-    query
-    |> String.replace(~r/\s+/, " ")
-    |> String.trim()
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
-  end
-
-  defp query_shape_signature(_query), do: String.duplicate("0", 64)
 
   defp parameter_member?(params, value) do
     candidates =
@@ -1311,10 +1611,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
       nested when is_list(nested) -> parameter_member_candidates?(nested, candidates)
       param -> Enum.member?(candidates, param)
     end)
-  end
-
-  defp source_count(query_events, source) do
-    Enum.count(query_events, &(&1.source == source))
   end
 
   defp source_events(query_events, source) do

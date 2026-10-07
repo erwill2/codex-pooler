@@ -4,9 +4,12 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
 
+  alias CodexPooler.Access
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Dev.OpenAIV1Fixture
+  alias CodexPooler.Gateway.Metadata
+  alias CodexPooler.Gateway.Metadata.CodexModelDecodeContract
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.{CandidateEligibility, ModelMetadata}
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
@@ -14,9 +17,38 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias Mix.Tasks.Dev.OpenaiV1Fixture, as: FixtureTask
 
   @pool_slug "openai-v1-smoke"
   @account_id "openai-v1-smoke"
+
+  test "final release removes leased traffic before assignment cascades and preserves other traffic",
+       context do
+    other = api_key_fixture(pool_fixture(%{slug: @pool_slug}))
+    retained = request_fixture(other)
+    retained_ledger = ledger_entry_fixture(retained)
+    assert {:ok, _} = OpenAIV1Fixture.acquire(context.options)
+    setup = context.receipt_path |> File.read!() |> CodexPooler.JSON.decode!()
+    pool = Repo.get!(Pool, setup["pool_id"])
+    key = Repo.get!(APIKey, setup["created"]["api_key_id"])
+    assignment = Repo.get!(PoolUpstreamAssignment, setup["created"]["assignment_id"])
+    model = Repo.get_by!(Model, pool_id: pool.id, exposed_model_id: "gpt-6-sol")
+    request = request_fixture(%{pool: pool, api_key: key}, %{model_id: model.id})
+    attempt = attempt_fixture(request, assignment)
+
+    ledger =
+      ledger_entry_fixture(request, %{
+        attempt_id: attempt.id,
+        pool_upstream_assignment_id: assignment.id
+      })
+
+    assert {:ok, %{status: "released"}} = OpenAIV1Fixture.release(context.options)
+    refute Repo.get(CodexPooler.Accounting.Request, request.id)
+    refute Repo.get(CodexPooler.Accounting.Attempt, attempt.id)
+    refute Repo.get(CodexPooler.Accounting.LedgerEntry, ledger.id)
+    assert Repo.get(CodexPooler.Accounting.Request, retained.id)
+    assert Repo.get(CodexPooler.Accounting.LedgerEntry, retained_ledger.id)
+  end
 
   setup do
     _owner = bootstrap_owner_fixture(%{"email" => unique_user_email()})
@@ -46,7 +78,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assert_private_mode(context.root, 0o700)
     assert_private_mode(context.receipt_path, 0o600)
 
-    setup = context.receipt_path |> File.read!() |> Jason.decode!()
+    setup = context.receipt_path |> File.read!() |> CodexPooler.JSON.decode!()
     assert setup["state"] == "ready"
     assert setup["leases"] == 1
     assert setup["upstream_base_url"] == "http://127.0.0.1:4057"
@@ -67,10 +99,13 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assert %RoutingSettings{allow_image_generation: true, v1_compatibility_enabled: true} =
              Repo.get(RoutingSettings, pool_id)
 
-    assert Repo.aggregate(from(model in Model, where: model.pool_id == ^pool_id), :count) == 5
+    assert Repo.aggregate(from(model in Model, where: model.pool_id == ^pool_id), :count) == 6
+    lite = Repo.get_by!(Model, pool_id: pool_id, exposed_model_id: "sample-preservation-lite")
+    assert lite.metadata["upstream_model"]["use_responses_lite"] == true
+    assert Repo.get!(UpstreamIdentity, identity_id).metadata["supports_compact_responses"] == true
 
     assert %Model{supports_responses: true, supports_streaming: true} =
-             Repo.get_by(Model, pool_id: pool_id, exposed_model_id: "gpt-5.6-terra")
+             Repo.get_by(Model, pool_id: pool_id, exposed_model_id: "gpt-6-luna")
 
     assert %Model{
              supports_responses: true,
@@ -79,7 +114,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
              supports_reasoning: true,
              metadata: text_metadata
            } =
-             Repo.get_by(Model, pool_id: pool_id, exposed_model_id: "gpt-5.5")
+             Repo.get_by(Model, pool_id: pool_id, exposed_model_id: "gpt-6-sol")
 
     assert %{"source_assignment_models" => source_models} = text_metadata
 
@@ -103,9 +138,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assert %{"visibility" => "hide", "priority" => 0} = ModelMetadata.metadata(decoy)
 
     assert %{"visibility" => "list", "priority" => 20} =
-             ModelMetadata.metadata(
-               Repo.get_by!(Model, pool_id: pool_id, exposed_model_id: "gpt-5.5")
-             )
+             ModelMetadata.metadata(Repo.get_by!(Model, pool_id: pool_id, exposed_model_id: "gpt-6-sol"))
 
     assert %Model{
              supports_responses: true,
@@ -128,7 +161,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
                where: window.upstream_identity_id == ^identity_id
              ),
              :count
-           ) == 12
+           ) == 14
 
     assert {:ok, second} = OpenAIV1Fixture.acquire(context.options)
     assert second.leases == 2
@@ -150,11 +183,11 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
        context do
     assert {:ok, %{status: "ready"}} = OpenAIV1Fixture.acquire(context.options)
 
-    setup = context.receipt_path |> File.read!() |> Jason.decode!()
+    setup = context.receipt_path |> File.read!() |> CodexPooler.JSON.decode!()
 
     assert %Pool{} = pool = Repo.get_by(Pool, slug: @pool_slug)
 
-    model = Repo.get_by(Model, pool_id: pool.id, exposed_model_id: "gpt-5.5")
+    model = Repo.get_by(Model, pool_id: pool.id, exposed_model_id: "gpt-6-sol")
     assert %Model{} = model
 
     assignment = Repo.get(PoolUpstreamAssignment, setup["created"]["assignment_id"])
@@ -174,7 +207,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     source_metadata = ModelMetadata.selected_assignment_metadata(model, assignment.id)
 
     assert ModelMetadata.supports_reasoning?(source_metadata)
-    assert source_metadata["supported_reasoning_levels"] == ["none"]
+    assert source_metadata["supported_reasoning_levels"] == [%{"effort" => "none", "description" => "none"}]
 
     prechange_model =
       model |> prechange_fixture_model(assignment.id) |> Map.put(:supports_reasoning, false)
@@ -187,11 +220,77 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
         |> Map.put(:supports_reasoning, true)
         |> put_assignment_reasoning(assignment.id, assignment_reasoning)
 
-      refute ModelMetadata.supports_reasoning?(
-               ModelMetadata.selected_assignment_metadata(top_level_only_model, assignment.id)
-             )
+      refute ModelMetadata.supports_reasoning?(ModelMetadata.selected_assignment_metadata(top_level_only_model, assignment.id))
 
       assert_reasoning_rejected(top_level_only_model, assignment, identity)
+    end
+
+    assert {:ok, %{status: "released"}} = OpenAIV1Fixture.release(context.options)
+  end
+
+  # The tier the released Codex client sends for these models when nothing
+  # configures one: `default_service_tier` of gpt-6-sol and gpt-6-luna in the
+  # client's bundled `codex-rs/models-manager/models.json` (0.156.1). The
+  # runtime filter refuses a non-default tier the assignment's model metadata
+  # does not declare, so without it the fixture answered `503
+  # no_compatible_backend` to every such Codex turn (findings#206).
+  @bundled_client_default_service_tier "priority"
+
+  test "fixture text models admit the service tier the released Codex client sends by default", context do
+    assert {:ok, %{status: "ready"}} = OpenAIV1Fixture.acquire(context.options)
+
+    setup = context.receipt_path |> File.read!() |> CodexPooler.JSON.decode!()
+    pool = Repo.get_by!(Pool, slug: @pool_slug)
+    assignment = Repo.get!(PoolUpstreamAssignment, setup["created"]["assignment_id"])
+    identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+
+    for exposed_model_id <- ["gpt-6-sol", "gpt-6-luna"] do
+      model = Repo.get_by!(Model, pool_id: pool.id, exposed_model_id: exposed_model_id)
+      payload = %{"model" => exposed_model_id, "service_tier" => @bundled_client_default_service_tier}
+      request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+      assert {:ok, [{%PoolUpstreamAssignment{id: assignment_id}, %UpstreamIdentity{}}]} =
+               FilterInput.new(%{
+                 model: model,
+                 endpoint: "/backend-api/codex/responses",
+                 payload: payload,
+                 request_options: request_options,
+                 candidates: [{assignment, identity}]
+               })
+               |> CandidateEligibility.filter_runtime_compatible_candidates()
+
+      assert assignment_id == assignment.id
+      source_metadata = ModelMetadata.selected_assignment_metadata(model, assignment.id)
+      assert Enum.map(source_metadata["service_tiers"], & &1["id"]) == [@bundled_client_default_service_tier]
+    end
+
+    assert {:ok, %{status: "released"}} = OpenAIV1Fixture.release(context.options)
+  end
+
+  # findings#258 row 258-42: a lane that points a released Codex client's
+  # `model_catalog_url` at this fixture Pool adopts what it serves, and one
+  # entry the client cannot decode makes it discard the whole catalog. Every
+  # representation therefore serves every model as a decodable entry and
+  # the decode-checked one leaves nothing out.
+  test "fixture catalog serves every model as an entry the released Codex client decodes", context do
+    assert {:ok, %{status: "ready"}} = OpenAIV1Fixture.acquire(context.options)
+
+    setup = context.receipt_path |> File.read!() |> CodexPooler.JSON.decode!()
+    {:ok, auth} = Access.authenticate_authorization_header("Bearer " <> setup["api_key"])
+    endpoint = "/backend-api/codex/models"
+    request_options = RequestOptions.build(%{}, endpoint, %{})
+
+    for representation <- [:verbatim, :instructions_template, :decode_checked] do
+      assert {:ok, snapshot} = Metadata.codex_catalog_snapshot(auth, endpoint, request_options, representation)
+      assert snapshot.undecodable_models == [], inspect(representation)
+
+      served = Map.new(snapshot.body["models"], &{&1["slug"], &1})
+      assert ["fixture-review-host", "gpt-4o-transcribe", "gpt-6-luna", "gpt-6-sol", "gpt-image-1"] -- Map.keys(served) == [], inspect(representation)
+
+      for {slug, entry} <- served do
+        violations = CodexModelDecodeContract.violations(entry)
+        assert violations == [], "#{representation} #{slug}: #{Enum.join(violations, ",")}"
+      end
     end
 
     assert {:ok, %{status: "released"}} = OpenAIV1Fixture.release(context.options)
@@ -200,7 +299,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
   test "rejects a non-loopback upstream before receipt or database mutation", context do
     options = Keyword.put(context.options, :upstream_base_url, "https://example.com")
 
-    assert {:error, "upstream base URL must be an origin-only loopback HTTP URL with a port"} =
+    assert {:error, "upstream base URL must be an origin-only loopback HTTP URL with a port, or an in-cluster service origin"} =
              OpenAIV1Fixture.acquire(options)
 
     refute File.exists?(context.receipt_path)
@@ -220,7 +319,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
              OpenAIV1Fixture.validate_environment(
                environment: :dev,
                allow_isolated_dev_database: true,
-               repo_config: [database: "codex_pooler_relqa_fixture_12345678"]
+               repo_config: [database: "codex_pooler_relqa_fixture_12345678", hostname: "127.0.0.1"]
              )
 
     for database <- [
@@ -255,7 +354,7 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
     assert {:ok, %{status: "released"}} = OpenAIV1Fixture.release(context.options)
   end
 
-  test "request compression opt-in restores the exact prior routing setting", context do
+  test "fixture restores the exact prior routing setting", context do
     baseline_updated_at = ~U[2026-08-01 12:34:56.123456Z]
 
     pool = pool_fixture(%{slug: @pool_slug})
@@ -268,23 +367,23 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
       sticky_http_sessions: true,
       prompt_cache_affinity_enabled: false,
       v1_compatibility_enabled: false,
-      request_compression_enabled: false,
       allow_image_generation: false,
+      allow_audio_transcription: false,
       metadata: %{"baseline" => true},
       created_at: ~U[2026-08-01 12:00:00.000000Z],
       updated_at: baseline_updated_at
     })
     |> Repo.insert!()
 
-    options = Keyword.put(context.options, :request_compression, :enabled)
+    options = context.options
 
     assert {:ok, %{status: "ready"}} = OpenAIV1Fixture.acquire(options)
 
-    assert %RoutingSettings{request_compression_enabled: true} =
-             Repo.get!(RoutingSettings, pool.id)
+    assert Repo.get!(RoutingSettings, pool.id).allow_audio_transcription
 
-    assert {:error, "OpenAI V1 fixture is leased with another request compression mode"} =
-             OpenAIV1Fixture.acquire(context.options)
+    refute Map.has_key?(Repo.get!(RoutingSettings, pool.id), :request_compression_enabled)
+    setup = context.receipt_path |> File.read!() |> CodexPooler.JSON.decode!()
+    refute Map.has_key?(setup, "request_compression_mode")
 
     assert {:ok, %{status: "released"}} = OpenAIV1Fixture.release(options)
 
@@ -295,11 +394,16 @@ defmodule CodexPooler.Dev.OpenAIV1FixtureTest do
              sticky_http_sessions: true,
              prompt_cache_affinity_enabled: false,
              v1_compatibility_enabled: false,
-             request_compression_enabled: false,
              allow_image_generation: false,
+             allow_audio_transcription: false,
              metadata: %{"baseline" => true},
              updated_at: ^baseline_updated_at
            } = Repo.get!(RoutingSettings, pool.id)
+  end
+
+  test "retired request compression CLI option is rejected before acquisition", context do
+    assert_raise Mix.Error, fn -> FixtureTask.run(["acquire", "--request-compression"]) end
+    refute File.exists?(context.receipt_path)
   end
 
   defp assert_private_mode(path, expected) do

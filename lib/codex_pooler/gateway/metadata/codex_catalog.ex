@@ -1,20 +1,27 @@
 defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
   @moduledoc false
 
-  alias CodexPooler.Access
-  alias CodexPooler.Catalog
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Metadata.CanonicalModelSource
+  alias CodexPooler.Gateway.Metadata.CatalogRepresentation
+  alias CodexPooler.Gateway.Metadata.CodexModelDecodeContract
+  alias CodexPooler.Gateway.Payloads.ReasoningEffort
   alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.ModelMetadata
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
 
   @etag_prefix ~s(W/"cp-models-v1-)
+  @known_reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
+  @reasoning_level_keys ~w(reasoning_efforts supported_reasoning_levels)
 
   @type normalized_policy :: map()
   @type body :: %{required(String.t()) => [map()]}
-  @type result :: %{required(:body) => body(), required(:etag) => String.t()}
-  @type pricing_buckets :: Catalog.pricing_bucket_map()
+  @type undecodable_model :: %{required(:slug) => String.t(), required(:fields) => [String.t()], required(:classes) => [String.t()]}
+  @type result :: %{
+          required(:body) => body(),
+          required(:etag) => String.t(),
+          required(:undecodable_models) => [undecodable_model()]
+        }
   @type context_window_overrides :: ModelMetadata.context_window_overrides()
   @type effective_model_serving_modes :: %{
           optional(String.t()) => ModelMetadata.effective_model_serving_mode()
@@ -28,6 +35,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
           required(:model) => Model.t(),
           required(:partition_count) => pos_integer(),
           required(:routable_selection?) => boolean(),
+          required(:routable_counts) => %{selected: non_neg_integer(), held_back: non_neg_integer()} | nil,
           required(:source) => map()
         }
   @type routable_assignment_ids_by_model_id :: %{
@@ -35,82 +43,25 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
         }
   @type routable_assignment_ids_by_model_id_resolver :: (-> routable_assignment_ids_by_model_id())
   @type selection_opts :: [
-          routable_assignment_ids_by_model_id: routable_assignment_ids_by_model_id_resolver()
+          routable_assignment_ids_by_model_id: routable_assignment_ids_by_model_id_resolver(),
+          representation: CatalogRepresentation.t()
         ]
-
-  @spec build([Model.t()], normalized_policy()) :: result()
-  def build(routable_models, normalized_policy)
-      when is_list(routable_models) and is_map(normalized_policy) do
-    visible_models = policy_visible_models(routable_models, normalized_policy)
-
-    build_visible(
-      visible_models,
-      normalized_policy,
-      Catalog.pricing_buckets_by_identifier(visible_models)
-    )
-  end
-
-  @spec build([Model.t()], normalized_policy(), pricing_buckets()) :: result()
-  def build(routable_models, normalized_policy, pricing_buckets)
-      when is_list(routable_models) and is_map(normalized_policy) and is_map(pricing_buckets) do
-    build(routable_models, normalized_policy, pricing_buckets, %{})
-  end
-
-  @spec build(
-          [Model.t()],
-          normalized_policy(),
-          pricing_buckets(),
-          context_window_overrides()
-        ) :: result()
-  def build(routable_models, normalized_policy, pricing_buckets, context_window_overrides)
-      when is_list(routable_models) and is_map(normalized_policy) and is_map(pricing_buckets) and
-             is_map(context_window_overrides) do
-    routable_models
-    |> policy_visible_models(normalized_policy)
-    |> build_visible(normalized_policy, pricing_buckets, context_window_overrides)
-  end
-
-  @spec build(
-          [Model.t()],
-          normalized_policy(),
-          pricing_buckets(),
-          context_window_overrides(),
-          effective_model_serving_modes()
-        ) :: result()
-  def build(
-        routable_models,
-        normalized_policy,
-        pricing_buckets,
-        context_window_overrides,
-        effective_model_serving_modes
-      )
-      when is_list(routable_models) and is_map(normalized_policy) and is_map(pricing_buckets) and
-             is_map(context_window_overrides) and is_map(effective_model_serving_modes) do
-    routable_models
-    |> policy_visible_models(normalized_policy)
-    |> build_visible(
-      normalized_policy,
-      pricing_buckets,
-      context_window_overrides,
-      effective_model_serving_modes
-    )
-  end
 
   @spec build_selected_sources(
           [selected_source()],
           normalized_policy(),
-          pricing_buckets(),
           context_window_overrides(),
-          effective_model_serving_modes()
+          effective_model_serving_modes(),
+          CatalogRepresentation.t()
         ) :: {:ok, result()} | {:error, :invalid_model_metadata}
   def build_selected_sources(
         selected_sources,
         normalized_policy,
-        pricing_buckets,
         context_window_overrides,
-        effective_model_serving_modes
+        effective_model_serving_modes,
+        representation \\ :verbatim
       )
-      when is_list(selected_sources) and is_map(normalized_policy) and is_map(pricing_buckets) and
+      when is_list(selected_sources) and is_map(normalized_policy) and
              is_map(context_window_overrides) and is_map(effective_model_serving_modes) do
     selected_sources
     |> Enum.filter(fn {%Model{} = model, _source} ->
@@ -122,7 +73,6 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
       case CanonicalModelSource.project(
              source,
              model,
-             pricing_buckets,
              context_window_overrides,
              mode
            ) do
@@ -131,7 +81,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
       end
     end)
     |> case do
-      {:ok, models} -> {:ok, result_from_models(models)}
+      {:ok, models} -> {:ok, result_from_models(models, representation)}
       {:error, :invalid_model_metadata} = error -> error
     end
   end
@@ -175,16 +125,16 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
   @spec build_selected_partitions(
           [selected_partition()],
           normalized_policy(),
-          pricing_buckets(),
           context_window_overrides(),
-          effective_model_serving_modes()
+          effective_model_serving_modes(),
+          CatalogRepresentation.t()
         ) :: {:ok, result()} | {:error, :invalid_model_metadata}
   def build_selected_partitions(
         partitions,
         normalized_policy,
-        pricing_buckets,
         context_window_overrides,
-        effective_model_serving_modes
+        effective_model_serving_modes,
+        representation \\ :verbatim
       )
       when is_list(partitions) do
     selected_sources =
@@ -196,9 +146,9 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
     build_selected_sources(
       selected_sources,
       normalized_policy,
-      pricing_buckets,
       context_window_overrides,
-      effective_model_serving_modes
+      effective_model_serving_modes,
+      representation
     )
   end
 
@@ -206,7 +156,6 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
           [Model.t()],
           candidates_by_model_id(),
           normalized_policy(),
-          pricing_buckets(),
           context_window_overrides(),
           effective_model_serving_modes(),
           selection_opts()
@@ -215,52 +164,52 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
         models,
         candidates_by_model_id,
         normalized_policy,
-        pricing_buckets,
         context_window_overrides,
         effective_model_serving_modes,
         opts \\ []
       ) do
+    representation = Keyword.get(opts, :representation, :verbatim)
+
     models
     |> select_canonical_sources(candidates_by_model_id, opts)
     |> build_selected_partitions(
       normalized_policy,
-      pricing_buckets,
       context_window_overrides,
-      effective_model_serving_modes
+      effective_model_serving_modes,
+      representation
     )
     |> case do
       {:ok, result} -> result
-      {:error, :invalid_model_metadata} -> result_from_models([])
+      {:error, :invalid_model_metadata} -> result_from_models([], representation)
     end
   end
 
-  defp build_visible(
-         visible_models,
-         normalized_policy,
-         pricing_buckets,
-         context_window_overrides \\ %{},
-         effective_model_serving_modes \\ nil
-       ) do
-    models =
-      visible_models
-      |> Enum.map(
-        &model_payload(
-          &1,
-          normalized_policy,
-          pricing_buckets,
-          context_window_overrides,
-          effective_model_serving_modes
-        )
-      )
+  defp result_from_models(models, representation) do
+    {models, undecodable_models} =
+      models
+      |> Enum.map(&CatalogRepresentation.apply_to_model(&1, representation))
       |> Enum.sort_by(&Map.fetch!(&1, "slug"))
+      |> reject_undecodable(representation)
 
-    result_from_models(models)
+    # The ETag is the digest of the representation actually served, so a
+    # client holding one representation never matches the other's token.
+    body = %{"models" => models}
+    %{body: body, etag: etag(body), undecodable_models: undecodable_models}
   end
 
-  defp result_from_models(models) do
-    body = %{"models" => Enum.sort_by(models, &Map.fetch!(&1, "slug"))}
-    %{body: body, etag: etag(body)}
+  # One entry the client cannot decode makes it discard the whole catalog, so
+  # for a client whose decode contract is known the entry is left out instead;
+  # the model stays routable and the client keeps every other entry.
+  defp reject_undecodable(models, :decode_checked) do
+    {decodable, undecodable} =
+      models
+      |> Enum.map(&{&1, CodexModelDecodeContract.violations(&1)})
+      |> Enum.split_with(fn {_model, fields} -> fields == [] end)
+
+    {Enum.map(decodable, &elem(&1, 0)), Enum.map(undecodable, fn {model, fields} -> %{slug: Map.fetch!(model, "slug"), fields: fields, classes: CodexModelDecodeContract.violation_classes(model)} end)}
   end
+
+  defp reject_undecodable(models, _representation), do: {models, []}
 
   defp policy_visible_models(routable_models, normalized_policy) do
     CandidateEligibility.policy_visible_models(routable_models, normalized_policy)
@@ -276,7 +225,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
   # the same source — the overwhelmingly common shape — stays read-free and
   # keeps byte-identical behavior.
   defp resolve_routable_assignment_ids_by_model_id(pairs_by_model, opts) do
-    if Enum.any?(pairs_by_model, &multi_partition?/1) do
+    if Enum.any?(pairs_by_model, &selection_requires_routability?/1) do
       case Keyword.get(opts, :routable_assignment_ids_by_model_id) do
         resolver when is_function(resolver, 0) ->
           resolver.()
@@ -293,6 +242,33 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
     pairs |> Enum.uniq_by(& &1.digest) |> length() > 1
   end
 
+  defp selection_requires_routability?({_model, pairs} = pair_group) do
+    multi_partition?(pair_group) or
+      pairs |> Enum.uniq_by(&reasoning_projection_signature/1) |> length() > 1
+  end
+
+  defp reasoning_projection_signature(pair) do
+    levels =
+      pair.source
+      |> ModelMetadata.metadata_reasoning_levels()
+      |> Enum.sort_by(&reasoning_level_sort_key/1)
+
+    {reasoning_source_default(pair.source), levels}
+  end
+
+  defp reasoning_source_default(source) do
+    case Map.get(source, "default_reasoning_level") do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> ReasoningEffort.normalize_known(trimmed) || trimmed
+        end
+
+      _value ->
+        nil
+    end
+  end
+
   defp canonical_pairs(%Model{} = model, candidates) do
     case Map.get(model.metadata || %{}, "source_assignment_models") do
       source_models when is_map(source_models) ->
@@ -304,8 +280,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
   end
 
   defp canonical_pair(
-         {%PoolUpstreamAssignment{id: assignment_id, created_at: %DateTime{} = created_at},
-          _identity},
+         {%PoolUpstreamAssignment{id: assignment_id, created_at: %DateTime{} = created_at}, _identity},
          %Model{} = model,
          source_models
        )
@@ -336,24 +311,84 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
   # sake. The contract is recorded under the `:backend_models_etag` entry in
   # `CodexPooler.CompatibilityMatrix`.
   defp select_anchored_partition(pairs, %Model{} = model, routable_assignment_ids) do
-    partitions =
+    capability_families =
       pairs
-      |> Enum.group_by(& &1.digest)
+      |> Enum.group_by(& &1.reasoning_agnostic_digest)
       |> Map.values()
       |> Enum.sort_by(&partition_anchor_key/1)
 
-    baseline_members = select_partition(partitions, nil)
-    members = select_partition(partitions, routable_assignment_ids)
+    baseline_members = select_partition(capability_families, nil)
+    members = select_partition(capability_families, routable_assignment_ids)
     anchor = partition_anchor(members)
+    presentation_anchor = tier_superset_anchor(anchor, pairs, routable_assignment_ids)
 
     %{
       assignment_ids: members |> Enum.map(& &1.assignment_id) |> Enum.sort(),
-      digest: anchor.digest,
+      digest: presentation_anchor.digest,
       model: model,
-      partition_count: length(partitions),
+      partition_count: length(capability_families),
       routable_selection?: members != baseline_members,
-      source: anchor.source
+      routable_counts: routable_counts(pairs, members, routable_assignment_ids),
+      source: tier_presentation_source(presentation_anchor, reasoning_union_source(anchor, members, routable_assignment_ids))
     }
+  end
+
+  # How many quota-routable seats selection counted inside and outside the
+  # selected family: a held-back count of zero says the held-back seats were
+  # read as unroutable, not that they were never read. Absent when selection
+  # did not need quota routability (one family, one reasoning projection).
+  defp routable_counts(_pairs, _members, nil), do: nil
+
+  defp routable_counts(pairs, members, %MapSet{} = routable_assignment_ids) do
+    selected_ids = MapSet.new(members, & &1.assignment_id)
+    {selected, held_back} = Enum.split_with(pairs, &MapSet.member?(selected_ids, &1.assignment_id))
+
+    %{
+      selected: partition_routable_count(selected, routable_assignment_ids),
+      held_back: partition_routable_count(held_back, routable_assignment_ids)
+    }
+  end
+
+  # Tier selection must not replace the baseline reasoning contract, including
+  # the absence of fields. Neutral requests still use the baseline members.
+  defp tier_presentation_source(presentation_anchor, reasoning_source) do
+    keys = ["default_reasoning_level" | @reasoning_level_keys]
+
+    presentation_anchor.source
+    |> Map.drop(keys)
+    |> Map.merge(Map.take(reasoning_source, keys))
+  end
+
+  # Tier presentation may use a richer pristine source in the same execution
+  # family. Keep the default tier unchanged: clients apply it without a user
+  # selecting a tier. An incomparable set has no honest single-source union.
+  defp tier_superset_anchor(anchor, pairs, routable_ids) do
+    eligible = Enum.filter(pairs, &tier_anchor_eligible?(&1, anchor, routable_ids))
+    required = Enum.reduce(eligible, MapSet.new(), &MapSet.union(tier_tokens(&1.source), &2))
+
+    eligible
+    |> Enum.filter(&(MapSet.subset?(required, tier_tokens(&1.source)) and MapSet.size(tier_tokens(&1.source)) > MapSet.size(tier_tokens(anchor.source))))
+    |> Enum.min_by(&partition_pair_key/1, fn -> anchor end)
+  end
+
+  defp tier_anchor_eligible?(pair, anchor, routable_ids) do
+    (is_nil(routable_ids) or MapSet.member?(routable_ids, pair.assignment_id)) and
+      Map.get(pair.source, "default_service_tier") == Map.get(anchor.source, "default_service_tier") and
+      CanonicalModelSource.same_service_tier_family?(anchor.source, pair.source)
+  end
+
+  defp tier_tokens(source) do
+    services =
+      source
+      |> ModelMetadata.list_metadata("service_tiers")
+      |> Enum.flat_map(fn
+        %{"id" => id} when is_binary(id) -> [{:service, id}]
+        id when is_binary(id) -> [{:service, id}]
+        _invalid -> []
+      end)
+
+    speeds = for tier <- ModelMetadata.list_metadata(source, "additional_speed_tiers"), is_binary(tier), do: {:speed, tier}
+    MapSet.new(services ++ speeds)
   end
 
   defp select_partition(partitions, routable_assignment_ids) do
@@ -365,11 +400,109 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
   end
 
   defp partition_selection_key(members, %MapSet{} = routable_assignment_ids) do
-    routable_count =
-      Enum.count(members, &MapSet.member?(routable_assignment_ids, &1.assignment_id))
+    routable_count = partition_routable_count(members, routable_assignment_ids)
 
     {-routable_count, -length(members), partition_anchor_key(members)}
   end
+
+  defp partition_routable_count(members, %MapSet{} = routable_assignment_ids) do
+    Enum.count(members, &MapSet.member?(routable_assignment_ids, &1.assignment_id))
+  end
+
+  defp reasoning_union_source(anchor, family_pairs, routable_assignment_ids) do
+    source_pairs = routable_family_pairs(family_pairs, routable_assignment_ids)
+
+    if one_reasoning_projection?(family_pairs) do
+      anchor.source
+    else
+      union_reasoning_source(anchor, source_pairs)
+    end
+  end
+
+  defp one_reasoning_projection?(source_pairs) do
+    source_pairs
+    |> Enum.uniq_by(&reasoning_projection_signature/1)
+    |> length() == 1
+  end
+
+  defp union_reasoning_source(anchor, source_pairs) do
+    base_source =
+      Map.drop(anchor.source, ["default_reasoning_level" | @reasoning_level_keys])
+
+    ordered_pairs = Enum.sort_by(source_pairs, &partition_pair_key/1)
+
+    reasoning_levels =
+      ordered_pairs
+      |> Enum.flat_map(&ModelMetadata.metadata_reasoning_levels(&1.source))
+      |> Enum.uniq()
+      |> Enum.sort_by(&reasoning_level_sort_key/1)
+
+    case reasoning_levels do
+      [] ->
+        base_source
+
+      [_ | _] ->
+        descriptions = reasoning_level_descriptions(ordered_pairs)
+        levels = Enum.map(reasoning_levels, &%{"effort" => &1, "description" => Map.get(descriptions, &1, &1)})
+
+        base_source
+        |> Map.put("supported_reasoning_levels", levels)
+        |> Map.put(
+          "default_reasoning_level",
+          reasoning_union_default(source_pairs, reasoning_levels)
+        )
+    end
+  end
+
+  # Each level of the union keeps the first description a source gives it, in
+  # the order the union reads its sources (oldest assignment first); its name
+  # stands in only when no source describes it. The released client shows the
+  # description in its reasoning picker (findings#280 point 3).
+  defp reasoning_level_descriptions(ordered_pairs) do
+    ordered_pairs
+    |> Enum.flat_map(&ModelMetadata.metadata_reasoning_level_descriptions(&1.source))
+    |> Enum.reduce(%{}, fn {effort, description}, descriptions -> Map.put_new(descriptions, effort, description) end)
+  end
+
+  defp reasoning_union_default(source_pairs, reasoning_levels) do
+    source_pairs
+    |> Enum.sort_by(&partition_pair_key/1)
+    |> Enum.find_value(&reasoning_default(&1.source, reasoning_levels))
+    |> case do
+      nil -> List.first(reasoning_levels)
+      default -> default
+    end
+  end
+
+  defp reasoning_level_sort_key(effort) do
+    case Enum.find_index(@known_reasoning_efforts, &(&1 == effort)) do
+      nil -> {1, effort}
+      index -> {0, index}
+    end
+  end
+
+  defp reasoning_default(source, reasoning_levels) do
+    case Map.get(source, "default_reasoning_level") do
+      value when is_binary(value) ->
+        normalized = ReasoningEffort.normalize_known(value) || String.trim(value)
+        if normalized in reasoning_levels, do: normalized
+
+      _value ->
+        nil
+    end
+  end
+
+  defp routable_family_pairs(family_pairs, %MapSet{} = routable_assignment_ids) do
+    routable =
+      Enum.filter(family_pairs, &MapSet.member?(routable_assignment_ids, &1.assignment_id))
+
+    case routable do
+      [] -> family_pairs
+      [_ | _] -> routable
+    end
+  end
+
+  defp routable_family_pairs(family_pairs, _routable_assignment_ids), do: family_pairs
 
   defp partition_anchor(members), do: Enum.min_by(members, &partition_pair_key/1)
 
@@ -390,39 +523,6 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalog do
       |> Base.encode16(case: :lower)
 
     @etag_prefix <> digest <> ~s(")
-  end
-
-  defp model_payload(
-         %Model{} = model,
-         policy,
-         pricing_buckets,
-         context_window_overrides,
-         effective_model_serving_modes
-       ) do
-    {reasoning_levels, reasoning_default} =
-      ModelMetadata.reasoning_level_maps_and_default(model)
-
-    reasoning_projection =
-      Access.project_reasoning_effort_metadata(policy, reasoning_levels, reasoning_default)
-
-    case effective_model_serving_modes do
-      nil ->
-        ModelMetadata.codex_model_payload(
-          model,
-          pricing_buckets,
-          reasoning_projection,
-          context_window_overrides
-        )
-
-      effective_modes ->
-        ModelMetadata.codex_model_payload(
-          model,
-          pricing_buckets,
-          reasoning_projection,
-          context_window_overrides,
-          Map.get(effective_modes, model.exposed_model_id)
-        )
-    end
   end
 
   defp canonical_json(value) when is_map(value) do

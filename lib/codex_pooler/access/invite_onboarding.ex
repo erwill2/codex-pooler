@@ -57,7 +57,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
          {:ok, identity, assignment} <- load_invite_account(invite, pool, upstream_account_id),
          {:ok, state_json} <-
            Secrets.decrypt_active_secret(identity, "device_code"),
-         {:ok, state} <- Jason.decode(state_json),
+         {:ok, state} <- CodexPooler.JSON.decode(state_json),
          {:ok, tokens} <- CodexAuth.poll_device_authorization(state) do
       complete_onboarding(invite, pool, identity, assignment, tokens, "device")
     end
@@ -74,7 +74,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
         # credo:disable-for-next-line Credo.Check.Refactor.Nesting
         case SecretStore.store_encrypted_secret(identity, %{
                secret_kind: "device_code",
-               plaintext: Jason.encode!(auth_state)
+               plaintext: CodexPooler.JSON.encode!(auth_state)
              }) do
           {:ok, _secret} -> %{identity: identity, assignment: assignment}
           {:error, reason} -> Repo.rollback(reason)
@@ -121,7 +121,8 @@ defmodule CodexPooler.Access.InviteOnboarding do
   defp pending_account?(_identity, _assignment, _invite), do: false
 
   defp refresh_pending_account(identity, assignment, invite, label, method) do
-    with {:ok, %{identity: identity, assignment: assignment}} <-
+    with {:ok, identity, assignment} <- lock_refreshable_pending_account(identity, assignment, invite),
+         {:ok, %{identity: identity, assignment: assignment}} <-
            InternalLifecycle.update_pending_pool_account(
              identity,
              assignment,
@@ -135,6 +136,23 @@ defmodule CodexPooler.Access.InviteOnboarding do
              }
            ) do
       {:ok, identity, assignment}
+    end
+  end
+
+  defp lock_refreshable_pending_account(identity, assignment, invite) do
+    locked = IdentitySlotLock.lock_identity_rows!([identity.id])
+    identity = Enum.find(locked.identities, &(&1.id == identity.id))
+    assignment = Enum.find(locked.assignments, &(&1.id == assignment.id))
+
+    cond do
+      match?(%UpstreamIdentity{metadata: %{"permanent_deletion_requested_at" => _}}, identity) ->
+        {:error, %{code: :upstream_account_deleting, message: "upstream account is being deleted"}}
+
+      pending_account?(identity, assignment, invite) ->
+        {:ok, identity, assignment}
+
+      true ->
+        {:error, %{code: :upstream_identity_not_found, message: "pending upstream account was not found"}}
     end
   end
 
@@ -343,9 +361,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
 
   defp candidate_identities(prepared, selected_identity) do
     siblings =
-      IdentityLifecycle.list_upstream_identities_by_chatgpt_account(
-        prepared.attrs.chatgpt_account_id
-      )
+      IdentityLifecycle.list_upstream_identities_by_chatgpt_account(prepared.attrs.chatgpt_account_id)
 
     [selected_identity | siblings]
     |> Enum.reject(&is_nil/1)

@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
   attr :datetime_preferences, :map, required: true
   attr :empty_label, :string, default: "Expiration dates not reported"
   attr :now, :any, default: nil
+  attr :calendar_path, :string, default: nil
 
   def saved_reset_expiration_table(assigns) do
     now = assigns.now || DateTime.utc_now()
@@ -58,7 +59,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
               {row.time_label}
             </span>
           </p>
+          <.link
+            :if={@calendar_path && row.expires_at && !row.expired?}
+            href={@calendar_path}
+            id={"#{@id}-time-left-#{row.index}"}
+            data-role="saved-reset-expiration-time-left"
+            class="inline-flex shrink-0 items-center gap-1 rounded-field text-xs font-medium leading-4 tabular-nums text-(--color-reset-bank) hover:underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            title="Download all upcoming banked reset expirations (.ics)"
+            aria-label={"Download all upcoming banked reset expirations (.ics); this reset expires #{row.title}"}
+          >
+            <.icon name="hero-clock" class="size-3 shrink-0" />
+            <span>{row.time_left_label}</span>
+          </.link>
           <p
+            :if={!@calendar_path || !row.expires_at || row.expired?}
             id={"#{@id}-time-left-#{row.index}"}
             data-role="saved-reset-expiration-time-left"
             class={[
@@ -179,10 +193,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
           />
           <span class="grid min-w-0 gap-0.5">
             <span class="text-[13px] font-semibold leading-tight text-base-content">
-              Weekly quota blocked
+              Long-window quota blocked
             </span>
             <span class="text-[11px] leading-4 text-base-content/55">
-              Request traffic can recover weekly exhaustion. Expiration rescue runs only through scheduled account checks.
+              Request traffic can recover weekly or monthly account quota. Expiration rescue runs only through scheduled account checks.
             </span>
           </span>
         </label>
@@ -228,7 +242,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
                   "input input-xs mx-0.5 inline-block w-14 border-base-300 bg-base-100 px-1.5 text-center text-[11px] font-semibold tabular-nums",
                   @threshold_errors != [] && "input-error"
                 ]}
-              />% of the weekly quota window.
+              />% of the weekly or monthly account quota window.
             </span>
             <span
               :for={message <- @threshold_errors}
@@ -253,7 +267,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
             readonly={!@policy_enabled?}
           />
           <p class="text-xs leading-5 text-base-content/65">
-            Do not spend a saved reset when the weekly quota will reset naturally within this many minutes.
+            Do not spend a saved reset when the weekly or monthly account quota will reset naturally within this many minutes.
           </p>
         </div>
         <div class="grid gap-1">

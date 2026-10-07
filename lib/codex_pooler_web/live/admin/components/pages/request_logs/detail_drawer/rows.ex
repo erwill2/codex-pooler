@@ -3,21 +3,27 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
 
   import CodexPoolerWeb.Admin.RequestLogsDisplay,
     only: [
+      format_advised_reset: 2,
       format_api_key: 1,
       format_datetime: 2,
       format_token_counts: 1,
       format_transport_route: 1,
       format_upstream_account_label: 1,
       format_usage_cost: 1,
+      model_default_reasoning?: 1,
       protocol_label: 1,
+      reasoning_endpoint?: 1,
       status_label: 1
     ]
 
-  import CodexPoolerWeb.Admin.RequestLogDetailDrawer.Format, only: [safe_text: 1]
+  alias CodexPooler.ServiceTier
 
   @serving_mode_configured_key "model_serving_mode_configured"
   @serving_mode_effective_key "model_serving_mode"
   @serving_mode_source_key "model_serving_mode_source"
+  @reasoning_not_set "Not set"
+  @reasoning_not_sent "Not sent (backend model default)"
+  @tier_not_set "Not set"
 
   @type detail_row :: %{
           required(:id) => String.t(),
@@ -31,33 +37,40 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
   def final_outcome_rows(log, datetime_preferences) do
     [
       detail("request-log-detail-request-id", "Request id", log.id, mono: true),
-      detail("request-log-detail-correlation-id", "Correlation id", log.correlation_id,
-        mono: true
-      ),
-      detail("request-log-detail-status", "Status", status_label(log.status || "unknown")),
+      detail("request-log-detail-correlation-id", "Correlation id", log.correlation_id, mono: true),
+      detail("request-log-detail-status", "Status", status_detail(log)),
       detail("request-log-detail-endpoint", "Endpoint", log.endpoint, mono: true),
       detail("request-log-detail-model", "Model", log.requested_model),
-      detail(
+      model_rows(log),
+      reasoning_detail(
         "request-log-detail-requested-reasoning",
         "Requested reasoning",
         log.reasoning_effort,
-        mono: true
+        reasoning_endpoint?(log) && @reasoning_not_set
       ),
-      detail(
+      reasoning_detail(
         "request-log-detail-applied-reasoning",
         "Applied reasoning",
         log.applied_reasoning_effort,
-        mono: true
+        model_default_reasoning?(log) && @reasoning_not_set
       ),
-      detail(
+      reasoning_detail(
         "request-log-detail-upstream-reasoning",
         "Upstream reasoning",
         log.effective_reasoning_effort,
-        mono: true
+        model_default_reasoning?(log) && @reasoning_not_sent
       ),
+      service_tier_rows(log),
+      price_bucket_rows(log),
       detail("request-log-detail-transport", "Transport", protocol_label(log.transport)),
       detail("request-log-detail-response-status", "Response status", log.response_status_code),
       detail("request-log-detail-error-code", "Error code", log.denial_reason, mono: true),
+      detail(
+        "request-log-detail-advised-reset",
+        "Advised retry",
+        format_advised_reset(Map.get(log, :errors), datetime_preferences),
+        mono: true
+      ),
       detail("request-log-detail-retry-count", "Retries", log.retry_count),
       detail(
         "request-log-detail-admitted-at",
@@ -72,7 +85,77 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
         mono: true
       )
     ]
+    |> List.flatten()
     |> present_rows()
+  end
+
+  # `Model` is what the client asked for. The latest attempt also records the
+  # model the Pooler sent upstream and the one the provider declared on its
+  # response object; they differ when the provider substitutes a model.
+  defp model_rows(log) do
+    sent = Map.get(log, :upstream_model)
+    served = Map.get(log, :served_model)
+
+    if blank?(sent) and blank?(served) do
+      []
+    else
+      [
+        detail("request-log-detail-upstream-model", "Sent upstream", sent),
+        detail("request-log-detail-served-model", "Upstream served", served)
+      ]
+    end
+  end
+
+  # The ChatGPT Codex backend reports `default` for `priority` requests and
+  # accounting prices the reported tier, so the three facts stay on separate
+  # rows. "Priced as" only appears once a priced settlement names the tier.
+  defp service_tier_rows(log) do
+    requested = ServiceTier.canonicalize(Map.get(log, :requested_service_tier))
+    reported = ServiceTier.canonicalize(Map.get(log, :actual_service_tier))
+    priced = priced_service_tier(log)
+
+    if Enum.all?([requested, reported, priced], &is_nil/1) do
+      []
+    else
+      [
+        detail(
+          "request-log-detail-requested-tier",
+          "Requested tier",
+          requested || @tier_not_set,
+          mono: !is_nil(requested)
+        ),
+        detail("request-log-detail-upstream-reported-tier", "Upstream reported", reported, mono: true),
+        detail("request-log-detail-priced-tier", "Priced as", priced, mono: true)
+      ]
+    end
+  end
+
+  defp priced_service_tier(%{cost: %{pricing_availability: "priced"}} = log),
+    do: ServiceTier.canonicalize(Map.get(log, :service_tier))
+
+  defp priced_service_tier(_log), do: nil
+
+  # Settlement reports the bucket a turn was charged at, so an ordinary turn
+  # and a long-context turn that found no long-context snapshot both read
+  # `default`. Pricing resolution records the substitution it made; this row
+  # exists only when it made one, and names the requested bucket beside the
+  # one that was priced.
+  defp price_bucket_rows(log) do
+    case Map.get(metadata_section(log, "pricing"), "price_bucket_fallback") do
+      %{"requested" => requested, "selected" => selected}
+      when is_binary(requested) and is_binary(selected) ->
+        [
+          detail(
+            "request-log-detail-price-bucket",
+            "Price bucket",
+            "#{selected} (#{requested} requested)",
+            mono: true
+          )
+        ]
+
+      _no_fallback ->
+        []
+    end
   end
 
   @spec routing_rows(map()) :: [detail_row()]
@@ -89,12 +172,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
       detail("request-log-detail-assignment", "Assignment", log.assignment_label),
       detail("request-log-detail-api-key", "API key", format_api_key(log)),
       detail("request-log-detail-route", "Route", format_transport_route(log), mono: true),
-      detail("request-log-detail-route-class", "Route class", Map.get(routing, "route_class"),
-        mono: true
-      ),
-      detail("request-log-detail-routing-strategy", "Strategy", Map.get(routing, "strategy"),
-        mono: true
-      ),
+      detail("request-log-detail-route-class", "Route class", Map.get(routing, "route_class"), mono: true),
+      detail("request-log-detail-routing-strategy", "Strategy", Map.get(routing, "strategy"), mono: true),
       detail(
         "request-log-detail-selected-rank",
         "Selected rank",
@@ -246,15 +325,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
     attempt = Map.get(debug, :attempt, %{})
 
     [
-      detail("request-log-detail-continuity-status", "Continuity", continuity[:status],
-        mono: true
-      ),
-      detail("request-log-detail-session-ref", "Session ref", continuity[:session_ref],
-        mono: true
-      ),
-      detail("request-log-detail-turn-ref", "Turn ref", continuity[:turn_ref] || turn[:turn_ref],
-        mono: true
-      ),
+      detail("request-log-detail-continuity-status", "Continuity", continuity[:status], mono: true),
+      detail("request-log-detail-session-ref", "Session ref", continuity[:session_ref], mono: true),
+      detail("request-log-detail-turn-ref", "Turn ref", continuity[:turn_ref] || turn[:turn_ref], mono: true),
       detail(
         "request-log-detail-turn-status",
         "Turn status",
@@ -267,9 +340,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
         turn[:final_attempt_ref],
         mono: true
       ),
-      detail("request-log-detail-failure-source", "Failure source", failure[:error_source],
-        mono: true
-      ),
+      detail("request-log-detail-failure-source", "Failure source", failure[:error_source], mono: true),
       detail("request-log-detail-debug-error", "Debug error", failure[:error_code], mono: true),
       detail("request-log-detail-terminal-state", "Terminal state", terminal[:state], mono: true),
       detail("request-log-detail-terminal-mismatch", "Terminal mismatch", terminal[:mismatch]),
@@ -292,7 +363,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
   @spec sanitized_metadata_rows(map()) :: [detail_row()]
   def sanitized_metadata_rows(log) do
     quota = metadata_section(log, "quota_decision")
-    compression = log.payload_compression || %{}
     file = metadata_section(log, "file")
 
     [
@@ -303,20 +373,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
         Map.get(log.metadata || %{}, "operation"),
         mono: true
       ),
-      detail("request-log-detail-file-status", "File status", Map.get(file, "status"),
-        mono: true
-      ),
-      detail("request-log-detail-compression-status", "Compression status", compression[:status],
-        mono: true
-      ),
-      detail("request-log-detail-compression-reason", "Compression reason", compression[:reason],
-        mono: true
-      ),
-      detail(
-        "request-log-detail-compression-saved",
-        "Compression saved",
-        compression_saved(compression)
-      )
+      detail("request-log-detail-file-status", "File status", Map.get(file, "status"), mono: true)
     ]
     |> present_rows()
   end
@@ -329,6 +386,18 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
   end
 
   defp metadata_section(_log, _key), do: %{}
+
+  # The requested effort comes from the request row, so its absence is known on
+  # any reasoning endpoint. Applied and upstream come from the attempt snapshot,
+  # which a legacy or unfinished attempt may lack; those rows only claim "not
+  # set" and "not sent" when the list row claims the model default too.
+  defp reasoning_detail(id, label, effort, placeholder) do
+    if blank?(effort) do
+      detail(id, label, placeholder || nil)
+    else
+      detail(id, label, effort, mono: true)
+    end
+  end
 
   defp detail(id, label, value, opts \\ []) do
     %{
@@ -380,12 +449,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
   defp list_count(value) when is_list(value), do: length(value)
   defp list_count(_value), do: nil
 
-  defp compression_saved(%{saved_count: saved, unit: unit})
-       when is_integer(saved) and is_binary(unit),
-       do: "#{safe_text(saved)} #{unit}"
-
-  defp compression_saved(_compression), do: nil
-
   defp format_debug_timestamp(nil, _preferences), do: nil
 
   defp format_debug_timestamp(value, preferences) when is_binary(value) do
@@ -398,4 +461,10 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
   defp blank?(nil), do: true
   defp blank?(value) when is_binary(value), do: String.trim(value) == ""
   defp blank?(_value), do: false
+
+  # A client cancellation shows its class and the status it was recorded with.
+  defp status_detail(%{display_status: "client_cancelled"} = log),
+    do: "#{status_label("client_cancelled")} (recorded as #{String.downcase(status_label(log.status || "unknown"))})"
+
+  defp status_detail(log), do: status_label(log.status || "unknown")
 end

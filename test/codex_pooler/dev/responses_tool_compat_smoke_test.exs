@@ -12,12 +12,12 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
   import CodexPooler.AccountsFixtures
 
   @owner_id "11111111-1111-4111-8111-111111111111"
-  @labels ~w(codex01 codex02 codex03)
+  @labels ~w(account-a account-b account-c)
 
   setup do
     run_id = "20260803T120000Z-#{random_hex(6)}"
-    run_dir = Path.join(["tmp", "issue-241", "runtime", run_id])
-    receipt_path = Path.join(["tmp", "issue-241", "receipts", "#{run_id}.json"])
+    run_dir = Path.join(["tmp", "responses-tool-compat", "runtime", run_id])
+    receipt_path = Path.join(["tmp", "responses-tool-compat", "receipts", "#{run_id}.json"])
 
     on_exit(fn ->
       File.rm_rf(run_dir)
@@ -43,11 +43,11 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
                  "--owner-id",
                  @owner_id,
                  "--identity-label",
-                 "codex01",
+                 "account-a",
                  "--identity-label",
-                 "codex02",
+                 "account-b",
                  "--identity-label",
-                 "codex03",
+                 "account-c",
                  "--dry-run"
                ])
     end
@@ -71,11 +71,11 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
         "--owner-id",
         @owner_id,
         "--identity-label",
-        "codex01",
+        "account-a",
         "--identity-label",
-        "codex02",
+        "account-b",
         "--identity-label",
-        "codex03"
+        "account-c"
       ]
 
       assert {:error, "base URL must be an origin-only HTTP loopback URL"} =
@@ -100,11 +100,11 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
                  "--owner-id",
                  @owner_id,
                  "--identity-label",
-                 "codex01",
+                 "account-a",
                  "--identity-label",
-                 "codex01",
+                 "account-a",
                  "--identity-label",
-                 "codex03"
+                 "account-c"
                ])
 
       assert {:error, "exactly three --identity-label values are required"} =
@@ -133,8 +133,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
         Enum.with_index(@labels, 1)
         |> Enum.map(fn {label, index} ->
           %{
-            id:
-              "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(index), 12, "0")}",
+            id: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(index), 12, "0")}",
             label: label,
             status: "active"
           }
@@ -142,8 +141,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
       other_client_application_names: []
     }
 
-    assert {:ok,
-            "dry-run passed: localhost, sole owner, three distinct active identities, no writes"} =
+    assert {:ok, "dry-run passed: localhost, sole owner, three distinct active identities, no writes"} =
              Smoke.execute(command,
                inspection: inspection,
                server_check: fn _uri -> :ok end
@@ -270,7 +268,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
   test "cleanup plan contains exact recorded ids only and has dependency order", %{run_id: run_id} do
     journal =
       Smoke.new_journal(run_id, @owner_id, @labels)
-      |> Smoke.record_resource("pool", "pool-exact", %{slug: "issue-241-#{run_id}-01"})
+      |> Smoke.record_resource("pool", "pool-exact", %{slug: "responses-tool-compat-#{run_id}-01"})
       |> Smoke.record_resource("model", "model-exact", %{pool_id: "pool-exact"})
       |> Smoke.record_resource("api_key", "key-exact", %{pool_id: "pool-exact"})
       |> Smoke.record_resource("assignment", "assignment-exact", %{pool_id: "pool-exact"})
@@ -299,7 +297,11 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     {:ok, pool} =
       Pools.create_pool(
         scope,
-        %{slug: "Issue-241-#{run_id}-01", name: "Issue 241 ownership test", status: "active"},
+        %{
+          slug: "Responses-tool-compat-#{run_id}-01",
+          name: "Responses tool compatibility ownership test",
+          status: "active"
+        },
         broadcast?: false
       )
 
@@ -309,7 +311,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
 
     assert :ok = Smoke.validate_cleanup_ownership(plan, valid)
 
-    mismatched = [%{hd(plan) | "slug" => "issue-241-mismatched"}]
+    mismatched = [%{hd(plan) | "slug" => "responses-tool-compat-mismatched"}]
 
     assert {:error, "journaled Pool ownership did not match its deterministic slug"} =
              Smoke.validate_cleanup_ownership(mismatched, valid)
@@ -320,9 +322,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     model = %CodexPooler.Catalog.Model{}
 
     assert {:ok, %{sync_run: ^sync_run, models: [^model]}} =
-             Smoke.accept_catalog_sync_result(
-               {:ok, %{sync_run: sync_run, models: [model], partial?: false}}
-             )
+             Smoke.accept_catalog_sync_result({:ok, %{sync_run: sync_run, models: [model], partial?: false}})
 
     assert {:error, "catalog sync was partial"} =
              Smoke.accept_catalog_sync_result({:ok, %{partial?: true}})
@@ -331,12 +331,86 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
              Smoke.accept_catalog_sync_result({:ok, %{skipped?: true}})
 
     assert {:error, "provisioning returned an unexpected shape"} =
-             Smoke.accept_catalog_sync_result(
-               {:ok, %{sync_run: %URI{}, models: [model], partial?: false}}
-             )
+             Smoke.accept_catalog_sync_result({:ok, %{sync_run: %URI{}, models: [model], partial?: false}})
 
     assert {:error, "provisioning returned an unexpected shape"} =
              Smoke.accept_catalog_sync_result(:unexpected)
+  end
+
+  # findings#206 206-138: the certification only considers the exact gpt-6
+  # family the Pool advertises; a lookalike id or a retired family must never
+  # become the model a tool-compatibility receipt certifies.
+  test "certification discovery keeps only exact gpt-6 family models the Pool advertises", %{
+    run_id: run_id,
+    run_dir: run_dir
+  } do
+    raw_key = "sk-test-#{random_hex(8)}"
+
+    port =
+      start_models_endpoint(
+        raw_key,
+        ~w(gpt-6 gpt-6-sol gpt-6-astra gpt-6-luna gpt-60 gpt-6sol gpt-5.5 gpt-5.6-sol gpt-6-sol-context)
+      )
+
+    model = &certification_candidate/2
+
+    models = [
+      model.("gpt-6", %{}),
+      model.("gpt-6-sol", %{metadata: %{"upstream_model" => %{"slug" => "gpt-6-sol"}}}),
+      model.("gpt-6-astra", %{}),
+      model.("gpt-6-luna", %{}),
+      model.("gpt-60", %{}),
+      model.("gpt-6sol", %{}),
+      model.("gpt-5.5", %{}),
+      model.("gpt-5.6-sol", %{}),
+      model.("gpt-6-sol-context", %{supports_tools: false}),
+      model.("gpt-6-nano", %{})
+    ]
+
+    fixture = %{raw_key: raw_key, models: models, pool: %{id: Ecto.UUID.generate()}}
+
+    assert {:error, "candidate capability probe completed without certification"} =
+             Smoke.candidate_capability_matrix_runner(
+               URI.parse("http://127.0.0.1:#{port}"),
+               nil,
+               %{"run_id" => run_id},
+               [fixture],
+               run_dir,
+               candidate_profiles: ["lite"]
+             )
+
+    # Each surviving model reaches its profile setup, which fails on the absent
+    # run journal before any database write, so its id is the only signal.
+    results = Process.get(:responses_tool_candidate_capability_results)
+    assert Enum.map(results, & &1.model) == ~w(gpt-6 gpt-6-astra gpt-6-sol)
+    assert Enum.all?(results, &(&1.status == "profile_setup_failed"))
+  end
+
+  # findings#206 206-258: the default matrix runner certifies gpt-6-sol whenever
+  # the Pool stores and advertises it with tools, ahead of every other exact
+  # gpt-6 model that sorts before it; otherwise the first qualifying id.
+  test "certification selection prefers a qualifying gpt-6-sol over earlier ids" do
+    raw_key = "sk-test-#{random_hex(8)}"
+    base_url = URI.parse("http://127.0.0.1:#{start_models_endpoint(raw_key, ~w(gpt-6 gpt-6-astra gpt-6-luna gpt-6-sol))}")
+    select = fn models -> Smoke.select_certification_model(base_url, %{raw_key: raw_key, models: models}) end
+    ids = fn models -> Enum.map(models, &certification_candidate(&1, %{})) end
+
+    assert {:ok, %{exposed_model_id: "gpt-6-sol"}} = select.(ids.(~w(gpt-6 gpt-6-astra gpt-6-sol gpt-6-luna)))
+
+    # Without a qualifying gpt-6-sol the first exact family id wins.
+    assert {:ok, %{exposed_model_id: "gpt-6"}} = select.(ids.(~w(gpt-6-luna gpt-6-astra gpt-6)))
+    assert {:ok, %{exposed_model_id: "gpt-6-astra"}} = select.(ids.(~w(gpt-6-luna gpt-6-astra)))
+
+    no_tools = certification_candidate("gpt-6-sol", %{supports_tools: false})
+    assert {:ok, %{exposed_model_id: "gpt-6-astra"}} = select.([no_tools | ids.(~w(gpt-6-astra gpt-6-luna))])
+
+    not_advertised_port = start_models_endpoint(raw_key, ~w(gpt-6-astra gpt-6-luna))
+
+    assert {:ok, %{exposed_model_id: "gpt-6-astra"}} =
+             Smoke.select_certification_model(
+               URI.parse("http://127.0.0.1:#{not_advertised_port}"),
+               %{raw_key: raw_key, models: ids.(~w(gpt-6-sol gpt-6-astra gpt-6-luna))}
+             )
   end
 
   test "candidate probe classification sanitizes binary and non-binary failures" do
@@ -350,9 +424,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
 
     assert Smoke.classify_candidate_probe_result(:not_tested) == "not_tested_http_failed"
 
-    assert Smoke.classify_candidate_probe_result(
-             {:error, "provider did not return the required tool call"}
-           ) == "missing_forced_tool_call"
+    assert Smoke.classify_candidate_probe_result({:error, "provider did not return the required tool call"}) == "missing_forced_tool_call"
 
     assert Smoke.classify_candidate_probe_result({:error, :response_timeout}) ==
              "transport_failed"
@@ -450,7 +522,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     call = %{
       "type" => "function_call",
       "name" => smoke_case.name,
-      "arguments" => Jason.encode!(%{"goal" => %{"value" => "issue241"}})
+      "arguments" => CodexPooler.JSON.encode!(%{"goal" => %{"value" => "responses_tool"}})
     }
 
     assert :ok = Smoke.validate_terminal_output(%{"output" => [call]}, smoke_case)
@@ -520,7 +592,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
                    %{
                      "type" => "custom_tool_call",
                      "name" => lark_case.name,
-                     "input" => "issue241"
+                     "input" => "responses_tool"
                    }
                  ]
                },
@@ -564,7 +636,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
                    %{
                      "type" => "custom_tool_call",
                      "name" => regex_case.name,
-                     "input" => "issue241"
+                     "input" => "responses_tool"
                    }
                  ]
                },
@@ -610,8 +682,8 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
              )
 
     for output <- [
-          [%{"type" => "function_call", "name" => lark_case.name, "input" => "issue241"}],
-          [%{"type" => "custom_tool_call", "name" => "wrong-name", "input" => "issue241"}],
+          [%{"type" => "function_call", "name" => lark_case.name, "input" => "responses_tool"}],
+          [%{"type" => "custom_tool_call", "name" => "wrong-name", "input" => "responses_tool"}],
           []
         ] do
       assert {:error, "provider did not return the required tool call"} =
@@ -623,7 +695,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
   end
 
   test "websocket terminals are backfilled from streamed output item frames" do
-    call = %{"type" => "custom_tool_call", "name" => "probe", "input" => "issue241"}
+    call = %{"type" => "custom_tool_call", "name" => "probe", "input" => "responses_tool"}
 
     frames = [
       %{"type" => "response.created"},
@@ -692,7 +764,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
              })
 
     assert {:ok, content} = File.read(receipt_path)
-    assert {:ok, receipt} = Jason.decode(content)
+    assert {:ok, receipt} = CodexPooler.JSON.decode(content)
 
     assert receipt == %{
              "certification_status" => "failed",
@@ -709,12 +781,10 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     owner = owner_fixture!()
     scope = Scope.for_user(owner)
     identity = active_identity_fixture!()
-    slug = "issue-241-no-job-#{System.unique_integer([:positive])}"
+    slug = "responses-tool-compat-no-job-#{System.unique_integer([:positive])}"
 
     assert {:ok, pool} =
-             Pools.create_pool(scope, %{slug: slug, name: "No job smoke", status: "active"},
-               broadcast?: false
-             )
+             Pools.create_pool(scope, %{slug: slug, name: "No job smoke", status: "active"}, broadcast?: false)
 
     assert :ok =
              Upstreams.sync_pool_assignments_for_pool_edit(pool, [identity.id],
@@ -759,8 +829,7 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
         Enum.with_index(@labels, 1)
         |> Enum.map(fn {label, index} ->
           %{
-            id:
-              "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(index), 12, "0")}",
+            id: "00000000-0000-4000-8000-#{String.pad_leading(Integer.to_string(index), 12, "0")}",
             label: label,
             status: "active"
           }
@@ -775,8 +844,8 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     user =
       %User{}
       |> User.bootstrap_changeset(%{
-        "email" => "issue-241-owner-#{System.unique_integer([:positive])}@example.com",
-        "display_name" => "Issue 241 Owner",
+        "email" => "responses-tool-compat-owner-#{System.unique_integer([:positive])}@example.com",
+        "display_name" => "Responses tool compatibility Owner",
         "password" => "bootstrap-pass-123"
       })
       |> Repo.insert!()
@@ -799,8 +868,8 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
     unique = System.unique_integer([:positive])
 
     %UpstreamIdentity{
-      chatgpt_account_id: "acct_issue241_#{unique}",
-      account_label: "issue-241-identity-#{unique}",
+      chatgpt_account_id: "acct_responses_tool_#{unique}",
+      account_label: "responses-tool-compat-identity-#{unique}",
       onboarding_method: "import",
       status: "active",
       headers_profile_version: 1,
@@ -809,6 +878,43 @@ defmodule CodexPooler.Dev.ResponsesToolCompatSmokeTest do
       metadata: %{}
     }
     |> Repo.insert!()
+  end
+
+  # A loopback `/v1/models` that advertises exactly `advertised` to `raw_key`.
+  defp start_models_endpoint(raw_key, advertised) do
+    {:ok, pid} =
+      Bandit.start_link(
+        plug: fn conn, _opts ->
+          authorized? = Plug.Conn.get_req_header(conn, "authorization") == ["Bearer #{raw_key}"]
+
+          if conn.request_path == "/v1/models" and authorized? do
+            body = CodexPooler.JSON.encode!(%{"data" => Enum.map(advertised, &%{"id" => &1})})
+
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.send_resp(200, body)
+          else
+            Plug.Conn.send_resp(conn, 401, "{}")
+          end
+        end,
+        port: 0,
+        ip: {127, 0, 0, 1}
+      )
+
+    Process.unlink(pid)
+    on_exit(fn -> Supervisor.stop(pid) end)
+    {:ok, {_ip, port}} = ThousandIsland.listener_info(pid)
+    port
+  end
+
+  defp certification_candidate(id, attrs) do
+    struct!(
+      CodexPooler.Catalog.Model,
+      Map.merge(
+        %{exposed_model_id: id, upstream_model_id: id, metadata: %{}, supports_responses: true, supports_streaming: true, supports_tools: true},
+        attrs
+      )
+    )
   end
 
   defp random_hex(bytes), do: :crypto.strong_rand_bytes(bytes) |> Base.encode16(case: :lower)

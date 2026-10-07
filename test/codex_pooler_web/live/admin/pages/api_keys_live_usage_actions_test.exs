@@ -1,13 +1,69 @@
 defmodule CodexPoolerWeb.Admin.ApiKeysLiveUsageActionsTest do
   use CodexPoolerWeb.ConnCase, async: false
+  use Oban.Testing, repo: CodexPooler.Repo
 
+  import Ecto.Query
   import Phoenix.LiveViewTest
+  import CodexPooler.PoolerFixtures
   alias CodexPooler.Access
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.Rollups
+  alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Events
   alias CodexPooler.Pools
   alias CodexPooler.Repo
+  alias Ecto.Adapters.SQL.Sandbox
+
+  @budget_usage_timeout_ms 15_000
 
   setup :register_and_log_in_user
+
+  test "limits explain known, provisional and pending budget without changing measured burn", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "budget-components", name: "Budget components"})
+
+    {:ok, %{api_key: key}} = Access.create_api_key(scope, pool, %{display_name: "Budget key"})
+    fixture = %{pool: pool, api_key: key}
+    known = request_fixture(fixture)
+    settlement = ledger_entry_fixture(known, %{total_tokens: 123})
+    Rollups.accumulate!(known, settlement)
+    pending = request_fixture(fixture, %{status: "in_progress", completed_at: nil})
+
+    ledger_entry_fixture(pending, %{
+      entry_kind: "reservation",
+      usage_status: "usage_unknown",
+      total_tokens: 512
+    })
+
+    unknown = request_fixture(fixture, %{usage_status: "usage_unknown"})
+
+    ledger_entry_fixture(unknown, %{
+      usage_status: "usage_unknown",
+      total_tokens: 2048,
+      details: %{"estimated_from_reserve" => true}
+    })
+
+    {:ok, before_usage} = Accounting.build_api_key_self_usage(pool, key)
+    {:ok, view, _} = live(conn, ~p"/admin/api-keys")
+    view |> element("#edit-api-key-#{key.id}") |> render_click()
+    select_api_key_section(view, :limits)
+    render_async(view, @budget_usage_timeout_ms)
+
+    for window <- ["daily", "weekly"] do
+      assert has_element?(view, "#api-key-budget-#{window}-known", "123")
+      assert has_element?(view, "#api-key-budget-#{window}-provisional", "2,048")
+      assert has_element?(view, "#api-key-budget-#{window}-pending", "512")
+      assert has_element?(view, "#api-key-budget-#{window}-effective", "2,683")
+    end
+
+    {:ok, after_usage} = Accounting.build_api_key_self_usage(pool, key)
+    assert after_usage.total_tokens == before_usage.total_tokens
+    assert after_usage.total_tokens == 123
+  end
 
   test "edit review shows Pool name and normalized policy limits without usage", %{
     conn: conn,
@@ -121,6 +177,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveUsageActionsTest do
     {:ok, %{api_key: api_key, raw_key: original_raw_key}} =
       Access.create_api_key(scope, pool, %{display_name: "Action key"})
 
+    history = CodexPooler.PoolerFixtures.request_fixture(%{pool: pool, api_key: api_key})
+
     {:ok, view, _html} = live(conn, ~p"/admin/api-keys")
 
     view |> element("#disable-api-key-#{api_key.id}") |> render_click()
@@ -144,6 +202,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveUsageActionsTest do
 
     view |> element("#delete-api-key-#{api_key.id}") |> render_click()
     assert has_element?(view, "#api-key-delete-dialog[open]")
+    assert has_element?(view, "#api-key-delete-dialog", "Request history is retained")
     assert render(view) =~ rotated_api_key.key_prefix
 
     view
@@ -169,6 +228,74 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveUsageActionsTest do
 
     refute has_element?(view, "#api-key-row-#{api_key.id}")
     refute Repo.get(APIKey, api_key.id)
+    retained = Repo.get!(CodexPooler.Accounting.Request, history.id)
+    assert retained.api_key_id == nil
+    assert retained.pool_id == pool.id
+    assert retained.status == "succeeded"
+  end
+
+  test "a key with a large history is revoked and shows as deleting until its deletion job removes it", context do
+    CodexPooler.DataCase.stop_sandbox(context.sandbox_owner, context.sandbox_settings_cache)
+    Sandbox.mode(Repo, :auto)
+    on_exit(fn -> Sandbox.mode(Repo, :manual) end)
+    %{user: owner, token: token} = CodexPooler.AccountsFixtures.committed_bootstrap_owner_fixture!()
+    conn = log_in_user(context.conn, owner, token)
+    scope = Scope.for_user(owner, ["instance_owner"])
+    CodexPooler.TestAppEnv.restore_on_exit(:api_key_deletion_immediate_request_limit)
+    Application.put_env(:codex_pooler, :api_key_deletion_immediate_request_limit, 1)
+
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "key-large-history", name: "Key Large History"})
+    {:ok, %{api_key: api_key}} = Access.create_api_key(scope, pool, %{display_name: "Large history key"})
+    history = CodexPooler.PoolerFixtures.request_fixture(%{pool: pool, api_key: api_key})
+
+    CodexPooler.UnboxedFixture.register_unboxed_cleanup!(fn ->
+      Repo.delete_all(from job in Oban.Job, where: fragment("? @> ?", job.args, ^%{"api_key_id" => api_key.id}))
+    end)
+
+    assert :ok = Events.subscribe_pool(pool.id, "pools")
+    {:ok, view, _html} = live(conn, ~p"/admin/api-keys")
+
+    on_exit(fn ->
+      if Process.alive?(view.pid) do
+        monitor = Process.monitor(view.pid)
+        GenServer.stop(view.pid, :normal)
+        assert_receive {:DOWN, ^monitor, :process, _, :normal}, @budget_usage_timeout_ms
+      end
+    end)
+
+    view |> element("#delete-api-key-#{api_key.id}") |> render_click()
+
+    view
+    |> element("#api-key-delete-form")
+    |> render_submit(%{"api_key_delete" => %{"id" => api_key.id, "confirmation_prefix" => api_key.key_prefix}})
+
+    assert has_element?(view, "#flash-info", "Its deletion started")
+    refute has_element?(view, "#flash-info", "API key deleted")
+    assert has_element?(view, "#api-key-row-#{api_key.id}-status", "revoked")
+    assert has_element?(view, "#api-key-row-#{api_key.id}-deletion", "deleting")
+    assert has_element?(view, "#delete-api-key-#{api_key.id}[disabled]")
+    assert Repo.get!(APIKey, api_key.id).status == "revoked"
+
+    assert [job] = all_enqueued(worker: CodexPooler.Jobs.APIKeyDeletionWorker, args: %{"api_key_id" => api_key.id})
+    assert :ok = perform_job(CodexPooler.Jobs.APIKeyDeletionWorker, job.args)
+
+    refute Repo.get(APIKey, api_key.id)
+    assert Repo.get!(CodexPooler.Accounting.Request, history.id).api_key_id == nil
+    key_id = api_key.id
+    assert_receive {Events, %{reason: "api_key_deleted", payload: %{"api_key_id" => ^key_id}}}, @budget_usage_timeout_ms
+    await_key_removed!(view, key_id, System.monotonic_time(:millisecond) + @budget_usage_timeout_ms)
+    refute has_element?(view, "#api-key-row-#{key_id}")
+  end
+
+  defp await_key_removed!(view, key_id, deadline) do
+    if has_element?(view, "#api-key-row-#{key_id}") do
+      assert System.monotonic_time(:millisecond) < deadline, "committed key deletion did not remove the row"
+
+      receive do
+      after
+        10 -> await_key_removed!(view, key_id, deadline)
+      end
+    end
   end
 
   defp extract_raw_key!(html) do

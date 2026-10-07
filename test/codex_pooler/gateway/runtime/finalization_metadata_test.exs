@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
+defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataTest do
   use CodexPoolerWeb.ConnCase, async: false
 
   import Ecto.Query
@@ -6,193 +6,139 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.{BridgeDemotion, RoutingCircuitState}
+
+  alias CodexPooler.Gateway.Persistence.{
+    BridgeDemotion,
+    BridgeOwnerLease,
+    CodexSession,
+    CodexTurn,
+    RoutingCircuitState,
+    SessionContinuity
+  }
+
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
   alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
+  alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
+  alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
 
-  import CodexPooler.AccountingTestSupport, only: [accounting_setup: 0]
+  import CodexPooler.AccountingTestSupport, only: [accounting_setup: 0, key_usage_events: 1]
 
-  test "HTTP attempt metadata includes safe payload compression savings" do
-    sensitive_placeholder =
-      "placeholder raw tool output with bearer example-token and private prompt text"
-
+  test "HTTP and websocket finalization ignore retired metadata while preserving prompt cache state" do
     options =
-      request_options()
-      |> RequestOptions.put_runtime_context(
-        payload_compression:
-          compression_metadata(%{
-            "raw_candidate" => sensitive_placeholder,
-            "call_id" => "call_sensitive_placeholder",
-            "json_path" => "$.input[0].output"
-          })
-      )
-
-    response = %Req.Response{
-      status: 200,
-      headers: [
-        {"content-type", ["application/json"]},
-        {"x-request-id", ["req_payload_compression"]}
-      ]
-    }
-
-    metadata = Metadata.response_metadata(response, nil, options)
-
-    assert metadata["payload_compression"] == expected_compression_metadata()
-
-    assert Metadata.request_metadata(options) == %{
-             "payload_compression" => metadata["payload_compression"]
-           }
-
-    metadata_text = inspect(metadata["payload_compression"])
-    refute metadata_text =~ sensitive_placeholder
-    refute metadata_text =~ "call_sensitive_placeholder"
-    refute metadata_text =~ "$.input[0].output"
-  end
-
-  test "HTTP finalization allowlists payload compression strategy metadata" do
-    options =
-      request_options()
-      |> RequestOptions.put_runtime_context(
-        payload_compression:
-          compression_metadata(%{
-            "strategies" => [
-              "log_output",
-              "call_probe_secret",
-              "json_document_lossless",
-              "json_array_lossless"
-            ],
-            "candidate_count" => 1
-          })
-      )
+      RequestOptions.build(%{payload_compression: %{"attempted" => true, "status" => "compressed"}}, "/backend-api/codex/responses", %{"model" => "example-model"})
+      |> RequestOptions.put_runtime_context(prompt_cache_controls_downgraded: true)
 
     response = %Req.Response{status: 200, headers: [{"content-type", ["application/json"]}]}
-    metadata = Metadata.response_metadata(response, nil, options)
 
-    assert metadata["payload_compression"]["strategies"] == [
-             "log_output",
-             "json_document_lossless",
-             "json_array_lossless"
-           ]
+    for metadata <- [Metadata.response_metadata(response, nil, options), Metadata.websocket_response_metadata([], nil, options)] do
+      assert metadata["prompt_cache_controls_downgraded"] == true
+      refute Map.has_key?(metadata, "payload_compression")
+    end
 
-    refute inspect(metadata["payload_compression"]) =~ "call_probe_secret"
+    assert_raise KeyError, fn -> RequestOptions.put_runtime_context(options, payload_compression: %{}) end
   end
 
-  test "HTTP finalization keeps tokenizer input limit metadata without raw skipped content" do
-    sensitive_placeholder = "placeholder skipped tokenizer input body"
+  test "stale owner terminal settlement keeps accounting truthful without moving replacement assignment" do
+    setup = accounting_setup()
 
-    options =
-      request_options()
-      |> RequestOptions.put_runtime_context(
-        payload_compression: %{
-          "attempted" => true,
-          "status" => "skipped",
-          "reason" => "tokenizer_input_limit",
-          "candidate_count" => 2,
-          "compressed_count" => 0,
-          "skipped_count" => 2,
-          "tokenizer_input_skipped_count" => 2,
-          "raw_candidate" => sensitive_placeholder
-        }
+    %{assignment: replacement_assignment} =
+      CodexPooler.PoolerFixtures.upstream_assignment_fixture(setup.pool)
+
+    payload = %{"model" => setup.model.exposed_model_id}
+
+    assert {:ok, %CodexSession{} = session} =
+             Gateway.start_codex_session(setup.auth, %{
+               accepted_turn_state: "terminal-settlement-#{System.unique_integer([:positive])}",
+               owner_instance_id: "node-a"
+             })
+
+    session = Repo.reload!(session)
+    {:ok, witness} = OwnerWitness.new(session)
+
+    request_options =
+      %{transport: "http_json"}
+      |> RequestOptions.build("/backend-api/codex/responses", payload)
+      |> RequestOptions.put_session_owner_witness(witness)
+
+    assert {:ok, reserved} =
+             Accounting.reserve(setup.auth, setup.model, payload, %{
+               endpoint: "/backend-api/codex/responses",
+               transport: "http_json",
+               correlation_id: "terminal-settlement-#{System.unique_integer([:positive])}",
+               request_metadata: %{}
+             })
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+    assert {:ok, %CodexTurn{} = turn} =
+             SessionContinuity.start_codex_turn(session, reserved.request, request_options)
+
+    turn
+    |> Ecto.Changeset.change(%{status: CodexTurn.interrupted_status()})
+    |> Repo.update!()
+
+    replacement_token = Ecto.UUID.generate()
+    takeover_now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    takeover_deadline = DateTime.add(takeover_now, 90, :second)
+
+    session
+    |> Ecto.Changeset.change(%{
+      owner_instance_id: "node-b",
+      owner_lease_token: replacement_token,
+      owner_lease_expires_at: takeover_deadline,
+      pool_upstream_assignment_id: replacement_assignment.id,
+      last_heartbeat_at: takeover_now,
+      updated_at: takeover_now
+    })
+    |> Repo.update!()
+
+    lease =
+      Repo.one!(
+        from lease in BridgeOwnerLease,
+          where: lease.codex_session_id == ^session.id and lease.status == "active",
+          limit: 1
       )
 
-    response = %Req.Response{status: 200, headers: [{"content-type", ["application/json"]}]}
-    metadata = Metadata.response_metadata(response, nil, options)
+    lease
+    |> Ecto.Changeset.change(%{
+      owner_instance_id: "node-b",
+      lease_token: replacement_token,
+      expires_at: takeover_deadline,
+      pool_upstream_assignment_id: replacement_assignment.id,
+      renewed_at: takeover_now,
+      updated_at: takeover_now
+    })
+    |> Repo.update!()
 
-    assert metadata["payload_compression"] == %{
-             "attempted" => true,
-             "status" => "skipped",
-             "reason" => "tokenizer_input_limit",
-             "candidate_count" => 2,
-             "compressed_count" => 0,
-             "skipped_count" => 2,
-             "tokenizer_input_skipped_count" => 2
-           }
+    before_session = Repo.get!(CodexSession, session.id)
+    before_lease = Repo.reload!(lease)
 
-    assert Metadata.request_metadata(options) == %{
-             "payload_compression" => metadata["payload_compression"]
-           }
+    assert {:ok, %{finalization_disposition: :inserted}} =
+             AttemptSettlement.finalize_success(
+               reserved.request,
+               attempt,
+               %{
+                 status: "usage_known",
+                 input_tokens: 3,
+                 output_tokens: 2,
+                 total_tokens: 5
+               },
+               %{response_status_code: 200},
+               witness
+             )
 
-    refute inspect(metadata["payload_compression"]) =~ sensitive_placeholder
+    assert Repo.reload!(reserved.request).status == "succeeded"
+    assert Repo.reload!(attempt).status == "succeeded"
+    assert Repo.reload!(turn).status == CodexTurn.succeeded_status()
+    assert Repo.get!(CodexSession, session.id) == before_session
+    assert Repo.reload!(lease) == before_lease
   end
 
-  test "websocket attempt metadata includes safe payload compression savings" do
-    options =
-      request_options()
-      |> RequestOptions.for_websocket(%{"model" => "example-model"})
-      |> RequestOptions.put_runtime_context(payload_compression: compression_metadata())
-
-    metadata =
-      Metadata.websocket_response_metadata(
-        [{"openai-request-id", "req_payload_compression_ws"}],
-        nil,
-        options
-      )
-
-    assert metadata["payload_compression"] == expected_compression_metadata()
-    assert metadata["upstream_transport"] == "websocket"
-  end
-
-  test "payload compression ratios are omitted when denominators are zero" do
-    options =
-      request_options()
-      |> RequestOptions.put_runtime_context(
-        payload_compression: %{
-          "attempted" => true,
-          "status" => "no_change",
-          "reason" => "no_token_shrink",
-          "original_bytes" => 0,
-          "compressed_bytes" => 0,
-          "original_tokens" => 0,
-          "compressed_tokens" => 0
-        }
-      )
-
-    response = %Req.Response{status: 200, headers: [{"content-type", ["application/json"]}]}
-    metadata = Metadata.response_metadata(response, nil, options)["payload_compression"]
-
-    assert metadata["saved_bytes"] == 0
-    assert metadata["saved_tokens"] == 0
-    refute Map.has_key?(metadata, "byte_savings_ratio")
-    refute Map.has_key?(metadata, "byte_savings_percent")
-    refute Map.has_key?(metadata, "token_savings_ratio")
-    refute Map.has_key?(metadata, "token_savings_percent")
-    refute Map.has_key?(metadata, "compression_ratio")
-  end
-
-  test "payload compression metadata stays absent when compression was not attempted" do
-    response = %Req.Response{status: 200, headers: [{"content-type", ["application/json"]}]}
-
-    without_metadata = request_options()
-
-    not_attempted =
-      RequestOptions.put_runtime_context(without_metadata,
-        payload_compression: %{"enabled" => true, "attempted" => false, "status" => "disabled"}
-      )
-
-    refute Map.has_key?(
-             Metadata.response_metadata(response, nil, without_metadata),
-             "payload_compression"
-           )
-
-    refute Map.has_key?(
-             Metadata.websocket_response_metadata([], nil, without_metadata),
-             "payload_compression"
-           )
-
-    assert Metadata.request_metadata(without_metadata) == %{}
-
-    refute Map.has_key?(
-             Metadata.response_metadata(response, nil, not_attempted),
-             "payload_compression"
-           )
-
-    assert Metadata.request_metadata(not_attempted) == %{}
-  end
-
-  @tag :prompt_cache_adaptation
   test "post-serialization dispatch failure persists only prompt cache adaptation metadata" do
     setup = accounting_setup()
     payload = %{"model" => setup.model.exposed_model_id}
@@ -201,8 +147,7 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
              Accounting.reserve(setup.auth, setup.model, payload, %{
                endpoint: "/backend-api/codex/responses",
                transport: "http_json",
-               correlation_id:
-                 "prompt-cache-dispatch-error-#{System.unique_integer([:positive])}",
+               correlation_id: "prompt-cache-dispatch-error-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -255,6 +200,62 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
            )
   end
 
+  test "ambiguous post-submit HTTP failure does not rotate candidates" do
+    setup = accounting_setup()
+
+    %{assignment: second_assignment, identity: second_identity} =
+      CodexPooler.PoolerFixtures.upstream_assignment_fixture(setup.pool)
+
+    payload = %{"model" => setup.model.exposed_model_id}
+
+    assert {:ok, reserved} =
+             Accounting.reserve(setup.auth, setup.model, payload, %{
+               endpoint: "/backend-api/codex/responses",
+               transport: "http_json",
+               correlation_id: "ambiguous-dispatch-#{System.unique_integer([:positive])}",
+               request_metadata: %{}
+             })
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    request_options = request_options()
+
+    context = %SelectedCandidateContext{
+      auth: setup.auth,
+      endpoint: "/backend-api/codex/responses",
+      payload: payload,
+      model: setup.model,
+      reserved: reserved,
+      request_options: request_options,
+      route_plan:
+        BridgeRing.plan_route(%{
+          auth: setup.auth,
+          model: setup.model,
+          candidates: [
+            {setup.assignment, setup.identity},
+            {second_assignment, second_identity}
+          ],
+          route_plan_input: RoutePlanInput.from_reserved(reserved),
+          request_options: request_options
+        }),
+      assignment: setup.assignment,
+      identity: setup.identity,
+      index: 0,
+      retry_count: 0,
+      allow_retry?: true,
+      routing_attempt_metadata: %{},
+      route_class: "proxy_http",
+      attempt: attempt,
+      started: System.monotonic_time(:millisecond)
+    }
+
+    error = TransportFailureReason.upstream_transport_error(:timeout, %{phase: :request})
+
+    assert {:error, %{status: 502}} = Finalization.handle_dispatch_error(error, context, 7)
+    assert Repo.reload!(reserved.request).status == "failed"
+    refute Repo.reload!(attempt).retryable
+    assert Repo.aggregate(Attempt, :count) == 1
+  end
+
   test "terminal websocket failure settles once with the sanitized local guard diagnostic" do
     setup = accounting_setup()
     payload = %{"model" => setup.model.exposed_model_id, "stream" => true}
@@ -263,8 +264,7 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
              Accounting.reserve(setup.auth, setup.model, payload, %{
                endpoint: "/backend-api/codex/responses",
                transport: "websocket",
-               correlation_id:
-                 "continuation-guard-finalization-#{System.unique_integer([:positive])}",
+               correlation_id: "continuation-guard-finalization-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -376,6 +376,11 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
              :count
            ) == 1
 
+    # The guard refused before anything was sent, so no usage applies: the
+    # reservation's estimate is neither the settlement's tokens and cost nor
+    # the key's provisional tokens, which it was as unknown usage.
+    assert_undispatched_settlement!(request, attempt)
+
     assert Repo.all(from(demotion in BridgeDemotion)) == []
 
     updated_circuit = Repo.get!(RoutingCircuitState, circuit.id)
@@ -433,8 +438,7 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
 
     assert {:ok, %{status: 200, websocket_messages: []}} =
              Finalization.finalize_terminal_websocket_response(context, %{
-               body:
-                 ~s(data: {"type":"error","error":{"code":"previous_response_not_found"}}\n\n),
+               body: ~s(data: {"type":"error","error":{"code":"previous_response_not_found"}}\n\n),
                terminal: "error",
                status: 200,
                headers: [],
@@ -475,6 +479,11 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
              :count
            ) == 1
 
+    # Guard-shaped metadata that is not the guard's exact pre-send shape proves
+    # nothing about dispatch: the miss keeps the unknown usage of a request the
+    # provider may have received.
+    assert_unknown_usage_settlement!(request, attempt)
+
     assert Repo.all(from(demotion in BridgeDemotion)) == []
     refute inspect({request.request_metadata, attempt.response_metadata}) =~ raw_sentinel
   end
@@ -487,8 +496,7 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
              Accounting.reserve(setup.auth, setup.model, payload, %{
                endpoint: "/backend-api/codex/responses",
                transport: "websocket",
-               correlation_id:
-                 "continuation-guard-near-miss-#{System.unique_integer([:positive])}",
+               correlation_id: "continuation-guard-near-miss-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -546,6 +554,49 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
     attempt = Repo.get!(Attempt, attempt.id)
     refute Map.has_key?(attempt.response_metadata, "transport_failure")
     assert attempt.response_metadata["upstream_error_param"] == "reasoning.summary"
+    assert_unknown_usage_settlement!(Repo.get!(Request, attempt.request_id), attempt)
+  end
+
+  defp assert_undispatched_settlement!(request, attempt) do
+    %{reservation: reservation, settlement: settlement, release: release} = ledger(request)
+    assert reservation.total_tokens > 0
+
+    assert request.usage_status == "not_applicable"
+    assert attempt.usage_status == "not_applicable"
+    assert settlement.attempt_id == attempt.id
+    assert settlement.usage_status == "not_applicable"
+    assert release.usage_status == "not_applicable"
+
+    assert {settlement.input_tokens, settlement.output_tokens, settlement.total_tokens} ==
+             {nil, nil, nil}
+
+    assert Decimal.equal?(settlement.estimated_cost_micros, 0)
+    assert Decimal.equal?(settlement.settled_cost_micros, 0)
+    assert settlement.details["estimated_from_reserve"] == false
+    assert settlement.details["usage_source"] == "undispatched_refusal"
+    assert key_usage_events(request.id) == %{known: 0, provisional: 0, admissions: 1}
+  end
+
+  defp assert_unknown_usage_settlement!(request, attempt) do
+    %{reservation: reservation, settlement: settlement} = ledger(request)
+    assert reservation.total_tokens > 0
+
+    assert request.usage_status == "usage_unknown"
+    assert attempt.usage_status == "usage_unknown"
+    assert settlement.usage_status == "usage_unknown"
+    assert settlement.total_tokens == reservation.total_tokens
+    assert settlement.details["estimated_from_reserve"] == true
+    assert key_usage_events(request.id) == %{known: 0, provisional: reservation.total_tokens, admissions: 1}
+  end
+
+  defp ledger(request) do
+    entries = Repo.all(from(entry in LedgerEntry, where: entry.request_id == ^request.id))
+    assert Enum.all?(entries, &(&1.amount_status == "recorded"))
+
+    assert [reservation] = Enum.filter(entries, &(&1.entry_kind == "reservation"))
+    assert [settlement] = Enum.filter(entries, &(&1.entry_kind == "settlement"))
+    assert [release] = Enum.filter(entries, &(&1.entry_kind == "release"))
+    %{reservation: reservation, settlement: settlement, release: release}
   end
 
   defp request_options do
@@ -554,55 +605,5 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
       "/backend-api/codex/responses",
       %{"model" => "example-model"}
     )
-  end
-
-  defp compression_metadata(extra \\ %{}) do
-    Map.merge(
-      %{
-        "enabled" => true,
-        "attempted" => true,
-        "status" => "compressed",
-        "route_class" => "proxy_stream",
-        "transport" => "http",
-        "tokenizer" => "local:o200k_base",
-        "candidate_count" => 3,
-        "compressed_count" => 2,
-        "skipped_count" => 1,
-        "original_bytes" => 1200,
-        "compressed_bytes" => 300,
-        "original_tokens" => 600,
-        "compressed_tokens" => 150,
-        "strategies" => ["log_output", "diff"],
-        "elapsed_ms" => 5
-      },
-      extra
-    )
-  end
-
-  defp expected_compression_metadata do
-    %{
-      "enabled" => true,
-      "attempted" => true,
-      "status" => "compressed",
-      "route_class" => "proxy_stream",
-      "transport" => "http",
-      "tokenizer" => "local:o200k_base",
-      "candidate_count" => 3,
-      "compressed_count" => 2,
-      "skipped_count" => 1,
-      "original_bytes" => 1200,
-      "compressed_bytes" => 300,
-      "saved_bytes" => 900,
-      "byte_savings_ratio" => 0.75,
-      "byte_savings_percent" => 75.0,
-      "compression_ratio" => 0.25,
-      "original_tokens" => 600,
-      "compressed_tokens" => 150,
-      "saved_tokens" => 450,
-      "token_savings_ratio" => 0.75,
-      "token_savings_percent" => 75.0,
-      "strategies" => ["log_output", "diff"],
-      "elapsed_ms" => 5
-    }
   end
 end

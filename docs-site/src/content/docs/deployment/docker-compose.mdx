@@ -1,9 +1,11 @@
 ---
-title: Docker Compose
+title: Run Codex Pooler with Docker Compose
+sidebar:
+  label: Docker Compose
 description: Run Codex Pooler with Docker Compose for a small self-hosted install.
 ---
 
-Docker Compose is the quickest self-host path for a laptop, lab server, or small single-node install. It runs the Codex Pooler release image with a local Postgres database and writes the release secrets into a private `.env` file.
+Docker Compose is the quickest self-host path for a laptop, lab server, or small single-node install. It runs the Codex Pooler release image with a local Postgres database and writes the release secrets into a private `.env` file. Release images are published for `linux/amd64` and `linux/arm64`, so an ARM server works as well as an x86 one.
 
 Use it when you want a simple first install before moving to Kubernetes.
 
@@ -24,13 +26,13 @@ cd codex-pooler
 ## Generate the local environment
 
 For every self-hosted install, choose a tagged stable release before creating
-`.env`. Find the latest tagged stable release on [GitHub Releases](https://github.com/icoretech/codex-pooler/releases). The `latest` tag follows the most recently published release, but a version tag keeps the installation reproducible.
+`.env`. Find the latest tagged stable release on [GitHub Releases](https://github.com/icoretech/codex-pooler/releases). The `latest` tag follows verified stable releases and does not move backward when an older version is published again. A version tag keeps the installation reproducible.
 
 {/* x-release-please-start-version */}
 
 ```bash
 export CODEX_POOLER_IMAGE=ghcr.io/icoretech/codex-pooler
-export CODEX_POOLER_IMAGE_TAG=0.7.0
+export CODEX_POOLER_IMAGE_TAG=0.11.1
 scripts/self-host/generate-env.sh
 ```
 
@@ -39,8 +41,7 @@ scripts/self-host/generate-env.sh
 The generated `.env` contains release secrets, encryption roots, database settings, and image settings such as `CODEX_POOLER_IMAGE` and `CODEX_POOLER_IMAGE_TAG`. Keep it private. Don't commit it, paste it into tickets, or reuse values between public installs.
 
 If you already generated `.env`, set `CODEX_POOLER_IMAGE_TAG` to the target
-tagged stable release before `docker compose pull`. The `latest` tag follows the
-most recently published release, but pinning a version tag makes the install
+tagged stable release before `docker compose pull`. Pinning a version tag makes the install
 reproducible. If port `4000` is already in use, set `CODEX_POOLER_HTTP_PORT`
 before generation or edit it in `.env` before starting the stack.
 
@@ -153,6 +154,37 @@ traffic:
 ```bash
 docker compose logs migrate
 ```
+
+Index migrations run concurrently, so they wait for other open transactions on
+the same database, such as a backup or a `psql` session left idle inside a
+transaction. The migration waits up to five minutes in total for them and logs
+the blocking sessions while it waits; a table lock held by another session stops
+it after ten seconds. If it fails with a message that names blocking sessions,
+end those sessions or let them finish, then run `docker compose run --rm migrate`
+again. An interrupted index build is rebuilt on the next run.
+
+## Restore a database backup
+
+A `pg_dump` backup leaves out planner statistics unless it was taken with
+`--statistics`, so a restored database has no column statistics until
+autovacuum analyzes each table. After restoring with `psql` or `pg_restore`,
+analyze the database before Codex Pooler serves traffic again:
+
+```bash
+docker compose exec db sh -c 'vacuumdb --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --analyze-in-stages'
+docker compose up -d
+```
+
+## Graceful stop
+
+When the app container stops, for an upgrade, a restart or `docker compose
+down`, it drains first: it refuses new work and lets in-flight turns finish
+within the drain budget, `CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS` (50 seconds
+unless set in `.env`). Turns get about the budget minus 10.7 seconds. The
+Compose file sets `stop_grace_period: 135s` on the app, so Docker waits for the
+drain and the rest of the shutdown instead of killing the container after its
+short default timeout. If you raise the drain budget, raise the app's
+`stop_grace_period` by the same amount in a Compose override file.
 
 ## Stop or reset
 

@@ -268,8 +268,8 @@ defmodule CodexPooler.CatalogTest do
           FakeUpstream.json_response(%{
             "data" => [
               %{
-                "id" => "gpt-5.4-mini",
-                "display_name" => "GPT 5.4 Mini",
+                "id" => "gpt-6-luna",
+                "display_name" => "GPT 6 Luna",
                 "owned_by" => "upstream",
                 "capabilities" => %{"responses" => true, "streaming" => true}
               }
@@ -284,8 +284,10 @@ defmodule CodexPooler.CatalogTest do
       assert sync_run.status == "succeeded"
       assert sync_run.discovered_model_count == 1
       assert sync_run.upserted_model_count == 1
-      assert sync_run.retired_count == 0
-      assert model.exposed_model_id == "gpt-5.4-mini"
+      # SyncRun no longer maps `retired_count`, but older releases still read
+      # the retained column (findings#261), so the row keeps the value 0.
+      assert %{rows: [[0]]} = Repo.query!("SELECT retired_count FROM sync_runs WHERE id = $1", [Ecto.UUID.dump!(sync_run.id)])
+      assert model.exposed_model_id == "gpt-6-luna"
       assert model.supports_responses
       assert model.supports_streaming
       assert model.metadata["source_assignment_ids"] == [assignment.id]
@@ -329,7 +331,7 @@ defmodule CodexPooler.CatalogTest do
 
     test "sync is idempotent and marks missing active models stale" do
       upstream =
-        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-5.4-mini"}]}))
+        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-6-luna"}]}))
 
       {pool, _assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
       stale_candidate = model_fixture(pool, %{exposed_model_id: "stale-model", status: "active"})
@@ -342,12 +344,12 @@ defmodule CodexPooler.CatalogTest do
       assert Repo.get!(Model, stale_candidate.id).status == "stale"
 
       assert [visible_model] = Catalog.list_visible_models(pool)
-      assert visible_model.exposed_model_id == "gpt-5.4-mini"
+      assert visible_model.exposed_model_id == "gpt-6-luna"
     end
 
     test "sync preserves smoke-provisioned manual models" do
       upstream =
-        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-5.4-mini"}]}))
+        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-6-luna"}]}))
 
       {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
 
@@ -450,7 +452,7 @@ defmodule CodexPooler.CatalogTest do
                 },
                 "capabilities" => %{"responses" => true, "streaming" => true}
               },
-              %{"id" => "gpt-masterkain-only"}
+              %{"id" => "gpt-free-only"}
             ]
           })
         )
@@ -474,17 +476,17 @@ defmodule CodexPooler.CatalogTest do
                 ],
                 "capabilities" => %{"tools" => true, "reasoning" => true}
               },
-              %{"id" => "gpt-5.5"}
+              %{"id" => "gpt-6-sol"}
             ]
           })
         )
 
       pool = pool_fixture()
 
-      {_pool, masterkain_assignment} =
+      {_pool, free_assignment} =
         active_assignment_fixture(pool, %{"base_url" => FakeUpstream.url(shared_upstream)}, %{
-          account_label: "masterkain@gmail.com",
-          assignment_label: "Masterkain Free"
+          account_label: "free-account@example.com",
+          assignment_label: "Codex Free"
         })
 
       {_pool, pro_assignment} =
@@ -497,15 +499,15 @@ defmodule CodexPooler.CatalogTest do
       assert length(models) == 3
 
       shared = Catalog.get_model_by_exposed_id(pool, "gpt-shared")
-      pro_only = Catalog.get_model_by_exposed_id(pool, "gpt-5.5")
-      masterkain_only = Catalog.get_model_by_exposed_id(pool, "gpt-masterkain-only")
+      pro_only = Catalog.get_model_by_exposed_id(pool, "gpt-6-sol")
+      free_only = Catalog.get_model_by_exposed_id(pool, "gpt-free-only")
 
       assert shared.source_assignment_count == 2
 
       assert shared.metadata["source_assignment_ids"] ==
-               Enum.sort([masterkain_assignment.id, pro_assignment.id])
+               Enum.sort([free_assignment.id, pro_assignment.id])
 
-      assert shared.metadata["source_assignment_models"][masterkain_assignment.id][
+      assert shared.metadata["source_assignment_models"][free_assignment.id][
                "service_tiers"
              ] == []
 
@@ -517,12 +519,12 @@ defmodule CodexPooler.CatalogTest do
                }
              ]
 
-      assert shared.metadata["source_assignment_models"][masterkain_assignment.id]["visibility"] ==
+      assert shared.metadata["source_assignment_models"][free_assignment.id]["visibility"] ==
                "hide"
 
       assert get_in(shared.metadata, [
                "source_assignment_models",
-               masterkain_assignment.id,
+               free_assignment.id,
                "upgrade",
                "model"
              ]) == "gpt-source-a-replacement"
@@ -554,8 +556,8 @@ defmodule CodexPooler.CatalogTest do
       assert pro_only.source_assignment_count == 1
       assert pro_only.metadata["source_assignment_ids"] == [pro_assignment.id]
 
-      assert masterkain_only.source_assignment_count == 1
-      assert masterkain_only.metadata["source_assignment_ids"] == [masterkain_assignment.id]
+      assert free_only.source_assignment_count == 1
+      assert free_only.metadata["source_assignment_ids"] == [free_assignment.id]
     end
 
     test "persists successful assignment results when another assignment fails" do
@@ -1040,6 +1042,9 @@ defmodule CodexPooler.CatalogTest do
     parent = self()
     handler_id = "catalog-query-count-#{System.unique_integer([:positive])}"
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -1082,7 +1087,6 @@ defmodule CodexPooler.CatalogTest do
       discovered_model_count: Map.get(attrs, :discovered_model_count, 0),
       upserted_model_count: Map.get(attrs, :upserted_model_count, 0),
       stale_marked_count: Map.get(attrs, :stale_marked_count, 0),
-      retired_count: Map.get(attrs, :retired_count, 0),
       error_message: Map.get(attrs, :error_message),
       stats: Map.get(attrs, :stats, %{})
     })

@@ -1,7 +1,9 @@
 defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
   @moduledoc false
 
-  @status_options ~w(in_progress succeeded failed rejected cancelled)
+  alias CodexPoolerWeb.DateTimeInput
+
+  @status_options ~w(in_progress succeeded failed client_cancelled rejected)
   @filter_keys ~w(pool_id status upstream_identity_id model date_from date_to request_id)
 
   @type filter_error :: %{required(:field) => atom(), required(:message) => String.t()}
@@ -15,9 +17,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
     |> Map.new()
   end
 
-  @spec parse_filters(map(), term(), MapSet.t(String.t())) ::
+  @spec parse_filters(map(), term(), MapSet.t(String.t()), String.t()) ::
           {parsed_filters(), map(), [filter_error()]}
-  def parse_filters(params, selected_pool, visible_upstream_identity_ids) do
+  def parse_filters(params, selected_pool, visible_upstream_identity_ids, timezone \\ "Etc/UTC") do
     form_values = form_values(params, selected_pool)
     {status, status_error} = parse_status(form_values["status"])
 
@@ -27,18 +29,18 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
         visible_upstream_identity_ids
       )
 
-    {date_from, date_from_error} = parse_date(form_values["date_from"], :date_from)
-    {date_to, date_to_error} = parse_date(form_values["date_to"], :date_to)
+    {date_from, date_from_error} = parse_date(form_values["date_from"], :date_from, timezone)
+    {date_to, date_to_error} = parse_date(form_values["date_to"], :date_to, timezone)
 
     filters =
-      [
-        status: status,
-        upstream_identity_id: upstream_id,
-        model: blank_to_nil(form_values["model"]),
-        request_id: blank_to_nil(form_values["request_id"]),
-        date_from: date_from,
-        date_to: date_to
-      ]
+      (status_filters(status) ++
+         [
+           upstream_identity_id: upstream_id,
+           model: blank_to_nil(form_values["model"]),
+           request_id: blank_to_nil(form_values["request_id"]),
+           date_from: date_from,
+           date_to: date_to
+         ])
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
     errors =
@@ -77,7 +79,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
 
   @spec blank?(term()) :: boolean()
   def blank?(nil), do: true
-  def blank?(value), do: String.trim(to_string(value)) == ""
+  def blank?(value) when is_binary(value), do: String.trim(value) == ""
+  def blank?(_value), do: true
 
   @spec blank_to_nil(term()) :: String.t() | nil
   def blank_to_nil(value), do: if(blank?(value), do: nil, else: String.trim(to_string(value)))
@@ -93,6 +96,14 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
       "request_id" => string_param(params, "request_id")
     }
   end
+
+  # The status filter selects rows by the status they show. `failed` leaves out
+  # the client cancellations (`RequestOutcome`), which have their own
+  # `client_cancelled` option; "Any status" lists both.
+  defp status_filters(nil), do: []
+  defp status_filters("failed"), do: [status: "failed", client_cancelled: false]
+  defp status_filters("client_cancelled"), do: [client_cancelled: true]
+  defp status_filters(status), do: [status: status]
 
   defp parse_status(nil), do: {nil, nil}
 
@@ -118,20 +129,23 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
     end
   end
 
-  defp parse_date(nil, _field), do: {nil, nil}
+  defp parse_date(nil, _field, _timezone), do: {nil, nil}
 
-  defp parse_date(value, field) do
-    case Date.from_iso8601(value) do
-      {:ok, date} ->
-        {date_boundary(date, field), nil}
+  defp parse_date(value, field, timezone) do
+    case DateTimeInput.date_boundary(value, field, timezone) do
+      {:ok, datetime} ->
+        {datetime, nil}
+
+      {:error, :gap} ->
+        {nil, %{field: field, message: "#{date_label(field)} does not exist in the selected timezone"}}
+
+      {:error, :unknown_timezone} ->
+        {nil, %{field: field, message: "#{date_label(field)} timezone is unavailable; update your timezone in Settings"}}
 
       {:error, _reason} ->
         {nil, %{field: field, message: "#{date_label(field)} must be a valid date"}}
     end
   end
-
-  defp date_boundary(date, :date_to), do: DateTime.new!(date, ~T[23:59:59.999999], "Etc/UTC")
-  defp date_boundary(date, _field), do: DateTime.new!(date, ~T[00:00:00], "Etc/UTC")
 
   defp date_label(:date_from), do: "Date from"
   defp date_label(:date_to), do: "Date to"

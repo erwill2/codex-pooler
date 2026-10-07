@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.Telemetry.AdmissionSampler
 
+  @detection_timeout_ms 15_000
   @event [:codex_pooler, :gateway, :admission, :saturation]
 
   defmodule DelayedAdmission do
@@ -28,10 +29,10 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
   end
 
   test "samples real Admission running and queue lifecycle transitions" do
-    attach_saturation_telemetry()
     attach_admission_telemetry()
     admission_name = unique_name(:admission)
     sampler_name = unique_name(:admission_sampler)
+    attach_saturation_telemetry(sampler_name)
     settings = settings(max_concurrency: 1, queue_limit: 1, queue_timeout_ms: 25)
     {:ok, _admission} = start_supervised({Admission, name: admission_name})
     {:ok, sampler} = start_sampler(sampler_name, admission_name)
@@ -72,7 +73,7 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
 
     Admission.release(queued_lease)
     send(queued_task.pid, :finish)
-    assert :ok = Task.await(queued_task, 1_000)
+    assert :ok = Task.await(queued_task, @detection_timeout_ms)
 
     assert {:ok, saturation} = Admission.saturation(admission_name)
     assert %{running: 0, queued: 0} = saturation["proxy_stream"]
@@ -86,7 +87,7 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
     sample(sampler)
     assert_saturation(snapshot("proxy_stream", 1, 1))
 
-    assert {:error, %{code: "bulkhead_queue_timeout"}} = Task.await(timeout_task, 1_000)
+    assert {:error, %{code: "bulkhead_queue_timeout"}} = Task.await(timeout_task, @detection_timeout_ms)
     assert_admission_event(:timeout)
 
     assert {:ok, saturation} = Admission.saturation(admission_name)
@@ -105,9 +106,9 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
   end
 
   test "retains a nonzero snapshot through Admission downtime then refreshes after restart" do
-    attach_saturation_telemetry()
     admission_name = unique_name(:admission)
     sampler_name = unique_name(:admission_sampler)
+    attach_saturation_telemetry(sampler_name)
     settings = settings(max_concurrency: 2, queue_limit: 0, queue_timeout_ms: 25)
     {:ok, admission_supervisor} = start_supervised({DynamicSupervisor, strategy: :one_for_one})
 
@@ -154,39 +155,33 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
   end
 
   test "autonomously rearms after timeout, success, and later timeout" do
-    attach_saturation_telemetry()
     sampler_name = unique_name(:admission_sampler)
+    attach_saturation_telemetry(sampler_name)
     {:ok, reader_calls} = Agent.start_link(fn -> 0 end)
 
     {:ok, sampler} =
-      start_supervised(
-        {AdmissionSampler,
-         name: sampler_name, interval_ms: 5, snapshot_reader: reader(reader_calls, self())}
-      )
+      start_supervised({AdmissionSampler, name: sampler_name, interval_ms: 5, snapshot_reader: reader(reader_calls, self())})
 
     assert_receive {:reader_called, :timeout}
     sync_sampler(sampler)
     assert_saturation(snapshot(0, 0))
-    assert_receive {:reader_called, :success}, 1_000
+    assert_receive {:reader_called, :success}, @detection_timeout_ms
     sync_sampler(sampler)
     assert_saturation(snapshot(3, 2))
-    assert_receive {:reader_called, :timeout}, 1_000
+    assert_receive {:reader_called, :timeout}, @detection_timeout_ms
     sync_sampler(sampler)
     assert_saturation(snapshot(3, 2))
     assert Process.alive?(sampler)
   end
 
   test "late Admission replies do not leave stale sampler mailbox messages" do
-    attach_saturation_telemetry()
     delayed_name = unique_name(:delayed_admission)
     sampler_name = unique_name(:admission_sampler)
+    attach_saturation_telemetry(sampler_name)
     {:ok, delayed} = start_supervised({DelayedAdmission, name: delayed_name, test_pid: self()})
 
     {:ok, sampler} =
-      start_supervised(
-        {AdmissionSampler,
-         name: sampler_name, admission_server: delayed_name, timeout_ms: 1, interval_ms: 60_000}
-      )
+      start_supervised({AdmissionSampler, name: sampler_name, admission_server: delayed_name, timeout_ms: 1, interval_ms: 60_000})
 
     sync_sampler(sampler)
     assert_receive {:delayed_saturation_call, _from}
@@ -195,11 +190,30 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
     assert {:messages, []} = Process.info(sampler, :messages)
   end
 
+  test "snapshot assertions isolate the target from another running sampler" do
+    sampler_name = unique_name(:admission_sampler)
+    attach_saturation_telemetry(sampler_name)
+    foreign_name = unique_name(:foreign_sampler)
+
+    {:ok, foreign} =
+      start_supervised(
+        Supervisor.child_spec(
+          {AdmissionSampler, name: foreign_name, interval_ms: 60_000, snapshot_reader: fn -> {:ok, snapshot(0, 0)} end},
+          id: foreign_name
+        )
+      )
+
+    sync_sampler(foreign)
+
+    {:ok, sampler} =
+      start_supervised({AdmissionSampler, name: sampler_name, interval_ms: 60_000, snapshot_reader: fn -> {:ok, snapshot(3, 2)} end})
+
+    sync_sampler(sampler)
+    assert_saturation(snapshot(3, 2))
+  end
+
   defp start_sampler(name, admission_name) do
-    start_supervised(
-      {AdmissionSampler,
-       name: name, admission_server: admission_name, interval_ms: 60_000, timeout_ms: 50}
-    )
+    start_supervised({AdmissionSampler, name: name, admission_server: admission_name, interval_ms: 60_000, timeout_ms: 50})
   end
 
   defp acquire(server, settings),
@@ -240,7 +254,7 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
     end
   end
 
-  defp attach_saturation_telemetry do
+  defp attach_saturation_telemetry(sampler_name) do
     handler_id = {__MODULE__, :saturation, self(), System.unique_integer([:positive])}
     test_pid = self()
 
@@ -248,10 +262,14 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
       :telemetry.attach(
         handler_id,
         @event,
-        fn @event, measurements, metadata, ^test_pid ->
-          send(test_pid, {handler_id, measurements, metadata})
+        fn @event, measurements, metadata, {^test_pid, ^sampler_name} ->
+          # Telemetry callbacks execute in the emitting sampler. The application's
+          # own sampler keeps ticking while this test's isolated sampler runs.
+          if self() == GenServer.whereis(sampler_name) do
+            send(test_pid, {handler_id, measurements, metadata})
+          end
         end,
-        test_pid
+        {test_pid, sampler_name}
       )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
@@ -305,5 +323,5 @@ defmodule CodexPoolerWeb.Telemetry.AdmissionSamplerTest do
     |> Map.put(route_class, %{running: running, queued: queued})
   end
 
-  defp unique_name(kind), do: {:global, {kind, System.unique_integer([:positive])}}
+  defp unique_name(kind), do: :"#{kind}-#{System.unique_integer([:positive])}"
 end

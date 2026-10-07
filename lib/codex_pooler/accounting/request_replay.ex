@@ -3,12 +3,16 @@ defmodule CodexPooler.Accounting.RequestReplay do
 
   import Ecto.Query
 
+  require Logger
+
   alias CodexPooler.Access
   alias CodexPooler.Access.{APIKey, APIKeyPolicyBinding}
 
   alias CodexPooler.Accounting.{
     Attempt,
     LedgerEntry,
+    LedgerReads,
+    NativeReplayClaim,
     Request,
     RequestLifecycle,
     RequestReplayEntitlement
@@ -19,8 +23,11 @@ defmodule CodexPooler.Accounting.RequestReplay do
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Routing.ModelMetadata
+  alias CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation
+  alias CodexPooler.Gateway.Runtime.Finalization.InterruptionOutcome
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.InstanceSettings.AppSecretCrypto
+  alias CodexPooler.Platform.InstancePresence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
@@ -40,6 +47,11 @@ defmodule CodexPooler.Accounting.RequestReplay do
   rescue
     Ecto.ConstraintError -> {:error, :already_armed}
     Ecto.NoResultsError -> {:error, :ineligible}
+    # The owner session arms inside its own GenServer call; a connection that
+    # cannot be checked out (a stall) must fail the suspension, which the owner
+    # already answers by keeping the turn attached for the ordinary detach, not
+    # crash the owner and every turn it holds (findings#232 row 232-202).
+    DBConnection.ConnectionError -> {:error, :database_unavailable}
   end
 
   def arm(_input), do: {:error, :invalid_input}
@@ -47,6 +59,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
   @spec consume(consume_input()) :: {:ok, map()} | {:error, atom() | Ecto.Changeset.t()}
   def consume(input) when is_map(input) do
     with :ok <- validate_consume_input(input),
+         :ok <- validate_original_preparation(input.request_id, input.eligible_attempt_id),
          %CodexSession{} = session <- reserve_session_snapshot(input),
          {:ok, consume_fence} <- consume_owner_reserve(session, input) do
       finish_consume(input, session, consume_fence)
@@ -141,6 +154,23 @@ defmodule CodexPooler.Accounting.RequestReplay do
     Repo.transaction(fn -> close_locked(request_id, reason, witness_now) end)
   end
 
+  # The owner retires the armed entitlement of a pre-visible cut when a
+  # different turn arrives from a newer socket of the session: the client has
+  # moved on and will not resend it. The interrupted request settles once like
+  # an expired entitlement, `failed 499` with unknown usage (its reservation is
+  # released, nothing is charged), under its own error code. It runs inside
+  # the owner's GenServer call like `arm/1`, so a connection that cannot be
+  # checked out answers an error, which the owner turns into the refusal it
+  # gave before, instead of raising (findings#206 row 206-348).
+  @spec supersede(map()) :: {:ok, :closed | :noop} | {:error, term()}
+  def supersede(%{request_id: request_id}) when is_binary(request_id) do
+    Repo.transaction(fn -> close_locked(request_id, :superseded) end)
+  rescue
+    DBConnection.ConnectionError -> {:error, :database_unavailable}
+  end
+
+  def supersede(_lifecycle), do: {:error, :invalid_input}
+
   @spec touch_liveness(provisional_reference()) ::
           {:ok, RequestReplayEntitlement.t()} | {:error, :binding_mismatch}
   def touch_liveness(reference) when is_map(reference) do
@@ -152,18 +182,21 @@ defmodule CodexPooler.Accounting.RequestReplay do
 
   def touch_liveness(_reference), do: {:error, :binding_mismatch}
 
-  @spec cleanup_due() :: {:ok, map()} | {:error, term()}
-  def cleanup_due do
+  # `:batch_size` is a test-facing knob for the bounded candidate batch; the
+  # minute worker always runs the 100-row production default.
+  @spec cleanup_due(keyword()) :: {:ok, map()} | {:error, term()}
+  def cleanup_due(opts \\ []) do
+    batch_size = Keyword.get(opts, :batch_size, @cleanup_batch_size)
     started_at = System.monotonic_time(:millisecond)
     now = db_now()
-    candidates = due_candidates(now)
+    candidates = due_candidates(now, batch_size)
 
     summary = %{
       replay_entitlements_selected: length(candidates),
       replay_entitlements_closed: 0,
       replay_entitlements_noop: 0,
       replay_entitlements_deferred: 0,
-      replay_cleanup_batch_full: length(candidates) == @cleanup_batch_size
+      replay_cleanup_batch_full: length(candidates) == batch_size
     }
 
     Enum.reduce_while(candidates, {:ok, summary}, &cleanup_next(&1, &2, started_at))
@@ -267,11 +300,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
       Enum.find(ledger, &(&1.source_event_id == "request:#{reference.request_id}:reservation")) ||
         Repo.rollback(:ineligible)
 
-    %{assignment: assignment} =
-      ReferenceLocks.lock_and_validate!(
-        attempt.upstream_identity_id,
-        attempt.pool_upstream_assignment_id
-      )
+    %{assignment: assignment} = lock_replay_references!(attempt)
 
     now = db_now()
 
@@ -308,7 +337,9 @@ defmodule CodexPooler.Accounting.RequestReplay do
           required(:model_id) => Ecto.UUID.t(),
           required(:model_identifier) => String.t(),
           required(:semantic_turn_digest) => <<_::256>>,
-          required(:replay_claim_digest) => <<_::256>>
+          required(:replay_claim_digest) => <<_::256>>,
+          optional(:replay_claim_alternates) => [<<_::256>>],
+          optional(:allow_execution_recovery?) => boolean()
         }
 
   @type provisional_reference :: %{
@@ -323,6 +354,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
 
   @spec preflight_snapshot(preflight_input()) ::
           :none
+          | :recoverable_generation_zero
           | {:active_generation_zero, map()}
           | {:armed_generation_one, map()}
           | {:error,
@@ -339,6 +371,35 @@ defmodule CodexPooler.Accounting.RequestReplay do
   end
 
   def preflight_snapshot(_input), do: {:error, :invalid_input}
+
+  @doc """
+  True while a turn of the key and Pool with this semantic digest is still
+  `in_progress`: the state `preflight_snapshot/1` refuses a same-turn
+  post-visible resend for as `lifecycle_conflict`. A socket that took over the
+  turn it inherited waits on this before its request is judged (findings#206
+  row 206-362). The request row used to settle before its turn row, and a
+  resend judged in between closed that turn as orphaned instead of the
+  `client_disconnected` interruption a compaction's successor is chained to
+  (row 206-436), so the wait lasts until the turn row itself settled. A
+  settlement now writes both in one transaction (findings#288); a node on an
+  older release still writes them apart during a rolling update.
+  """
+  @spec semantic_turn_in_flight?(%{
+          required(:pool_id) => Ecto.UUID.t(),
+          required(:api_key_id) => Ecto.UUID.t(),
+          required(:semantic_turn_digest) => <<_::256>>
+        }) :: boolean()
+  def semantic_turn_in_flight?(%{pool_id: pool_id, api_key_id: api_key_id, semantic_turn_digest: digest})
+      when is_binary(pool_id) and is_binary(api_key_id) and is_binary(digest) and byte_size(digest) == 32 do
+    Repo.exists?(
+      from turn in CodexTurn,
+        join: request in Request,
+        on: request.id == turn.request_id,
+        where:
+          request.pool_id == ^pool_id and request.api_key_id == ^api_key_id and
+            turn.semantic_turn_digest == ^digest and turn.status == "in_progress"
+    )
+  end
 
   @spec provisional_binding_status(provisional_reference()) ::
           :armed
@@ -425,11 +486,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
     existing = lock_entitlement(input.request_id)
     _ledger = lock_ledger!(input.request_id)
 
-    %{assignment: assignment} =
-      ReferenceLocks.lock_and_validate!(
-        attempt.upstream_identity_id,
-        attempt.pool_upstream_assignment_id
-      )
+    %{assignment: assignment} = lock_replay_references!(attempt)
 
     if existing, do: Repo.rollback(:already_armed)
 
@@ -530,6 +587,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
              },
              now
            ),
+         :ok <- validate_attempt_preparation(attempt, input.request_id, input.eligible_attempt_id),
          {:ok, provisional_digest} <-
            RequestReplayEntitlement.provisional_binding_digest(input.provisional_token),
          {:ok, reserve_receipt_digest} <-
@@ -545,10 +603,8 @@ defmodule CodexPooler.Accounting.RequestReplay do
            assignment: %PoolUpstreamAssignment{} = assignment,
            identity: %UpstreamIdentity{} = identity
          } <-
-           ReferenceLocks.lock_and_validate!(
-             attempt.upstream_identity_id,
-             attempt.pool_upstream_assignment_id
-           ),
+           lock_replay_references!(attempt),
+         :ok <- validate_upstream_not_deleting(identity),
          :ok <-
            authorize_exact_assignment(
              api_key,
@@ -589,6 +645,13 @@ defmodule CodexPooler.Accounting.RequestReplay do
       {:error, reason} -> Repo.rollback(reason)
       nil -> Repo.rollback(:ineligible)
       false -> Repo.rollback(:ineligible)
+    end
+  end
+
+  defp lock_replay_references!(attempt) do
+    case ReferenceLocks.lock_and_validate!(attempt.upstream_identity_id, attempt.pool_upstream_assignment_id) do
+      %{assignment: %PoolUpstreamAssignment{}, identity: %UpstreamIdentity{}} = references -> references
+      %{assignment: nil, identity: nil} -> Repo.rollback(:ineligible)
     end
   end
 
@@ -713,9 +776,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
         )
 
       {:consumed, error_code} ->
-        finalize_close!({session, turn, request, attempt, entitlement}, nil, error_code, now,
-          preserve_attempt?: false
-        )
+        finalize_close!({session, turn, request, attempt, entitlement}, nil, error_code, now, preserve_attempt?: false)
 
       :noop ->
         :noop
@@ -749,6 +810,9 @@ defmodule CodexPooler.Accounting.RequestReplay do
 
   defp close_kind(_session, %RequestReplayEntitlement{status: "armed"}, _api_key, :deleted, _now),
     do: {:armed, "revoked", "websocket_replay_revoked"}
+
+  defp close_kind(_session, %RequestReplayEntitlement{status: "armed"}, _api_key, :superseded, _now),
+    do: {:armed, "revoked", "websocket_replay_superseded"}
 
   defp close_kind(
          _session,
@@ -952,7 +1016,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
     end
   end
 
-  defp due_candidates(now) do
+  defp due_candidates(now, batch_size) do
     Repo.all(
       from entitlement in RequestReplayEntitlement,
         join: api_key in APIKey,
@@ -970,7 +1034,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
           asc: entitlement.abandon_at,
           asc: entitlement.id
         ],
-        limit: @cleanup_batch_size,
+        limit: ^batch_size,
         select:
           {entitlement.request_id,
            fragment(
@@ -992,9 +1056,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
   defp cleanup_close_reason(request_id, :abandoned) do
     case started_owner_witness(request_id) do
       %{session: session, reference: reference} ->
-        case WebsocketOwnerForwarder.touch_replay_liveness(session, reference,
-               timeout: @owner_witness_timeout_ms
-             ) do
+        case WebsocketOwnerForwarder.touch_replay_liveness(session, reference, timeout: @owner_witness_timeout_ms) do
           :ok -> :abandoned
           {:error, _reason} -> :owner_unavailable
         end
@@ -1125,6 +1187,18 @@ defmodule CodexPooler.Accounting.RequestReplay do
     end
   end
 
+  # The turn a resend is asking to rejoin, found by the tenant and the semantic
+  # turn digest rather than by the Pooler session.
+  #
+  # The digest is already thread-scoped and tenant-bound
+  # (`WebsocketTurnIdentity.claim_scope/2`), and the session is NOT stable for
+  # the life of a turn's thread: a remote compaction rotates
+  # `x-codex-window-id`, the session key prefers the window, and the successor
+  # therefore arrives in a different session. Scoping this lookup on that
+  # session made a live predecessor invisible to its own client, so the resend
+  # fell through to the resend policy and was refused instead of rejoining the
+  # turn that was still running (findings#250). The `in_progress` status is what
+  # keeps the refusal for a resend that has nothing to rejoin.
   defp active_semantic_lifecycle(input) do
     Repo.one(
       from turn in CodexTurn,
@@ -1135,10 +1209,10 @@ defmodule CodexPooler.Accounting.RequestReplay do
         left_join: entitlement in RequestReplayEntitlement,
         on: entitlement.request_id == request.id,
         where:
-          turn.codex_session_id == ^input.codex_session_id and
+          request.pool_id == ^input.pool_id and request.api_key_id == ^input.api_key_id and
             turn.semantic_turn_digest == ^input.semantic_turn_digest and
             turn.status == "in_progress",
-        order_by: [desc: turn.turn_sequence],
+        order_by: [desc: request.admitted_at, desc: turn.turn_sequence],
         limit: 1,
         select: %{
           turn: turn,
@@ -1153,18 +1227,29 @@ defmodule CodexPooler.Accounting.RequestReplay do
   defp classify_preflight(nil, _input), do: :none
 
   defp classify_preflight(
-         %{turn: turn, request: request, api_key: api_key, entitlement: nil},
+         %{turn: turn, request: request, api_key: api_key, entitlement: nil} = lifecycle,
          input
        ) do
-    with :ok <- compare_active_authorization(turn, request, api_key, input),
-         true <- open_turn?(turn),
-         true <- open_request?(request),
-         %Attempt{} = attempt <- latest_attempt(request.id),
-         true <- live_generation_zero_attempt?(attempt) do
-      {:active_generation_zero, active_snapshot(turn, request, attempt)}
-    else
-      {:error, _reason} = error -> error
-      _closed_or_absent -> {:error, :lifecycle_conflict}
+    case compare_active_authorization(turn, request, api_key, input) do
+      :ok ->
+        attempt = latest_attempt(request.id)
+
+        cond do
+          recoverable_execution?(input, request, attempt) ->
+            # Advisory only: the ordinary claim rechecks death authority, exact
+            # witness, epoch and successor fences in its recovery transaction.
+            # No settlement or replay capability is minted by this preflight.
+            :recoverable_generation_zero
+
+          open_turn?(turn) and open_request?(request) and live_generation_zero_attempt?(attempt) ->
+            {:active_generation_zero, turn |> active_snapshot(request, attempt) |> put_matched_replay_claim(active_matched_replay_claim(request, input))}
+
+          true ->
+            close_orphaned_lifecycle_or_conflict(lifecycle)
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -1173,17 +1258,169 @@ defmodule CodexPooler.Accounting.RequestReplay do
          input
        ) do
     with :ok <- compare_entitlement_authorization(entitlement, input),
-         :ok <- compare_replay_claim(entitlement, input),
+         {:ok, matched} <- compare_replay_claim(entitlement, request, input),
          "armed" <- entitlement.status,
          true <- open_turn?(turn),
          true <- open_request?(request),
          %Attempt{} = attempt <- latest_attempt(request.id),
          true <- coherent_armed_attempt?(attempt, entitlement),
-         true <- DateTime.compare(entitlement.expires_at, db_now) == :gt do
-      {:armed_generation_one, entitlement_snapshot(entitlement)}
+         true <- DateTime.compare(entitlement.expires_at, db_now) == :gt,
+         :ok <- validate_original_preparation(request.id, entitlement.eligible_attempt_id) do
+      {:armed_generation_one, entitlement |> entitlement_snapshot() |> put_matched_replay_claim(matched)}
     else
       {:error, _reason} = error -> error
       _other -> {:error, :lifecycle_conflict}
+    end
+  end
+
+  @orphaned_turn_closed_code "orphaned_turn_closed"
+
+  defp recoverable_execution?(%{allow_execution_recovery?: true}, request, %Attempt{} = attempt),
+    do: open_request?(request) and live_generation_zero_attempt?(attempt) and not is_nil(RequestLifecycle.execution_recovery_authority(attempt))
+
+  defp recoverable_execution?(_input, _request, _attempt), do: false
+
+  # Defense in depth for a generation-zero finalization gap: an `in_progress`
+  # turn whose request is already terminal, or whose latest attempt finished
+  # without a retry path, has no live work behind it. Closing it here lets
+  # the byte-identical resend proceed instead of meeting a permanent
+  # `lifecycle_conflict`. A turn with a live, queued, or retryable attempt,
+  # or no attempt yet, stays a conflict: nothing durable distinguishes it
+  # from a turn that is genuinely in flight. Armed replay entitlements keep
+  # their own close and cleanup lifecycle and are not repaired here.
+  defp close_orphaned_lifecycle_or_conflict(%{turn: turn, request: request}) do
+    attempt = latest_attempt(request.id)
+
+    if orphaned_lifecycle?(request, attempt) do
+      close_orphaned_lifecycle!(turn, request, attempt)
+      :none
+    else
+      {:error, :lifecycle_conflict}
+    end
+  end
+
+  defp orphaned_lifecycle?(%Request{status: status}, _attempt)
+       when status not in ["accepted", "in_progress"],
+       do: true
+
+  defp orphaned_lifecycle?(%Request{}, %Attempt{status: status, completed_at: %DateTime{}})
+       when status in ["succeeded", "failed", "cancelled"],
+       do: true
+
+  defp orphaned_lifecycle?(_request, _attempt), do: false
+
+  defp close_orphaned_lifecycle!(turn, request, attempt) do
+    if Repo.in_transaction?() do
+      close_orphaned_lifecycle_locked!(turn, request, attempt)
+    else
+      {:ok, :closed} =
+        Repo.transaction(fn ->
+          _session = lock_session!(turn.codex_session_id)
+          close_orphaned_lifecycle_locked!(turn, request, attempt)
+        end)
+    end
+
+    :ok
+  end
+
+  # The caller holds the session lock; then api key, turn, request, attempt.
+  defp close_orphaned_lifecycle_locked!(turn, request, attempt) do
+    _api_key = lock_api_key!(request.api_key_id)
+    turn = lock_turn!(turn.id)
+    request = lock_request!(request.id)
+    attempt = if attempt, do: lock_latest_attempt!(request.id)
+    now = max_db_time(DateTime.utc_now() |> DateTime.truncate(:microsecond))
+
+    request =
+      if request.status in ["accepted", "in_progress"] do
+        finalize_orphaned_request!(request, attempt, now)
+      else
+        request
+      end
+
+    if turn.status == "in_progress" and is_nil(turn.completed_at) do
+      {status, error_code} = settled_turn_outcome(request)
+
+      turn
+      |> Ecto.Changeset.change(%{
+        status: status,
+        error_code: error_code,
+        final_attempt_id: attempt && attempt.id,
+        completed_at: now,
+        updated_at: now
+      })
+      |> Repo.update!()
+    end
+
+    Logger.info(fn ->
+      "websocket replay preflight closed orphaned turn " <>
+        "reason_code=#{@orphaned_turn_closed_code} " <>
+        "request_id=#{request.id} codex_session_id=#{turn.codex_session_id} " <>
+        "request_status=#{request.status} " <>
+        "attempt_status=#{if attempt, do: attempt.status, else: "none"}"
+    end)
+
+    :closed
+  end
+
+  # A request that was already terminal when its turn was met still open was,
+  # most often, a settlement in flight: the request, its attempt and its ledger
+  # used to commit before the turn row, in a second transaction. Every writer
+  # that settles a request carrying a turn now completes the turn in the
+  # request's own transaction (findings#288), so this is defense in depth for
+  # rows an older release left that way. The turn is written the way a
+  # settlement writes it (`Finalization.Interruption`'s terminal turn
+  # vocabulary: interrupted for a lost client or owner, failed otherwise, the
+  # request's own error code), so a resend meets the same predecessor it meets
+  # after a settlement. It used to close it `failed orphaned_turn_closed`,
+  # which no resend policy admits: the released client's resend of a
+  # provider-failed turn arriving in that window was refused `409
+  # duplicate_turn` (findings#206 row 206-609). A request this closer finalizes
+  # itself keeps `orphaned_turn_closed`.
+  defp settled_turn_outcome(%Request{status: "succeeded"}), do: {"succeeded", nil}
+
+  defp settled_turn_outcome(%Request{status: status, last_error_code: code})
+       when status in ["failed", "rejected", "cancelled"] and is_binary(code) and code != @orphaned_turn_closed_code do
+    if status == "failed" and InterruptionOutcome.interrupted_error_code?(code),
+      do: {"interrupted", code},
+      else: {"failed", code}
+  end
+
+  defp settled_turn_outcome(%Request{}), do: {"failed", @orphaned_turn_closed_code}
+
+  # Closing a request with an outstanding reservation must settle the ledger
+  # in the same transaction. Otherwise its terminal status removes it from
+  # stale-reservation recovery while its reserved budget remains held.
+  defp finalize_orphaned_request!(request, attempt, now) do
+    attrs = %{
+      request_status: "failed",
+      usage_status: "usage_unknown",
+      response_status_code: 500,
+      last_error_code: @orphaned_turn_closed_code,
+      now: now
+    }
+
+    if match?(%Attempt{}, attempt) and LedgerReads.reservation_outstanding?(request) do
+      attrs =
+        Map.merge(attrs, %{
+          preserve_replay_attempt: true,
+          usage: %{status: "usage_unknown", source: @orphaned_turn_closed_code}
+        })
+
+      case RequestLifecycle.finalize_request(request, attempt, attrs) do
+        {:ok, %{request: finalized}} -> finalized
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    else
+      request
+      |> Ecto.Changeset.change(%{
+        status: attrs.request_status,
+        usage_status: attrs.usage_status,
+        completed_at: now,
+        response_status_code: attrs.response_status_code,
+        last_error_code: attrs.last_error_code
+      })
+      |> Repo.update!()
     end
   end
 
@@ -1274,6 +1511,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
        do: true
 
   defp live_generation_zero_attempt?(%Attempt{}), do: false
+  defp live_generation_zero_attempt?(nil), do: false
 
   defp coherent_armed_attempt?(
          %Attempt{
@@ -1291,8 +1529,14 @@ defmodule CodexPooler.Accounting.RequestReplay do
 
   defp coherent_armed_attempt?(%Attempt{}, %RequestReplayEntitlement{}), do: false
 
-  defp compare_active_authorization(turn, request, api_key, input) do
-    if turn.codex_session_id == input.codex_session_id and request.api_key_id == input.api_key_id and
+  # No session term, for the reason stated on `active_semantic_lifecycle/1`: the
+  # successor of a compacted thread is in a different session by construction,
+  # and requiring the predecessor's would refuse exactly the resend this path
+  # exists to serve. Every other binding the session used to imply -- api key,
+  # its revocation epoch, pool, model id and requested model -- is still
+  # compared here (findings#250).
+  defp compare_active_authorization(_turn, request, api_key, input) do
+    if request.api_key_id == input.api_key_id and
          api_key.runtime_revocation_epoch == input.api_key_runtime_epoch and
          request.pool_id == input.pool_id and request.model_id == input.model_id and
          secure_text_match?(request.requested_model, input.model_identifier) do
@@ -1314,11 +1558,59 @@ defmodule CodexPooler.Accounting.RequestReplay do
     end
   end
 
-  defp compare_replay_claim(entitlement, input) do
-    if secure_digest_match?(entitlement.replay_claim_digest, input.replay_claim_digest),
-      do: :ok,
-      else: {:error, :replay_claim_mismatch}
+  # The byte-identical resend carries the entitlement's own claim. The released
+  # client never resends an anchored request that way: it reconnects without
+  # the anchor and sends the same request as full history, whose trailing items
+  # are exactly the anchored request's (findings#232 row 232-160). The armed
+  # request stored the anchor-free digest of those items as its client-retry
+  # witness, so that resend is the same request when the witness is one of its
+  # alternates; the socket then carries the entitlement's claim for every later
+  # owner and admission check. An anchored resend never has alternates, so a
+  # changed anchor stays a different request.
+  defp compare_replay_claim(entitlement, request, input) do
+    cond do
+      secure_digest_match?(entitlement.replay_claim_digest, input.replay_claim_digest) ->
+        {:ok, nil}
+
+      Enum.any?(
+        Map.get(input, :replay_claim_alternates, []),
+        &secure_digest_match?(request.native_client_retry_digest, &1)
+      ) ->
+        {:ok, entitlement.replay_claim_digest}
+
+      true ->
+        {:error, :replay_claim_mismatch}
+    end
   end
+
+  # A generation-zero turn whose socket died without its cleanup keeps running
+  # in its owner for a resend to reattach to, and the owner matches the
+  # reattach on the exact replay claim of the request it runs. A resend that
+  # is not byte-identical can still be that request: one whose turn metadata
+  # gained the `workspaces` the client fills late (findings#319 row 1), or the
+  # anchor-free full-history resend of an anchored request (findings#323). Its
+  # transient witness alternates then hold the request's stored witness, and
+  # the socket rebinds the frame to the request's claim before the owner checks
+  # it. An unanchored request's witness is its claim; an anchored request's is
+  # the anchor-free digest of its items, so its claim is the one its
+  # reservation recorded (`NativeReplayClaim`). A row recorded without it falls
+  # back to the witness, which the owner never holds, so its verdict stays as
+  # it was. A resend already carrying the claim, or none of the alternates,
+  # keeps its own claim.
+  defp active_matched_replay_claim(%Request{native_client_retry_digest: stored} = request, input) do
+    claim = NativeReplayClaim.recorded(request) || stored
+
+    cond do
+      secure_digest_match?(claim, input.replay_claim_digest) -> nil
+      Enum.any?(Map.get(input, :replay_claim_alternates, []), &secure_digest_match?(stored, &1)) -> claim
+      true -> nil
+    end
+  end
+
+  defp put_matched_replay_claim(snapshot, nil), do: snapshot
+
+  defp put_matched_replay_claim(snapshot, matched),
+    do: Map.put(snapshot, :matched_replay_claim_digest, matched)
 
   defp open_consumed_reference?(
          %RequestReplayEntitlement{status: "consumed", closed_at: nil} = entitlement,
@@ -1489,6 +1781,18 @@ defmodule CodexPooler.Accounting.RequestReplay do
       input.reserve_timeout_ms in 1..60_000
   end
 
+  defp validate_original_preparation(request_id, attempt_id) do
+    validate_attempt_preparation(Repo.get(Attempt, attempt_id), request_id, attempt_id)
+  end
+
+  defp validate_attempt_preparation(%Attempt{id: attempt_id, request_id: request_id} = attempt, request_id, attempt_id) do
+    if ReplayPreparation.replay_eligible?(attempt.response_metadata),
+      do: :ok,
+      else: {:error, :invalid_replay_preparation}
+  end
+
+  defp validate_attempt_preparation(_attempt, _request_id, _attempt_id), do: {:error, :invalid_replay_preparation}
+
   defp reserve_session_snapshot(input) do
     Repo.one(
       from session in CodexSession,
@@ -1633,7 +1937,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
     valid? =
       consume_entitlement_matches?(input, request, turn, entitlement, now) and
         consume_owner_matches?(input, session, turn, owner_lease, now) and
-        consume_key_matches?(input, api_key, pool, entitlement) and
+        consume_key_matches?(input, api_key, pool, entitlement, now) and
         consume_lifecycle_open?(request, turn, attempt, entitlement) and
         no_terminal_ledger?(request.id)
 
@@ -1681,12 +1985,25 @@ defmodule CodexPooler.Accounting.RequestReplay do
       live_lease_matches?(session, owner_lease, input.owner_lease_token, now)
   end
 
-  defp consume_key_matches?(input, api_key, pool, entitlement) do
+  # A replay is a new upstream send, so consume passes the same lifecycle fence
+  # as a claim: the Pool must be active, the key must still be the armed key
+  # with its exact runtime epoch, and its expiry must still be ahead of the
+  # database clock read under the locks. Expiry is a clock crossing rather
+  # than an edit, so status and epoch alone cannot reveal it, and an armed
+  # replay whose key expired between arm and consume must fail closed before
+  # any replay attempt exists (findings#204).
+  defp consume_key_matches?(input, api_key, pool, entitlement, now) do
     pool.status == "active" and api_key.id == input.auth.api_key.id and
       api_key.pool_id == input.auth.pool.id and
       current_replay_authorization?(api_key, entitlement) and
+      key_unexpired?(api_key, now) and
       model_policy_allows?(api_key, entitlement.model_identifier)
   end
+
+  defp key_unexpired?(%APIKey{expires_at: nil}, _now), do: true
+
+  defp key_unexpired?(%APIKey{expires_at: %DateTime{} = expires_at}, now),
+    do: future?(expires_at, now)
 
   defp consume_turn_open?(turn),
     do:
@@ -1694,6 +2011,8 @@ defmodule CodexPooler.Accounting.RequestReplay do
         is_nil(turn.completed_at)
 
   defp insert_replay_attempt!(request, eligible_attempt, _provisional_digest, now) do
+    owner = InstancePresence.local_identity()
+
     %Attempt{
       request_id: request.id,
       attempt_number: eligible_attempt.attempt_number + 1,
@@ -1703,6 +2022,8 @@ defmodule CodexPooler.Accounting.RequestReplay do
       model_id: eligible_attempt.model_id || request.model_id,
       upstream_model_id: eligible_attempt.upstream_model_id,
       transport: eligible_attempt.transport,
+      owner_instance_id: owner.node_name,
+      owner_instance_boot_id: owner.boot_id,
       status: "in_progress",
       started_at: now,
       retryable: false,
@@ -1713,14 +2034,21 @@ defmodule CodexPooler.Accounting.RequestReplay do
     |> Repo.insert!()
   end
 
+  defp validate_upstream_not_deleting(%UpstreamIdentity{metadata: %{"permanent_deletion_requested_at" => _}}),
+    do: {:error, :upstream_account_deleting}
+
+  defp validate_upstream_not_deleting(%UpstreamIdentity{}), do: :ok
+
   defp lock_session!(session_id),
     do: Repo.one!(from row in CodexSession, where: row.id == ^session_id, lock: "FOR UPDATE")
 
   defp lock_session(session_id),
     do: Repo.one(from row in CodexSession, where: row.id == ^session_id, lock: "FOR UPDATE")
 
+  # Reader lock: no replay transaction writes the `api_keys` row, and each one
+  # holds its codex session first; finalization reached from here reads too.
   defp lock_api_key!(api_key_id),
-    do: Repo.one!(from row in APIKey, where: row.id == ^api_key_id, lock: "FOR UPDATE")
+    do: Access.lock_api_key_for_read(api_key_id) || raise(Ecto.NoResultsError, queryable: APIKey)
 
   defp lock_turn!(turn_id),
     do: Repo.one!(from row in CodexTurn, where: row.id == ^turn_id, lock: "FOR UPDATE")
@@ -1758,8 +2086,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
       )
 
   defp lock_ledger!(request_id),
-    do:
-      Repo.all(from row in LedgerEntry, where: row.request_id == ^request_id, lock: "FOR UPDATE")
+    do: Repo.all(from row in LedgerEntry, where: row.request_id == ^request_id, lock: "FOR UPDATE")
 
   defp no_terminal_ledger?(request_id) do
     not Repo.exists?(
@@ -1769,8 +2096,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
   end
 
   defp lock_pool!(pool_id),
-    do:
-      Repo.one!(from row in CodexPooler.Pools.Pool, where: row.id == ^pool_id, lock: "FOR UPDATE")
+    do: Repo.one!(from row in CodexPooler.Pools.Pool, where: row.id == ^pool_id, lock: "FOR UPDATE")
 
   defp lock_api_key_policy_bindings!(api_key_id),
     do:
@@ -1842,6 +2168,16 @@ defmodule CodexPooler.Accounting.RequestReplay do
     end
   end
 
+  # The window in which the owner of a started replay must touch it again
+  # before the replay cleanup takes the replay for abandoned. The owner touches
+  # it at every renewal of its lease, so the window lasts at least the lease
+  # TTL plus one renewal interval: it cannot lapse while the owner's lease is
+  # still valid. The cleanup then asks only an owner whose lease is already
+  # gone, with its 100 ms probe. A lease TTL raised above the idle timeout used
+  # to leave a shorter window, and the probe closed a live but slow owner's
+  # replay `owner_unavailable` (findings#270 row 270-258). The shipped
+  # settings are not affected: their window is the idle timeout's 30 minutes
+  # against a 45 s lease.
   defp replay_liveness_grace_ms do
     settings = OperationalSettings.current()
 
@@ -1849,6 +2185,7 @@ defmodule CodexPooler.Accounting.RequestReplay do
     |> max(settings.bridge_owner_lease_renewal_seconds * 3 * 1_000)
     |> min(3_660_000)
     |> max(60_000)
+    |> max((settings.bridge_owner_lease_ttl_seconds + settings.bridge_owner_lease_renewal_seconds) * 1_000)
   end
 
   defp current_replay_authorization?(
@@ -1896,15 +2233,21 @@ defmodule CodexPooler.Accounting.RequestReplay do
       :replay_claim_digest
     ]
 
-    if Map.keys(input) |> Enum.sort() == Enum.sort(required) and
+    if (Map.keys(input) -- [:replay_claim_alternates, :allow_execution_recovery?]) |> Enum.sort() == Enum.sort(required) and
+         is_boolean(Map.get(input, :allow_execution_recovery?, false)) and
          Enum.all?([:codex_session_id, :api_key_id, :pool_id, :model_id], &uuid?(input[&1])) and
          is_integer(input.api_key_runtime_epoch) and input.api_key_runtime_epoch >= 0 and
          is_binary(input.model_identifier) and byte_size(input.model_identifier) in 1..255 and
-         digest?(input.semantic_turn_digest) and digest?(input.replay_claim_digest) do
+         valid_preflight_digests?(input) do
       :ok
     else
       {:error, :invalid_input}
     end
+  end
+
+  defp valid_preflight_digests?(input) do
+    digest?(input.semantic_turn_digest) and digest?(input.replay_claim_digest) and
+      valid_alternates?(Map.get(input, :replay_claim_alternates, []))
   end
 
   defp validate_provisional_reference(reference) do
@@ -1929,6 +2272,9 @@ defmodule CodexPooler.Accounting.RequestReplay do
       {:error, :invalid_input}
     end
   end
+
+  defp valid_alternates?(alternates) when is_list(alternates), do: Enum.all?(alternates, &digest?/1)
+  defp valid_alternates?(_alternates), do: false
 
   defp uuid?(value), do: match?({:ok, ^value}, Ecto.UUID.cast(value))
   defp digest?(value), do: is_binary(value) and byte_size(value) == @digest_bytes

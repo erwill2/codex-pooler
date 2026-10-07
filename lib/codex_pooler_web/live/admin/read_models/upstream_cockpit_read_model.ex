@@ -1,6 +1,7 @@
 defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   @moduledoc false
 
+  alias CodexPooler.Accounting.RequestOutcome
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Admin.{UpstreamCircuitReadiness, UpstreamCockpitMetrics}
   alias CodexPooler.Audit
@@ -9,15 +10,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPooler.Upstreams.Secrets
+  alias CodexPoolerWeb.Admin.SavedResetCalendar
+  alias CodexPoolerWeb.Admin.UpstreamAccountActions
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetOperationProjection
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection
   alias CodexPoolerWeb.DateTimeDisplay
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
   @recovery_statuses ~w(paused refresh_due refresh_failed reauth_required)
   @usable_refresh_statuses ~w(succeeded imported refreshing)
-  @request_failed_statuses ~w(failed rejected interrupted cancelled)
+  @request_failed_statuses ~w(failed rejected)
   @recent_event_limit 8
   @recent_event_prefetch_limit 32
   @oauth_terminal_statuses ~w(failed expired cancelled)
@@ -49,10 +54,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:auth_fresh_label) => String.t(),
           required(:auth_verified_label) => String.t(),
           required(:access_token_label) => String.t(),
-          required(:credential_expiry) =>
-            UpstreamAccountsReadModel.credential_expiry_projection(),
-          required(:secret_status) =>
-            :present | :missing | :expired | :refresh_due | :reauth_required,
+          required(:credential_expiry) => UpstreamAccountsReadModel.credential_expiry_projection(),
+          required(:secret_status) => :present | :missing | :expired | :refresh_due | :reauth_required,
           required(:token_refresh_label) => String.t(),
           required(:refresh_job_state) => String.t() | nil,
           required(:reauth_required?) => boolean(),
@@ -109,7 +112,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:count) => non_neg_integer(),
           required(:empty?) => boolean(),
           required(:degraded?) => boolean(),
-          required(:missing?) => boolean()
+          required(:missing?) => boolean(),
+          required(:searched_attempt_limit) => pos_integer() | nil
         }
   @type action :: %{
           required(:available?) => boolean(),
@@ -121,6 +125,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:reactivate) => action(),
           required(:refresh_token) => action(),
           required(:redeem_saved_reset) => action(),
+          required(:download_reset_calendar) => action(),
           required(:replace_auth_json) => action(),
           required(:oauth_relink) => action(),
           required(:reinvite) => action(),
@@ -156,8 +161,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:saved_resets) => SavedResets.snapshot_projection(),
           required(:saved_reset_policy) => SavedResets.auto_policy_projection(),
           required(:saved_reset_confirmation) => QuotaProjection.saved_reset_confirmation() | nil,
+          required(:saved_reset_operation) => SavedResetOperationProjection.t() | nil,
+          required(:saved_reset_refresh_cursor) => UpstreamAccountsReadModel.saved_reset_refresh_cursor() | nil,
           required(:quota_limits) => [UpstreamAccountsReadModel.quota_limit_row()],
           required(:quota_readiness) => UpstreamAccountsReadModel.quota_readiness(),
+          required(:provider_credits_policy) => %{allow_provider_credits: boolean()},
+          required(:provider_credits_summary) => QuotaProjection.provider_credits_summary(),
+          required(:can_manage_provider_credits?) => boolean(),
+          required(:usage_poll_pause) => UpstreamAccountsReadModel.usage_poll_pause() | nil,
           required(:flags) => flags()
         }
 
@@ -170,7 +181,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
 
   @spec load_visible_without_request_metrics(term(), Ecto.UUID.t()) :: {:ok, t()} | :error
   def load_visible_without_request_metrics(scope, identity_id) when is_binary(identity_id) do
-    load_visible(scope, identity_id, request_metrics?: false)
+    load_visible(scope, identity_id, request_metrics?: false, request_events?: false)
+  end
+
+  @spec deferred_request_data(Scope.t(), t()) :: %{
+          request_health: request_health(),
+          pool_contribution: pool_contribution(),
+          recent_events: recent_events()
+        }
+  def deferred_request_data(%Scope{} = scope, %{identity: %{id: identity_id}} = cockpit) do
+    scope
+    |> request_metrics(cockpit)
+    |> Map.put(:recent_events, recent_events(identity_id, scope, cockpit.oauth_flows))
   end
 
   @spec request_metrics(Scope.t(), Ecto.UUID.t(), assignments()) :: %{
@@ -205,6 +227,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   end
 
   @spec merge_request_metrics(t(), %{
+          optional(:recent_events) => recent_events(),
           request_health: request_health(),
           pool_contribution: pool_contribution()
         }) ::
@@ -222,9 +245,45 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       cockpit
       | flags: flags,
         charts: charts,
-        sections:
-          sections(flags, cockpit.assignments, charts, cockpit.recent_events, cockpit.actions)
+        sections: sections(flags, cockpit.assignments, charts, cockpit.recent_events, cockpit.actions)
     }
+  end
+
+  @spec merge_deferred_request_data(t(), %{
+          request_health: request_health(),
+          pool_contribution: pool_contribution(),
+          recent_events: recent_events()
+        }) :: t()
+  def merge_deferred_request_data(cockpit, %{recent_events: recent_events} = data) do
+    cockpit = merge_request_metrics(cockpit, data)
+
+    %{
+      cockpit
+      | recent_events: recent_events,
+        sections:
+          sections(
+            cockpit.flags,
+            cockpit.assignments,
+            cockpit.charts,
+            recent_events,
+            cockpit.actions
+          )
+    }
+  end
+
+  @spec preserve_request_data(t(), t()) :: t()
+  def preserve_request_data(cockpit, previous) do
+    recent_events =
+      previous.recent_events.items
+      |> Enum.filter(&(&1.source == "request_log"))
+      |> Enum.concat(cockpit.recent_events.items)
+      |> summarize_recent_events(previous.recent_events.searched_attempt_limit)
+
+    merge_deferred_request_data(cockpit, %{
+      request_health: previous.charts.request_health,
+      pool_contribution: previous.charts.pool_contribution,
+      recent_events: recent_events
+    })
   end
 
   defp load_visible(scope, identity_id, options) when is_binary(identity_id) do
@@ -269,7 +328,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     flags = flags(account, assignments, quota_health, request_health)
     charts = charts(flags, quota_health, request_health, pool_contribution)
     oauth_flows = oauth_flows(account, scope)
-    recent_events = recent_events(account.identity, scope, oauth_flows)
+    recent_events = recent_events(account.identity.id, scope, oauth_flows, options)
     actions = actions(account, header)
     saved_resets = saved_resets(account)
     saved_reset_policy = saved_reset_policy(account)
@@ -286,8 +345,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       saved_resets: saved_resets,
       saved_reset_policy: saved_reset_policy,
       saved_reset_confirmation: saved_reset_confirmation,
+      saved_reset_operation: Map.get(account, :saved_reset_operation),
+      saved_reset_refresh_cursor: Map.get(account, :saved_reset_refresh_cursor),
       quota_limits: quota_limits(account),
       quota_readiness: quota_readiness,
+      provider_credits_policy: account.provider_credits_policy,
+      provider_credits_summary: account.provider_credits_summary,
+      can_manage_provider_credits?: account.can_manage_provider_credits?,
+      usage_poll_pause: Map.get(account, :usage_poll_pause),
       oauth_flows: oauth_flows,
       sections: sections,
       flags: flags
@@ -381,7 +446,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     %{
       title: account.label,
       status: account.identity.status,
-      status_label: String.replace(account.identity.status, "_", " "),
+      status_label: status_label(account),
       plan_label: account.plan_label,
       plan_reported?: account.plan_reported?,
       refresh_status: account.refresh_status,
@@ -403,6 +468,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       identity_observability: account.identity_observability
     }
   end
+
+  defp status_label(%{deletion_state: :in_progress}), do: "Deletion in progress"
+  defp status_label(%{deletion_state: :failed}), do: "Deletion failed - retry Delete"
+  defp status_label(account), do: account.identity.status |> String.replace("_", " ") |> String.capitalize()
 
   defp assignments(%{identity: %UpstreamIdentity{} = identity, assignments: assignment_snapshots})
        when is_list(assignment_snapshots) do
@@ -430,6 +499,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       quota_priming_label: snapshot.quota_priming_label,
       last_successful_refresh_at: snapshot.last_successful_refresh_at,
       pool_label: snapshot.pool_label,
+      routing_readiness: Map.get(snapshot, :routing_readiness),
       circuit_readiness: snapshot.circuit_readiness
     }
   end
@@ -478,12 +548,27 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   defp datetime_sort_value(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
   defp datetime_sort_value(_datetime), do: 0
 
-  defp recent_events(%UpstreamIdentity{} = identity, scope, oauth_flows) do
+  defp recent_events(identity_id, scope, oauth_flows, options \\ [])
+       when is_binary(identity_id) do
+    %{rows: request_rows, searched_attempt_limit: searched_attempt_limit} =
+      if Keyword.get(options, :request_events?, true) do
+        request_recent_events(identity_id, scope)
+      else
+        %{rows: [], searched_attempt_limit: nil}
+      end
+
+    request_rows
+    |> Enum.map(&request_recent_event_item(&1, identity_id))
+    |> Enum.concat(audit_recent_event_items(scope, identity_id))
+    |> Enum.concat(oauth_recent_event_items(oauth_flows))
+    |> summarize_recent_events(searched_attempt_limit)
+  end
+
+  # `searched_attempt_limit` is set only when the request walk stopped at its
+  # attempt window with older attempts left unread.
+  defp summarize_recent_events(items, searched_attempt_limit) do
     items =
-      identity.id
-      |> request_recent_event_items(scope)
-      |> Enum.concat(audit_recent_event_items(scope, identity.id))
-      |> Enum.concat(oauth_recent_event_items(oauth_flows))
+      items
       |> Enum.sort_by(&datetime_sort_value(&1.timestamp), :desc)
       |> Enum.take(@recent_event_limit)
 
@@ -492,25 +577,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       count: length(items),
       empty?: items == [],
       degraded?: Enum.any?(items, & &1.failure?),
-      missing?: false
+      missing?: false,
+      searched_attempt_limit: searched_attempt_limit
     }
   end
 
-  defp request_recent_event_items(identity_id, scope) do
-    identity_id
-    |> request_recent_event_rows(scope)
-    |> Enum.map(&request_recent_event_item(&1, identity_id))
+  defp request_recent_events(identity_id, %Scope{} = scope) do
+    UpstreamCockpitMetrics.recent_request_events(scope, identity_id, @recent_event_prefetch_limit)
   end
 
-  defp request_recent_event_rows(identity_id, %Scope{} = scope) do
-    UpstreamCockpitMetrics.recent_request_event_rows(
-      scope,
-      identity_id,
-      @recent_event_prefetch_limit
-    )
-  end
-
-  defp request_recent_event_rows(_identity_id, _scope), do: []
+  defp request_recent_events(_identity_id, _scope), do: %{rows: [], searched_attempt_limit: nil}
 
   defp request_recent_event_item(row, identity_id) do
     %{
@@ -520,7 +596,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       subtitle: request_recent_event_subtitle(row),
       link: request_recent_event_link(row.id, identity_id),
       request_id: row.id,
-      failure?: row.status in @request_failed_statuses
+      failure?: row.status in @request_failed_statuses and not RequestOutcome.client_cancelled?(row)
     }
   end
 
@@ -541,9 +617,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
 
   defp fallback_request_event_title(_row), do: "Request retried"
 
+  # A client cancellation reaches the feed only through a retry: it names its
+  # class, not "Failed".
   defp request_recent_event_subtitle(row) do
     [
-      human_status(row.status),
+      request_event_status(row),
       retry_label(row),
       pluralize_count(row.attempt_count, "attempt", "attempts")
     ]
@@ -571,7 +649,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
 
   defp audit_recent_event_rows(nil, identity_id) do
     nil
-    |> Audit.list_events(limit: @recent_event_prefetch_limit, filters: [target: identity_id])
+    |> Audit.list_events(limit: @recent_event_prefetch_limit, count_limit: @recent_event_prefetch_limit, filters: [target: identity_id])
     |> Map.fetch!(:items)
   end
 
@@ -579,6 +657,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     scope
     |> Audit.list_events_for_scope(
       limit: @recent_event_prefetch_limit,
+      count_limit: @recent_event_prefetch_limit,
       filters: [target: identity_id]
     )
     |> Map.fetch!(:items)
@@ -646,9 +725,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
 
   # A pending flow past its deadline is expired in fact; present it as such
   # without waiting for the expiry sweeper to relabel the row.
-  defp normalize_oauth_flow_status(
-         %{status: "pending", expires_at: %DateTime{} = expires_at} = flow
-       ) do
+  defp normalize_oauth_flow_status(%{status: "pending", expires_at: %DateTime{} = expires_at} = flow) do
     if DateTime.after?(expires_at, DateTime.utc_now()) do
       flow
     else
@@ -712,6 +789,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     |> String.capitalize()
   end
 
+  defp request_event_status(row) do
+    if RequestOutcome.client_cancelled?(row), do: "Client cancelled", else: human_status(row.status)
+  end
+
   defp human_status(value) do
     value
     |> to_string()
@@ -734,16 +815,27 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     redeem_saved_reset = redeem_saved_reset_action(account, header)
 
     %{
-      rename: action(status != "deleted", "deleted accounts cannot be renamed"),
+      rename: assignment_action(account, status != "deleted", "deleted accounts cannot be renamed"),
       pause:
-        action(status in ["active", "refresh_due", "refresh_failed"], "account is not pausable"),
-      reactivate: action(status in @reactivatable_statuses, "account is not reactivatable"),
+        assignment_action(
+          account,
+          status in ["active", "refresh_due", "refresh_failed"],
+          "account is not pausable"
+        ),
+      reactivate:
+        assignment_action(
+          account,
+          status in @reactivatable_statuses,
+          "account is not reactivatable"
+        ),
       refresh_token:
-        action(
+        assignment_action(
+          account,
           status in ["active", "refresh_due", "refresh_failed"],
           "token refresh is unavailable"
         ),
       redeem_saved_reset: redeem_saved_reset,
+      download_reset_calendar: action(SavedResetCalendar.available?(account.identity), "no upcoming banked reset expirations are available"),
       replace_auth_json: action(recovery_eligible?, "credential replacement is not needed"),
       oauth_relink:
         action(
@@ -755,42 +847,37 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           recovery_eligible? and account.assignments != [],
           "reinvite requires a Pool assignment"
         ),
-      delete: action(status != "deleted", "account is already deleted"),
+      delete: action(Map.get(account, :can_delete?, false), deletion_unavailable_reason(account)),
       empty?: false,
       degraded?: recovery_eligible?
     }
   end
 
+  defp deletion_unavailable_reason(%{deletion_state: :in_progress}),
+    do: "account deletion is already in progress"
+
+  defp deletion_unavailable_reason(%{assignments: [_ | _]}),
+    do: "Remove this account from all Pools before deleting it."
+
+  defp deletion_unavailable_reason(_account),
+    do: "You do not have permission to permanently delete this account."
+
   defp redeem_saved_reset_action(account, header) do
-    cond do
-      account.identity.status == "deleted" ->
-        action(false, "deleted accounts cannot redeem saved resets")
-
-      account.identity.status == "disabled" ->
-        action(false, "disabled accounts cannot redeem saved resets")
-
-      not auth_clearly_usable?(header) ->
-        action(false, "saved reset redemption requires usable credentials")
-
-      account.assignments == [] ->
-        action(false, "saved reset redemption requires a Pool assignment")
-
-      account.saved_resets.reported? == false ->
-        action(false, "saved reset count is not reported")
-
-      account.saved_resets.available? == false ->
-        action(false, "no saved resets are available")
-
-      account.saved_resets.in_progress? == true ->
-        action(false, "saved reset redemption is already in progress")
-
-      true ->
-        action(true, nil)
+    if account.identity.status not in ["deleted", "disabled"] and not auth_clearly_usable?(header) do
+      action(false, "saved reset redemption requires usable credentials")
+    else
+      Map.get_lazy(account, :saved_reset_redemption_action, fn -> SavedResetProjection.redemption_action(account) end)
     end
   end
 
   defp action(true, _reason), do: %{available?: true, reason: nil}
   defp action(false, reason), do: %{available?: false, reason: reason}
+
+  defp assignment_action(account, available?, reason) do
+    available?
+    |> action(reason)
+    |> UpstreamAccountActions.require_assignment(account.assignments)
+  end
 
   defp sections(flags, assignments, charts, recent_events, actions) do
     %{

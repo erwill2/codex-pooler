@@ -16,7 +16,6 @@ defmodule CodexPooler.Accounting.Request do
     field :status, :string
     field :usage_status, :string
     field :correlation_id, :string
-    field :idempotency_key, :string
     field :client_ip, CodexPooler.Postgres.INET
     field :user_agent, :string
     field :request_metadata, :map
@@ -36,5 +35,10 @@ defmodule CodexPooler.Accounting.Request do
     field :native_client_retry_version, :integer
     field :native_client_retry_digest, :binary
     field :native_client_retry_auth_epoch, :integer
+    field :admission_instance_id, :string
+    field :admission_instance_boot_id, :string
+    field :admission_process_id, :string
+    field :admission_execution_id, :binary_id
+    field :admission_execution_checked_at, :utc_datetime_usec
   end
 end

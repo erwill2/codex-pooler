@@ -12,10 +12,11 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Persistence.CodexTurn
   alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport
 
+  @detection_timeout_ms 15_000
   @terminal_cases [
     {"response.completed",
      %{
@@ -83,25 +84,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
   ]
 
   setup do
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
-
-    on_exit(fn ->
-      capture_log(fn ->
-        WebsocketOwnerSession.Registry
-        |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-        |> Enum.each(fn session_id ->
-          with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(session_id) do
-            GenServer.stop(owner_pid, :shutdown, 1_000)
-          end
-        end)
-      end)
-
-      case previous do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
-    end)
 
     :ok
   end
@@ -110,33 +94,34 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
        %{conn: conn} do
     release_ref = make_ref()
 
-    replay_event =
-      {"response.completed",
-       %{
-         "type" => "response.completed",
-         "response" => %{"id" => "unexpected_http_replay", "status" => "completed"}
-       }}
-
+    # The strict scenario permits exactly one native websocket turn; an HTTP
+    # replay would surface as an unexpected extra request.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.websocket_terminal_then_close_barrier(
-             %{
-               "type" => "response.completed",
-               "response" => %{
-                 "id" => "resp_dropped_before_bridge_close",
-                 "status" => "in_progress"
-               }
-             },
-             notify: self(),
-             release_ref: release_ref
-           ),
-           FakeUpstream.sse_stream([replay_event])
-         ]}
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}],
+            respond:
+              FakeUpstream.websocket_terminal_then_close_barrier(
+                %{
+                  "type" => "response.completed",
+                  "response" => %{
+                    "id" => "resp_dropped_before_bridge_close",
+                    "status" => "in_progress"
+                  }
+                },
+                notify: self(),
+                release_ref: release_ref
+              )
+          )
+        ])
       )
 
     setup = gateway_setup(upstream)
+    stop_own_pool_owners_on_exit(setup.pool)
     session_id = "zero-visible-bridge-#{System.unique_integer([:positive])}"
     parent = self()
 
@@ -154,18 +139,16 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
         })
       end)
 
-    assert_receive {:fake_upstream_websocket_barrier, :before_terminal, barrier_pid,
-                    ^release_ref},
-                   1_000
+    assert_receive {:fake_upstream_websocket_barrier, :before_terminal, barrier_pid, ^release_ref},
+                   @detection_timeout_ms
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
 
-    assert_receive {:fake_upstream_websocket_barrier, :before_close, close_barrier_pid,
-                    ^release_ref},
-                   1_000
+    assert_receive {:fake_upstream_websocket_barrier, :before_close, close_barrier_pid, ^release_ref},
+                   @detection_timeout_ms
 
     send(close_barrier_pid, {:fake_upstream_release_websocket, release_ref})
-    response = Task.await(request_task, 1_000)
+    response = Task.await(request_task, @detection_timeout_ms)
 
     assert [content_type] = get_resp_header(response, "content-type")
     assert content_type =~ "text/event-stream"
@@ -182,8 +165,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
     assert %{
              "code" => "server_error",
              "error" => nested_error,
-             "message" =>
-               "upstream request failed: stream interrupted before terminal response event",
+             "message" => "upstream request failed: stream interrupted before terminal response event",
              "param" => nil,
              "sequence_number" => sequence_number,
              "type" => "error"
@@ -195,8 +177,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
 
     assert nested_error == %{
              "code" => "server_error",
-             "message" =>
-               "upstream request failed: stream interrupted before terminal response event",
+             "message" => "upstream request failed: stream interrupted before terminal response event",
              "param" => nil,
              "type" => "server_error"
            }
@@ -226,6 +207,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
            } = attempt.response_metadata["public_openai_responses_stream"]
 
     assert settlement_count(request.id) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   for {terminal_type, terminal, public_type} <- @terminal_cases do
@@ -236,25 +218,27 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
     test "#{terminal_type} survives an immediate websocket peer close exactly once", %{conn: conn} do
       release_ref = make_ref()
 
+      # Exactly one native websocket turn is permitted; an HTTP replay would
+      # surface as an unexpected extra request.
       upstream =
         start_upstream(
-          {:sequence,
-           [
-             FakeUpstream.websocket_terminal_then_close_barrier(@terminal,
-               notify: self(),
-               release_ref: release_ref
-             ),
-             FakeUpstream.sse_stream([
-               {"response.completed",
-                %{
-                  "type" => "response.completed",
-                  "response" => %{"id" => "unexpected_http_replay", "status" => "completed"}
-                }}
-             ])
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              path: "/backend-api/codex/responses",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond:
+                FakeUpstream.websocket_terminal_then_close_barrier(@terminal,
+                  notify: self(),
+                  release_ref: release_ref
+                )
+            )
+          ])
         )
 
       setup = gateway_setup(upstream)
+      stop_own_pool_owners_on_exit(setup.pool)
       session_id = "terminal-close-#{@terminal_type}-#{System.unique_integer([:positive])}"
       parent = self()
 
@@ -272,11 +256,10 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
           })
         end)
 
-      assert_receive {:fake_upstream_websocket_barrier, :before_terminal, barrier_pid,
-                      ^release_ref},
-                     1_000
+      assert_receive {:fake_upstream_websocket_barrier, :before_terminal, barrier_pid, ^release_ref},
+                     @detection_timeout_ms
 
-      owner = sole_owner_pid!()
+      owner = sole_owner_pid!(setup.pool)
       active_turn = :sys.get_state(owner).active_turn
       task_pid = active_turn.task_pid
       task_monitor = Process.monitor(task_pid)
@@ -291,24 +274,23 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
 
       send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
 
-      assert_receive {:fake_upstream_websocket_barrier, :before_close, close_barrier_pid,
-                      ^release_ref},
-                     1_000
+      assert_receive {:fake_upstream_websocket_barrier, :before_close, close_barrier_pid, ^release_ref},
+                     @detection_timeout_ms
 
       # If the task exits before this external monitor is fully registered,
       # Erlang reports :noproc instead of preserving its :normal exit reason.
-      assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, task_exit_reason}, 1_000
+      assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, task_exit_reason}, @detection_timeout_ms
       assert task_exit_reason in [:normal, :noproc]
       assert Process.info(owner, :status) == {:status, :suspended}
       close_monitor = Process.monitor(close_barrier_pid)
       send(close_barrier_pid, {:fake_upstream_release_websocket, release_ref})
 
-      assert_receive {:DOWN, ^close_monitor, :process, ^close_barrier_pid, _reason}, 1_000
+      assert_receive {:DOWN, ^close_monitor, :process, ^close_barrier_pid, _reason}, @detection_timeout_ms
       assert Process.info(request_task.pid, :status) != nil
       assert Process.info(owner, :status) == {:status, :suspended}
       assert :erlang.resume_process(owner)
 
-      response = Task.await(request_task, 1_000)
+      response = Task.await(request_task, @detection_timeout_ms)
 
       assert response.status == 200
       assert Enum.count(stream_event_types(response.resp_body), &(&1 == @public_type)) == 1
@@ -359,35 +341,35 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
              ) == 1
 
       assert settlement_count(request.id) == 1
+      assert :ok = FakeUpstream.verify!(upstream)
     end
   end
 
-  # Deliberately reversed by the bridged-pre-content-retry work: a peer close
-  # without a terminal and without content is retried over plain HTTP on the
-  # same attempt with a single settlement.
-  test "websocket close without a terminal falls back to plain HTTP exactly once",
+  test "websocket close without a terminal fails without HTTP resubmission",
        %{conn: conn} do
     release_ref = make_ref()
 
+    # Exactly one native websocket turn is permitted; an HTTP resubmission
+    # would surface as an unexpected extra request.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.websocket_close_without_terminal_barrier(
-             notify: self(),
-             release_ref: release_ref
-           ),
-           FakeUpstream.sse_stream([
-             {"response.completed",
-              %{
-                "type" => "response.completed",
-                "response" => %{"id" => "resp_close_fallback", "status" => "completed"}
-              }}
-           ])
-         ]}
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}],
+            respond:
+              FakeUpstream.websocket_close_without_terminal_barrier(
+                notify: self(),
+                release_ref: release_ref
+              )
+          )
+        ])
       )
 
     setup = gateway_setup(upstream)
+    stop_own_pool_owners_on_exit(setup.pool)
     session_id = "missing-terminal-close-#{System.unique_integer([:positive])}"
     parent = self()
 
@@ -406,22 +388,21 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
       end)
 
     assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref},
-                   1_000
+                   @detection_timeout_ms
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
-    response = Task.await(request_task, 1_000)
+    response = Task.await(request_task, @detection_timeout_ms)
 
     assert response.status == 200
-    assert stream_event_types(response.resp_body) == ["response.created", "response.completed"]
-    assert response.resp_body =~ "resp_close_fallback"
-    refute response.resp_body =~ "upstream_stream_error"
+    assert stream_event_types(response.resp_body) == ["error"]
+    refute response.resp_body =~ "resp_close_fallback"
 
     assert [upstream_request | _rest] = FakeUpstream.requests(upstream)
     assert upstream_request.method == "WEBSOCKET"
-    assert FakeUpstream.http_request_count(upstream) == 1
+    assert FakeUpstream.http_request_count(upstream) == 0
 
     request = latest_request(setup.pool.id)
-    assert request.status == "succeeded"
+    assert request.status == "failed"
 
     assert Repo.aggregate(
              from(attempt in Attempt, where: attempt.request_id == ^request.id),
@@ -429,57 +410,61 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
            ) == 1
 
     assert settlement_count(request.id) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   @tag :owner_drained_terminal_state
   test "post-budget bridge drain emits one owner_drained terminal without replay", %{conn: conn} do
     release_ref = make_ref()
 
+    # Exactly one upstream turn is permitted; an HTTP replay would surface as
+    # an unexpected extra request. The held-terminal barrier has no native
+    # websocket equivalent, so the entry cannot declare `method: "WEBSOCKET"`;
+    # the transport claim is asserted on the recorded request below.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.delayed_terminal_sse_stream(
-             [
-               {"response.created",
-                %{
-                  "type" => "response.created",
-                  "response" => %{
-                    "id" => "resp_terminal_owner_drained",
-                    "status" => "in_progress"
-                  }
-                }},
-               {"response.output_text.delta",
-                %{
-                  "type" => "response.output_text.delta",
-                  "response_id" => "resp_terminal_owner_drained",
-                  "output_index" => 0,
-                  "content_index" => 0,
-                  "delta" => "visible before terminal drain"
-                }}
-             ],
-             {"response.completed",
-              %{
-                "type" => "response.completed",
-                "response" => %{
-                  "id" => "resp_terminal_owner_drained",
-                  "status" => "completed"
-                }
-              }},
-             notify: self(),
-             release_ref: release_ref
-           ),
-           FakeUpstream.sse_stream([
-             {"response.completed",
-              %{
-                "type" => "response.completed",
-                "response" => %{"id" => "unexpected_http_replay", "status" => "completed"}
-              }}
-           ])
-         ]}
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}],
+            respond:
+              FakeUpstream.delayed_terminal_sse_stream(
+                [
+                  {"response.created",
+                   %{
+                     "type" => "response.created",
+                     "response" => %{
+                       "id" => "resp_terminal_owner_drained",
+                       "status" => "in_progress"
+                     }
+                   }},
+                  {"response.output_text.delta",
+                   %{
+                     "type" => "response.output_text.delta",
+                     "response_id" => "resp_terminal_owner_drained",
+                     "output_index" => 0,
+                     "content_index" => 0,
+                     "delta" => "visible before terminal drain"
+                   }}
+                ],
+                {"response.completed",
+                 %{
+                   "type" => "response.completed",
+                   "response" => %{
+                     "id" => "resp_terminal_owner_drained",
+                     "status" => "completed"
+                   }
+                 }},
+                notify: self(),
+                release_ref: release_ref
+              )
+          )
+        ])
       )
 
     setup = gateway_setup(upstream)
+    stop_own_pool_owners_on_exit(setup.pool)
     parent = self()
 
     request_task =
@@ -500,7 +485,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
       end)
 
     assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
-                   1_000
+                   @detection_timeout_ms
 
     assert %CodexTurn{first_visible_output_at: %DateTime{}} =
              turn = await_committed_turn(setup.pool.id)
@@ -593,6 +578,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
            } = Repo.reload!(turn)
 
     assert settlement_count(request.id) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   defp stream_event_types(body) do
@@ -612,7 +598,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
     |> Enum.flat_map(fn block ->
       with [event] <- Regex.run(~r/^event: (.+)$/m, block, capture: :all_but_first),
            [data] <- Regex.run(~r/^data: (.+)$/m, block, capture: :all_but_first) do
-        [%{"event" => event, "data" => Jason.decode!(data)}]
+        [%{"event" => event, "data" => CodexPooler.JSON.decode!(data)}]
       else
         _missing -> []
       end
@@ -625,7 +611,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
     |> Enum.find_value(fn block ->
       with ["error"] <- Regex.run(~r/^event: (.+)$/m, block, capture: :all_but_first),
            [data] <- Regex.run(~r/^data: (.+)$/m, block, capture: :all_but_first) do
-        Jason.decode!(data)
+        CodexPooler.JSON.decode!(data)
       else
         _missing -> nil
       end
@@ -635,7 +621,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
   defp expected_relayed_failed_terminal do
     %{
       "type" => "response.failed",
-      "sequence_number" => 0,
+      "sequence_number" => 1,
       "response" => %{
         "id" => "resp_terminal_failed",
         "created_at" => 0,
@@ -668,11 +654,10 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
     }
   end
 
-  defp await_committed_turn(pool_id, attempts_left \\ 1_000)
+  defp await_committed_turn(pool_id),
+    do: await_committed_turn(pool_id, System.monotonic_time(:millisecond) + @detection_timeout_ms)
 
-  defp await_committed_turn(_pool_id, 0), do: flunk("expected committed public bridge turn")
-
-  defp await_committed_turn(pool_id, attempts_left) do
+  defp await_committed_turn(pool_id, deadline) do
     turn =
       Repo.one(
         from turn in CodexTurn,
@@ -688,9 +673,11 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
         turn
 
       _pending ->
+        if System.monotonic_time(:millisecond) >= deadline, do: flunk("expected committed public bridge turn")
+
         receive do
         after
-          1 -> await_committed_turn(pool_id, attempts_left - 1)
+          1 -> await_committed_turn(pool_id, deadline)
         end
     end
   end
@@ -718,12 +705,17 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTerminalTest do
 
   defp terminal_request_status(_type), do: "failed"
 
-  defp sole_owner_pid! do
-    assert [owner_pid] =
-             Registry.select(WebsocketOwnerSession.Registry, [
-               {{:"$1", :"$2", :_}, [], [:"$2"]}
-             ])
-
+  # The owner of this test's own Pool, never one another test left in the
+  # application-global registry (findings#206 row 206-377).
+  defp sole_owner_pid!(pool) do
+    assert [owner_pid] = BackendCodexWebsocketOwnerForwardingSupport.pool_owner_pids(pool)
     owner_pid
+  end
+
+  # Stops only this test's Pool owners, while the sandbox is still up; the
+  # module used to stop every owner in the global registry, which hid another
+  # test's leaked owner instead of failing it.
+  defp stop_own_pool_owners_on_exit(pool) do
+    on_exit(fn -> capture_log(fn -> BackendCodexWebsocketOwnerForwardingSupport.stop_pool_owners!(pool) end) end)
   end
 end

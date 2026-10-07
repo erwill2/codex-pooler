@@ -13,9 +13,15 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
   alias CodexPooler.Jobs
   alias CodexPooler.Pools
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPoolerWeb.Admin.StatsPresentation
   alias CodexPoolerWeb.Admin.StatsPresentation.Charts, as: StatsCharts
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
 
   @reload_telemetry_event [:codex_pooler, :admin, :stats_live, :reload]
   @dashboard_build_telemetry_event [:codex_pooler, :admin, :stats, :dashboard, :build]
@@ -108,7 +114,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       |> LazyHTML.query("#stats-traffic-chart-plot")
       |> LazyHTML.attribute("data-chart-series")
       |> List.first()
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
 
     assert Enum.map(traffic_series, & &1["name"]) == [
              "model-a",
@@ -156,15 +162,11 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
            |> Enum.count() == 2
 
     assert fragment
-           |> LazyHTML.query(
-             "#stats-traffic-chart-plot[data-chart-stacked='true'][data-chart-bar-radius='0'][data-chart-zoom='false'][data-chart-legend='always'][data-chart-safe-tooltip='true']"
-           )
+           |> LazyHTML.query("#stats-traffic-chart-plot[data-chart-stacked='true'][data-chart-bar-radius='0'][data-chart-zoom='false'][data-chart-legend='always'][data-chart-safe-tooltip='true']")
            |> Enum.count() == 1
 
     assert fragment
-           |> LazyHTML.query(
-             "#stats-token-cost-chart-plot[data-chart-bar-radius='0'][data-chart-zoom='false']"
-           )
+           |> LazyHTML.query("#stats-token-cost-chart-plot[data-chart-bar-radius='0'][data-chart-zoom='false']")
            |> Enum.count() == 1
 
     for selector <- [
@@ -670,7 +672,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       {:ok, view, _html} =
         live(conn, ~p"/admin/stats?pool_id=#{pool.id}")
 
-      assert_receive {^handler_id, query_pid}, 1_000
+      assert_receive {^handler_id, query_pid}, @detection_timeout_ms
 
       try do
         assert has_element?(view, "#admin-stats[aria-busy='true']")
@@ -1142,7 +1144,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       safe_model =
         model_fixture(pool, %{
-          exposed_model_id: "gpt-5.5",
+          exposed_model_id: "gpt-6-sol",
           display_name: "Model Usage Display Name #{sensitive_marker}"
         })
 
@@ -1227,7 +1229,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       model_series_names = Enum.drop(series_names, -1)
 
       assert series_names == [
-               "gpt-5.5",
+               "gpt-6-sol",
                escaped_unsafe_model_code,
                "gpt-ranked-3",
                "gpt-ranked-4",
@@ -1259,7 +1261,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
              ] = yaxis
 
       refute unsafe_model_code in series_names
-      assert chart_html =~ "gpt-5.5"
+      assert chart_html =~ "gpt-6-sol"
       assert chart_html =~ "&amp;lt;img src=x onerror=alert(1)&amp;gt;"
       refute chart_html =~ "<img src=x onerror=alert(1)>"
       refute chart_html =~ "Model Usage Display Name"
@@ -1918,6 +1920,32 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute has_element?(view, "#stats-traffic-chart", "100 tokens")
     end
 
+    test "traffic distribution identifies deleted history and omits unused deleted accounts", %{conn: conn, scope: scope} do
+      {:ok, pool} = Pools.create_pool(scope, %{slug: "stats-deleted-history", name: "History Pool"})
+      %{identity: deleted} = stats_usage_fixture(pool, %{total_tokens: 40, correlation_id: "stats-deleted-history"})
+      %{identity: removed, assignment: removed_assignment} = stats_usage_fixture(pool, %{total_tokens: 60, correlation_id: "stats-removed-history"})
+      %{identity: unused} = upstream_assignment_fixture(pool, %{account_label: "Unused deleted account"})
+      upstream_assignment_fixture(pool, %{account_label: "Current idle account"})
+
+      assert {:ok, _} = Upstreams.rename_account_for_scope(scope, deleted, %{account_label: "Deleted account"})
+      assert {:ok, _} = Upstreams.rename_account_for_scope(scope, removed, %{account_label: "Removed account"})
+      assert {:ok, _} = Upstreams.soft_delete_account_for_scope(scope, deleted, %{})
+      assert {:ok, _} = Upstreams.soft_delete_account_for_scope(scope, unused, %{})
+      assert {:ok, _} = PoolAssignments.delete_pool_assignment(pool, removed_assignment)
+
+      {:ok, view, _html} = live_stats(conn, ~p"/admin/stats?pool_id=#{pool.id}")
+
+      assert has_element?(view, "#stats-upstream-surface h3", "Deleted account (deleted)")
+      assert has_element?(view, "#stats-upstream-surface h3", "Removed account (removed from selected Pools)")
+      assert has_element?(view, "#stats-upstream-surface h3", "Current idle account")
+      refute has_element?(view, "#stats-upstream-surface", "Unused deleted account")
+      assert has_element?(view, "#stats-upstream-lane-1 [data-role='upstream-tokens']", "60")
+      assert has_element?(view, "#stats-upstream-lane-2 [data-role='upstream-tokens']", "40")
+      assert has_element?(view, "#stats-upstream-lane-1 [data-role='upstream-traffic-share']", "50.0%")
+      assert has_element?(view, "#stats-upstream-lane-2 [data-role='upstream-traffic-share']", "50.0%")
+      assert has_element?(view, "#stats-kpi-tokens", "100")
+    end
+
     test "empty selected period shows operational no-data copy without fake trends", %{
       conn: conn,
       scope: scope
@@ -2104,30 +2132,30 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
     end
   end
 
-  defp await_stats_dashboard(view, attempts \\ 100)
+  defp await_stats_dashboard(view),
+    do: await_stats_dashboard(view, System.monotonic_time(:millisecond) + @detection_timeout_ms)
 
-  defp await_stats_dashboard(view, attempts) when attempts > 0 do
+  defp await_stats_dashboard(view, deadline) do
     _ = render_async(view, 5_000)
     state = :sys.get_state(view.pid)
 
     if Map.get(state.socket.assigns, :dashboard_loading?, false) or
          Map.get(state.socket.assigns, :stats_dashboard_running?, false) do
+      if System.monotonic_time(:millisecond) >= deadline, do: flunk("stats dashboard did not finish loading: #{inspect(:sys.get_state(view.pid))}")
+
       receive do
       after
-        1 -> await_stats_dashboard(view, attempts - 1)
+        1 -> await_stats_dashboard(view, deadline)
       end
     else
       state
     end
   end
 
-  defp await_stats_dashboard(view, 0) do
-    flunk("stats dashboard did not finish loading: #{inspect(:sys.get_state(view.pid))}")
-  end
+  defp await_stats_dashboard_params(view, expected_params),
+    do: await_stats_dashboard_params(view, expected_params, System.monotonic_time(:millisecond) + @detection_timeout_ms)
 
-  defp await_stats_dashboard_params(view, expected_params, attempts \\ 100)
-
-  defp await_stats_dashboard_params(view, expected_params, attempts) when attempts > 0 do
+  defp await_stats_dashboard_params(view, expected_params, deadline) do
     state = :sys.get_state(view.pid)
     assigns = state.socket.assigns
 
@@ -2137,17 +2165,13 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
     else
       _ = render_async(view, 5_000)
 
+      if System.monotonic_time(:millisecond) >= deadline, do: flunk("stats dashboard did not load params #{inspect(expected_params)}: #{inspect(:sys.get_state(view.pid))}")
+
       receive do
       after
-        1 -> await_stats_dashboard_params(view, expected_params, attempts - 1)
+        1 -> await_stats_dashboard_params(view, expected_params, deadline)
       end
     end
-  end
-
-  defp await_stats_dashboard_params(view, expected_params, 0) do
-    flunk(
-      "stats dashboard did not load params #{inspect(expected_params)}: #{inspect(:sys.get_state(view.pid))}"
-    )
   end
 
   defp assert_stats_patch_params(view, expected_params) do
@@ -2164,6 +2188,9 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
        when is_pid(query_pid) and is_function(fun, 0) do
     test_pid = self()
     handler_id = {__MODULE__, :stats_repo_query, test_pid, System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -2222,7 +2249,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
     |> LazyHTML.from_fragment()
     |> LazyHTML.attribute(attribute)
     |> case do
-      [value] -> Jason.decode!(value)
+      [value] -> CodexPooler.JSON.decode!(value)
       [] -> flunk("missing #{attribute} in chart HTML")
     end
   end
@@ -2237,7 +2264,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
     |> LazyHTML.query("##{chart_id}")
     |> LazyHTML.attribute(attribute)
     |> case do
-      [value] -> Jason.decode!(value)
+      [value] -> CodexPooler.JSON.decode!(value)
       [] -> flunk("missing #{attribute} in #{chart_id} HTML")
     end
   end
@@ -2372,8 +2399,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       input_tokens: Map.fetch!(attrs, :total_tokens),
       output_tokens: 0,
       estimated_cost_micros: Map.get(attrs, :estimated_cost_micros, 0),
-      settled_cost_micros:
-        Map.get(attrs, :settled_cost_micros, Map.get(attrs, :estimated_cost_micros, 0))
+      settled_cost_micros: Map.get(attrs, :settled_cost_micros, Map.get(attrs, :estimated_cost_micros, 0))
     })
 
     %{api_key: api_key, raw_key: raw_key, identity: identity, assignment: assignment}

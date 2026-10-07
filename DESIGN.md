@@ -159,6 +159,16 @@ Contents:
 
 ## Overview
 
+### Selected satin plan badge
+
+On upstream account cards only, the existing `admin-token-burn-active` recent-usage signal also enables a clipped static-width highlight sweep on the plan badge. Cadence is fixed at3.2seconds, independent of burn level and quota meter speed. Idle cards and badges outside account cards do not animate. The pseudo-element cannot intercept pointer events; reduced-motion removes the sweep entirely while retaining the satin material. This indicates the existing recent five-minute token-burn activity, not a new in-flight-request detector.
+
+Plan badges use the approved B satin material through `admin-plan-badge` in `assets/css/app.css`: a static 165-degree highlight, 999px capsule radius, 24px minimum height, 11px medium-bold text and subtle inset/outer shadow. Component consumers retain their existing compact sizing overrides. Palette hue/saturation tokens are Free 220/10%, Go 190/70%, Plus 245/65%, Pro 42/80%, Pro Lite 32/48%, Team 213/72%, Business 163/48%, Enterprise 300/22%, Edu 275/62%. Light text/border lightness is24/69%; gradient stops96/80/89%. Dark text is82%, border39% with saturation scaled0.65; gradient lightness31/19/25% with saturation35/38/32%. The user accepted the proposed dark treatment provisionally for in-context review. This is an explicit badge-only exception to the flat-first rule; no animation or changes to status chips. Unknown plans retain the previous fallback. Plan labels reflect provider evidence and never infer5x/20x.
+
+### Development plan badge proposals
+
+The `plan-badges` component-showcase state compares three CSS-only treatments inside the real account card: enamel (solid tint), satin (static restrained metallic highlight), and split (plan plus compact multiplier segment). This is a scoped material exception for badges only: existing shell, density, fonts, cards, spacing and controls remain the operator-bench contract. Pro uses gold; Go uses cyan, Free neutral, Plus indigo, Team blue, Business teal, Enterprise plum, Edu violet. Light and dark pairs use readable foregrounds and visible borders; each badge stays compact at 24px high with no animation. Pro 5x/20x labels are explicitly hypothetical layout examples, never inferred provider entitlements. Proposal styles apply only below `.plan-badge-review`; production badges do not opt in. Full cards stack on mobile; no horizontal page overflow, no decorative card shadows, no imagery or background effects.
+
 **Creative North Star: "The Operator Bench."** Codex Pooler is a compact
 operations surface for trusted users who inspect routing, upstream capacity,
 API keys, request history, quota evidence, and maintenance state without ever
@@ -199,7 +209,7 @@ animated):
   `--shine-delay` stagger and burn-scaled `--shine-period`. An unreported
   quota uses the component-scoped `admin-static-unknown-progress` treatment:
   native indeterminate semantics but no daisyUI gradient or animation, in
-  normal and reduced-motion sessions ([Upstream account card](#upstream-account-card)/[Quota progress row](#quota-progress-row-including-striped-credit-backed-state)).
+  normal and reduced-motion sessions ([Upstream account card](#upstream-account-card)/[Quota progress row](#quota-progress-row-and-provider-credits)).
 - Panel switcher: 150ms opacity ease-out with `motion-reduce:transition-none`.
 - Pool compat disclosure: 160ms slide/fade in (`pool-compat-panel-in`),
   disabled under reduced motion.
@@ -228,8 +238,19 @@ animated):
   150ms, and the tab opens on the release gesture so popup blockers stay
   quiet. Only the 300ms launch pop is decorative, and it is motion-gated.
 
+- OAuth callback paste figure (`oauth-paste-demo` in `app.css`, browser route of
+  the [OAuth handoff dialog](#oauth-handoff-dialog-two-doors)): one 8s loop on a
+  single `--opd-loop` clock — select, `Copy`, carry the value down into the
+  field, `Paste`, arm `Complete link` — with a short opacity veil covering the
+  reset so the loop never rewinds on screen. Reduced motion stops the clock and
+  keeps the finished frame, where the selection, the pasted value, both key
+  pills and the armed button are already shown.
+
 Rule: no looping decorative animation; the burn shine is the ceiling for
-ambient motion and it is evidence-driven (recent token burn).
+ambient motion and it is evidence-driven (recent token burn). The callback paste
+figure is the one loop that is not ambient: every moving part is a step of an
+instruction for something that happens outside this app, it runs only while that
+step is actually owed, and it holds the same drawing still under reduced motion.
 
 ## Colors
 
@@ -342,18 +363,13 @@ utilities; never hardcode raw violet/oklch literals in `lib/`.
 
 **Display / Body Font:** Roboto Condensed (with `ui-sans-serif`, `system-ui`,
 `sans-serif`)
-**Label / Mono Font:** the Tailwind `font-mono` stack (`ui-monospace`, Menlo, …)
+**Code / Identifier Mono Font:** the Tailwind `font-mono` stack (`ui-monospace`, Menlo, …)
 
 **Character:** one condensed grotesque doing every job, narrow enough that a
-dense row of facts still reads at a glance, with monospace used strictly as
-data dress. There is no display face and no pairing to admire; the hierarchy is
+dense row of facts still reads at a glance. There is no display face and no pairing to admire; the hierarchy is
 carried by weight, case, and opacity rather than by contrast between families.
 
 ### Named Rules
-
-**The Mono-Is-Data Rule.** Monospace marks values you might copy, compare, or
-diff — IDs, prefixes, versions, tabular numbers, OTP slots, the sidebar nav
-labels. It is never reached for as personality, and never for prose.
 
 **The No-Hero-Type Rule.** No fluid or clamped hero type on admin screens. The
 largest type on any page is the `text-3xl` page title, and tracked uppercase
@@ -369,10 +385,7 @@ appears only at micro sizes.
   on the label span: `text-box: trim-both cap alphabetic` lets flex center the
   font's cap-to-baseline box beside its icon. Unsupported browsers retain the
   existing line box; icons and control hit areas keep their original geometry.
-- **Mono:** the Tailwind `font-mono` stack (`ui-monospace`, Menlo, …) is data
-  dress, used for IDs, prefixes, versions, tabular values
-  (`font-mono tabular-nums`), the sidebar nav labels, and the OTP slots. Mono
-  is never product personality.
+- **Mono:** existing shell and code-specific components may use the Tailwind `font-mono` stack. Data does not require a different font family; numeric alignment uses `tabular-nums`.
 
 Observed hierarchy (all from live pages):
 
@@ -383,7 +396,7 @@ Observed hierarchy (all from live pages):
 | Surface title | `text-base font-semibold leading-5` | `admin_surface`, card headers |
 | Section heading | `text-xs font-semibold uppercase tracking-wide text-base-content/45` | drawer sections |
 | Micro label | `text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35` | metric cards, card footers |
-| Value | `font-mono font-semibold tabular-nums` (`text-xl`/`text-lg` compact) | metric cards, leaderboards |
+| Value | `font-semibold tabular-nums` (`text-xl`/`text-lg` compact) | metric cards, leaderboards |
 | Body / help | `text-sm leading-6 text-base-content/65` | wizard copy, descriptions |
 | Fine print | `text-xs` / `text-[11px] leading-4 text-base-content/55` | card details, sublabels |
 
@@ -652,7 +665,7 @@ ownership, accessibility, and a minimal real markup example.
   outlier in the strip — the split's one interesting number already lives
   in the dedicated Cache rate card, so Tokens went back to a single
   description like its siblings.
-- **Anatomy:** micro uppercase label + trailing icon, `font-mono tabular-nums`
+- **Anatomy:** micro uppercase label + trailing icon, `tabular-nums`
   value (`data-role="metric-card-value"`), optional muted description.
 - **metric_strip API:** attrs `id`, `compact_mobile`, `desktop_columns`
   (`:four | :five`), `class` (full grid override — the stats KPI strip passes
@@ -694,7 +707,13 @@ ownership, accessibility, and a minimal real markup example.
 </AdminComponents.admin_surface>
 ```
 
+### Traffic distribution
+
+Traffic distribution keeps current assigned accounts visible at zero usage. Deleted accounts and accounts removed from the selected Pools appear only when the selected period contains their accounting history. Their existing account heading, title, and traffic-share accessibility label append `(deleted)` or `(removed from selected Pools)`; retain the same typography, truncation, rails, and density, without status badges or links to unavailable account detail pages.
+
 ### Upstream account card
+
+The existing Delete action is permanent and becomes available only after every Pool assignment has been removed, including disabled assignments. Disabled Delete explains this prerequisite without exposing hidden Pool names. Legacy deleted accounts appear in Any status and the Deleted filter; their list menu contains only Delete, and their cockpit keeps other actions unavailable. Deletion in progress and Deletion failed use the existing written status treatment. Reuse the typed-account-label confirmation dialog, explicitly naming permanent removal and retained shared request accounting; do not add a separate purge action.
 
 - **Source:** `account_card/1` in
   [`account_card.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card.ex)
@@ -728,7 +747,7 @@ border-base-300 bg-base-200/35 px-4 py-3`):
   `!px-2 !py-0.5 !text-[10px]` micro override + `max-w-48 truncate`),
   auth-expiration line (`data-role="upstream-auth-expiration"`, `text-xs
   text-base-content/55`, full timestamp in `title`).
-- Header actions cluster: saved-reset count badge ([Saved-reset badge and meter](#saved-reset-badge-and-meter)), plan badge ([Plan badge](#plan-badge--all-tones)) or
+- Header actions cluster: plan badge ([Plan badge](#plan-badge--all-tones)) or
   `diagnostic_popover` when the plan is unreported, and the actions dropdown
   ([Dropdown action menu](#dropdown-action-menu)).
 
@@ -737,7 +756,7 @@ pools) inside `data-role="upstream-account-panel-switcher"` with
 `data-panel-view` reflecting the open one. The hidden panels use `max-h-0
 opacity-0 pointer-events-none` plus `aria-hidden` and `inert`; the visible one
 `max-h-[28rem] opacity-100` with a 150ms opacity transition
-(`motion-reduce:transition-none`). Usage panel holds the quota rows ([Quota progress row](#quota-progress-row-including-striped-credit-backed-state)) and
+(`motion-reduce:transition-none`). Usage panel holds the quota rows ([Quota progress row](#quota-progress-row-and-provider-credits)) and
 saved-reset meter ([Saved-reset badge and meter](#saved-reset-badge-and-meter)); tokens panel holds a model leaderboard list ([Compact and definition lists](#compact-and-definition-lists));
 pools panel renders per-assignment route chevrons:
 
@@ -831,7 +850,7 @@ all three facts remain readable inside the single-column phone card.
 token-burn shine active/idle, per-panel open state, deleted/paused disabling
 of actions, lifecycle warning block via `ReconciliationStatus`.
 
-### Quota progress row (including active credit burn)
+### Quota progress row and provider credits
 
 - **Source:** `quota_limit_row/1` in
   [`quota_limit_row.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card/quota_limit_row.ex);
@@ -843,51 +862,38 @@ of actions, lifecycle warning block via `ReconciliationStatus`.
   Fixed account rows and fresh or unknown-freshness additional rows remain
   visible. The compact row shows no freshness or history copy, reset status, or
   unconfirmed reset.
+- **Observation details:** a quota opens a compact, scrollable evidence dialog using saved-reset typography and disclosure patterns. The selected record comes first; other records follow by evidence timestamp, newest first. Five records are initially visible, with a total count and Show all for the remainder. Only the selected bar and percentage use quota colors; alternatives use theme-aware gray, and stale percentages say last known. Source and original provider slot identify each record. Expand a record for reset, synchronization, precision, window and scope details. Values are reconciled retained state, not raw response history. Event-driven reloads wait until close and then catch up. Preserve Escape/backdrop dismissal, focus restoration, existing quota selection and metadata-only output.
 - **Tones:** percent ≥ 70 → `progress-success`/`text-success`; ≥ 30 →
   warning; below → error. Unreported remains `progress-neutral` with muted
   text and adds `admin-static-unknown-progress`; it is never presented as a
   determinate zero-value meter.
-- **Credit burn state:** a positive credit balance does not change the
-  quota meter while included Codex quota remains. The row continues to show
-  the provider's remaining quota percentage with a solid fill and may show the
-  current raw credit balance as secondary detail. Once provider usage reaches
-  100%, `burning_credits: true` appends
-  `progress-striped`; the fill then tracks the observed credit balance against
-  the last pre-burn balance baseline and the detail shows only the current
-  provider balance, such as `500 credits`. An explicit depleted balance remains
-  visible as `0 credits` without stripes; an omitted, stale, or unavailable
-  provider balance has no credit footer. The UI never
-  renders an inferred `balance / capacity` denominator.
+- **Included quota:** each account window always shows the provider's included-quota percentage with a solid fill. An exhausted Weekly remains `0%` even when provider credits can serve a request. Credit balance, baseline ratios and credit counts belong only to the distinct provider-credit row; do not restore `burning_credits` or reinterpret the Weekly meter as credit capacity.
+- **Provider credits:** `ProviderCreditsComponents.provider_credits_summary/1` sits in the same quota grid: Credits at top left, the observed percentage alone at top right, a 1.5-height striped bar, and the footer with Enabled/Disabled on the left and the numeric balance on the right, directly below the percentage. Percentages truncate to exactly three decimal places with a decimal point, such as `99.976%`. Use the same success >=70, warning >=30 and error <30 palette for text, bar and hover as included quota rows. Balance and baseline amounts truncate to whole numbers with comma grouping and no repeated unit suffix, such as `62,485`; positive balances below one display `<1`. Exact decimals remain in the source and optional native title, while dialog values also use whole numbers. The reference qualifier belongs in the tooltip, ARIA and details, not the visible percentage. The stripe describes an observed reference, never confirmed credit consumption or purchased allocation. Hide the Credits row for unknown/unreported balances and finite zero, keeping those facts distinct in the policy dialog. Show finite positive balances and explicit Unlimited independently of plan labels. An absent baseline or Unlimited state has no invented percentage or progress bar. Keep policy entry available in the list menu and cockpit action even when the row is hidden; those actions use the existing currency-dollar icon.
+- **Credit readiness and interaction:** fresh enabled usable credits produce the normal successful routing tone and Routing ready via credits label after identity/assignment checks; circuit protection still overrides that presentation. Included exhaustion remains a separate red 0% meter. Unknown, disabled and blocked states retain their own labels and tones. A native hover title gives availability and identifies the observed reference. Authorized operators click the row to open the existing provider-credit policy dialog; read-only viewers get no policy action. The dialog reuses the existing modal shell, eyebrow/title typography and shared footer, with Cancel followed by Save policy associated with the form. Extra balance, baseline and availability explanations stay in the collapsed Balance and availability disclosure. Credit expiry is unreported in the inspected provider facts; never borrow saved-reset expiry or quota reset time. Preserve the backend's cross-Pool mutation authorization and focus restoration.
 - **Motion:** known values use width/color transitions 260/180ms; cards with
   recent burn run the gloss sweep. An unreported value omits `value`, keeps
   native indeterminate semantics, and neutralizes daisyUI's indeterminate
   gradient/animation with `admin-static-unknown-progress`; it stays static in
   normal and `prefers-reduced-motion` sessions. Firefox falls back to a static
   bar for the known-value gloss; reduced motion disables known-value motion.
-- **A11y:** a solid included-quota `<progress>` carries `aria-label`
-  "{label} included Codex quota remaining {pct}". A striped burn meter carries
-  "{label} credit balance remaining {pct}; credits in use" and a
-  title explaining that stripes mean included quota is exhausted and credits
-  are being consumed. When a credit count is present, its `aria-label` and
-  title explain that the value is a credit balance, separate from
-  included Codex quota and not a currency amount. The visible percent remains
-  text beside the bar.
+- **A11y:** included-quota progress uses "{label} included Codex quota remaining {pct}". The separate credit progress uses "Observed provider credit balance relative to observed baseline", an `aria-valuetext` with the same three-decimal visible ratio and an associated description identifying the reference. The row action has a balance-bearing label, `aria-haspopup="dialog"` and the existing policy-dialog target. Do not claim credits are in use or equate provider units with currency.
 
 ```heex
-<%!-- Known credit-burn meter: numeric fill plus stripes, with current balance in details. --%>
+<%!-- Separate observed credit-reference meter; included quota has its own solid bar. --%>
 <progress
   id={"#{@id}-progress"}
-  data-role="upstream-limit-progress"
-  aria-label={"#{@limit.label} credit balance remaining #{@limit.percent_label}; credits in use"}
-  title="Striped while credits are being consumed after included Codex quota is exhausted."
-  class="progress admin-live-progress progress-warning progress-striped h-1.5 w-full"
-  value={@limit.percent_value}
+  data-role="provider-credits-observed-progress"
+  aria-label="Observed provider credit balance relative to observed baseline"
+  aria-valuetext={"#{@percent_label} of observed baseline"}
+  aria-describedby={"#{@id}-baseline-description"}
+  class={["progress admin-live-progress progress-striped h-1.5 w-full", progress_tone(@summary.observed_percent)]}
+  value={@percent_value}
   max="100"
 >
-  {@limit.percent_label}
+  {@percent_label}
 </progress>
 
-<%!-- Unknown meter: preserve id, role, ARIA, max, and any burn stripe; omit `value`. --%>
+<%!-- Unknown included meter: preserve id, role, ARIA and max; omit `value`. --%>
 <progress
   id={"#{@id}-progress"}
   data-role="upstream-limit-progress"
@@ -900,6 +906,10 @@ of actions, lifecycle warning block via `ReconciliationStatus`.
 ```
 
 ### Saved-reset badge and meter
+
+Future expiration countdowns in the saved-reset bank dialog and upstream cockpit are native download links. Keep their existing clock icon, purple type, alignment, countdown text and stable ids; add hover underline, keyboard focus and a tooltip/accessibility label explaining that the download includes all upcoming expirations for that upstream. Both surfaces use the shared expiration component and the same authenticated `.ics` route. Expired, due-now and unknown timestamps remain plain text. Clicking a countdown starts a file download without submitting policy changes or queuing redemption.
+
+The cockpit's Actions rail also exposes **Download reset calendar**, using the existing action-row treatment and calendar icon. It downloads the same complete upstream calendar; when no upcoming expirations are available it remains visible as a disabled action with the reason in its tooltip.
 
 - **Source:** `saved_reset_count_badge/1` and `saved_reset_meter/1` in
   [`saved_reset_meter.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card/saved_reset_meter.ex)
@@ -1009,7 +1019,7 @@ Three recurring list shapes, all `text-xs`-scale and truncation-guarded:
 ```heex
 <div id={@row.id} data-role="request-log-detail-field" class="grid gap-1 rounded-box bg-base-200/60 px-3 py-2">
   <dt class="text-xs font-semibold uppercase tracking-wide text-base-content/45">{@row.label}</dt>
-  <dd class="break-words text-base-content/80 font-mono text-xs tabular-nums">{@row.value}</dd>
+  <dd class="break-words text-base-content/80 text-xs tabular-nums">{@row.value}</dd>
 </div>
 ```
 
@@ -1047,21 +1057,26 @@ Three recurring list shapes, all `text-xs`-scale and truncation-guarded:
 - **API:** attrs `id`, `label`, `family`, `placeholder` (default
   "Plan unknown"), `class`, global rest. Labels are canonicalized
   ("chatgpt plus" → "ChatGPT Plus"); when a family is present and differs it
-  renders as "Label (Family)". Always renders as a [Chips](#chips-status-count-metadata-severity-protocol-redacted) pill chip.
+  renders as "Label (Family)". Known plans use the selected satin capsule; unknown values retain the [Chips](#chips-status-count-metadata-severity-protocol-redacted) fallback.
 - **Tone map:**
 
 | Tone | Plans | Chip |
 | --- | --- | --- |
-| free | Free | success chip |
-| pro | Pro, Plus, ChatGPT Pro/Plus | primary chip |
-| team | Team, Business, ChatGPT Team | info chip |
-| enterprise | Enterprise, Edu, Education | warning chip |
+| free | Free | neutral satin |
+| go | Go | cyan satin |
+| plus | Plus, ChatGPT Plus | indigo satin |
+| pro | Pro, ChatGPT Pro | gold satin |
+| prolite | Pro Lite | bronze satin |
+| team | Team, ChatGPT Team, self-serve business variants | blue satin |
+| business | Business | teal satin |
+| enterprise | Enterprise variants | plum satin |
+| edu | Edu, Education variants | violet satin |
 | generated | any other non-empty label | phash2-stable tone chip |
 | unknown | blank | neutral chip |
 
 Used on upstream card headers, the upstream cockpit header, request-log rows
 (with `!`-override micro sizing), and the pool wizard's identity options —
-verified live as the orange "Pro" / green "Free" pills.
+verified in the local runtime with gold Pro, neutral Free and separate plan hues.
 
 ```heex
 <AdminBadges.plan_badge id={"#{@dom}-plan-label"} label={@account.plan_label} aria-label={"Account plan: #{@account.plan_label}"} />
@@ -1210,7 +1225,7 @@ verified live as the orange "Pro" / green "Free" pills.
   errors, and one compact constraint note immediately above the matrix for fixed
   route keys and numeric limits. Route names and numeric inputs use the shared
   admin form type so bulkhead values match every other editable number;
-  monospace remains reserved for read-only identifiers and diffable metadata.
+  read-only identifiers follow their component's typography.
   Each row-group header puts the sole top hairline on the spanning header cell
   so the boundary remains explicit after the preceding data row without a
   second border on the group row.
@@ -1347,6 +1362,10 @@ control.
 
 ### Dialog shell (every admin modal)
 
+The Pool wizard and editor reuse the same Compatibility toggle rows for `/v1`, image generation, and audio transcription, in that order. Pool cards expose the same three settings through the existing compact icon disclosure: code brackets, photo, and microphone. Audio uses the shared checked, disabled, focus and help-text treatments; it adds no separate palette, card style, or dialog layout. Keep the quick toggle and both forms synchronized through the canonical persisted Pool settings.
+
+The API-key Limits panel uses a compact tonal key-wide control band, a bordered default-policy group, and a subordinate single-model group separated by a hairline. Both policy groups share a three-column grid from `sm`, one column below it, `gap-3`, and standard inputs with fieldset outer margin/padding removed; input height and label typography remain unchanged. The active-request cap stays separate from model policy fields. Configured overrides and validation remain visible. A compact known/provisional/pending/effective budget breakdown explains reservations without changing measured burn. The existing policy dialog body owns scrolling and the footer remains reachable.
+
 - **Presentation:** `<dialog class="modal modal-bottom overflow-x-hidden sm:modal-middle">`.
   Below `sm` the dialog is a **bottom sheet** — edge to edge, anchored to the
   bottom, top corners rounded and bottom corners square, capped at
@@ -1388,6 +1407,15 @@ control.
   countdown inside the help sentence, and the only status line in the dialog —
   a poll really is running there. The browser route has no status line: nothing
   is running, the pooler is waiting for the operator.
+- **The browser route draws its one off-screen step.** Under the callback help
+  text, `callback_paste_demo/1` renders an inline SVG figure (`oauth-paste-demo`
+  in `app.css`): a browser window whose address bar holds the callback URL over
+  a page that did not load, an arrow down to the dialog's own field, and an
+  8s loop that selects the URL, shows a `Copy` pill, carries the value into the
+  field, shows a `Paste` pill and arms `Complete link`. It is the only place
+  where the flow leaves the pooler's screen, and the dead page is drawn as part
+  of the expected picture rather than left to read as the error it resembles.
+  See [Motion](#motion) for the exception this claims and its reduced-motion frame.
 - **The completing action lives in the dialog footer**, beside the dismiss,
   submitting the body form through `form=`. It is the dialog's only filled
   orange; `Open` is secondary. A finished flow replaces it with `Open cockpit`,
@@ -1419,7 +1447,7 @@ control.
   through `fields_class` without replacing the shared control recipe.
   Upstreams uses it for a two-column phone layout with search spanning both,
   then a `1.55fr / 1fr / 1fr` search/Pool/status row from `sm`.
-  `cally_date_filter/1` provides the anchored calendar popover.
+  `cally_date_filter/1` provides the anchored calendar popover. Its scoped `admin-calendar` uses the body font, `text-xs` tabular date numerals and weekday labels, and a `text-sm font-semibold` month heading. Navigation buttons inherit the body font; weekday headers have no selectable-day radius or hover fill. Keep Cally's seven-column geometry and native popover anchoring; month/year select elements are not part of this primitive.
 - **`empty_state/1`:** dashed-border `rounded-box` panel, icon at
   `text-base-content/40`, title + optional description + actions, all
   centered. The chart-free variant (`pool-activity-empty-state` in `app.css`)
@@ -1527,7 +1555,7 @@ control.
   the card. Cockpit labels never use the compact `Assign` form.
 - **Quota & banked resets** (`#upstream-quota`): account plus additional
   model, upstream-model, and feature window rows (reusing the index card's
-  `quota_limit_row`, [Quota progress row](#quota-progress-row-including-striped-credit-backed-state)).
+  `quota_limit_row`, [Quota progress row](#quota-progress-row-and-provider-credits)).
   Both current admin views apply the same snapshot-time rule: dynamically stale
   additional rows are omitted, while fixed account rows and fresh or
   unknown-freshness additional rows remain visible.
@@ -1592,6 +1620,10 @@ control.
 
 ### Record row — the ledger contract
 
+Lens is the standalone model-declaration observability page at `/admin/lens`, immediately after Audit logs in the sidebar. It reuses the admin shell, filters, compact numeric strip and record ledger with the normal sans-serif UI font for model names and evidence. An ApexTimeSeriesChart plots unstacked mismatch/conflict counts over time below the counters. A neighboring horizontal bar chart shows the eight most frequent sent / first-declared / first-conflicting combinations among affected attempts, counting overlapping signals once per attempt. Both use the same Pool/upstream/model/window population. Declaration coverage is neutral information in a compact disclosure; missing declarations are never downgrade signals. The default attempt filter includes only mismatches or conflicts. The affected-groups table uses that same signals-only population and its links select signals explicitly. No retained attempts replace the whole data surface with the shared `empty_state`; retained data without signals replaces both charts with one shared empty panel and omits empty groups. An explicitly selected evidence filter with no rows uses the same empty-state component for the attempt list. Operator copy names the comparisons explicitly: Different from sent and Name changed in response. An inline help disclosure gives A/B examples and the Operators Lens guide explains the historical labels mismatch/conflict. The goal is to identify a different model; no quality comparison is required. The source of evidence remains the model name reported by the provider. The attempt table is one markup tree that stacks labelled model facts on phones and pairs them in the dense tablet ledger; the grouped count matrix retains contained horizontal scrolling. Unknown/uncollected evidence never receives a success badge. The drawer shows the evidence on each attempt, preserving sent-versus-first-model meaning. Reuse existing chart shells, colors, typography and hooks; no new visual language or chart library.
+
+Lens's main filter row uses the shared admin filter form and actual Pool selector with status/strategy icons, plus matching icon dropdowns for Window, Sent model and Attempt evidence. Keep all four on the same desktop row with accessible trigger names instead of visible labels. Evidence icons distinguish mismatch (warning arrows), conflict (error triangle), missing (muted question), uncollected (muted eye-off) and partial (info pie). Raw upstream identity belongs in Advanced filters. The page relies on the shared live-update controls without a separate header refresh or timestamp; a Retry action is shown only after a failed load. Mismatch/conflict links share the title row at the right of the signal-card header, with `admin-control-label` centering the text beside the icons. Filter menus use a soft primary selection background with normal content text so semantic icon colors stay readable in light and dark themes. Initial content has an async loading surface, event reloads preserve the previous charts, and failed refreshes label the stale snapshot. The shared live-update pause gates automatic refreshes, including in-flight publication, while explicit filters, error retries and authorization changes remain active.
+
 The jobs explorer and the request-log table are the two record tables. They
 share one contract, and a third record table should join it rather than invent
 a fourth shape.
@@ -1625,14 +1657,40 @@ that field will shift its neighbours' columns — the figures track is a fixed
 whose fields do not pair up gains nothing from a second column.
 
 **Column widths belong to the `colgroup`, and only hold up with a floor under
-the table.** Give every column a floor and leave exactly one elastic — the one
+the table.** Give every column a floor and leave one elastic — the one
 whose content already truncates with the full value in a `title`. Then give the
 table `lg:min-w-[Nrem]` equal to the sum of those floors, and let the wrapper
 scroll (`lg:overflow-x-auto`). Without it the floors are decoration: `<col>`
 widths are hints, so a narrow container compresses every column at once and the
 elastic column stops being the one that gives. The min-width is safe *because*
 the table reflows below `lg` — it never applies at a width where it could push
-content off a phone. Request logs: `8+9+10+17+6+6 = 56rem`. Jobs: `72rem`.
+content off a phone. Request logs use a 58.4375rem floor without issues and a 69.8125rem floor when the current page contains issues. Their fixed content tracks are 128px time/status/duration, 136px model, 126px attribution, 162px tokens and 55px cost, with 14px gaps and 14px edge padding; the `colgroup` includes that padding in each width. Endpoint is the main elastic track, starting at 230px of content. Model and upstream tracks do not expand on wide screens. The optional issues track starts at 168px of content. The model column keeps model and effort together; different upstream declarations belong to the issues column with their warning icon and full diagnostic text. Matching or missing declarations add no warning. Jobs: `72rem`.
+
+**Request log groups.** Read each record from left to right as time/status/duration, model/effort/tier, upstream/Pool/key, endpoint/transport/client, errors/warnings, tokens/cache, and cost. The request-explorer structure is a 34px header and 52px desktop rows, with 12px primary text, 11px secondary text, 16px line height and 4px between the two lines. Typography remains Roboto Condensed and colors remain existing theme tokens. Time sits above the status label and a 12px icon; both use the semantic status color: success for succeeded, error for failed/rejected, warning for cancelled and info for in progress. The icon has a 4px gap before the label; the measured duration follows the colored label with one normal text space as `Succeeded in 3.2s`, using muted text and its existing millisecond tooltip. Missing duration adds no label. There is no separate duration column, duration bar or vertical status rail. The full date/time follows the operator's preference in the tooltip and accessible text. Model identity has an 8px square marker, followed by the model name and reasoning effort on the same line, separated by a middle dot (`sample-model · high`); the existing conditional `model default` label occupies that same effort position. Tier and requested-versus-effective annotations remain on the indented second line; declaration warnings move to the dedicated issues cell. Upstream and canonical plan label share the first line as plain text, with Pool and key separated by a middle dot below. The endpoint displays its complete recorded path, including `/backend-api` where present; the original rounded transport badge and client occupy the second line. Transport badges retain their full labels and semantic colors: WebSocket/info, HTTP SSE/success, HTTP JSON/primary, HTTP multipart/warning and unknown HTTP/neutral, with the existing priority indicator. Structural changes must preserve the existing presentation values rather than copying sample strings from a proposal. The timestamp button and whole-row click open the inspector. Preserve the existing page shell and filters.
+
+**Request token composition.** Each 8px token bar represents 100% of that request's recorded total, split into cached input (`info`), uncached input (`info/25`) and output (`success`). All tracks have the same width; segment lengths depend only on that request, never other rows, filters or page maxima. A visible legend above the table is titled `Token breakdown` and names the three colors. Its text uses `admin-control-label` to center the letters beside the 8px swatches within a 16px row. Tooltips and the accessible image label give exact segment counts; reasoning is already part of output and is not added again. The recorded total stays beside the bar. Beneath the left edge, retain the cached count and add its percentage of input, explicitly labelled `of input`; omit that percentage if input is zero or cache evidence is missing or invalid. Draw the composition only when all four counts are nonnegative integers, total is positive, input plus output equals total, and cached input does not exceed input. Otherwise show `breakdown n/a` in the bar slot while retaining the recorded numbers; never infer missing cache as zero or rewrite counts to fill the track. A recorded zero cache reads `0 cached`; an absent measurement reads `cache n/a`. Bars have no animation. Below `lg`, numeric values and the input-cache percentage remain visible while bars and their legend step aside; the percentage wraps beneath the cached count. Cost, duration, endpoint and transport retain their current placement and values.
+
+**Request log footer.** This table intentionally uses the proposal's footer instead of the shared sticky top pager: timezone, result range and page number sit at the left, with the selected request action and previous/next controls at the right. Paging still uses `LogPagination.metadata/1` and the existing pinned-window URL contract, including newer-count and Back to latest controls. The shared pager and rail rules below continue to govern the other ledgers. On narrow viewports the footer may wrap so its actions remain reachable; the ledger omits the old rail's empty column.
+
+**Request issues.** An `Errors · Warnings` column sits between endpoint/transport/client and tokens/cache only when at least one currently displayed row has a formatted error, a different declared model or a model-name conflict. Omit its header, `col` and every body cell together on clean pages, and remove its minimum width from the table. Recompute from the current page's rows after filtering, pagination or live updates, including retry errors and warnings on successful requests. When present, show all formatted messages in a compact 11px/16px stack, allowing wrapping rather than truncating or limiting the list to two entries. Every request/attempt error has a decorative red triangle; model warnings use amber for both icon and text. Preserve the actual final request status and show a muted dash in unaffected rows of a mixed page. The issue column starts at 11.375rem including padding and receives 25% of spare width; endpoint receives the rest. On clean pages all spare width goes to endpoint. Time, model, attribution, tokens and cost retain fixed widths. The desktop scroll wrapper is the inline-size query container; one `--request-log-min-width` token drives the desktop floor and growth calculations. Long identity labels keep an ellipsis and full tooltip when space is limited; the plan may use up to half its line rather than a fixed 80px cap. On phones the same issues cell spans the record beneath endpoint metadata; from sm it spans all three ledger tracks beneath identity and route. Hide empty issue cells on narrow layouts. Failed rows may grow to show their evidence; healthy desktop rows retain their 52px rhythm.
+
+The endpoint/transport/translation/client group is at most two lines. For translated requests, the first line reads recorded source, the existing arrows-right-left icon, then recorded destination; the second contains only protocol, client and other existing route metadata. Prefer the accounting endpoint as destination when it differs from the source, preserving special routes such as `/backend-api/codex/responses/compact`; when accounting already records the source, use the recorded `translated_endpoint`. Native routes and equal or incomplete pairs show one available recorded path, without duplicate paths or invented mappings. Give the shorter source up to half the first line and let the destination use the remaining width; both may ellipsize when constrained, with complete original strings and the translation meaning in tooltips and accessible text. Give this column spare desktop width before expanding fixed identity columns. Keep icons and the protocol badge visible and never wrap the group into a third line.
+
+On phones, the numeric column is fixed at 4.5rem so token/cache text cannot take the model's available width. Cached count and percentage remain on separate lines; model plus effort share the remaining track, and long identifiers retain their full tooltip and accessible text.
+
+Model name, separator and reasoning share one typographic line: Roboto Condensed, 12px, normal weight, 16px line height and a common text baseline. Preserve the established tones: model name uses base-content, reasoning and separator use base-content/60, and `model default` uses base-content/45. The effort and `model default` inherit the same font metrics; neither uses the smaller secondary-line size. The model swatch remains vertically centered beside the text.
+
+When there is no recorded model, render the entire `— no model` placeholder with `text-base-content/45`; it is missing metadata, not a primary model identity.
+
+Upstream name and plan follow the same first-line pairing as model and reasoning: `Sample upstream · Pro More`, with a middle dot, shared Roboto Condensed 12px normal-weight typography, 16px line height and a common baseline. Both first-line groups use a 4px gap (`gap-1`). Preserve upstream base-content and separator base-content/50 tones. The plan name uses the exact foreground color of its existing plan badge: `admin-plan-text` shares the badge's hue/saturation modifiers and light/dark foreground rules without capsule, background, border or typography changes. Unknown labels use the badge's existing generated tone; missing values use its neutral fallback. Omit the separator when either value is missing. Curated plan names use plain words without parentheses: Pro More, Pro Max and Enterprise Automation; raw provider identifiers and unknown labels stay unchanged.
+
+Model identity swatches use only the general theme palette (`info`, `success`, `secondary`, `warning`, `neutral`, `base-content`). Reserve `reset-bank` for banked resets and `admin-chart-other-models` for the chart's aggregated category; an individual model must not consume either domain token. Names, accessible text and tooltips remain the identity, and color only distinguishes neighbouring rows.
+
+Request timestamps display the complete date and time using the operator's selected format and timezone. Use the same Roboto Condensed, 12px, normal weight and 16px line height as the model name; do not apply bold. Keep the date visible, and allow longer formats to wrap within the time column instead of truncating the value. The tooltip and accessible label retain the same complete timestamp.
+
+Request user-agent labels use a local normalized brand mark when the client is recognized, rendered at 14px with a 4px gap before the existing name/version. SVG masters have a 24x24 canvas and proportional 20x20 painted bounds; render them as alpha masks using the label's neutral theme color. Preserve internal secondary opacity and negative space. The official LiteLLM train is raster: use the grayscale 32px export at 14px and invert its tones on dark surfaces, preserving its internal detail. Unknown clients retain the existing generic icon. Center the mark and text within the endpoint metadata line; truncate only the text so the mark stays visible. Missing user agents render neither label nor icon. SDK/runtime logos identify the reported SDK/runtime, never a guessed harness. Source provenance and reusable PNG sizes live in the client-logo asset catalog.
+
+Status icons reuse the shared status mapping: clock for in progress, check-circle for succeeded, x-circle for failed, shield-exclamation for rejected, no-symbol for cancelled and question-mark-circle for unknown. Each 12px icon centers against the status/latency text's cap-to-baseline box using the shared `admin-control-label` primitive on that text group. The icon is decorative (`aria-hidden`) because visible and accessible status text already names the outcome. Preserve the surrounding 16px row rhythm, status colors and 4px horizontal gap.
 
 **Status tick.** Opt in with `admin-status-tick` and put `data-tone` on the row
 (`success` / `warning` / `error` / `info`). A rounded 4px bar is painted inside
@@ -1653,10 +1711,12 @@ to the record above by a continuing tone bar and by the suppressed rule between
 them. It renders only when something actually failed.
 
 **Figures.** Measures live in right-aligned `tabular-nums` columns, with the
-qualifier under its figure — cached tokens under the total, compression under
+qualifier under its figure — cached tokens under the total, recorded cost qualifiers under
 the cost. Units and currency marks are notation, not figure: same weight as the
 number, stepped back to `text-base-content/60`. Never repeat the column heading
 in the cell (`235.3k`, not `235.3k tokens`).
+
+The request cost column uses 55px of content plus its existing 21px edge padding, contains only the recorded monetary value and does not absorb spare desktop width. Token totals align to the left within a fixed 36px slot, exactly 4px after the bar. The token column is 176px including padding, keeping the existing 122px bar width while reducing unused space. Preserve recorded values, precision, tooltip semantics and the surrounding font sizes.
 
 **The count comes with the way to move, and the pager sticks.** A record table
 draws from a set larger than a page, so it carries one nav: `Page X of Y` at the
@@ -1665,8 +1725,8 @@ the end, disabled as `btn-disabled` spans rather than removed so the control
 keeps its shape. It sits **above** the rows and is `sticky top-0 z-20` on the
 page-chrome background — fifty records is a long scroll to reach Next, and
 taller on a tablet, so a pager only at the bottom is a pager you cannot reach.
-Sticky rather than rendered twice: one tree. Request logs, audit logs and the
-jobs explorer all render it from `LogPagination`, so there is no second copy of
+Sticky rather than rendered twice: one tree. Audit logs and the
+jobs explorer render it from `LogPagination`, so there is no second copy of
 either the markup or the arithmetic. It renders only where there are rows: an
 empty result has nothing to page through, and the count it still owes a screen
 reader is the `sr-only` total above it, not a range of zero.
@@ -2016,8 +2076,8 @@ and [Observatory rules in `app.css`](assets/css/app.css).
   4. *Throughput*: tok/s value + delta.
   5. *Latency*: p50 as the value with a smaller p95 beside it, detail "Mean
      Ns · slowest settled Ns".
-  Values are `font-mono tabular-nums`; labels are [Typography](#typography) micro labels; deltas are
-  small mono figures in success/error ink.
+  Values are `tabular-nums`; labels are [Typography](#typography) micro labels; deltas are
+  small tabular figures in success/error ink.
 - **Left rail, card 2 — models**: [Compact and definition lists](#compact-and-definition-lists) ranked compact rows
   (`name | bar | tokens`), bars relative to the leader, series colors in
   fixed order primary → info → success → muted ink mixes; every row is

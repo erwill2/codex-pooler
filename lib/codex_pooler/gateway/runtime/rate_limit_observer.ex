@@ -33,25 +33,57 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
         }
 
   @spec record_headers(UpstreamIdentity.t(), Req.Response.t()) :: observer_result()
-  def record_headers(%UpstreamIdentity{} = identity, response) do
-    record_header_evidence(identity, response.headers, "rate_limit_headers", "runtime_headers")
+  @spec record_headers(UpstreamIdentity.t(), Req.Response.t(), String.t() | nil) ::
+          observer_result()
+  @spec record_headers(UpstreamIdentity.t(), Req.Response.t(), String.t() | nil, String.t() | nil) ::
+          observer_result()
+  # `denial_code` is the provider's usage-limit refusal code on a `429`, so the
+  # windows the refusal's headers carry are recorded as its denial, as the
+  # websocket frame headers are (findings#206 row 206-594).
+  def record_headers(%UpstreamIdentity{} = identity, response, dispatched_model \\ nil, denial_code \\ nil) do
+    record_header_evidence(
+      identity,
+      response.headers,
+      "rate_limit_headers",
+      "runtime_headers",
+      dispatched_model,
+      denial_code
+    )
   end
 
   @spec record_websocket_upgrade_headers(UpstreamIdentity.t() | term(), term()) ::
           observer_result()
-  def record_websocket_upgrade_headers(%UpstreamIdentity{} = identity, headers) do
+  @spec record_websocket_upgrade_headers(term(), term(), String.t() | nil) :: observer_result()
+  def record_websocket_upgrade_headers(identity, headers, dispatched_model \\ nil)
+
+  def record_websocket_upgrade_headers(%UpstreamIdentity{} = identity, headers, dispatched_model) do
     record_header_evidence(
       identity,
       headers,
       "rate_limit_websocket_upgrade_headers",
-      "runtime_websocket_upgrade_headers"
+      "runtime_websocket_upgrade_headers",
+      dispatched_model,
+      nil
     )
   end
 
-  def record_websocket_upgrade_headers(_identity, _headers), do: :ok
+  def record_websocket_upgrade_headers(_identity, _headers, _dispatched_model), do: :ok
 
-  defp record_header_evidence(%UpstreamIdentity{} = identity, headers, operation, source) do
-    case QuotaWindows.upsert_quota_windows_from_codex_headers(identity, headers) do
+  defp record_header_evidence(
+         %UpstreamIdentity{} = identity,
+         headers,
+         operation,
+         source,
+         dispatched_model,
+         denial_code
+       ) do
+    case QuotaWindows.upsert_quota_windows_from_codex_headers(
+           identity,
+           headers,
+           DateTime.utc_now(),
+           dispatched_model,
+           denial_code
+         ) do
       {:ok, windows} ->
         maybe_converge_saved_reset(identity, windows, source)
 
@@ -62,9 +94,30 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
 
   @spec record_websocket_frame_headers(UpstreamIdentity.t() | term(), map() | term()) ::
           observer_result()
-  def record_websocket_frame_headers(%UpstreamIdentity{} = identity, headers)
+  @spec record_websocket_frame_headers(term(), term(), String.t() | nil) :: observer_result()
+  @spec record_websocket_frame_headers(term(), term(), String.t() | nil, String.t() | nil) ::
+          observer_result()
+  def record_websocket_frame_headers(
+        identity,
+        headers,
+        dispatched_model \\ nil,
+        denial_code \\ nil
+      )
+
+  def record_websocket_frame_headers(
+        %UpstreamIdentity{} = identity,
+        headers,
+        dispatched_model,
+        denial_code
+      )
       when is_map(headers) and map_size(headers) > 0 do
-    case QuotaWindows.upsert_quota_windows_from_codex_headers(identity, headers) do
+    case QuotaWindows.upsert_quota_windows_from_codex_headers(
+           identity,
+           headers,
+           DateTime.utc_now(),
+           dispatched_model,
+           denial_code
+         ) do
       {:ok, windows} ->
         maybe_converge_saved_reset(identity, windows, "runtime_websocket_frame_headers")
 
@@ -73,7 +126,8 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
     end
   end
 
-  def record_websocket_frame_headers(_identity, _headers), do: :ok
+  def record_websocket_frame_headers(_identity, _headers, _dispatched_model, _denial_code),
+    do: :ok
 
   @spec event_state() :: event_state()
   def event_state, do: StreamProtocol.new_sse_block_state()
@@ -241,8 +295,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
        when is_binary(request_id) and is_binary(attempt_id) and is_integer(generation) and
               generation >= 0 do
     case {CodexPooler.Repo.get(Request, request_id), CodexPooler.Repo.get(Attempt, attempt_id)} do
-      {%Request{} = request,
-       %Attempt{request_id: ^request_id, replay_generation: ^generation} = attempt} ->
+      {%Request{} = request, %Attempt{request_id: ^request_id, replay_generation: ^generation} = attempt} ->
         {:ok, request, attempt}
 
       _missing_or_mismatched ->
@@ -341,7 +394,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   defp normalize_event_state(_state), do: event_state()
 
   defp rate_limit_error_payloads(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, %{} = decoded} ->
         [decoded, Map.get(decoded, "error")]
         |> Enum.filter(&is_map/1)
@@ -453,7 +506,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   end
 
   defp rate_limit_events_from_json(payload) do
-    case Jason.decode(payload, strings: :copy) do
+    case CodexPooler.JSON.decode(payload, strings: :copy) do
       {:ok, %{"type" => "codex.rate_limits"} = event} -> [event]
       {:ok, _decoded} -> []
       {:error, _reason} -> []

@@ -55,9 +55,7 @@ defmodule CodexPooler.Admin.Stats do
   end
 
   def build_dashboard(_scope, _filters),
-    do:
-      {:error,
-       Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
+    do: {:error, Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
 
   @spec prepare_dashboard(Scope.t(), map() | keyword()) ::
           {:ok, dashboard_preparation()} | {:error, access_error()}
@@ -74,8 +72,7 @@ defmodule CodexPooler.Admin.Stats do
        }}
     else
       {:error, %{code: code}} when code in [:capability_denied, :invalid_request] ->
-        {:error,
-         Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
+        {:error, Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
 
       {:error, _reason} = error ->
         error
@@ -83,9 +80,7 @@ defmodule CodexPooler.Admin.Stats do
   end
 
   def prepare_dashboard(_scope, _filters),
-    do:
-      {:error,
-       Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
+    do: {:error, Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
 
   @spec build_prepared_dashboard(dashboard_preparation()) :: {:ok, dashboard()}
   def build_prepared_dashboard(%{
@@ -183,9 +178,10 @@ defmodule CodexPooler.Admin.Stats do
     recent_activity = activity_summary.recent_activity
     activity_counts = activity_summary.source_counts
 
-    quota_accounts =
+    upstream_accounts =
       Quota.ReadModel.account_summaries_for_pool_ids(pool_ids, normalized.ended_at)
 
+    quota_accounts = Enum.filter(upstream_accounts, &Quota.ReadModel.current_account?/1)
     quota_summary = Quota.ReadModel.summary(quota_accounts)
     tokens = Kpis.token_kpi(settlements)
     request_kpi = Kpis.request_kpi(request_buckets)
@@ -206,7 +202,7 @@ defmodule CodexPooler.Admin.Stats do
       },
       tables: %{
         top_api_keys: Tables.top_api_keys(settlements, pools),
-        upstreams: Tables.upstream_table(settlements, quota_accounts),
+        upstreams: Tables.upstream_table(settlements, upstream_accounts),
         recent_failures: recent_failures,
         daily_rollups: Tables.daily_rollup_table(daily_rollups),
         recent_activity: recent_activity

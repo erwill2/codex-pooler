@@ -6,8 +6,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   alias CodexPooler.Pools
   alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
+  alias CodexPoolerWeb.Admin.ProviderCreditsWorkflow
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetOperationProjection
   alias CodexPoolerWeb.Admin.UpstreamAuthJsonImport
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitLive.AccountLifecycleWorkflow
@@ -16,6 +20,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   alias CodexPoolerWeb.Admin.UpstreamCockpitLive.SavedResetWorkflow
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
   alias CodexPoolerWeb.DateTimeDisplay
+
+  @saved_reset_status_interval_ms 5_000
 
   @type cockpit :: UpstreamCockpitReadModel.t()
 
@@ -51,8 +57,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         cockpit_metrics_loaded?: false,
         cockpit_metrics_loading?: true,
         cockpit_metrics_running?: false,
-        cockpit_metrics_rerun?: false
+        cockpit_metrics_rerun?: false,
+        saved_reset_status_generation: 0,
+        saved_reset_status_running: nil,
+        saved_reset_status_rerun?: false,
+        saved_reset_status_force?: false,
+        saved_reset_status_timer: nil,
+        saved_reset_status_timer_token: nil
       )
+      |> assign(ProviderCreditsWorkflow.initial_assigns())
       |> allow_upload(:auth_json,
         accept: ~w(.json),
         max_entries: 1,
@@ -61,6 +74,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         chunk_timeout: 5_000,
         auto_upload: true
       )
+      |> NotificationCenterHooks.follow_viewer_visibility()
 
     case UpstreamCockpitReadModel.load_visible_without_request_metrics(
            socket.assigns.current_scope,
@@ -78,9 +92,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   end
 
   @impl true
-  def handle_info({Events, %{topics: topics, payload: payload}}, socket) do
+  def handle_info({Events, %{topics: topics, reason: "upstream_account_provider_credits_policy_updated", payload: payload}}, socket) do
+    if "upstreams" in topics and upstream_event_in_scope?(socket, payload), do: {:noreply, request_saved_reset_status(socket)}, else: {:noreply, socket}
+  end
+
+  def handle_info({Events, %{topics: topics, payload: payload} = event}, socket) do
     if "upstreams" in topics and upstream_event_in_scope?(socket, payload) do
-      {:noreply, load_cockpit(socket)}
+      {:noreply, refresh_for_upstream_event(socket, event)}
     else
       {:noreply, socket}
     end
@@ -91,13 +109,71 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   # can overwrite this one's. The gate says so instead of guessing, and the only
   # honest answer from here is to reload.
   def handle_info(:live_updates_resumed, socket) do
-    {:noreply, load_cockpit(socket)}
+    {:noreply, request_saved_reset_status(socket)}
+  end
+
+  # A role change or a Pool granted or revoked changes which of this account's
+  # Pool assignments, request data and dialog Pools the viewer may see. The
+  # page re-reads them at once, even behind the quota observations, closes an
+  # auth.json or OAuth relink dialog that offered a Pool the viewer lost and a
+  # request it can no longer see, and leaves for the account list when the
+  # account itself is no longer visible (findings#206 row 206-410).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, %{assigns: %{cockpit: nil}} = socket), do: {:noreply, socket}
+
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    socket = invalidate_saved_reset_status(socket)
+    scope = socket.assigns.current_scope
+
+    case UpstreamCockpitReadModel.load_visible_without_request_metrics(scope, socket.assigns.cockpit.identity.id) do
+      {:ok, cockpit} ->
+        {socket, closed?} = close_lost_dialogs(socket, scope)
+
+        socket =
+          socket
+          |> assign_cockpit(preserve_request_metrics(socket, cockpit))
+          |> request_cockpit_metrics()
+
+        {:noreply, if(closed?, do: put_flash(socket, :info, "Your Pool access changed"), else: socket)}
+
+      :error ->
+        {:noreply,
+         socket
+         |> clear_inaccessible_cockpit()
+         |> put_flash(:info, "Your Pool access changed")
+         |> push_navigate(to: ~p"/admin/upstreams")}
+    end
+  end
+
+  def handle_info({:saved_reset_status_tick, token}, socket) do
+    if token == socket.assigns.saved_reset_status_timer_token do
+      socket = assign(socket, saved_reset_status_timer: nil, saved_reset_status_timer_token: nil)
+      {:noreply, socket |> request_saved_reset_status() |> schedule_saved_reset_status()}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
   def handle_info({:poll_oauth_relink_device, flow_id}, socket) do
     {:noreply, OAuthRelinkWorkflow.poll_device(socket, flow_id, &refresh_oauth_flow_state/1)}
   end
+
+  @impl true
+  def handle_event("open_quota_observations", _params, socket),
+    do: {:noreply, socket |> assign(:quota_observations_open?, true) |> schedule_saved_reset_status()}
+
+  def handle_event("close_quota_observations", _params, socket),
+    do: {:noreply, socket |> assign(:quota_observations_open?, false) |> schedule_saved_reset_status()}
+
+  def handle_event("refresh_saved_reset_status", %{"id" => identity_id}, socket) do
+    if socket.assigns.cockpit && identity_id == socket.assigns.cockpit.identity.id do
+      {:noreply, request_saved_reset_status(socket, true)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("refresh_saved_reset_status", _params, socket), do: {:noreply, socket}
 
   @impl true
   def handle_event("open_request_log", %{"request-id" => request_id}, socket) do
@@ -117,7 +193,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
 
   @impl true
   def handle_event("open_rename_account", %{"id" => identity_id}, socket) do
-    {:noreply, AccountLifecycleWorkflow.open_rename(socket, identity_id)}
+    {:noreply, socket |> ProviderCreditsWorkflow.close() |> AccountLifecycleWorkflow.open_rename(identity_id)}
   end
 
   def handle_event("cancel_rename_account", _params, socket) do
@@ -152,7 +228,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         Map.get(params, "pool-id") || Map.get(params, "pool_id") ||
           default_pool_id(socket.assigns.cockpit)
 
-      {:noreply, AuthJsonImportWorkflow.open(socket, pool_id)}
+      {:noreply, socket |> ProviderCreditsWorkflow.close() |> AuthJsonImportWorkflow.open(pool_id)}
     else
       {:noreply, put_unavailable_action_error(socket, :replace_auth_json)}
     end
@@ -175,6 +251,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
          |> AccountLifecycleWorkflow.close_delete()
          |> OAuthRelinkWorkflow.close()
          |> SavedResetWorkflow.close_redemption_confirmation()
+         |> ProviderCreditsWorkflow.close()
          |> OAuthRelinkWorkflow.open()}
 
       true ->
@@ -245,7 +322,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   end
 
   def handle_event("open_delete_account", %{"id" => identity_id}, socket) do
-    {:noreply, AccountLifecycleWorkflow.open_delete(socket, identity_id)}
+    {:noreply, socket |> ProviderCreditsWorkflow.close() |> AccountLifecycleWorkflow.open_delete(identity_id)}
   end
 
   def handle_event("cancel_delete_account", _params, socket) do
@@ -257,6 +334,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
      AccountLifecycleWorkflow.confirm_delete(socket, delete_params, fn socket ->
        redirect(socket, to: ~p"/admin/upstreams")
      end)}
+  end
+
+  def handle_event("open_provider_credits_policy", _params, socket) do
+    socket = socket |> AuthJsonImportWorkflow.close() |> OAuthRelinkWorkflow.close() |> AccountLifecycleWorkflow.close_rename() |> AccountLifecycleWorkflow.close_delete() |> SavedResetWorkflow.close_redemption_confirmation() |> load_cockpit()
+    {:noreply, ProviderCreditsWorkflow.open(socket, socket.assigns.cockpit)}
+  end
+
+  def handle_event("cancel_provider_credits_policy", _params, socket), do: {:noreply, ProviderCreditsWorkflow.close(socket)}
+
+  def handle_event("validate_provider_credits_policy", params, socket) do
+    {:noreply, ProviderCreditsWorkflow.validate(socket, Map.get(params, "provider_credits_policy"))}
+  end
+
+  def handle_event("save_provider_credits_policy", params, socket) do
+    {:noreply, ProviderCreditsWorkflow.save(socket, Map.get(params, "provider_credits_policy"), &load_cockpit/1)}
   end
 
   def handle_event("validate_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do
@@ -295,32 +387,66 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   end
 
   @impl true
+  def handle_async({:saved_reset_status, token}, {:ok, result}, socket) do
+    if socket.assigns.saved_reset_status_running == token do
+      current? = status_token_current?(socket, token)
+      socket = assign(socket, :saved_reset_status_running, nil)
+      socket = if current?, do: apply_saved_reset_status(socket, result, token), else: socket
+      {:noreply, finish_saved_reset_status(socket)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_async({:saved_reset_status, token}, {:exit, _reason}, socket) do
+    if socket.assigns.saved_reset_status_running == token do
+      socket = assign(socket, :saved_reset_status_running, nil)
+      {:noreply, finish_saved_reset_status(socket)}
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_async({:cockpit_metrics, generation}, {:ok, metrics}, socket) do
     socket = assign(socket, cockpit_metrics_running?: false)
 
-    if generation == socket.assigns.cockpit_metrics_generation do
-      {:noreply,
-       socket
-       |> assign(cockpit_metrics_loaded?: true, cockpit_metrics_loading?: false)
-       |> merge_cockpit_metrics(metrics)
-       |> maybe_restart_cockpit_metrics()}
+    if is_nil(socket.assigns.cockpit) do
+      {:noreply, socket}
     else
-      {:noreply, start_cockpit_metrics_task(socket, socket.assigns.cockpit_metrics_generation)}
+      if generation == socket.assigns.cockpit_metrics_generation do
+        {:noreply,
+         socket
+         |> assign(cockpit_metrics_loaded?: true, cockpit_metrics_loading?: false)
+         |> merge_cockpit_deferred_data(metrics)
+         |> maybe_restart_cockpit_metrics()}
+      else
+        {:noreply, start_cockpit_metrics_task(socket, socket.assigns.cockpit_metrics_generation)}
+      end
     end
   end
 
   def handle_async({:cockpit_metrics, generation}, {:exit, _reason}, socket) do
     socket = assign(socket, cockpit_metrics_running?: false)
 
-    if generation == socket.assigns.cockpit_metrics_generation do
-      {:noreply,
-       socket
-       |> assign(:cockpit_metrics_loading?, false)
-       |> put_flash(:error, "Could not refresh request metrics")
-       |> maybe_restart_cockpit_metrics()}
+    if is_nil(socket.assigns.cockpit) do
+      {:noreply, socket}
     else
-      {:noreply, start_cockpit_metrics_task(socket, socket.assigns.cockpit_metrics_generation)}
+      if generation == socket.assigns.cockpit_metrics_generation do
+        {:noreply,
+         socket
+         |> assign(:cockpit_metrics_loading?, false)
+         |> put_flash(:error, "Could not refresh request metrics")
+         |> maybe_restart_cockpit_metrics()}
+      else
+        {:noreply, start_cockpit_metrics_task(socket, socket.assigns.cockpit_metrics_generation)}
+      end
     end
+  end
+
+  @impl true
+  def terminate(_reason, socket) do
+    if socket.assigns.saved_reset_status_timer, do: Process.cancel_timer(socket.assigns.saved_reset_status_timer)
+    :ok
   end
 
   @impl true
@@ -338,9 +464,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       current_scope={@current_scope}
       active_nav={:upstreams}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <UpstreamCockpitComponents.cockpit_page
-        cockpit={@cockpit}
+        :if={@cockpit}
+        cockpit={present_saved_reset_status(assigns)}
         auth_json_form={@auth_json_form}
         auth_json_upload_limit_label={@auth_json_upload_limit_label}
         dialog_pool_options={@dialog_pool_options}
@@ -356,6 +484,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         deleting_account={@deleting_account}
         delete_account_form={@delete_account_form}
         saved_reset_policy_form={@saved_reset_policy_form}
+        editing_provider_credits_policy={@editing_provider_credits_policy}
+        provider_credits_policy_form={@provider_credits_policy_form}
         confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
         selected_request_log={@selected_request_log}
         refresh_data_message={@refresh_data_message}
@@ -372,9 +502,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   # Same scope-checked loader the request logs page uses for its drawer; the
   # admin surface includes the debug projection.
   defp load_request_log(socket, request_id) do
-    Accounting.get_request_log_for_scope(socket.assigns.current_scope, request_id,
-      surface: :admin
-    )
+    Accounting.get_request_log_for_scope(socket.assigns.current_scope, request_id, surface: :admin)
   end
 
   defp default_relink_pool(socket) do
@@ -382,6 +510,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   end
 
   defp load_cockpit(socket) do
+    socket = invalidate_saved_reset_status(socket)
+
     case UpstreamCockpitReadModel.load_visible_without_request_metrics(
            socket.assigns.current_scope,
            socket.assigns.cockpit.identity.id
@@ -393,9 +523,148 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
 
       :error ->
         socket
+        |> clear_inaccessible_cockpit()
         |> put_flash(:error, "Upstream account was not found")
         |> redirect(to: ~p"/admin/upstreams")
     end
+  end
+
+  # Status reads never request traffic metrics or contact the provider. Pool
+  # events are the fast path; a single connected timer covers missed events.
+  defp refresh_for_upstream_event(socket, event) do
+    if event.reason == "request_metrics_updated", do: load_cockpit(socket), else: request_saved_reset_status(socket)
+  end
+
+  defp request_saved_reset_status(socket, force? \\ false) do
+    cond do
+      is_nil(socket.assigns.cockpit) or not connected?(socket) ->
+        socket
+
+      not force? and LiveUpdatesHooks.paused?(socket) ->
+        LiveUpdatesHooks.hold(socket)
+
+      socket.assigns.saved_reset_status_running != nil ->
+        queue_saved_reset_status(socket, force?)
+
+      true ->
+        start_saved_reset_status(socket, force?)
+    end
+  end
+
+  defp queue_saved_reset_status(socket, force?) do
+    if force? and socket.assigns.saved_reset_status_running.force? do
+      socket
+    else
+      assign(socket,
+        saved_reset_status_generation: socket.assigns.saved_reset_status_generation + 1,
+        saved_reset_status_rerun?: true,
+        saved_reset_status_force?: socket.assigns.saved_reset_status_force? or force?
+      )
+    end
+  end
+
+  defp start_saved_reset_status(socket, force?) do
+    scope = socket.assigns.current_scope
+    identity_id = socket.assigns.cockpit.identity.id
+
+    token = %{
+      generation: socket.assigns.saved_reset_status_generation + 1,
+      scope: scope_signature(scope),
+      cursor: socket.assigns.cockpit.saved_reset_refresh_cursor,
+      force?: force?
+    }
+
+    socket
+    |> assign(saved_reset_status_generation: token.generation, saved_reset_status_running: token, saved_reset_status_rerun?: false, saved_reset_status_force?: false)
+    |> start_async({:saved_reset_status, token}, fn ->
+      UpstreamCockpitReadModel.load_visible_without_request_metrics(scope, identity_id)
+    end)
+  end
+
+  defp status_token_current?(socket, token) do
+    socket.assigns.cockpit != nil and
+      token.generation == socket.assigns.saved_reset_status_generation and
+      token.scope == scope_signature(socket.assigns.current_scope) and
+      token.cursor == socket.assigns.cockpit.saved_reset_refresh_cursor and
+      (token.force? or not LiveUpdatesHooks.paused?(socket))
+  end
+
+  defp scope_signature(scope), do: {scope.user.id, scope.roles, scope.assigned_pool_ids}
+
+  defp apply_saved_reset_status(socket, {:ok, cockpit}, token) do
+    if UpstreamAccountsReadModel.newer_saved_reset_refresh_cursor?(cockpit.saved_reset_refresh_cursor, token.cursor) do
+      assign_cockpit(socket, preserve_request_metrics(socket, cockpit))
+    else
+      socket
+    end
+  end
+
+  defp apply_saved_reset_status(socket, :error, _token) do
+    socket
+    |> clear_inaccessible_cockpit()
+    |> put_flash(:info, "Your Pool access changed")
+    |> push_navigate(to: ~p"/admin/upstreams")
+  end
+
+  defp finish_saved_reset_status(socket) do
+    socket = if socket.assigns.saved_reset_status_rerun?, do: request_saved_reset_status(socket, socket.assigns.saved_reset_status_force?), else: socket
+    schedule_saved_reset_status(socket)
+  end
+
+  defp invalidate_saved_reset_status(socket) do
+    assign(socket, saved_reset_status_generation: socket.assigns.saved_reset_status_generation + 1, saved_reset_status_rerun?: false, saved_reset_status_force?: false)
+  end
+
+  defp clear_inaccessible_cockpit(socket) do
+    socket
+    |> invalidate_saved_reset_status()
+    |> assign(cockpit: nil, confirming_saved_reset_redemption: nil, quota_observations_open?: false, selected_request_log: nil, saved_reset_policy_dirty?: false)
+    |> ProviderCreditsWorkflow.close()
+    |> cancel_saved_reset_status_timer()
+  end
+
+  defp schedule_saved_reset_status(socket) do
+    socket = if connected?(socket), do: LiveUpdatesHooks.hold(socket), else: socket
+
+    if connected?(socket) and monitor_saved_reset_status?(socket) do
+      socket = LiveUpdatesHooks.hold(socket)
+
+      if socket.assigns.saved_reset_status_timer do
+        socket
+      else
+        token = make_ref()
+        timer = Process.send_after(self(), {:saved_reset_status_tick, token}, @saved_reset_status_interval_ms)
+        assign(socket, saved_reset_status_timer: timer, saved_reset_status_timer_token: token)
+      end
+    else
+      cancel_saved_reset_status_timer(socket)
+    end
+  end
+
+  defp monitor_saved_reset_status?(socket) do
+    cockpit = socket.assigns.cockpit
+    operation = cockpit && cockpit.saved_reset_operation
+
+    cockpit != nil and
+      (socket.assigns[:quota_observations_open?] == true or
+         (is_map(operation) and (operation.active? or operation.request.state in [:queued, :processing])))
+  end
+
+  defp cancel_saved_reset_status_timer(socket) do
+    if socket.assigns.saved_reset_status_timer, do: Process.cancel_timer(socket.assigns.saved_reset_status_timer)
+    assign(socket, saved_reset_status_timer: nil, saved_reset_status_timer_token: nil)
+  end
+
+  defp present_saved_reset_status(assigns) do
+    cockpit = assigns.cockpit
+    operation = cockpit.saved_reset_operation
+
+    operation =
+      if is_map(operation) and assigns[:live_updates_paused?] == true,
+        do: SavedResetOperationProjection.observe(operation, paused?: true),
+        else: operation
+
+    cockpit |> Map.delete(:saved_reset_refresh_cursor) |> Map.put(:saved_reset_status_refreshing?, assigns.saved_reset_status_running != nil) |> Map.put(:saved_reset_operation, operation)
   end
 
   defp request_cockpit_metrics(socket) do
@@ -430,7 +699,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       cockpit_metrics_rerun?: false
     )
     |> start_async({:cockpit_metrics, generation}, fn ->
-      UpstreamCockpitReadModel.request_metrics(scope, cockpit)
+      UpstreamCockpitReadModel.deferred_request_data(scope, cockpit)
     end)
   end
 
@@ -442,21 +711,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     end
   end
 
-  defp merge_cockpit_metrics(socket, metrics) do
+  defp merge_cockpit_deferred_data(socket, data) do
     assign(
       socket,
       :cockpit,
-      UpstreamCockpitReadModel.merge_request_metrics(socket.assigns.cockpit, metrics)
+      UpstreamCockpitReadModel.merge_deferred_request_data(socket.assigns.cockpit, data)
     )
   end
 
   defp preserve_request_metrics(socket, cockpit) do
-    current = socket.assigns.cockpit.charts
-
-    UpstreamCockpitReadModel.merge_request_metrics(cockpit, %{
-      request_health: current.request_health,
-      pool_contribution: current.pool_contribution
-    })
+    UpstreamCockpitReadModel.preserve_request_data(cockpit, socket.assigns.cockpit)
   end
 
   # Event-driven cockpit reloads must not clobber policy edits in progress:
@@ -478,6 +742,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       dialog_pool_options: preserve_dialog_pool_options(socket),
       saved_reset_policy_form: preserve_policy_edits(socket, cockpit)
     )
+    |> ProviderCreditsWorkflow.refresh([cockpit])
+    |> schedule_saved_reset_status()
   end
 
   # Event-driven reloads must not rebuild the pool options feeding the
@@ -528,9 +794,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     end
   end
 
-  defp upstream_event_in_scope?(socket, payload) do
-    payload_upstream_identity_id(payload) == socket.assigns.cockpit.identity.id
-  end
+  defp upstream_event_in_scope?(%{assigns: %{cockpit: %{identity: %{id: identity_id}}}}, payload), do: payload_upstream_identity_id(payload) == identity_id
+  defp upstream_event_in_scope?(_socket, _payload), do: false
 
   defp payload_upstream_identity_id(%{"upstream_identity_id" => identity_id})
        when is_binary(identity_id),
@@ -575,6 +840,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       options -> options
     end
   end
+
+  # A dialog that offered a Pool the viewer can no longer see closes; one that
+  # only gained a Pool keeps its options, so an unsubmitted choice stays. A
+  # finished relink keeps its result on screen.
+  defp close_lost_dialogs(socket, scope) do
+    visible_pool_ids = scope |> Pools.list_visible_pools() |> MapSet.new(& &1.id)
+
+    offered_pool_lost? =
+      MapSet.size(visible_pool_ids) == 0 or
+        Enum.any?(socket.assigns.dialog_pool_options, fn {_name, pool_id} -> pool_id != "" and not MapSet.member?(visible_pool_ids, pool_id) end)
+
+    confirmation_pool = socket.assigns.confirming_saved_reset_redemption && socket.assigns.confirming_saved_reset_redemption.pool_id
+    confirmation_lost? = is_binary(confirmation_pool) and not MapSet.member?(visible_pool_ids, confirmation_pool)
+
+    request_lost? = match?(%{id: _id}, socket.assigns.selected_request_log) and is_nil(load_request_log(socket, socket.assigns.selected_request_log.id))
+
+    {socket, false}
+    |> close_if(socket.assigns.importing_auth_json and offered_pool_lost?, &AuthJsonImportWorkflow.close/1)
+    |> close_if(socket.assigns.oauth_relinking and is_nil(socket.assigns.oauth_relink_result) and offered_pool_lost?, &OAuthRelinkWorkflow.close/1)
+    |> close_if(confirmation_lost?, &SavedResetWorkflow.close_redemption_confirmation/1)
+    |> close_if(request_lost?, &assign(&1, :selected_request_log, nil))
+  end
+
+  defp close_if({socket, _closed?}, true, close), do: {close.(socket), true}
+  defp close_if({socket, closed?}, false, _close), do: {socket, closed?}
 
   defp default_pool_id(%{assignments: %{items: [%{pool_id: pool_id} | _items]}}), do: pool_id
   defp default_pool_id(_cockpit), do: nil

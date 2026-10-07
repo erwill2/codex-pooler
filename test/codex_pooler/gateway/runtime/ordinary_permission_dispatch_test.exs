@@ -16,6 +16,7 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
   alias CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
+  alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Service
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
@@ -25,6 +26,85 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
 
   @endpoint_path "/backend-api/codex/responses"
+
+  test "fresh permission keeps consecutive requests routable after percent-only response headers",
+       %{conn: conn} do
+    usage = usage_payload(:weekly_primary)
+    {upstream, setup} = reconciled_setup(usage)
+    reset_at = get_in(usage, ["rate_limit", "primary_window", "reset_at"])
+
+    {:path_json, usage_routes} = routes(usage)
+
+    FakeUpstream.set_mode(
+      upstream,
+      {:path_json,
+       Map.put(
+         usage_routes,
+         @endpoint_path,
+         FakeUpstream.json_response_with_headers(
+           %{"id" => "resp_permission_headers", "object" => "response", "output" => []},
+           [
+             {"x-codex-secondary-used-percent", "100"},
+             {"x-codex-secondary-window-minutes", "10080"},
+             {"x-codex-secondary-reset-at", Integer.to_string(reset_at)}
+           ]
+         )
+       )}
+    )
+
+    assert dispatch(conn, setup).status == 200
+    assert generation_count(upstream) == 1
+    identity = Repo.reload!(setup.identity)
+    assert {:ok, %{state: :available}} = AccountAvailabilityStore.load(identity.metadata)
+    assert dispatch(Phoenix.ConnTest.build_conn(), setup).status == 200
+    assert generation_count(upstream) == 2
+    assert Repo.aggregate(Attempt, :count) == 2
+
+    FakeUpstream.set_mode(upstream, routes(denied_payload(:denied)))
+
+    assert {:ok, _} =
+             PoolReconciliation.refresh_quota_from_usage(
+               Repo.reload!(setup.identity),
+               setup.assignment
+             )
+
+    assert_usage_limit!(dispatch(Phoenix.ConnTest.build_conn(), setup), 604_800)
+    assert generation_count(upstream) == 2
+    assert Repo.aggregate(Attempt, :count) == 2
+  end
+
+  test "percent-only stream events preserve permission for the next dispatch" do
+    usage = usage_payload(:weekly_primary)
+    {upstream, setup} = reconciled_setup(usage)
+
+    event = %{
+      "type" => "codex.rate_limits",
+      "rate_limits" => %{
+        "secondary" => %{
+          "used_percent" => 100,
+          "window_minutes" => 10_080,
+          "reset_at" => get_in(usage, ["rate_limit", "primary_window", "reset_at"])
+        }
+      }
+    }
+
+    state = RateLimitObserver.event_state()
+
+    assert {:ok, state} =
+             RateLimitObserver.collect_events(
+               "data: " <> CodexPooler.JSON.encode!(event) <> "\n\n",
+               state
+             )
+
+    assert :ok =
+             RateLimitObserver.commit_events(
+               Repo.reload!(setup.identity),
+               state
+             )
+
+    assert dispatch(Phoenix.ConnTest.build_conn(), setup).status == 200
+    assert generation_count(upstream) == 1
+  end
 
   for shape <- [:weekly_primary, :five_hour_and_weekly] do
     test "full affirmative #{shape} usage at 100 percent reaches the provider" do
@@ -91,15 +171,30 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
     end
   end
 
-  for denial <- [:denied, :spend_control, :conflicting_flags, :malformed_flags] do
+  for denial <- [:denied, :conflicting_flags, :malformed_flags] do
     test "#{denial} usage never permits exhausted account dispatch", %{conn: conn} do
       payload = denied_payload(unquote(denial))
       {upstream, setup} = reconciled_setup(payload)
       conn = dispatch(conn, setup)
-      assert conn.status == 503
+      assert_usage_limit!(conn, 604_800)
       assert generation_count(upstream) == 0
       assert Repo.aggregate(Attempt, :count) == 0
     end
+  end
+
+  test "reached spend control does not block affirmative included quota", %{conn: conn} do
+    payload = spend_control_limited_payload()
+    {upstream, setup} = reconciled_setup(payload)
+
+    assert {:ok, %{state: :available}} =
+             setup.identity
+             |> Repo.reload!()
+             |> Map.fetch!(:metadata)
+             |> AccountAvailabilityStore.load()
+
+    assert dispatch(conn, setup).status == 200
+    assert generation_count(upstream) == 1
+    assert Repo.aggregate(Attempt, :count) == 1
   end
 
   test "affirmative account permission does not bypass an exhausted model meter", %{conn: conn} do
@@ -124,7 +219,7 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
         upstream_model_id: "gpt-5.3-codex-spark"
       )
 
-    assert dispatch(conn, setup).status == 503
+    assert_usage_limit!(dispatch(conn, setup), 604_800)
     assert generation_count(upstream) == 0
     assert Repo.aggregate(Attempt, :count) == 0
   end
@@ -178,7 +273,7 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
     |> Ecto.Changeset.change(allowed_model_identifiers: ["sample-other-model"])
     |> Repo.update!()
 
-    assert dispatch(conn, setup).status == 403
+    assert dispatch(conn, setup).status == 400
     assert generation_count(upstream) == 0
     assert Repo.aggregate(Attempt, :count) == 0
   end
@@ -188,20 +283,25 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
     owner = Repo.get!(User, setup.api_key.created_by_user_id)
     scope = Scope.for_user(owner, ["instance_owner"])
 
+    # Another in-flight request of the key exhausts the daily window the
+    # request would fit on its own (findings#206 row 206-448).
+    holder = CodexPooler.AccountingTestSupport.hold_key_reservation!(setup.authorization, setup.model, 10_000)
+
     assert {:ok, _updated} =
              Access.update_api_key_with_policy(scope, setup.api_key, %{
-               default_policy: %{max_tokens_per_day: 1}
+               default_policy: %{max_tokens_per_day: 10_000}
              })
 
     assert {:ok, _auth} = Access.authenticate_authorization_header(setup.authorization)
     conn = dispatch(conn, setup)
-    assert conn.status == 403
+    assert conn.status == 429
 
     assert %{"error" => %{"code" => "api_key_policy_limit_exceeded"}} =
-             Jason.decode!(conn.resp_body)
+             CodexPooler.JSON.decode!(conn.resp_body)
 
     assert generation_count(upstream) == 0
     assert Repo.aggregate(Attempt, :count) == 0
+    CodexPooler.AccountingTestSupport.release_key_reservation!(holder)
   end
 
   test "affirmative usage does not bypass upstream reauthentication", %{conn: conn} do
@@ -233,9 +333,7 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
     }
 
     setup.identity
-    |> Ecto.Changeset.change(
-      metadata: Map.put(setup.identity.metadata, "saved_reset_redemption", redemption)
-    )
+    |> Ecto.Changeset.change(metadata: Map.put(setup.identity.metadata, "saved_reset_redemption", redemption))
     |> Repo.update!()
 
     assert dispatch(conn, setup).status == 503
@@ -328,9 +426,7 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
 
     identity =
       setup.identity
-      |> Ecto.Changeset.change(
-        metadata: Map.put(setup.identity.metadata, "usage_base_url", FakeUpstream.url(upstream))
-      )
+      |> Ecto.Changeset.change(metadata: Map.put(setup.identity.metadata, "usage_base_url", FakeUpstream.url(upstream)))
       |> Repo.update!()
 
     assert {:ok, identity} =
@@ -346,6 +442,23 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
     payload = %{"model" => setup.model.exposed_model_id, "input" => []}
     options = RequestOptions.build(%{api_key_policy: policy}, @endpoint_path, payload)
     {auth, payload, options}
+  end
+
+  # Every candidate excluded for quota with a reset still ahead answers the
+  # provider's terminal usage limit with the soonest reset (findings#206 row
+  # 206-508): a model meter the provider refused advises its 5-hour reset, an
+  # account the Usage API reports blocked advises its exhausted window's.
+  defp assert_usage_limit!(conn, expected_seconds) do
+    assert conn.status == 429
+
+    assert %{"error" => %{"type" => "usage_limit_reached", "code" => "quota_exhausted", "resets_at" => resets_at, "resets_in_seconds" => seconds}} =
+             CodexPooler.JSON.decode!(conn.resp_body)
+
+    assert is_integer(resets_at)
+    assert seconds in (expected_seconds - 5)..expected_seconds
+    assert get_resp_header(conn, "retry-after") == [Integer.to_string(seconds)]
+    assert get_resp_header(conn, "x-should-retry") == ["false"]
+    conn
   end
 
   defp dispatch(conn, setup) do
@@ -365,8 +478,7 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
        "/backend-api/codex/usage" => {200, usage},
        "/wham/usage" => {200, usage},
        "/backend-api/wham/usage" => {200, usage},
-       @endpoint_path =>
-         {200, %{"id" => "resp_permission_fixture", "object" => "response", "output" => []}}
+       @endpoint_path => {200, %{"id" => "resp_permission_fixture", "object" => "response", "output" => []}}
      }}
   end
 
@@ -391,14 +503,14 @@ defmodule CodexPooler.Gateway.Runtime.OrdinaryPermissionDispatchTest do
     |> put_in(["rate_limit", "limit_reached"], true)
   end
 
-  defp denied_payload(:spend_control),
-    do: Map.put(usage_payload(:weekly_primary), "spend_control", %{"reached" => true})
-
   defp denied_payload(:conflicting_flags),
     do: put_in(usage_payload(:weekly_primary), ["rate_limit", "limit_reached"], true)
 
   defp denied_payload(:malformed_flags),
     do: put_in(usage_payload(:weekly_primary), ["rate_limit", "allowed"], "true")
+
+  defp spend_control_limited_payload,
+    do: Map.put(usage_payload(:weekly_primary), "spend_control", %{"reached" => true})
 
   defp window(seconds) do
     %{

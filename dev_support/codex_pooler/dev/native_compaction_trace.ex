@@ -9,8 +9,8 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
 
   use GenServer
 
-  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace, as: TraceEvent
   alias CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace, as: TraceEvent
 
   @name __MODULE__
   @handler_id "codex-pooler-native-compaction-run-trace"
@@ -35,12 +35,10 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :ordinary_success, 1},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :arm_compact, 2},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :reserve, 5},
-    {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :mark_accounting_started,
-     3},
+    {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :mark_accounting_started, 3},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :consume, 3},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :cancel, 4},
-    {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission,
-     :record_compact_collected, 1},
+    {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :record_compact_collected, 1},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :confirm_compact, 4},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :clear_consumed, 1},
     {CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission, :clear, 1}
@@ -124,11 +122,8 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
   @doc false
   @spec validate_full_limits(keyword()) :: :ok | {:error, map()}
   def validate_full_limits(opts) when is_list(opts) do
-    with :ok <-
-           validate_optional_limit(opts, :max_events, @min_full_max_events, @max_full_max_events),
-         :ok <-
-           validate_optional_limit(opts, :max_bytes, @min_full_max_bytes, @max_full_max_bytes) do
-      :ok
+    with :ok <- validate_optional_limit(opts, :max_events, @min_full_max_events, @max_full_max_events) do
+      validate_optional_limit(opts, :max_bytes, @min_full_max_bytes, @max_full_max_bytes)
     end
   end
 
@@ -160,8 +155,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
            {:ok, pid} <-
              GenServer.start(
                __MODULE__,
-               {run_fingerprint, generation, sensitivity_authorization, restorer, limit, mode,
-                trace_plan, opts},
+               {run_fingerprint, generation, sensitivity_authorization, restorer, limit, mode, trace_plan, opts},
                name: @name
              ),
            :ok <-
@@ -276,10 +270,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
   def handle_event(_event, _measurements, _metadata, _generation), do: :ok
 
   @impl true
-  def init(
-        {run_fingerprint, generation, sensitivity_authorization, restorer, limit, mode,
-         trace_plan, opts}
-      ) do
+  def init({run_fingerprint, generation, sensitivity_authorization, restorer, limit, mode, trace_plan, opts}) do
     with {:ok, file} <- open_output(mode, run_fingerprint, Keyword.get(opts, :root)) do
       now_system = System.system_time(:microsecond)
       now_mono = System.monotonic_time(:microsecond)
@@ -494,44 +485,9 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
          )}
 
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
-    cond do
-      state.sensitivity_restorer == pid and state.sensitivity_restorer_monitor == monitor ->
-        :ok = TraceEvent.deactivate_sensitivity_control()
-
-        Enum.each(state.traced, fn {target, %{role: role}} ->
-          if Process.alive?(target) and
-               role in [:response_task, :owner_session, :upstream_session] do
-            send(
-              target,
-              {:native_compaction_trace_sensitivity, :restore, state.generation,
-               state.sensitivity_authorization, pid}
-            )
-          end
-        end)
-
-        Process.send_after(self(), :sensitivity_fail_safe, @sensitivity_fail_safe_ms)
-
-        {:noreply,
-         %{
-           state
-           | sensitivity_restorer: nil,
-             sensitivity_restorer_monitor: nil,
-             sensitivity_restorer_failed: true
-         }}
-
-      true ->
-        case state.traced do
-          %{^pid => %{monitor: ^monitor, role: role}} ->
-            status = Map.put(state.sensitivity_status, inspect(pid), %{role: role, state: :dead})
-            next = %{state | traced: Map.delete(state.traced, pid), sensitivity_status: status}
-
-            {:noreply,
-             append(next, :beam_process_down, %{pid: pid, pid_role: role, reason: reason}, :beam)}
-
-          _unknown ->
-            {:noreply, state}
-        end
-    end
+    if state.sensitivity_restorer == pid and state.sensitivity_restorer_monitor == monitor,
+      do: sensitivity_restorer_down(state, pid),
+      else: traced_process_down(state, monitor, pid, reason)
   end
 
   def handle_info({:trace_delivered, pid, reference}, state) do
@@ -628,6 +584,39 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
     :ok
   end
 
+  defp sensitivity_restorer_down(state, restorer) do
+    :ok = TraceEvent.deactivate_sensitivity_control()
+    Enum.each(state.traced, &request_sensitivity_restore(&1, state, restorer))
+    Process.send_after(self(), :sensitivity_fail_safe, @sensitivity_fail_safe_ms)
+
+    {:noreply,
+     %{
+       state
+       | sensitivity_restorer: nil,
+         sensitivity_restorer_monitor: nil,
+         sensitivity_restorer_failed: true
+     }}
+  end
+
+  defp request_sensitivity_restore({target, %{role: role}}, state, restorer) do
+    if Process.alive?(target) and role in [:response_task, :owner_session, :upstream_session] do
+      send(target, {:native_compaction_trace_sensitivity, :restore, state.generation, state.sensitivity_authorization, restorer})
+    end
+  end
+
+  defp traced_process_down(state, monitor, pid, reason) do
+    case state.traced do
+      %{^pid => %{monitor: ^monitor, role: role}} ->
+        status = Map.put(state.sensitivity_status, inspect(pid), %{role: role, state: :dead})
+        next = %{state | traced: Map.delete(state.traced, pid), sensitivity_status: status}
+
+        {:noreply, append(next, :beam_process_down, %{pid: pid, pid_role: role, reason: reason}, :beam)}
+
+      _unknown ->
+        {:noreply, state}
+    end
+  end
+
   defp attach(generation, trace_plan) do
     :telemetry.detach(@handler_id)
 
@@ -697,7 +686,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
   defp maybe_write_full_entry(%{truncated: true} = state, _entry), do: state
 
   defp maybe_write_full_entry(state, entry) do
-    encoded = [Jason.encode!(entry), "\n"]
+    encoded = [CodexPooler.JSON.encode!(entry), "\n"]
     bytes = IO.iodata_length(encoded)
 
     cond do
@@ -736,7 +725,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
       }
     }
 
-    encoded = [Jason.encode!(entry), "\n"]
+    encoded = [CodexPooler.JSON.encode!(entry), "\n"]
     :ok = IO.binwrite(state.file.io, encoded)
 
     %{
@@ -856,8 +845,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
     if cooperative_genserver?(pid) do
       GenServer.call(
         pid,
-        {:native_compaction_trace_sensitivity, :observe, state.generation,
-         state.sensitivity_authorization, state.sensitivity_restorer},
+        {:native_compaction_trace_sensitivity, :observe, state.generation, state.sensitivity_authorization, state.sensitivity_restorer},
         5_000
       )
     else
@@ -1090,8 +1078,8 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
   defp textual_frame_key?(_key), do: false
 
   defp redact_frame_text(value) do
-    case Jason.decode(value) do
-      {:ok, decoded} -> Jason.encode!(redact(decoded))
+    case CodexPooler.JSON.decode(value) do
+      {:ok, decoded} -> CodexPooler.JSON.encode!(redact(decoded))
       {:error, _reason} -> redact_non_json_text(value)
     end
   end
@@ -1202,7 +1190,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace do
       "fields" => encode_term(redact_secrets(fields))
     }
 
-    encoded = [Jason.encode!(entry), "\n"]
+    encoded = [CodexPooler.JSON.encode!(entry), "\n"]
     :ok = IO.binwrite(state.file.io, encoded)
 
     %{

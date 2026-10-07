@@ -18,6 +18,8 @@ defmodule CodexPooler.JobsTest do
     CatalogSyncWorker,
     DailyRollupRebuildEnqueueWorker,
     DailyRollupRebuildWorker,
+    OpenAIStatusCleanupWorker,
+    OpenAIStatusSyncWorker,
     PricingImportWorker,
     RequestReplayCleanupWorker,
     RuntimeStateCleanupWorker,
@@ -52,9 +54,11 @@ defmodule CodexPooler.JobsTest do
                {"* * * * *", AccountReconciliationEnqueueWorker},
                {"*/5 * * * *", AlertEvaluationEnqueueWorker},
                {"*/15 * * * *", TokenRefreshEnqueueWorker},
-               {"17 0 * * *", DailyRollupRebuildEnqueueWorker},
+               {"17 * * * *", DailyRollupRebuildEnqueueWorker},
                {"*/15 * * * *", RuntimeStateCleanupWorker},
-               {"* * * * *", RequestReplayCleanupWorker}
+               {"* * * * *", RequestReplayCleanupWorker},
+               {"*/5 * * * *", OpenAIStatusSyncWorker},
+               {"0 0 * * *", OpenAIStatusCleanupWorker}
              ]
 
       worker_groups = Schedule.worker_groups()
@@ -164,6 +168,11 @@ defmodule CodexPooler.JobsTest do
 
       assert worker_max_attempts(RuntimeStateCleanupWorker, %{}) == 3
       assert RuntimeStateCleanupWorker.timeout(%Oban.Job{}) == :timer.minutes(5)
+
+      assert worker_max_attempts(OpenAIStatusSyncWorker, %{}) == 3
+      assert OpenAIStatusSyncWorker.timeout(%Oban.Job{}) == :timer.seconds(30)
+      assert worker_max_attempts(OpenAIStatusCleanupWorker, %{}) == 3
+      assert OpenAIStatusCleanupWorker.timeout(%Oban.Job{}) == :timer.seconds(30)
     end
   end
 
@@ -587,8 +596,8 @@ defmodule CodexPooler.JobsTest do
       assert rollup.total_tokens == 17
     end
 
-    test "returns a tagged error for non-binary rollup dates" do
-      assert {:error, :invalid_rollup_date} =
+    test "cancels non-binary rollup dates" do
+      assert {:cancel, :invalid_rollup_date} =
                perform_job(DailyRollupRebuildWorker, %{"rollup_date" => nil})
     end
   end
@@ -730,7 +739,6 @@ defmodule CodexPooler.JobsTest do
       discovered_model_count: 0,
       upserted_model_count: 0,
       stale_marked_count: 0,
-      retired_count: 0,
       stats: %{}
     })
     |> Repo.insert!()

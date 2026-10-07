@@ -3,10 +3,13 @@ defmodule CodexPooler.Accounting.Metadata do
 
   import Ecto.Query
 
+  alias CodexPooler.Accounting.NativeContentFilterRetry
+  alias CodexPooler.Accounting.NativeReplayClaim
+  alias CodexPooler.Accounting.NativeResampledCompletion
   alias CodexPooler.Accounting.{Request, RequestLogFacts}
   alias CodexPooler.Events
-  alias CodexPooler.Gateway.RequestCompression.Metadata, as: RequestCompressionMetadata
   alias CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
@@ -17,6 +20,9 @@ defmodule CodexPooler.Accounting.Metadata do
   @redacted "[REDACTED]"
   @sensitive_key_fragments ~w(api_key apikey authorization bearer token access_token refresh_token upstream_token upstream_secret cookie set-cookie secret password prompt messages input output completion content raw_request raw_response body payload file filename audio image transcript transcription upload_url download_url sas_url signed_url auth_json chatgpt_account_id)
   @public_openai_responses_stream_modes ~w(normalized passthrough)
+  # Mirrors CodexPooler.Accounting.ClientRetry.authority_poison_reasons/0; the
+  # agreement is pinned by metadata_test.exs so the two never drift apart.
+  @native_client_retry_authority_lost_reasons ~w(malformed_event unknown_completed_item unknown_response_event)
   @public_openai_responses_stream_terminal_values ~w(completed failed incomplete)
   @public_openai_responses_stream_boolean_keys ~w(
     created_seen
@@ -61,12 +67,19 @@ defmodule CodexPooler.Accounting.Metadata do
                         ])
   @safe_sensitive_exact_keys MapSet.new([
                                "api_key_id",
-                               "payload_compression",
                                "reservation_snapshot_inputs",
                                "token_refresh_reason_code_preview"
                              ])
 
-  @type accounting_error :: %{required(:code) => atom(), required(:message) => String.t()}
+  @type accounting_error :: %{
+          required(:code) => atom(),
+          required(:message) => String.t(),
+          optional(:limit_scope) => :window | :request,
+          optional(:retry_after_seconds) => pos_integer(),
+          optional(:resend_disposition) => atom(),
+          optional(:mailbox_check) => CodexPooler.Accounting.ClientRetry.mailbox_stage(),
+          optional(:resample_check) => CodexPooler.Accounting.NativeResampledCompletion.result()
+        }
   @type request_result_row :: %{required(:request) => Request.t(), optional(atom()) => term()}
   @type request_result :: {:ok, request_result_row()} | {:error, accounting_error()}
 
@@ -90,11 +103,9 @@ defmodule CodexPooler.Accounting.Metadata do
           status: status,
           usage_status: @usage_not_applicable,
           correlation_id: attr(attrs, :correlation_id) || Ecto.UUID.generate(),
-          idempotency_key: nil,
           client_ip: blank_to_nil(attr(attrs, :client_ip)),
           user_agent: blank_to_nil(attr(attrs, :user_agent)),
-          request_metadata:
-            metadata_request_metadata(auth, attr(attrs, :request_metadata) || %{}),
+          request_metadata: metadata_request_metadata(auth, attr(attrs, :request_metadata) || %{}),
           admitted_at: timestamp,
           completed_at: timestamp,
           response_status_code: attr(attrs, :response_status_code),
@@ -105,7 +116,7 @@ defmodule CodexPooler.Accounting.Metadata do
           upstream_account_plan_label: metadata_identity_plan_label(attrs),
           upstream_account_plan_family: metadata_identity_plan_family(attrs)
         }
-        |> Repo.insert!()
+        |> insert_metadata_request!()
 
       RequestLogFacts.record_request_created!(request)
 
@@ -116,8 +127,22 @@ defmodule CodexPooler.Accounting.Metadata do
   end
 
   def record_metadata_request(_auth, _attrs),
-    do:
-      {:error, accounting_error(:invalid_request, "authenticated pool and api key are required")}
+    do: {:error, accounting_error(:invalid_request, "authenticated pool and api key are required")}
+
+  # Metadata rows record separate operations, not idempotent turn claims. A
+  # websocket handshake or caller correlation can name several acknowledgements.
+  # Keep the original row intact and assign only the colliding operation a new id.
+  defp insert_metadata_request!(%Request{} = request) do
+    changeset =
+      request
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.unique_constraint(:correlation_id, name: :requests_correlation_id_uq)
+
+    case Repo.insert(changeset, mode: :savepoint) do
+      {:ok, inserted} -> inserted
+      {:error, %Ecto.Changeset{}} -> Repo.insert!(%{request | correlation_id: Ecto.UUID.generate()})
+    end
+  end
 
   @spec record_upstream_identity_metadata_request(UpstreamIdentity.t(), map()) :: request_result()
   def record_upstream_identity_metadata_request(identity, attrs \\ %{})
@@ -175,6 +200,49 @@ defmodule CodexPooler.Accounting.Metadata do
 
   def merge_request_metadata(_request, _metadata, _opts), do: {:error, :invalid_request}
 
+  # A provider-declared model identifier is bounded, never erased: a plain
+  # ASCII identifier of at most 80 bytes stays cleartext, the shape every
+  # catalog model id has, and anything else records a 12-character SHA-256
+  # fingerprint so the declaration survives without persisting its content.
+  @model_identifier_max_bytes 80
+  @model_identifier_pattern ~r/\A[A-Za-z0-9][A-Za-z0-9_.:\/-]*\z/
+
+  @spec bounded_model_identifier(term()) :: String.t() | nil
+  def bounded_model_identifier(value),
+    do: bounded_string(value, @model_identifier_pattern, @model_identifier_max_bytes)
+
+  # The one rule for every provider-controlled string that is persisted or
+  # promoted to a code (findings#238): a trimmed value that matches the
+  # caller's pattern within the caller's byte length stays cleartext,
+  # anything else becomes a 12-character SHA-256 fingerprint, and a blank or
+  # non-binary value is absent. The fact is never erased and a value outside
+  # its pattern is never stored verbatim; the caller chooses the pattern and
+  # length for its value class.
+  @bounded_string_fingerprint_length 12
+
+  @spec bounded_string(term(), Regex.t(), pos_integer()) :: String.t() | nil
+  def bounded_string(value, %Regex{} = pattern, max_bytes)
+      when is_binary(value) and is_integer(max_bytes) and max_bytes > 0 do
+    case String.trim(value) do
+      "" ->
+        nil
+
+      trimmed ->
+        if byte_size(trimmed) <= max_bytes and Regex.match?(pattern, trimmed),
+          do: :binary.copy(trimmed),
+          else: bounded_string_fingerprint(trimmed)
+    end
+  end
+
+  def bounded_string(_value, _pattern, _max_bytes), do: nil
+
+  defp bounded_string_fingerprint(value) do
+    "sha256_" <>
+      (:crypto.hash(:sha256, value)
+       |> Base.encode16(case: :lower)
+       |> String.slice(0, @bounded_string_fingerprint_length))
+  end
+
   @spec sanitize_metadata(term()) :: term()
   def sanitize_metadata(value), do: sanitize_value(value, nil)
 
@@ -198,11 +266,9 @@ defmodule CodexPooler.Accounting.Metadata do
           status: status,
           usage_status: @usage_not_applicable,
           correlation_id: attr(attrs, :correlation_id) || Ecto.UUID.generate(),
-          idempotency_key: nil,
           client_ip: blank_to_nil(attr(attrs, :client_ip)),
           user_agent: blank_to_nil(attr(attrs, :user_agent)),
-          request_metadata:
-            identity_metadata_request_metadata(identity, attr(attrs, :request_metadata) || %{}),
+          request_metadata: identity_metadata_request_metadata(identity, attr(attrs, :request_metadata) || %{}),
           admitted_at: timestamp,
           completed_at: timestamp,
           response_status_code: attr(attrs, :response_status_code),
@@ -333,20 +399,50 @@ defmodule CodexPooler.Accounting.Metadata do
   defp sanitize_value(value, key) when key in [:usage_observation, "usage_observation"],
     do: sanitize_usage_observation(value)
 
+  defp sanitize_value(value, key) when key in [:native_content_filter_terminal, "native_content_filter_terminal"],
+    do: NativeContentFilterRetry.sanitize_terminal(value)
+
+  defp sanitize_value(value, key) when key in [:native_content_filter_original, "native_content_filter_original"],
+    do: NativeContentFilterRetry.sanitize_original(value)
+
+  defp sanitize_value(value, key) when key in [:native_replay_claim, "native_replay_claim"],
+    do: NativeReplayClaim.sanitize(value)
+
+  defp sanitize_value(value, key) when key in [:native_content_filter_source, "native_content_filter_source", :native_content_filter_binding, "native_content_filter_binding"],
+    do: NativeContentFilterRetry.sanitize_source(value)
+
+  defp sanitize_value(value, key) when key in [:native_content_filter_pin, "native_content_filter_pin"],
+    do: NativeContentFilterRetry.sanitize_pin(value)
+
   # Reason: metadata dispatch deliberately preserves separate safe projections.
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp sanitize_value(value, key) when is_map(value) do
     normalized = normalize_key(key)
 
     cond do
-      normalized == "payload_compression" ->
-        sanitize_payload_compression_map(value)
-
       normalized == "public_openai_responses_stream" ->
         sanitize_public_openai_responses_stream_map(value)
 
       normalized == "native_client_retry_observation" ->
         sanitize_native_client_retry_observation(value)
+
+      normalized == "native_client_retry_authority_loss" ->
+        sanitize_native_client_retry_authority_loss(value)
+
+      normalized == "native_http_resume_progress" ->
+        sanitize_native_http_resume_progress(value)
+
+      normalized == "native_http_mailbox_prefix" ->
+        sanitize_native_http_mailbox_prefix(value)
+
+      normalized == "native_http_turn_progress" ->
+        sanitize_native_http_turn_progress(value)
+
+      normalized == "native_http_input_witness" ->
+        NativeResampledCompletion.sanitize_input_witness(value)
+
+      normalized == "native_turn_progress" ->
+        sanitize_native_http_turn_progress(value)
 
       normalized == "transport_failure" ->
         sanitize_transport_failure_map(value)
@@ -356,6 +452,9 @@ defmodule CodexPooler.Accounting.Metadata do
 
       normalized == "routing" ->
         sanitize_routing_map(value)
+
+      normalized == "websocket_frame_headers" ->
+        sanitize_websocket_frame_headers_map(value)
 
       sensitive_key?(normalized) ->
         @redacted
@@ -388,6 +487,33 @@ defmodule CodexPooler.Accounting.Metadata do
   defp sanitize_value(value, key) do
     if public_openai_responses_stream_key?(key), do: %{}, else: value
   end
+
+  # Frame-carried headers are name-allowlisted when the frame is read
+  # (`StreamProtocol.websocket_error_frame_header_allowed?/1`) and
+  # value-bounded when persisted, so an allowlisted name keeps its value even
+  # when the name carries a redaction fragment (`x-ratelimit-*-tokens`), the
+  # way `content_type` is exempt from key redaction. Any other name under the
+  # map, and every value, still takes the ordinary rules (findings#238).
+  defp sanitize_websocket_frame_headers_map(value) do
+    Enum.reduce(value, %{}, fn {child_key, child_value}, sanitized ->
+      Map.put(sanitized, child_key, sanitize_frame_header_value(child_key, child_value))
+    end)
+  end
+
+  defp sanitize_frame_header_value(name, value) when is_binary(value) do
+    cond do
+      not StreamProtocol.websocket_error_frame_header_allowed?(to_string(name)) ->
+        sanitize_value(value, name)
+
+      sensitive_binary?(value) ->
+        @redacted
+
+      true ->
+        value
+    end
+  end
+
+  defp sanitize_frame_header_value(name, value), do: sanitize_value(value, name)
 
   defp sanitize_map(value) do
     Enum.reduce(value, %{}, fn
@@ -422,9 +548,6 @@ defmodule CodexPooler.Accounting.Metadata do
 
   defp sanitize_usage_observation(_value), do: %{}
 
-  defp sanitize_payload_compression_map(value) when is_map(value),
-    do: RequestCompressionMetadata.sanitize_map(value)
-
   defp sanitize_transport_failure_map(value) do
     Enum.reduce(value, %{}, fn
       {"peer_close_code", child_value}, sanitized
@@ -456,9 +579,7 @@ defmodule CodexPooler.Accounting.Metadata do
 
   defp sanitize_native_client_retry_observation(value) do
     value
-    |> Map.take(
-      ~w(version authority_complete output_item_done_count output_item_done_count_saturated partial_reasoning_seen first_visible_at terminal_seen terminal_candidate_seen)
-    )
+    |> Map.take(~w(version authority_complete output_item_done_count output_item_done_count_saturated partial_reasoning_seen first_visible_at terminal_seen terminal_candidate_seen))
     |> Enum.reduce(%{}, fn
       {"version", 1}, sanitized ->
         Map.put(sanitized, "version", 1)
@@ -472,6 +593,9 @@ defmodule CodexPooler.Accounting.Metadata do
              is_boolean(value) ->
         Map.put(sanitized, key, value)
 
+      {"first_visible_at", nil}, sanitized ->
+        Map.put(sanitized, "first_visible_at", nil)
+
       {"first_visible_at", value}, sanitized when is_binary(value) ->
         case DateTime.from_iso8601(value) do
           {:ok, _timestamp, 0} -> Map.put(sanitized, "first_visible_at", value)
@@ -482,6 +606,76 @@ defmodule CodexPooler.Accounting.Metadata do
         sanitized
     end)
   end
+
+  # The bounded reason a native client-retry observation lost its authority.
+  # It is never an admission witness, so the shape is fixed at exactly the
+  # version and one known reason; anything else is dropped whole.
+  defp sanitize_native_client_retry_authority_loss(%{"version" => 1, "authority_lost_reason" => reason} = value)
+       when map_size(value) == 2 and reason in @native_client_retry_authority_lost_reasons,
+       do: value
+
+  defp sanitize_native_client_retry_authority_loss(_value), do: %{}
+
+  defp sanitize_native_http_resume_progress(
+         %{
+           "version" => 1,
+           "output_item_done_count" => count,
+           "digest" => digest
+         } = value
+       )
+       when map_size(value) == 3 and is_integer(count) and count in 0..65_535 and
+              is_binary(digest) and byte_size(digest) == 43 do
+    case Base.url_decode64(digest, padding: false) do
+      {:ok, decoded} when byte_size(decoded) == 32 -> value
+      _invalid -> %{}
+    end
+  end
+
+  defp sanitize_native_http_resume_progress(_value), do: %{}
+
+  defp sanitize_native_http_mailbox_prefix(%{"version" => 1, "output_item_done_count" => count, "item_digests" => digests} = value)
+       when map_size(value) == 3 and is_integer(count) and count in 1..65_535 and is_list(digests) do
+    if length(digests) == min(count, 4) and Enum.all?(digests, &(is_binary(&1) and byte_size(&1) == 12 and &1 =~ ~r/\A[0-9a-f]{12}\z/)), do: value, else: %{}
+  end
+
+  defp sanitize_native_http_mailbox_prefix(_value), do: %{}
+
+  # The opaque progress digest a native HTTP opening request records
+  # (`NativeTurnContinuation.turn_progress/1`, findings#206 row 206-403), and
+  # the same digest a native websocket request records as
+  # `native_turn_progress` (row 206-412). Since row 206-423 it also carries the
+  # position that orders a later request against it: the count of user
+  # messages after the latest compaction pivot and, when there is a pivot, the
+  # pivot's 32-byte digest. Rows of the previous release carry the digest alone.
+  @max_recorded_turn_user_messages 1_000_000
+
+  defp sanitize_native_http_turn_progress(%{"version" => 1, "digest" => digest} = value) when is_binary(digest) do
+    with true <- recorded_progress_digest?(digest),
+         true <- recorded_turn_position?(Map.drop(value, ["version", "digest"])) do
+      value
+    else
+      _invalid -> %{}
+    end
+  end
+
+  defp sanitize_native_http_turn_progress(_value), do: %{}
+
+  defp recorded_turn_position?(position) when map_size(position) == 0, do: true
+
+  defp recorded_turn_position?(%{"user_messages" => count} = position)
+       when map_size(position) == 1 and is_integer(count) and count >= 0 and count <= @max_recorded_turn_user_messages,
+       do: true
+
+  defp recorded_turn_position?(%{"user_messages" => count, "pivot" => pivot} = position)
+       when map_size(position) == 2 and is_integer(count) and count >= 0 and count <= @max_recorded_turn_user_messages,
+       do: recorded_progress_digest?(pivot)
+
+  defp recorded_turn_position?(_position), do: false
+
+  defp recorded_progress_digest?(digest) when is_binary(digest) and byte_size(digest) == 43,
+    do: match?({:ok, <<_::256>>}, Base.url_decode64(digest, padding: false))
+
+  defp recorded_progress_digest?(_digest), do: false
 
   defp sanitize_compaction_projection_map(value) do
     value

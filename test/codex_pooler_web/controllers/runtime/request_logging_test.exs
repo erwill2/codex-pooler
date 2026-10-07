@@ -19,8 +19,7 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
 
     previous_level = Logger.level()
 
-    previous_owner_forwarding =
-      Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
 
     Logger.configure(level: :info)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
@@ -28,11 +27,6 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
 
     on_exit(fn ->
       Logger.configure(level: previous_level)
-
-      case previous_owner_forwarding do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
     end)
 
     :ok
@@ -196,7 +190,7 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
   end
 
   defp setup_trusted_proxies(trusted_proxies) do
-    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -205,12 +199,13 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
       |> Keyword.put(:settings, %OperationalSettings{trusted_proxies: trusted_proxies})
       |> Keyword.put(:use_instance_settings?, false)
     )
-
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
   end
 
   defp collect_repo_query_events(fun) when is_function(fun, 0) do
     handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

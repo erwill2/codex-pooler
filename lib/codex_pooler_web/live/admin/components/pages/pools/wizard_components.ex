@@ -19,7 +19,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     %{id: :models, label: "Models", description: "Serving mode"}
   ]
 
-  @pool_docs_url "https://docs.codex-pooler.com/operators/pools/"
+  @pool_docs_url "https://www.codex-pooler.com/docs/operators/pools/"
 
   @pool_wizard_step_ids Enum.map(@pool_wizard_steps, &to_string(&1.id))
 
@@ -27,8 +27,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     create: %{
       id: "pool-create-dialog",
       title: "Create Pool",
-      description:
-        "Create the operational boundary used by API keys, upstream assignments, routing policy, and audit filters.",
+      description: "Create the operational boundary used by API keys, upstream assignments, routing policy, and audit filters.",
       form_id: "pool-create-form",
       form_submit: "create_pool",
       cancel_event: "cancel_create",
@@ -47,8 +46,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     edit: %{
       id: "pool-edit-dialog",
       title: "Edit Pool",
-      description:
-        "Update lifecycle details, routing, upstream assignments, and related API key context.",
+      description: "Update lifecycle details, routing, upstream assignments, and related API key context.",
       form_id: "pool-edit-form",
       form_submit: "save_pool",
       cancel_event: "cancel_edit",
@@ -67,8 +65,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     models: %{
       id: "pool-model-serving-dialog",
       title: "Model serving modes",
-      description:
-        "Choose serving modes for this assigned Pool. Other Pool settings remain instance-owner only.",
+      description: "Choose serving modes for this assigned Pool. Other Pool settings remain instance-owner only.",
       form_id: "pool-model-serving-edit-form",
       form_submit: "save_pool_model_serving",
       cancel_event: "cancel_edit",
@@ -105,8 +102,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     },
     "models" => %{
       title: "Model serving modes",
-      description:
-        "Choose the Responses serving path for each model currently known to this Pool."
+      description: "Choose the Responses serving path for each model currently known to this Pool."
     }
   }
 
@@ -314,14 +310,14 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         help="OpenAI-style /v1 compatibility routes."
                       />
                       <.routing_toggle_row
-                        field={@form[:request_compression_enabled]}
-                        label="Request compression"
-                        help="Shrinks eligible Responses tool outputs before upstream dispatch."
-                      />
-                      <.routing_toggle_row
                         field={@form[:allow_image_generation]}
                         label="Allow Image Generation"
                         help="Permits image generation and edits for requests using this Pool."
+                      />
+                      <.routing_toggle_row
+                        field={@form[:allow_audio_transcription]}
+                        label="Allow Audio Transcription"
+                        help="Permits speech-to-text transcription for requests using this Pool."
                       />
                     </div>
                   </div>

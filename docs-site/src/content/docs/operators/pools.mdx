@@ -29,10 +29,9 @@ A Pool controls:
 4. routing strategy, which decides how eligible upstreams are ordered
 5. continuity settings, which decide when related requests should prefer the same upstream
 6. compatibility settings, such as OpenAI-style `/v1` routes
-7. request compression, which can reduce upstream-bound Responses tool-output payloads for eligible route families
-8. image-generation permission for the supported image generation and edit routes
-9. reporting scope for Pool-filtered request logs, audit logs, and traffic summaries
-10. per-model serving mode, which chooses Auto, Lite, or Full backend Responses behavior without changing the model id clients use
+7. image-generation permission for the supported image generation and edit routes
+8. reporting scope for Pool-filtered request logs, audit logs, and traffic summaries
+9. per-model serving mode, which chooses Auto, Lite, or Full backend Responses behavior without changing the model id clients use
 
 ## Page Metrics
 
@@ -91,11 +90,11 @@ The lifecycle states are:
     </tr>
     <tr>
       <td>Disabled</td>
-      <td>The Pool stays configured and visible for operations, but should not admit new runtime work.</td>
+      <td>The Pool stays configured and visible for operations, but should not admit new runtime work. <code>Reactivate</code> in the card menu makes it active again.</td>
     </tr>
     <tr>
       <td>Archived</td>
-      <td>The Pool is kept for historical reporting and cleanup. Hard deletion is only available after archive.</td>
+      <td>The Pool is kept for historical reporting and cleanup. Hard deletion is only available after archive. <code>Reactivate</code> in the card menu makes it active again; admin Pool assignments that archiving revoked stay revoked.</td>
     </tr>
   </tbody>
 </table>
@@ -173,11 +172,15 @@ The current actions are:
     </tr>
     <tr>
       <td>Edit</td>
-      <td>Opens the Pool configuration dialog for lifecycle, routing, upstream assignments, and API key assignments.</td>
+      <td>Opens the Pool configuration dialog for lifecycle, routing, upstream assignments, and API key assignments. Available for an active Pool; reactivate a disabled or archived Pool first.</td>
+    </tr>
+    <tr>
+      <td>Reactivate</td>
+      <td>Shown for a disabled or archived Pool. Makes the Pool active again, so its API keys can admit new runtime work, and records a Pool status audit event. Admin Pool assignments that archiving revoked are not restored; assign them again from the Operators page.</td>
     </tr>
     <tr>
       <td>Delete</td>
-      <td>Hard-deletes a Pool only after it is archived. Active and disabled Pools cannot be hard-deleted from the card menu.</td>
+      <td>Hard-deletes a Pool only after it is archived and you have typed its slug, together with its request history, sessions, API keys and upstream assignments. Active and disabled Pools cannot be hard-deleted from the card menu. A Pool with a small history is deleted at once. A Pool with a large history is handed to a background job: the card shows <code>deleting</code>, Delete and Reactivate stay disabled, and the Pool disappears when the job has removed its history. If the job gives up, the card shows <code>deletion failed</code>, and deleting again resumes where it stopped. The <code>Pool deleted</code> audit event is recorded only when the Pool is actually gone.</td>
     </tr>
   </tbody>
 </table>
@@ -227,17 +230,7 @@ Routing settings are split into selection policy, continuity, and compatibility.
 
 `Allow /v1 compatibility` enables OpenAI-style `/v1` compatibility routes for clients that use that surface.
 
-`Request compression` enables per-Pool request compression. It is off by default and applies only to upstream-bound Responses tool-output payloads on eligible request routes. It is request-side only: Codex Pooler does not store raw outputs, does not store upstream response bodies, and does not implement CCR/retrieval.
-
-Eligible families are backend and public Responses, translated chat completions, direct backend compact routes, and websocket `response.create` dispatches. Multipart, file, audio, image, admin, MCP, usage, and other non-Responses requests are not eligible. Public `/v1/responses/compact` remains unsupported.
-
-Within eligible tool outputs, valid JSON objects or arrays can be minified even when they are surrounded by ordinary explanatory text. Every surrounding byte stays unchanged. Quoted JSON-looking text, malformed or over-limit spans, and protected exact-output tool results remain pass-through.
-
-Recognized same-frame command-backed file reads remain byte-for-byte pass-through before output-range lookup, content detection, or any compression strategy. The bounded read grammar permits direct `cat`, `nl`, `head`, `tail`, and print-only `sed` reads, plus one `nl`-to-print-only-`sed` pipeline. Function-call outputs match `call_id`; native local-shell outputs match `call_id` or `id`. Duplicate, cross-kind, or conflicting identifiers protect the original output, while malformed or unrecognized commands retain existing behavior.
-
-Request compression is fail-open. If scanning, token counting, rewriting, or limits fail, the original request body is sent upstream and request logs record a safe `payload_compression` status and reason. JSON bodies over 1 MiB skip before scanning, and a dispatch processes at most 50 output candidates. Token counting is local and in-process using tokenizer data shipped with the application; it does not call OpenAI or load a local model.
-
-Request logs may show compression savings when safe aggregate data exists. The UI prefers saved token count and token savings percent, then falls back to saved bytes and byte savings percent when token counts are unavailable.
+Codex Pooler preserves accepted tool-output text through the protocol adapters. There is no Pool compression setting or savings display. Full and Lite keep their own tool-manifest and request-normalization behavior; neither minifies or summarizes accepted tool-output text.
 
 `Allow image generation` controls these exact authenticated POST routes:
 
@@ -252,6 +245,10 @@ have a saved value. When disabled, the runtime returns `403` with code
 body decompression, parsing, coercion, admission, or upstream dispatch. This
 keeps a disabled Pool from accepting image payloads at the parser boundary.
 
+`Allow Audio Transcription` controls `POST /backend-api/transcribe` and `POST /v1/audio/transcriptions`. It is on by default for new and existing Pools. Turning it off returns `403 audio_transcription_disabled` after authentication and before the audio upload is parsed, work is reserved, or an upstream is called. It applies to both JSON and plain-text transcription output. The setting is independent of image generation and does not enable speech synthesis, audio translation, or Realtime audio.
+
+Change either media permission in the Pool wizard or editor under Compatibility, or use its icon beside the Pool name for a quick toggle. Saved changes apply to subsequent requests across the deployment.
+
 ## Upstreams Step
 
 The Upstreams step selects which active upstream accounts are available to the Pool. A checked upstream becomes a Pool assignment. Runtime routing still applies eligibility checks before using it.
@@ -259,6 +256,20 @@ The Upstreams step selects which active upstream accounts are available to the P
 Assign more than one upstream when you want load distribution, fallback, quota flexibility, or account maintenance without moving clients to a different API key. Keep an upstream unassigned when it should not receive work for that Pool.
 
 When a saved edit changes upstream assignments for an active Pool, Codex Pooler enqueues an immediate asynchronous catalog sync for that Pool so model source metadata can refresh without waiting for the 30-minute scheduler. The sync does not bypass runtime eligibility checks or change the routing state held by in-flight requests or already-open streams.
+
+### Sharing One Upstream Across Pools
+
+Assigning the same upstream account to more than one Pool is supported and is usually what you want: it pools quota and gives each Pool fallback without a dedicated account.
+
+**Nobody can read anyone else's prompts.** Codex Pooler never stores prompts, and nothing described below gives any caller a way to retrieve, list or reconstruct content they do not already have. If you are evaluating whether this is safe to use, that is the answer.
+
+The detail worth knowing is about the provider's prompt-prefix cache, which exists to make repeated prefixes cheaper. That cache matches on content, and it is not partitioned per upstream account the way you might expect: measured against a provider in September 2026, content sent under one upstream account came back as cached input tokens under a different one. Those accounts each had their own account and user identifiers; whether the provider also groups them under one organisation is not something Codex Pooler can see, so treat the boundary as the provider's to define. Either way this is the provider's own behaviour and it applies to anyone sharing accounts, with or without Codex Pooler in front of it.
+
+The only thing that behaviour exposes is a yes-or-no answer about bytes you already hold. If you send a prefix and the response reports cached input tokens, you learn that those exact bytes had been sent before by someone sharing the account. You had to possess them to send them, so you learn nothing about content you did not already have, and there is no way to go from a cache hit to anything you were not already holding.
+
+Where that could matter in practice is a shared artifact rather than someone's typing: if you already have a document, a system prompt or a code file, you could use this to test whether it had previously been sent through the same account. Guessing a colleague's prompt is not a realistic use of it — provider caches match long exact prefixes, so you would need the text verbatim first.
+
+For a single team or operator this is simply an efficiency and needs no action. If your Pools are separate customers or separate legal entities, and even that yes-or-no answer about a shared file is more than you want between them, give each its own upstream accounts. No Codex Pooler setting changes it, because the cache lives at the provider.
 
 ## API Keys Step
 
@@ -274,7 +285,7 @@ An assigned instance admin sees a separate `Models` action for an assigned activ
 
 ![Edit Pool details step](/operators/pools/pools-edit-dialog-details.png)
 
-The edit Details step includes the Pool name and lifecycle status. Status is the safest way to retire or pause a Pool without deleting historical metadata.
+The edit Details step includes the Pool name and lifecycle status. Status is the safest way to retire or pause a Pool without deleting historical metadata. The dialog edits active Pools only: to bring back a disabled or archived Pool, use `Reactivate` from its card menu, then edit it.
 
 ![Edit Pool routing step](/operators/pools/pools-edit-dialog-routing.png)
 
@@ -321,9 +332,25 @@ If a catalog refresh no longer returns a model, an existing Lite or Full overrid
 
 Codex, OpenCode, and other supported public OpenAI-compatible clients keep their existing Pool API key, base URL, configuration, and model id. Codex Pooler changes only the backend request selected for that Pool-model pair. `GET /v1/models` remains unchanged and does not expose serving-mode fields; public `POST /v1/responses/compact` remains unsupported.
 
-Full never silently downgrades. A generic ordinary Responses HTTP failure under the explicit Full override keeps the upstream status but returns only a fixed server-owned error; provider message, body, code, param, and extra fields are not returned. Request-log detail drawers show the configured, effective, and source labels when each request or attempt has a complete validated snapshot; a non-rate-limit 4xx is classified as `full_upstream_rejection`, a 429 as `upstream_rate_limited`, and an ordinary 5xx as `upstream_status`. They do not retain the upstream error text, request payload, prompt, response body, or credentials. Auto, Lite, compact or unrelated routes, and established model-unavailability responses keep their existing response behavior. Review provider support, then explicitly select `Auto` or `Lite` and retry as a new request or turn.
+Masked Images edits need an eligible Full Responses host with image-input support. Auto can supply one when the catalog resolves that host to Full; there is no need to force every model to Full. An exact requested model explicitly configured Lite remains unavailable for masked edits, and the adapter does not override that setting. Without an eligible Full host, masked edits return `400 unsupported_parameter` (`mask`) before dispatch or accounting reservation. Unmasked native Images requests continue to use their existing route. See [Responses Full and Lite](/reference/responses-lite-vs-full/#image-generation-and-masked-edits).
+
+Full never silently downgrades. An ordinary Responses HTTP failure under the explicit Full override keeps the upstream status and a server-owned message, and on a non-rate-limit 4xx it relays the same bounded rejection `type`, `code`, and `param` the attempt already records; the provider message, body, and extra fields are not returned. Request-log detail drawers show the configured, effective, and source labels when each request or attempt has a complete validated snapshot; a non-rate-limit 4xx is classified as `upstream_status`, a 429 as `upstream_rate_limited`, and an ordinary 5xx as `upstream_status`. The error code does not record the serving mode, so the same provider rejection carries the same code under Auto, Lite, and Full, and the mode is read from the serving-mode snapshot instead. They do not retain the upstream error text, request payload, prompt, response body, or credentials. Auto, Lite, compact or unrelated routes, and established model-unavailability responses keep their existing response behavior. Review provider support, then explicitly select `Auto` or `Lite` and retry as a new request or turn.
 
 Serving modes are database-backed Pool configuration. There is no global environment variable or Helm value for them.
+
+### Codex Catalog Entries Left Out
+
+Codex reads the whole Pool catalog as one document: a single entry it cannot decode (a required field missing or null, an unknown enumeration value, a fractional number where it expects an integer) makes it discard every entry and fall back to the catalog bundled with the Codex release. For Codex releases 0.154.0 through 0.160.1, the catalog is checked entry by entry and an entry that release cannot decode is left out, so the client keeps every other Pool model. The version is the one in the Codex `User-Agent` (`codex_cli_rs/0.156.1 (...)`, `Codex Desktop/0.155.0-alpha.16 (...)`), which Codex sends on the catalog request and on every turn; the `client_version` query parameter is not read. Prereleases count by their whole version, so `0.155.0-alpha.16` is judged as 0.155.0. Newer and older releases, `/v1/models`, and clients whose `User-Agent` is not a Codex build's receive the catalog unchecked, because the decoder rules are not known to hold for them.
+
+A left-out model is not advertised to that client, so it is missing from the Codex model picker. It stays routable: a request that names the model is routed and served as usual, because routing does not read the served catalog.
+
+Each omission is logged as a warning on every catalog fetch that leaves an entry out:
+
+```text
+codex catalog entry left out: the requesting client cannot decode it pool_id=<pool id> model=<model id> fields=<field paths>
+```
+
+The line names the Pool, the model, and up to ten field paths that fail, never a value. A model id outside letters, digits, `.`, `_` and `-` is shown as a `sha256:` fingerprint. A left-out entry usually means the provider catalog changed shape or a synced entry is incomplete. The next [catalog sync](/operators/jobs/) replaces the entry; if the warning persists after it, compare the named fields with a current Codex release before changing anything else. Codex Desktop and the IDE extension report the version of the Codex core they bundle, so the same rule applies to them.
 
 ## Operational Checklist
 
@@ -336,8 +363,8 @@ When a Pool is not behaving as expected, check it in this order:
 5. confirm the requested model and route shape are supported by the assigned upstreams
 6. inspect recent Requests 5h, TPS 5h, and Traffic 24h for changes in load
 7. open Request logs filtered from the card footer for request-level metadata
-8. for request-compression questions, inspect `payload_compression` status, reason, route class, candidate counts, and savings display in the Request log row
-9. for explicit Full failures, inspect `full_upstream_rejection` for non-rate-limit 4xx, `upstream_rate_limited` for 429, or `upstream_status` for 5xx, the upstream status, and only the three bounded serving-mode labels before selecting `Auto` or `Lite`
+8. for tool-output delivery questions, compare the selected transport, serving mode, request outcome, and attempt outcome; request logs do not retain tool-output content
+9. for explicit Full failures, inspect `upstream_status` for non-rate-limit 4xx and for 5xx or `upstream_rate_limited` for 429, the upstream status, and the three bounded serving-mode labels, which are what identify the failure as a Full one, before selecting `Auto` or `Lite`
 10. check Audit logs when a Pool, upstream assignment, API key, routing setting, or model serving mode changed recently
 
 If all upstreams fail eligibility, routing cannot use them even if the Pool card looks active. The card shows Pool-level configuration, while final routing also depends on upstream status, model support, quota evidence, route health, and continuity constraints.

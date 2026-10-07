@@ -121,6 +121,46 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     end
   end
 
+  test "POST /v1/chat/completions rewrites ultra to the highest catalog level and forwards none unchanged",
+       %{conn: conn} do
+    cases = [
+      {"ultra", "xhigh", "ultra_to_xhigh"},
+      {"none", "none", nil}
+    ]
+
+    for {requested_effort, expected_effort, expected_rewrite} <- cases do
+      upstream = start_upstream(completed_chat_upstream())
+
+      setup =
+        gateway_setup(upstream,
+          model_metadata: %{"supported_reasoning_levels" => ~w(low medium high xhigh)}
+        )
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/chat/completions",
+          Map.put(chat_payload(setup), "reasoning_effort", requested_effort)
+        )
+
+      assert %{"id" => "resp_reasoning_policy_chat"} = json_response(response, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["reasoning"]["effort"] == expected_effort
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      assert get_in(attempt.response_metadata, ["reasoning", "requested_effort"]) ==
+               requested_effort
+
+      assert get_in(attempt.response_metadata, ["reasoning", "effective_effort"]) ==
+               expected_effort
+
+      assert get_in(attempt.response_metadata, ["reasoning", "rewrite"]) == expected_rewrite
+    end
+  end
+
   test "POST /v1/chat/completions non-streaming returns OpenAI chat shape", %{conn: conn} do
     upstream =
       start_upstream(
@@ -139,7 +179,12 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
                    "content" => [%{"type" => "output_text", "text" => "synthetic answer"}]
                  }
                ],
-               "usage" => %{"input_tokens" => 4, "output_tokens" => 6, "total_tokens" => 10}
+               "usage" => %{
+                 "input_tokens" => 4,
+                 "output_tokens" => 6,
+                 "total_tokens" => 10,
+                 "compute_units" => 7
+               }
              }
            }}
         ])
@@ -175,6 +220,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
                }
              ],
              "usage" => %{
+               "compute_units" => 7,
                "prompt_tokens" => 4,
                "completion_tokens" => 6,
                "total_tokens" => 10
@@ -210,6 +256,88 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
+
+    refute inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)}) =~ "compute_units"
+  end
+
+  test "POST /v1/chat/completions derives the Codex routing hint from the effective model and tier",
+       %{conn: conn} do
+    upstream_model = "provider-chat-routing-hint-model"
+
+    upstream =
+      start_upstream(
+        # provenance: observed released Codex client source core/src/client.rs build_routing_hint_header (header format; replies invented)
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            headers: [
+              required: %{"x-codex-routing-hint" => "model=#{upstream_model};tier=priority"}
+            ],
+            json: [
+              valid: true,
+              equals: %{"model" => upstream_model, "service_tier" => "priority"}
+            ],
+            respond: chat_routing_hint_completed_response("resp_chat_routing_hint_priority")
+          ),
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            headers: [required: %{"x-codex-routing-hint" => "model=#{upstream_model}"}],
+            json: [valid: true, forbidden: ["service_tier"]],
+            respond: chat_routing_hint_completed_response("resp_chat_routing_hint_default")
+          )
+        ])
+      )
+
+    setup =
+      gateway_setup(upstream,
+        upstream_model_id: upstream_model,
+        model_metadata: chat_priority_tier_metadata()
+      )
+
+    priority =
+      conn
+      |> auth(setup)
+      |> put_req_header("x-codex-routing-hint", "model=forged;tier=forged")
+      |> post("/v1/chat/completions", Map.put(chat_payload(setup), "service_tier", "priority"))
+
+    assert %{"id" => "resp_chat_routing_hint_priority"} = json_response(priority, 200)
+
+    default =
+      conn
+      |> recycle()
+      |> auth(setup)
+      |> put_req_header("x-codex-routing-hint", "model=forged;tier=priority")
+      |> post("/v1/chat/completions", chat_payload(setup))
+
+    assert %{"id" => "resp_chat_routing_hint_default"} = json_response(default, 200)
+    assert :ok = FakeUpstream.verify!(upstream)
+    refute inspect(FakeUpstream.requests(upstream)) =~ "forged"
+  end
+
+  defp chat_priority_tier_metadata do
+    %{"upstream_model" => %{"service_tiers" => [%{"id" => "priority"}]}}
+  end
+
+  defp chat_routing_hint_completed_response(id) do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => id,
+           "status" => "completed",
+           "output" => [
+             %{
+               "type" => "message",
+               "content" => [%{"type" => "output_text", "text" => "synthetic answer"}]
+             }
+           ],
+           "usage" => %{"input_tokens" => 4, "output_tokens" => 6, "total_tokens" => 10}
+         }
+       }}
+    ])
   end
 
   @tag :external_issues_229_231
@@ -324,13 +452,10 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     end
   end
 
-  # The Lite typed-choice guard is driven by the model's serving mode, not by the
-  # endpoint, and Chat translates a named-function choice into the same map form
-  # that Responses sends. A Chat SDK client forcing a tool therefore meets the
-  # same pre-dispatch rejection on a Lite-served model, with no upstream call and
-  # no accounting side effects.
+  # Chat's translated custom choice retains the Lite restriction; named function
+  # choices are covered by the Full/Lite HTTP boundary matrix.
   @tag :issue_241
-  test "public Chat rejects a named function choice on a Lite-served model before dispatch", %{
+  test "public Chat rejects a named custom choice on a Lite-served model before dispatch", %{
     conn: conn
   } do
     upstream = start_upstream(public_chat_mode_matrix_upstream())
@@ -342,16 +467,13 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
       chat_payload(setup)
       |> Map.put("tools", [
         %{
-          "type" => "function",
-          "function" => %{
-            "name" => "issue241_chat_tool",
-            "parameters" => %{"type" => "object", "properties" => %{}}
-          }
+          "type" => "custom",
+          "custom" => %{"name" => "responses_tool_chat_tool"}
         }
       ])
       |> Map.put("tool_choice", %{
-        "type" => "function",
-        "function" => %{"name" => "issue241_chat_tool"}
+        "type" => "custom",
+        "custom" => %{"name" => "responses_tool_chat_tool"}
       })
 
     response =
@@ -553,10 +675,8 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
              "type" => "response.created",
              "response" => %{"id" => "resp_chat_delta_collect", "status" => "in_progress"}
            }},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "delta"}},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => " answer"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "delta"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => " answer"}},
           {"response.completed",
            %{
              "type" => "response.completed",
@@ -611,7 +731,11 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
       |> auth(setup)
       |> post("/v1/chat/completions", Map.put(chat_payload(setup), "tools", [function_tool()]))
 
-    assert %{"choices" => [%{"message" => %{"tool_calls" => [tool_call]}}]} =
+    assert %{
+             "choices" => [
+               %{"finish_reason" => "tool_calls", "message" => %{"tool_calls" => [tool_call]}}
+             ]
+           } =
              json_response(conn, 200)
 
     assert tool_call["id"] == "call_fixture"
@@ -625,6 +749,57 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert translated_tool["name"] == "lookup_fixture"
     assert translated_tool["parameters"] == get_in(function_tool(), ["function", "parameters"])
     refute Map.has_key?(translated_tool, "function")
+  end
+
+  test "POST /v1/chat/completions accepts tool replay with empty assistant content", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_replay_fixture",
+          "status" => "completed",
+          "output" => []
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "messages" => [
+          %{
+            "role" => "assistant",
+            "content" => [],
+            "tool_calls" => [
+              %{
+                "id" => "call_fixture",
+                "type" => "function",
+                "function" => %{"name" => "fixture", "arguments" => "{}"}
+              }
+            ]
+          },
+          %{
+            "role" => "tool",
+            "tool_call_id" => "call_fixture",
+            "content" => [%{"type" => "text", "text" => "synthetic result"}]
+          }
+        ]
+      })
+
+    assert %{"object" => "chat.completion"} = json_response(response, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+
+    assert Enum.any?(
+             captured.json["input"],
+             &(&1["type"] == "function_call" and &1["call_id"] == "call_fixture")
+           )
+
+    assert Enum.any?(
+             captured.json["input"],
+             &(&1["type"] == "function_call_output" and &1["call_id"] == "call_fixture")
+           )
   end
 
   @tag :streaming_chat
@@ -644,15 +819,19 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
                "service_tier" => "fast"
              }
            }},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "streamed answer"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "streamed answer"}},
           {"response.completed",
            %{
              "type" => "response.completed",
              "response" => %{
                "id" => "resp_chat_stream",
                "status" => "completed",
-               "usage" => %{"input_tokens" => 3, "output_tokens" => 4, "total_tokens" => 7}
+               "usage" => %{
+                 "input_tokens" => 3,
+                 "output_tokens" => 4,
+                 "total_tokens" => 7,
+                 "compute_units" => 7
+               }
              }
            }}
         ])
@@ -681,7 +860,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert Enum.all?(chat_chunks(conn.resp_body), &(&1["service_tier"] == "fast"))
 
     assert conn.resp_body =~
-             "\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":3,\"total_tokens\":7}"
+             "\"usage\":{\"completion_tokens\":4,\"compute_units\":7,\"prompt_tokens\":3,\"total_tokens\":7}"
 
     assert conn.resp_body =~ "data: [DONE]\n\n"
     assert conn.resp_body |> chat_chunk_ids() |> Enum.uniq() == ["resp_chat_stream"]
@@ -981,7 +1160,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
         }
       }
 
-    raw_failed = "event: \t \ndata: " <> Jason.encode!(failed) <> "\n\n"
+    raw_failed = "event: \t \ndata: " <> CodexPooler.JSON.encode!(failed) <> "\n\n"
 
     late_completed =
       {"response.completed",
@@ -1172,8 +1351,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "partial chat text"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "partial chat text"}},
           {"response.failed",
            %{
              "type" => "response.failed",
@@ -1283,6 +1461,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
 
     assert [tool_call] = get_in(tool_chunk, ["choices", Access.at(0), "delta", "tool_calls"])
     assert tool_call["id"] == "call_chat_stream_tool"
+    assert conn.resp_body =~ "\"finish_reason\":\"tool_calls\""
     assert tool_call["type"] == "function"
     assert get_in(tool_call, ["function", "name"]) == "lookup_fixture"
     assert is_binary(get_in(tool_call, ["function", "arguments"]))
@@ -1722,6 +1901,165 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     refute metadata_text =~ "lookup_additional_fixture"
   end
 
+  test "POST /v1/chat/completions streams Responses-shaped fallbacks with terminal usage",
+       %{
+         conn: conn
+       } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "response" => %{"id" => "resp_fallback_chat_stream", "status" => "in_progress"}
+           }},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "synthetic fallback answer"}},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_fallback_chat_stream",
+               "status" => "completed",
+               "usage" => %{"input_tokens" => 5, "output_tokens" => 4, "total_tokens" => 9}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic fallback fallback input",
+        "reasoning" => %{"effort" => "low"},
+        "text" => %{"verbosity" => "low"},
+        "include" => ["reasoning.encrypted_content"],
+        "stream" => true,
+        "stream_options" => %{"include_usage" => true}
+      })
+
+    assert response.status == 200
+    assert [content_type] = get_resp_header(response, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert response.resp_body =~ "\"object\":\"chat.completion.chunk\""
+    assert response.resp_body =~ "\"content\":\"synthetic fallback answer\""
+    assert response.resp_body =~ "\"finish_reason\":\"stop\""
+    assert response.resp_body =~ "\"choices\":[]"
+
+    assert response.resp_body =~
+             "\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":5,\"total_tokens\":9}"
+
+    assert response.resp_body =~ "data: [DONE]\n\n"
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["reasoning"] == %{"effort" => "low"}
+    assert captured.json["text"] == %{"verbosity" => "low"}
+    assert captured.json["include"] == ["reasoning.encrypted_content"]
+
+    assert captured.json["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [
+                 %{"type" => "input_text", "text" => "synthetic fallback fallback input"}
+               ]
+             }
+           ]
+
+    refute Map.has_key?(captured.json, "stream_options")
+  end
+
+  test "POST /v1/chat/completions returns JSON for Responses-shaped fallbacks", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_fallback_chat_json",
+          "status" => "completed",
+          "model" => "provider-gpt-test-model",
+          "output" => [
+            %{
+              "type" => "message",
+              "content" => [
+                %{"type" => "output_text", "text" => "synthetic fallback JSON answer"}
+              ]
+            }
+          ],
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 4, "total_tokens" => 9}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic fallback JSON fallback input",
+        "user" => "synthetic-client-identifier",
+        "reasoning" => %{"effort" => "low"},
+        "text" => %{"verbosity" => "low"},
+        "include" => ["reasoning.encrypted_content"],
+        "stream" => false
+      })
+
+    assert %{
+             "id" => "resp_fallback_chat_json",
+             "object" => "chat.completion",
+             "choices" => [
+               %{
+                 "message" => %{
+                   "role" => "assistant",
+                   "content" => "synthetic fallback JSON answer"
+                 },
+                 "finish_reason" => "stop"
+               }
+             ],
+             "usage" => %{"prompt_tokens" => 5, "completion_tokens" => 4, "total_tokens" => 9}
+           } = json_response(response, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["reasoning"] == %{"effort" => "low"}
+    assert captured.json["text"] == %{"verbosity" => "low"}
+    assert captured.json["include"] == ["reasoning.encrypted_content"]
+
+    assert captured.json["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [
+                 %{"type" => "input_text", "text" => "synthetic fallback JSON fallback input"}
+               ]
+             }
+           ]
+
+    refute Map.has_key?(captured.json, "messages")
+    refute Map.has_key?(captured.json, "stream_options")
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+
+    metadata_text =
+      inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)})
+
+    refute metadata_text =~ "synthetic fallback JSON fallback input"
+    refute metadata_text =~ "synthetic fallback JSON answer"
+    refute Map.has_key?(captured.json, "user")
+    refute metadata_text =~ "synthetic-client-identifier"
+  end
+
   test "POST /v1/chat/completions rejects malformed fallback input before dispatch", %{
     conn: conn
   } do
@@ -1755,8 +2093,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
            }
          ]
        }, "invalid_request", "input", "remote MCP tools are not supported"},
-      {%{"input" => "synthetic fallback input", "additional_tools" => []},
-       "unsupported_parameter", "additional_tools", "Unsupported parameter: additional_tools"}
+      {%{"input" => "synthetic fallback input", "additional_tools" => []}, "unsupported_parameter", "additional_tools", "Unsupported parameter: additional_tools"}
     ]
 
     Enum.each(invalid_cases, fn {payload_update, expected_code, expected_param, expected_message} ->
@@ -1928,11 +2265,8 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     setup = gateway_setup(upstream)
 
     invalid_cases = [
-      {input_audio_part("ogg", malformed_data),
-       public_audio_error("input_audio data must be base64"), [malformed_data]},
-      {input_audio_part("flac", flac_data),
-       public_audio_error("message content part is not translatable"),
-       [flac_source, flac_data, "flac"]}
+      {input_audio_part("ogg", malformed_data), public_audio_error("input_audio data must be base64"), [malformed_data]},
+      {input_audio_part("flac", flac_data), public_audio_error("message content part is not translatable"), [flac_source, flac_data, "flac"]}
     ]
 
     Enum.each(invalid_cases, fn {audio_part, expected_error, forbidden_values} ->
@@ -2170,6 +2504,21 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.json["tools"] == [Map.put(custom, "type", "custom")]
     assert captured.json["tool_choice"] == %{"type" => "custom", "name" => "code_exec"}
+
+    flat_response =
+      conn
+      |> recycle()
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        Map.put(payload, "tools", [Map.put(custom, "type", "custom")])
+      )
+
+    assert %{"choices" => [%{"finish_reason" => "tool_calls"}]} =
+             json_response(flat_response, 200)
+
+    assert [_, flat_capture] = FakeUpstream.requests(upstream)
+    assert flat_capture.json["tools"] == [Map.put(custom, "type", "custom")]
   end
 
   @tag :streaming_chat
@@ -2426,7 +2775,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
         %{"type" => "unknown", "function" => %{"name" => "lookup_fixture", "parameters" => %{}}}
       ]),
       Map.put(chat_payload(setup), "tools", [
-        %{"type" => "custom", "name" => "custom_fixture"}
+        %{"type" => "custom", "name" => 42}
       ]),
       Map.put(chat_payload(setup), "tools", [
         %{"type" => "custom", "custom" => %{}}
@@ -2737,7 +3086,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
       flunk("expected successful Chat response status")
     end
 
-    case Jason.decode(response.resp_body) do
+    case CodexPooler.JSON.decode(response.resp_body) do
       {:ok, %{"id" => ^expected_id}} ->
         :ok
 
@@ -2953,7 +3302,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     |> Enum.filter(&String.starts_with?(&1, "data: "))
     |> Enum.map(&String.replace_prefix(&1, "data: ", ""))
     |> Enum.reject(&(&1 == "[DONE]"))
-    |> Enum.map(&Jason.decode!/1)
+    |> Enum.map(&CodexPooler.JSON.decode!/1)
   end
 
   defp synthetic_terminal_error do

@@ -52,8 +52,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
       end
 
     lookup_for_tier(
-      model,
-      requested_model,
+      pricing_identifiers(model, requested_model, attr(opts, :endpoint)),
       requested_tier,
       actual_tier,
       price_bucket,
@@ -79,6 +78,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
         attrs,
         timestamp
       ) do
+    maybe_test_settlement_fault(request)
     model = request.model_id && Repo.get(Model, request.model_id)
 
     if model do
@@ -92,9 +92,8 @@ defmodule CodexPooler.Accounting.PricingResolution do
           metadata_service_tier(attempt.response_metadata) ||
           request |> metadata_pricing_value("actual_service_tier")
 
-      model
+      pricing_identifiers(model, request.requested_model, request.endpoint)
       |> lookup_for_tier(
-        request.requested_model,
         requested_tier,
         actual_tier,
         Costing.price_bucket_for_input_tokens(usage.input_tokens),
@@ -145,7 +144,9 @@ defmodule CodexPooler.Accounting.PricingResolution do
         )
     }
 
-    put_serialized_alias_metadata(pricing_metadata, Map.get(pricing, :alias))
+    pricing_metadata
+    |> put_serialized_alias_metadata(Map.get(pricing, :alias))
+    |> put_serialized_price_bucket_fallback(Map.get(pricing, :price_bucket_fallback))
   end
 
   @spec details(map()) :: map()
@@ -163,7 +164,9 @@ defmodule CodexPooler.Accounting.PricingResolution do
       "price_version" => snapshot && snapshot.price_version
     }
 
-    put_serialized_alias_metadata(details, Map.get(pricing, :alias))
+    details
+    |> put_serialized_alias_metadata(Map.get(pricing, :alias))
+    |> put_serialized_price_bucket_fallback(Map.get(pricing, :price_bucket_fallback))
   end
 
   @spec update_request_metadata(map() | nil, map()) :: map()
@@ -192,8 +195,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
     actual_tier = metadata_pricing_value(request, "actual_service_tier")
 
     lookup_for_tier(
-      model,
-      request.requested_model,
+      pricing_identifiers(model, request.requested_model, request.endpoint),
       requested_tier,
       actual_tier,
       metadata_pricing_value(request, "price_bucket") || @default_price_bucket,
@@ -203,8 +205,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
   end
 
   defp lookup_for_tier(
-         %Model{} = model,
-         requested_model,
+         identifiers,
          requested_tier,
          actual_tier,
          price_bucket,
@@ -213,7 +214,6 @@ defmodule CodexPooler.Accounting.PricingResolution do
        ) do
     requested_tier = ServiceTier.canonicalize(requested_tier)
     actual_tier = ServiceTier.canonicalize(actual_tier)
-    identifiers = pricing_identifiers(model, requested_model)
 
     case priceable_service_tier(requested_tier, actual_tier, batch_usage?) do
       {:ok, service_tier} ->
@@ -254,7 +254,11 @@ defmodule CodexPooler.Accounting.PricingResolution do
 
     context
     |> pricing_resolution_steps()
-    |> Enum.find_value(&resolve_pricing_step(context, &1))
+    |> Enum.find_value(fn step ->
+      context
+      |> resolve_pricing_step(step)
+      |> annotate_price_bucket_fallback(context, step)
+    end)
     |> case do
       nil -> missing_pricing_snapshot(context)
       pricing -> pricing
@@ -337,6 +341,36 @@ defmodule CodexPooler.Accounting.PricingResolution do
     end
   end
 
+  # A resolution step that prices a bucket other than the one the request asked
+  # for keeps that substitution on the record. `price_bucket` alone reports the
+  # bucket that was charged, so a long-context turn settled at default rates is
+  # indistinguishable from an ordinary one; the marker names the requested and
+  # the selected bucket and why they differ. It is provenance only: the amount,
+  # the status and `price_bucket` stay exactly what the step produced.
+  @spec annotate_price_bucket_fallback(map() | nil, pricing_context(), pricing_resolution_step()) ::
+          map() | nil
+  defp annotate_price_bucket_fallback(nil, _context, _step), do: nil
+
+  defp annotate_price_bucket_fallback(pricing, %{price_bucket: requested}, {_match, _availability, requested}),
+    do: pricing
+
+  defp annotate_price_bucket_fallback(pricing, %{price_bucket: requested}, {_match, _availability, selected}) do
+    Map.put(pricing, :price_bucket_fallback, %{
+      "requested" => requested,
+      "selected" => selected,
+      "reason" => price_bucket_fallback_reason(requested, selected)
+    })
+  end
+
+  # Bounded vocabulary. `pricing_resolution_steps/1` defines every substitution
+  # that can happen, so a new fallback pair earns its own reason here rather
+  # than arriving unnamed.
+  @spec price_bucket_fallback_reason(String.t(), String.t()) :: String.t()
+  defp price_bucket_fallback_reason(@long_context_price_bucket, @default_price_bucket),
+    do: "long_context_pricing_absent"
+
+  defp price_bucket_fallback_reason(_requested, _selected), do: "requested_bucket_pricing_absent"
+
   defp priced_snapshot(context, snapshot, alias_metadata \\ nil) do
     priced_snapshot(
       snapshot,
@@ -383,6 +417,14 @@ defmodule CodexPooler.Accounting.PricingResolution do
     end
   end
 
+  # `pricing_identifiers/3` is a precedence, not a set: an explicit
+  # `pricing_ref` is what an operator set this model to be priced as, the
+  # upstream model id is what was actually served, and the requested model is
+  # only what the client typed — under an enforced-model key it need not name
+  # this model at all. Recency is the tie-break *within* one identifier; on its
+  # own it lets a newer snapshot for a lower-precedence identifier decide, and
+  # a pricing import writes one `effective_at` for every model it holds, so
+  # ties were the ordinary case and row id settled them.
   @spec latest_pricing_snapshot([String.t()], String.t(), String.t(), DateTime.t()) ::
           PricingSnapshot.t() | nil
   defp latest_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
@@ -399,6 +441,12 @@ defmodule CodexPooler.Accounting.PricingResolution do
             fragment("?->>'price_bucket'", ps.config) == ^price_bucket and
             fragment("?->>'pricing_type'", ps.config) == "per_1m_tokens",
         order_by: [
+          asc:
+            fragment(
+              "array_position(?, lower(?))",
+              type(^normalized_identifiers, {:array, :string}),
+              ps.model_identifier
+            ),
           desc: ps.effective_at,
           desc: ps.captured_at,
           asc:
@@ -695,7 +743,14 @@ defmodule CodexPooler.Accounting.PricingResolution do
     }
   end
 
-  defp pricing_identifiers(model, requested_model) do
+  # Native Images use a catalog model only to select an eligible account. That
+  # carrier's text-token prices do not describe the image service's usage.
+  defp pricing_identifiers(_model, requested_model, endpoint)
+       when endpoint in ["/backend-api/codex/images/generations", "/backend-api/codex/images/edits"] do
+    Enum.reject([requested_model], &blank?/1)
+  end
+
+  defp pricing_identifiers(model, requested_model, _endpoint) do
     Enum.uniq(
       Enum.reject(
         [model.pricing_ref, model.upstream_model_id, model.exposed_model_id, requested_model],
@@ -894,11 +949,22 @@ defmodule CodexPooler.Accounting.PricingResolution do
     cond do
       requested == "batch" and not batch_usage? -> {:unpriced, "unpriced_batch_tier"}
       requested == "batch" -> mapped_service_tier(requested, batch_usage?)
+      echo_hides_requested_tier?(requested, actual) -> mapped_service_tier(requested, batch_usage?)
       actual not in [nil, "auto"] -> mapped_service_tier(actual, batch_usage?)
       requested == "auto" and actual in [nil, "auto"] -> {:unpriced, "unpriced_auto_tier"}
       true -> mapped_service_tier(requested, batch_usage?)
     end
   end
+
+  # The ChatGPT Codex backend reports `default` on the terminal response of a
+  # request that asked for `priority` (Fast), with or without the Pooler in the
+  # path, while it serves and meters the request as Fast: the provider bills
+  # Fast at a multiple of the standard credit rate and it uses included limits
+  # faster (findings#127, findings#206 row 206-271). A `default` echo therefore
+  # says nothing about a requested priority tier, and pricing keeps the tier
+  # that was requested; any other reported tier still outranks the request.
+  defp echo_hides_requested_tier?("priority", "default"), do: true
+  defp echo_hides_requested_tier?(_requested, _actual), do: false
 
   defp mapped_service_tier("batch", false), do: {:unpriced, "unpriced_batch_tier"}
   defp mapped_service_tier("batch", true), do: {:ok, "batch"}
@@ -911,6 +977,12 @@ defmodule CodexPooler.Accounting.PricingResolution do
   defp mapped_service_tier("priority"), do: {:ok, "priority"}
   defp mapped_service_tier("ultrafast"), do: {:ok, "ultrafast"}
   defp mapped_service_tier("batch"), do: {:ok, "batch"}
+
+  # Scale is a recognized service tier. Resolve only matching snapshots;
+  # without one, leave pricing explicitly unpriced rather than borrowing
+  # another tier's rate.
+  defp mapped_service_tier("scale"), do: {:ok, "scale"}
+
   defp mapped_service_tier(_tier), do: {:unpriced, "unpriced_unsupported_tier"}
 
   defp normalize_service_tier(tier), do: ServiceTier.canonicalize(tier)
@@ -944,10 +1016,14 @@ defmodule CodexPooler.Accounting.PricingResolution do
   end
 
   defp payload_reasoning_effort(payload) do
-    attr(payload, :reasoning_effort) ||
-      get_in(payload, ["reasoning", "effort"]) ||
-      get_in(payload, [:reasoning, :effort])
+    attr(payload, :reasoning_effort) || nested_reasoning_effort(payload)
   end
+
+  # The payload is the client's, read before dispatch: only an object `reasoning` states an effort. Any other shape
+  # (a string, a list) is the provider's to refuse at validation, and the request must still reach it (findings#339).
+  defp nested_reasoning_effort(%{"reasoning" => %{"effort" => effort}}), do: effort
+  defp nested_reasoning_effort(%{reasoning: %{effort: effort}}), do: effort
+  defp nested_reasoning_effort(_payload), do: nil
 
   defp pricing_metadata_value(request_metadata, key) do
     get_in(request_metadata, ["pricing", key])
@@ -961,7 +1037,10 @@ defmodule CodexPooler.Accounting.PricingResolution do
     |> blank_to_nil()
   end
 
-  defp normalize_snapshot_value(value), do: value |> to_string() |> normalize_snapshot_value()
+  defp normalize_snapshot_value(value) when is_atom(value) or is_number(value), do: value |> to_string() |> normalize_snapshot_value()
+
+  # An effort the client sent as an object or a list states no effort to record.
+  defp normalize_snapshot_value(_value), do: nil
 
   defp metadata_pricing_value(%Request{request_metadata: metadata}, key) do
     get_in(metadata || %{}, ["pricing", key])
@@ -990,5 +1069,30 @@ defmodule CodexPooler.Accounting.PricingResolution do
   defp put_serialized_alias_metadata(serialized, alias_metadata),
     do: Map.put(serialized, "alias", alias_metadata)
 
+  defp put_serialized_price_bucket_fallback(serialized, nil), do: serialized
+
+  defp put_serialized_price_bucket_fallback(serialized, fallback),
+    do: Map.put(serialized, "price_bucket_fallback", fallback)
+
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  if Mix.env() == :test do
+    # Test-only fault seam: raises the armed exception once, from inside a
+    # response task's settlement transaction, reproducing a database failure
+    # at the pricing lookup (the production frame under pool exhaustion).
+    # Armed per pool and one-shot, so the task's own recovery finalization
+    # and the client's resend run against a healthy database.
+    defp maybe_test_settlement_fault(%Request{pool_id: pool_id}) do
+      case Application.get_env(:codex_pooler, :settlement_pricing_test_fault) do
+        {^pool_id, exception} when is_exception(exception) ->
+          Application.delete_env(:codex_pooler, :settlement_pricing_test_fault)
+          raise exception
+
+        _no_fault ->
+          :ok
+      end
+    end
+  else
+    defp maybe_test_settlement_fault(_request), do: :ok
+  end
 end

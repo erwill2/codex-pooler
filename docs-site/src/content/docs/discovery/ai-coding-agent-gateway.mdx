@@ -1,14 +1,8 @@
 ---
 title: AI Coding Agent Gateway
-description: Public answer page for using Codex Pooler as a self-hosted gateway for AI coding agents, Codex backend clients, selected /v1 SDK clients, and operator MCP metadata.
+description: "Codex Pooler as a self-hosted gateway for AI coding agents: Codex backend clients and selected /v1 SDK clients on Pool API keys, with MCP metadata."
 sidebar:
   hidden: true
-head:
-  - tag: script
-    attrs:
-      type: application/ld+json
-    content: |
-      {"@context":"https://schema.org","@type":"TechArticle","headline":"AI Coding Agent Gateway","description":"Codex Pooler can serve as a self-hosted gateway for trusted AI coding agents by giving clients stable Pool API keys, routing Codex backend or narrow /v1 traffic through account Pools, and keeping operator evidence metadata-only.","url":"https://docs.codex-pooler.com/discovery/ai-coding-agent-gateway/","about":["AI coding agent gateway","Codex Pooler","Codex backend clients","OpenAI-compatible /v1","Pool API keys"]}
 ---
 
 Codex Pooler can act as a self-hosted gateway for trusted AI coding agents. Operators run Codex Pooler themselves, connect authorized upstream Codex accounts to Pools, issue stable Pool API keys to agent clients, and route supported Codex backend or narrow `/v1` requests through Pool policy without exposing upstream account secrets to every workstation or automation host.
@@ -35,7 +29,7 @@ The gateway does not replace account authorization. It coordinates accounts you 
       <td>Codex CLI and Codex Desktop</td>
       <td><code>/backend-api/codex</code></td>
       <td>Pool API key</td>
-      <td><a href="/clients/codex-cli/">Codex CLI and Codex Desktop</a></td>
+      <td><a href="/clients/codex-cli-desktop/">Codex CLI and Codex Desktop</a></td>
     </tr>
     <tr>
       <td>Selected OpenAI SDK-compatible agents</td>
@@ -44,7 +38,7 @@ The gateway does not replace account authorization. It coordinates accounts you 
       <td><a href="/clients/openai-compatible/">OpenAI-compatible SDKs</a></td>
     </tr>
     <tr>
-      <td>Aider, Continue, Cline, Goose, Kilo, OpenCode, OpenClaw, OpenHands, OMP, Pi, Hermes, Trae, and Windmill</td>
+      <td>Aider, Continue, Cline, Goose, Kilo Code, OpenCode, OpenClaw, OpenHands, OMP, Pi, Hermes, Trae, and Windmill</td>
       <td>Client-specific <code>/v1</code> or backend route documented on each setup page</td>
       <td>Pool API key for runtime model work</td>
       <td><a href="/clients/openai-compatible/">Client setup index</a></td>

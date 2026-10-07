@@ -12,19 +12,25 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
           optional(:output_tokens) => non_neg_integer(),
           optional(:reasoning_tokens) => non_neg_integer(),
           optional(:total_tokens) => non_neg_integer(),
-          optional(:service_tier) => String.t() | nil
+          optional(:service_tier) => String.t() | nil,
+          optional(:served_model) => String.t(),
+          optional(:model_observation) => map()
         }
+
+  alias CodexPooler.Accounting.Metadata
+  alias CodexPooler.Gateway.Runtime.Streaming.ModelDeclarationObserver
+  alias CodexPooler.ServiceTier
 
   @spec from_json(binary()) :: usage()
   def from_json(body) when is_binary(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, decoded} -> from_decoded(decoded)
-      {:error, _reason} -> %{status: "usage_unknown", source: "json_decode_failed"}
+      {:error, _reason} -> ModelDeclarationObserver.put_usage(%{status: "usage_unknown", source: "json_decode_failed"}, ModelDeclarationObserver.partial(ModelDeclarationObserver.new()))
     end
   end
 
   @spec from_decoded(term()) :: usage()
-  def from_decoded(decoded), do: usage_from_decoded(decoded)
+  def from_decoded(decoded), do: ModelDeclarationObserver.put_usage(usage_from_decoded(decoded), ModelDeclarationObserver.json(decoded))
 
   @doc "Extracts only the aggregate usage owned by a streamed response envelope."
   @spec from_stream_event(term()) :: usage()
@@ -37,7 +43,34 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   def from_stream_event(%{"response" => %{"usage" => usage} = response}) when is_map(usage),
     do: normalize_stream_usage(usage, response)
 
+  def from_stream_event(event) when is_map(event),
+    do: maybe_put_served_model(%{status: "usage_unknown", source: "usage_missing"}, event)
+
   def from_stream_event(_event), do: %{status: "usage_unknown", source: "usage_missing"}
+
+  @doc """
+  The bounded model identifier a response object declares, from `model` at the
+  root or under `response`, or `nil` when it declares none.
+  """
+  @spec served_model(term()) :: String.t() | nil
+  def served_model(%{"model" => model}) when is_binary(model), do: bounded_served_model(model)
+
+  def served_model(%{"response" => %{"model" => model}}) when is_binary(model),
+    do: bounded_served_model(model)
+
+  def served_model(_envelope), do: nil
+
+  # The model identifier the provider declares on its response object, bounded
+  # by the accounting rule that owns the column it lands in.
+  @spec bounded_served_model(term()) :: String.t() | nil
+  defdelegate bounded_served_model(model), to: Metadata, as: :bounded_model_identifier
+
+  defp maybe_put_served_model(usage, envelope) do
+    case served_model(envelope) do
+      nil -> usage
+      model -> Map.put(usage, :served_model, model)
+    end
+  end
 
   defp normalize_stream_usage(usage, envelope) do
     case normalize_usage(usage, envelope) do
@@ -47,46 +80,91 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
 
         if cached + written <= normalized.input_tokens and
              normalized.reasoning_tokens <= normalized.output_tokens,
-           do: Map.put(normalized, :service_tier, stream_service_tier(envelope["service_tier"])),
-           else: %{status: "usage_unknown", source: "invalid_usage_tokens"}
+           do: Map.put(normalized, :service_tier, bounded_service_tier(envelope["service_tier"])),
+           else: maybe_put_served_model(%{status: "usage_unknown", source: "invalid_usage_tokens"}, envelope)
 
       unknown ->
-        unknown
+        maybe_put_served_model(unknown, envelope)
     end
   end
 
-  defp stream_service_tier(tier) when tier in ~w(auto default flex priority scale ultrafast),
-    do: :binary.copy(tier)
+  # The provider's spelling is canonicalized before it is bounded, not after:
+  # the catalog's own name for the priority tier is `fast`, and matching the
+  # raw value dropped it to nil -- which then priced a priority response at
+  # standard rates, because an absent reported tier falls back to the request.
+  # The allowlist itself stays: this value reaches grouped read models, so an
+  # arbitrary provider string would be a cardinality problem, and the copy is
+  # what keeps a two-word tier from retaining the whole decoded frame.
+  @reported_service_tiers ~w(auto default flex priority scale ultrafast)
 
-  defp stream_service_tier(_tier), do: nil
+  defp bounded_service_tier(tier) when is_binary(tier) do
+    case ServiceTier.canonicalize(tier) do
+      canonical when canonical in @reported_service_tiers -> :binary.copy(canonical)
+      _unreported -> nil
+    end
+  end
+
+  defp bounded_service_tier(_tier), do: nil
 
   @spec from_sse(binary()) :: usage()
   def from_sse(body) when is_binary(body) do
-    case Jason.decode(body) do
-      {:ok, decoded} when is_map(decoded) -> from_stream_event(decoded)
+    case CodexPooler.JSON.decode(body) do
+      {:ok, decoded} when is_map(decoded) -> ModelDeclarationObserver.put_usage(from_stream_event(decoded), ModelDeclarationObserver.observe(ModelDeclarationObserver.new(), decoded))
       _framed_or_incomplete -> decode_stream_body(body, "sse_usage_missing", false)
     end
   end
+
+  @doc """
+  The usage of a request the Pooler refused before anything was sent upstream:
+  none applies, so its settlement keeps no tokens and no reservation estimate.
+  """
+  @spec undispatched() :: usage()
+  def undispatched, do: %{status: "not_applicable", source: "undispatched_refusal"}
 
   @spec from_websocket_body(binary()) :: usage()
   def from_websocket_body(body) when is_binary(body),
     do: decode_stream_body(body, "websocket_usage_missing", true)
 
-  defp decode_stream_body(body, missing_source, websocket?) do
-    usage =
-      body
-      |> stream_records(websocket?)
-      |> Enum.reduce_while(nil, &stream_record_usage/2)
+  @doc "Reads first-model facts from older mapped owner bodies without inventing collection coverage."
+  @spec legacy_websocket_model_usage(binary()) :: map()
+  def legacy_websocket_model_usage(body) when is_binary(body) do
+    observer = Enum.reduce(stream_records(body, true), ModelDeclarationObserver.new(), &stream_record_model(&1, &2, :legacy))
+    %{} |> ModelDeclarationObserver.put_usage(observer) |> Map.take([:served_model])
+  end
 
-    case usage do
-      nil -> %{status: "usage_unknown", source: missing_source}
-      %{source: "usage_missing"} -> %{status: "usage_unknown", source: missing_source}
-      usage -> usage
+  defp decode_stream_body(body, missing_source, websocket?) do
+    records = stream_records(body, websocket?)
+    usage = Enum.reduce_while(records, nil, &stream_record_usage/2)
+
+    usage =
+      case usage do
+        nil -> %{status: "usage_unknown", source: missing_source}
+        %{source: "usage_missing"} -> %{status: "usage_unknown", source: missing_source}
+        usage -> usage
+      end
+
+    observer = Enum.reduce(records, ModelDeclarationObserver.new(), &stream_record_model/2)
+    ModelDeclarationObserver.put_usage(usage, observer)
+  end
+
+  defp stream_record_model(record, observer, source \\ :provider)
+
+  defp stream_record_model({json, event_type}, observer, source) do
+    case CodexPooler.JSON.decode(json) do
+      {:ok, decoded} when is_map(decoded) -> ModelDeclarationObserver.observe(observer, model_event(decoded, event_type || decoded["type"], source), event_type)
+      _malformed -> ModelDeclarationObserver.partial(observer)
     end
   end
 
+  # PublicResponses authors this empty failed envelope. A first declaration
+  # from an earlier event, even the literal "unknown", remains authoritative.
+  defp model_event(%{"response" => %{"model" => "unknown", "status" => "failed", "created_at" => 0, "object" => "response", "output" => [], "tools" => [], "parallel_tool_calls" => false} = response} = event, "response.failed", :legacy),
+    do: Map.put(event, "response", Map.delete(response, "model"))
+
+  defp model_event(event, _type, _source), do: event
+
   defp stream_record_usage({json, event_type}, previous) do
-    case Jason.decode(json) do
+    case CodexPooler.JSON.decode(json) do
       {:ok, decoded} when is_map(decoded) ->
         candidate = from_stream_event(decoded)
 
@@ -184,13 +262,21 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
       }
       |> maybe_put_cached_input_tokens(cached_input_tokens)
       |> maybe_put_cache_write_tokens(cache_write_tokens)
+      |> maybe_put_served_model(envelope)
     else
-      _invalid -> %{status: "usage_unknown", source: "invalid_usage_tokens"}
+      _invalid ->
+        maybe_put_served_model(%{status: "usage_unknown", source: "invalid_usage_tokens"}, envelope)
     end
   end
 
-  defp service_tier(%{"service_tier" => tier}) when is_binary(tier), do: tier
-  defp service_tier(%{"response" => %{"service_tier" => tier}}) when is_binary(tier), do: tier
+  # Same field, same contract on both transports: the non-streaming path used
+  # to take any binary at all, so the two disagreed about the same provider
+  # answer.
+  defp service_tier(%{"service_tier" => tier}) when is_binary(tier), do: bounded_service_tier(tier)
+
+  defp service_tier(%{"response" => %{"service_tier" => tier}}) when is_binary(tier),
+    do: bounded_service_tier(tier)
+
   defp service_tier(_envelope), do: nil
 
   defp cached_input_tokens_value(usage) do

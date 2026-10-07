@@ -6,6 +6,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
   @root_fields ~w(generated_at models models_count source source_url tools tools_count)
   @model_fields ~w(categories category model prices pricing_type pricing_types timestamp)
   @tool_fields ~w(details price pricing tool)
+  @expanded_tool_fields @tool_fields ++ ~w(amounts price_semantics rates)
+  @tool_rate_fields ~w(amounts details pricing tool)
   @snapshot_buckets ~w(default short_context long_context)
   @price_fields ~w(input cached_input cache_write output reasoning)
   @pricing_type "per_1m_tokens"
@@ -73,7 +75,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
 
   @spec decode(binary()) :: {:ok, map()} | {:error, decode_error()}
   def decode(raw) when is_binary(raw) do
-    with {:ok, value} <- Jason.decode(raw, objects: :ordered_objects),
+    with {:ok, value} <- CodexPooler.JSON.decode(raw, objects: :ordered_objects),
          {:ok, payload} <- ordered_to_maps(value) do
       {:ok, payload}
     else
@@ -138,18 +140,54 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     path = "tools.#{key}"
     state = validate_trimmed_key(state, key, "tools")
 
-    case exact_object(tool, @tool_fields, path, state) do
+    fields =
+      if is_map(tool) and Map.has_key?(tool, "rates"),
+        do: @expanded_tool_fields,
+        else: @tool_fields
+
+    case exact_object(tool, fields, path, state) do
       {:ok, tool} ->
         state
         |> validate_trimmed_nonblank(tool["tool"], path <> ".tool")
         |> validate_trimmed_nonblank(tool["details"], path <> ".details")
         |> validate_trimmed_nonblank(tool["pricing"], path <> ".pricing")
         |> validate_number(tool["price"], path <> ".price")
+        |> validate_tool_rates(tool, path)
 
       {:error, state} ->
         state
     end
   end
+
+  defp validate_tool_rates(state, %{"rates" => rates} = tool, path) do
+    valid? = is_list(rates) and rates != [] and Enum.all?(rates, &valid_tool_rate?/1)
+
+    if valid? and valid_amounts?(tool["amounts"]) and
+         tool["price_semantics"] == "first listed rate; consult rates for billing conditions" and
+         tool["price"] == hd(tool["amounts"]) and
+         Map.take(tool, @tool_rate_fields) == hd(rates) do
+      state
+    else
+      add_error(
+        state,
+        :invalid_tool_rates,
+        "tool rates must preserve the first listed rate",
+        path
+      )
+    end
+  end
+
+  defp validate_tool_rates(state, _tool, _path), do: state
+
+  defp valid_tool_rate?(rate) do
+    exact_keys?(rate, @tool_rate_fields) and valid_amounts?(rate["amounts"]) and
+      Enum.all?(~w(details pricing tool), fn key ->
+        is_binary(rate[key]) and String.trim(rate[key]) != ""
+      end)
+  end
+
+  defp valid_amounts?(values),
+    do: is_list(values) and values != [] and Enum.all?(values, &finite_nonnegative_number?/1)
 
   defp validate_models(models, generated_at, state)
        when is_map(models) and map_size(models) > 0 do
@@ -205,8 +243,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       end
     else
       false ->
-        {add_error(state, :invalid_model_name, "model names must be strings", "models"),
-         identities}
+        {add_error(state, :invalid_model_name, "model names must be strings", "models"), identities}
 
       {:error, state} ->
         {state, identities}
@@ -224,7 +261,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       @pricing_type ->
         classify_token_prices(state, identifier, model, path)
 
-      type when type in ["mixed", "per_minute", "per_second"] ->
+      type when type in ["mixed", "per_minute", "per_second", "per_1m_characters"] ->
         classify_unsupported_prices(state, model, path)
 
       _type ->
@@ -356,6 +393,14 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     end)
   end
 
+  defp unsupported_prices_valid?(
+         "per_minute",
+         %{"standard" => %{"default" => values} = buckets} = prices
+       )
+       when map_size(prices) == 1 and map_size(buckets) == 1 do
+    exact_numeric_keys?(values, ["price_per_minute"])
+  end
+
   defp unsupported_prices_valid?("per_minute", %{"standard" => buckets} = prices)
        when map_size(prices) == 1 and map_size(buckets) > 0 do
     Enum.all?(buckets, fn
@@ -383,6 +428,14 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       tier in ["batch", "standard"] and is_map(buckets) and map_size(buckets) > 0 and
         Enum.all?(buckets, &video_bucket_valid?/1)
     end)
+  end
+
+  defp unsupported_prices_valid?(
+         "per_1m_characters",
+         %{"standard" => %{"text" => values}} = prices
+       )
+       when map_size(prices) == 1 do
+    map_size(prices["standard"]) == 1 and exact_numeric_keys?(values, ["input"])
   end
 
   defp unsupported_prices_valid?(_type, _prices), do: false
@@ -478,8 +531,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
       categories: Enum.map(model["categories"], &String.trim/1),
       availability: availability,
       input: decimal(values["input"]),
-      cached_input:
-        decimal(values["cached_input"]) || if(availability == "priced", do: Decimal.new(0)),
+      cached_input: decimal(values["cached_input"]) || if(availability == "priced", do: Decimal.new(0)),
       cache_write: decimal(values["cache_write"]),
       output: output,
       reasoning: reasoning,
@@ -503,6 +555,23 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
     |> Enum.reduce(%{state | rows: []}, fn {_identifier, rows}, acc ->
       coalesce_model_rows(acc, rows)
     end)
+    |> recount_rows()
+  end
+
+  defp recount_rows(state) do
+    summary =
+      Map.merge(state.summary, %{
+        importable_rows: length(state.rows),
+        priced_rows: Enum.count(state.rows, &(&1.availability == "priced")),
+        unavailable_rows: Enum.count(state.rows, &(&1.availability == "unavailable"))
+      })
+
+    buckets =
+      Enum.reduce(state.rows, Map.new(@snapshot_buckets, &{&1, 0}), fn row, counts ->
+        Map.update!(counts, row.price_bucket, &(&1 + 1))
+      end)
+
+    %{state | summary: summary, buckets: buckets}
   end
 
   defp coalesce_model_rows(state, rows) do
@@ -622,7 +691,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingFormat do
   defp exact_object(_value, _fields, path, state),
     do: {:error, add_error(state, :invalid_object_shape, "value must be an object", path)}
 
-  defp ordered_to_maps(%Jason.OrderedObject{values: values}) do
+  defp ordered_to_maps(%CodexPooler.JSON.OrderedObject{values: values}) do
     keys = Enum.map(values, &elem(&1, 0))
 
     if length(keys) == MapSet.size(MapSet.new(keys)) do

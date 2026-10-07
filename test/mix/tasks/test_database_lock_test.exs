@@ -1,14 +1,18 @@
 defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
   use ExUnit.Case, async: false
+  use CodexPooler.CommittedWriteGuard
 
   alias CodexPooler.MixTasks.TestDatabaseLock
   alias CodexPooler.Repo
 
   @lock_namespace "codex_pooler_test_runner"
   @lock_database "postgres"
-  @lock_wait_attempts 50
-  @scenario_timeout_ms 5_000
   @detection_timeout_ms 15_000
+  # A lock holder waits for its release message, which the test sends only
+  # after up to two detection budgets of its own (the second caller's entry and
+  # its advisory-lock wait); the wait outlasts that chain so the late step, not
+  # the holder, reports the failure. A green run never spends it.
+  @handoff_timeout_ms 3 * @detection_timeout_ms
   @connection_keys [
     :after_connect,
     :connect_timeout,
@@ -41,7 +45,7 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
           receive do
             :release_first -> :first_released
           after
-            @scenario_timeout_ms -> raise "timed out waiting to release first lock holder"
+            @handoff_timeout_ms -> raise "timed out waiting to release first lock holder"
           end
         end)
       end)
@@ -93,7 +97,7 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
           receive do
             :release_first_distinct_lock -> :first_distinct_lock_released
           after
-            @scenario_timeout_ms -> raise "timed out waiting to release first distinct lock"
+            @handoff_timeout_ms -> raise "timed out waiting to release first distinct lock"
           end
         end)
       end)
@@ -115,23 +119,27 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
     assert Task.await(second, @detection_timeout_ms) == :second_distinct_lock_released
   end
 
-  defp assert_advisory_lock_waiter!(conn, repo_config, attempts \\ @lock_wait_attempts)
-
-  defp assert_advisory_lock_waiter!(conn, repo_config, attempts) when attempts > 0 do
-    if advisory_lock_waiter?(conn, repo_config) do
-      :ok
-    else
-      receive do
-      after
-        20 -> assert_advisory_lock_waiter!(conn, repo_config, attempts - 1)
-      end
-    end
+  # `pg_locks` has no completion signal for a backend joining the lock queue, so
+  # poll it against one monotonic detection deadline.
+  defp assert_advisory_lock_waiter!(conn, repo_config) do
+    deadline = System.monotonic_time(:millisecond) + @detection_timeout_ms
+    await_advisory_lock_waiter!(conn, repo_config, deadline)
   end
 
-  defp assert_advisory_lock_waiter!(_conn, repo_config, 0) do
-    flunk(
-      "expected a PostgreSQL advisory lock waiter for #{Keyword.fetch!(repo_config, :database)}"
-    )
+  defp await_advisory_lock_waiter!(conn, repo_config, deadline) do
+    cond do
+      advisory_lock_waiter?(conn, repo_config) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected a PostgreSQL advisory lock waiter for #{Keyword.fetch!(repo_config, :database)}")
+
+      true ->
+        receive do
+        after
+          20 -> await_advisory_lock_waiter!(conn, repo_config, deadline)
+        end
+    end
   end
 
   defp advisory_lock_waiter?(conn, repo_config) do
@@ -185,6 +193,15 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
     previous_namespace = System.get_env("CODEX_POOLER_TEST_RUN_NAMESPACE")
     previous_partition = System.get_env("MIX_TEST_PARTITION")
 
+    restore = fn ->
+      restore_env("CODEX_POOLER_TEST_RUN_NAMESPACE", previous_namespace)
+      restore_env("MIX_TEST_PARTITION", previous_partition)
+    end
+
+    # Also on_exit: the ExUnit timeout kills the test before `after` runs, and every later run
+    # of the config reader in this VM would resolve the namespaced database.
+    on_exit(restore)
+
     System.put_env("CODEX_POOLER_TEST_RUN_NAMESPACE", namespace)
     System.put_env("MIX_TEST_PARTITION", Integer.to_string(partition))
 
@@ -192,8 +209,7 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
       config = Config.Reader.read!("config/test.exs", env: :test)
       config[:codex_pooler][CodexPooler.Repo][:database]
     after
-      restore_env("CODEX_POOLER_TEST_RUN_NAMESPACE", previous_namespace)
-      restore_env("MIX_TEST_PARTITION", previous_partition)
+      restore.()
     end
   end
 

@@ -83,6 +83,15 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     }
   end
 
+  defp safe_same_cycle_used(observed_at, reset_at, used_percent) do
+    floating_zero(observed_at,
+      reset_at: reset_at,
+      reset_after_seconds: DateTime.diff(reset_at, observed_at, :second),
+      metadata: safe_status()
+    )
+    |> Map.put(:used_percent, Decimal.new(used_percent))
+  end
+
   defp account_row(identity) do
     Repo.one(
       from w in AccountQuotaWindow,
@@ -153,8 +162,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
     assert events == [
              {%{count: 1}, %{scope: "account", decision: :candidate, source: "provider_usage"}},
-             {%{count: 1},
-              %{scope: "account", decision: :anchored_confirmed, source: "provider_usage"}}
+             {%{count: 1}, %{scope: "account", decision: :anchored_confirmed, source: "provider_usage"}}
            ]
 
     assert log =~ "quota_cycle_decision decision=candidate reason=candidate_restarted"
@@ -196,6 +204,57 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
     row = account_row(identity)
     assert Decimal.compare(row.used_percent, Decimal.new("100")) == :eq
+  end
+
+  test "two safe lower same-cycle Usage API observations converge a retained exhausted measurement" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+
+    assert {:ok, _row} =
+             exhausted_row!(identity, t0,
+               reset_at: fixed_anchor,
+               metadata: %{"reset_after_seconds" => DateTime.diff(fixed_anchor, t0, :second)}
+             )
+
+    candidate_at = DateTime.add(t0, 1, :minute)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_same_cycle_used(candidate_at, fixed_anchor, "32"),
+               candidate_at,
+               candidate_at
+             )
+
+    pending = account_row(identity)
+    assert Decimal.equal?(pending.used_percent, Decimal.new("100"))
+    assert {:ok, candidate} = EvidenceStore.parse_candidate(pending.metadata)
+    assert Decimal.equal?(candidate.used_percent, Decimal.new("32"))
+    assert EvidenceStore.candidate_provider_status_safe?(pending.metadata)
+
+    confirmed_at = DateTime.add(candidate_at, 1, :minute)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_same_cycle_used(confirmed_at, fixed_anchor, "32"),
+               confirmed_at,
+               confirmed_at
+             )
+
+    confirmed = account_row(identity)
+    assert Decimal.equal?(confirmed.used_percent, Decimal.new("32"))
+    assert DateTime.compare(confirmed.observed_at, confirmed_at) == :eq
+    refute Map.has_key?(confirmed.metadata, "__quota_confirmed_candidate_v1")
+    refute Map.has_key?(confirmed.metadata, "__quota_candidate_provider_status_v1")
+
+    assert %{
+             eligible?: true,
+             routing_state: :weekly_only_probe,
+             exclusions: [],
+             selection: %{blocked_windows: []}
+           } = Windows.routing_quota_eligibility(identity, at: confirmed_at)
   end
 
   test "safe fixed same-anchor observations confirm an exhausted weekly restart" do
@@ -466,8 +525,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
            ]
 
     assert confirmation_events == [
-             {%{count: 1},
-              %{scope: "account", decision: :anchored_confirmed, source: "provider_usage"}}
+             {%{count: 1}, %{scope: "account", decision: :anchored_confirmed, source: "provider_usage"}}
            ]
 
     assert log =~ "reason=same_anchor_allowed_confirmation"
@@ -536,21 +594,15 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
        end},
       {:stale_provider_time,
        fn candidate_at, confirmed_at, fixed_anchor ->
-         safe_fixed_zero(confirmed_at, fixed_anchor,
-           provider_at: DateTime.add(candidate_at, -20, :minute)
-         )
+         safe_fixed_zero(confirmed_at, fixed_anchor, provider_at: DateTime.add(candidate_at, -20, :minute))
        end},
       {:future_provider_time,
        fn _candidate_at, confirmed_at, fixed_anchor ->
-         safe_fixed_zero(confirmed_at, fixed_anchor,
-           provider_at: DateTime.add(confirmed_at, 1, :second)
-         )
+         safe_fixed_zero(confirmed_at, fixed_anchor, provider_at: DateTime.add(confirmed_at, 1, :second))
        end},
       {:future_event_time,
        fn _candidate_at, confirmed_at, fixed_anchor ->
-         safe_fixed_zero(DateTime.add(confirmed_at, 1, :second), fixed_anchor,
-           provider_at: confirmed_at
-         )
+         safe_fixed_zero(DateTime.add(confirmed_at, 1, :second), fixed_anchor, provider_at: confirmed_at)
        end},
       {:out_of_order_event,
        fn candidate_at, _confirmed_at, fixed_anchor ->
@@ -606,8 +658,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
   test "same-anchor confirmation rejects reset, identity, source, and window mismatches" do
     cases = [
-      {:reset,
-       fn evidence -> Map.put(evidence, :reset_at, DateTime.add(evidence.reset_at, 301)) end},
+      {:reset, fn evidence -> Map.put(evidence, :reset_at, DateTime.add(evidence.reset_at, 301)) end},
       {:identity, fn evidence -> Map.put(evidence, :quota_key, "other_account") end},
       {:source, fn evidence -> Map.put(evidence, :source, "codex_response_headers") end},
       {:window, fn evidence -> Map.put(evidence, :window_kind, "primary") end}
@@ -843,9 +894,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
              )
 
     assert {:ok, _row} =
-             used_row!(identity, DateTime.add(candidate_at, 60, :second), "100",
-               reset_at: canonical_reset
-             )
+             used_row!(identity, DateTime.add(candidate_at, 60, :second), "100", reset_at: canonical_reset)
 
     row = account_row(identity)
     refute Map.has_key?(row.metadata, "__quota_confirmed_candidate_v1")
@@ -2114,9 +2163,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     legacy_row = account_row(identity)
 
     legacy_row
-    |> Ecto.Changeset.change(
-      metadata: Map.delete(legacy_row.metadata, "__quota_relative_liveness_v1")
-    )
+    |> Ecto.Changeset.change(metadata: Map.delete(legacy_row.metadata, "__quota_relative_liveness_v1"))
     |> Repo.update!()
 
     cached_positive_at = DateTime.add(base, 7, :minute)
@@ -2239,6 +2286,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
   defp capture_info_log(fun) when is_function(fun, 0) do
     previous_level = Logger.level()
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> Logger.configure(level: previous_level) end)
     Logger.configure(level: :info)
 
     try do
@@ -2410,6 +2459,9 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
   defp capture_quota_cycle_events(fun) when is_function(fun, 0) do
     parent = self()
     handler_id = "weekly-restart-quota-cycle-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

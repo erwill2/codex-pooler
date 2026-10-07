@@ -6,6 +6,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
   import Ecto.Changeset
 
   alias CodexPooler.Gateway.OperationalSettings.IPRules
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
   alias CodexPooler.InstanceSettings.{AppSecretCrypto, Defaults, StaticDefaults}
   alias CodexPooler.RouteClass
 
@@ -26,6 +27,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
     :upstream_connect_timeout_ms,
     :upstream_pool_timeout_ms,
     :upstream_receive_timeout_ms,
+    :upstream_conn_max_idle_time_ms,
+    :upstream_token_refresh_margin_seconds,
+    :upstream_token_refresh_proactive_enabled,
     :expired_alias_ttl_seconds,
     :bridge_owner_lease_ttl_seconds,
     :bridge_owner_lease_renewal_seconds,
@@ -48,6 +52,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
       field :upstream_connect_timeout_ms, :integer
       field :upstream_pool_timeout_ms, :integer
       field :upstream_receive_timeout_ms, :integer
+      field :upstream_conn_max_idle_time_ms, :integer
+      field :upstream_token_refresh_margin_seconds, :integer
+      field :upstream_token_refresh_proactive_enabled, :boolean
       field :expired_alias_ttl_seconds, :integer
       field :bridge_owner_lease_ttl_seconds, :integer
       field :bridge_owner_lease_renewal_seconds, :integer
@@ -87,6 +94,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
     embeds_one :operator, Operator, on_replace: :update, primary_key: false do
       field :login_base_url, :string
+      field :openai_status_polling_enabled, :boolean, default: true
     end
 
     embeds_one :catalog, Catalog, on_replace: :update, primary_key: false do
@@ -106,7 +114,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
       field :bearer_token_hmac_digest, :string
       field :bearer_token_fingerprint, :string
       field :bearer_token_key_version, :string
-      field :bearer_token, :string, virtual: true
+      field :bearer_token, :string, virtual: true, redact: true
       field :bearer_token_action, :string, virtual: true
 
       field :bearer_token_status, Ecto.Enum,
@@ -123,11 +131,11 @@ defmodule CodexPooler.InstanceSettings.Settings do
       field :ssl, :boolean
       field :tls, :string
       field :retries, :integer
-      field :password_ciphertext, :string
-      field :password_nonce, :string
+      field :password_ciphertext, :string, redact: true
+      field :password_nonce, :string, redact: true
       field :password_aad, :map
       field :password_key_version, :string
-      field :password, :string, virtual: true
+      field :password, :string, virtual: true, redact: true
       field :password_action, :string, virtual: true
 
       field :password_status, Ecto.Enum,
@@ -233,6 +241,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
       :upstream_connect_timeout_ms,
       :upstream_pool_timeout_ms,
       :upstream_receive_timeout_ms,
+      :upstream_conn_max_idle_time_ms,
+      :upstream_token_refresh_margin_seconds,
+      :upstream_token_refresh_proactive_enabled,
       :expired_alias_ttl_seconds,
       :bridge_owner_lease_ttl_seconds,
       :bridge_owner_lease_renewal_seconds,
@@ -251,6 +262,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
       :upstream_connect_timeout_ms,
       :upstream_pool_timeout_ms,
       :upstream_receive_timeout_ms,
+      :upstream_conn_max_idle_time_ms,
+      :upstream_token_refresh_margin_seconds,
+      :upstream_token_refresh_proactive_enabled,
       :expired_alias_ttl_seconds,
       :bridge_owner_lease_ttl_seconds,
       :bridge_owner_lease_renewal_seconds,
@@ -273,9 +287,27 @@ defmodule CodexPooler.InstanceSettings.Settings do
     |> validate_positive_integer(:upstream_connect_timeout_ms)
     |> validate_positive_integer(:upstream_pool_timeout_ms)
     |> validate_positive_integer(:upstream_receive_timeout_ms)
+    |> validate_number(:upstream_conn_max_idle_time_ms,
+      greater_than_or_equal_to: 1_000,
+      less_than_or_equal_to: 3_600_000
+    )
+    # The lower bound keeps the proactive refresh margin far above the
+    # 15-minute recovery cadence, so a pass can still act before the deadline.
+    # The upper bound sits above the observed access-token lifetime, which lets
+    # an operator hold every idle identity permanently inside the margin, paced
+    # only by the recovery cooldown, without accepting an unbounded value.
+    |> validate_number(:upstream_token_refresh_margin_seconds,
+      greater_than_or_equal_to: 3_600,
+      less_than_or_equal_to: 1_209_600
+    )
     |> validate_positive_integer(:expired_alias_ttl_seconds)
-    |> validate_positive_integer(:bridge_owner_lease_ttl_seconds)
+    # A lease shorter than this cannot outlive one full pre-dispatch database
+    # statement plus the synchronous renewal; `OwnerRenewalSchedule` derives it.
+    |> validate_number(:bridge_owner_lease_ttl_seconds,
+      greater_than_or_equal_to: OwnerRenewalSchedule.minimum_lease_ttl_seconds()
+    )
     |> validate_positive_integer(:bridge_owner_lease_renewal_seconds)
+    |> validate_owner_lease_renewal_within_ttl()
     |> validate_positive_integer(:circuit_failure_threshold)
     |> validate_positive_integer(:circuit_open_seconds)
     |> validate_positive_integer(:circuit_half_open_probe_limit)
@@ -362,8 +394,8 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
   defp operator_changeset(operator, attrs) do
     operator
-    |> cast(attrs, [:login_base_url])
-    |> validate_required([:login_base_url])
+    |> cast(attrs, [:login_base_url, :openai_status_polling_enabled])
+    |> validate_required([:login_base_url, :openai_status_polling_enabled])
     |> update_change(:login_base_url, &normalize_operator_app_url/1)
     |> validate_format(:login_base_url, ~r/^https?:\/\//)
     |> validate_change(:login_base_url, &validate_operator_app_url/2)
@@ -599,6 +631,35 @@ defmodule CodexPooler.InstanceSettings.Settings do
     validate_number(changeset, field, greater_than: 0)
   end
 
+  # Every owner (HTTP heartbeat and websocket owner) renews at most every
+  # ttl / 3, so a live owner gets at least two renewal attempts before its
+  # lease expires; a renewal setting above that is refused here and lowered at
+  # read time (findings#206 row 206-499). The ttl compared is the one in
+  # effect, raised to its minimum. Checked only when either field changes,
+  # like every other gateway validation, so an unrelated save still succeeds.
+  defp validate_owner_lease_renewal_within_ttl(changeset) do
+    renewal = get_field(changeset, :bridge_owner_lease_renewal_seconds)
+    ttl = get_field(changeset, :bridge_owner_lease_ttl_seconds)
+
+    changed? =
+      changed?(changeset, :bridge_owner_lease_renewal_seconds) or
+        changed?(changeset, :bridge_owner_lease_ttl_seconds)
+
+    maximum =
+      if is_integer(ttl) and ttl > 0,
+        do: OwnerRenewalSchedule.maximum_renewal_seconds(max(ttl, OwnerRenewalSchedule.minimum_lease_ttl_seconds()))
+
+    if changed? and is_integer(renewal) and is_integer(maximum) and renewal > maximum do
+      add_error(changeset, :bridge_owner_lease_renewal_seconds, "must be less than or equal to %{number}, a third of the owner lease TTL",
+        validation: :number,
+        kind: :less_than_or_equal_to,
+        number: maximum
+      )
+    else
+      changeset
+    end
+  end
+
   defp validate_cidr_rules(field, rules) do
     case IPRules.compile(rules) do
       {:ok, _compiled} -> []
@@ -619,8 +680,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
       true ->
         [
-          bulkheads:
-            "must contain positive max_concurrency, non-negative queue_limit, and positive queue_timeout_ms"
+          bulkheads: "must contain positive max_concurrency, non-negative queue_limit, and positive queue_timeout_ms"
         ]
     end
   end

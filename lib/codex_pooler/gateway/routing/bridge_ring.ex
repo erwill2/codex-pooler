@@ -17,19 +17,15 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
-  alias CodexPooler.Gateway.Persistence.{
-    BridgeAffinity,
-    BridgeDemotion,
-    CodexSession,
-    RoutingCircuitState
-  }
-
-  alias CodexPooler.Gateway.Routing.BridgeRing.{Metadata, Status}
+  alias CodexPooler.Gateway.Persistence.{BridgeAffinity, BridgeDemotion, CodexSession}
+  alias CodexPooler.Gateway.Routing.AffinityTelemetry
+  alias CodexPooler.Gateway.Routing.BridgeRing.Metadata
   alias CodexPooler.Gateway.Routing.CandidateEligibility.Quota, as: QuotaEligibility
+  alias CodexPooler.Gateway.Routing.ProviderCredits
   alias CodexPooler.Gateway.Routing.RoutePlanInput
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
-  alias CodexPooler.Pools.{Pool, RoutingSettings}
   alias CodexPooler.Pools.Routing, as: PoolRouting
+  alias CodexPooler.Pools.RoutingSettings
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
@@ -39,11 +35,24 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   @default_strategy "bridge_ring"
   @default_ring_size 3
   @demotion_seconds 60
+  # A first overload is a brief skip rather than a verdict: long enough to move
+  # the next turn or two off the account, short enough that one cold prompt is
+  # the worst it can cost. A second overload while the first window is still
+  # open is the repeat this exists to prevent, so it extends. The window is the
+  # whole penalty: a success does not cut a live one short, so the steering
+  # lasts exactly as long as it says it does. See `resolve_demotions!/3`.
+  @overload_demotion_seconds 20
+  @overload_repeat_demotion_seconds 120
+  @overload_reason_code "provider_overloaded"
   @prompt_cache_affinity_kind "prompt_cache"
-  @affinity_conflict_target {:unsafe_fragment,
-                             "(pool_id, api_key_id, model_identifier, affinity_kind, affinity_key_hash) WHERE status = 'active'"}
-  @demotion_conflict_target {:unsafe_fragment,
-                             "(pool_id, api_key_id, model_identifier, pool_upstream_assignment_id) WHERE status = 'active'"}
+  @unusable_prompt_cache_key_reasons %{
+    blank: "prompt_cache_key_blank",
+    oversized: "prompt_cache_key_oversized",
+    invalid: "prompt_cache_key_invalid",
+    route_excluded: "route_excluded"
+  }
+  @affinity_conflict_target {:unsafe_fragment, "(pool_id, api_key_id, model_identifier, affinity_kind, affinity_key_hash) WHERE status = 'active'"}
+  @demotion_conflict_target {:unsafe_fragment, "(pool_id, api_key_id, model_identifier, pool_upstream_assignment_id) WHERE status = 'active'"}
 
   @type candidate :: {PoolUpstreamAssignment.t(), UpstreamIdentity.t()}
   @type routing_auth :: Access.auth_context()
@@ -69,17 +78,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
           locality: map(),
           model_serving_mode_snapshot: RequestOptions.Routing.model_serving_mode_snapshot() | nil,
           request_metadata: map(),
-          selected_assignment_id: Ecto.UUID.t() | nil
+          selected_assignment_id: Ecto.UUID.t() | nil,
+          planned_at: DateTime.t()
         }
-  @type routing_status :: %{
-          settings: RoutingSettings.t() | nil,
-          active_affinity_count: non_neg_integer(),
-          active_demotion_count: non_neg_integer(),
-          active_circuit_count: non_neg_integer(),
-          recent_demotions: [BridgeDemotion.t()],
-          recent_circuits: [RoutingCircuitState.t()]
-        }
-
   @type plan_input :: %{
           required(:auth) => routing_auth(),
           required(:model) => Model.t(),
@@ -101,12 +102,18 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       )
       when is_list(candidates) do
     route_state = Map.get(input, :route_state)
+    # The turn's own start mark. One plan is built per turn, before dispatch, so
+    # this is the wall clock the turn's success may reason about: demotion state
+    # written after it is state this turn was never in a position to disprove.
+    planned_at = now()
     settings = routing_settings(auth, route_state)
     affinity = affinity_context(auth, model, route_plan_input, request_options, settings)
     demotions = active_demotions(auth, model, candidates)
 
     prompt_cache_locality =
       prompt_cache_locality_context(auth, model, request_options, settings, affinity, candidates)
+
+    session_preference = codex_session_preference_context(request_options, candidates)
 
     ordered =
       strategy_order_unless_prompt_cache_locality(
@@ -119,10 +126,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       )
       |> apply_prompt_cache_locality(prompt_cache_locality)
       |> apply_affinity(affinity)
-      |> apply_codex_session_preference(request_options)
-      |> apply_reserve_mode_tier(model, request_options, route_state)
-      |> apply_demotions(demotions)
-      |> apply_windowless_tier(model, route_state)
+      |> apply_codex_session_preference(session_preference)
+      |> apply_quota_tier_and_demotions(demotions, model, request_options, route_state)
 
     ring_size = max(settings.bridge_ring_size || @default_ring_size, 1)
     candidates = Enum.take(ordered, ring_size)
@@ -145,9 +150,11 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
           demotions,
           selected,
           prompt_cache_locality,
-          model_serving_mode_snapshot
+          model_serving_mode_snapshot,
+          session_preference
         ),
-      selected_assignment_id: selected && elem(selected, 0).id
+      selected_assignment_id: selected && elem(selected, 0).id,
+      planned_at: planned_at
     }
   end
 
@@ -157,12 +164,20 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
     if affinity.enabled? and affinity.key_hash do
       locked_side_effect(:affinity_upsert, assignment, identity, fn ->
-        upsert_affinity!(plan, assignment, identity, now)
+        upsert_existing_key_affinity(plan, assignment, identity, now)
       end)
     end
 
     resolve_demotions!(plan, assignment, now)
     :ok
+  end
+
+  defp upsert_existing_key_affinity(plan, assignment, identity, now) do
+    # The admitted turn may outlive deletion of its key. Hold the reader lock
+    # through the insert, or skip the obsolete hint when deletion already won.
+    if Access.lock_api_key_for_read(plan_affinity_scope(plan, :api_key_id)) do
+      upsert_affinity!(plan, assignment, identity, now)
+    end
   end
 
   @spec record_failure(
@@ -187,15 +202,85 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     reason_code
   end
 
+  @doc """
+  Records an ordering-only demotion for a provider overload terminal.
+
+  An overload says the provider refused the work, not that the account is
+  unhealthy, so this deliberately does less than `record_failure/5`: it writes
+  the demotion and nothing else. No affinity miss, because the session's prompt
+  cache must survive one overload; no circuit state, because the terminal stays
+  health-neutral by contract. The penalty is ordering inside the candidate's
+  quota tier, so an overloaded account is still reachable behind the others.
+  """
+  @spec record_overload(
+          route_plan(),
+          PoolUpstreamAssignment.t(),
+          UpstreamIdentity.t(),
+          term()
+        ) :: String.t()
+  def record_overload(plan, assignment, identity, request_id \\ nil) do
+    now = now()
+
+    locked_side_effect(:overload_demotion_upsert, assignment, identity, fn ->
+      seconds = overload_demotion_seconds(plan, assignment, now)
+
+      upsert_overload_demotion!(
+        plan,
+        assignment,
+        identity,
+        request_id,
+        now,
+        seconds
+      )
+    end)
+
+    @overload_reason_code
+  end
+
   # The upsert's implicit FK checks lock the assignment row before the identity
   # row, inverting the canonical identity-first order used by credential
-  # fencing and reconciliation guards (production 40P01, 2026-07-22). Taking
+  # fencing and reconciliation guards (an observed production 40P01). Taking
   # the canonical reference locks first removes the cycle; lock or ownership
   # failures degrade to a logged skip because routing bookkeeping must never
-  # fail an already-finalized turn. A residual deadlock first drains the
-  # assignment holder without retaining the identity lock, then retries once.
+  # fail an already-finalized turn. Standalone, a residual deadlock first
+  # drains the assignment holder without retaining the identity lock, then
+  # retries once. Inside a caller-owned transaction (a `before_finalize`
+  # callback runs inside the finalization transaction) the side effect runs
+  # under its own savepoint, so a missing pair or a deadlock still degrades to
+  # a skip instead of rolling back the caller's work; the retry needs a fresh
+  # transaction and is not attempted there (findings#221).
   defp locked_side_effect(side_effect, assignment, identity, fun) do
-    run_locked_side_effect(side_effect, assignment, identity, fun, _retry_left = 1)
+    if Repo.in_transaction?() do
+      run_locked_side_effect_in_savepoint(side_effect, assignment, identity, fun)
+    else
+      run_locked_side_effect(side_effect, assignment, identity, fun, _retry_left = 1)
+    end
+  end
+
+  @side_effect_savepoint "routing_side_effect"
+
+  defp run_locked_side_effect_in_savepoint(side_effect, assignment, identity, fun) do
+    Repo.query!("SAVEPOINT #{@side_effect_savepoint}")
+
+    case ReferenceLocks.lock_and_validate(identity.id, assignment.id) do
+      {:ok, _locked} ->
+        fun.()
+        Repo.query!("RELEASE SAVEPOINT #{@side_effect_savepoint}")
+        :ok
+
+      {:error, reason} ->
+        Repo.query!("ROLLBACK TO SAVEPOINT #{@side_effect_savepoint}")
+        log_skipped_side_effect(side_effect, assignment, identity, skip_code(reason))
+    end
+  rescue
+    error in Postgrex.Error ->
+      Repo.query!("ROLLBACK TO SAVEPOINT #{@side_effect_savepoint}")
+
+      if deadlock?(error) do
+        log_skipped_side_effect(side_effect, assignment, identity, "routing_side_effect_deadlock")
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   defp run_locked_side_effect(side_effect, assignment, identity, fun, retry_left) do
@@ -265,9 +350,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   @spec demotion_metadata(term()) :: map()
   defdelegate demotion_metadata(reason_code), to: Metadata
-
-  @spec routing_status(Pool.t() | Ecto.UUID.t() | term()) :: routing_status()
-  defdelegate routing_status(pool_or_id), to: Status
 
   defp strategy_order("deterministic_rotation", candidates, _model, seed, _route_state) do
     rotate_candidates(candidates, seed)
@@ -353,7 +435,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       enabled?: enabled?,
       kind: kind,
       key_hash: key_hash,
-      seed: key_value || input.correlation_id,
+      seed: routing_seed(kind, key_value, key_hash, input.correlation_id),
       row: affinity,
       status: affinity_status(enabled?, affinity),
       fallback_reason: nil,
@@ -378,6 +460,13 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
     :crypto.hash(:sha256, canonical_key)
   end
+
+  defp routing_seed("idempotency_key", _key_value, key_hash, _correlation_id)
+       when is_binary(key_hash),
+       do: key_hash
+
+  defp routing_seed(_kind, key_value, _key_hash, correlation_id),
+    do: key_value || correlation_id
 
   defp active_affinity(auth, model, kind, key_hash) do
     active_status = BridgeAffinity.active_status()
@@ -408,20 +497,85 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     matched ++ rest
   end
 
-  defp apply_codex_session_preference(
-         candidates,
-         %RequestOptions{
-           continuity: %{codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}}
+  # The preference has to be applied here and not only in pre-dispatch:
+  # `strategy_order/5` re-sorts the whole shortlist, so an ordering applied
+  # before planning never survives to the selected candidate. It stays a
+  # preference — quota tier and demotion ordering still run after it.
+  defp apply_codex_session_preference(candidates, %{
+         status: "applied",
+         assignment_id: assignment_id
+       }),
+       do: prefer_assignment(candidates, assignment_id)
+
+  defp apply_codex_session_preference(candidates, _preference), do: candidates
+
+  # Decided once, before ordering, so the request metadata reports the same
+  # decision the ring acted on instead of re-deriving it from the session.
+  # `status` records whether the wanted assignment was among the eligible
+  # candidates at all: `prefer_assignment/2` hoists nothing when it is absent,
+  # so without this a preference that found nothing would be indistinguishable
+  # from one that was honoured.
+  defp codex_session_preference_context(%RequestOptions{} = request_options, candidates) do
+    case codex_session_preference(request_options) do
+      {kind, assignment_id} ->
+        %{
+          kind: kind,
+          assignment_id: assignment_id,
+          status: preference_status(candidates, assignment_id)
+        }
+
+      nil ->
+        %{}
+    end
+  end
+
+  defp codex_session_preference(%RequestOptions{
+         continuity: %{codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}}
+       })
+       when is_binary(assignment_id),
+       do: {"pinned", assignment_id}
+
+  # A session recreated after owner-lease expiry has no durable pin yet; the
+  # replacement carries the closed session's assignment in memory instead.
+  defp codex_session_preference(%RequestOptions{
+         continuity: %{
+           codex_session: %CodexSession{
+             pool_upstream_assignment_id: nil,
+             recreated_from_assignment_id: assignment_id
+           }
          }
-       )
-       when is_binary(assignment_id) do
+       })
+       when is_binary(assignment_id),
+       do: {"recreated", assignment_id}
+
+  # A session a native websocket upgrade opened on a window no session knew
+  # carries its thread's previous window's assignment the same way
+  # (findings#270 row 270-283).
+  defp codex_session_preference(%RequestOptions{
+         continuity: %{
+           codex_session: %CodexSession{
+             pool_upstream_assignment_id: nil,
+             previous_window_assignment_id: assignment_id
+           }
+         }
+       })
+       when is_binary(assignment_id),
+       do: {"previous_window", assignment_id}
+
+  defp codex_session_preference(%RequestOptions{}), do: nil
+
+  defp preference_status(candidates, assignment_id) do
+    if Enum.any?(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end),
+      do: "applied",
+      else: "candidate_unavailable"
+  end
+
+  defp prefer_assignment(candidates, assignment_id) do
     {matched, rest} =
       Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
 
     matched ++ rest
   end
-
-  defp apply_codex_session_preference(candidates, %RequestOptions{}), do: candidates
 
   defp apply_prompt_cache_locality(candidates, %{status: "applied", seed: seed}) do
     Enum.sort_by(candidates, fn {assignment, _identity} ->
@@ -452,10 +606,29 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     |> Map.put(:seed, seed)
     |> Map.put(:seed_basis_class, seed_basis_class(seed))
     |> Map.put(:seed_fingerprint, fingerprint(seed))
-    |> Map.merge(
-      prompt_cache_locality_status(settings, affinity, prompt_cache_key, candidate_count)
-    )
+    |> Map.merge(prompt_cache_locality_status(opts, settings, affinity, prompt_cache_key, candidate_count))
   end
+
+  # A websocket turn never carries a routing copy of `prompt_cache_key`
+  # (`RequestOptions.for_websocket/2` drops it whatever the client sent: that
+  # transport follows the session's assignment), so its reason names the
+  # transport instead of claiming the client omitted the key (findings#255
+  # row 255-40). Diagnostic only; the ordering is unchanged.
+  defp prompt_cache_locality_status(%RequestOptions{transport: %{transport: "websocket"}}, _settings, _affinity, _prompt_cache_key, _candidate_count) do
+    %{status: "unavailable", applied?: false, unhonored_reason: "websocket_transport"}
+  end
+
+  # A key the client sent but that cannot seed locality names the bound that
+  # refused it rather than reading as absent (findings#255 row 255-81), and a
+  # route that never takes a seed says so whatever the body carried (row
+  # 255-80). Diagnostic only; the routing copy is nil either way.
+  defp prompt_cache_locality_status(%RequestOptions{routing: %{prompt_cache_key: nil, prompt_cache_key_state: state}}, _settings, _affinity, _prompt_cache_key, _candidate_count)
+       when is_map_key(@unusable_prompt_cache_key_reasons, state) do
+    %{status: "unavailable", applied?: false, unhonored_reason: Map.fetch!(@unusable_prompt_cache_key_reasons, state)}
+  end
+
+  defp prompt_cache_locality_status(%RequestOptions{}, settings, affinity, prompt_cache_key, candidate_count),
+    do: prompt_cache_locality_status(settings, affinity, prompt_cache_key, candidate_count)
 
   defp prompt_cache_locality_status(_settings, _affinity, prompt_cache_key, _candidate_count)
        when not (is_binary(prompt_cache_key) and prompt_cache_key != "") do
@@ -574,41 +747,26 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     |> Map.new(&{&1.pool_upstream_assignment_id, &1})
   end
 
-  defp apply_demotions(candidates, demotions) when map_size(demotions) == 0, do: candidates
+  # Capacity basis is outermost; affinity, strategy and demotion never promote
+  # a credit-dependent candidate above a compatible non-credit candidate.
+  defp apply_quota_tier_and_demotions(candidates, demotions, %Model{} = model, request_options, route_state) do
+    Enum.sort_by(candidates, fn {assignment, identity} = candidate ->
+      reserve_tier =
+        if explicit_reserve_request?(request_options) or
+             not candidate_in_reserve_mode?(identity, model, route_state),
+           do: 0,
+           else: 1
 
-  defp apply_demotions(candidates, demotions) do
-    {active, demoted} =
-      Enum.split_with(candidates, fn {assignment, _identity} ->
-        not Map.has_key?(demotions, assignment.id)
-      end)
-
-    active ++ demoted
+      {capacity_tier(model, candidate, route_state), reserve_tier, Map.has_key?(demotions, assignment.id)}
+    end)
   end
-
-  defp apply_reserve_mode_tier(
-         candidates,
-         %Model{} = model,
-         %RequestOptions{} = request_options,
-         %RouteState{} = route_state
-       ) do
-    if explicit_reserve_request?(request_options) do
-      candidates
-    else
-      {reserve, standard} =
-        Enum.split_with(candidates, fn {_assignment, identity} ->
-          candidate_in_reserve_mode?(identity, model, route_state)
-        end)
-
-      standard ++ reserve
-    end
-  end
-
-  defp apply_reserve_mode_tier(candidates, %Model{}, _request_options, nil), do: candidates
 
   defp explicit_reserve_request?(%RequestOptions{} = request_options) do
     request_options.routing.reserve_mode? == true or
       request_options.routing.requested_model in ["gpt-reserve", "gpt_reserve"]
   end
+
+  defp candidate_in_reserve_mode?(_identity, %Model{}, nil), do: false
 
   defp candidate_in_reserve_mode?(identity, %Model{} = model, %RouteState{} = route_state) do
     snapshot = RouteState.quota_snapshot_for_identity(route_state, identity)
@@ -626,70 +784,183 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     end
   end
 
-  defp apply_windowless_tier(candidates, %Model{} = model, %RouteState{} = route_state) do
-    {windowless, ordinary} =
-      Enum.split_with(candidates, &QuotaEligibility.windowless_candidate?(model, &1, route_state))
+  defp capacity_tier(%Model{}, _candidate, nil), do: 0
 
-    ordinary ++ windowless
+  defp capacity_tier(%Model{} = model, {_assignment, identity}, %RouteState{} = route_state) do
+    snapshot = RouteState.quota_snapshot_for_identity(route_state, identity)
+    context = ProviderCredits.request_context(model)
+    eligibility = ProviderCredits.eligibility(snapshot, context)
+    if ProviderCredits.non_credit_basis?(eligibility.capacity_basis), do: 0, else: ProviderCredits.tier(eligibility)
   end
 
-  defp apply_windowless_tier(candidates, %Model{}, nil), do: candidates
-
+  # One affinity row is one event record: the assignment, the identity, the
+  # metadata and the timestamps all describe the same completed turn, so one
+  # ordering key governs the whole tuple. The key is `updated_at`, carrying the
+  # writer's own clock at the moment the outcome landed, and a writer whose
+  # event is older than the stored one applies nothing at all. Fencing only the
+  # timestamps — which is what `GREATEST` on `last_hit_at`/`updated_at` did —
+  # leaves the routing hint free to move backwards under a timestamp that
+  # belongs to a different turn, which is the split this rule removes.
+  #
+  # The key is completion time and not plan time because the row is already a
+  # completion record: `last_hit_at` is stamped when a success lands, its
+  # counterpart `last_miss_at` when a failure does, and `metadata.source` says
+  # `gateway_success`. "The latest completed outcome for this key" is therefore
+  # the meaning the existing columns carry, and it needs no new durable marker.
+  # Keying on plan time would mean persisting a plan-time column and redefining
+  # `last_hit_at` away from its name, which is more machinery than this deserves:
+  # `apply_affinity/2` only promotes the named assignment within an already
+  # eligible shortlist, so a stale hint costs ordering, never admission.
+  #
+  # `insert_all/3` rather than `insert!/2` because a fenced conflict clause
+  # updates no row when it refuses, and `Repo.insert!/2` raises
+  # `Ecto.StaleEntryError` on exactly that. Refusing is the fence working, and
+  # routing bookkeeping must never fail a turn whose work is already finalized.
   defp upsert_affinity!(plan, assignment, identity, now) do
     metadata = %{"source" => "gateway_success"}
 
     on_conflict =
       from affinity in BridgeAffinity,
+        where: affinity.updated_at <= fragment("EXCLUDED.updated_at"),
         update: [
           set: [
             pool_upstream_assignment_id: ^assignment.id,
             upstream_identity_id: ^identity.id,
-            last_hit_at:
-              fragment(
-                "GREATEST(COALESCE(?, EXCLUDED.last_hit_at), EXCLUDED.last_hit_at)",
-                affinity.last_hit_at
-              ),
+            last_hit_at: fragment("EXCLUDED.last_hit_at"),
             metadata: ^metadata,
-            updated_at: fragment("GREATEST(?, EXCLUDED.updated_at)", affinity.updated_at)
+            updated_at: fragment("EXCLUDED.updated_at")
           ]
         ]
 
-    %{
-      pool_id: plan_affinity_scope(plan, :pool_id),
-      api_key_id: plan_affinity_scope(plan, :api_key_id),
-      model_identifier: plan_affinity_scope(plan, :model_identifier),
-      affinity_kind: plan.affinity.kind,
-      affinity_key_hash: plan.affinity.key_hash,
-      pool_upstream_assignment_id: assignment.id,
-      upstream_identity_id: identity.id,
-      status: BridgeAffinity.active_status(),
-      last_hit_at: now,
-      metadata: metadata,
-      created_at: now,
-      updated_at: now
-    }
-    |> then(&struct(BridgeAffinity, &1))
-    |> Repo.insert!(
+    Repo.insert_all(
+      BridgeAffinity,
+      [
+        %{
+          pool_id: plan_affinity_scope(plan, :pool_id),
+          api_key_id: plan_affinity_scope(plan, :api_key_id),
+          model_identifier: plan_affinity_scope(plan, :model_identifier),
+          affinity_kind: plan.affinity.kind,
+          affinity_key_hash: plan.affinity.key_hash,
+          pool_upstream_assignment_id: assignment.id,
+          upstream_identity_id: identity.id,
+          status: BridgeAffinity.active_status(),
+          last_hit_at: now,
+          metadata: metadata,
+          created_at: now,
+          updated_at: now
+        }
+      ],
       on_conflict: on_conflict,
       conflict_target: @affinity_conflict_target
     )
+    |> count_fenced_affinity_write("success_upsert", plan)
   end
 
+  # The same single rule as the success upsert, because a miss is an event on the
+  # same row: `updated_at` is the row's event clock, so a failure older than the
+  # stored event writes nothing rather than dragging the row's timestamps back to
+  # its own moment. The comparison belongs in the statement, not in Elixir: the
+  # writer it has to order against may be on another node.
   defp mark_affinity_miss!(plan, now) do
     case plan.affinity.row do
       %BridgeAffinity{} = affinity ->
-        affinity
-        |> Ecto.Changeset.change(%{last_miss_at: now, updated_at: now})
-        |> Repo.update!()
+        BridgeAffinity
+        |> where([row], row.id == ^affinity.id and row.updated_at <= ^now)
+        |> Repo.update_all(set: [last_miss_at: now, updated_at: now])
+        |> count_fenced_affinity_write("miss_update", plan)
 
       nil ->
         :ok
     end
   end
 
+  # The fence refuses by applying no row, and the refusal is otherwise
+  # indistinguishable from an accepted write: both return `:ok`, because a stale
+  # affinity event must never fail a turn whose work is already finalized. The
+  # affected-row count the statement already produced is the only place the
+  # condition is visible, so it is read here rather than discarded. Counting is
+  # all that happens — no log line on a path that runs for every turn on a hot
+  # route, and no routing, retry, settlement or durable-metadata effect. See
+  # `AffinityTelemetry`, which also explains why the payload names no node.
+  defp count_fenced_affinity_write({0, _returning}, operation, plan) do
+    AffinityTelemetry.emit_stale_write(operation, plan.affinity.kind)
+    :ok
+  end
+
+  defp count_fenced_affinity_write(_result, _operation, _plan), do: :ok
+
   defp upsert_demotion!(plan, assignment, identity, reason_code, request_id, now) do
-    metadata = %{"source" => "gateway_failure"}
-    demoted_until = DateTime.add(now, @demotion_seconds, :second)
+    do_upsert_demotion!(
+      plan,
+      assignment,
+      identity,
+      reason_code,
+      request_id,
+      now,
+      @demotion_seconds,
+      "gateway_failure"
+    )
+  end
+
+  # Progressive rather than one flat window. The repeat signal is the demotion
+  # row itself: an active overload row whose window has not yet expired means
+  # this account refused work again while still being skipped, which is the
+  # cascade this exists to break. Anything else — no row, an expired one, or a
+  # row written by an ordinary failure — is a first overload.
+  defp overload_demotion_seconds(plan, assignment, now) do
+    if active_overload_demotion?(plan, assignment, now) do
+      @overload_repeat_demotion_seconds
+    else
+      @overload_demotion_seconds
+    end
+  end
+
+  defp active_overload_demotion?(plan, assignment, now) do
+    active_status = BridgeDemotion.active_status()
+
+    BridgeDemotion
+    |> where(
+      [demotion],
+      demotion.pool_id == ^plan_affinity_scope(plan, :pool_id) and
+        demotion.api_key_id == ^plan_affinity_scope(plan, :api_key_id) and
+        demotion.model_identifier == ^plan_affinity_scope(plan, :model_identifier) and
+        demotion.pool_upstream_assignment_id == ^assignment.id and
+        demotion.status == ^active_status and
+        demotion.reason_code == ^@overload_reason_code and
+        not is_nil(demotion.demoted_until) and demotion.demoted_until > ^now
+    )
+    |> Repo.exists?()
+  end
+
+  defp upsert_overload_demotion!(plan, assignment, identity, request_id, now, seconds) do
+    do_upsert_demotion!(
+      plan,
+      assignment,
+      identity,
+      @overload_reason_code,
+      request_id,
+      now,
+      seconds,
+      "gateway_overload"
+    )
+  end
+
+  # The conflict clause takes the later of the stored and the new expiry, so a
+  # repeat can only extend a live window, never cut one short. Repeat detection
+  # is also repeated atomically here: concurrent first overloads may both have
+  # read no row before their conflicting inserts serialize on this row.
+  defp do_upsert_demotion!(
+         plan,
+         assignment,
+         identity,
+         reason_code,
+         request_id,
+         now,
+         seconds,
+         source
+       ) do
+    metadata = %{"source" => source}
+    demoted_until = DateTime.add(now, seconds, :second)
 
     attrs = %{
       reason_code: reason_code,
@@ -704,12 +975,33 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       from demotion in BridgeDemotion,
         update: [
           set: [
-            reason_code: ^reason_code,
+            # A health failure cannot erase an unexpired capacity penalty.
+            # Keep the overload reason with its existing monotone deadline so
+            # a later success cannot resolve that live window indirectly.
+            reason_code:
+              fragment(
+                "CASE WHEN ? = ? AND ? > EXCLUDED.updated_at THEN ? ELSE EXCLUDED.reason_code END",
+                demotion.reason_code,
+                ^@overload_reason_code,
+                demotion.demoted_until,
+                demotion.reason_code
+              ),
             upstream_identity_id: ^identity.id,
             demoted_until:
               fragment(
-                "GREATEST(COALESCE(?, EXCLUDED.demoted_until), EXCLUDED.demoted_until)",
-                demotion.demoted_until
+                """
+                GREATEST(COALESCE(?, EXCLUDED.demoted_until), EXCLUDED.demoted_until,
+                  CASE WHEN EXCLUDED.reason_code = ? AND ? = ? AND ? > EXCLUDED.updated_at
+                    THEN GREATEST(?, EXCLUDED.updated_at) + (?::integer * INTERVAL '1 second')
+                    ELSE EXCLUDED.demoted_until END)
+                """,
+                demotion.demoted_until,
+                ^@overload_reason_code,
+                demotion.reason_code,
+                ^@overload_reason_code,
+                demotion.demoted_until,
+                demotion.updated_at,
+                ^@overload_repeat_demotion_seconds
               ),
             last_request_id: ^request_id,
             metadata: ^metadata,
@@ -734,7 +1026,51 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     )
   end
 
+  # What a success is allowed to clear, and why it is two different rules.
+  #
+  # The fence. A success may only resolve demotion evidence that already existed
+  # when its own turn planned its route. Without it a turn still in flight
+  # resolves rows written after it started: production saw a 109.8 s turn that
+  # started 61 s before the demotion it cleared, and a 71.1 s one that cleared a
+  # row created after its own start (icoretech/codex-pooler-findings#158). The
+  # mark is `updated_at`, not `created_at`, because the upsert extends a live
+  # window in place and only ever moves `updated_at` forward — an extension that
+  # postdates this turn is evidence this turn equally cannot speak to, and
+  # `updated_at >= created_at` always holds, so this also covers creation.
+  #
+  # The overload rule. A health demotion is a claim about this route: it was
+  # written because the route failed, so a success on it is direct
+  # counter-evidence and clearing it is what makes recovery immediate. A
+  # `provider_overloaded` row is a claim about the provider's capacity at one
+  # moment. One success says a request got served; it does not say the capacity
+  # that refused the previous one came back, because two turns differ in size,
+  # cache state and concurrency. The window is the entire penalty, it already
+  # expires by itself (20 s first, 120 s when the account refuses again while
+  # still being skipped), and the penalty is ordering inside the quota tier, so
+  # the account stays reachable throughout. Letting a success cut it short
+  # defeats the repeat window in the ordinary case, and the fence cannot help
+  # there: the overloaded account is still in the ring, so the next small turn
+  # on it legitimately begins after the demotion and succeeds seconds later,
+  # taking the 120 s that exists to break a flapping cascade with it.
+  #
+  # A lapsed overload window is still resolved, because there is nothing left to
+  # truncate: `active_demotions/3` and `active_overload_demotion?/3` both already
+  # ignore an expired window, so this changes no routing or escalation decision
+  # and keeps the operator-visible active demotion count honest.
   defp resolve_demotions!(plan, assignment, now) do
+    case Map.get(plan, :planned_at) do
+      %DateTime{} = planned_at ->
+        resolve_fenced_demotions!(plan, assignment, planned_at, now)
+
+      # A plan with no planning mark cannot establish the fence, so it resolves
+      # nothing. This is bookkeeping on an already-finalized turn; failing
+      # closed leaves the window to expire on its own, which is its normal end.
+      _missing ->
+        {0, nil}
+    end
+  end
+
+  defp resolve_fenced_demotions!(plan, assignment, planned_at, now) do
     active_status = BridgeDemotion.active_status()
     resolved_status = BridgeDemotion.resolved_status()
 
@@ -746,6 +1082,12 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
         demotion.model_identifier == ^plan_affinity_scope(plan, :model_identifier) and
         demotion.pool_upstream_assignment_id == ^assignment.id and
         demotion.status == ^active_status
+    )
+    |> where(
+      [demotion],
+      (demotion.reason_code == ^@overload_reason_code and demotion.demoted_until <= ^now) or
+        ((demotion.reason_code != ^@overload_reason_code or is_nil(demotion.demoted_until)) and
+           demotion.updated_at < ^planned_at)
     )
     |> Repo.update_all(set: [status: resolved_status, updated_at: now])
   end
@@ -795,9 +1137,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
     snapshot
     |> RoutingQuotaSnapshot.time_visible_raw_windows()
-    |> QuotaWindows.quota_window_selection_data_from_windows(
-      Keyword.put(quota_scope_opts(model), :at, snapshot.as_of)
-    )
+    |> QuotaWindows.quota_window_selection_data_from_windows(Keyword.put(quota_scope_opts(model), :at, snapshot.as_of))
     |> Map.get(:routing_windows, [])
     |> quota_capacity_score_for_windows(snapshot.as_of)
   end
@@ -859,7 +1199,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   defp remaining_percent(_window), do: nil
 
-  defp rendezvous_score(seed, assignment_id) do
+  @doc false
+  @spec rendezvous_score(String.t(), String.t()) :: non_neg_integer()
+  def rendezvous_score(seed, assignment_id) do
     :crypto.hash(:sha256, [to_string(seed), ?:, assignment_id])
     |> :binary.decode_unsigned()
   end

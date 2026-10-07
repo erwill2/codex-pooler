@@ -8,19 +8,21 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
   """
 
   alias CodexPooler.Admin.{UpstreamCircuitReadiness, UpstreamQuotaReadiness}
+  alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Lifecycle.IdentityRouting
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
 
   @assignment_active AssignmentStatus.active_status()
   @assignment_health_active AssignmentStatus.active_health_status()
   @assignment_eligible AssignmentStatus.eligible_status()
+  @spark_model "gpt-5.3-codex-spark"
   @circuit_blocked_projection %{
     state: "circuit_protection_active",
     label: "Circuit protection active",
     tone: :error,
-    reason:
-      "One or more model and route lanes are blocked; unaffected routes may remain available.",
+    reason: "One or more model and route lanes are blocked; unaffected routes may remain available.",
     reason_code: "circuit_routes_blocked",
     recovery_action: "Wait for circuit protection to clear before relying on affected routes."
   }
@@ -28,8 +30,7 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
     state: "circuit_recovering",
     label: "Circuit recovery in progress",
     tone: :warning,
-    reason:
-      "One or more model and route lanes are recovering; unaffected routes may remain available.",
+    reason: "One or more model and route lanes are recovering; unaffected routes may remain available.",
     reason_code: "circuit_recovering",
     recovery_action: "Wait for circuit recovery to complete before relying on affected routes."
   }
@@ -133,6 +134,33 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
     })
   end
 
+  @spec with_model_availability(t(), RoutingQuotaSnapshot.t(), [map()]) :: t()
+  def with_model_availability(%{state: "quota_blocked"} = readiness, snapshot, assignments) do
+    advertised? =
+      Enum.any?(assignments, fn assignment ->
+        assignment_routing_ready?(assignment) and
+          Enum.any?(Map.get(assignment, :models, []), &(&1.exposed_model_id == @spark_model))
+      end)
+
+    decision = Upstreams.provider_credits_decision(snapshot, %{model: @spark_model, upstream_model: @spark_model})
+
+    if advertised? and decision.eligible? and decision.capacity_basis == :model_allowance do
+      Map.merge(readiness, %{
+        routing_ready_now?: true,
+        state: "model_limited",
+        label: "Limited model availability",
+        tone: :warning,
+        reason: "Only the independently evidenced Spark allowance permits model routing; ordinary account quota remains blocked.",
+        reason_code: "spark_quota_available",
+        recovery_action: "Use Spark or wait for ordinary account quota to recover."
+      })
+    else
+      readiness
+    end
+  end
+
+  def with_model_availability(readiness, _snapshot, _assignments), do: readiness
+
   @spec with_circuit_visibility(t(), UpstreamCircuitReadiness.summary()) :: t()
   def with_circuit_visibility(%{routing_ready_now?: true} = base_readiness, %{state: :blocked}) do
     Map.merge(base_readiness, @circuit_blocked_projection)
@@ -174,21 +202,31 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
           state: "ready_refreshing",
           label: "Routing while refreshing",
           tone: :warning,
-          reason:
-            "Identity refresh is in progress, but this lifecycle state remains visible for model routing.",
+          reason: "Identity refresh is in progress, but this lifecycle state remains visible for model routing.",
           reason_code: "identity_refreshing_model_routable",
           recovery_action: nil
         })
 
-      Map.get(quota_readiness, :state) == "provider_available_no_windows" ->
+      Map.get(quota_readiness, :capacity_basis) == :provider_credits ->
         projection(%{
           routing_ready_now?: true,
-          state: "provider_available_no_windows",
-          label: "Provider available",
-          tone: :warning,
-          reason: "Provider availability allows routing without reported quota windows.",
-          reason_code: "provider_available_no_windows",
+          state: "ready",
+          label: "Routing ready via credits",
+          tone: :success,
+          reason: "Current provider credit permission, identity lifecycle and assignment availability allow routing. Each request still checks its model, transport and serving mode; this does not identify a billing debit.",
+          reason_code: "routing_ready",
           recovery_action: nil
+        })
+
+      Map.get(quota_readiness, :conditional?, false) ->
+        projection(%{
+          routing_ready_now?: true,
+          state: quota_readiness.state,
+          label: quota_readiness.label,
+          tone: :warning,
+          reason: "Availability is conditional on the request model, transport and serving mode. The account summary is not permission for every model or route.",
+          reason_code: quota_readiness.state,
+          recovery_action: "Check the request-specific capacity decision before relying on this account."
         })
 
       true ->
@@ -197,8 +235,7 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
           state: "ready",
           label: "Routing ready",
           tone: :success,
-          reason:
-            "Identity lifecycle, assignment availability, and quota readiness allow model routing.",
+          reason: "Identity lifecycle, assignment availability, and quota readiness allow model routing.",
           reason_code: "routing_ready",
           recovery_action: nil
         })
@@ -244,8 +281,7 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
       state: "assignment_unavailable",
       label: "Assignment unavailable",
       tone: :warning,
-      reason:
-        "No active, healthy, eligible pool assignment is available for this upstream account.",
+      reason: "No active, healthy, eligible pool assignment is available for this upstream account.",
       reason_code: "assignment_unavailable",
       recovery_action: "Enable a healthy, eligible pool assignment."
     })
@@ -255,14 +291,27 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
   defp quota_blocked_projection(quota_readiness) do
     quota_state = Map.get(quota_readiness, :state, "blocked")
     label = Map.get(quota_readiness, :label, "Quota blocked")
+    reason_codes = Map.get(quota_readiness, :reason_codes, [])
+
+    reason_code =
+      Enum.find(reason_codes, &(&1 in ["provider_credits_disabled", "saved_reset_probe_pending", "saved_reset_recovery_unavailable"])) ||
+        if(quota_state == "provider_credit_capacity_unverified", do: "provider_credit_capacity_unverified", else: "quota_#{quota_state}")
+
+    reason =
+      case reason_code do
+        "provider_credits_disabled" -> "Provider credit-dependent admission is disabled; independently valid included capacity, ordinary provider permission and authorized banked-reset recovery remain separate."
+        "provider_credit_capacity_unverified" -> "Observed balance does not grant routing; current account evidence does not establish usable provider credit permission."
+        "saved_reset_probe_pending" -> "Waiting for a request on included quota to confirm the reset. Requests paid with provider credits do not count."
+        _other -> "Quota readiness blocks model routing: #{label}."
+      end
 
     projection(%{
       routing_ready_now?: false,
       state: "quota_blocked",
       label: label,
       tone: Map.get(quota_readiness, :tone, :warning),
-      reason: "Quota readiness blocks model routing: #{label}.",
-      reason_code: "quota_#{quota_state}",
+      reason: reason,
+      reason_code: reason_code,
       recovery_action: "Refresh quota evidence or wait for quota reset."
     })
   end

@@ -34,9 +34,7 @@ defmodule CodexPooler.Accounting.ObservatoryTest do
     assert :ok = Rollups.accumulate!(request, settlement)
 
     assert {:ok, usage} =
-             Accounting.build_api_key_self_usage(pool, api_key,
-               as_of: ~U[2026-07-17 11:00:00.000000Z]
-             )
+             Accounting.build_api_key_self_usage(pool, api_key, as_of: ~U[2026-07-17 11:00:00.000000Z])
 
     assert usage.request_count == 1
     assert usage.total_tokens == 65
@@ -112,7 +110,8 @@ defmodule CodexPooler.Accounting.ObservatoryTest do
              total: 3,
              succeeded: 1,
              failed: 1,
-             in_progress: 1
+             in_progress: 1,
+             client_cancelled: 0
            }
 
     assert projection.totals.tokens == %{

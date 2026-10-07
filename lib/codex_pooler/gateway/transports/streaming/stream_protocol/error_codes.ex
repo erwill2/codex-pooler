@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
     "server_error",
     "overloaded_error",
     "server_is_overloaded",
+    "slow_down",
     "websocket_connection_limit_reached"
   ]
   @websocket_auth_refresh_event_codes ["invalid_api_key", "invalid_authentication"]
@@ -14,6 +15,11 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
     "previous_response_not_found",
     "invalid_previous_response_id"
   ]
+  # The Codex backend's websocket refusal of an anchor the connection cannot
+  # resolve (a connection that did not produce the response, a fresh one
+  # included): a codeless 400 `invalid_request_error` with exactly this message
+  # (findings#232 row 232-277, live probe 2026-09-23).
+  @invalid_previous_response_id_message "Invalid `previous_response_id`."
   @stream_incomplete_code "stream_incomplete"
   @previous_response_not_found_code "previous_response_not_found"
   @previous_response_not_found_message "Previous response was not found. Retrying the full request."
@@ -22,11 +28,126 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
   @terminal_default_code "upstream_websocket_terminal_failure"
   @upstream_request_failed_code "upstream_request_failed"
   @websocket_request_failed_code "websocket_request_failed"
+  # Gateway-owned retryable code for exhausted upstream credential refresh on
+  # either transport; the client-facing 401 stays reserved for API-key rejection.
+  @upstream_unauthorized_code "upstream_unauthorized"
+
+  # Keep provider vocabulary in one module while exposing separate predicates:
+  # retry, terminal classification, and route health deliberately have
+  # different effects for some of the same provider codes.
+  @incomplete_failure_reason_codes [
+    "flex_unavailable",
+    "upstream_request_timeout",
+    "stream_incomplete",
+    "server_error",
+    "overloaded_error",
+    "server_is_overloaded",
+    "slow_down",
+    "websocket_connection_limit_reached",
+    "invalid_api_key",
+    "invalid_authentication",
+    "context_length_exceeded",
+    # The three spend/credit codes are the final quota error `insufficient_quota`
+    # is (rust-v0.156.0 `QuotaExceeded`): a `response.incomplete` naming one is
+    # a failed turn, not an ordinary incomplete. Like `insufficient_quota` they
+    # stay out of the health-neutral list, so the account that cannot serve is
+    # demoted (findings#258 row 258-24).
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "usage_not_included",
+    "invalid_previous_response_id",
+    "invalid_request",
+    "invalid_request_error",
+    "invalid_prompt",
+    "bio_policy",
+    "cyber_policy",
+    "misalignment_policy_violation",
+    "previous_response_not_found",
+    "rate_limit_exceeded",
+    "unauthorized",
+    "usage_limit_exceeded",
+    "usage_limit_reached",
+    "workspace_member_credits_depleted",
+    "workspace_member_usage_limit_reached",
+    "workspace_owner_credits_depleted",
+    "workspace_owner_usage_limit_reached"
+  ]
+  # Provider overload specifically, kept apart from the wider health-neutral set.
+  # Those codes share one property — they say nothing about the account's health
+  # — but an overload additionally says the account just refused work, which is
+  # the only one of them worth steering the next turn away from. `slow_down` is
+  # health-neutral too and is deliberately absent: nothing in the tree shows it
+  # means provider overload rather than client pacing.
+  @provider_overload_error_codes [
+    "overloaded_error",
+    "server_is_overloaded"
+  ]
+  # A provider parameter-validation refusal is the client's error: every code
+  # `Finalization.ValidationRejection` relays (`invalid_value`, `invalid_type`,
+  # `string_above_max_length`, `unknown_parameter`, `invalid_parameter` and the
+  # three `unsupported_*`/`missing_*` below) stays health-neutral, or a
+  # websocket terminal refused with one of them demotes the assignment and
+  # records a circuit failure the HTTP 400 of the same refusal never records
+  # (findings#254 row 254-20).
+  @health_neutral_error_codes [
+    "flex_unavailable",
+    "context_length_exceeded",
+    "cyber_policy",
+    "invalid_request",
+    "invalid_request_error",
+    "invalid_parameter",
+    "invalid_previous_response_id",
+    "invalid_prompt",
+    "invalid_type",
+    "invalid_value",
+    "bio_policy",
+    "max_output_tokens",
+    "misalignment_policy_violation",
+    "missing_required_parameter",
+    "overloaded_error",
+    "previous_response_not_found",
+    "server_is_overloaded",
+    "slow_down",
+    "server_error",
+    "string_above_max_length",
+    "unknown_parameter",
+    "unsupported_input_image_format",
+    "unsupported_parameter",
+    "unsupported_value",
+    "usage_limit_exceeded",
+    "usage_limit_reached"
+  ]
+  # The `response.failed` codes the latest released Codex client treats as
+  # final instead of resending the compaction (rust-v0.156.0
+  # `codex-api/src/sse/responses.rs` `process_responses_event` and
+  # `protocol/src/error.rs` `retry_delay`). Since 0.156.0 `slow_down` is a
+  # retried rate limit and the three spend/credit codes are a final quota
+  # error; a 0.155.1 client still resends after those three and the Pooler
+  # refuses that resend as a terminal predecessor.
+  @codex_response_failed_non_retryable_codes [
+    "flex_unavailable",
+    "context_length_exceeded",
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "usage_not_included",
+    "cyber_policy",
+    "misalignment_policy_violation",
+    "invalid_prompt",
+    "bio_policy",
+    "server_is_overloaded"
+  ]
 
   @known_error_codes Enum.uniq(
                        @retryable_first_event_codes ++
                          @websocket_auth_refresh_event_codes ++
                          @previous_response_miss_codes ++
+                         @incomplete_failure_reason_codes ++
+                         @health_neutral_error_codes ++
+                         @codex_response_failed_non_retryable_codes ++
                          [
                            @stream_incomplete_code,
                            @previous_response_not_found_code,
@@ -34,12 +155,29 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
                            @rate_limit_exceeded_code,
                            @terminal_default_code,
                            @upstream_request_failed_code,
-                           @websocket_request_failed_code
+                           @websocket_request_failed_code,
+                           @upstream_unauthorized_code
                          ]
                      )
 
   @spec known_error_codes() :: [String.t()]
   def known_error_codes, do: @known_error_codes
+
+  @spec invalid_previous_response_id_message() :: String.t()
+  def invalid_previous_response_id_message, do: @invalid_previous_response_id_message
+
+  @spec upstream_unauthorized_code() :: String.t()
+  def upstream_unauthorized_code, do: @upstream_unauthorized_code
+
+  # The answer to an upstream credential the Pooler could not refresh, on HTTP
+  # and the websocket alike: retryable `503`, never a client-facing 401, which
+  # stays reserved for the Pooler's own API-key rejection (findings#325 row
+  # 325-7).
+  @spec upstream_unauthorized_status() :: 503
+  def upstream_unauthorized_status, do: 503
+
+  @spec upstream_unauthorized_message() :: String.t()
+  def upstream_unauthorized_message, do: "upstream authentication failed; retry the request"
 
   @spec upstream_request_failed_code() :: String.t()
   def upstream_request_failed_code, do: @upstream_request_failed_code
@@ -54,7 +192,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
     |> Enum.filter(&String.starts_with?(&1, "data: "))
     |> Enum.map(&String.replace_prefix(&1, "data: ", ""))
     |> Enum.find_value(fn line ->
-      case Jason.decode(line) do
+      case CodexPooler.JSON.decode(line) do
         {:ok, decoded} -> error_code_from_decoded(decoded)
         {:error, _error} -> nil
       end
@@ -121,6 +259,71 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
   @spec retryable_first_event_code?(String.t() | nil) :: boolean()
   def retryable_first_event_code?(code) when code in @retryable_first_event_codes, do: true
   def retryable_first_event_code?(_code), do: false
+
+  @spec incomplete_failure_reason?(String.t() | nil) :: boolean()
+  def incomplete_failure_reason?(code) when code in @incomplete_failure_reason_codes, do: true
+  def incomplete_failure_reason?(_code), do: false
+
+  @spec health_neutral_error_code?(String.t() | nil) :: boolean()
+  def health_neutral_error_code?(code) when code in @health_neutral_error_codes, do: true
+  def health_neutral_error_code?(_code), do: false
+
+  @doc """
+  True for a provider refusal the upstream websocket sent as its wrapped error
+  frame (`{"type": "error", "status": 4xx, ...}`, whose integer `status` the
+  canonical `response.failed` keeps) with a status HTTP completes neutrally
+  (every 4xx but 401 and 429) and a code this module does not know. The HTTP
+  answer of the same refusal leaves route health alone whatever its code
+  (findings#254 row 254-32), while the websocket terminal demoted the
+  assignment and counted a `proxy_websocket` circuit failure for any code
+  outside the health-neutral list (row 254-81). A known code keeps its own
+  classification: a quota or credential code still demotes.
+  """
+  @spec unknown_provider_refusal?(term(), String.t() | nil) :: boolean()
+  def unknown_provider_refusal?(status, code) when is_integer(status) and status in 400..499 and status not in [401, 429],
+    do: code not in @known_error_codes
+
+  def unknown_provider_refusal?(_status, _code), do: false
+
+  @doc """
+  True when a wrapped provider 4xx refusal leaves route health alone on the
+  websocket: its code is health-neutral, or it is an unknown refusal
+  (`unknown_provider_refusal?/2`). The native websocket projection reads it to
+  decide whether a 403 refusal demotes the account (findings#254 rows 254-71
+  and 254-81).
+  """
+  @spec provider_refusal_health_neutral?(term(), String.t() | nil) :: boolean()
+  def provider_refusal_health_neutral?(status, code),
+    do: health_neutral_error_code?(code) or unknown_provider_refusal?(status, code)
+
+  @spec provider_overload_error_code?(String.t() | nil) :: boolean()
+  def provider_overload_error_code?(code) when code in @provider_overload_error_codes, do: true
+  def provider_overload_error_code?(_code), do: false
+
+  @spec codex_compaction_terminal_retryable?(String.t() | nil, String.t() | nil) :: boolean()
+  def codex_compaction_terminal_retryable?("response.incomplete", _code), do: true
+
+  def codex_compaction_terminal_retryable?("response.failed", code),
+    do: code not in @codex_response_failed_non_retryable_codes
+
+  def codex_compaction_terminal_retryable?(_event_type, _code), do: false
+
+  # Every `response.failed` code the latest released Codex client classifies
+  # into its own error (rust-v0.156.0 `process_responses_event`): the final
+  # ones above plus the two rate-limit codes it retries as a rate limit. Any
+  # other code on a `response.failed` is a generic retryable stream error to
+  # that client, while the wrapped `{"type":"error","status":400}` frame of the
+  # same refusal is a final invalid request; a wrapped 400 naming one of these
+  # codes would lose the classification (a wrapped `context_length_exceeded` is
+  # an invalid request, never the context-window error that compacts), so the
+  # native projection keeps them on `response.failed` (findings#254 row 254-52).
+  @codex_response_failed_classified_codes @codex_response_failed_non_retryable_codes ++ [@rate_limit_exceeded_code, "slow_down"]
+
+  @spec codex_response_failed_classified_code?(String.t() | nil) :: boolean()
+  def codex_response_failed_classified_code?(code) when code in @codex_response_failed_classified_codes,
+    do: true
+
+  def codex_response_failed_classified_code?(_code), do: false
 
   @spec websocket_auth_refresh_event_code?(String.t() | nil) :: boolean()
   def websocket_auth_refresh_event_code?(code) when code in @websocket_auth_refresh_event_codes,

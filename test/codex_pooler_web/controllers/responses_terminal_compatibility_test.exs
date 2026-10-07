@@ -1,17 +1,15 @@
 defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
   use CodexPoolerWeb.ConnCase, async: false
 
-  import ExUnit.CaptureLog
+  import Ecto.Query
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
 
   alias CodexPooler.CompatibilityMatrix
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
 
   @terminal_shapes [
-    {:done,
-     ~s({"type":"response.done","response":{"id":"resp_terminal_done","custom":{"kept":true}}})},
+    {:done, ~s({"type":"response.done","response":{"id":"resp_terminal_done","custom":{"kept":true}}})},
     {:legacy, ~s({ "id" : "resp_terminal_legacy", "custom" : { "kept" : true } })}
   ]
 
@@ -93,16 +91,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
   ]
 
   setup do
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-
-    on_exit(fn ->
-      cleanup_owner_sessions()
-
-      case previous do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
-    end)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
 
     :ok
   end
@@ -125,7 +114,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
              public_http_done_event: :response_completed,
              public_websocket_done_event: :response_completed,
              synthetic_missing_terminal_surfaces: ["public_post_http_sse"],
-             target: "same_candidate_same_attempt_http",
+             target: "websocket_failure_without_resubmission",
              settlements: 1,
              upstream_committed: "no_http_fallback_or_automatic_replay",
              post_visible_upstream_death: "failed_request",
@@ -147,7 +136,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
 
       assert response.status == 200
       assert [payload] = decoded_sse_payloads(response.resp_body)
-      assert payload == Jason.decode!(frame)
+      assert payload == CodexPooler.JSON.decode!(frame)
     end
   end
 
@@ -181,7 +170,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
 
       "/v1/responses"
       |> websocket_terminal(frame, shape)
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> assert_public_completed(shape)
     end
   end
@@ -194,7 +183,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
 
       "/v1/responses"
       |> websocket_terminal(frame, shape)
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> assert_public_completed(shape)
     end
   end
@@ -221,7 +210,8 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
       refute response.resp_body =~ "synthetic upstream detail"
 
       if shape == :failed_without_nested_code do
-        assert terminal == expected_failed_terminal()
+        assert hd(events)["type"] == "response.created"
+        assert terminal == Map.put(expected_failed_terminal(), "sequence_number", 1)
         assert_hostile_failed_sentinels_absent(response.resp_body)
       end
     end
@@ -321,9 +311,10 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
     end
   end
 
-  test "public GET websocket keeps canonical terminal error transformations" do
-    for owner_forwarding? <- [false, true],
-        {shape, payload, expected_code} <- @failure_shapes do
+  for owner_forwarding? <- [false, true],
+      {shape, payload, expected_code} <- @failure_shapes do
+    @tag terminal_shape: shape, terminal_payload: payload, terminal_code: expected_code, owner_forwarding: owner_forwarding?
+    test "public GET websocket keeps #{shape} terminal transformation with forwarding=#{owner_forwarding?}", %{terminal_shape: shape, terminal_payload: payload, terminal_code: expected_code, owner_forwarding: owner_forwarding?} do
       Application.put_env(
         :codex_pooler,
         :websocket_owner_forwarding_enabled,
@@ -332,15 +323,15 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
 
       terminal =
         "/v1/responses"
-        |> websocket_terminal(Jason.encode!(payload), shape)
-        |> Jason.decode!()
+        |> websocket_terminal(CodexPooler.JSON.encode!(payload), shape)
+        |> CodexPooler.JSON.decode!()
 
       assert terminal_error_code(terminal) == expected_code,
              "unexpected websocket terminal for #{shape}: #{inspect(terminal)}"
 
       if shape == :failed_without_nested_code do
         assert terminal == expected_failed_terminal()
-        assert_hostile_failed_sentinels_absent(Jason.encode!(terminal))
+        assert_hostile_failed_sentinels_absent(CodexPooler.JSON.encode!(terminal))
       end
     end
   end
@@ -392,13 +383,43 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
         setup
         |> stream_payload(shape)
         |> Map.merge(%{"type" => "response.create", "generate" => true})
-        |> Jason.encode!()
+        |> CodexPooler.JSON.encode!()
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {_conn, _websocket, terminal_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      # The terminal frame reaches the client before the response task commits
+      # its settlement; callers loop over shapes, so the next setup must not race
+      # that task for the shared sandbox connection.
+      await_settled_pool_requests!(setup.pool.id)
       terminal_frame
     after
       Mint.HTTP.close(conn)
+    end
+  end
+
+  defp await_settled_pool_requests!(pool_id, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+
+    statuses =
+      CodexPooler.Repo.all(
+        from(request in CodexPooler.Accounting.Request,
+          where: request.pool_id == ^pool_id,
+          select: request.status
+        )
+      )
+
+    cond do
+      statuses != [] and "in_progress" not in statuses ->
+        :ok
+
+      System.monotonic_time(:millisecond) < deadline ->
+        receive do
+        after
+          5 -> await_settled_pool_requests!(pool_id, deadline)
+        end
+
+      true ->
+        flunk("expected settled websocket requests, got #{inspect(statuses)}")
     end
   end
 
@@ -408,7 +429,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
     |> Enum.flat_map(fn block ->
       case Regex.run(~r/^data: (.+)$/m, block, capture: :all_but_first) do
         ["[DONE]"] -> []
-        [data] -> [Jason.decode!(data)]
+        [data] -> [CodexPooler.JSON.decode!(data)]
         _missing -> []
       end
     end)
@@ -424,7 +445,7 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
       }
       |> maybe_put_misalignment(misalignment)
 
-    ~s(event: response.failed\ndata: #{Jason.encode!(%{"type" => "response.failed", "error" => error, "response" => %{"status" => "failed", "error" => error}})}\n\n)
+    ~s(event: response.failed\ndata: #{CodexPooler.JSON.encode!(%{"type" => "response.failed", "error" => error, "response" => %{"status" => "failed", "error" => error}})}\n\n)
   end
 
   defp valid_misalignment do
@@ -529,21 +550,6 @@ defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
           "response-sibling-sentinel"
         ] do
       refute wire =~ sentinel
-    end
-  end
-
-  defp cleanup_owner_sessions do
-    capture_log(fn ->
-      WebsocketOwnerSession.Registry
-      |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-      |> Enum.each(&stop_owner_session/1)
-    end)
-  end
-
-  defp stop_owner_session(session_id) do
-    case WebsocketOwnerSession.lookup(session_id) do
-      {:ok, owner_pid} -> GenServer.stop(owner_pid, :shutdown, 1_000)
-      {:error, _reason} -> :ok
     end
   end
 end

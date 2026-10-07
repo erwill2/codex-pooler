@@ -1,5 +1,17 @@
 SHELL := /bin/bash
 
+# Use mise for the repository-pinned Elixir/Erlang toolchain when installed,
+# and launch npm through the same environment; Node/npm are not pinned here.
+# Without mise, fall back to the commands on PATH.
+MISE := $(shell command -v mise 2>/dev/null)
+ifeq ($(MISE),)
+MIX := mix
+NPM := npm
+else
+MIX := $(MISE) x -- mix
+NPM := $(MISE) x -- npm
+endif
+
 PORT ?= 4000
 POSTGRES_PORT ?= 5433
 POSTGRES_WAIT_TIMEOUT ?= 60
@@ -15,18 +27,20 @@ DEV_DB_ENV := POSTGRES_HOST=localhost POSTGRES_PORT=$(POSTGRES_PORT) POSTGRES_DB
 DEV_SECRET_ENV := if [ -f .env ]; then while IFS= read -r line; do case "$$line" in CODEX_POOLER_UPSTREAM_SECRET_KEY=*|CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION=*|CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING=*) export "$$line";; esac; done < .env; fi;
 N ?= 4
 # Test-only shell acceptance overrides. Normal runs must use the default commands.
-TEST_FAST_COMMAND ?= mix test
-TEST_FAST_DROP_COMMAND ?= mix ecto.drop --quiet
+TEST_FAST_COMMAND ?= $(MIX) test.product
+TEST_FAST_DROP_COMMAND ?= $(MIX) ecto.drop --quiet
 
-.PHONY: dev dev-prepare dev-db dev-compile dev-migrate dev-pricing dev-stop dev-status dev-logs precommit smoke test-fast
+.PHONY: dev dev-prepare dev-db dev-compile dev-assets dev-docs-deps dev-migrate dev-pricing dev-stop dev-status dev-logs precommit smoke test-db-prune test-fast
 
 dev: dev-prepare
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) DEV_SERVER_PORT=$(PORT) DEV_SERVER_STATE_DIR=$(DEV_SERVER_STATE_DIR) DEV_SERVER_LOG=$(DEV_LOG) DEV_SERVER_CWD=$(CURDIR) DEV_SERVER_COMMAND='PORT=$(PORT) mix phx.server' $(DEV_SERVER_LIFECYCLE) start
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) DEV_SERVER_PORT=$(PORT) DEV_SERVER_STATE_DIR=$(DEV_SERVER_STATE_DIR) DEV_SERVER_LOG=$(DEV_LOG) DEV_SERVER_CWD=$(CURDIR) DEV_SERVER_COMMAND='PORT=$(PORT) $(MIX) phx.server' $(DEV_SERVER_LIFECYCLE) start
 
 dev-prepare:
 	@$(MAKE) --no-print-directory dev-stop
 	@$(MAKE) --no-print-directory dev-db
 	@$(MAKE) --no-print-directory dev-compile
+	@$(MAKE) --no-print-directory dev-assets
+	@$(MAKE) --no-print-directory dev-docs-deps
 	@$(MAKE) --no-print-directory dev-migrate
 	@$(MAKE) --no-print-directory dev-pricing
 
@@ -50,14 +64,21 @@ dev-db:
 	exit 1
 
 dev-compile:
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix compile --force
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) compile --force
+
+dev-assets:
+	@$(MIX) assets.setup
+	@$(MIX) assets.build
+
+dev-docs-deps:
+	@$(NPM) ci --prefix docs-site
 
 dev-migrate:
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix ecto.create --quiet
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix ecto.migrate
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) ecto.create --quiet
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) run --no-start -e 'CodexPooler.Release.migrate()'
 
 dev-pricing:
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix pricing.import_openai
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) pricing.import_openai
 
 dev-stop:
 	@DEV_SERVER_PORT=$(PORT) DEV_SERVER_STATE_DIR=$(DEV_SERVER_STATE_DIR) DEV_SERVER_LOG=$(DEV_LOG) DEV_SERVER_CWD=$(CURDIR) $(DEV_SERVER_LIFECYCLE) stop
@@ -69,8 +90,21 @@ dev-logs:
 	@tail -f $(DEV_LOG)
 
 precommit:
-	@mix precommit
+	@$(MIX) precommit
 
+# Drops the run-scoped test databases that killed or crashed runs left behind. A database any
+# session is connected to, or a running test holds, is kept.
+test-db-prune:
+	@MIX_ENV=test $(MIX) codex_pooler.test.prune_databases
+
+# Every partition VM starts with `+hmbs 1000000`, a minimum binary virtual heap of one million words (the VM default is 46,422), and
+# the caller's ERL_FLAGS follow it, so they can override it. With the default, the compile of a large test file (the 17 KB file that
+# expands one body 72 times, a 12,500-line controller test) spends most of its time in garbage collections forced by the virtual
+# binary heap: the compile cycle of the partitions that hold such files is 27-41% shorter with the flag. Test VMs only.
+# Each partition writes the wall time of every test file it ran to its own file (CodexPooler.TestFileDurations).
+# With TEST_FAST_PRINT_FILE_DURATIONS=1 a passing run prints those files after the partition results, which is how
+# a saved CI log carries the duration of every test file: mix test.partition_weights turns such a log into the
+# weights mix test.product and mix test.tooling deal their partitions by (test/partition_weights.tsv).
 test-fast:
 	@partitions="$(N)"; \
 	if [[ ! "$$partitions" =~ ^[0-9]+$$ ]] || (( 10#$$partitions < 1 || 10#$$partitions > 4 )); then \
@@ -100,7 +134,7 @@ test-fast:
 	logical_cpus=$$((10#$$logical_cpus)); \
 	schedulers_per_partition=$$((logical_cpus / partitions)); \
 	if [ "$$schedulers_per_partition" -lt 1 ]; then schedulers_per_partition=1; fi; \
-	partition_erl_flags="$${ERL_FLAGS:+$${ERL_FLAGS} }+S $$schedulers_per_partition:$$schedulers_per_partition"; \
+	partition_erl_flags="+hmbs 1000000 $${ERL_FLAGS:+$${ERL_FLAGS} }+S $$schedulers_per_partition:$$schedulers_per_partition"; \
 	echo "test-fast: scheduler budget $$logical_cpus logical CPUs, $$schedulers_per_partition per partition"; \
 	run_namespace=$$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n'); \
 	if [[ ! "$$run_namespace" =~ ^[0-9a-f]{16}$$ ]]; then \
@@ -181,12 +215,64 @@ test-fast:
 		echo "test-fast: interrupted; stopping partitions"; \
 		exit "$$rc"; \
 	}; \
+	duration_locations() { \
+		cat "$$@" 2>/dev/null | cut -f1 | sort -u; \
+	}; \
+	duration_report() { \
+		local total; \
+		total=$$(awk '/^test duration report: [0-9]+ tests / { sum += $$4 } END { print sum + 0 }' "$$@" 2>/dev/null); \
+		[ "$${total:-0}" -eq 0 ] && return 0; \
+		echo "test-fast: duration report: $$total tests over the normal limit without @tag slow beside the other partitions (not a failure), longest first:"; \
+		awk '/^test duration report: / { block = 1; next } block && /^  [0-9]+\.[0-9]ms / { print; next } { block = 0 }' "$$@" 2>/dev/null | sort -rn | head -n 20; \
+		if [ "$$total" -gt 20 ]; then echo "  ... and $$((total - 20)) more"; fi; \
+		return 0; \
+	}; \
+	file_duration_report() { \
+		local partition file; \
+		[ "$${TEST_FAST_PRINT_FILE_DURATIONS:-}" = "1" ] || return 0; \
+		for partition in $$(seq 1 "$$partitions"); do \
+			file="$$log_dir/files-$$partition.tsv"; \
+			if [ -s "$$file" ]; then \
+				awk -F '\t' -v partition="$$partition" -v total="$$partitions" 'NR == 1 { header = $$0; sub(/^# codex-pooler test file durations /, "", header); print "test-fast: file durations partition " partition "/" total " " header " (sync_ms async_ms path)"; next } { print "  " $$2 " " $$3 " " $$1 }' "$$file"; \
+			else \
+				echo "test-fast: file durations partition $$partition/$$partitions none recorded"; \
+			fi; \
+		done; \
+		return 0; \
+	}; \
+	confirm_durations() { \
+		local round rc total locations; \
+		locations=($$(duration_locations "$$log_dir"/duration-*.tsv)); \
+		total=$${#locations[@]}; \
+		[ "$$total" -eq 0 ] && return 0; \
+		echo "test-fast: $$total tests exceeded the duration limits beside the other partitions; re-measuring them alone"; \
+		for round in 1 2 3; do \
+			(ERL_FLAGS="$$partition_erl_flags" CODEX_POOLER_TEST_RUN_NAMESPACE="$$run_namespace" MIX_TEST_PARTITION=1 CODEX_POOLER_TEST_DURATION_CANDIDATES="$$log_dir/confirm-$$round.tsv" $(TEST_FAST_COMMAND) "$${locations[@]}") > "$$log_dir/confirm-$$round.log" 2>&1 & \
+			pids[1]=$$!; \
+			while child_running "$${pids[1]}"; do sleep 0.1; done; \
+			if wait "$${pids[1]}"; then rc=0; else rc=$$?; fi; \
+			pids[1]=""; \
+			if [ "$$rc" -ne 0 ]; then \
+				echo "test-fast: FAIL (duration re-measurement $$round/3 exited $$rc)"; \
+				cat "$$log_dir/confirm-$$round.log"; \
+				return 1; \
+			fi; \
+			locations=($$(duration_locations "$$log_dir/confirm-$$round.tsv")); \
+			if [ "$${#locations[@]}" -eq 0 ]; then \
+				echo "test-fast: all $$total re-measured within the duration limits ($$round/3 runs)"; \
+				return 0; \
+			fi; \
+		done; \
+		echo "test-fast: FAIL (duration: $${#locations[@]} of $$total tests exceeded the limits in 3 runs on their own)"; \
+		tr '\t' ' ' < "$$log_dir/confirm-3.tsv"; \
+		return 1; \
+	}; \
 	trap finalize EXIT; \
 	trap 'interrupt 130' INT; \
 	trap 'interrupt 143' TERM; \
 	for partition in $$(seq 1 "$$partitions"); do \
 		logs[$$partition]="$$log_dir/partition-$$partition.log"; \
-		(ERL_FLAGS="$$partition_erl_flags" CODEX_POOLER_TEST_RUN_NAMESPACE="$$run_namespace" MIX_TEST_PARTITION="$$partition" $(TEST_FAST_COMMAND) --partitions $$partitions) > "$${logs[$$partition]}" 2>&1 & \
+		(ERL_FLAGS="$$partition_erl_flags" CODEX_POOLER_TEST_RUN_NAMESPACE="$$run_namespace" MIX_TEST_PARTITION="$$partition" CODEX_POOLER_TEST_DURATION_CANDIDATES="$$log_dir/duration-$$partition.tsv" CODEX_POOLER_TEST_FILE_DURATIONS="$$log_dir/files-$$partition.tsv" $(TEST_FAST_COMMAND) --partitions $$partitions) > "$${logs[$$partition]}" 2>&1 & \
 		pids[$$partition]=$$!; \
 	done; \
 	failures=0; \
@@ -194,8 +280,15 @@ test-fast:
 		pid=$${pids[$$partition]}; \
 		while child_running "$$pid"; do sleep 0.1; done; \
 		if wait "$$pid"; then \
-			results[$$partition]=0; \
-			echo "test-fast: partition $$partition/$$partitions PASS"; \
+			if awk '/^Result: / { result=$$0 } END { exit !(result ~ /^Result: [1-9][0-9]* passed( \([^)]*\))?(, [0-9]+ (skipped|excluded))*$$/) }' "$${logs[$$partition]}"; then \
+				results[$$partition]=0; \
+				echo "test-fast: partition $$partition/$$partitions PASS"; \
+				awk '/^Finished in / || /^Result: / { print "test-fast: partition " partition "/" total ": " $$0 }' partition="$$partition" total="$$partitions" "$${logs[$$partition]}"; \
+			else \
+				results[$$partition]=1; \
+				failures=$$((failures + 1)); \
+				echo "test-fast: partition $$partition/$$partitions FAIL (no successful nonempty test result)"; \
+			fi; \
 		else \
 			rc=$$?; \
 			results[$$partition]=$$rc; \
@@ -205,6 +298,9 @@ test-fast:
 		pids[$$partition]=""; \
 	done; \
 	if [ "$$failures" -eq 0 ]; then \
+		duration_report "$${logs[@]}"; \
+		file_duration_report; \
+		confirm_durations || exit 1; \
 		echo "test-fast: PASS ($$partitions/$$partitions partitions)"; \
 		exit 0; \
 	fi; \
@@ -216,6 +312,3 @@ test-fast:
 		fi; \
 	done; \
 	exit 1
-
-smoke:
-	@scripts/dev/codex-smoke.sh

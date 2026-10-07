@@ -6,7 +6,8 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
   `Evidence` module remains the normalized value, validation, and freshness API.
   """
 
-  alias CodexPooler.Quotas.{AccountAvailability, Evidence}
+  alias CodexPooler.Accounting.Metadata, as: AccountingMetadata
+  alias CodexPooler.Quotas.{AccountAvailability, CapacityFacts, Evidence}
 
   alias CodexPooler.Quotas.Evidence.CodexParsers.{
     RateLimitEvents,
@@ -22,7 +23,8 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
 
   @type usage_result :: %{
           required(:windows) => [Evidence.t()],
-          required(:account_availability) => AccountAvailability.t() | nil
+          required(:account_availability) => AccountAvailability.t() | nil,
+          required(:capacity_facts) => CapacityFacts.t()
         }
 
   @spec parse_codex_usage_result(term(), DateTime.t()) ::
@@ -40,15 +42,27 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
       |> Kernel.++(additional_usage_evidence(payload, observed_at, :strict))
       |> normalize_many(observed_at)
       |> dedupe_by_identity()
+      |> attest_spark_permission(payload)
+
+    availability =
+      if Enum.any?(windows, &invalid_capacity_account_descriptor?/1),
+        do: AccountAvailability.new!(:unknown, :conflict, :unknown),
+        else: account_availability(payload, account_window_selection)
 
     {:ok,
      %{
        windows: windows,
-       account_availability: account_availability(payload, account_window_selection)
+       account_availability: availability,
+       capacity_facts: CapacityFacts.from_usage(payload, windows, account_window_selection, observed_at)
      }}
   end
 
   def parse_codex_usage_result(_payload, _observed_at), do: unusable_usage_payload()
+
+  defp invalid_capacity_account_descriptor?(%{quota_key: "account", quota_scope: "account", window_minutes: minutes}),
+    do: not (is_integer(minutes) and minutes in 1..525_600)
+
+  defp invalid_capacity_account_descriptor?(_window), do: false
 
   @spec parse_codex_usage_payload(term(), DateTime.t()) ::
           {:ok, [Evidence.t()]}
@@ -84,16 +98,17 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
   end
 
   defp unusable_usage_payload do
-    {:error,
-     %{code: :upstream_quota_unusable, message: "upstream quota payload had no usable windows"}}
+    {:error, %{code: :upstream_quota_unusable, message: "upstream quota payload had no usable windows"}}
   end
 
   defp account_availability(payload, account_windows) do
+    rate_limit_signal = rate_limit_signal(payload)
+
     signals =
       [
-        rate_limit_signal(payload),
+        rate_limit_signal,
         credits_signal(payload),
-        spend_control_signal(payload),
+        account_spend_control_signal(payload, rate_limit_signal),
         reached_type_signal(payload),
         window_signal(account_windows),
         additional_integrity_signal(payload)
@@ -108,6 +123,65 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
       basis
       |> basis_state()
       |> AccountAvailability.new!(basis, account_windows)
+    end
+  end
+
+  # Spend control governs additional credits, not quota included with the
+  # subscription. Only a valid reached signal yields to explicit included
+  # quota permission; malformed spend-control input remains fail-closed.
+  defp account_spend_control_signal(payload, rate_limit_signal) do
+    case {rate_limit_signal, spend_control_signal(payload)} do
+      {:affirmative, :blocker} -> nil
+      {_rate_limit_signal, spend_signal} -> spend_signal
+    end
+  end
+
+  # This is a distinct provider meter, not a label-derived model exemption.
+  # Bind its grant to this complete usage observation; account-wide blockers
+  # and malformed permission signals must never acquire the marker.
+  defp attest_spark_permission(windows, payload) do
+    ordinary_only_denial? =
+      rate_limit_signal(payload) == :blocker and
+        spend_control_signal(payload) == nil and
+        ordinary_reached_type?(payload) and
+        credits_signal(payload) in [nil, :affirmative, :no_proof] and
+        additional_integrity_signal(payload) == nil
+
+    Enum.map(windows, &put_spark_permission(&1, ordinary_only_denial?))
+  end
+
+  defp put_spark_permission(
+         %{raw_metered_feature: "codex_bengalfox"} = window,
+         ordinary_only_denial?
+       ) do
+    granted? =
+      ordinary_only_denial? and window.model == "gpt-5.3-codex-spark" and
+        window.metadata["rate_limit_allowed"] == true and
+        window.metadata["rate_limit_reached"] == false
+
+    %{
+      window
+      | metadata:
+          window.metadata
+          |> Map.put("independent_spark_permission", granted?)
+          |> Map.put(
+            "independent_spark_permission_reset_at",
+            DateTime.to_iso8601(window.reset_at)
+          )
+          |> Map.put(
+            "independent_spark_permission_observed_at",
+            DateTime.to_iso8601(window.observed_at)
+          )
+    }
+  end
+
+  defp put_spark_permission(window, _ordinary_only_denial?), do: window
+
+  defp ordinary_reached_type?(payload) do
+    case Map.get(payload, "rate_limit_reached_type") do
+      nil -> true
+      %{"type" => "rate_limit_reached"} -> true
+      _other -> false
     end
   end
 
@@ -294,11 +368,12 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
   # Reason: parser accepts several upstream rate-limit error dialects.
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def parse_rate_limit_error(%{} = payload, observed_at) do
+    limit_name = Descriptors.bounded_limit_label(payload["limit_name"])
+
     family =
-      present_string(payload["limit_id"] || payload["limit_name"] || payload["metered_feature"]) ||
+      present_string(payload["limit_id"] || limit_name || payload["metered_feature"]) ||
         "codex"
 
-    limit_name = present_string(payload["limit_name"])
     descriptor = Descriptors.limit_descriptor(family, limit_name, %{})
     reset_at = ResetTimes.reset_at_from(payload, observed_at)
 
@@ -399,20 +474,34 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
        ) do
     raw_metered_feature = present_string(limit["metered_feature"])
     raw_limit_id = present_string(limit["limit_id"]) || raw_metered_feature
+    bounded_label = Descriptors.bounded_limit_label(limit["limit_name"])
 
-    descriptor_id =
-      raw_metered_feature || raw_limit_id ||
-        present_string(limit["limit_name"]) || present_string(limit["model"]) ||
-        present_string(limit["model_id"]) || present_string(limit["model_identifier"]) ||
-        "additional"
+    # The model fallbacks are provider-controlled strings that become the
+    # meter's persisted identity when no label is present, so they take the
+    # model-identifier bound (findings#240): an ASCII identifier stays
+    # cleartext, anything else is fingerprinted, and a blank one is absent.
+    bounded_model =
+      AccountingMetadata.bounded_model_identifier(limit["model"]) ||
+        AccountingMetadata.bounded_model_identifier(limit["model_id"]) ||
+        AccountingMetadata.bounded_model_identifier(limit["model_identifier"])
 
-    limit_name =
-      present_string(limit["limit_name"]) || present_string(limit["model"]) ||
-        present_string(limit["model_id"]) || present_string(limit["model_identifier"])
+    descriptor_id = raw_metered_feature || raw_limit_id || bounded_label || bounded_model || "additional"
+    limit_name = bounded_label || bounded_model
+
+    # The display label derives from the same fields, so it reads the bounded
+    # values: the first present model key, already bounded, replaces the raw
+    # three with the same precedence.
+    display_label_limit =
+      Map.merge(limit, %{
+        "limit_name" => bounded_label,
+        "model" => bounded_model,
+        "model_id" => nil,
+        "model_identifier" => nil
+      })
 
     descriptor =
       Descriptors.limit_descriptor(descriptor_id, limit_name, %{
-        display_label: Descriptors.additional_display_label(limit, descriptor_id),
+        display_label: Descriptors.additional_display_label(display_label_limit, descriptor_id),
         metered_feature: raw_metered_feature || raw_limit_id,
         raw_limit_id: raw_limit_id,
         raw_metered_feature: raw_metered_feature
@@ -437,6 +526,7 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
       ]
     end
     |> Enum.reject(&is_nil/1)
+    |> Enum.map(&put_provider_status(&1, provider_status_metadata(rate_limit)))
   end
 
   defp additional_limit_evidence(_limit, _observed_at, _validation), do: []

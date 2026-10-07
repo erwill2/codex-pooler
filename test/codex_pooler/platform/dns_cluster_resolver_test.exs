@@ -31,6 +31,37 @@ defmodule CodexPooler.Platform.DNSClusterResolverTest do
   end
 
   describe "reject_current_pod_ip/1" do
+    test "matches equivalent IPv6 spellings and preserves neighboring pods" do
+      current = {0x2001, 0xDB8, 0, 0, 0, 0, 0, 1}
+      neighbor = {0x2001, 0xDB8, 0, 0, 0, 0, 0, 2}
+
+      for pod_ip <- ["2001:db8::1", "2001:0DB8:0000:0000:0000:0000:0000:0001"] do
+        with_pod_ip(pod_ip, fn ->
+          assert DNSClusterResolver.reject_current_pod_ip([current, neighbor, current]) ==
+                   [neighbor]
+        end)
+      end
+    end
+
+    test "empty or malformed pod addresses leave discovery unchanged" do
+      records = [{192, 0, 2, 1}, {0, 0, 0, 0, 0, 0, 0, 1}]
+
+      for pod_ip <- ["", "not-an-ip"] do
+        with_pod_ip(pod_ip, fn ->
+          assert DNSClusterResolver.reject_current_pod_ip(records) == records
+        end)
+      end
+    end
+
+    test "node naming and discovery use the distribution runtime" do
+      assert DNSClusterResolver.basename(:"sample_app@192.0.2.1") == "sample_app"
+      assert DNSClusterResolver.basename(:"sample_app@2001:db8::1") == "sample_app"
+      refute Node.self() in DNSClusterResolver.list_nodes()
+
+      assert DNSClusterResolver.connect_node(Node.self()) ==
+               if(Node.alive?(), do: true, else: :ignored)
+    end
+
     test "removes only the current pod IPv4 record" do
       with_pod_ip("10.42.0.130", fn ->
         assert DNSClusterResolver.reject_current_pod_ip([
@@ -70,14 +101,7 @@ defmodule CodexPooler.Platform.DNSClusterResolverTest do
       with_pod_ip("10.42.0.130", fn ->
         capture_log(fn ->
           assert {:ok, _pid} =
-                   start_supervised(
-                     {DNSCluster,
-                      name: __MODULE__.Cluster,
-                      query: "cluster.invalid",
-                      resource_types: [:a, :aaaa, :srv],
-                      interval: :timer.hours(1),
-                      resolver: ContractResolver}
-                   )
+                   start_supervised({DNSCluster, name: __MODULE__.Cluster, query: "cluster.invalid", resource_types: [:a, :aaaa, :srv], interval: :timer.hours(1), resolver: ContractResolver})
         end)
 
         for resource_type <- [:a, :aaaa, :srv] do
@@ -94,6 +118,17 @@ defmodule CodexPooler.Platform.DNSClusterResolverTest do
   defp with_pod_ip(value, fun) do
     previous = System.get_env("POD_IP")
 
+    restore = fn ->
+      if previous do
+        System.put_env("POD_IP", previous)
+      else
+        System.delete_env("POD_IP")
+      end
+    end
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs.
+    on_exit(restore)
+
     if value do
       System.put_env("POD_IP", value)
     else
@@ -103,11 +138,7 @@ defmodule CodexPooler.Platform.DNSClusterResolverTest do
     try do
       fun.()
     after
-      if previous do
-        System.put_env("POD_IP", previous)
-      else
-        System.delete_env("POD_IP")
-      end
+      restore.()
     end
   end
 end

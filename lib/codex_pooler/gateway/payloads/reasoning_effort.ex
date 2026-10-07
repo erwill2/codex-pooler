@@ -4,8 +4,11 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
   @known_efforts ~w(none minimal low medium high xhigh max ultra persistent)
+  @non_ultra_targets ~w(none minimal ultra)
 
-  @spec extract(map(), RequestOptions.t()) :: String.t() | nil
+  @type effort :: String.t() | non_neg_integer() | nil
+
+  @spec extract(map(), RequestOptions.t()) :: effort()
   def extract(payload, %RequestOptions{} = request_options) when is_map(payload) do
     case request_options.openai_compatibility.source_endpoint do
       source_endpoint when is_binary(source_endpoint) ->
@@ -16,11 +19,21 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
     end
   end
 
-  @spec extract_native(map()) :: String.t() | nil
-  def extract_native(payload) when is_map(payload) do
+  @spec extract_native(map()) :: effort()
+  def extract_native(payload) when is_map(payload), do: normalize_native(raw_native_effort(payload))
+
+  @spec invalid_native_budget?(map(), RequestOptions.t()) :: boolean()
+  def invalid_native_budget?(payload, %RequestOptions{openai_compatibility: %{source_endpoint: nil}}) do
+    value = raw_native_effort(payload)
+    (is_number(value) or is_boolean(value)) and is_nil(normalize_native(value))
+  end
+
+  def invalid_native_budget?(_payload, %RequestOptions{}), do: false
+
+  defp raw_native_effort(payload) do
     with :absent <- present_nested_effort(payload),
-         :absent <- present_clean_string(payload, "reasoning_effort"),
-         :absent <- present_clean_string(payload, "reasoningEffort"),
+         :absent <- present_native_effort(payload, "reasoning_effort"),
+         :absent <- present_native_effort(payload, "reasoningEffort"),
          :absent <- present_thinking_effort(payload),
          :absent <- present_enabled_effort(payload, "enable_thinking") do
       nil
@@ -29,18 +42,28 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
     end
   end
 
+  @doc "Preserves native unsigned 64-bit budgets without changing their JSON number type."
+  @spec normalize_native(term()) :: effort()
+  def normalize_native(value) when is_integer(value) and value >= 0 and value <= 18_446_744_073_709_551_615, do: value
+  def normalize_native(value), do: clean_string(value)
+
   @spec parameter(RequestOptions.t()) :: String.t()
   def parameter(%RequestOptions{} = request_options) do
     case request_options.openai_compatibility.source_endpoint do
       source_endpoint when is_binary(source_endpoint) ->
         if String.ends_with?(source_endpoint, "/chat/completions"),
-          do: "reasoning_effort",
+          do: chat_parameter(request_options.openai_compatibility.openai_chat_payload),
           else: "reasoning.effort"
 
       _source_endpoint ->
         "reasoning.effort"
     end
   end
+
+  defp chat_parameter(%{"messages" => [_message | _rest], "reasoning" => effort}) when is_binary(effort),
+    do: "reasoning"
+
+  defp chat_parameter(_payload), do: "reasoning_effort"
 
   @spec normalize_known(term()) :: String.t() | nil
   def normalize_known(value) when is_binary(value) do
@@ -57,12 +80,19 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
 
   def rewrite_client_upstream(value), do: value
 
-  @spec rewrite_backend_upstream(term()) :: term()
-  def rewrite_backend_upstream(value) when is_binary(value) do
-    if normalize_for_compare(value) == "ultra", do: "max", else: value
+  # The backend rejects the literal `ultra`, and it rejects `max` on models whose
+  # catalog omits it. The alias lands on `max`, or on the highest listed level when
+  # known catalog levels exclude `max`; it never targets `none` or `minimal`.
+  @spec rewrite_backend_upstream(term(), [term()] | nil) :: term()
+  def rewrite_backend_upstream(value, catalog_levels \\ nil)
+
+  def rewrite_backend_upstream(value, catalog_levels) when is_binary(value) do
+    if normalize_for_compare(value) == "ultra",
+      do: backend_ultra_target(catalog_levels),
+      else: value
   end
 
-  def rewrite_backend_upstream(value), do: value
+  def rewrite_backend_upstream(value, _catalog_levels), do: value
 
   defp extract_compatible(payload, request_options, source_endpoint) do
     if String.ends_with?(source_endpoint, "/chat/completions") do
@@ -78,7 +108,7 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
     case fetch_field(payload, "reasoning") do
       {:ok, reasoning} when is_map(reasoning) ->
         case fetch_field(reasoning, "effort") do
-          {:ok, value} -> {:present, clean_string(value)}
+          {:ok, value} -> {:present, value}
           :error -> :absent
         end
 
@@ -90,9 +120,9 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
     end
   end
 
-  defp present_clean_string(payload, key) do
+  defp present_native_effort(payload, key) do
     case fetch_field(payload, key) do
-      {:ok, value} -> {:present, clean_string(value)}
+      {:ok, value} -> {:present, value}
       :error -> :absent
     end
   end
@@ -179,4 +209,21 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
   defp clean_string(_value, _mapper), do: nil
 
   defp normalize_for_compare(value), do: value |> String.trim() |> String.downcase()
+
+  defp backend_ultra_target(catalog_levels) when is_list(catalog_levels) do
+    targets =
+      catalog_levels
+      |> Enum.map(&normalize_known/1)
+      |> Enum.reject(&(is_nil(&1) or &1 in @non_ultra_targets))
+
+    cond do
+      targets == [] -> "max"
+      "max" in targets -> "max"
+      true -> Enum.max_by(targets, &effort_rank/1)
+    end
+  end
+
+  defp backend_ultra_target(_catalog_levels), do: "max"
+
+  defp effort_rank(effort), do: Enum.find_index(@known_efforts, &(&1 == effort))
 end

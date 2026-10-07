@@ -15,46 +15,58 @@ defmodule CodexPoolerWeb.Runtime.AnchoredOwnerDrainSupport do
 
   @budget 15_000
 
-  @spec fixture() :: {map(), FakeUpstream.t(), map(), reference()}
-  def fixture do
+  @spec fixture(keyword()) :: {map(), FakeUpstream.t(), map(), reference()}
+  def fixture(opts \\ []) do
     cache = InstanceSettings.snapshot_cache_for_test()
     on_exit(fn -> InstanceSettings.restore_cache_for_test(cache) end)
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
     Sandbox.mode(Repo, :auto)
 
     on_exit(fn ->
       Sandbox.mode(Repo, :manual)
-
-      if previous == nil,
-        do: Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled),
-        else: Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, previous)
     end)
 
     release_ref = make_ref()
 
+    # Every entry is consumed exactly once: the completed anchor turns, then
+    # the barrier-held continuation. Callers supply SSE-shaped completed
+    # responses and the held terminal has no native websocket flavour, so the
+    # entries assert the native discriminator rather than `method:
+    # "WEBSOCKET"`; consumers pin the transport on the recorded requests.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           completed_tool_response(),
-           FakeUpstream.delayed_terminal_sse_stream(
-             [%{"type" => "response.output_text.delta", "delta" => "synthetic"}],
-             %{
-               "type" => "response.completed",
-               "response" => %{"id" => "resp_synthetic_continuation", "status" => "completed"}
-             },
-             notify: self(),
-             release_ref: release_ref
-           )
-         ]}
+        FakeUpstream.strict_sequence(
+          Enum.map(
+            Keyword.get(opts, :completed_responses, [completed_tool_response()]) ++
+              [
+                FakeUpstream.delayed_terminal_sse_stream(
+                  [%{"type" => "response.output_text.delta", "delta" => "synthetic"}],
+                  %{
+                    "type" => "response.completed",
+                    "response" => %{
+                      "id" => "resp_synthetic_continuation",
+                      "status" => "completed"
+                    }
+                  },
+                  notify: self(),
+                  release_ref: release_ref
+                )
+              ],
+            &FakeUpstream.expect_request(
+              path: "/backend-api/codex/responses",
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond: &1
+            )
+          )
+        )
       )
 
     setup = gateway_setup(upstream)
 
     on_exit(fn ->
       Sandbox.unboxed_run(Repo, fn ->
-        Repo.delete!(setup.pool)
+        CodexPooler.PoolerFixtures.delete_committed_pools!([setup.pool.id])
         Repo.delete!(setup.identity)
         Repo.delete!(setup.pricing)
       end)
@@ -107,7 +119,7 @@ defmodule CodexPoolerWeb.Runtime.AnchoredOwnerDrainSupport do
     assert %{"item" => %{"type" => "function_call", "call_id" => call_id} = item} = item_event
     assert completed["response"]["output"] == [item]
     assert item["name"] == "synthetic_tool"
-    assert Jason.decode!(item["arguments"]) == %{}
+    assert CodexPooler.JSON.decode!(item["arguments"]) == %{}
     {completed["response"]["id"], call_id, receive_until(state, :complete)}
   end
 
@@ -138,16 +150,32 @@ defmodule CodexPoolerWeb.Runtime.AnchoredOwnerDrainSupport do
           }
         }
       ],
-      "client_metadata" => %{"x-codex-turn-metadata" => Jason.encode!(metadata)},
+      "client_metadata" => %{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(metadata)},
       "stream" => true,
       "generate" => true
     }
   end
 
-  @spec receive_until(map(), :complete | String.t() | {:error | :event, String.t()}) ::
+  # `{:close, close_detail}` waits for the socket to close itself with that
+  # detail, as an idle native socket does once its owner drained (findings#276).
+  @spec receive_until(map(), :complete | String.t() | {:error | :event, String.t()} | {:close, {pos_integer(), String.t()}}) ::
           map() | {map(), map()}
   def receive_until(state, expected) do
+    if expected == :complete and MapSet.size(state.tasks) == 0,
+      do: state,
+      else: receive_next(state, expected)
+  end
+
+  defp receive_next(state, expected) do
+    owner_monitor = Map.get(state, :websocket_owner_monitor)
+    task_monitors = Map.get(state, :task_monitors, %{})
+
     receive do
+      {:DOWN, ref, :process, pid, _reason} = message
+      when ref == owner_monitor or
+             (is_map_key(task_monitors, pid) and :erlang.map_get(pid, task_monitors) == ref) ->
+        handle_lifecycle_message(message, state, expected)
+
       message
       when elem(message, 0) in [
              :websocket_owner_cleanup_witness,
@@ -159,24 +187,28 @@ defmodule CodexPoolerWeb.Runtime.AnchoredOwnerDrainSupport do
              :direct_request_cleanup,
              :codex_response_chunk
            ] ->
-        case CodexResponsesSocket.handle_info(message, state) do
-          {:ok, state} ->
-            if expected == :complete and MapSet.size(state.tasks) == 0,
-              do: state,
-              else: receive_until(state, expected)
-
-          {:push, {:text, frame}, state} ->
-            event = Jason.decode!(frame)
-
-            code = get_in(event, ["error", "code"])
-
-            if event["type"] == expected or expected == {:event, event["type"]} or
-                 (not is_nil(code) and expected == {:error, code}),
-               do: event_result(event, state, expected),
-               else: receive_until(state, expected)
-        end
+        handle_lifecycle_message(message, state, expected)
     after
       @budget -> flunk("missing bounded owner lifecycle event #{inspect(expected)}")
+    end
+  end
+
+  defp handle_lifecycle_message(message, state, expected) do
+    case CodexResponsesSocket.handle_info(message, state) do
+      {:ok, state} ->
+        receive_until(state, expected)
+
+      {:push, {:text, frame}, state} ->
+        event = CodexPooler.JSON.decode!(frame)
+        code = get_in(event, ["error", "code"])
+
+        if event["type"] == expected or expected == {:event, event["type"]} or
+             (not is_nil(code) and expected == {:error, code}),
+           do: event_result(event, state, expected),
+           else: receive_until(state, expected)
+
+      {:stop, :normal, close_detail, state} when expected == {:close, close_detail} ->
+        state
     end
   end
 

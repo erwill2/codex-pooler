@@ -74,6 +74,20 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentityLifecycle do
     end
   end
 
+  @doc false
+  @spec select_upsert_identity_from_candidates(map(), [UpstreamIdentity.t()]) ::
+          {:ok, UpstreamIdentity.t() | nil} | {:error, identity_conflict()}
+  def select_upsert_identity_from_candidates(attrs, candidates)
+      when is_map(attrs) and is_list(candidates) do
+    attrs = atomize_attrs(attrs)
+    normalized = IdentitySlotLock.normalize(attrs)
+
+    case normalized.chatgpt_account_id do
+      nil -> select_email_fallback_from_candidates(attrs, normalized, candidates)
+      account_id -> select_account_slot_from_candidates(account_id, normalized, attrs, candidates)
+    end
+  end
+
   @spec get_upstream_identity_by_chatgpt_account(term()) :: UpstreamIdentity.t() | nil
   def get_upstream_identity_by_chatgpt_account(chatgpt_account_id)
       when is_binary(chatgpt_account_id) do
@@ -191,39 +205,74 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentityLifecycle do
     do: not is_nil(present_string(identity.workspace_id))
 
   defp select_account_slot_identity(account_id, workspace_id, nil, attrs) do
-    identities = identities_for_account(account_id)
-
-    case subjectless_identity_for_workspace(identities, workspace_id) do
+    case account_identity(account_id, workspace_id, :subjectless) do
       %UpstreamIdentity{} = identity ->
         {:ok, identity}
 
       nil ->
-        select_subjectless_account_fallback(identities, workspace_id, attrs)
+        select_subjectless_account_fallback(account_id, workspace_id, attrs)
     end
   end
 
   defp select_account_slot_identity(account_id, workspace_id, subject, _attrs) do
-    identities = identities_for_account(account_id)
-
-    with nil <- identity_for_workspace_and_subject(identities, workspace_id, subject),
-         nil <- subjectless_identity_for_workspace(identities, workspace_id) do
-      {:ok, claimable_subjectless_legacy_identity(identities, workspace_id)}
+    with nil <- account_identity(account_id, workspace_id, {:subject, subject}),
+         nil <- account_identity(account_id, workspace_id, :subjectless) do
+      {:ok, claimable_subjectless_legacy_identity_for_account(account_id, workspace_id)}
     else
       %UpstreamIdentity{} = identity -> {:ok, identity}
     end
   end
 
-  defp select_subjectless_account_fallback(identities, workspace_id, attrs) do
-    case claimable_subjectless_legacy_identity(identities, workspace_id) do
+  defp select_subjectless_account_fallback(account_id, workspace_id, attrs) do
+    case claimable_subjectless_legacy_identity_for_account(account_id, workspace_id) do
       %UpstreamIdentity{} = identity ->
         {:ok, identity}
 
       nil ->
-        case subject_bound_identity_for_workspace(identities, workspace_id) do
+        case account_identity(account_id, workspace_id, :subject_bound) do
           %UpstreamIdentity{} = conflict -> {:error, identity_conflict(attrs, conflict)}
           nil -> {:ok, nil}
         end
     end
+  end
+
+  defp account_identity(account_id, workspace_id, subject_selector) do
+    UpstreamIdentity
+    |> where([identity], identity.chatgpt_account_id == ^account_id)
+    |> where_workspace(workspace_id)
+    |> where_subject(subject_selector)
+    |> order_by([identity], asc: identity.created_at, asc: identity.id)
+    |> limit(1)
+    |> Repo.one()
+  end
+
+  defp where_subject(query, :subjectless),
+    do: where(query, [identity], is_nil(identity.chatgpt_user_id))
+
+  defp where_subject(query, :subject_bound),
+    do: where(query, [identity], not is_nil(identity.chatgpt_user_id))
+
+  defp where_subject(query, {:subject, subject}),
+    do: where(query, [identity], identity.chatgpt_user_id == ^subject)
+
+  defp claimable_subjectless_legacy_identity_for_account(account_id, workspace_id)
+       when is_binary(workspace_id) do
+    legacy_identity = account_identity(account_id, nil, :subjectless)
+
+    if legacy_identity && not subjectless_concrete_identity_exists?(account_id) do
+      legacy_identity
+    end
+  end
+
+  defp claimable_subjectless_legacy_identity_for_account(_account_id, _workspace_id), do: nil
+
+  defp subjectless_concrete_identity_exists?(account_id) do
+    Repo.exists?(
+      from identity in UpstreamIdentity,
+        where: identity.chatgpt_account_id == ^account_id,
+        where: not is_nil(identity.workspace_id),
+        where: is_nil(identity.chatgpt_user_id)
+    )
   end
 
   defp claimable_subjectless_legacy_identity(identities, workspace_id)
@@ -255,6 +304,102 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentityLifecycle do
           [conflict | _rest] -> {:error, identity_conflict(attrs, conflict)}
         end
     end
+  end
+
+  defp select_account_slot_from_candidates(account_id, normalized, attrs, candidates) do
+    identities =
+      candidates
+      |> Enum.filter(&(&1.chatgpt_account_id == account_id))
+      |> sort_account_candidates()
+
+    select_account_candidates(
+      identities,
+      normalized.workspace_id,
+      normalized.chatgpt_user_id,
+      attrs
+    )
+  end
+
+  defp select_account_candidates(identities, workspace_id, nil, attrs) do
+    case subjectless_identity_for_workspace(identities, workspace_id) do
+      %UpstreamIdentity{} = identity -> {:ok, identity}
+      nil -> select_subjectless_account_fallback_from_candidates(identities, workspace_id, attrs)
+    end
+  end
+
+  defp select_account_candidates(identities, workspace_id, subject, _attrs) do
+    with nil <- identity_for_workspace_and_subject(identities, workspace_id, subject),
+         nil <- subjectless_identity_for_workspace(identities, workspace_id) do
+      {:ok, claimable_subjectless_legacy_identity(identities, workspace_id)}
+    else
+      %UpstreamIdentity{} = identity -> {:ok, identity}
+    end
+  end
+
+  defp select_subjectless_account_fallback_from_candidates(identities, workspace_id, attrs) do
+    case claimable_subjectless_legacy_identity(identities, workspace_id) do
+      %UpstreamIdentity{} = identity ->
+        {:ok, identity}
+
+      nil ->
+        case subject_bound_identity_for_workspace(identities, workspace_id) do
+          %UpstreamIdentity{} = conflict -> {:error, identity_conflict(attrs, conflict)}
+          nil -> {:ok, nil}
+        end
+    end
+  end
+
+  defp select_email_fallback_from_candidates(attrs, normalized, candidates) do
+    case normalized.account_email do
+      nil ->
+        {:error, identity_conflict(attrs, nil)}
+
+      email ->
+        matches =
+          candidates
+          |> Enum.filter(fn identity ->
+            normalize_email(identity.account_email) == email and
+              present_string(identity.workspace_id) == normalized.workspace_id
+          end)
+          |> Enum.sort_by(&{&1.created_at, &1.id})
+
+        case matches do
+          [candidate] ->
+            maybe_select_email_candidate_from_candidates(candidate, attrs, candidates)
+
+          [] ->
+            {:error, identity_conflict(attrs, nil)}
+
+          [conflict | _rest] ->
+            {:error, identity_conflict(attrs, conflict)}
+        end
+    end
+  end
+
+  defp maybe_select_email_candidate_from_candidates(candidate, attrs, candidates) do
+    incoming_workspace_id = attrs |> Map.get(:workspace_id) |> present_string()
+
+    sibling =
+      candidates
+      |> Enum.filter(fn identity ->
+        identity.id != candidate.id and
+          identity.chatgpt_account_id == candidate.chatgpt_account_id and
+          not is_nil(present_string(identity.workspace_id))
+      end)
+      |> Enum.sort_by(&{&1.workspace_id, &1.created_at, &1.id})
+      |> List.first()
+
+    if is_nil(incoming_workspace_id) and not is_nil(sibling) do
+      {:error, identity_conflict(attrs, sibling)}
+    else
+      {:ok, candidate}
+    end
+  end
+
+  defp sort_account_candidates(candidates) do
+    Enum.sort_by(candidates, fn identity ->
+      {if(is_nil(identity.workspace_id), do: 0, else: 1), identity.workspace_id || "", identity.created_at, identity.id}
+    end)
   end
 
   defp maybe_select_email_candidate(%UpstreamIdentity{} = candidate, attrs) do
@@ -362,6 +507,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentityLifecycle do
     |> where([identity], identity.account_email == ^account_email)
     |> where_workspace(workspace_id)
     |> order_by([identity], asc: identity.created_at, asc: identity.id)
+    |> limit(2)
     |> Repo.all()
   end
 
@@ -451,6 +597,13 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentityLifecycle do
   end
 
   defp present_string(_value), do: nil
+
+  defp normalize_email(value) do
+    case present_string(value) do
+      nil -> nil
+      email -> String.downcase(email)
+    end
+  end
 
   defp atomize_attrs(attrs) when is_map(attrs) do
     Map.new(attrs, fn

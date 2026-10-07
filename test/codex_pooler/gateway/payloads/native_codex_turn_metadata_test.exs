@@ -44,7 +44,7 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
              NativeCodexTurnMetadata.parse(
                %{
                  "client_metadata" => %{
-                   "x-codex-turn-metadata" => Jason.encode!(metadata)
+                   "x-codex-turn-metadata" => CodexPooler.JSON.encode!(metadata)
                  }
                },
                @session_id
@@ -65,7 +65,8 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
         "sandbox_mode" => "danger-full-access"
       }
 
-      canonical = if encoding == :encoded, do: Jason.encode!(canonical), else: canonical
+      canonical =
+        if encoding == :encoded, do: CodexPooler.JSON.encode!(canonical), else: canonical
 
       assert {:ok, parsed} = NativeCodexTurnMetadata.parse(payload(canonical), @session_id)
       assert parsed.request_kind == String.to_existing_atom(request_kind)
@@ -85,7 +86,7 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
       "sandbox_mode" => "read-only"
     }
 
-    for value <- [Jason.encode!(canonical), canonical] do
+    for value <- [CodexPooler.JSON.encode!(canonical), canonical] do
       assert {:ok, parsed} = NativeCodexTurnMetadata.parse(payload(value), @session_id)
       assert parsed.request_kind == :prewarm
       assert parsed.semantic_turn_key == nil
@@ -136,7 +137,7 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
         "comp_hash_changed"
       ],
       "implementation" => ["responses", "responses_compaction_v2", "responses_compact"],
-      "phase" => ["standalone_turn", "pre_turn", "mid_turn"],
+      "phase" => ["standalone_turn", "pre_turn", "mid_turn", "post_turn"],
       "strategy" => ["memento", "prefix_compaction"]
     }
 
@@ -167,7 +168,7 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
       "unknown_sibling" => "ignored"
     }
 
-    for value <- [Jason.encode!(canonical), canonical] do
+    for value <- [CodexPooler.JSON.encode!(canonical), canonical] do
       assert {:ok, parsed} = NativeCodexTurnMetadata.parse(payload(value), @session_id)
       assert parsed.request_kind == :memory
       assert parsed.semantic_turn_key == nil
@@ -243,6 +244,37 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
              )
   end
 
+  # findings#258 row 258-91, measured on the released Codex client against a capture server:
+  # 742 bytes by default, 22,504 bytes with `turn_metadata_includes_tool_info` on a Responses
+  # Lite model and 120 MCP tools, 3,910 bytes with 16 maximal `responses_api_metadata` entries.
+  test "accepts the released client's tool inventory and maximal extra metadata" do
+    tool_heavy = released_turn_metadata(%{"tool_namespaces_info" => tool_namespaces_info(3, 40)})
+    extras = released_turn_metadata(maximal_extra_metadata())
+
+    assert byte_size(tool_heavy) > 16_384
+    assert byte_size(extras) > 3_500
+
+    for encoded <- [tool_heavy, extras] do
+      assert {:ok, %NativeCodexTurnMetadata{request_kind: :turn} = metadata} =
+               NativeCodexTurnMetadata.parse(payload(encoded), @session_id)
+
+      assert byte_size(metadata.semantic_turn_key) == 32
+
+      assert {:ok, %NativeCodexTurnMetadata{request_kind: :turn}} =
+               NativeCodexTurnMetadata.parse(payload(CodexPooler.JSON.decode!(encoded)), @session_id)
+    end
+  end
+
+  test "refuses a canonical value above the decode bound" do
+    oversized = released_turn_metadata(%{"tool_namespaces_info" => tool_namespaces_info(12, 150)})
+    assert byte_size(oversized) > 262_144
+
+    for value <- [oversized, CodexPooler.JSON.decode!(oversized)] do
+      assert {:error, %{status: 400, code: "invalid_request"}} =
+               NativeCodexTurnMetadata.parse(payload(value), @session_id)
+    end
+  end
+
   test "produces domain-separated deterministic keyed digests without raw leakage" do
     sentinel = "raw-sentinel-#{System.unique_integer([:positive])}"
 
@@ -273,6 +305,119 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadataTest do
       assert byte_size(digest) == 32
       refute inspect(digest) =~ sentinel
     end
+  end
+
+  # A native HTTP request carries the canonical document in a header, and the
+  # remote compaction claim its HTTPS fallback derives binds the same window
+  # digest the websocket frame's parsed metadata carries (findings#270 row
+  # 270-357); a window `parse/2` would refuse names none.
+  test "digests a canonical document's window as the parsed metadata does, and nothing else" do
+    window = "019a0000-0000-7000-8000-000000000357:1"
+    canonical = %{"window_id" => window, "request_kind" => "compaction"}
+
+    assert NativeCodexTurnMetadata.canonical_window_digest(canonical) == {:ok, NativeCodexTurnMetadata.window_id_digest(window)}
+
+    for invalid <- [%{}, %{"window_id" => nil}, %{"window_id" => ""}, %{"window_id" => "   "}, %{"window_id" => 1}, %{"window_id" => String.duplicate("w", 257)}, %{"window_id" => <<0xFF>>}] do
+      assert NativeCodexTurnMetadata.canonical_window_digest(invalid) == :error
+    end
+
+    for not_a_document <- [nil, "window", [window]] do
+      assert NativeCodexTurnMetadata.canonical_window_digest(not_a_document) == :error
+    end
+  end
+
+  # The released client's window id is `<thread>:<window number>`; the number
+  # starts at 0 and moves by one per completed compaction (findings#289).
+  test "reads the thread of a released window id and nothing else" do
+    thread = "019a0000-0000-7000-8000-000000000289"
+
+    for window <- ["#{thread}:0", "#{thread}:7", "#{thread}:01", "#{thread}:18446744073709551615"] do
+      assert NativeCodexTurnMetadata.window_thread(window) == {:ok, thread}
+    end
+
+    for window <- [thread, "#{thread}:", ":1", "#{thread}:x", "#{thread}:1:2", "#{thread}:-1", "#{thread}: 1", "#{thread}:#{String.duplicate("1", 21)}", ""] do
+      assert NativeCodexTurnMetadata.window_thread(window) == :error
+    end
+  end
+
+  test "names the previous window of a canonical window number above zero only" do
+    thread = "019a0000-0000-7000-8000-000000000289"
+
+    assert NativeCodexTurnMetadata.previous_window("#{thread}:1") == {:ok, "#{thread}:0"}
+    assert NativeCodexTurnMetadata.previous_window("#{thread}:10") == {:ok, "#{thread}:9"}
+
+    assert NativeCodexTurnMetadata.previous_window("#{thread}:18446744073709551615") ==
+             {:ok, "#{thread}:18446744073709551614"}
+
+    for window <- [
+          "#{thread}:0",
+          "#{thread}:01",
+          "#{thread}:00",
+          "#{thread}:18446744073709551616",
+          thread,
+          "#{thread}:",
+          ":1",
+          "#{thread}:x",
+          "#{thread}:1:2",
+          String.duplicate("t", 255) <> ":1",
+          "",
+          nil
+        ] do
+      assert NativeCodexTurnMetadata.previous_window(window) == :none
+    end
+
+    assert NativeCodexTurnMetadata.previous_window(String.duplicate("t", 254) <> ":1") ==
+             {:ok, String.duplicate("t", 254) <> ":0"}
+  end
+
+  defp released_turn_metadata(extra) do
+    %{
+      "installation_id" => "00000000-0000-4000-8000-00000000b001",
+      "session_id" => @session_id,
+      "thread_id" => @session_id,
+      "agent_name" => "/root",
+      "turn_id" => "019a0000-0000-7000-8000-00000000b002",
+      "window_id" => "#{@session_id}:0",
+      "window_number" => 0,
+      "context_window_id" => "00000000-0000-4000-8000-00000000b003",
+      "request_kind" => "turn",
+      "root_turn_id" => "019a0000-0000-7000-8000-00000000b002",
+      "thread_source" => "user",
+      "turn_trigger" => "exec",
+      "sandbox" => "seccomp",
+      "sandbox_mode" => "read-only",
+      "auto_review_enabled" => false,
+      "node_repl_auto_review_required" => false,
+      "node_repl_disabled" => false,
+      "turn_started_at_unix_ms" => 1_790_000_000_000,
+      "analytics_enabled" => true,
+      "model" => "gpt-test-model",
+      "reasoning_effort" => "medium"
+    }
+    |> Map.merge(extra)
+    |> CodexPooler.JSON.encode!()
+  end
+
+  # The `TurnToolNamespacesInfo` shape of the released Codex client (`responses_metadata.rs`): one entry per
+  # namespace, one per function, with the MCP server as the function's source.
+  defp tool_namespaces_info(servers, tools) do
+    Map.new(1..servers, fn server ->
+      namespace = "mcp__p23s#{server}__"
+
+      functions =
+        Map.new(1..tools, fn tool ->
+          name = "p23s#{server}_lookup_record_#{tool}"
+          {name, %{"name" => name, "direct" => false, "code_mode_name" => nil, "deferred" => true, "source" => %{"kind" => "mcp", "server_name" => "p23s#{server}"}}}
+        end)
+
+      {namespace, %{"name" => namespace, "functions" => functions}}
+    end)
+  end
+
+  defp maximal_extra_metadata do
+    Map.new(1..16, fn index ->
+      {"k#{index}_" <> String.duplicate("x", 60), String.duplicate("v", 128)}
+    end)
   end
 
   defp payload(metadata) do

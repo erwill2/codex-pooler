@@ -8,10 +8,14 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
+  alias CodexPooler.SavedResetConfirmationFixtures
+  alias CodexPooler.TestDiagnostics
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
+  alias CodexPooler.Upstreams.SavedResets.AutomaticConfirmation
   alias CodexPooler.Upstreams.Schemas.EncryptedSecret
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias Ecto.Adapters.SQL
@@ -62,6 +66,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
     assert evidence.wait_event_type == "Lock"
     assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} = evidence.claim_result
     assert provider_consume_count(fixture.fake) == 1
+    TestDiagnostics.puts("EXPIRY_LOCK_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "circuit_open_consume", consumes: provider_consume_count(fixture.fake), generation_sends: Enum.count(FakeUpstream.requests(fixture.fake), &String.ends_with?(&1.path, "/responses")), distinct_backends: evidence.writer_backend_pid != evidence.claim_backend_pid, blocking_witness: evidence.writer_backend_pid in evidence.blocking_pids}))
   end
 
   test "open to closed rereads current C and vetoes before provider I/O" do
@@ -74,11 +79,11 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
     assert evidence.writer_backend_pid in evidence.blocking_pids
     assert evidence.wait_event_type == "Lock"
 
-    assert {:ok,
-            %{status: :noop, applied?: false, code: "gateway_auto_sibling_transient_exclusion"}} =
+    assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_sibling_transient_exclusion"}} =
              evidence.claim_result
 
     assert provider_consume_count(fixture.fake) == 0
+    TestDiagnostics.puts("EXPIRY_LOCK_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "circuit_close_veto", consumes: provider_consume_count(fixture.fake), generation_sends: Enum.count(FakeUpstream.requests(fixture.fake), &String.ends_with?(&1.path, "/responses")), distinct_backends: evidence.writer_backend_pid != evidence.claim_backend_pid, blocking_witness: evidence.writer_backend_pid in evidence.blocking_pids}))
   end
 
   test "quota becoming usable while the claim waits is evaluated after locks" do
@@ -103,6 +108,135 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
 
     assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_sibling_usable_capacity"}} =
              evidence.claim_result
+
+    assert provider_consume_count(fixture.fake) == 0
+    TestDiagnostics.puts("EXPIRY_LOCK_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "capacity_after_scan_veto", consumes: provider_consume_count(fixture.fake), generation_sends: Enum.count(FakeUpstream.requests(fixture.fake), &String.ends_with?(&1.path, "/responses")), distinct_backends: evidence.writer_backend_pid != evidence.claim_backend_pid, blocking_witness: evidence.writer_backend_pid in evidence.blocking_pids}))
+  end
+
+  test "an allowed provider receipt committed while the claim waits clears the proof after locks" do
+    fixture = committed_fixture!("closed", false)
+    on_exit(fn -> cleanup_fixture!(fixture) end)
+    target_identity_id = fixture.target_assignment.upstream_identity_id
+
+    [window] =
+      Sandbox.unboxed_run(Repo, fn ->
+        SavedResetConfirmationFixtures.weekly_provider_windows(target_identity_id)
+      end)
+
+    assert Sandbox.unboxed_run(Repo, fn ->
+             SavedResetConfirmationFixtures.marker_state(window)
+           end) == "confirmed"
+
+    evidence = race_proof_cleared(fixture, window)
+
+    assert evidence.writer_backend_pid != evidence.claim_backend_pid
+    assert evidence.writer_backend_pid in evidence.blocking_pids
+    assert evidence.wait_event_type == "Lock"
+
+    assert {:ok, %{status: :noop, applied?: false, code: code}} = evidence.claim_result
+    assert code in ["gateway_auto_trigger_not_current", "gateway_auto_confirmation_mismatch"]
+    assert provider_consume_count(fixture.fake) == 0
+
+    assert Sandbox.unboxed_run(Repo, fn ->
+             SavedResetConfirmationFixtures.marker_state(window)
+           end) == "approach"
+
+    refute Sandbox.unboxed_run(Repo, fn ->
+             Repo.get!(UpstreamIdentity, target_identity_id).metadata["saved_reset_redemption"]
+           end)
+  end
+
+  test "a re-observed proof committed while the claim waits invalidates the carried references" do
+    fixture = committed_fixture!("closed", true)
+    on_exit(fn -> cleanup_fixture!(fixture) end)
+    target_identity_id = fixture.target_assignment.upstream_identity_id
+
+    # The routable sibling is exhausted so every capacity fence passes and the
+    # confirmation fence is the one that decides. The target proof is aged by
+    # two minutes so the racing receipt is strictly newer at second precision.
+    {fixture, window} =
+      Sandbox.unboxed_run(Repo, fn ->
+        put_weekly_quota!(Repo.get!(UpstreamIdentity, fixture.sibling_identity_id), "100")
+        [window] = SavedResetConfirmationFixtures.weekly_provider_windows(target_identity_id)
+
+        window
+        |> AccountQuotaWindow.changeset(%{metadata: AutomaticConfirmation.clear(window.metadata)})
+        |> Repo.update!()
+
+        for offset <- [-120, -60] do
+          SavedResetConfirmationFixtures.observe_window!(
+            target_identity_id,
+            window,
+            DateTime.utc_now()
+            |> DateTime.add(offset, :second)
+            |> DateTime.truncate(:microsecond),
+            []
+          )
+        end
+
+        [window] = SavedResetConfirmationFixtures.weekly_provider_windows(target_identity_id)
+        assert SavedResetConfirmationFixtures.marker_state(window) == "confirmed"
+        context = SavedResetConfirmationFixtures.put_confirmation_refs(fixture.context)
+        {%{fixture | context: context}, window}
+      end)
+
+    evidence = race_proof_reobserved(fixture, window)
+
+    assert evidence.writer_backend_pid in evidence.blocking_pids
+    assert evidence.wait_event_type == "Lock"
+
+    assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_confirmation_mismatch"}} =
+             evidence.claim_result
+
+    assert provider_consume_count(fixture.fake) == 0
+
+    assert Sandbox.unboxed_run(Repo, fn ->
+             SavedResetConfirmationFixtures.marker_state(window)
+           end) == "confirmed"
+  end
+
+  test "rounded-full permitted sibling vetoes redemption before provider consume" do
+    fixture = committed_fixture!("closed", false)
+    on_exit(fn -> cleanup_fixture!(fixture) end)
+
+    result =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.delete!(Repo.get!(RoutingCircuitState, fixture.circuit_id))
+        identity = Repo.get!(UpstreamIdentity, fixture.sibling_identity_id)
+        window = put_weekly_quota!(identity, "100")
+
+        window
+        |> Ecto.Changeset.change(
+          metadata: %{
+            "rate_limit_allowed" => true,
+            "rate_limit_reached" => false
+          }
+        )
+        |> Repo.update!()
+
+        identity
+        |> Ecto.Changeset.change(
+          metadata:
+            Map.put(
+              identity.metadata,
+              "quota_account_availability",
+              AccountAvailabilityStore.encode!(
+                :available,
+                window.observed_at,
+                1
+              )
+            )
+        )
+        |> Repo.update!()
+
+        SavedResetRedemption.redeem(fixture.target_assignment,
+          trigger_kind: "gateway_auto",
+          gateway_auto_context: %{fixture.context | transient_circuit_exclusions: []}
+        )
+      end)
+
+    assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_sibling_usable_capacity"}} =
+             result
 
     assert provider_consume_count(fixture.fake) == 0
   end
@@ -165,8 +299,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
         %{fixture | context: context}
       end)
 
-    assert {:ok,
-            %{status: :noop, applied?: false, code: "gateway_auto_sibling_transient_exclusion"}} =
+    assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_sibling_transient_exclusion"}} =
              Sandbox.unboxed_run(Repo, fn ->
                SavedResetRedemption.redeem(fixture.target_assignment,
                  trigger_kind: "gateway_auto",
@@ -181,8 +314,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
     fixture = committed_fixture!("open", false)
     on_exit(fn -> cleanup_fixture!(fixture) end)
 
-    assert {:ok,
-            %{status: :noop, applied?: false, code: "gateway_auto_sibling_transient_exclusion"}} =
+    assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_sibling_transient_exclusion"}} =
              Sandbox.unboxed_run(Repo, fn ->
                SavedResetRedemption.redeem(fixture.target_assignment,
                  trigger_kind: "gateway_auto",
@@ -280,6 +412,8 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
           hard_pinned_continuity?: false
         }
 
+        context = SavedResetConfirmationFixtures.put_confirmation_refs(context, now)
+
         %{
           fake: fake,
           pool_id: setup.pool.id,
@@ -372,6 +506,78 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
               trigger_kind: "gateway_auto",
               gateway_auto_context: fixture.context,
               started_at: started_at
+            )
+
+          {backend_pid, result}
+        end)
+      end)
+
+    assert_receive {^barrier, :claim_started, claim_backend_pid}, @detection_budget
+    blocking = await_blocking!(claim_backend_pid, writer_backend_pid)
+    send(writer_pid, {barrier, :release_writer})
+    assert {:ok, ^writer_backend_pid} = Task.await(writer, @detection_budget)
+    {^claim_backend_pid, claim_result} = Task.await(claim, @detection_budget)
+
+    %{
+      blocking_pids: blocking.blocking_pids,
+      wait_event_type: blocking.wait_event_type,
+      writer_backend_pid: writer_backend_pid,
+      claim_backend_pid: claim_backend_pid,
+      claim_result: claim_result
+    }
+  end
+
+  defp race_proof_cleared(fixture, window) do
+    target_identity_id = fixture.target_assignment.upstream_identity_id
+
+    race_target_identity_write(fixture, fn ->
+      lock_identity_reference!(target_identity_id)
+
+      SavedResetConfirmationFixtures.observe_window!(
+        target_identity_id,
+        window,
+        DateTime.utc_now() |> DateTime.truncate(:microsecond),
+        permission: {true, false, :available},
+        used_percent: Decimal.new("60")
+      )
+    end)
+  end
+
+  # A strictly newer equivalent receipt keeps the window confirmed but changes
+  # the persisted proof, so the claim's carried references no longer match.
+  defp race_proof_reobserved(fixture, window) do
+    target_identity_id = fixture.target_assignment.upstream_identity_id
+
+    race_target_identity_write(fixture, fn ->
+      lock_identity_reference!(target_identity_id)
+
+      SavedResetConfirmationFixtures.observe_window!(
+        target_identity_id,
+        window,
+        DateTime.utc_now() |> DateTime.truncate(:microsecond),
+        []
+      )
+    end)
+  end
+
+  defp race_target_identity_write(fixture, mutation) do
+    parent = self()
+    barrier = make_ref()
+
+    writer = start_writer(mutation, parent, barrier, :proof_written, "proof writer")
+
+    assert_receive {^barrier, :proof_written, writer_backend_pid, writer_pid}, @detection_budget
+
+    claim =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          backend_pid = backend_pid!()
+          send(parent, {barrier, :claim_started, backend_pid})
+
+          result =
+            SavedResetRedemption.redeem(fixture.target_assignment,
+              trigger_kind: "gateway_auto",
+              gateway_auto_context: fixture.context
             )
 
           {backend_pid, result}
@@ -591,7 +797,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
   defp put_weekly_quota!(identity, used_percent) do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-    {:ok, [window]} =
+    {:ok, [_window]} =
       QuotaWindows.upsert_quota_windows(identity, [
         %{
           quota_key: "account",
@@ -609,6 +815,8 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
         }
       ])
 
+    SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
+    [window] = SavedResetConfirmationFixtures.weekly_provider_windows(identity.id)
     window
   end
 
@@ -674,10 +882,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CapacityFencePostgresTest do
     FakeUpstream.stop(fixture.fake)
 
     Sandbox.unboxed_run(Repo, fn ->
-      case Repo.get(Pool, fixture.pool_id) do
-        %Pool{} = pool -> Repo.delete!(pool)
-        nil -> :ok
-      end
+      CodexPooler.PoolerFixtures.delete_committed_pools!([fixture.pool_id])
 
       identity_ids = [fixture.target_assignment.upstream_identity_id, fixture.sibling_identity_id]
       Repo.delete_all(from(identity in UpstreamIdentity, where: identity.id in ^identity_ids))

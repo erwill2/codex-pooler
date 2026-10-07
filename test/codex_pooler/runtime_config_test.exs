@@ -10,6 +10,23 @@ defmodule CodexPooler.RuntimeConfigTest do
     "CODEX_POOLER_UPSTREAM_SECRET_KEY" => String.duplicate("r", 32)
   }
 
+  test "instance slot is explicit, bounded and never inferred from hostname" do
+    for value <- [nil, "", "00000000-0000-0000-0000-000000000001/app"] do
+      with_env(Map.merge(@required_env, %{"CODEX_POOLER_INSTANCE_SLOT_ID" => value, "HOSTNAME" => "reused-pod-name"}), fn ->
+        config = Config.Reader.read!("config/runtime.exs", env: :prod)
+        assert config[:codex_pooler][:instance_slot_id] == if(value == "", do: nil, else: value)
+      end)
+    end
+
+    for value <- ["space invalid", "line\nbreak", String.duplicate("a", 201)] do
+      with_env(Map.put(@required_env, "CODEX_POOLER_INSTANCE_SLOT_ID", value), fn ->
+        assert_raise RuntimeError, ~r/CODEX_POOLER_INSTANCE_SLOT_ID must be/, fn ->
+          Config.Reader.read!("config/runtime.exs", env: :prod)
+        end
+      end)
+    end
+  end
+
   test "prod endpoint http config keeps the configured port and binds IPv4" do
     with_env(@required_env, fn ->
       config = Config.Reader.read!("config/runtime.exs", env: :prod)
@@ -85,6 +102,14 @@ defmodule CodexPooler.RuntimeConfigTest do
         assert oban_config.queues != [] == queues?
         assert oban_config.stager != false == stager?
 
+        if services? do
+          {Oban.Cron, cron_opts} = Enum.find(oban_config.plugins, &match?({Oban.Cron, _}, &1))
+          crontab = Keyword.fetch!(cron_opts, :crontab)
+
+          assert {"*/5 * * * *", CodexPooler.Jobs.OpenAIStatusSyncWorker} in crontab
+          assert {"0 0 * * *", CodexPooler.Jobs.OpenAIStatusCleanupWorker} in crontab
+        end
+
         for service <- [Oban.Cron, Oban.Lifeline, Oban.Pruner] do
           assert MapSet.member?(plugin_modules, service) == services?
         end
@@ -92,18 +117,97 @@ defmodule CodexPooler.RuntimeConfigTest do
     end
   end
 
+  test "the Repo names its PostgreSQL backends after the release role" do
+    for {mode, application_name} <- [
+          {"web", "codex_pooler_web"},
+          {"worker", "codex_pooler_worker"},
+          {"scheduler", "codex_pooler_scheduler"},
+          {"all", "codex_pooler_all"},
+          {"unexpected-role-value", "codex_pooler_web"}
+        ] do
+      with_env(Map.put(@required_env, "OBAN_MODE", mode), fn ->
+        config = Config.Reader.read!("config/runtime.exs", env: :prod)
+        repo_config = config[:codex_pooler][CodexPooler.Repo]
+
+        assert repo_config[:parameters] == [application_name: application_name]
+        assert byte_size(application_name) <= 63
+      end)
+    end
+  end
+
+  test "the upstream connection idle bound is an instance setting, not release env" do
+    env = Map.put(@required_env, "CODEX_POOLER_UPSTREAM_CONN_MAX_IDLE_TIME_MS", "30s")
+
+    with_env(env, fn ->
+      config = Config.Reader.read!("config/runtime.exs", env: :prod)
+
+      refute Keyword.has_key?(config[:codex_pooler], :upstream_conn_max_idle_time_ms)
+    end)
+  end
+
+  test "standard proxy variables load at boot with sanitized invalid configuration errors" do
+    env =
+      @required_env
+      |> Map.put("http_proxy", "http://http-proxy.example.com:8080")
+      |> Map.put("HTTP_PROXY", "http://ignored.example.com:8081")
+      |> Map.put("https_proxy", "http://user:p%40ss@proxy.example.com:3128")
+      |> Map.put("no_proxy", "localhost,.example.com")
+
+    with_env(env, fn ->
+      config = Config.Reader.read!("config/runtime.exs", env: :prod)
+
+      assert config[:codex_pooler][CodexPooler.Platform.OutboundHTTP][:proxy_config] == %{
+               http: [proxy: {:http, "http-proxy.example.com", 8080, []}],
+               https: [
+                 proxy: {:http, "proxy.example.com", 3128, []},
+                 proxy_headers: [
+                   {"proxy-authorization", "Basic " <> Base.encode64("user:p@ss")}
+                 ]
+               ],
+               no_proxy: ["localhost", ".example.com"]
+             }
+    end)
+
+    invalid_proxy = "https://secret:password@proxy.example.com"
+
+    with_env(Map.put(@required_env, "https_proxy", invalid_proxy), fn ->
+      error =
+        assert_raise ArgumentError, fn ->
+          Config.Reader.read!("config/runtime.exs", env: :prod)
+        end
+
+      refute Exception.message(error) =~ invalid_proxy
+      refute Exception.message(error) =~ "secret"
+      refute Exception.message(error) =~ "password"
+    end)
+  end
+
   defp with_env(env, fun) do
-    previous = Map.new(env, fn {key, _value} -> {key, System.get_env(key)} end)
+    proxy_names = ~w(http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY)
+    managed_names = Enum.uniq(Map.keys(env) ++ proxy_names)
+    previous = Map.new(managed_names, &{&1, System.get_env(&1)})
 
-    Enum.each(env, fn {key, value} -> System.put_env(key, value) end)
-
-    try do
-      fun.()
-    after
+    restore = fn ->
       Enum.each(previous, fn
         {key, nil} -> System.delete_env(key)
         {key, value} -> System.put_env(key, value)
       end)
+    end
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs.
+    on_exit(restore)
+
+    Enum.each(proxy_names, &System.delete_env/1)
+
+    Enum.each(env, fn
+      {key, nil} -> System.delete_env(key)
+      {key, value} -> System.put_env(key, value)
+    end)
+
+    try do
+      fun.()
+    after
+      restore.()
     end
   end
 end

@@ -1,6 +1,10 @@
 defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
   use CodexPooler.DataCase, async: false
 
+  import CodexPooler.PoolerFixtures
+
+  import ExUnit.CaptureLog, only: [with_log: 1]
+
   alias CodexPooler.Accounting.Request
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Service
@@ -9,6 +13,8 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
   alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
   alias CodexPooler.Repo
+
+  @detection_timeout_ms 15_000
 
   test "manually assembled prepared frames cannot enter prepared execution" do
     payload = %{"generate" => false, "model" => "gpt-example"}
@@ -21,7 +27,10 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
       request_options: request_options
     }
 
-    assert {:error, %{status: 400, code: "invalid_request"}} =
+    # A frame that cannot verify is a gateway invariant breach, not a malformed
+    # client request: it answers a logged 5xx rather than a client-blamed 400
+    # (findings #168 item 2).
+    assert {:error, %{status: 500, code: "server_error"}} =
              Service.execute_prepared_websocket_response(%{}, manually_assembled)
   end
 
@@ -36,7 +45,7 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
 
     assert {:ok, %PreparedWebsocketFrame{variant: :prewarm} = prepared} =
              Service.prepare_websocket_response(
-               Jason.encode!(payload),
+               CodexPooler.JSON.encode!(payload),
                opts,
                fn _frame -> :ok end
              )
@@ -74,7 +83,11 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
       )
 
     assert {:ok, %PreparedWebsocketFrame{} = prepared} =
-             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(payload),
+               opts,
+               fn _frame -> :ok end
+             )
 
     assert is_binary(prepared.replay_claim_digest)
     assert byte_size(prepared.replay_claim_digest) == 32
@@ -86,8 +99,7 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     mutated = %{
       prepared
       | replay_claim_digest: <<9::256>>,
-        request_options:
-          RequestOptions.put_continuity(prepared.request_options, replay_claim_digest: <<9::256>>)
+        request_options: RequestOptions.put_continuity(prepared.request_options, replay_claim_digest: <<9::256>>)
     }
 
     assert {:error, :invalid} = WebsocketCodec.validate_prepared_frame(mutated)
@@ -122,7 +134,11 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
       )
 
     assert {:ok, prepared} =
-             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(payload),
+               opts,
+               fn _frame -> :ok end
+             )
 
     assert prepared.native_client_retry_witness.version == 1
     assert prepared.native_client_retry_witness.digest == prepared.replay_claim_digest
@@ -172,12 +188,72 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     end
   end
 
+  # Findings #168. The socket writes `native_compaction_reservation` into a
+  # frame it has already sealed, and two of the three dispatch routes never
+  # unwind it, so the field has to stay outside the signed basis: it is
+  # socket-local scheduling state whose only reader re-runs the reservation
+  # from scratch. The authority it stands in for —
+  # `native_compaction_admission`, which the owner issues — stays signed. The
+  # real poisoning path is driven end to end in
+  # `CodexPoolerWeb.CodexResponsesSocketPreparedFrameProvenanceTest`.
+  test "a post-seal compaction deferral keeps the frame verifiable while its admission stays signed" do
+    payload = %{
+      "type" => "response.create",
+      "model" => "gpt-example",
+      "turn_id" => "deferred-reservation-turn",
+      "input" => []
+    }
+
+    session = %{
+      id: Ecto.UUID.generate(),
+      pool_id: Ecto.UUID.generate(),
+      api_key_id: Ecto.UUID.generate(),
+      status: "active"
+    }
+
+    opts =
+      RequestOptions.for_websocket(
+        %{request_id: "deferred-reservation", codex_session: session, api_key_runtime_epoch: 0},
+        payload
+      )
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(payload),
+               opts,
+               fn _frame -> :ok end
+             )
+
+    assert :ok = WebsocketCodec.validate_prepared_frame(prepared)
+
+    deferred =
+      put_in(prepared.request_options.native_compaction_reservation, %{
+        metadata: :native_turn_metadata,
+        phase: :final,
+        control_ref: make_ref()
+      })
+
+    assert :ok = WebsocketCodec.validate_prepared_frame(deferred)
+
+    forged_admission =
+      put_in(prepared.request_options.native_compaction_admission, %{forged: true})
+
+    assert {:error, :invalid} = WebsocketCodec.validate_prepared_frame(forged_admission)
+
+    assert {:ok, nil} = WebsocketCodec.consume_prepared_frame(deferred)
+    assert {:error, :consumed} = WebsocketCodec.validate_prepared_frame(prepared)
+  end
+
   test "malformed non-capability provenance returns bounded invalid results" do
     payload = %{"generate" => false, "model" => "gpt-example"}
     opts = RequestOptions.for_websocket(%{request_id: "malformed-capability"}, payload)
 
     assert {:ok, prepared} =
-             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(payload),
+               opts,
+               fn _frame -> :ok end
+             )
 
     malformed = put_in(prepared.provenance.capability, :not_a_capability)
 
@@ -185,8 +261,13 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     assert WebsocketCodec.validate_prepared_frame(malformed) == {:error, :invalid}
     assert WebsocketCodec.consume_prepared_frame(malformed) == {:error, :invalid}
 
-    assert {:error, %{status: 400, code: "invalid_request"}} =
-             Service.execute_prepared_websocket_response(%{}, malformed)
+    {result, log} =
+      with_log(fn -> Service.execute_prepared_websocket_response(%{}, malformed) end)
+
+    assert {:error, %{status: 500, code: "server_error"}} = result
+    assert log =~ "prepared websocket frame provenance invalid"
+    assert log =~ "stage=prepared_dispatch_consume"
+    refute log =~ "gpt-example"
   end
 
   @tag :replay_protocol_v2
@@ -201,7 +282,9 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     opts = RequestOptions.for_websocket(%{codex_session: %{id: Ecto.UUID.generate()}}, payload)
 
     assert {:ok, prepared} =
-             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _ -> :ok end)
+             Service.prepare_websocket_response(CodexPooler.JSON.encode!(payload), opts, fn _ ->
+               :ok
+             end)
 
     binding = replay_binding(prepared)
     assert {:ok, resealed} = WebsocketCodec.attach_native_replay_admission(prepared, binding)
@@ -240,7 +323,11 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     opts = RequestOptions.for_websocket(%{request_id: "prepared-concurrent"}, payload)
 
     assert {:ok, %PreparedWebsocketFrame{variant: :prewarm} = prepared} =
-             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(payload),
+               opts,
+               fn _frame -> :ok end
+             )
 
     caller = self()
     start_ref = make_ref()
@@ -264,7 +351,7 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
       end
 
     Enum.each(task_pids, &send(&1, {:start, start_ref}))
-    results = Enum.map(tasks, &Task.await(&1, 1_000))
+    results = Enum.map(tasks, &Task.await(&1, @detection_timeout_ms))
 
     assert Enum.count(results, &match?({:ok, _result}, &1)) == 1
 
@@ -279,14 +366,18 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     opts = RequestOptions.for_websocket(%{request_id: "prepared-substitution"}, payload)
 
     assert {:ok, %PreparedWebsocketFrame{} = prepared} =
-             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(payload),
+               opts,
+               fn _frame -> :ok end
+             )
 
     substituted = %{
       prepared
       | provenance: %{prepared.provenance | capability: Capability.issue()}
     }
 
-    assert {:error, %{status: 400, code: "invalid_request"}} =
+    assert {:error, %{status: 500, code: "server_error"}} =
              Service.execute_prepared_websocket_response(%{}, substituted)
   end
 
@@ -317,7 +408,7 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
 
     assert {:ok, %PreparedWebsocketFrame{variant: :response_processed} = prepared} =
              Service.prepare_websocket_response(
-               Jason.encode!(payload),
+               CodexPooler.JSON.encode!(payload),
                opts,
                fn _frame -> :ok end
              )
@@ -326,8 +417,13 @@ defmodule CodexPooler.Gateway.Runtime.PreparedWebsocketFrameTest do
     refute_received :request_options_built
     row_count = Repo.aggregate(Request, :count)
 
+    # response.processed is authorized against a real API key before it is forwarded
+    # (findings#197), so the control path needs an authorization context to reach the forward.
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    auth = %{pool: pool, api_key: api_key, key_prefix: api_key.key_prefix}
+
     assert {:error, %{code: "upstream_websocket_forward_failed"}} =
-             Service.execute_prepared_websocket_response(%{}, prepared)
+             Service.execute_prepared_websocket_response(auth, prepared)
 
     refute_received :request_options_built
     assert Repo.aggregate(Request, :count) == row_count

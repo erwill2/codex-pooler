@@ -164,6 +164,12 @@ defmodule CodexPoolerWeb.Router do
     get "/files/:file_id/content", V1.FilesController, :content
   end
 
+  scope "/admin", CodexPoolerWeb.Admin do
+    pipe_through [:browser, :require_authenticated_password_current]
+
+    get "/upstreams/:id/saved-reset-expirations.ics", UpstreamCalendarController, :download
+  end
+
   scope "/", CodexPoolerWeb do
     pipe_through [:browser, :require_authenticated_user]
 
@@ -178,10 +184,12 @@ defmodule CodexPoolerWeb.Router do
       on_mount: [{CodexPoolerWeb.UserAuth, :require_authenticated_password_current}] do
       live "/admin/operators", Admin.OperatorsLive, :index
       live "/admin/request-logs", Admin.RequestLogsLive, :index
+      live "/admin/lens", Admin.LensLive, :index
       live "/admin/pools", Admin.PoolsLive, :index
       live "/admin/stats", Admin.StatsLive, :index
       live "/admin/jobs", Admin.JobsLive, :index
       live "/admin/system", Admin.SystemLive, :index
+      live "/admin/incidents", Admin.IncidentsLive, :index
       live "/admin/alerts", Admin.AlertsLive, :index
       live "/admin/upstreams", Admin.UpstreamsLive, :index
       live "/admin/upstreams/:id", Admin.UpstreamCockpitLive, :show

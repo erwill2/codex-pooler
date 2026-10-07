@@ -37,8 +37,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6 do
           upstream_identity_id: Ecto.UUID.t(),
           observation: WebsocketOwnerRequest.observation(),
           reset_probe: CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe.t() | nil,
-          native_codex_response_control:
-            CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot.t() | nil,
+          native_codex_response_control: CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot.t() | nil,
           assignment_advertised?: boolean(),
           connection_bound_continuation?: boolean(),
           forward_error_body?: boolean(),
@@ -98,7 +97,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6 do
   @doc false
   @spec unanchored_full_history_payload?(term()) :: boolean()
   def unanchored_full_history_payload?(encoded) when is_binary(encoded) do
-    with {:ok, %{"input" => input} = payload} <- Jason.decode(encoded),
+    with {:ok, %{"input" => input} = payload} <- CodexPooler.JSON.decode(encoded),
          true <- is_list(input) and length(input) >= 2,
          true <- Enum.all?(input, &history_item?/1),
          true <- is_nil(payload["previous_response_id"]),
@@ -170,7 +169,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6 do
     map_size(compaction) == 6 and trigger in [:auto, :manual] and
       reason in [:user_requested, :context_limit, :model_downshift, :comp_hash_changed] and
       implementation in [:responses, :responses_compaction_v2, :responses_compact] and
-      phase in [:standalone_turn, :pre_turn, :mid_turn] and
+      phase in [:standalone_turn, :pre_turn, :mid_turn, :post_turn] and
       strategy in [:memento, :prefix_compaction]
   end
 

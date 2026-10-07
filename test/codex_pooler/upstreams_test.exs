@@ -44,6 +44,8 @@ defmodule CodexPooler.UpstreamsTest do
       monthly_only_account_primary_quota_window_attrs: 1
     ]
 
+  @detection_timeout_ms 15_000
+
   describe "upstream identity lifecycle" do
     test "creates, activates, updates, and reuses upstream account identities" do
       assert {:ok, identity} =
@@ -160,9 +162,7 @@ defmodule CodexPooler.UpstreamsTest do
       account_id = "acct_blank_subject_#{System.unique_integer([:positive])}"
 
       assert {:ok, identity} =
-               IdentityLifecycle.create_upstream_identity(
-                 subject_identity_attrs(account_id, %{chatgpt_user_id: "   "})
-               )
+               IdentityLifecycle.create_upstream_identity(subject_identity_attrs(account_id, %{chatgpt_user_id: "   "}))
 
       assert identity.chatgpt_user_id == nil
       assert Repo.get!(UpstreamIdentity, identity.id).chatgpt_user_id == nil
@@ -190,9 +190,7 @@ defmodule CodexPooler.UpstreamsTest do
       account_id = "acct_duplicate_user_legacy_#{System.unique_integer([:positive])}"
 
       assert {:ok, _identity} =
-               IdentityLifecycle.create_upstream_identity(
-                 subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"})
-               )
+               IdentityLifecycle.create_upstream_identity(subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"}))
 
       assert {:error, changeset} =
                IdentityLifecycle.create_upstream_identity(
@@ -234,9 +232,7 @@ defmodule CodexPooler.UpstreamsTest do
       account_id = "acct_distinct_user_legacy_#{System.unique_integer([:positive])}"
 
       assert {:ok, first_identity} =
-               IdentityLifecycle.create_upstream_identity(
-                 subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"})
-               )
+               IdentityLifecycle.create_upstream_identity(subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"}))
 
       assert {:ok, second_identity} =
                IdentityLifecycle.create_upstream_identity(
@@ -296,6 +292,38 @@ defmodule CodexPooler.UpstreamsTest do
     end
   end
 
+  describe "provider-routable account scope" do
+    test "returns the trimmed account id when the provider can route on it" do
+      assert UpstreamIdentity.account_scope("2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40") ==
+               "2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40"
+
+      assert UpstreamIdentity.account_scope("  2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40\t\n") ==
+               "2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40"
+    end
+
+    test "has no scope for blank, missing, or non-binary account ids" do
+      assert UpstreamIdentity.account_scope("") == nil
+      assert UpstreamIdentity.account_scope("   \t\n ") == nil
+      assert UpstreamIdentity.account_scope(nil) == nil
+      assert UpstreamIdentity.account_scope(:acct_atom) == nil
+      assert UpstreamIdentity.account_scope(42) == nil
+      assert UpstreamIdentity.account_scope(%{"chatgpt_account_id" => "acct_map"}) == nil
+    end
+
+    test "has no scope for synthetic email_ and local_ placeholder account ids" do
+      assert UpstreamIdentity.account_scope("email_sentinel@example.com") == nil
+      assert UpstreamIdentity.account_scope("local_provider_identity") == nil
+      assert UpstreamIdentity.account_scope("  email_sentinel@example.com  ") == nil
+      assert UpstreamIdentity.account_scope("  local_provider_identity  ") == nil
+    end
+
+    test "matches the synthetic prefixes case-sensitively" do
+      assert UpstreamIdentity.account_scope("Email_x@example.com") == "Email_x@example.com"
+      assert UpstreamIdentity.account_scope("Local_provider_identity") == "Local_provider_identity"
+      assert UpstreamIdentity.account_scope("EMAIL_x@example.com") == "EMAIL_x@example.com"
+    end
+  end
+
   describe "pool assignment lifecycle" do
     test "counts visible pool assignments by pool id and excludes deleted rows" do
       pool = pool_fixture()
@@ -323,7 +351,7 @@ defmodule CodexPooler.UpstreamsTest do
                ])
     end
 
-    test "lists only upstream identities assigned through visible active pools" do
+    test "owners list identities in visible active pools plus globally unassigned identities" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
       scope = Scope.for_user(owner, ["instance_owner"])
       visible_pool = pool_fixture(%{status: "active"})
@@ -355,7 +383,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert visible_identity.id in visible_identity_ids
       refute disabled_pool_identity.id in visible_identity_ids
       refute deleted_identity.id in visible_identity_ids
-      refute deleted_assignment_identity.id in visible_identity_ids
+      assert deleted_assignment_identity.id in visible_identity_ids
     end
 
     test "enforces one assignment per pool identity and returns active eligible routing data" do
@@ -1209,8 +1237,7 @@ defmodule CodexPooler.UpstreamsTest do
         plan_label: "team",
         token: access_token,
         refresh_token: refresh_token,
-        access_token_expires_at:
-          DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:microsecond),
+        access_token_expires_at: DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:microsecond),
         import_metadata: %{
           "account_email" => "token-linking@example.com",
           "auth_json_imported" => true
@@ -1306,9 +1333,9 @@ defmodule CodexPooler.UpstreamsTest do
       initial_epoch = identity.metadata["credential_epoch"]
 
       assert {:ok, renamed_identity} =
-               IdentityLifecycle.update_upstream_identity(identity, %{account_label: "codex01"})
+               IdentityLifecycle.update_upstream_identity(identity, %{account_label: "account-a"})
 
-      assert renamed_identity.account_label == "codex01"
+      assert renamed_identity.account_label == "account-a"
 
       assert {:ok,
               %{
@@ -1320,13 +1347,13 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert reimported_identity.id == identity.id
       assert reimported_identity.metadata["credential_epoch"] == initial_epoch + 1
-      assert reimported_identity.account_label == "codex01"
+      assert reimported_identity.account_label == "account-a"
       assert reimported_identity.account_email == account_email
       assert reimported_identity.metadata["account_email"] == account_email
       assert reimported_assignment.id == assignment.id
-      assert reimported_assignment.assignment_label == "codex01"
+      assert reimported_assignment.assignment_label == "account-a"
 
-      assert Repo.get!(UpstreamIdentity, identity.id).account_label == "codex01"
+      assert Repo.get!(UpstreamIdentity, identity.id).account_label == "account-a"
     end
 
     test "auth parsers prefer nested workspace claims over conflicting top-level claims" do
@@ -1352,9 +1379,7 @@ defmodule CodexPooler.UpstreamsTest do
               }} = CodexAuth.token_info(id_token)
 
       assert {:ok, attrs} =
-               CodexAuthJson.parse(
-                 auth_json_fixture(account_id: "acct_workspace_nested", id_token: id_token)
-               )
+               CodexAuthJson.parse(auth_json_fixture(account_id: "acct_workspace_nested", id_token: id_token))
 
       assert attrs.workspace_id == "ws_nested"
       assert attrs.workspace_label == "Nested Workspace"
@@ -1449,13 +1474,13 @@ defmodule CodexPooler.UpstreamsTest do
 
       auth_json =
         auth_json_fixture(account_id: "acct_workspace_label_only", id_token: id_token)
-        |> Jason.decode!()
+        |> CodexPooler.JSON.decode!()
         |> Map.merge(%{
           "workspace_id" => "untrusted_payload_workspace",
           "workspace_label" => "Untrusted Payload Workspace",
           "seat_type" => "untrusted-seat"
         })
-        |> Jason.encode!()
+        |> CodexPooler.JSON.encode!()
 
       assert {:ok, %{identity: identity}} =
                Upstreams.import_codex_auth_json(scope, pool, auth_json)
@@ -1969,8 +1994,7 @@ defmodule CodexPooler.UpstreamsTest do
           refresh_token: second_refresh
         )
 
-      assert {:ok,
-              %{status: :existing, identity: imported, assignment: imported_assignment} = result} =
+      assert {:ok, %{status: :existing, identity: imported, assignment: imported_assignment} = result} =
                Upstreams.import_codex_auth_json(scope, pool, second_auth_json)
 
       assert imported.id == identity.id
@@ -2061,9 +2085,8 @@ defmodule CodexPooler.UpstreamsTest do
           TokenRefresh.refresh_access_token(identity, trigger_kind: "stale_import_race")
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid,
-                      ^release_ref},
-                     1_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                     @detection_timeout_ms
 
       refreshing = Repo.get!(UpstreamIdentity, identity.id)
       claimed_generation = refreshing.metadata["token_refresh"]["generation"]
@@ -2085,7 +2108,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
 
-      assert {:ok, %{status: :noop, retryable?: false}} = Task.await(refresh_task, 1_000)
+      assert {:ok, %{status: :noop, retryable?: false}} = Task.await(refresh_task, @detection_timeout_ms)
 
       persisted = Repo.get!(UpstreamIdentity, identity.id)
       assert persisted.status == "active"
@@ -2172,14 +2195,10 @@ defmodule CodexPooler.UpstreamsTest do
 
       invalid_cases = [
         {"not-json", "Codex auth.json is malformed"},
-        {Jason.encode!(%{"OPENAI_API_KEY" => sensitive_token}),
-         "Codex API-key auth.json is not supported"},
-        {auth_json_fixture(access_token: jwt_token(%{"exp" => past_unix()})),
-         "Codex auth.json access token is expired"},
-        {auth_json_fixture(tokens: %{"id_token" => id_token_fixture()}),
-         "Codex auth.json is missing access_token"},
-        {auth_json_fixture(tokens: %{"access_token" => jwt_token(%{"exp" => future_unix()})}),
-         "Codex auth.json is missing id_token"},
+        {CodexPooler.JSON.encode!(%{"OPENAI_API_KEY" => sensitive_token}), "Codex API-key auth.json is not supported"},
+        {auth_json_fixture(access_token: jwt_token(%{"exp" => past_unix()})), "Codex auth.json access token is expired"},
+        {auth_json_fixture(tokens: %{"id_token" => id_token_fixture()}), "Codex auth.json is missing access_token"},
+        {auth_json_fixture(tokens: %{"access_token" => jwt_token(%{"exp" => future_unix()})}), "Codex auth.json is missing id_token"},
         {auth_json_fixture(
            tokens: %{
              "id_token" => id_token_fixture(),
@@ -2207,12 +2226,12 @@ defmodule CodexPooler.UpstreamsTest do
       unsupported_message = "Codex personal access token auth.json is not supported in this cycle"
 
       payloads = [
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "auth_mode" => "personalAccessToken",
           "personalAccessToken" => personal_access_token
         }),
-        Jason.encode!(%{"personalAccessToken" => personal_access_token}),
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{"personalAccessToken" => personal_access_token}),
+        CodexPooler.JSON.encode!(%{
           "tokens" => %{
             "access_token" => personal_access_token,
             "id_token" => id_token_fixture(),
@@ -2261,8 +2280,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert {:error,
               %{
                 code: :upstream_secret_key_invalid,
-                message:
-                  "CODEX_POOLER_UPSTREAM_SECRET_KEY must be 32 raw bytes or base64-encoded 32 bytes"
+                message: "CODEX_POOLER_UPSTREAM_SECRET_KEY must be 32 raw bytes or base64-encoded 32 bytes"
               } = error} =
                Upstreams.import_codex_auth_json(
                  scope,
@@ -2816,9 +2834,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       Repo.query!("ALTER TABLE oban_jobs DROP CONSTRAINT positive_max_attempts")
 
-      Repo.query!(
-        "ALTER TABLE oban_jobs ADD CONSTRAINT positive_max_attempts CHECK (max_attempts > 3)"
-      )
+      Repo.query!("ALTER TABLE oban_jobs ADD CONSTRAINT positive_max_attempts CHECK (max_attempts > 3)")
 
       log =
         capture_log(fn ->
@@ -3261,7 +3277,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "stores monthly-only account primary quota without synthetic secondary window" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 13:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       reset_at = DateTime.add(observed_at, 30, :day)
 
       assert {:ok, [window]} =
@@ -3291,7 +3307,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "persists monthly-only usage payload as raw account primary evidence" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 13:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       reset_at = DateTime.add(observed_at, 30, :day)
 
       payload =
@@ -3399,7 +3415,7 @@ defmodule CodexPooler.UpstreamsTest do
                DateTime.diff(reset_at, synced_at, :second)
     end
 
-    test "preserves exact provider allow status on account windows only" do
+    test "preserves distinct provider allow status on account and model windows" do
       synced_at = ~U[2026-04-27 10:00:00Z]
 
       assert {:ok, windows} =
@@ -3446,8 +3462,8 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert [model_window] = Enum.filter(windows, &(&1.quota_scope == "model"))
 
-      refute Map.has_key?(model_window.metadata, "rate_limit_allowed")
-      refute Map.has_key?(model_window.metadata, "rate_limit_reached")
+      assert model_window.metadata["rate_limit_allowed"] == false
+      assert model_window.metadata["rate_limit_reached"] == true
     end
 
     test "preserves rejected provider status on weekly primary normalized as account secondary" do
@@ -3504,7 +3520,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "preserves unknown long primary usage windows without remapping them" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 13:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       unknown_window_seconds = 1_209_600
       unknown_window_minutes = 20_160
       reset_after_seconds = 1_800
@@ -4505,7 +4521,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "persists reset-bearing usage windows with precise evidence dimensions" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 14:00:00Z]
+      observed_at = DateTime.utc_now()
       reset_at = DateTime.add(observed_at, 900, :second)
 
       assert {:ok, windows} =
@@ -5106,8 +5122,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       upstream =
         start_path_upstream(%{
-          "/backend-api/wham/usage" =>
-            {200, weekly_only_payload(%{"additional_rate_limits" => [descriptor]})}
+          "/backend-api/wham/usage" => {200, weekly_only_payload(%{"additional_rate_limits" => [descriptor]})}
         })
 
       %{identity: identity, pool: pool, assignment: assignment} =
@@ -5147,9 +5162,7 @@ defmodule CodexPooler.UpstreamsTest do
           configure_descriptor_zero_coverage_mode(mode, identity, assignment, existing)
 
         if mode == :auth do
-          Repo.delete_all(
-            from(secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity.id)
-          )
+          Repo.delete_all(from(secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity.id))
         end
 
         assert {:ok, _result} = Upstreams.reconcile_pool_account(pool, assignment, opts)
@@ -5163,11 +5176,14 @@ defmodule CodexPooler.UpstreamsTest do
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             {:timeout_before_headers, self(), release_ref},
-             FakeUpstream.json_response(%{"error" => "unavailable"}, 503)
-           ]}
+          # provenance: synthetic_adversarial
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond: {:timeout_before_headers, self(), release_ref}
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -5181,19 +5197,33 @@ defmodule CodexPooler.UpstreamsTest do
           DateTime.utc_now() |> DateTime.truncate(:second),
           "Provider limit alpha"
         )
+        |> Repo.reload!()
 
       parent = self()
 
       task =
         Task.async(fn ->
           Sandbox.allow(Repo, parent, self())
-          Upstreams.reconcile_pool_account(pool, assignment, receive_timeout: 1)
+          Upstreams.reconcile_pool_account(pool, assignment, receive_timeout: 100)
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref}
-      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
-      assert {:ok, _result} = Task.await(task)
-      assert Enum.any?(QuotaWindows.list_evidence(identity), &(&1.id == existing.id))
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                     15_000
+
+      try do
+        # Keep the response blocked until the real HTTP timeout has completed.
+        # Releasing first races a 200 unusable payload (which permits fallback)
+        # against a transport timeout (which stops probing).
+        assert {:ok, result} = Task.await(task, 15_000)
+        assert result.quota.status == :failed
+        assert result.quota.code == "quota_refresh_unavailable"
+        assert result.quota.message == "quota windows were not available (timeout)"
+        assert Repo.reload!(existing) == existing
+        assert FakeUpstream.count(upstream) == 1
+        assert :ok = FakeUpstream.verify!(upstream)
+      after
+        send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+      end
     end
 
     @tag :quota_descriptor_coverage
@@ -5856,30 +5886,39 @@ defmodule CodexPooler.UpstreamsTest do
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             FakeUpstream.raw_response(html_403,
-               status: 403,
-               headers: [{"content-type", "text/html; charset=utf-8"}]
-             ),
-             FakeUpstream.json_response(
-               weekly_only_payload(%{
-                 "additional_rate_limits" => [
-                   %{
-                     "limit_name" => "GPT-5.3-Codex-Spark",
-                     "metered_feature" => "codex_bengalfox",
-                     "rate_limit" => %{
-                       "primary_window" => %{
-                         "used_percent" => 45,
-                         "limit_window_seconds" => 604_800,
-                         "reset_after_seconds" => 1_200
-                       }
-                     }
-                   }
-                 ]
-               })
-             )
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond:
+                FakeUpstream.raw_response(html_403,
+                  status: 403,
+                  headers: [{"content-type", "text/html; charset=utf-8"}]
+                )
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/usage",
+              respond:
+                FakeUpstream.json_response(
+                  weekly_only_payload(%{
+                    "additional_rate_limits" => [
+                      %{
+                        "limit_name" => "GPT-5.3-Codex-Spark",
+                        "metered_feature" => "codex_bengalfox",
+                        "rate_limit" => %{
+                          "primary_window" => %{
+                            "used_percent" => 45,
+                            "limit_window_seconds" => 604_800,
+                            "reset_after_seconds" => 1_200
+                          }
+                        }
+                      }
+                    ]
+                  })
+                )
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -5898,6 +5937,8 @@ defmodule CodexPooler.UpstreamsTest do
                "/backend-api/wham/usage",
                "/backend-api/codex/usage"
              ]
+
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "does not reuse Cloudflare cookies from non-ChatGPT usage probe origins" do
@@ -5905,30 +5946,40 @@ defmodule CodexPooler.UpstreamsTest do
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             FakeUpstream.raw_response(html_403,
-               status: 403,
-               headers: [
-                 {"content-type", "text/html; charset=utf-8"},
-                 {"set-cookie", "__cf_bm=cf-token; Path=/; HttpOnly; Secure"}
-               ]
-             ),
-             FakeUpstream.json_response(%{
-               "rate_limit" => %{
-                 "primary_window" => %{
-                   "used_percent" => 42,
-                   "limit_window_seconds" => 18_000,
-                   "reset_after_seconds" => 300
-                 },
-                 "secondary_window" => %{
-                   "used_percent" => 51,
-                   "limit_window_seconds" => 604_800,
-                   "reset_after_seconds" => 3_600
-                 }
-               }
-             })
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond:
+                FakeUpstream.raw_response(html_403,
+                  status: 403,
+                  headers: [
+                    {"content-type", "text/html; charset=utf-8"},
+                    {"set-cookie", "__cf_bm=cf-token; Path=/; HttpOnly; Secure"}
+                  ]
+                )
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/usage",
+              headers: [forbidden: ["cookie"]],
+              respond:
+                FakeUpstream.json_response(%{
+                  "rate_limit" => %{
+                    "primary_window" => %{
+                      "used_percent" => 42,
+                      "limit_window_seconds" => 18_000,
+                      "reset_after_seconds" => 300
+                    },
+                    "secondary_window" => %{
+                      "used_percent" => 51,
+                      "limit_window_seconds" => 604_800,
+                      "reset_after_seconds" => 3_600
+                    }
+                  }
+                })
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -5952,6 +6003,7 @@ defmodule CodexPooler.UpstreamsTest do
       [_first_request, second_request | _rest] = FakeUpstream.requests(upstream)
       second_headers = Map.new(second_request.headers)
       refute Map.has_key?(second_headers, "cookie")
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "stores 5h and weekly quota windows from Codex response headers" do
@@ -5978,8 +6030,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert Enum.map(
                windows,
-               &{&1.quota_key, &1.window_kind, Decimal.to_integer(&1.used_percent),
-                &1.display_label, &1.source}
+               &{&1.quota_key, &1.window_kind, Decimal.to_integer(&1.used_percent), &1.display_label, &1.source}
              ) == [
                {"account", "primary", 12, "Account", "codex_response_headers"},
                {"account", "secondary", 67, "Account", "codex_response_headers"},
@@ -6090,8 +6141,7 @@ defmodule CodexPooler.UpstreamsTest do
              |> Map.has_key?("cookie")
 
       refute CloudflareCookies.store_from_headers(url, [
-               {"set-cookie",
-                "__cf_bm=expired; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
+               {"set-cookie", "__cf_bm=expired; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
              ])
 
       refute CloudflareCookies.request_headers(url, [])
@@ -6125,8 +6175,7 @@ defmodule CodexPooler.UpstreamsTest do
         "https://cookie-invalid-expiry-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
 
       assert CloudflareCookies.store_from_headers(url, [
-               {"set-cookie",
-                "cf_chl_invalid=live; Expires=Wed, 32 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
+               {"set-cookie", "cf_chl_invalid=live; Expires=Wed, 32 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
              ])
 
       assert CloudflareCookies.request_headers(url, []) |> Map.new() |> Map.fetch!("cookie") =~
@@ -8643,16 +8692,13 @@ defmodule CodexPooler.UpstreamsTest do
         |> Quotas.Evidence.new!(observed_at)
 
       assert Quotas.Evidence.identity_key(evidence) ==
-               {"model", "codex_model", "example-model", "upstream-model", "model_quota",
-                "primary", 300, "codex_usage_api", "limit-id", "Limit name", "meter"}
+               {"model", "codex_model", "example-model", "upstream-model", "model_quota", "primary", 300, "codex_usage_api", "limit-id", "Limit name", "meter"}
 
       assert Quotas.Evidence.descriptor_key(evidence) ==
-               {"model", "codex_model", "example-model", "upstream-model", "model_quota",
-                "codex_usage_api", "limit-id", "Limit name", "meter"}
+               {"model", "codex_model", "example-model", "upstream-model", "model_quota", "codex_usage_api", "limit-id", "Limit name", "meter"}
 
       assert Quotas.Evidence.logical_window_key(evidence) ==
-               {"model", "codex_model", "example-model", "upstream-model", "model_quota",
-                "primary", 300}
+               {"model", "codex_model", "example-model", "upstream-model", "model_quota", "primary", 300}
     end
 
     @tag :quota_candidate_contract
@@ -8788,19 +8834,12 @@ defmodule CodexPooler.UpstreamsTest do
       cutoff_margin = 60
 
       for {label, candidate_at, reset_at, confirmation_at, expected_result} <- [
-            {:ttl_in_budget, DateTime.add(now, -ttl + cutoff_margin, :second),
-             DateTime.add(now, cutoff_margin, :second), now, :confirmed},
-            {:ttl_past, DateTime.add(now, -ttl - cutoff_margin, :second),
-             DateTime.add(now, cutoff_margin, :second), now, :candidate_restarted},
+            {:ttl_in_budget, DateTime.add(now, -ttl + cutoff_margin, :second), DateTime.add(now, cutoff_margin, :second), now, :confirmed},
+            {:ttl_past, DateTime.add(now, -ttl - cutoff_margin, :second), DateTime.add(now, cutoff_margin, :second), now, :candidate_restarted},
             {:reset_exact, DateTime.add(now, -2, :second), now, now, :rejected},
-            {:reset_future, DateTime.add(now, -2, :second),
-             DateTime.add(now, cutoff_margin, :second), now, :confirmed},
-            {:future_skew_in_budget, DateTime.add(now, future_skew - cutoff_margin, :second),
-             DateTime.add(now, future_skew + 60, :second),
-             DateTime.add(now, future_skew + 1, :second), :confirmed},
-            {:future_skew_past, DateTime.add(now, future_skew + cutoff_margin, :second),
-             DateTime.add(now, future_skew + cutoff_margin + 60, :second),
-             DateTime.add(now, future_skew + cutoff_margin + 1, :second), :rejected}
+            {:reset_future, DateTime.add(now, -2, :second), DateTime.add(now, cutoff_margin, :second), now, :confirmed},
+            {:future_skew_in_budget, DateTime.add(now, future_skew - cutoff_margin, :second), DateTime.add(now, future_skew + 60, :second), DateTime.add(now, future_skew + 1, :second), :confirmed},
+            {:future_skew_past, DateTime.add(now, future_skew + cutoff_margin, :second), DateTime.add(now, future_skew + cutoff_margin + 60, :second), DateTime.add(now, future_skew + cutoff_margin + 1, :second), :rejected}
           ] do
         identity = active_identity_fixture(%{account_label: "Candidate cutoff #{label}"})
         canonical_at = DateTime.add(candidate_at, -1, :second)
@@ -9281,9 +9320,7 @@ defmodule CodexPooler.UpstreamsTest do
       existing_attrs = rich_identity_attrs(observed_at, %{raw_limit_id: "existing-limit"})
 
       assert {:ok, [existing]} =
-               QuotaWindows.upsert_quota_windows(identity, [existing_attrs],
-                 delete_missing?: false
-               )
+               QuotaWindows.upsert_quota_windows(identity, [existing_attrs], delete_missing?: false)
 
       valid_sibling =
         rich_identity_attrs(observed_at, %{
@@ -9619,7 +9656,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "stores Spark rate-limit events without deriving rolling weekly resets" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 12:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.add(-10, :day) |> DateTime.truncate(:second)
       primary_reset_at = DateTime.add(observed_at, 900, :second)
 
       assert {:ok, [primary, secondary]} =
@@ -10169,9 +10206,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert QuotaWindows.usable_window?(window, observed_at, model: "gpt-5.3-codex-spark")
 
-      assert QuotaWindows.usable_window?(window, observed_at,
-               upstream_model: "upstream-gpt-5.3-codex-spark"
-             )
+      assert QuotaWindows.usable_window?(window, observed_at, upstream_model: "upstream-gpt-5.3-codex-spark")
 
       refute QuotaWindows.usable_window?(window, observed_at, model: "gpt-6-codex-other")
 
@@ -10763,8 +10798,7 @@ defmodule CodexPooler.UpstreamsTest do
                        "used_percent" => 3,
                        "limit_window_seconds" => 2_592_000,
                        "reset_at" => DateTime.to_unix(provider_reset_at),
-                       "reset_after_seconds" =>
-                         DateTime.diff(provider_reset_at, incoming_at, :second)
+                       "reset_after_seconds" => DateTime.diff(provider_reset_at, incoming_at, :second)
                      }
                    }
                  },
@@ -10797,8 +10831,7 @@ defmodule CodexPooler.UpstreamsTest do
                        "used_percent" => 3,
                        "limit_window_seconds" => 2_592_000,
                        "reset_at" => DateTime.to_unix(explicit_reset_at),
-                       "reset_after_seconds" =>
-                         DateTime.diff(explicit_reset_at, observed_at, :second)
+                       "reset_after_seconds" => DateTime.diff(explicit_reset_at, observed_at, :second)
                      }
                    }
                  },
@@ -11153,8 +11186,11 @@ defmodule CodexPooler.UpstreamsTest do
 
       # Values always converge on the long-reset snapshot, while observation
       # liveness follows the latest fresh same-cycle provider confirmation even
-      # when that confirmation's values were rejected. Metadata keeps the value
-      # provenance of the accepted long-reset sample.
+      # when that confirmation's values were rejected. The stored countdown is
+      # measured against the kept long reset from that latest confirmation, so
+      # it agrees with `observed_at`; it kept the countdown of the accepted
+      # sample, which froze a cycle's first countdown for the whole window
+      # (findings#206 row 206-555).
       sequences = [
         {[
            snapshot.(1, short_reset_at, observed_at),
@@ -11174,7 +11210,7 @@ defmodule CodexPooler.UpstreamsTest do
          ], one_second_later, observed_at}
       ]
 
-      for {samples, expected_observed_at, expected_value_anchor_at} <- sequences do
+      for {samples, expected_observed_at, _value_anchor_at} <- sequences do
         identity = active_identity_fixture()
 
         merged_window =
@@ -11194,7 +11230,7 @@ defmodule CodexPooler.UpstreamsTest do
         assert Decimal.equal?(merged_window.used_percent, Decimal.new("2.000"))
 
         assert merged_window.metadata["reset_after_seconds"] ==
-                 DateTime.diff(long_reset_at, expected_value_anchor_at, :second)
+                 DateTime.diff(long_reset_at, expected_observed_at, :second)
       end
     end
 
@@ -11905,8 +11941,7 @@ defmodule CodexPooler.UpstreamsTest do
                  [
                    {"x-codex-bengalfox-primary-used-percent", ["44"]},
                    {"x-codex-bengalfox-primary-window-minutes", ["300"]},
-                   {"x-codex-bengalfox-primary-reset-at",
-                    [DateTime.to_iso8601(expired_reset_at)]},
+                   {"x-codex-bengalfox-primary-reset-at", [DateTime.to_iso8601(expired_reset_at)]},
                    {"x-codex-bengalfox-limit-name", ["gpt-5.3-codex-spark"]}
                  ],
                  DateTime.add(now, -30, :second)
@@ -11948,7 +11983,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "expired and stale quota evidence remains visible but routing unusable" do
       identity = active_identity_fixture()
-      now = ~U[2026-04-27 12:00:00Z]
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
 
       expired_reset_at = DateTime.add(now, -60, :second)
       stale_observed_at = DateTime.add(now, -Quotas.Evidence.freshness_ttl_seconds() - 1, :second)
@@ -13116,9 +13151,7 @@ defmodule CodexPooler.UpstreamsTest do
     upstream
   end
 
-  defp configure_upstream_secret_key!(
-         key \\ Base.encode64(:crypto.hash(:sha256, "test-upstream-secret-key"))
-       ) do
+  defp configure_upstream_secret_key!(key \\ Base.encode64(:crypto.hash(:sha256, "test-upstream-secret-key"))) do
     previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams)
 
     Application.put_env(:codex_pooler, CodexPooler.Upstreams,
@@ -13158,6 +13191,9 @@ defmodule CodexPooler.UpstreamsTest do
   defp capture_repo_queries(fun) do
     parent = self()
     handler_id = "upstreams-repo-query-capture-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -13241,7 +13277,7 @@ defmodule CodexPooler.UpstreamsTest do
       "tokens" => tokens,
       "last_refresh" => "2026-05-03T00:00:00Z"
     }
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp id_token_fixture do
@@ -13257,7 +13293,7 @@ defmodule CodexPooler.UpstreamsTest do
 
   defp jwt_token(payload) do
     header = %{"alg" => "none", "typ" => "JWT"}
-    encode = &Base.url_encode64(Jason.encode!(&1), padding: false)
+    encode = &Base.url_encode64(CodexPooler.JSON.encode!(&1), padding: false)
 
     Enum.join([encode.(header), encode.(payload), Base.url_encode64("sig", padding: false)], ".")
   end
@@ -13574,8 +13610,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     assert candidate == %{
              "version" => 1,
-             "used_percent" =>
-               used_percent |> Decimal.new() |> Decimal.normalize() |> Decimal.to_string(:normal),
+             "used_percent" => used_percent |> Decimal.new() |> Decimal.normalize() |> Decimal.to_string(:normal),
              "reset_at" => DateTime.to_iso8601(reset_at),
              "observed_at" => DateTime.to_iso8601(observed_at),
              "count" => 1

@@ -144,9 +144,7 @@ defmodule CodexPooler.MCP.Redaction do
   defp assert_no_forbidden_value!(_value, _surface), do: :ok
 
   defp assert_no_raw_struct!(%{__struct__: struct}, path) do
-    raise_assertion(
-      "structuredContent contains raw struct #{inspect(struct)} at #{format_path(path)}"
-    )
+    raise_assertion("structuredContent contains raw struct #{inspect(struct)} at #{format_path(path)}")
   end
 
   defp assert_no_raw_struct!(%{} = map, path) do
@@ -216,7 +214,7 @@ defmodule CodexPooler.MCP.Redaction do
   defp assert_text_not_structured_mirror!(nil, _text), do: :ok
 
   defp assert_text_not_structured_mirror!(structured, text) do
-    encoded = Jason.encode!(structured)
+    encoded = CodexPooler.JSON.encode!(structured)
 
     if String.contains?(text, encoded) do
       raise_assertion("text content mirrors structuredContent")

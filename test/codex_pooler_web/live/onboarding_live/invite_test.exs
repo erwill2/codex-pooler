@@ -512,6 +512,32 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert assignment.metadata["quota_priming"]["status"] == "unknown"
   end
 
+  test "completed onboarding hands out the documented Codex provider config for the deployment's public origin" do
+    CodexPooler.TestAppEnv.restore_on_exit(CodexPoolerWeb.OnboardingLive.Invite)
+    Application.put_env(:codex_pooler, CodexPoolerWeb.OnboardingLive.Invite, public_origin: "https://pooler.example.test/")
+    configure_codex_auth_client!(%{poll_result: {:ok, token_payload()}})
+
+    {token, _pool} = invite_fixture()
+    {:ok, view, _html} = live(build_conn(), ~p"/onboarding/invites/#{token}")
+
+    view
+    |> element("#device-onboarding-button")
+    |> render_click()
+
+    send_current_device_poll(view)
+
+    assert has_element?(view, "#invite-accepted")
+    document = view |> render() |> LazyHTML.from_fragment()
+    [copy_text] = document |> LazyHTML.query("#invite-config-copy") |> LazyHTML.attribute("data-copy-text")
+    shown_text = document |> LazyHTML.query("#invite-config-toml") |> LazyHTML.text()
+
+    expected = documented_codex_provider_config("https://pooler.example.test")
+
+    assert copy_text == expected
+    assert shown_text == expected
+    assert has_element?(view, "#invite-config-features-hint", "[features]")
+  end
+
   test "restricted invite rejects a different authorized Codex email without side effects" do
     configure_codex_auth_client!(%{
       poll_result: {:ok, token_payload(%{"email" => "other@example.com"})}
@@ -590,7 +616,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert {:ok, first_identity} =
              first_completed.identity
-             |> Ecto.Changeset.change(account_label: "codex01")
+             |> Ecto.Changeset.change(account_label: "account-a")
              |> Repo.update()
 
     scope =
@@ -614,16 +640,14 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert second_completed.identity.metadata["credential_epoch"] == first_epoch + 1
     assert second_completed.assignment.id == first_completed.assignment.id
     assert second_completed.identity.account_email == "codex-user@example.com"
-    assert second_completed.identity.account_label == "codex01"
-    assert Repo.get!(UpstreamIdentity, first_identity.id).account_label == "codex01"
+    assert second_completed.identity.account_label == "account-a"
+    assert Repo.get!(UpstreamIdentity, first_identity.id).account_label == "account-a"
 
     assert Repo.aggregate(UpstreamIdentity, :count) == 1
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 1
 
     assert [first_acceptance, second_acceptance] =
-             Repo.all(
-               from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at]
-             )
+             Repo.all(from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at])
 
     assert first_acceptance.upstream_identity_id == first_completed.identity.id
     assert second_acceptance.upstream_identity_id == first_completed.identity.id
@@ -690,8 +714,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     refresh_token = "invite-cross-pool-refresh"
 
     configure_codex_auth_client!(%{
-      poll_result:
-        {:ok, token_payload(%{}, access_token: access_token, refresh_token: refresh_token)}
+      poll_result: {:ok, token_payload(%{}, access_token: access_token, refresh_token: refresh_token)}
     })
 
     {first_token, source_pool} = invite_fixture()
@@ -735,9 +758,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 2
 
     assert [first_acceptance, second_acceptance] =
-             Repo.all(
-               from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at]
-             )
+             Repo.all(from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at])
 
     assert first_acceptance.pool_upstream_assignment_id == first_completed.assignment.id
     assert second_acceptance.pool_upstream_assignment_id == second_completed.assignment.id
@@ -777,6 +798,19 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     {token, pool}
   end
 
+  # The published Codex client page is the contract for the provider block the
+  # invite page hands out; the page's placeholder host becomes the deployment's
+  # public origin.
+  defp documented_codex_provider_config(origin) do
+    page = Path.expand("../../../../docs-site/src/content/docs/clients/codex-cli-desktop.mdx", __DIR__)
+
+    [block] =
+      Regex.run(~r/```toml title="CODEX_HOME\/config\.toml" frame="code"\n(.*?)\n```/s, File.read!(page), capture: :all_but_first)
+
+    assert block =~ "model_provider = \"codex-pooler-ws\""
+    String.replace(block, "https://codex-pooler.example.com", origin)
+  end
+
   defp configure_codex_auth_client!(attrs) do
     start_supervised!(%{
       id: __MODULE__.FakeCodexAuthState,
@@ -785,9 +819,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth)
 
-    Application.put_env(:codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth,
-      client: __MODULE__.FakeCodexAuthClient
-    )
+    Application.put_env(:codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth, client: __MODULE__.FakeCodexAuthClient)
 
     on_exit(fn ->
       if previous do
@@ -870,7 +902,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
       )
 
     header = Base.url_encode64(~s({"alg":"none"}), padding: false)
-    payload = Base.url_encode64(Jason.encode!(claims), padding: false)
+    payload = Base.url_encode64(CodexPooler.JSON.encode!(claims), padding: false)
     header <> "." <> payload <> ".signature"
   end
 
@@ -881,8 +913,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
          "device_auth_id" => "dev_123",
          "user_code" => "ABCD-EFGH",
          "verification_url" => "https://auth.openai.com/codex/device",
-         "expires_at" =>
-           DateTime.utc_now() |> DateTime.add(600, :second) |> DateTime.to_iso8601(),
+         "expires_at" => DateTime.utc_now() |> DateTime.add(600, :second) |> DateTime.to_iso8601(),
          "poll_interval_seconds" => 5
        }}
     end
@@ -912,7 +943,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     app_version = :codex_pooler |> Application.spec(:vsn) |> to_string()
 
     assert has_element?(view, selector, "Codex Pooler #{app_version}")
-    assert has_element?(view, "#{selector} a[href='https://docs.codex-pooler.com']")
+    assert has_element?(view, "#{selector} a[href='https://www.codex-pooler.com/']")
     assert has_element?(view, selector, "© #{Date.utc_today().year} iCoreTech, Inc.")
     assert has_element?(view, "#{selector} a[href='https://github.com/icoretech/codex-pooler']")
     assert has_element?(view, "#{selector} a[aria-label='Codex Pooler on GitHub']")

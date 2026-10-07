@@ -20,7 +20,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainTest do
       |> DrainPlug.call([])
 
     assert response.status == 409
-    assert Jason.decode!(response.resp_body) == %{"error" => "idle_owner_required"}
+    assert CodexPooler.JSON.decode!(response.resp_body) == %{"error" => "idle_owner_required"}
     refute NativePreAttemptDrain.status().captured
     refute NativePreAttemptDrain.status().armed
   end
@@ -32,7 +32,11 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainTest do
       |> DrainPlug.call([])
 
     assert response.status == 409
-    assert Jason.decode!(response.resp_body) == %{"error" => "visible_attempt_required"}
+
+    assert CodexPooler.JSON.decode!(response.resp_body) == %{
+             "error" => "visible_attempt_required"
+           }
+
     refute NativePreAttemptDrain.status().captured
     refute NativePreAttemptDrain.status().armed
   end
@@ -68,16 +72,24 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainTest do
       |> DrainPlug.call([])
 
     assert response.status == 409
-    assert Jason.decode!(response.resp_body) == %{"error" => "capture_required"}
+    assert CodexPooler.JSON.decode!(response.resp_body) == %{"error" => "capture_required"}
 
-    for route <- ["/drain", "/disarm"] do
+    for route <- [
+          "/drain",
+          "/disarm",
+          "/hold-caller",
+          "/begin-drain",
+          "/release-caller",
+          "/await-finalization",
+          "/await-drained"
+        ] do
       response =
         conn(:post, route, "malformed")
         |> put_req_header("authorization", owned.authorization)
         |> DrainPlug.call([])
 
       assert response.status == 400
-      assert Jason.decode!(response.resp_body) == %{"error" => "invalid_control"}
+      assert CodexPooler.JSON.decode!(response.resp_body) == %{"error" => "invalid_control"}
     end
   end
 
@@ -101,6 +113,21 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainTest do
 
     assert response.status == 200
     assert NativePreAttemptDrain.status().armed
+
+    for route <- [
+          "/hold-caller",
+          "/begin-drain",
+          "/release-caller",
+          "/await-finalization",
+          "/await-drained"
+        ] do
+      response =
+        conn(:post, route, "{}")
+        |> put_req_header("authorization", foreign.authorization)
+        |> DrainPlug.call([])
+
+      assert response.status == 403
+    end
 
     for method <- [:get, :post] do
       response =

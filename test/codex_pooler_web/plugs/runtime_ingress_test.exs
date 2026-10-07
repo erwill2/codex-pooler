@@ -4,7 +4,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
   import CodexPooler.PoolerFixtures
   import ExUnit.CaptureLog, only: [capture_log: 2]
 
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
@@ -30,6 +30,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
   alias CodexPoolerWeb.Plugs.RuntimeIngress.Firewall.Decision
   alias CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP.Resolution
 
+  @detection_timeout_ms 15_000
   @firewall_denied_event [:codex_pooler, :ingress, :firewall, :denied]
 
   defp append_req_header(conn, name, value) do
@@ -37,7 +38,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
   end
 
   setup do
-    previous_operational_settings = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous_operational_settings = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -51,7 +52,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
     InstanceSettings.reset_cache_for_test()
 
     on_exit(fn ->
-      Application.put_env(:codex_pooler, OperationalSettings, previous_operational_settings)
       Repo.delete_all(Settings)
       InstanceSettings.reset_cache_for_test()
     end)
@@ -60,6 +60,53 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
   end
 
   describe "unencoded ingress characterization" do
+    test "all body-parsed methods authenticate backend routes before multipart parsing" do
+      setup_runtime_ingress(%OperationalSettings{})
+
+      for method <- [:post, :put, :patch, :delete],
+          path <- ["/backend-api/transcribe", "/backend-api/files", "/backend-api/codex/responses"],
+          content_type <- ["application/json", "multipart/form-data; boundary=example"] do
+        conn =
+          build_conn()
+          |> put_req_header("content-type", content_type)
+          |> dispatch(@endpoint, method, path, "invalid body")
+
+        assert json_response(conn, 401)["error"]["code"] == "api_key_missing"
+        assert %Plug.Conn.Unfetched{} = conn.body_params
+      end
+
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+    end
+
+    test "authenticated transcription reports malformed JSON before file validation" do
+      setup_runtime_ingress(%OperationalSettings{})
+      setup = active_api_key_fixture()
+
+      conn =
+        build_conn()
+        |> auth(setup)
+        |> put_req_header("content-type", "application/json")
+        |> post("/backend-api/transcribe", ~s({"model":))
+
+      assert json_response(conn, 400)["error"]["message"] == "request body must be valid JSON"
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+    end
+
+    test "transcription authenticates JSON requests before parsing for canonical and encoded paths" do
+      setup_runtime_ingress(%OperationalSettings{})
+
+      for path <- ["/backend-api/transcribe", "/backend-api/%74ranscribe"],
+          body <- [~s({"model":), "{}"] do
+        conn = build_conn() |> put_req_header("content-type", "application/json") |> post(path, body)
+        assert json_response(conn, 401)["error"]["code"] == "api_key_missing"
+      end
+
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+    end
+
     test "preserves runtime, MCP, multipart, usage, pruned-helper, and passthrough order", %{
       conn: conn
     } do
@@ -153,8 +200,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
       for {path, content_type, body} <- [
             {"/%62ackend-api/codex/responses", "application/json", ~s({"model":)},
             {"/backend-api/%66iles", "application/json", ~s({"file_name":)},
-            {"/backend-api/%74ranscribe", "multipart/form-data; boundary=example",
-             "invalid multipart fixture"}
+            {"/backend-api/%74ranscribe", "multipart/form-data; boundary=example", "invalid multipart fixture"}
           ] do
         conn =
           conn
@@ -163,6 +209,35 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
           |> post(path, body)
 
         assert json_response(conn, 401)["error"]["code"] == "api_key_missing"
+      end
+    end
+
+    test "the beta Agents and vault families are classified on the decoded path and stop at the segment boundary", %{conn: conn} do
+      setup_runtime_ingress(%OperationalSettings{})
+      setup = active_api_key_fixture()
+
+      for {method, path} <- [
+            {:post, "/v1/%61gents/sessions"},
+            {:get, "/v1/agents/sessions/session_fixture/events"},
+            {:post, "/v1/%76aults/vault_fixture/credentials"},
+            {:get, "/v1/agents/"}
+          ] do
+        conn = conn |> recycle() |> auth(setup) |> dispatch(method, path)
+
+        assert json_response(conn, 404) == %{
+                 "error" => %{
+                   "message" => "Unsupported OpenAI /v1 endpoint: the beta Agents API is not supported",
+                   "type" => "invalid_request_error",
+                   "code" => "unsupported_endpoint",
+                   "param" => nil
+                 }
+               }
+      end
+
+      for path <- ["/v1/agent/sessions", "/v1/agentsx", "/v1/vault", "/v1/sessions/agents"] do
+        conn = conn |> recycle() |> auth(setup) |> get(path)
+
+        assert html_response(conn, 404) =~ "Not Found"
       end
     end
 
@@ -406,12 +481,11 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
                  "code" => "settings_unavailable",
                  "message" => "runtime settings are temporarily unavailable",
                  "param" => nil,
-                 "type" => "invalid_request_error"
+                 "type" => "server_error"
                }
              }
 
-      assert_received {@firewall_denied_event, %{count: 1},
-                       %{scope: "runtime", reason: "settings_unavailable"}}
+      assert_received {@firewall_denied_event, %{count: 1}, %{scope: "runtime", reason: "settings_unavailable"}}
 
       refute_received {@firewall_denied_event, _measurements, _metadata}
     end
@@ -514,8 +588,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
       assert json_response(denied, 403)["error"]["code"] == "access_denied"
 
-      assert_received {@firewall_denied_event, %{count: 1},
-                       %{scope: "runtime", reason: "invalid_allowlist_rules"}}
+      assert_received {@firewall_denied_event, %{count: 1}, %{scope: "runtime", reason: "invalid_allowlist_rules"}}
 
       refute_received {@firewall_denied_event, _measurements, _metadata}
     end
@@ -673,6 +746,28 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
                  "type" => "invalid_request_error"
                }
              } = json_response(conn, 403)
+    end
+
+    @tag :capture_log
+    test "denies the beta Agents and vault families before authentication", %{conn: conn} do
+      setup_runtime_ingress(%OperationalSettings{firewall_allowlist: ["203.0.113.10"]})
+
+      for path <- ["/v1/agents/sessions", "/v1/agents/sessions/session_fixture/events", "/v1/vaults/vault_fixture/credentials"] do
+        conn =
+          conn
+          |> recycle()
+          |> remote_ip({198, 51, 100, 20})
+          |> compressed_post(path, "gzip", "not a gzip body")
+
+        assert %{
+                 "error" => %{
+                   "code" => "access_denied",
+                   "message" => "client IP is not allowed",
+                   "param" => nil,
+                   "type" => "invalid_request_error"
+                 }
+               } = json_response(conn, 403)
+      end
     end
 
     @tag :capture_log
@@ -916,8 +1011,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
       assert_pruned_helper_side_effects_absent(conn, upstream)
 
-      assert_received {@firewall_denied_event, %{count: 1},
-                       %{scope: "runtime", reason: "not_allowed"}}
+      assert_received {@firewall_denied_event, %{count: 1}, %{scope: "runtime", reason: "not_allowed"}}
 
       refute_received {@firewall_denied_event, _measurements, _metadata}
     end
@@ -941,14 +1035,13 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
                  "code" => "settings_unavailable",
                  "message" => "runtime settings are temporarily unavailable",
                  "param" => nil,
-                 "type" => "invalid_request_error"
+                 "type" => "server_error"
                }
              }
 
       assert_pruned_helper_side_effects_absent(conn, upstream)
 
-      assert_received {@firewall_denied_event, %{count: 1},
-                       %{scope: "runtime", reason: "settings_unavailable"}}
+      assert_received {@firewall_denied_event, %{count: 1}, %{scope: "runtime", reason: "settings_unavailable"}}
 
       refute_received {@firewall_denied_event, _measurements, _metadata}
     end
@@ -997,8 +1090,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
             {"POST", "/backend-api/codex/analytics-events/events", "application/json", "{}"},
             {"POST", "/backend-api/codex/memories/trace_summarize", "application/json", "{}"},
             {"POST", "/backend-api/codex/alpha/search", "application/json", "{}"},
-            {"POST", "/backend-api/codex/realtime/calls", "application/sdp",
-             "v=0\r\ns=codex-pooler-test\r\n"},
+            {"POST", "/backend-api/codex/realtime/calls", "application/sdp", "v=0\r\ns=codex-pooler-test\r\n"},
             {"POST", "/backend-api/codex/safety/arc", "application/json", "{}"}
           ] do
         conn =
@@ -1118,6 +1210,56 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
     end
   end
 
+  describe "audio transcription permission order" do
+    for path <- ["/backend-api/transcribe", "/v1/audio/transcriptions", "/v1/audio/%74ranscriptions"],
+        {content_type, body, encoding} <- [
+          {"application/json", ~s({"model":), nil},
+          {"multipart/form-data; boundary=synthetic", "malformed multipart", nil},
+          {"application/json", "invalid gzip bytes", "gzip"}
+        ] do
+      @audio_path path
+      @audio_content_type content_type
+      @audio_body body
+      @audio_encoding encoding
+      test "#{path} denies disabled #{content_type} #{encoding} before reading the body", %{conn: conn} do
+        setup_runtime_ingress(%OperationalSettings{})
+        setup = active_api_key_fixture()
+        setup.pool |> Pools.ensure_routing_settings() |> Ecto.Changeset.change(allow_audio_transcription: false) |> Repo.update!()
+
+        conn = conn |> auth(setup) |> put_req_header("content-type", @audio_content_type)
+        conn = if @audio_encoding, do: put_req_header(conn, "content-encoding", @audio_encoding), else: conn
+        response = post(conn, @audio_path, @audio_body)
+
+        assert %{"error" => %{"code" => "audio_transcription_disabled", "type" => "invalid_request_error"}} = json_response(response, 403)
+        assert Repo.aggregate(Request, :count) == 0
+        assert Repo.aggregate(Attempt, :count) == 0
+        assert Repo.aggregate(LedgerEntry, :count) == 0
+      end
+    end
+
+    test "authentication remains first and unsupported audio routes keep their own contract", %{conn: conn} do
+      setup_runtime_ingress(%OperationalSettings{})
+      setup = active_api_key_fixture()
+      setup.pool |> Pools.ensure_routing_settings() |> Ecto.Changeset.change(allow_audio_transcription: false) |> Repo.update!()
+
+      for path <- ["/backend-api/transcribe", "/v1/audio/transcriptions"] do
+        response = conn |> recycle() |> put_req_header("content-type", "multipart/form-data; boundary=synthetic") |> post(path, "malformed multipart")
+        assert json_response(response, 401)["error"]["code"] == "api_key_missing"
+      end
+
+      for path <- ["/v1/audio/speech", "/v1/audio/translations"] do
+        response = conn |> recycle() |> auth(setup) |> post(path, %{})
+        assert response.status == 404
+        refute response.resp_body =~ "audio_transcription_disabled"
+      end
+
+      settings = Pools.get_routing_settings(setup.pool)
+      settings |> Ecto.Changeset.change(allow_audio_transcription: true) |> Repo.update!()
+      response = conn |> recycle() |> auth(setup) |> post("/v1/audio/transcriptions", %{"model" => "gpt-transcribe"})
+      assert json_response(response, 400)["error"]["param"] == "file"
+    end
+  end
+
   describe "compressed runtime API requests" do
     test "decode returns the unchanged connection when content-encoding is absent", %{conn: conn} do
       assert {:ok, ^conn} = CompressedBody.decode(conn, OperationalSettings.current())
@@ -1136,7 +1278,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
         |> compressed_post(
           "/backend-api/codex/responses",
           "gzip",
-          :zlib.gzip(Jason.encode!(body))
+          :zlib.gzip(CodexPooler.JSON.encode!(body))
         )
 
       assert %{"id" => "gzip_ok"} = json_response(conn, 200)
@@ -1153,7 +1295,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
         conn
         |> auth(setup)
         |> put_req_header("content-type", "application/json")
-        |> post("/backend-api/codex/responses", Jason.encode!(gateway_body(setup)))
+        |> post("/backend-api/codex/responses", CodexPooler.JSON.encode!(gateway_body(setup)))
 
       assert %{"id" => "plain_json_ok"} = json_response(conn, 200)
       assert [captured] = FakeUpstream.requests(upstream)
@@ -1279,7 +1421,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
       upstream = start_upstream(FakeUpstream.json_response(%{"id" => "zstd_one_mib_ok"}))
       setup = gateway_setup(upstream)
       body = fixed_size_gateway_body(setup, 1_048_576)
-      encoded = Jason.encode!(body)
+      encoded = CodexPooler.JSON.encode!(body)
 
       assert byte_size(encoded) == 1_048_576
 
@@ -1347,6 +1489,29 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
       assert Repo.aggregate(Attempt, :count) == 0
     end
 
+    test "rejects the beta Agents family before gzip decompression, body parsing and dispatch", %{conn: conn} do
+      setup_runtime_ingress(%OperationalSettings{max_compressed_body_bytes: 1})
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+      setup = gateway_setup(upstream)
+
+      for path <- ["/v1/agents/sessions", "/v1/agents/sessions/session_fixture/events", "/v1/vaults"] do
+        conn = conn |> recycle() |> auth(setup) |> compressed_post(path, "gzip", "not a gzip body")
+
+        assert %{
+                 "error" => %{
+                   "code" => "unsupported_endpoint",
+                   "message" => "Unsupported OpenAI /v1 endpoint: the beta Agents API is not supported",
+                   "param" => nil,
+                   "type" => "invalid_request_error"
+                 }
+               } = json_response(conn, 404)
+      end
+
+      assert FakeUpstream.requests(upstream) == []
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+    end
+
     test "rejects compressed bodies above the compressed-size limit", %{conn: conn} do
       setup_runtime_ingress(%OperationalSettings{max_compressed_body_bytes: 1})
       setup = active_api_key_fixture()
@@ -1360,7 +1525,13 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
           :zlib.gzip(~s({"model":"x"}))
         )
 
-      assert json_response(conn, 413)["error"]["code"] == "compressed_request_too_large"
+      error = json_response(conn, 413)["error"]
+      assert error["code"] == "compressed_request_too_large"
+      assert error["message"] =~ "1-byte limit"
+      assert error["message"] =~ "ingress.max_compressed_body_bytes in System > Firewall before retrying"
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+      assert Repo.aggregate(LedgerEntry, :count) == 0
     end
 
     test "plain JSON readers pick up updated body limits for new requests" do
@@ -1383,6 +1554,45 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
                |> CompressedBody.read_plain_json_body([])
     end
 
+    @tag slow: "decodes a synthetic 48-image history larger than the former 32 MiB compressed budget"
+    test "default ingress budgets accept image-heavy zstd history while explicit smaller limits still reject" do
+      settings = %OperationalSettings{}
+      previous_settings = %{settings | max_compressed_body_bytes: 32 * 1024 * 1024, max_decompressed_body_bytes: 64 * 1024 * 1024}
+
+      images =
+        Enum.map(1..48, fn _index ->
+          %{"type" => "input_image", "image_url" => "data:image/png;base64," <> Base.encode64(:crypto.strong_rand_bytes(1_500_000))}
+        end)
+
+      encoded = CodexPooler.JSON.encode!(%{"input" => [%{"type" => "message", "role" => "user", "content" => images}]})
+      compressed = zstd_encoded(encoded)
+      assert byte_size(compressed) > previous_settings.max_compressed_body_bytes
+      assert byte_size(compressed) < settings.max_compressed_body_bytes
+      assert byte_size(encoded) > previous_settings.max_decompressed_body_bytes
+      assert byte_size(encoded) < settings.max_decompressed_body_bytes
+
+      new_conn = fn ->
+        Plug.Test.conn(:post, "/backend-api/codex/responses", compressed)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("content-encoding", "zstd")
+      end
+
+      assert {:error, %{status: 413, code: "compressed_request_too_large", message: message}, _conn} = CompressedBody.decode(new_conn.(), previous_settings)
+      assert message =~ "#{previous_settings.max_compressed_body_bytes}-byte limit"
+      assert message =~ "ingress.max_compressed_body_bytes"
+
+      assert {:error, %{status: 413, code: "decompressed_request_too_large"}} = CompressedBody.decode(new_conn.(), %{settings | max_decompressed_body_bytes: previous_settings.max_decompressed_body_bytes})
+
+      assert {:ok, accepted} = CompressedBody.decode(new_conn.(), settings)
+      assert length(hd(accepted.body_params["input"])["content"]) == 48
+      assert :crypto.hash(:sha256, CodexPooler.JSON.encode!(accepted.body_params)) == :crypto.hash(:sha256, encoded)
+
+      assert {:ok, ^encoded, _conn} =
+               Plug.Test.conn(:post, "/plain-json-reader", encoded)
+               |> put_private(:codex_pooler_runtime_ingress_settings, settings)
+               |> CompressedBody.read_plain_json_body([])
+    end
+
     test "rejects decompressed bodies above the decompressed-size limit", %{conn: conn} do
       setup_runtime_ingress(%OperationalSettings{max_decompressed_body_bytes: 16})
       setup = active_api_key_fixture()
@@ -1395,15 +1605,21 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
         |> compressed_post(
           "/backend-api/codex/responses",
           "gzip",
-          :zlib.gzip(Jason.encode!(payload))
+          :zlib.gzip(CodexPooler.JSON.encode!(payload))
         )
 
-      assert json_response(conn, 413)["error"]["code"] == "decompressed_request_too_large"
+      error = json_response(conn, 413)["error"]
+      assert error["code"] == "decompressed_request_too_large"
+      assert error["message"] =~ "16-byte limit"
+      assert error["message"] =~ "ingress.max_decompressed_body_bytes in System > Firewall before retrying"
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+      assert Repo.aggregate(LedgerEntry, :count) == 0
     end
 
     test "updated decompressed limits affect subsequent compressed requests", %{conn: conn} do
       payload = %{"model" => "x", "input" => native_text_input(String.duplicate("a", 200))}
-      compressed = :zlib.gzip(Jason.encode!(payload))
+      compressed = :zlib.gzip(CodexPooler.JSON.encode!(payload))
 
       setup_runtime_ingress(%OperationalSettings{max_decompressed_body_bytes: 16})
       setup = active_api_key_fixture()
@@ -1428,7 +1644,10 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
           "/backend-api/codex/responses",
           "gzip",
           :zlib.gzip(
-            Jason.encode!(gateway_body(gateway_setup) |> Map.put("input", payload["input"]))
+            CodexPooler.JSON.encode!(
+              gateway_body(gateway_setup)
+              |> Map.put("input", payload["input"])
+            )
           )
         )
 
@@ -1446,7 +1665,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
       setup = gateway_setup(upstream)
       large_input = :crypto.strong_rand_bytes(1_200_000) |> Base.encode16(case: :lower)
       body = gateway_body(setup) |> Map.put("input", native_text_input(large_input))
-      compressed = :zlib.gzip(Jason.encode!(body))
+      compressed = :zlib.gzip(CodexPooler.JSON.encode!(body))
 
       assert byte_size(compressed) > 1_000_000
 
@@ -1490,7 +1709,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
         |> compressed_post(
           "/backend-api/codex/responses",
           "gzip",
-          :zlib.gzip(Jason.encode!(payload))
+          :zlib.gzip(CodexPooler.JSON.encode!(payload))
         )
 
       assert json_response(conn, 413)["error"]["code"] == "decompressed_request_too_large"
@@ -1512,7 +1731,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
         |> compressed_post(
           "/backend-api/codex/responses",
           "gzip",
-          :zlib.gzip(Jason.encode!(payload))
+          :zlib.gzip(CodexPooler.JSON.encode!(payload))
         )
 
       assert json_response(conn, 413)["error"]["code"] == "decompression_ratio_exceeded"
@@ -1597,7 +1816,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
   end
 
   defp setup_runtime_ingress_override(%OperationalSettings{} = settings) do
-    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -1606,12 +1825,18 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
       |> Keyword.put(:settings, settings)
       |> Keyword.put(:use_instance_settings?, false)
     )
-
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
   end
 
   defp with_cache_unregistered(fun) when is_function(fun, 0) do
     cache = Process.whereis(Cache)
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs, and
+    # every later test in the run would find the cache process without its name.
+    on_exit(fn ->
+      if is_pid(cache) and Process.alive?(cache) and is_nil(Process.whereis(Cache)),
+        do: Process.register(cache, Cache)
+    end)
+
     Process.unregister(Cache)
 
     try do
@@ -1667,15 +1892,15 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
         receive do
           {:trace_result, pid, result} when pid == task.pid -> result
         after
-          1_000 -> flunk("traced callback did not complete")
+          @detection_timeout_ms -> flunk("traced callback did not complete")
         end
 
       delivered_ref = :erlang.trace_delivered(task.pid)
-      assert_receive {:trace_delivered, pid, ^delivered_ref} when pid == task.pid, 1_000
+      assert_receive {:trace_delivered, pid, ^delivered_ref} when pid == task.pid, @detection_timeout_ms
 
       calls = collect_traced_calls(task.pid, module, function, arity, 0)
       send(task.pid, {:release_trace, release_ref})
-      assert Task.await(task, 1_000) == result
+      assert Task.await(task, @detection_timeout_ms) == result
       {result, calls}
     after
       :erlang.trace_pattern(traced_mfa, false, [:local])
@@ -1719,10 +1944,10 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
     |> post(path, body)
   end
 
-  defp deflate(body) when is_map(body), do: body |> Jason.encode!() |> :zlib.compress()
+  defp deflate(body) when is_map(body), do: body |> CodexPooler.JSON.encode!() |> :zlib.compress()
 
   defp zstd(body) when is_map(body) do
-    body |> Jason.encode!() |> zstd_encoded()
+    body |> CodexPooler.JSON.encode!() |> zstd_encoded()
   end
 
   defp zstd_encoded(body), do: body |> :zstd.compress() |> IO.iodata_to_binary()
@@ -1752,7 +1977,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
   defp fixed_size_gateway_body(setup, target_bytes) do
     body = gateway_body(setup) |> Map.put("input", native_text_input(""))
-    padding_bytes = target_bytes - byte_size(Jason.encode!(body))
+    padding_bytes = target_bytes - byte_size(CodexPooler.JSON.encode!(body))
     Map.put(body, "input", native_text_input(String.duplicate("a", padding_bytes)))
   end
 

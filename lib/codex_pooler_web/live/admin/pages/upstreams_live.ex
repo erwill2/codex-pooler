@@ -8,10 +8,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.InviteCreationDialog
   alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.PoolWizardComponents
+  alias CodexPoolerWeb.Admin.ProviderCreditsWorkflow
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetOperationProjection
   alias CodexPoolerWeb.Admin.UpstreamAuthJsonImport
   alias CodexPoolerWeb.Admin.UpstreamFilterForm
   alias CodexPoolerWeb.Admin.UpstreamPageComponents
@@ -28,6 +31,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   alias CodexPoolerWeb.DateTimeDisplay
 
   @upstreams_reload_debounce_ms 1_000
+  @saved_reset_status_interval_ms 5_000
 
   @impl true
   def mount(_params, _session, socket) do
@@ -63,6 +67,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         delete_account_form: AccountLifecycleWorkflow.delete_form(nil),
         editing_saved_reset_policy: nil,
         saved_reset_policy_form: saved_reset_policy_form(%{}),
+        saved_reset_policy_recovery: connected_saved_reset_policy_recovery(socket),
         confirming_saved_reset_redemption: nil,
         account_panel_views: %{},
         subscribed_pool_ids: MapSet.new(),
@@ -72,10 +77,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         upstreams_reload_rerun?: false,
         upstreams_reload_dirty?: false,
         upstreams_loaded?: false,
+        saved_reset_status_timer: nil,
+        saved_reset_status_generation: 0,
+        saved_reset_status_running: nil,
+        saved_reset_status_rerun: nil,
         mailer_configured?: Mailer.configured?()
       )
       |> assign(PoolEditorWorkflow.initial_assigns())
       |> assign(InviteWorkflow.initial_assigns())
+      |> assign(ProviderCreditsWorkflow.initial_assigns())
       |> allow_upload(:auth_json,
         accept: ~w(.json),
         max_entries: 1,
@@ -84,6 +94,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         chunk_timeout: 5_000,
         auto_upload: true
       )
+      |> NotificationCenterHooks.follow_viewer_visibility()
 
     {:ok, socket}
   end
@@ -94,12 +105,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
      socket
      |> close_account_workflow_dialogs()
      |> maybe_load_upstreams(params)
+     |> restore_saved_reset_policy_draft()
      |> apply_pool_editor_params(params)
      |> apply_invite_params(params)
      |> canonicalize_upstreams_url(params)}
   end
 
   @impl true
+  def handle_info({Events, %{topics: topics, reason: "upstream_account_provider_credits_policy_updated"}}, socket) do
+    if "upstreams" in topics, do: {:noreply, reload_upstreams(socket)}, else: {:noreply, socket}
+  end
+
   def handle_info({Events, %{topics: topics}}, socket) do
     if "upstreams" in topics do
       {:noreply, schedule_upstreams_reload(socket)}
@@ -121,6 +137,30 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     {:noreply, resume_upstreams_reload(socket)}
   end
 
+  # A role change or a Pool granted or revoked changes which accounts, Pools
+  # and management controls this page may show. It re-reads them at once, even
+  # behind an open dialog (an ordinary reload waits for it to close), and
+  # closes a dialog on an account the viewer can no longer see, the Pool editor
+  # the viewer may no longer use, and a dialog that needs a Pool when none is
+  # left (findings#206 row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    {socket, closed?} = socket |> invalidate_saved_reset_status() |> reload_upstreams() |> close_lost_account_dialogs()
+
+    # The Pool editor and the invite dialog live in the URL: closing them is a
+    # patch to the page without their parameters.
+    url_dialog_lost? = url_dialog_lost?(socket)
+    socket = if url_dialog_lost?, do: push_patch(socket, to: upstreams_path(socket)), else: socket
+    {:noreply, if(closed? or url_dialog_lost?, do: put_flash(socket, :info, "Your Pool access changed"), else: socket)}
+  end
+
+  def handle_info(:refresh_saved_reset_status_tick, socket) do
+    socket = assign(socket, :saved_reset_status_timer, nil)
+
+    socket
+    |> sync_saved_reset_status_timer()
+    |> LiveUpdatesHooks.unless_paused(&request_saved_reset_status/1)
+  end
+
   @impl true
   def handle_info({:poll_oauth_device, flow_id}, socket) do
     {:noreply, OAuthWorkflow.poll_device(socket, flow_id, &reload_upstreams/1)}
@@ -133,6 +173,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     cond do
       generation != socket.assigns.upstreams_reload_generation ->
         {:noreply, maybe_run_upstreams_reload_rerun(socket)}
+
+      LiveUpdatesHooks.paused?(socket) ->
+        {:noreply, socket |> assign(:upstreams_reload_dirty?, true) |> LiveUpdatesHooks.hold()}
 
       upstream_dialog_open?(socket) ->
         {:noreply,
@@ -151,19 +194,60 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     {:noreply, maybe_run_upstreams_reload_rerun(socket)}
   end
 
+  def handle_async({:saved_reset_status, generation}, {:ok, result}, socket) do
+    case socket.assigns.saved_reset_status_running do
+      %{generation: ^generation} = running ->
+        socket = assign(socket, :saved_reset_status_running, nil)
+
+        socket =
+          if generation == socket.assigns.saved_reset_status_generation and
+               running.page_generation == socket.assigns.upstreams_reload_generation and
+               (running.forced? or (not LiveUpdatesHooks.paused?(socket) and not unrelated_upstream_dialog_open?(socket))) do
+            apply_saved_reset_status(socket, result, running)
+          else
+            socket
+          end
+
+        {:noreply, socket |> run_saved_reset_status_rerun() |> sync_saved_reset_status_timer()}
+
+      _stale ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_async({:saved_reset_status, generation}, {:exit, _reason}, socket) do
+    case socket.assigns.saved_reset_status_running do
+      %{generation: ^generation} ->
+        {:noreply, socket |> assign(:saved_reset_status_running, nil) |> run_saved_reset_status_rerun() |> sync_saved_reset_status_timer()}
+
+      _stale ->
+        {:noreply, socket}
+    end
+  end
+
   def handle_async({:pool_editor_model_serving, _load_token, _pool_id} = key, result, socket) do
     {:noreply, PoolEditorWorkflow.handle_model_async(key, result, socket)}
+  end
+
+  @impl true
+  def terminate(_reason, socket) do
+    cancel_saved_reset_status_timer(socket)
+    :ok
   end
 
   @impl true
   def handle_event("filter", %{"filters" => filter_params}, socket) do
     filter_values = UpstreamFilterForm.filter_values(filter_params, socket.assigns.pools)
 
-    {:noreply,
-     push_patch(socket,
-       to: upstreams_path(socket, filter_values, current_workflow_params(socket)),
-       replace: true
-     )}
+    if filter_values == socket.assigns.filter_values do
+      {:noreply, socket}
+    else
+      {:noreply,
+       push_patch(socket,
+         to: upstreams_path(socket, filter_values, current_workflow_params(socket)),
+         replace: true
+       )}
+    end
   end
 
   def handle_event("select_pool_filter", %{"pool-id" => pool_id}, socket) do
@@ -326,6 +410,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         {:noreply,
          socket
          |> close_saved_reset_policy_dialog()
+         |> ProviderCreditsWorkflow.close()
          |> assign(
            renaming_account: account,
            rename_account_form: rename_account_form(identity)
@@ -357,8 +442,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("confirm_delete_account", %{"upstream_delete" => delete_params}, socket) do
-    {:noreply,
-     AccountLifecycleWorkflow.confirm_delete(socket, delete_params, &reload_upstreams/1)}
+    {:noreply, AccountLifecycleWorkflow.confirm_delete(socket, delete_params, &reload_upstreams/1)}
+  end
+
+  def handle_event("open_provider_credits_policy", %{"id" => identity_id}, socket) do
+    socket = socket |> close_account_workflow_dialogs() |> reload_upstreams()
+    {:noreply, ProviderCreditsWorkflow.open(socket, find_account(socket.assigns.upstream_accounts, identity_id))}
+  end
+
+  def handle_event("cancel_provider_credits_policy", _params, socket) do
+    {:noreply, socket |> ProviderCreditsWorkflow.close() |> flush_deferred_upstreams_reload()}
+  end
+
+  def handle_event("validate_provider_credits_policy", params, socket) do
+    {:noreply, ProviderCreditsWorkflow.validate(socket, Map.get(params, "provider_credits_policy"))}
+  end
+
+  def handle_event("save_provider_credits_policy", params, socket) do
+    {:noreply, ProviderCreditsWorkflow.save(socket, Map.get(params, "provider_credits_policy"), &reload_upstreams/1)}
   end
 
   def handle_event("open_saved_reset_policy", %{"id" => identity_id}, socket) do
@@ -375,15 +476,32 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
            saved_reset_policy_form: saved_reset_policy_form(account.saved_reset_policy),
            confirming_saved_reset_redemption: nil
          )
-         |> defer_upstreams_reload()}
+         |> defer_upstreams_reload()
+         |> sync_saved_reset_status_timer()}
     end
+  end
+
+  def handle_event("open_quota_observations", _params, socket) do
+    {:noreply, socket |> assign(:quota_observations_open?, true) |> defer_upstreams_reload() |> sync_saved_reset_status_timer()}
+  end
+
+  def handle_event("close_quota_observations", _params, socket) do
+    {:noreply, socket |> assign(:quota_observations_open?, false) |> flush_deferred_upstreams_reload() |> sync_saved_reset_status_timer()}
   end
 
   def handle_event("cancel_saved_reset_policy", _params, socket) do
     {:noreply,
      socket
      |> close_saved_reset_policy_dialog()
-     |> flush_deferred_upstreams_reload()}
+     |> flush_deferred_upstreams_reload()
+     |> sync_saved_reset_status_timer()}
+  end
+
+  def handle_event("refresh_saved_reset_status", %{"id" => identity_id}, socket) do
+    case find_account(socket.assigns.upstream_accounts, identity_id) do
+      nil -> {:noreply, socket}
+      _trusted_account -> {:noreply, request_saved_reset_status(socket, [identity_id], true)}
+    end
   end
 
   def handle_event("validate_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do
@@ -404,13 +522,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("toggle_account_pools_panel", %{"id" => identity_id}, socket) do
-    {:noreply,
-     update(socket, :account_panel_views, &toggle_account_panel_view(&1, identity_id, :pools))}
+    {:noreply, update(socket, :account_panel_views, &toggle_account_panel_view(&1, identity_id, :pools))}
   end
 
   def handle_event("toggle_account_tokens_panel", %{"id" => identity_id}, socket) do
-    {:noreply,
-     update(socket, :account_panel_views, &toggle_account_panel_view(&1, identity_id, :tokens))}
+    {:noreply, update(socket, :account_panel_views, &toggle_account_panel_view(&1, identity_id, :tokens))}
   end
 
   def handle_event("cancel_saved_reset_redemption", _params, socket) do
@@ -495,13 +611,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   # has just armed a fresh debounce, and dropping the reference without killing
   # the timer leaves it to fire into a second reload.
   defp resume_upstreams_reload(socket) do
-    socket
-    |> cancel_upstreams_reload_timer()
-    |> reload_upstreams_or_defer()
+    socket = cancel_upstreams_reload_timer(socket)
+
+    if saved_reset_status_targets(socket) == [] do
+      reload_upstreams_or_defer(socket)
+    else
+      request_saved_reset_status(socket)
+    end
   end
 
   @impl true
   def render(assigns) do
+    assigns = saved_reset_view_assigns(assigns)
+
     assigns =
       assign(
         assigns,
@@ -515,6 +637,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
       current_scope={@current_scope}
       active_nav={:upstreams}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <div
         :for={warning <- @pool_editor_warnings}
@@ -575,6 +698,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         delete_account_form={@delete_account_form}
         editing_saved_reset_policy={@editing_saved_reset_policy}
         saved_reset_policy_form={@saved_reset_policy_form}
+        editing_provider_credits_policy={@editing_provider_credits_policy}
+        provider_credits_policy_form={@provider_credits_policy_form}
         confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
         account_panel_views={@account_panel_views}
         upstream_accounts={@upstream_accounts}
@@ -586,10 +711,44 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     """
   end
 
+  defp connected_saved_reset_policy_recovery(socket) do
+    if connected?(socket), do: saved_reset_policy_recovery_params(get_connect_params(socket))
+  end
+
+  defp saved_reset_policy_recovery_params(%{"saved_reset_policy_recovery" => %{"id" => id, "policy" => policy}}) when is_binary(id) and is_map(policy) do
+    policy = Map.take(policy, ~w(auto_redeem_enabled trigger_mode quota_threshold_percent min_blocked_minutes keep_credits))
+    if Enum.all?(policy, fn {_key, value} -> is_binary(value) and byte_size(value) <= 256 end), do: %{id: id, policy: policy}
+  end
+
+  defp saved_reset_policy_recovery_params(_params), do: nil
+
+  defp restore_saved_reset_policy_draft(socket) do
+    recovery = socket.assigns.saved_reset_policy_recovery
+    socket = assign(socket, :saved_reset_policy_recovery, nil)
+
+    case recovery do
+      %{id: identity_id, policy: policy} ->
+        case find_account(socket.assigns.upstream_accounts, identity_id) do
+          nil ->
+            socket
+
+          account ->
+            socket
+            |> assign(editing_saved_reset_policy: account, saved_reset_policy_form: saved_reset_policy_form(account.saved_reset_policy, policy, :validate))
+            |> defer_upstreams_reload()
+            |> sync_saved_reset_status_timer()
+        end
+
+      nil ->
+        socket
+    end
+  end
+
   defp load_upstreams(socket, params) do
     generation = socket.assigns.upstreams_reload_generation + 1
 
     socket
+    |> invalidate_saved_reset_status()
     |> assign(
       upstreams_reload_generation: generation,
       upstreams_reload_rerun?: false,
@@ -649,9 +808,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
       upstreams_reload_dirty?: false,
       upstreams_reload_rerun?: false,
       upstreams_loaded?: true,
-      account_panel_views:
-        prune_account_panel_views(socket.assigns.account_panel_views, upstream_accounts)
+      account_panel_views: prune_account_panel_views(socket.assigns.account_panel_views, upstream_accounts)
     )
+    |> ProviderCreditsWorkflow.refresh(upstream_accounts)
+    |> sync_saved_reset_status_timer()
   end
 
   defp request_upstreams_reload(socket) do
@@ -699,33 +859,36 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
 
   defp reload_upstreams_or_defer(socket) do
     if upstream_dialog_open?(socket) do
-      assign(socket, :upstreams_reload_dirty?, true)
+      socket |> assign(:upstreams_reload_dirty?, true) |> request_saved_reset_status()
     else
       request_upstreams_reload(socket)
     end
   end
 
   defp defer_upstreams_reload(socket) do
-    if socket.assigns.upstreams_reload_running? or
-         is_reference(socket.assigns.upstreams_reload_timer) do
-      socket
-      |> assign(:upstreams_reload_dirty?, true)
-      |> cancel_upstreams_reload_timer()
-    else
-      socket
-    end
+    socket =
+      if socket.assigns.upstreams_reload_running? or is_reference(socket.assigns.upstreams_reload_timer) do
+        socket |> assign(:upstreams_reload_dirty?, true) |> cancel_upstreams_reload_timer()
+      else
+        socket
+      end
+
+    sync_saved_reset_status_timer(socket)
   end
 
   defp flush_deferred_upstreams_reload(socket) do
-    if socket.assigns.upstreams_reload_dirty? and not upstream_dialog_open?(socket) do
-      request_upstreams_reload(socket)
-    else
-      socket
-    end
+    socket =
+      if socket.assigns.upstreams_reload_dirty? and not upstream_dialog_open?(socket) do
+        request_upstreams_reload(socket)
+      else
+        socket
+      end
+
+    sync_saved_reset_status_timer(socket)
   end
 
   defp upstream_dialog_open?(socket) do
-    socket.assigns.importing_auth_json or
+    socket.assigns[:quota_observations_open?] == true or socket.assigns.importing_auth_json or
       socket.assigns.oauth_linking or
       socket.assigns.creating_invite or
       not is_nil(socket.assigns.editing_pool) or
@@ -844,6 +1007,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         socket
         |> assign(:upstreams_reload_dirty?, true)
         |> cancel_upstreams_reload_timer()
+        |> request_saved_reset_status()
 
       is_reference(socket.assigns[:upstreams_reload_timer]) ->
         socket
@@ -858,6 +1022,154 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
 
         assign(socket, :upstreams_reload_timer, timer)
     end
+  end
+
+  defp saved_reset_status_targets(socket) do
+    if unrelated_upstream_dialog_open?(socket) do
+      []
+    else
+      editing_id = get_in(socket.assigns, [:editing_saved_reset_policy, :identity, Access.key(:id)])
+
+      socket.assigns.upstream_accounts
+      |> Enum.filter(fn account ->
+        account.identity.id == editing_id or socket.assigns[:quota_observations_open?] == true or
+          get_in(account, [:saved_reset_operation, :active?]) == true
+      end)
+      |> Enum.map(& &1.identity.id)
+    end
+  end
+
+  defp unrelated_upstream_dialog_open?(socket) do
+    socket.assigns.importing_auth_json or socket.assigns.oauth_linking or socket.assigns.creating_invite or
+      not is_nil(socket.assigns.editing_pool) or not is_nil(socket.assigns.renaming_account) or
+      not is_nil(socket.assigns.deleting_account) or not is_nil(socket.assigns.editing_provider_credits_policy)
+  end
+
+  defp request_saved_reset_status(socket), do: request_saved_reset_status(socket, saved_reset_status_targets(socket), false)
+
+  defp request_saved_reset_status(socket, [], _forced?), do: sync_saved_reset_status_timer(socket)
+
+  defp request_saved_reset_status(socket, identity_ids, forced?) do
+    if connected?(socket) and (forced? or not LiveUpdatesHooks.paused?(socket)) do
+      generation = socket.assigns.saved_reset_status_generation + 1
+      socket = assign(socket, :saved_reset_status_generation, generation)
+
+      if socket.assigns.saved_reset_status_running do
+        previous = socket.assigns.saved_reset_status_rerun || %{identity_ids: [], forced?: false}
+        assign(socket, :saved_reset_status_rerun, %{identity_ids: Enum.uniq(previous.identity_ids ++ identity_ids), forced?: previous.forced? or forced?})
+      else
+        start_saved_reset_status(socket, identity_ids, forced?, generation)
+      end
+    else
+      LiveUpdatesHooks.hold(socket)
+    end
+  end
+
+  defp start_saved_reset_status(socket, identity_ids, forced?, generation) do
+    # A targeted read is newer than any whole-page read already in flight.
+    # Advancing their shared ordering prevents the older page from restoring it.
+    socket = assign(socket, :upstreams_reload_generation, socket.assigns.upstreams_reload_generation + 1)
+    scope = socket.assigns.current_scope
+    filters = Map.put(socket.assigns.filter_values, :identity_ids, identity_ids)
+    preferences = DateTimeDisplay.preferences_for_user(scope.user)
+    cursors = Map.new(socket.assigns.upstream_accounts, &{&1.identity.id, &1.saved_reset_refresh_cursor})
+    running = %{generation: generation, page_generation: socket.assigns.upstreams_reload_generation, identity_ids: identity_ids, forced?: forced?, cursors: Map.take(cursors, identity_ids)}
+
+    socket
+    |> assign(saved_reset_status_running: running, saved_reset_status_rerun: nil)
+    |> start_async({:saved_reset_status, generation}, fn ->
+      pools = Pools.list_visible_pools(scope)
+      UpstreamAccountsReadModel.list_visible_accounts(scope, filtered_pools(pools, filters), filters, preferences)
+    end)
+  end
+
+  defp run_saved_reset_status_rerun(socket) do
+    case socket.assigns.saved_reset_status_rerun do
+      %{identity_ids: ids, forced?: forced?} ->
+        visible_ids = MapSet.new(socket.assigns.upstream_accounts, & &1.identity.id)
+        ids = Enum.filter(ids, &MapSet.member?(visible_ids, &1))
+        socket |> assign(:saved_reset_status_rerun, nil) |> request_saved_reset_status(ids, forced?)
+
+      nil ->
+        socket
+    end
+  end
+
+  defp apply_saved_reset_status(socket, accounts, running) do
+    fresh = Map.new(accounts, &{&1.identity.id, &1})
+    targets = MapSet.new(running.identity_ids)
+
+    accounts =
+      Enum.flat_map(socket.assigns.upstream_accounts, fn current ->
+        id = current.identity.id
+
+        cond do
+          not MapSet.member?(targets, id) -> [current]
+          current.saved_reset_refresh_cursor != running.cursors[id] -> [current]
+          not Map.has_key?(fresh, id) -> []
+          UpstreamAccountsReadModel.newer_saved_reset_refresh_cursor?(fresh[id].saved_reset_refresh_cursor, current.saved_reset_refresh_cursor) -> [fresh[id]]
+          true -> [current]
+        end
+      end)
+
+    socket = assign(socket, :upstream_accounts, accounts)
+
+    socket =
+      case socket.assigns.editing_saved_reset_policy do
+        %{identity: %{id: id}} -> refresh_editing_saved_reset_policy(socket, id)
+        nil -> socket
+      end
+
+    {socket, _closed?} = close_lost_account_dialogs(socket)
+    socket
+  end
+
+  defp sync_saved_reset_status_timer(socket) do
+    if connected?(socket) and saved_reset_status_targets(socket) != [] do
+      socket = LiveUpdatesHooks.hold(socket)
+
+      if is_reference(socket.assigns.saved_reset_status_timer) do
+        socket
+      else
+        assign(socket, :saved_reset_status_timer, Process.send_after(self(), :refresh_saved_reset_status_tick, @saved_reset_status_interval_ms))
+      end
+    else
+      cancel_saved_reset_status_timer(socket)
+    end
+  end
+
+  defp cancel_saved_reset_status_timer(socket) do
+    if is_reference(socket.assigns[:saved_reset_status_timer]) do
+      Process.cancel_timer(socket.assigns.saved_reset_status_timer, async: false, info: false)
+    end
+
+    assign(socket, :saved_reset_status_timer, nil)
+  end
+
+  defp invalidate_saved_reset_status(socket) do
+    socket =
+      case socket.assigns.saved_reset_status_running do
+        %{generation: generation} -> cancel_async(socket, {:saved_reset_status, generation})
+        nil -> socket
+      end
+
+    assign(socket, saved_reset_status_generation: socket.assigns.saved_reset_status_generation + 1, saved_reset_status_running: nil, saved_reset_status_rerun: nil)
+  end
+
+  defp saved_reset_view_assigns(assigns) do
+    paused? = assigns[:live_updates_paused?] == true
+    connected? = match?(%{transport_pid: pid} when is_pid(pid), assigns.socket)
+    running = assigns.saved_reset_status_running
+
+    decorate = fn account ->
+      operation = SavedResetOperationProjection.observe(account.saved_reset_operation, paused?: paused?, connected?: connected?)
+
+      account |> Map.put(:saved_reset_operation, operation) |> Map.put(:saved_reset_status_refreshing?, running != nil and account.identity.id in running.identity_ids)
+    end
+
+    assigns
+    |> assign(:upstream_accounts, Enum.map(assigns.upstream_accounts, decorate))
+    |> assign(:editing_saved_reset_policy, if(assigns.editing_saved_reset_policy, do: decorate.(assigns.editing_saved_reset_policy)))
   end
 
   defp cancel_upstreams_reload_timer(socket) do
@@ -941,7 +1253,42 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     |> AccountLifecycleWorkflow.close_delete()
     |> OAuthWorkflow.close()
     |> close_saved_reset_policy_dialog()
+    |> ProviderCreditsWorkflow.close()
   end
+
+  defp close_lost_account_dialogs(socket) do
+    visible_account_ids = MapSet.new(socket.assigns.upstream_accounts, & &1.identity.id)
+    lost? = &(match?(%{identity: %{id: _id}}, &1) and not MapSet.member?(visible_account_ids, &1.identity.id))
+    no_pools? = socket.assigns.pools == []
+
+    {socket, false}
+    |> close_if(lost?.(socket.assigns.renaming_account), &close_rename_account_dialog/1)
+    |> close_if(lost?.(socket.assigns.deleting_account), &AccountLifecycleWorkflow.close_delete/1)
+    |> close_if(provider_credits_control_lost?(socket), &ProviderCreditsWorkflow.close/1)
+    |> close_if(lost?.(socket.assigns.editing_saved_reset_policy), &close_saved_reset_policy_dialog/1)
+    |> close_if(lost?.(socket.assigns.confirming_saved_reset_redemption), &assign(&1, :confirming_saved_reset_redemption, nil))
+    |> close_if(socket.assigns.oauth_linking and (lost?.(socket.assigns.oauth_link_target_account) or no_pools?), &OAuthWorkflow.close/1)
+    |> close_if(socket.assigns.importing_auth_json and no_pools?, &AuthJsonWorkflow.close/1)
+  end
+
+  defp provider_credits_control_lost?(socket) do
+    case socket.assigns.editing_provider_credits_policy do
+      %{identity: %{id: identity_id}} ->
+        not Enum.any?(socket.assigns.upstream_accounts, &(&1.identity.id == identity_id and &1.can_manage_provider_credits?))
+
+      nil ->
+        false
+    end
+  end
+
+  defp url_dialog_lost?(%{assigns: %{editing_pool: %{id: pool_id}, current_scope: scope}}),
+    do: match?({:error, _reason}, PoolEditorWorkflow.find_editable_pool(scope, pool_id))
+
+  defp url_dialog_lost?(%{assigns: %{creating_invite: true, pools: []}}), do: true
+  defp url_dialog_lost?(_socket), do: false
+
+  defp close_if({socket, _closed?}, true, close), do: {close.(socket), true}
+  defp close_if({socket, closed?}, false, _close), do: {socket, closed?}
 
   defp close_rename_account_dialog(socket) do
     assign(socket,

@@ -56,6 +56,17 @@ defmodule CodexPooler.Pools.Routing do
 
   def allow_image_generation?(_pool_id), do: true
 
+  @spec allow_audio_transcription?(Pool.t() | Ecto.UUID.t() | term()) :: boolean()
+  def allow_audio_transcription?(%Pool{id: pool_id}), do: allow_audio_transcription?(pool_id)
+
+  def allow_audio_transcription?(pool_id) when is_binary(pool_id) do
+    case routing_settings_with_defaults(pool_id) do
+      %RoutingSettings{allow_audio_transcription: allowed} -> allowed
+    end
+  end
+
+  def allow_audio_transcription?(_pool_id), do: true
+
   def ensure_routing_settings(%Pool{id: pool_id}), do: ensure_routing_settings(pool_id)
 
   def ensure_routing_settings(pool_id) when is_binary(pool_id) do
@@ -107,10 +118,7 @@ defmodule CodexPooler.Pools.Routing do
       settings
       |> RoutingSettings.changeset(%{
         routing_strategy: routing_attr(attrs, "routing_strategy", settings.routing_strategy),
-        bridge_ring_size:
-          parse_positive_integer(
-            routing_attr(attrs, "bridge_ring_size", settings.bridge_ring_size)
-          ),
+        bridge_ring_size: parse_positive_integer(routing_attr(attrs, "bridge_ring_size", settings.bridge_ring_size)),
         sticky_websocket_sessions:
           parse_boolean(
             routing_attr(
@@ -119,10 +127,7 @@ defmodule CodexPooler.Pools.Routing do
               settings.sticky_websocket_sessions
             )
           ),
-        sticky_http_sessions:
-          parse_boolean(
-            routing_attr(attrs, "sticky_http_sessions", settings.sticky_http_sessions)
-          ),
+        sticky_http_sessions: parse_boolean(routing_attr(attrs, "sticky_http_sessions", settings.sticky_http_sessions)),
         prompt_cache_affinity_enabled:
           parse_boolean(
             routing_attr(
@@ -139,14 +144,6 @@ defmodule CodexPooler.Pools.Routing do
               settings.v1_compatibility_enabled
             )
           ),
-        request_compression_enabled:
-          parse_boolean(
-            routing_attr(
-              attrs,
-              "request_compression_enabled",
-              settings.request_compression_enabled
-            )
-          ),
         allow_image_generation:
           parse_required_boolean(
             routing_attr(
@@ -155,6 +152,7 @@ defmodule CodexPooler.Pools.Routing do
               settings.allow_image_generation
             )
           ),
+        allow_audio_transcription: parse_required_boolean(routing_attr(attrs, "allow_audio_transcription", settings.allow_audio_transcription)),
         metadata: settings.metadata || %{},
         created_at: settings.created_at,
         updated_at: now
@@ -168,8 +166,8 @@ defmodule CodexPooler.Pools.Routing do
             sticky_websocket_sessions: settings.sticky_websocket_sessions,
             sticky_http_sessions: settings.sticky_http_sessions,
             prompt_cache_affinity_enabled: settings.prompt_cache_affinity_enabled,
-            request_compression_enabled: settings.request_compression_enabled,
-            allow_image_generation: settings.allow_image_generation
+            allow_image_generation: settings.allow_image_generation,
+            allow_audio_transcription: settings.allow_audio_transcription
           })
 
           maybe_broadcast_routing_change(opts, pool, settings)
@@ -191,9 +189,7 @@ defmodule CodexPooler.Pools.Routing do
   end
 
   def update_routing_settings(_scope, _pool, _attrs, _opts),
-    do:
-      {:error,
-       PoolAuthorization.access_error(:invalid_request, "user scope and Pool are required")}
+    do: {:error, PoolAuthorization.access_error(:invalid_request, "user scope and Pool are required")}
 
   defp default_routing_settings(pool_id) do
     now = now()
@@ -206,8 +202,8 @@ defmodule CodexPooler.Pools.Routing do
       sticky_http_sessions: false,
       prompt_cache_affinity_enabled: true,
       v1_compatibility_enabled: true,
-      request_compression_enabled: false,
       allow_image_generation: true,
+      allow_audio_transcription: true,
       metadata: %{},
       created_at: now,
       updated_at: now

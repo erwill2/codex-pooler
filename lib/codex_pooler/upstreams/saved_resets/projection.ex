@@ -3,6 +3,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
   Metadata-only helpers for Codex saved reset observations and policy projection.
   """
 
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
   alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
@@ -28,6 +29,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
   @last_call_failed_refresh_backoff_seconds 60
   @redemption_receive_timeout_ms 15_000
   @redemption_stale_grace_ms 60_000
+  @max_credit_kinds 8
   @detail_status_marker :saved_reset_detail_status
   @detail_payload_max_bytes 1_048_576
 
@@ -43,7 +45,9 @@ defmodule CodexPooler.Upstreams.SavedResets do
   @type reset_credit_detail_status :: :authoritative_zero | :authoritative_rows | :incomplete
   @type sanitized_credit :: %{
           required(:expires_at) => String.t(),
-          required(:granted_at) => String.t() | nil
+          required(:granted_at) => String.t() | nil,
+          optional(:reset_type) => String.t() | nil,
+          optional(:title_fingerprint) => String.t() | nil
         }
   @type reset_credit_detail :: %{
           required(:status) => reset_credit_detail_status(),
@@ -77,6 +81,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
           required(:expires_reported?) => boolean(),
           required(:in_progress?) => boolean(),
           required(:redemption_stale?) => boolean(),
+          required(:redemption_blocked?) => boolean(),
           required(:last_redemption) => map() | nil
         }
   @type auto_policy_projection :: %{
@@ -255,6 +260,10 @@ defmodule CodexPooler.Upstreams.SavedResets do
       expires_reported?: next_expires_at != nil,
       in_progress?: redemption_state == :in_progress,
       redemption_stale?: redemption_state == :stale,
+      # The claim's own guard, so a reader never offers a redemption the
+      # claim would refuse (an applied reblock, an expired window, an
+      # unrecognized phase).
+      redemption_blocked?: RedemptionLifecycle.blocks_new_redemption?(redemption, timestamp),
       last_redemption: redemption_or_nil(redemption)
     }
   end
@@ -306,14 +315,75 @@ defmodule CodexPooler.Upstreams.SavedResets do
 
   @spec expiration_observation_fresh?(snapshot_projection(), DateTime.t()) :: boolean()
   def expiration_observation_fresh?(snapshot, %DateTime{} = timestamp) do
-    with {:ok, observed_at} <- parse_iso8601_datetime(snapshot.expires_observed_at),
+    expiration_observation_fresh?(snapshot.expires_observed_at, snapshot.next_expires_at, timestamp)
+  end
+
+  @spec expiration_observation_fresh?(term(), String.t() | nil, DateTime.t()) :: boolean()
+  defp expiration_observation_fresh?(expires_observed_at, next_expires_at, timestamp) do
+    with {:ok, observed_at} <- parse_iso8601_datetime(expires_observed_at),
          false <- DateTime.after?(observed_at, timestamp) do
       observation_age = whole_second_diff(timestamp, observed_at)
-      observation_age >= 0 and observation_age < expiration_observation_ttl(snapshot, timestamp)
+      observation_age >= 0 and observation_age < expiration_observation_ttl(%{next_expires_at: next_expires_at}, timestamp)
     else
       _invalid_or_future -> false
     end
   end
+
+  @doc "Returns an account ordering hint from fresh authoritative expiration detail, never spend permission."
+  @spec expiration_priority_hint(UpstreamIdentity.t() | map() | nil, DateTime.t()) :: {:known, DateTime.t()} | :unknown
+  def expiration_priority_hint(%UpstreamIdentity{} = identity, %DateTime{} = timestamp),
+    do: expiration_priority_hint(identity.metadata, timestamp)
+
+  def expiration_priority_hint(%{} = metadata, %DateTime{} = timestamp) do
+    raw = Map.get(metadata, "saved_resets", metadata)
+
+    with %{} <- raw,
+         %{"status" => @reported, "expires_detail_status" => "authoritative_rows"} <- raw,
+         {:ok, count} when count > 0 <- non_negative_truncated_integer(raw["available_count"]),
+         {:ok, expirations} <- priority_expirations(raw),
+         true <- Enum.all?(expirations, &DateTime.after?(&1, timestamp)),
+         minimum <- Enum.min_by(expirations, &DateTime.to_unix(&1, :microsecond)),
+         true <- expiration_observation_fresh?(raw["expires_observed_at"], DateTime.to_iso8601(minimum), timestamp) do
+      {:known, minimum}
+    else
+      _unqualified -> :unknown
+    end
+  end
+
+  def expiration_priority_hint(_metadata, %DateTime{}), do: :unknown
+
+  defp priority_expirations(raw) do
+    collections =
+      for key <- ["available_expires_at", "available_expirations"], Map.has_key?(raw, key) do
+        priority_expiration_collection(raw[key], key)
+      end
+
+    case Enum.uniq(collections) do
+      [{:ok, [_ | _] = expirations}] -> {:ok, expirations}
+      _missing_invalid_or_disagreeing -> :error
+    end
+  end
+
+  defp priority_expiration_collection([_ | _] = values, key) do
+    values
+    |> Enum.reduce_while({:ok, []}, fn value, {:ok, acc} ->
+      value = if key == "available_expirations", do: priority_expiration_row(value), else: value
+
+      case parse_iso8601_datetime(value) do
+        {:ok, datetime} -> {:cont, {:ok, [DateTime.from_unix!(DateTime.to_unix(datetime, :microsecond), :microsecond) | acc]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, dates} -> {:ok, dates |> Enum.uniq_by(&DateTime.to_unix(&1, :microsecond)) |> Enum.sort_by(&DateTime.to_unix(&1, :microsecond))}
+      :error -> :error
+    end
+  end
+
+  defp priority_expiration_collection(_values, _key), do: :error
+  defp priority_expiration_row(%{"expires_at" => value}), do: value
+  defp priority_expiration_row(%{expires_at: value}), do: value
+  defp priority_expiration_row(_row), do: nil
 
   @spec reuse_expiration_metadata(term(), UpstreamIdentity.t() | map()) :: term()
   @spec reuse_expiration_metadata(term(), UpstreamIdentity.t() | map(), DateTime.t() | nil) ::
@@ -491,8 +561,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
 
   @spec expiration_metadata_from_payload(term(), DateTime.t(), UpstreamIdentity.t() | map() | nil) ::
           %{
-            required(String.t()) =>
-              [String.t()] | [stored_available_expiration_row()] | String.t() | nil
+            required(String.t()) => [String.t()] | [stored_available_expiration_row()] | String.t() | nil
           }
   defp expiration_metadata_from_payload(payload, observed_at, previous_metadata) do
     summary = reset_credit_summary(payload)
@@ -522,8 +591,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
           UpstreamIdentity.t() | map() | nil
         ) ::
           %{
-            required(String.t()) =>
-              [String.t()] | [stored_available_expiration_row()] | String.t() | nil
+            required(String.t()) => [String.t()] | [stored_available_expiration_row()] | String.t() | nil
           }
   defp expiration_metadata_from_detail(
          %{status: :authoritative_zero},
@@ -536,6 +604,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "expires_detail_status" => "authoritative_zero",
       "available_expires_at" => [],
       "available_expirations" => [],
+      "available_credit_kinds" => [],
       "next_expires_at" => nil,
       "expires_observed_at" => observed_at_iso8601,
       "expires_refresh_attempted_at" => observed_at_iso8601
@@ -563,6 +632,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "expires_observed_at" => observed_at_iso8601,
       "expires_refresh_attempted_at" => observed_at_iso8601
     }
+    |> put_credit_kinds(credits)
   end
 
   defp expiration_metadata_from_detail(%{status: :incomplete}, observed_at, previous_metadata) do
@@ -576,12 +646,12 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "expires_observed_at" => snapshot.expires_observed_at,
       "expires_refresh_attempted_at" => DateTime.to_iso8601(observed_at)
     }
+    |> carry_credit_kinds(previous_metadata)
   end
 
   @spec expiration_metadata_from_summary(term(), DateTime.t(), UpstreamIdentity.t() | map() | nil) ::
           %{
-            required(String.t()) =>
-              [String.t()] | [stored_available_expiration_row()] | String.t() | nil
+            required(String.t()) => [String.t()] | [stored_available_expiration_row()] | String.t() | nil
           }
   defp expiration_metadata_from_summary(payload, observed_at, previous_metadata) do
     summary = reset_credit_summary(payload)
@@ -603,6 +673,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "expires_observed_at" => snapshot_expires_observed_at(summary),
       "expires_refresh_attempted_at" => snapshot_expires_refresh_attempted_at(summary)
     }
+    |> carry_credit_kinds(previous_metadata)
   end
 
   defp put_expiration_summary(reset_credits, snapshot, attempted_at) do
@@ -780,7 +851,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
   defp sanitized_available_credit(%{} = credit) do
     with true <- available_credit?(credit),
          expires_at when is_binary(expires_at) <- safe_iso8601(Map.get(credit, "expires_at")) do
-      %{expires_at: expires_at, granted_at: safe_iso8601(Map.get(credit, "granted_at"))}
+      %{expires_at: expires_at, granted_at: safe_iso8601(Map.get(credit, "granted_at")), reset_type: credit_reset_type(credit), title_fingerprint: credit_title_fingerprint(credit)}
     else
       _invalid -> nil
     end
@@ -788,12 +859,73 @@ defmodule CodexPooler.Upstreams.SavedResets do
 
   defp sanitized_available_credit(_credit), do: nil
 
+  # What a credit says about the windows it resets (findings#310): the
+  # provider's machine `reset_type`, cleartext only within the diagnostic
+  # identifier rule, and its title as a fingerprint only (the first 12 hex of
+  # its SHA-256), since no machine field names the windows. A credit read back
+  # from the sanitized detail carries both already bounded.
+  defp credit_reset_type(%{"reset_type" => reset_type}) when is_binary(reset_type) and reset_type != "", do: DiagnosticTaxonomy.identifier(reset_type)
+  defp credit_reset_type(_credit), do: nil
+
+  defp credit_title_fingerprint(%{"title" => title}) when is_binary(title) and title != "",
+    do: "sha256_" <> (:crypto.hash(:sha256, title) |> Base.encode16(case: :lower) |> String.slice(0, 12))
+
+  defp credit_title_fingerprint(%{"title_fingerprint" => "sha256_" <> hex = fingerprint}) when byte_size(hex) == 12 do
+    if hex =~ ~r/\A[0-9a-f]{12}\z/, do: fingerprint
+  end
+
+  defp credit_title_fingerprint(_credit), do: nil
+
+  # The kinds of the credits the detail retains, counted. More distinct kinds
+  # than the cap leave the record absent rather than bucketed.
+  defp put_credit_kinds(metadata, credits) do
+    kinds =
+      credits
+      |> Enum.frequencies_by(&{Map.get(&1, :reset_type), Map.get(&1, :title_fingerprint)})
+      |> Enum.map(fn {{reset_type, title_fingerprint}, count} -> %{"reset_type" => reset_type, "title_fingerprint" => title_fingerprint, "count" => count} end)
+      |> Enum.sort_by(&{&1["reset_type"] || "", &1["title_fingerprint"] || ""})
+
+    if length(kinds) <= @max_credit_kinds, do: Map.put(metadata, "available_credit_kinds", kinds), else: metadata
+  end
+
+  # A refresh without an authoritative detail keeps the kinds already
+  # recorded; anything malformed there is dropped, not carried.
+  defp carry_credit_kinds(metadata, previous_metadata) do
+    case previous_credit_kinds(previous_metadata) do
+      {:ok, kinds} -> Map.put(metadata, "available_credit_kinds", kinds)
+      :none -> metadata
+    end
+  end
+
+  defp previous_credit_kinds(%UpstreamIdentity{} = identity), do: previous_credit_kinds(identity.metadata)
+
+  defp previous_credit_kinds(%{} = metadata) do
+    case metadata |> Map.get("saved_resets", metadata) |> Map.get("available_credit_kinds") do
+      kinds when is_list(kinds) and length(kinds) <= @max_credit_kinds -> if Enum.all?(kinds, &credit_kind?/1), do: {:ok, kinds}, else: :none
+      _absent -> :none
+    end
+  end
+
+  defp previous_credit_kinds(_previous_metadata), do: :none
+
+  defp credit_kind?(%{"reset_type" => reset_type, "title_fingerprint" => title_fingerprint, "count" => count} = kind)
+       when map_size(kind) == 3 and is_integer(count) and count > 0 and (is_nil(reset_type) or is_binary(reset_type)) and
+              (is_nil(title_fingerprint) or is_binary(title_fingerprint)),
+       do: true
+
+  defp credit_kind?(_kind), do: false
+
   defp maybe_clear_grants(credits, true), do: Enum.map(credits, &%{&1 | granted_at: nil})
   defp maybe_clear_grants(credits, false), do: credits
 
-  defp stored_sanitized_credit(%{expires_at: expires_at, granted_at: granted_at}) do
+  defp stored_sanitized_credit(%{expires_at: expires_at, granted_at: granted_at} = credit) do
     %{"expires_at" => expires_at, "granted_at" => granted_at}
+    |> put_credit_field("reset_type", Map.get(credit, :reset_type))
+    |> put_credit_field("title_fingerprint", Map.get(credit, :title_fingerprint))
   end
+
+  defp put_credit_field(credit, _key, nil), do: credit
+  defp put_credit_field(credit, key, value), do: Map.put(credit, key, value)
 
   @spec authoritative_available_expiration_rows([sanitized_credit()], map(), String.t()) :: [
           stored_available_expiration_row()

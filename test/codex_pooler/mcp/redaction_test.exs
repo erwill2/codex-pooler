@@ -130,9 +130,7 @@ defmodule CodexPooler.MCP.RedactionTest do
     end
 
     assert_raise ExUnit.AssertionError, ~r/upload_url/, fn ->
-      Redaction.assert_text_content_safe!(
-        "upload destination https://uploads.example.com/private/file"
-      )
+      Redaction.assert_text_content_safe!("upload destination https://uploads.example.com/private/file")
     end
   end
 
@@ -165,7 +163,7 @@ defmodule CodexPooler.MCP.RedactionTest do
     assert_raise ExUnit.AssertionError, ~r/text content mirrors structuredContent/, fn ->
       Redaction.assert_mcp_output_safe!(%{
         structuredContent: structured,
-        content: [%{"type" => "text", "text" => Jason.encode!(structured)}]
+        content: [%{"type" => "text", "text" => CodexPooler.JSON.encode!(structured)}]
       })
     end
   end

@@ -539,9 +539,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     refute has_element?(view, "#invite-row-#{first.id}")
 
     view
-    |> element(
-      "#invite-pool-filter [data-role='pool-filter-option'][data-pool-id='#{first_pool.id}']"
-    )
+    |> element("#invite-pool-filter [data-role='pool-filter-option'][data-pool-id='#{first_pool.id}']")
     |> render_click()
 
     assert_patch(view, ~p"/admin/invites?pool_id=#{first_pool.id}&status=revoked")
@@ -639,10 +637,10 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     docs_url =
       case footer_id do
         "invite-revoke-dialog-footer" ->
-          "https://docs.codex-pooler.com/operators/invites/#active-invite-actions"
+          "https://www.codex-pooler.com/docs/operators/invites/#active-invite-actions"
 
         _footer_id ->
-          "https://docs.codex-pooler.com/operators/invites/#create-pool-invite"
+          "https://www.codex-pooler.com/docs/operators/invites/#create-pool-invite"
       end
 
     assert has_element?(

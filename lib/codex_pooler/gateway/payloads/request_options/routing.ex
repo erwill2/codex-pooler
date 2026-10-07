@@ -8,6 +8,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
     allowed
     summary
     routing_state
+    capacity_basis
+    non_credit_recovery_outcome
     precise_candidate_count
     credit_backed_probe_candidate_count
     weekly_probe_candidate_count
@@ -24,6 +26,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
     :canonical_partition,
     :file_affinity_assignment_id,
     :prompt_cache_key,
+    :prompt_cache_key_state,
     :quota_decision,
     :reset_probe,
     :reasoning_effort_decision,
@@ -43,6 +46,11 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
   @type canonical_partition :: %{
           required(String.t()) => String.t() | non_neg_integer() | boolean()
         }
+  # Why the routing copy of `prompt_cache_key` holds what it holds: the digest
+  # of a usable key (`:present`), or nil because none was sent (`:absent`),
+  # because a sent key was blank, longer than the bound, or not a string, or
+  # because the route never takes a key as a seed (`:route_excluded`).
+  @type prompt_cache_key_state :: :present | :absent | :blank | :oversized | :invalid | :route_excluded
   @type configured_model_serving_mode :: String.t()
   @type effective_model_serving_mode :: String.t()
   @type model_serving_mode_source :: String.t()
@@ -59,6 +67,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
           canonical_partition: canonical_partition() | nil,
           file_affinity_assignment_id: Ecto.UUID.t() | nil,
           prompt_cache_key: String.t() | nil,
+          prompt_cache_key_state: prompt_cache_key_state() | nil,
           quota_decision: map() | nil,
           reset_probe: ResetProbe.t() | nil,
           reasoning_effort_decision: Decision.t() | nil,

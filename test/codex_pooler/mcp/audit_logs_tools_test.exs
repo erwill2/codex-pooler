@@ -89,7 +89,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
 
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     structured = result["structuredContent"]
 
@@ -98,10 +98,11 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
              "limit",
              "nextOffset",
              "offset",
-             "total"
+             "total",
+             "totalExact"
            ]
 
-    assert %{"items" => [item], "total" => 1, "limit" => 10, "offset" => 0} = structured
+    assert %{"items" => [item], "total" => 1, "totalExact" => true, "limit" => 10, "offset" => 0} = structured
     assert structured["nextOffset"] == nil
 
     assert item["id"] == event.id
@@ -147,7 +148,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
   end
 
   test "audit-log list text handles empty results without echoing caller filters", %{auth: auth} do
-    sentinels = caller_filter_sentinels()
+    sentinels = Map.put(caller_filter_sentinels(), "outcome", "failure")
 
     assert {:ok, result} =
              ToolDispatch.call(
@@ -161,6 +162,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     assert result["structuredContent"] == %{
              "items" => [],
              "total" => 0,
+             "totalExact" => true,
              "limit" => 50,
              "offset" => 5,
              "nextOffset" => nil
@@ -280,7 +282,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
       |> Enum.count(&String.starts_with?(&1, "- occurred_at="))
 
     assert row_count == 10
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
   end
 
   test "audit-log tool rejects malformed semantic filters without echoing date sentinels", %{
@@ -341,7 +343,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     assert result["isError"] == false
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     assert %{"status" => "ok", "kind" => "audit_log", "item" => item} =
              result["structuredContent"]

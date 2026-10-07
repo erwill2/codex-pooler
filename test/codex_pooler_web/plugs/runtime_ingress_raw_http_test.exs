@@ -15,7 +15,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
   @max_json_bytes 16_384
 
   setup do
-    previous_settings = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous_settings = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     settings = %OperationalSettings{
       firewall_allowlist: ["198.51.100.20", "2001:db8::7"],
@@ -29,8 +29,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
       |> Keyword.put(:settings, settings)
       |> Keyword.put(:use_instance_settings?, false)
     )
-
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous_settings) end)
 
     {:ok, upstream} =
       FakeUpstream.start_link(FakeUpstream.json_response(%{"id" => "unexpected_dispatch"}))
@@ -295,7 +293,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressRawHTTPTest do
 
   defp json_field(%{body: body}, path) when byte_size(body) <= @max_json_bytes do
     body
-    |> Jason.decode!()
+    |> CodexPooler.JSON.decode!()
     |> get_in(Enum.map(path, &Access.key/1))
   end
 

@@ -4,6 +4,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Snapshot do
   import Ecto.Query
 
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Accounting.Request
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Dev.OpenAIV1Fixture.SnapshotReader
   alias CodexPooler.Gateway.Persistence.{BridgeDemotion, RoutingCircuitState}
@@ -121,8 +122,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Snapshot do
     function.()
   rescue
     error ->
-      raise RuntimeError,
-            "OpenAI V1 fixture restore failed at #{phase} (#{inspect(error.__struct__)})"
+      reraise RuntimeError, "OpenAI V1 fixture restore failed at #{phase} (#{inspect(error.__struct__)})", __STACKTRACE__
   end
 
   defp delete_fixture_rows!(snapshot, existing_identity_id, existing_pool_id) do
@@ -136,6 +136,18 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Snapshot do
   end
 
   defp delete_pool_children(snapshot, pool_id) when is_binary(pool_id) do
+    leased_keys =
+      from key in APIKey,
+        where: key.pool_id == ^pool_id and key.id not in ^row_ids(snapshot.api_keys),
+        select: key.id
+
+    # Delete the whole request graph before assignment deletion cascades to attempts
+    # still referenced by immutable ledger entries. Captured keys keep their history.
+    Repo.delete_all(
+      from request in Request,
+        where: request.pool_id == ^pool_id and request.api_key_id in subquery(leased_keys)
+    )
+
     Repo.delete_all(
       from key in APIKey,
         where: key.pool_id == ^pool_id and key.id not in ^row_ids(snapshot.api_keys)
@@ -235,9 +247,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Snapshot do
   defp delete_route_state(_schema, _rows, _pool_id, _assignment_id), do: :ok
 
   defp delete_assignment(assignment_id) when is_binary(assignment_id) do
-    Repo.delete_all(
-      from assignment in PoolUpstreamAssignment, where: assignment.id == ^assignment_id
-    )
+    Repo.delete_all(from assignment in PoolUpstreamAssignment, where: assignment.id == ^assignment_id)
   end
 
   defp delete_assignment(_assignment_id), do: :ok

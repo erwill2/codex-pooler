@@ -63,9 +63,7 @@ defmodule CodexPooler.Catalog.Sync do
     pool_id = pool_id(pool_or_id)
 
     PoolUpstreamAssignment
-    |> join(:inner, [assignment], identity in UpstreamIdentity,
-      on: identity.id == assignment.upstream_identity_id
-    )
+    |> join(:inner, [assignment], identity in UpstreamIdentity, on: identity.id == assignment.upstream_identity_id)
     |> join(:inner, [_assignment, identity], secret in EncryptedSecret,
       on:
         secret.upstream_identity_id == identity.id and secret.secret_kind == ^@secret_kind and
@@ -188,7 +186,6 @@ defmodule CodexPooler.Catalog.Sync do
       discovered_model_count: 0,
       upserted_model_count: 0,
       stale_marked_count: 0,
-      retired_count: 0,
       stats: %{}
     })
     |> Repo.insert()
@@ -207,7 +204,6 @@ defmodule CodexPooler.Catalog.Sync do
           discovered_model_count: 0,
           upserted_model_count: 0,
           stale_marked_count: 0,
-          retired_count: 0,
           stats: %{}
         },
         attrs

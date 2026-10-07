@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   alias CodexPooler.Events
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.StatsPresentation
@@ -41,7 +42,8 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
        stats_dashboard_running?: false,
        stats_dashboard_rerun?: false,
        stats_dashboard_preparation: nil
-     )}
+     )
+     |> NotificationCenterHooks.follow_viewer_visibility()}
   end
 
   @impl true
@@ -114,6 +116,17 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
     |> reload_stats_dashboard()
   end
 
+  # A role change or a Pool granted or revoked changes which Pools the figures
+  # may cover. The dashboard built from the old set goes at once, instead of
+  # staying on screen until the new one is ready, and is rebuilt for the Pools
+  # the viewer sees now (findings#206 row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    {:noreply,
+     socket
+     |> assign(:dashboard, nil)
+     |> request_stats_dashboard(socket.assigns.current_params)}
+  end
+
   defp reload_stats_dashboard(socket) do
     notify_stats_reload(:executed, socket.assigns.current_params)
 
@@ -156,6 +169,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
       current_scope={@current_scope}
       active_nav={:stats}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section
         id="admin-stats"
@@ -198,7 +212,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
                 <summary
                   data-role="window-filter-trigger"
                   aria-label="Range"
-                  class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+                  class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
                 >
                   <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
                   <span class="truncate">{selected_window_filter_label(@filter_form)}</span>

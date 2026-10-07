@@ -177,9 +177,7 @@ defmodule CodexPooler.Upstreams.Auth.AccessTokenExpiryTest do
                TokenRefreshMetadata.project_access_token_expiry(known)
 
       assert %{state: :unknown} =
-               TokenRefreshMetadata.project_access_token_expiry(
-                 put_in(known, ["credential_epoch"], 3)
-               )
+               TokenRefreshMetadata.project_access_token_expiry(put_in(known, ["credential_epoch"], 3))
 
       unknown = %{
         "credential_epoch" => 2,
@@ -295,8 +293,7 @@ defmodule CodexPooler.Upstreams.Auth.AccessTokenExpiryTest do
         metadata =
           if is_nil(epoch), do: %{"credential_epoch" => nil}, else: %{"credential_epoch" => epoch}
 
-        assert {:error,
-                %{code: :invalid_credential_epoch, message: "credential epoch is invalid"}} =
+        assert {:error, %{code: :invalid_credential_epoch, message: "credential epoch is invalid"}} =
                  CredentialFencing.prepare_replacement_metadata(%UpstreamIdentity{
                    status: "active",
                    metadata: metadata
@@ -378,8 +375,8 @@ defmodule CodexPooler.Upstreams.Auth.AccessTokenExpiryTest do
   end
 
   defp jwt(claims) do
-    header = Base.url_encode64(Jason.encode!(%{"alg" => "none"}), padding: false)
-    payload = Base.url_encode64(Jason.encode!(claims), padding: false)
+    header = Base.url_encode64(CodexPooler.JSON.encode!(%{"alg" => "none"}), padding: false)
+    payload = Base.url_encode64(CodexPooler.JSON.encode!(claims), padding: false)
     header <> "." <> payload <> ".signature"
   end
 end

@@ -17,7 +17,7 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
     send(task, {:begin, self()})
     assert_receive {:began, :ok}
     waiter = Task.async(fn -> ActivityRegistry.await_direct_cleanup(context) end)
-    :sys.get_state(context.registry)
+    await_registered_waiter(context, waiter.pid)
     assert Task.yield(waiter, 0) == nil
     receipt = receipt(context)
     send(task, {:bind, receipt, self()})
@@ -38,6 +38,7 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
     send(task, {:bind, receipt, self()})
     assert_receive :bound
     waiter = Task.async(fn -> ActivityRegistry.await_direct_cleanup(context) end)
+    await_registered_waiter(context, waiter.pid)
     Process.exit(task, :kill)
     assert {:ok, ^receipt} = Task.await(waiter)
     assert {:ok, ^receipt} = ActivityRegistry.await_direct_cleanup(context)
@@ -97,6 +98,41 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
     assert ActivityRegistry.await_direct_cleanup(context) == :none
   end
 
+  # A closing socket may stop a pre-visible direct task only while it waits on
+  # its upstream request: stopping it anywhere else, inside a query or its own
+  # settlement, dropped its connection under load (findings#206 row 206-110).
+  test "a stop is granted only inside the upstream wait and the task then exits without settling" do
+    {context, task} = coordinator()
+    send(task, {:begin, self()})
+    assert_receive {:began, :ok}
+
+    # Reserving, binding, settling: not waiting upstream, so not stoppable.
+    assert :busy = ActivityRegistry.stop_direct_upstream_wait(context)
+
+    send(task, {:upstream_wait, self()})
+    assert_receive {:upstream_waiting, request_pid}
+    assert :stop = ActivityRegistry.stop_direct_upstream_wait(context)
+
+    # The request returns after the stop was granted: the task exits with the
+    # socket's stop reason instead of going on to settle.
+    monitor = Process.monitor(task)
+    send(request_pid, :upstream_answered)
+    assert_receive {:DOWN, ^monitor, :process, ^task, {:shutdown, :client_disconnected}}
+    refute_received {:upstream_wait_result, _result}
+  end
+
+  test "an upstream wait nobody stops returns the request result and leaves the task stoppable only while waiting" do
+    {context, task} = coordinator()
+    send(task, {:begin, self()})
+    assert_receive {:began, :ok}
+    send(task, {:upstream_wait, self()})
+    assert_receive {:upstream_waiting, request_pid}
+    send(request_pid, :upstream_answered)
+    assert_receive {:upstream_wait_result, :answered}
+    assert :busy = ActivityRegistry.stop_direct_upstream_wait(context)
+    send(task, :stop)
+  end
+
   defp coordinator(parent \\ self()) do
     name = Module.concat(__MODULE__, "Registry#{System.unique_integer([:positive])}")
     start_supervised!({ActivityRegistry, name: name})
@@ -146,6 +182,19 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
         send(parent, {:ready_result, ActivityRegistry.ready_direct_cleanup(context)})
         loop(context)
 
+      {:upstream_wait, parent} ->
+        result =
+          DirectCleanup.upstream_wait(context, fn ->
+            send(parent, {:upstream_waiting, self()})
+
+            receive do
+              :upstream_answered -> :answered
+            end
+          end)
+
+        send(parent, {:upstream_wait_result, result})
+        loop(context)
+
       :stop ->
         :ok
     end
@@ -169,4 +218,31 @@ defmodule CodexPooler.Gateway.Websocket.DirectCleanupRegistryTest do
       end
     end
   end
+
+  defp await_registered_waiter(context, pid) do
+    await_registered_waiter(context, pid, System.monotonic_time(:millisecond) + 15_000)
+  end
+
+  defp await_registered_waiter(context, pid, deadline) do
+    registered? =
+      context.registry
+      |> :sys.get_state()
+      |> Map.fetch!(:activities)
+      |> Enum.any?(fn {_token, entry} -> registered_waiter?(entry, context, pid) end)
+
+    unless registered? do
+      assert System.monotonic_time(:millisecond) < deadline,
+             "direct cleanup waiter was not registered"
+
+      receive do
+      after
+        10 -> await_registered_waiter(context, pid, deadline)
+      end
+    end
+  end
+
+  defp registered_waiter?(%{direct_cleanup: %{context: context, waiters: waiters}}, context, pid),
+    do: Enum.any?(waiters, fn {waiter, _tag} -> waiter == pid end)
+
+  defp registered_waiter?(_entry, _context, _pid), do: false
 end

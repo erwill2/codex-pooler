@@ -111,7 +111,7 @@ These endpoints keep Codex backend semantics and do not translate through the pu
       <td>Model metadata served from Pool/catalog state</td>
       <td>No Codex request translation</td>
       <td>Supported</td>
-      <td>Lists models visible to the authenticated Pool, including backend Codex metadata such as the selected raw <code>context_window</code>, <code>effective_context_window_percent</code>, automatic compaction limit, and optional <code>comp_hash</code>. Provider accounts can temporarily report different catalog ceilings for the same model; Pooler selects one canonical source cohort for the Pool. Codex applies the percentage once, while the separate <code>/v1/models</code> surface publishes the same selected window as a flattened <code>context_length</code>.</td>
+      <td>Lists models visible to the authenticated Pool, preserving the selected upstream's default <code>context_window</code>, supported <code>max_context_window</code>, compaction metadata (including an absent or null threshold), <code>effective_context_window_percent</code>, and optional <code>comp_hash</code>. Pricing categories do not change the context or catalog ETag. Explicit operator context overrides still apply. Provider accounts can report different limits for the same model; Pooler selects one canonical source cohort for the Pool. Codex applies the percentage once, while <code>/v1/models</code> publishes the selected default's effective value as <code>context_length</code>.</td>
     </tr>
     <tr>
       <td><code>POST /backend-api/codex/responses</code></td>
@@ -213,6 +213,8 @@ reset-credit consume operations. Configure Codex clients by pointing
 `model_providers.*.base_url` at `/backend-api/codex`.
 Supported Responses stream event metadata is relayed on model-provider streams as upstream sends it. Codex Pooler does not synthesize app-server notifications such as `turn/safetyBuffering/updated`.
 
+On HTTP SSE, Codex Pooler holds a response's lifecycle events (`response.created`, `response.in_progress`, `response.metadata`) until the attempt streams output or a terminal event, so a retry before the first output can move to another account without mixing two responses. While nothing else arrives the stream carries `: keepalive` comments at the SSE keepalive interval (System page, Gateway tab, 10 seconds by default). On the native `/backend-api/codex/responses` route, the first keepalive after a held lifecycle event is a data event instead, `event: keepalive` with `{"type":"keepalive"}`: the Codex client's stream idle timeout (300 seconds by default) counts only events, not comments, so without it a provider that stays in its lifecycle phase longer than that made the client give up and resend while the provider was still working. Silence after that event stays comments, so the client's idle timer still measures the provider as it would on a direct connection, and nothing but comments follows a terminal event. Codex ignores the event; a client with its own SSE parser on this route should ignore unknown event types. The `/v1` routes keep comments only, and the native websocket route holds nothing back: it relays these events as they arrive.
+
 ## Backend bridge and usage routes
 
 These routes live under `/backend-api` or legacy usage paths. They are still Pool API key routes. The backend file bridge stores metadata only; file bytes stay upstream-backed.
@@ -273,6 +275,8 @@ These routes live under `/backend-api` or legacy usage paths. They are still Poo
   </tbody>
 </table>
 
+The usage routes report the account quota evidence Codex Pooler keeps. A window whose reset time has passed is still reported, marked by its reset time, for 30 days after that reset. After that it is no longer evidence, and an account with nothing newer answers `404` with error code `no_upstream_usage`, the same answer as for an account that has never reported usage. The next successful usage read reports the account again.
+
 The app-server JSON-RPC reset-credit method
 `account/rateLimitResetCredit/consume` remains unsupported. Codex Pooler does
 not add a wildcard backend app-server proxy for reset-credit methods.
@@ -310,14 +314,14 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI Responses payloads are coerced to Codex-compatible work. Input audio uses the public <code>&#123;data, format&#125;</code> shape and accepts <code>WAV</code>, <code>MP3</code>, <code>M4A</code>, <code>WebM</code>, and <code>OGG</code>. The decoded audio ceiling is 50 MiB (52,428,800 bytes), while the configured request envelope may reject a request earlier. Malformed, unsupported, or oversized audio returns a sanitized <code>invalid_request</code> before upstream dispatch. System/developer input-message text is lifted into top-level instructions. Exactly one final <code>compaction_trigger</code> after visible input requests an explicit compaction turn; non-streaming JSON and public SSE return the normalized compact item. Encrypted <code>type: "compaction"</code> replay items from prior remote compaction turns are forwarded. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes. If visible public output ends without a terminal Responses event, public HTTP SSE returns a sequence-valid sanitized <code>type: "error"</code> / nested <code>server_error</code> terminal. Native backend streams and websocket surfaces retain their route-native behavior.</td>
+      <td>OpenAI Responses payloads are coerced to Codex-compatible work. Input audio uses the public <code>&#123;data, format&#125;</code> shape and accepts <code>WAV</code>, <code>MP3</code>, <code>M4A</code>, <code>WebM</code>, and <code>OGG</code>. The decoded audio ceiling is 50 MiB (52,428,800 bytes), while the configured request envelope may reject a request earlier. Malformed, unsupported, or oversized audio returns a sanitized <code>invalid_request</code> before upstream dispatch. System/developer input-message text is lifted into top-level instructions. Exactly one final <code>compaction_trigger</code> after visible input requests an explicit compaction turn; non-streaming JSON and public SSE return the normalized compact item. Encrypted <code>type: "compaction"</code> replay items from prior remote compaction turns are forwarded. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and terminal-only failed or incomplete responses receive a response.created lifecycle prefix without implying success. If visible public output ends without a terminal Responses event, public HTTP SSE returns a sequence-valid sanitized <code>type: "error"</code> / nested <code>server_error</code> terminal. Native backend streams and websocket surfaces retain their route-native behavior.</td>
     </tr>
     <tr>
       <td><code>GET /v1/responses</code></td>
       <td>Backend Codex websocket response session</td>
       <td>Partial</td>
       <td>Partial</td>
-      <td>Narrow Responses websocket compatibility only. It is not OpenAI Realtime SDK support. Exactly one final <code>compaction_trigger</code> after visible input returns the same normalized compaction item as HTTP through <code>response.output_item.done</code> and <code>response.completed</code>. Encrypted compaction replay follows the same field and ordering contract as <code>POST /v1/responses</code>. It uses the same downstream idle and frame guardrails as backend Codex websockets. Malformed JSON and JSON non-object provider frames are dropped without consuming a public sequence number or creating a local terminal.</td>
+      <td>Narrow Responses websocket compatibility only. It is not OpenAI Realtime SDK support. Exactly one final <code>compaction_trigger</code> after visible input returns the same normalized compaction item as HTTP through <code>response.created</code>, <code>response.output_item.added</code>, <code>response.output_item.done</code> and <code>response.completed</code>. Encrypted compaction replay follows the same field and ordering contract as <code>POST /v1/responses</code>. It uses the same downstream idle and frame guardrails as backend Codex websockets. Malformed JSON and JSON non-object provider frames are dropped without consuming a public sequence number or creating a local terminal.</td>
     </tr>
     <tr>
       <td><code>POST /v1/chat/completions</code></td>
@@ -345,7 +349,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td>Upstream-backed file metadata create flow</td>
       <td>Partial</td>
       <td>Partial</td>
-      <td>Creates metadata for Codex-compatible upstream file storage. Backend <code>/backend-api/files</code> remains JSON-only; this is the OpenAI-compatible file-create surface.</td>
+      <td>Uploads to Codex-compatible upstream file storage. Transient storage failures retry the same upload, with at most five PUT attempts within five minutes. Backend <code>/backend-api/files</code> remains JSON-only; this is the OpenAI-compatible file-create surface.</td>
     </tr>
     <tr>
       <td><code>GET /v1/files/:file_id</code></td>
@@ -373,28 +377,28 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/transcribe</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI-style multipart transcription request dispatched through the backend transcription path. <code>gpt-transcribe</code> is a caller alias for canonical <code>gpt-4o-transcribe</code>. Nonempty <code>keywords</code> and <code>languages</code> lists retain order and duplicates, while empty lists are omitted. Responses omit language-detection fields. Audio support is speech-to-text only: speech synthesis, audio translation and Realtime voice sessions are unsupported. This is request-shape compatibility, not a transcription-quality, model-discovery, or general Audio API coverage claim.</td>
+      <td>OpenAI-style multipart transcription request dispatched through the backend transcription path. <code>gpt-transcribe</code> is a caller alias for canonical <code>gpt-4o-transcribe</code>. Output is JSON by default, or plain UTF-8 text with <code>response_format: "text"</code>. SRT, VTT and timestamped or diarized JSON are unsupported. Nonempty <code>keywords</code> and <code>languages</code> lists retain order and duplicates, while empty lists are omitted. Responses omit language-detection fields. Audio support is speech-to-text only: speech synthesis, audio translation and Realtime voice sessions are unsupported. This is request-shape compatibility, not a transcription-quality, model-discovery, or general Audio API coverage claim.</td>
     </tr>
     <tr>
       <td><code>POST /v1/images/generations</code></td>
-      <td><code>/backend-api/codex/responses</code></td>
+      <td><code>/backend-api/codex/images/generations</code> or <code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI image generation request is converted to Codex Responses-compatible image work. Pool image permission applies before body parsing.</td>
+      <td>GPT Image 2/2.5 uses native Images generation; legacy image models use Responses translation. Pool image permission applies before body parsing.</td>
     </tr>
     <tr>
       <td><code>POST /v1/images/edits</code></td>
-      <td><code>/backend-api/codex/responses</code></td>
+      <td><code>/backend-api/codex/images/edits</code> or <code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI image edit request is converted to Codex Responses-compatible image work. Pool image permission applies before body parsing.</td>
+      <td>Unmasked GPT Image 2/2.5 edits use native Images. Masked edits require an eligible Full Responses image-input host and explicit image tool selection; without one, mask is rejected before dispatch or reservation. Legacy models use Responses translation. Pool image permission applies before body parsing.</td>
     </tr>
   </tbody>
 </table>
 
-For explicit remote compaction on the narrow public surface, the request must contain visible input followed by exactly one final `{"type":"compaction_trigger"}` item. Invalid placement returns `400 invalid_request` on `input` before upstream dispatch. Successful HTTP JSON returns one completed Responses object; public SSE emits `response.output_item.done`, `response.completed`, and `[DONE]`; narrow Responses websocket completion emits the same two Responses events without `[DONE]`.
+For explicit remote compaction on the narrow public surface, the request must contain visible input followed by exactly one final `{"type":"compaction_trigger"}` item. Invalid placement returns `400 invalid_request` on `input` before upstream dispatch. Successful HTTP JSON returns one completed Responses object; public SSE emits `response.created` with an empty output, `response.output_item.added` and `response.output_item.done` at `output_index` 0, `response.completed`, and `[DONE]`; narrow Responses websocket completion emits the same four Responses events without `[DONE]`.
 
-The returned replay item has `type: "compaction"`, nonblank opaque `encrypted_content`, and optional `id` whose absence, string value, or explicit `null` is preserved. Start the next request as a new chain without `previous_response_id`, put the compaction item first, and append new visible input after it. When an accepted narrow Responses websocket compaction continuation carries an explicit opaque response anchor, Codex Pooler preserves it only on the current live upstream websocket connection with the same generation and effective Full/Lite mode. That incremental compact collects provider output before validation, settlement, and adaptation; it never reconnects, retries, switches assignment, or falls back to HTTP. If that connection or mode is unavailable, the request returns the existing `previous_response_not_found` recovery result and the client can submit a separate no-anchor full-history request. When no anchor is present, Codex Pooler sends the supplied full history through the existing HTTP compact path. Unknown replay fields and malformed values reject before upstream dispatch. Malformed upstream compact JSON or missing encrypted content returns sanitized `502 invalid_compaction_response`. Direct `POST /v1/responses/compact` remains unsupported.
+The returned replay item has `type: "compaction"`, nonblank opaque `encrypted_content`, and a string `id`: the upstream id when it sent a nonblank one, otherwise a derived `cmp_` id that Codex Pooler removes again when the item is replayed. Start the next request as a new chain without `previous_response_id`, put the compaction item first, and append new visible input after it. When an accepted narrow Responses websocket compaction continuation carries an explicit opaque response anchor, Codex Pooler preserves it only on the current live upstream websocket connection with the same generation and effective Full/Lite mode. That incremental compact collects provider output before validation, settlement, and adaptation; it never reconnects, retries, switches assignment, or falls back to HTTP. If that connection or mode is unavailable, the request returns the existing `previous_response_not_found` recovery result and the client can submit a separate no-anchor full-history request. When no anchor is present, Codex Pooler sends the supplied full history through the existing HTTP compact path. Unknown replay fields and malformed values reject before upstream dispatch. Malformed upstream compact JSON or missing encrypted content returns sanitized `502 invalid_compaction_response`. Direct `POST /v1/responses/compact` remains unsupported.
 
 ### Pool image permission
 
@@ -406,6 +410,10 @@ rows without a stored value. When it is disabled, runtime ingress authenticates
 the Pool API key, then returns `403` with code `image_generation_disabled`
 before decompression, request parsing, compatibility coercion, admission, or
 upstream dispatch.
+
+### Pool audio permission
+
+The Pool setting `allow_audio_transcription` controls `POST /backend-api/transcribe` and `POST /v1/audio/transcriptions`. It defaults to `true`, including for existing Pools. A disabled Pool returns `403 audio_transcription_disabled` after Pool API-key authentication and before decompression, multipart parsing, admission, accounting reservation, or upstream dispatch. The gateway also reads the current shared setting before transcription execution. Image permission and unsupported audio routes retain their separate behavior.
 
 `POST /v1/responses` accepts `reasoning.context` only for `auto`,
 `current_turn`, and `all_turns` after trimming and lowercasing. Unknown, empty,
@@ -420,9 +428,11 @@ policy is derived from its configured fields:
    value, passes through this policy.
 2. **Allow up to** permits only known efforts at or below the selected ceiling:
    `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
-   The selected model's effective known levels narrow the permitted set. An
-   omitted effort resolves to the permitted model default, or the highest
-   permitted known effort.
+   The Pool model's known levels (the union across the Pool's assignments,
+   as `/v1/models` lists them) narrow the permitted set; admission happens
+   before routing, so it cannot know which assignment will serve. An omitted
+   effort resolves to the permitted model default, or the highest permitted
+   known effort.
 3. **Always use** applies the legacy exact configured effort. It remains
    compatible even when the configured effort is absent from model metadata.
 
@@ -432,30 +442,48 @@ custom effort, or an omission with no permitted effort, returns `400` with code
 `reasoning effort is not available for this API key` before reservation or
 upstream dispatch. Responses, backend Responses, and compact routes return
 `param: "reasoning.effort"`; Chat Completions returns
-`param: "reasoning_effort"`. API-key model denial remains first and returns the
-existing `403 model_not_allowed` response.
+`param: "reasoning_effort"`. API-key model denial remains first and returns
+`400 model_not_allowed` with `param: "model"`.
 
 The same policy runs after websocket upgrade for every `response.create` frame.
 A forbidden frame uses the existing websocket error frame with the same status,
 code, message, and route-native parameter. The connection is not rejected at
 upgrade time.
 
-Authenticated backend Codex model metadata reflects the policy. Unrestricted
-keeps the current levels and default. Allow up to filters to permitted known
-levels and a permitted default. Always use advertises its singleton only when it
-is model-effective, otherwise it returns no levels and no default. Models stay
-visible, and public `/v1/models` remains unchanged.
+Authenticated backend Codex model metadata does not change with the policy:
+the Pool catalog serves each model's selected upstream entry with all of its
+advertised reasoning levels and its default, whatever the key's policy, and the
+policy applies when a request arrives. A Codex client can therefore offer an
+effort the key does not allow; that request is refused with
+`400 reasoning_effort_not_allowed`. Models stay visible, and public
+`/v1/models` remains unchanged.
 
 `minimal` and `ultra` remain distinct for policy evaluation. Backend Codex
-compatibility rewrites them to `low` and `max` respectively before upstream
-dispatch. Safe reasoning summaries retain requested, applied, and effective
-values.
+compatibility rewrites `minimal` to `low` and `ultra` to `max` before upstream
+dispatch. When the serving assignment's own source model lists reasoning
+levels without `max`, `ultra` becomes the highest level that assignment
+lists (the Pool-wide union only when the assignment has no levels of its
+own), and it never becomes `none` or `minimal`. `none` and every other explicit effort are forwarded
+unchanged, even when the model catalog does not list them, so the upstream
+decides whether that model accepts the value. Routing prefers a candidate whose
+own source model lists the effort the turn will send, so an effort the Pool-wide
+union advertises is served by an assignment that advertises it whenever one is
+eligible; when no candidate lists it, every candidate stays and the upstream
+refusal stands. Safe reasoning summaries retain
+requested, applied, and effective values and name the rewrite as
+`minimal_to_low` or `ultra_to_<level>`.
+
+Native backend turns apply the same rule within their canonical cap. When otherwise-equivalent source partitions differ only in reasoning levels, the models catalog advertises the union from the quota-routable capability family and all reasoning variants in that family remain allowed through canonical filtering. After quota and circuit eligibility, an explicit known effort prefers an eligible assignment that lists it, preserving hard continuation pins and healthy fallbacks. This never crosses a partition that differs in another capability such as context window or serving mode. If no eligible assignment lists the effort, every effective candidate stays and the upstream decides. The resulting `x-models-etag` remains byte-identical to the authenticated backend models ETag because both snapshots use the same stable family union.
 
 Non-strict function tool schemas are lowered before local validation and
 upstream dispatch for backend Responses HTTP, backend Responses websocket
 `response.create`, and public `/v1/responses` compatibility paths. Lowering is
-limited to function tools, including nested function tools inside accepted
-namespace tools. Strict function tools and strict structured-output schemas stay
+limited to function tools. The backend routes lower top-level function tools and
+forward namespace tools unchanged. `/v1/responses` also lowers the function
+tools nested inside accepted namespace tools, and keeps their boolean
+`encrypted: true` parameter markers, which the provider requires for the
+namespaced functions it reserves. Top-level function tools lose that marker on
+every path. Strict function tools and strict structured-output schemas stay
 on the strict validation path and are not made looser.
 
 Direct public Responses requests also accept exact executable custom tools on
@@ -467,18 +495,21 @@ namespace accepts the same flat `function` and exact `custom` children. A custom
 tool requires `type: "custom"` and a nonblank `name`. It may include a
 description, boolean `defer_loading`, nullable `allowed_callers` using `direct`
 or `programmatic`, and omitted, unconstrained text, or a `lark`/`regex` grammar
-format. Hosted, MCP, tool-search, nested-namespace, malformed, and duplicate
-executable-name shapes are rejected; executable names must be globally unique
-across top-level and namespace children.
+format. Hosted, MCP, nested-namespace, malformed, and duplicate
+executable-name shapes are rejected, and so is a `tool_search` tool inside a
+namespace; executable names must be globally unique across top-level and
+namespace children. A top-level `tool_search` tool is accepted, see
+[OpenAI-compatible SDKs](/clients/openai-compatible/#tool-search-with-deferred-tools).
 
 A typed custom `tool_choice` resolves only a declared same-kind custom tool with
 the same exact name, whether it is top-level or an accepted namespace child.
-Full mode preserves that typed choice. Lite mode rejects every map-shaped
+Full mode preserves that typed custom choice. Lite mode rejects that custom
 `tool_choice` before upstream dispatch with `unsupported_parameter` and
-`param: "tool_choice"`; use automatic or explicit Full mode when a client needs
-forced typed selection. That rejection follows the model's serving mode rather
-than the endpoint, so any map-shaped `tool_choice` is rejected on a Lite-served
-model, including a Chat Completions named-function choice. See
+`param: "tool_choice"`; use automatic or explicit Full mode for forced custom
+selection. Named function choices with exactly `type: "function"` and a nonblank
+`name` are preserved in both modes, including translated Chat Completions choices.
+Lite resolves the function against its `additional_tools` manifest. Other
+map-shaped choices, including `allowed_tools`, remain rejected in Lite. See
 [Responses Lite and Full](/reference/responses-lite-vs-full/) for what the two
 serving modes change on the outgoing request. String choices such
 as `auto` are accepted in both modes. This is separate from accepted
@@ -552,14 +583,190 @@ Every non-compact request that reaches the backend Responses destination has a
 `include` after final normalization. This applies to canonical backend HTTP and
 websocket traffic, backend `/v1` Responses and Chat Completions aliases, and
 translated `POST /v1/responses`, `GET /v1/responses`, and
-`POST /v1/chat/completions` traffic. Compact dispatch is excluded and keeps its
-narrow compact request shape.
+`POST /v1/chat/completions` traffic. Native backend compaction requests preserve
+the client's `client_metadata`, `include`, and `tool_choice`, with the same
+websocket turn-id removal and Lite marker handling as ordinary turns. Direct
+compact aliases and public `/v1` compaction keep their narrow compact request
+shape.
 
 When upstream returns a valid parameter path with an error, failed attempt
 detail may expose it as `upstream_error_param`. The value is limited to a
 bounded field or numeric-index path. Invalid values and successful attempts
 omit the field, and raw upstream error messages or rejected values are never
 projected through it.
+
+### Upstream parameter validation rejections
+
+When upstream rejects an ordinary Responses or Chat Completions HTTP request
+with status `400`, an error object of type `invalid_request_error`, and one of
+the parameter-validation codes `unsupported_value`, `invalid_value`,
+`unsupported_parameter`, `missing_required_parameter`, `invalid_type`,
+`string_above_max_length`, `unknown_parameter` (a request key upstream does not
+know) or `invalid_parameter` (a field the selected model does not support), the
+client receives that rejection instead of an empty or generic error:
+
+```json
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "unsupported_value",
+    "param": "reasoning.effort",
+    "message": "upstream rejected parameter reasoning.effort (unsupported_value); supported values: low, medium, high"
+  }
+}
+```
+
+`param` is a bounded field path such as `reasoning.effort` or `input[0].content`,
+or `null` when upstream supplies no valid path. An `input[N]` index names the
+position of the item in the input the client sent, also when Lite adds the tool
+manifest and the instructions message in front of it; when an index points at an
+item Codex Pooler added, or cannot be mapped back, it is left out
+(`input[].id`). Chat Completions requests
+receive the Chat field they sent where Codex Pooler renamed it, such as
+`reasoning_effort`, `max_tokens` or `max_completion_tokens`, `verbosity`,
+`response_format`, and nested `tools[N].function` fields. A path into the
+Responses input that Codex Pooler built from `messages` is reported as
+`messages`, because those input items do not correspond one to one with the
+messages the client sent; other paths stay as upstream reported them. The message is written by Codex Pooler from the code
+and param; the provider message is never forwarded because validation messages
+can quote submitted or gateway-normalized values. For `unsupported_value` and
+`invalid_value`, the message may list up to 12 supported values when upstream
+reports them as a plain list of simple identifiers; the rejected value is never
+included, and the list is omitted when it cannot be read safely.
+
+Auto, Lite, Full relay the same bounded supported-values list from persisted attempt metadata.
+
+The Codex backend answers some unsupported parameters with a `{"detail": "Unsupported parameter: <name>"}` body instead of an error object, notably `previous_response_id` on every HTTP request, because it resolves that anchor only on the websocket connection that produced the response. A public `/v1/responses` request anchored on `previous_response_id` never reaches the provider over HTTP: Codex Pooler answers it with `previous_response_not_found` first (see [OpenAI-compatible clients](/clients/openai-compatible/#continuing-with-previous_response_id)), so this relay concerns the native route. A detail that is exactly that text followed by a bounded field path is relayed as `unsupported_parameter` with that path as `param`, for example `upstream rejected parameter previous_response_id (unsupported_parameter)`, so a client can send the complete input again without the parameter. Any other detail text is not relayed.
+
+A streaming
+`POST /backend-api/codex/responses` request receives this JSON body with
+`content-type: application/json` and no SSE stream, and a non-streaming native
+request receives the same body instead of the upstream one.
+
+A native `/backend-api/codex/responses` websocket turn receives the same error
+object in one wrapped error event, `{"type":"error","status":400,"error":{...}}`,
+so the Codex client reports it as an invalid request instead of retrying it, as
+it does for the HTTP answer. The public `GET /v1/responses` websocket sends the
+same error object in its `error` event, and a streaming `POST /v1/responses`
+request that Codex Pooler carries over the backend's websocket gets it as the
+HTTP `400`. Both websocket events leave an `input[N]` index out, because the
+socket does not know how the turn's input was rewritten.
+
+The Codex backend's websocket sends the refusals it answers over HTTP with a code
+as an error object that holds the HTTP message as text and has no code and no
+param. Codex Pooler reads that text and relays the code and the field path the
+HTTP answer of the same fault carries. The backend words the text in one of two
+ways, chosen per connection: `Invalid response.create payload: <message>`, and
+`[<Schema>] [<path>] [<kind>] <message>`, where the kind `invalid_enum_value` is
+read as `invalid_value` and `invalid_type`, `unknown_parameter`,
+`missing_required_parameter` and `string_above_max_length` as themselves. The
+bracket wording names the field path. The payload wording repeats the HTTP
+message, which names the field for a type, a missing parameter, an unknown
+parameter or a string length, and names none for `Invalid value`: that refusal
+relays `invalid_value` and the supported values with a `null` `param`, and the
+HTTP answer's `param` is not in the frame. A message outside these templates is
+not read, a code or param the frame carries is never replaced, and the provider
+text is never forwarded. `Unsupported parameter: <name>` is read the same way as
+the HTTP detail body above. `Unsupported tool type: <type>` is not relayed on
+either transport: its answer stays the generic refusal below, and the failed
+attempt keeps the type only as a bounded identifier.
+
+Any other `400` refusal of a native websocket turn, including one that carries
+no code and whose text Codex Pooler does not read, also reaches the client as one
+wrapped error event, so the Codex client stops instead of resending the turn and
+then retrying it over HTTPS. Codex Pooler writes its error object from the
+refusal's sanitized type, code and param only: `code` is the upstream code, the
+code its text reads as, or `invalid_request` when neither exists, `param`
+follows the websocket rule above, and the message reads
+`upstream rejected the request (<code>)` or names the param. The provider
+message is not forwarded. A refusal naming a code the Codex client classifies
+itself keeps its `response.failed` event, so the client still compacts on
+`context_length_exceeded`, stops on the quota codes (`insufficient_quota`,
+`credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+`project_spend_limit_exceeded`) and `usage_not_included`, and reports
+`invalid_prompt`, `cyber_policy`, `bio_policy` and
+`misalignment_policy_violation` as it would from the provider; overload and
+rate-limit codes stay retryable.
+
+A native websocket refusal with another final `4xx` status, such as `404`,
+`409`, `413` or `422`, reaches the client the same way, as one wrapped error
+event with status `400`, because the Codex client treats a wrapped event of any
+other status as a retryable unexpected status: it resends the turn over the
+websocket, then falls back to HTTPS and retries there, and every HTTPS attempt
+reaches the provider again. The message names the provider status, for
+example `upstream rejected the request (invalid_request); upstream status 404`.
+The same code exceptions apply. A `401`, a `408` and a `429` keep their
+`response.failed` event, and so does a `403` whose code makes Codex Pooler
+demote the account (a code it knows as an account failure, such as a
+credential code): the Codex client's HTTPS fallback is then routed to another
+account of the Pool first. When the Pool has no other routable account for the
+model, that `403` is final like the others, since a retry could only reach the
+demoted account again. A `403` that demotes nothing, with no code or an
+unknown one, would only reach the same account again and is final like the
+others. The kept `401` and demoting `403` are about the Pool's upstream
+account, not the client's request, so their message is the Codex
+Pooler-written one naming the status, for example
+`upstream rejected the request (unauthorized); upstream status 403`; a `408`
+and a `429` keep the provider's message, whose retry or limit detail the
+client acts on.
+
+A websocket refusal with any `4xx` status other than `401` and `429` and a code
+Codex Pooler does not know leaves route health alone, as the HTTP answer of the
+same refusal does: it does not demote the account or count a circuit failure.
+A code it knows keeps its own classification, so a quota or credential code
+still demotes the account.
+
+A native HTTP `POST /backend-api/codex/responses` answers a `400` refusal
+outside the relayed validation codes (no code, an unknown code, another error
+type, or any other `{"detail": ...}` body) with the same Codex Pooler-authored error
+object as the websocket event, as JSON, streaming or
+not, keeping the `400` status; an `input[N]` param keeps the index the client
+sent. The Codex client shows the refusal's text and reads a `cyber_policy` or
+`bio_policy` code in that body as the policy refusal it names.
+
+A native HTTP refusal with another final `4xx` status, such as `403`, `404`,
+`409`, `413` or `422`, is answered the same way with status `400`, whatever the
+serving mode, and the message names the provider status, for example
+`upstream rejected the request (invalid_request); upstream status 404`. The
+Codex client retries every HTTP status but `400` as an unexpected status, and
+each retry would reach the provider again: a single refused turn would cost six
+provider requests. The request and its attempt keep the provider status.
+
+Over HTTP, every other upstream failure gets its own answer instead of that
+`400`: a `401` and a `403` with a credential code (refreshed, then a retryable
+`503`), `408`, `429`, `5xx`, misalignment and model-unavailability refusals, and
+compact routes. The request is a non-retried failure recorded as
+`upstream_status`, and a `4xx` rejection other than `401` and `429` does not
+demote the upstream or affect its circuit.
+
+On `/v1`, such a failure keeps the redacted error (`upstream request failed`,
+code `upstream_status` or the upstream code, no param) on HTTP and in the
+`GET /v1/responses` websocket `error` event. Its `type` follows the status it is
+answered with: `invalid_request_error` for a refused `4xx` such as `400` or
+`422`, `rate_limit_error` for a `429` (OpenAI's type for a throttle; SDKs retry
+it on the status alone), and `server_error` for an upstream `401` or `403` (the
+upstream account's credentials or standing, not the request), a `5xx`, and an
+upstream `404`, which `/v1` answers as `502`. A `429` or a `5xx` the upstream
+websocket sends reaches a `GET /v1/responses` websocket client as the masked
+`response.failed` event rather than an `error` event; its error is typed the
+same way, `rate_limit_error` for the `429` and `server_error` for the `5xx`.
+
+A native `/backend-api/codex/responses` websocket turn treats network failures
+as an HTTP request does. Before its request is written to the upstream
+websocket, a connection failure, a refused handshake or a close moves the turn
+to the next eligible account. A handshake `401` refreshes the account's
+credential first, and when the refresh cannot retry, the turn moves on as well.
+With no other account eligible, the client gets one wrapped error event with
+status `503`, code `upstream_unauthorized` and the message
+`upstream authentication failed; retry the request`, the answer HTTP gives when
+its refresh fails. Once the request has been written, a connection that closes
+or fails before any response frame settles the turn on that account with `502`
+and code `upstream_request_failed`, and the turn does not move to another
+account, because the provider may already be running it. The Codex client's
+resend is served as described under
+[Prompt-cache and continuity boundaries](#prompt-cache-and-continuity-boundaries).
+An authorization failure that the provider reports in a response frame is
+relayed as the provider's own terminal.
 
 ### Unsupported `/v1` Responses request shapes
 
@@ -570,7 +777,7 @@ These `POST /v1/responses` request shapes return OpenAI-shaped `invalid_request`
 
 ### Routed but unsupported `/v1` endpoints
 
-These routes are deliberately present so clients receive deterministic OpenAI-shaped unsupported endpoint errors before gateway admission or upstream dispatch.
+These routes are deliberately answered so clients receive deterministic OpenAI-shaped unsupported endpoint errors before gateway admission or upstream dispatch.
 
 <table>
   <thead>
@@ -653,6 +860,20 @@ These routes are deliberately present so clients receive deterministic OpenAI-sh
       <td>Unsupported</td>
       <td>Response deletion by id is not part of the public compatibility surface.</td>
     </tr>
+    <tr>
+      <td><code>/v1/agents</code> and every path below it, any method</td>
+      <td>None</td>
+      <td>No</td>
+      <td>Unsupported</td>
+      <td>The beta Agents API (sessions, session events and tool results, environments and their files, result artifacts) is not served: the Codex backend has no Agents route. Every request answers <code>404 unsupported_endpoint</code> naming the beta Agents API, after the Pool API key and <code>/v1</code> compatibility checks and before the body is read. Function tools and tool results go through <code>POST /v1/responses</code>.</td>
+    </tr>
+    <tr>
+      <td><code>/v1/vaults</code> and every path below it, any method</td>
+      <td>None</td>
+      <td>No</td>
+      <td>Unsupported</td>
+      <td>The credential vaults of the beta Agents API are answered like <code>/v1/agents</code>.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -691,7 +912,15 @@ MCP uses operator-owned bearer MCP tokens. It doesn't accept Pool API keys, brow
 
 MCP output is metadata-only and scoped by the operator's owner or assigned-Pool visibility. It is an operator inspection endpoint, not a runtime client endpoint.
 
+The request-log and audit-log list tools accept `offset` from 0 through 10,000 and reject larger values as `invalid_arguments`. Refine the filters to inspect another slice of history. Counts are bounded; `totalExact` indicates whether the total is exact, and `nextOffset` becomes null at the traversal cap. Audit `outcome` accepts only `success` or `failure`.
+
 The root `/mcp` operator endpoint is not a bridge for `/v1/responses` remote MCP tools.
+
+## Responses access programs
+
+The narrow `/v1/responses` surface accepts `access_programs` on HTTP JSON, HTTP SSE, and websocket `response.create` requests in both Full and Lite modes. The object may contain only the optional `cyber` selection: `standard`, `daybreak_blue`, or `daybreak_red`. Codex Pooler validates the shape and forwards the selection unchanged; an omitted field or empty object leaves selection to the provider. Invalid shapes, unknown keys, and unsupported selections return `400 invalid_request` before upstream dispatch.
+
+Forwarding a selection does not grant access. The upstream account and model must be eligible for the requested program, and provider refusals follow the normal upstream error contract.
 
 ## Prompt-cache and continuity boundaries
 
@@ -699,82 +928,21 @@ Prompt-cache routing locality is a local routing hint. It can apply on `POST /ba
 
 ## Websocket Guardrails
 
-Backend Codex websocket routes and the narrow public `GET /v1/responses` websocket route use bounded downstream guardrails. `websocket_idle_timeout_ms` controls the downstream websocket idle close window for new upgrades. Its default is `1_800_000` ms, and accepted values are `60_000..3_600_000` ms.
+Backend Codex websocket routes and the narrow public `GET /v1/responses` websocket route use bounded downstream guardrails. `websocket_idle_timeout_ms` controls the downstream websocket idle close window for new upgrades. Its default is `1_800_000` ms, and accepted values are `60_000..3_600_000` ms. The window counts what the client sends. While a response streams, Codex Pooler sends a websocket ping every third of the window, and the client's pong keeps a turn longer than the window open; websocket client libraries answer pings on their own. A turn that delivers nothing for the whole window gets no ping and is closed.
 
 Inbound websocket frames are also bounded by the configured gateway request body limit. Operators should treat `reason_class=max_frame_size_exceeded` as an oversized client frame, `reason_class=timeout` as downstream websocket idle close, and upstream receive timeout errors as separate upstream-side failures. These classifications are metadata-only and must not include raw websocket frames or request bodies.
 
-## Request compression boundaries
+On the native `GET /backend-api/codex/responses` websocket and its `GET /backend-api/codex/v1/responses` alias, a `previous_response_id` resolves only on the upstream connection that produced the response. When that upstream connection closes between two requests, for example because the provider ends a connection that reached its age limit or restarts, Codex Pooler closes the client's websocket with close code `1001` and the reason `upstream connection closed`, as soon as the socket is idle and its last response completed. The Codex client then sends its next request in full on a new websocket, as it does after any server close of an idle websocket, instead of an anchored request that the closed connection can no longer serve. When the client sends its next request while the previous response is still being recorded, for example a quick tool's output, and anchors it on that response, the same close answers it once the response is recorded. Nothing of that request is sent upstream, and the client resends it in full on a new websocket. Any other request the client sends before the close is decided goes out on a fresh upstream connection. There, an anchor the connection cannot resolve is refused with `previous_response_not_found` before anything is sent upstream, and the client resends the request in full. A revoked Pool API key still closes the socket with `1008`, and the public `GET /v1/responses` websocket is not closed this way.
 
-Request compression is a per-Pool routing option named `request_compression_enabled`. It is disabled by default. When enabled, Codex Pooler may compress upstream-bound Responses tool-output content before dispatch. This is request-side only: raw outputs and upstream response bodies are not stored, and CCR/retrieval is not implemented.
+With websocket owner forwarding, which the Helm chart enables from two app replicas, each websocket session is served by an owner process on one replica, and every websocket on that session follows its owner. If the owner crashes, the websocket is closed at once with close code `1011` and the reason `websocket owner crashed`. The turn the socket was waiting on is not handed to another owner: it is recorded as failed with the error code `owner_crashed` and no usage recorded, and the client's resend on a new websocket is served once and billed once. If the owner is drained or stopped, for example by a rolling deploy, an idle native websocket is closed with close code `1001` and the reason `websocket owner is draining`, and the Codex client sends its next request in full on a new websocket: the responses its next request could anchor on went with the owner's upstream connection. A native websocket that receives a frame before that close is decided, and the public `GET /v1/responses` websocket, stay open, and their next request is served by a new owner.
 
-Supported input shapes are explicit. Search-result compression accepts classic
-`path:line[:column]: text`, grouped heading output when a path-like heading has
-enough line matches below it, and portable NUL-delimited output shaped as
-`path\0line[:column]: text`. Diff compression requires a hunk header and accepts
-additions-only, deletions-only, replacement, minimal unified, combined unified,
-and long-preamble diffs without a leading `diff --git` header. Log-output
-compression keeps every discovered failure block when a summary reports
-failure/error counts, or skips the rewrite. Malformed NUL fragments, prose
-headings, ordinary prose with plus/minus lines, and incomplete failure-summary
-logs stay text/skip.
+## Tool-output preservation
 
-Protected exact-output tool results stay byte-for-byte upstream-bound before
-rewriting. This includes default function tools `Read`, `Glob`, `Grep`, `Write`,
-`Edit`, `WebSearch`, `WebFetch`, `web_search`, and `web_fetch`, plus external
-retrieval outputs. Output-only function tool results fail closed as protected
-when the tool name is unavailable. Metadata records aggregate skip counts only.
+Accepted tool-output text is preserved through the existing protocol adapters on backend Responses and their aliases, public Responses, translated Chat, native compact, and supported Responses websocket dispatches. JSON whitespace, numeric text, duplicate keys, logs, search results, diffs, source text and Unicode are not minified or summarized by the gateway. When an adapter splits a text value into ordered text parts, their concatenation preserves the original value; the complete HTTP envelope can still change during normalization.
 
-Recognized same-frame command-backed file reads are also protected byte-for-byte
-before output-range lookup, content detection, or any compression strategy. The
-bounded read grammar accepts direct `cat`, `nl`, `head`, `tail`, and print-only
-`sed` reads, plus one `nl`-to-print-only-`sed` pipeline. Function calls publish
-`call_id`; native local-shell calls publish `call_id` and `id`; matching outputs
-must resolve through those same-frame identifiers. Duplicate, cross-kind, or
-conflicting identifiers preserve the original output. Malformed or unrecognized
-commands retain existing behavior.
+Full and Lite retain their distinct request contracts, including tool manifests and schema normalization. HTTP gzip, deflate and zstd decoding, provider compaction and client-owned context management remain separate features. Public `POST /v1/responses/compact` remains unsupported.
 
-Eligible route families are exact:
-
-<table>
-  <thead>
-    <tr>
-      <th>Family</th>
-      <th>Eligible routes</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>Backend Responses</td>
-      <td><code>POST /backend-api/codex/responses</code></td>
-    </tr>
-    <tr>
-      <td>Backend <code>/v1/responses</code></td>
-      <td><code>POST /backend-api/codex/v1/responses</code></td>
-    </tr>
-    <tr>
-      <td>Translated chat completions</td>
-      <td><code>POST /backend-api/codex/v1/chat/completions</code> and <code>POST /v1/chat/completions</code></td>
-    </tr>
-    <tr>
-      <td>Public <code>/v1/responses</code></td>
-      <td><code>POST /v1/responses</code></td>
-    </tr>
-    <tr>
-      <td>Compact backend routes</td>
-      <td><code>POST /backend-api/codex/responses/compact</code> and <code>POST /backend-api/codex/v1/responses/compact</code></td>
-    </tr>
-    <tr>
-      <td>Responses websocket</td>
-      <td>backend and narrow public websocket <code>response.create</code> payloads that dispatch to backend Responses</td>
-    </tr>
-  </tbody>
-</table>
-
-Unsupported surfaces are multipart, file, audio, image, admin, MCP, usage, and other non-Responses routes. `POST /v1/responses/compact` remains unsupported because the public compact route has no upstream dispatch. This does not change support for backend compact compatibility.
-
-Compression is fail-open. Scanner, tokenizer, compression, and limit errors preserve the original upstream request body and record safe `payload_compression` metadata. JSON request bodies over 1 MiB skip before scanning, and a dispatch processes at most 50 output candidates. Token counting is local and in-process with tokenizer data shipped by the application; it does not call OpenAI or load a local model.
-
-Request logs show safe aggregate savings only. They prefer saved tokens and token savings percent when token counts are available, and fall back to saved bytes and byte savings percent when token counts are unavailable.
+There is no compression setting or savings display, and new requests produce no compression metadata. Compression columns and metadata already stored stay inert. During a rolling upgrade, serving nodes that are not yet replaced keep the behavior of their own version. A change in how tool output is rewritten changes the upstream serialized prefix and may change prompt-cache reuse or token usage; content preservation does not guarantee the same cache-hit ratio.
 
 Continuity headers are also local routing inputs. Codex Pooler chooses them in this order:
 
@@ -786,7 +954,17 @@ Continuity headers are also local routing inputs. Codex Pooler chooses them in t
 6. `session_id`
 7. `x-codex-conversation-id`
 
-`session-id`, `x-session-id`, and `x-session-affinity` are not forwarded upstream. If a pinned continuation points at an upstream account that now requires reauthentication, `/v1/responses` HTTP and websocket requests fail closed with a recovery hint to restart with full context and remove stale continuation anchors.
+The local session those headers select belongs to the calling API key within its Pool. Two API keys of one Pool that send the same header, for example one Codex thread resumed on two machines configured with different keys, each get their own session: neither joins, renews, or closes the other's. A rotated API key resumes its own sessions, because rotation replaces the secret and keeps the key.
+
+`x-session-id` and `x-session-affinity` are never forwarded upstream. The Codex client's `session-id`, `thread-id`, and `x-client-request-id` are forwarded only on the native `/backend-api/codex/responses` and `/backend-api/codex/responses/compact` routes, on HTTP requests and on the websocket handshake, when each value is a short ASCII identifier; `/v1` routes never forward them. On `/v1/responses` and `/v1/chat/completions`, a `prompt_cache_key` in the body produces a Codex Pooler-derived upstream `session-id` for provider sticky routing, scoped to the calling API key and its Pool so different API keys or Pools that send the same key never share one; see Routing strategies. The native `/backend-api/codex/responses` and `/backend-api/codex/responses/compact` HTTP routes send the same derived `session-id` when the client sent no usable `session-id` of its own, for example a client that names its conversation only with `session_id` or `x-session-id`. When such a request has no `prompt_cache_key` either, the `session-id` is derived the same way from that conversation header instead, under a separate namespace and with the same API key and Pool scoping; the header itself is never forwarded. A client `session-id` is always forwarded unchanged, and the native websocket handshake is not affected. If a pinned continuation points at an upstream account that now requires reauthentication, `/v1/responses` HTTP and websocket requests fail closed with a recovery hint to restart with full context and remove stale continuation anchors.
+
+Native Codex resends use the same durable request identity on the HTTP and websocket forms of `/backend-api/codex/responses`. An identical resend of a matching settled response within the retry window is served as a linked successor, even when the server wrote an output item or terminal that the client did not read. A turn that ended with a content filter is the exception, described after this paragraph. Each generation is accounted and billed once. A refusal creates no upstream dispatch, accounting reservation or request row. Request identity is scoped to the thread identity the client carries in its own turn metadata, not to the local session the continuity headers above select, so it survives the window rotation a Codex client performs after a remote compaction: the first turn after compaction holds the same claim as its resend, so recovery is linked rather than dispatched under an unrelated identity. Local routing, affinity and session ownership keep following the window headers above, a genuinely new turn of a rotated window is ordinary work, and a request that carries no thread identity is scoped to its local session. A resend that reaches a turn still running upstream rejoins that turn and is served its output rather than refused, whatever window it carries; a live request that cannot be rejoined stays behind the concurrency fence. A turn that settled as a failure the Codex client retries, such as a retryable provider failure, a stream cut before any completed output, or a websocket client that disconnected before any output reached it (the response lifecycle events `response.created`, `response.in_progress` and `response.queued` are not output), is also eligible: once that request has settled, its byte-identical resend is served as a new request linked to the failed one, including when the failed request was itself the resend of a served one. Byte-identical means the same request, not the same bytes on the wire: the Codex client sends every turn after the first on a websocket as an increment anchored with `previous_response_id`, and after a reconnect it resends that turn as full history without the anchor. That full-history resend is the same request when it ends with exactly the items the anchored request carried and every other field matches; a resend that changes the anchor, a trailing item, or any other field is a different request. A websocket turn whose anchored request was refused because its connection cannot resolve `previous_response_id`, either by the provider (whose `Invalid previous_response_id` refusal reaches the client as `previous_response_not_found`) or by Codex Pooler before sending an anchor that connection cannot serve, recovers the same way: the Codex client sends the turn again as full history without the anchor, and that resend is served as a new request linked to the refused one, with or without owner forwarding. With owner forwarding, a websocket that closes before the owner has accepted any turn of it, as a client cut within milliseconds of its request does, is detached at once and its turn never reaches the provider; the client's resend is then served as that turn, on its first retry. A turn the client sends the moment its previous response completes, as a tool continuation, recovers the same way as one sent later: with owner forwarding, a disconnect before any of its output keeps it as one request that the resend completes, instead of a failed request followed by a linked one. On the websocket form, and on the HTTP form when the client falls back to it, the resend of a turn whose provider refusal went out as a final `400` is answered with that same error rather than `409 duplicate_turn`, and is not sent to the provider again; the same holds for the HTTP resend of a turn first sent over HTTP and refused there with a validation error the provider repeats for the same request, while any other refusal of an HTTP turn is sent to the provider again; this is what a Codex client's in-band compaction, which resends a refused compaction request several times, then shows. A websocket turn the provider completed after its client had already disconnected, and of which nothing was sent to that client, is served again as a new request when the client resends it; the provider is asked twice and each request is recorded and billed once. The same holds for a websocket turn cut after its client was shown only the response lifecycle events, the opening of an output item or of a content or reasoning-summary part, and output deltas: the Codex client discards that partial output and resends the request unchanged, as it would to the provider directly, and the resend is served as a new request linked to the cut one, whether the cut turn was stopped or the provider completed it afterwards. A turn whose client was shown one or more completed output items, and not the end of the response, is resent differently: the Codex client keeps those completed items and resends the request with the completed items it retained appended, as it would to the provider directly. That resend is served as a new request linked to the cut one when it is the cut request plus a nonempty ordered prefix of the completed items the server recorded writing; each item is recognised by its content, ignoring only the fields the Codex client does not keep, such as the item status and text annotations. An unrelated or reordered appended item, extra items beyond the recorded output, or any other unmatched change keeps the `409 duplicate_turn` refusal. A successful server write is not a client acknowledgement: the client can retain only a prefix even when the server wrote more items and the terminal. Delivery receipts remain evidence of server writes, while the resend shape determines which output the client retained. Such a resend is served only within 30 seconds of the cut request's settlement or, when a write to its connection failed, within 30 seconds of that failure: a client that stopped reading without disconnecting is noticed only when a write times out, 30 seconds later by default, and its resend is still served when it arrives within 30 seconds of that timeout. Without owner forwarding, the closing connection stops a turn cut in either of these ways instead of letting it keep generating beside its resend. The resend the Codex client sends over HTTPS after its websocket retries have failed is the same request as its websocket form, so it is admitted, linked or answered by the same rules. A later request of a turn is not a resend of it: the Codex client sends user input typed while a turn is running as another request of that same turn, ending with the new message, including right after a compaction the turn made. On the HTTP form that request is served as a later request of the turn when it is further along than the turn's first HTTP request: more user input after the same compaction (or with no compaction), or a compaction the first request did not end on. A Codex client whose provider is not named `OpenAI` compacts the thread itself and leaves no compaction in the history; the context window its request names stands in for it, so the request that resumes the turn after each such compaction, in the same turn or a later one, is served on both forms. Its own identical resend is chained within the retry window; a changed resend of the first request remains refused when it carries less user input or has lost its compaction, since that is the first request again with part of its history trimmed. On the websocket form it arrives on the same connection anchored on the response the turn just completed there, and is served as a later request of the turn, after that response has settled; its identical resend is chained within the retry window. When that connection closed before the client sent it, the client sends it as full history on a new websocket connection, and when the session has fallen back to HTTPS it sends it over HTTP; either is served as a later request of the turn when it is further along than the turn's first request in the same sense, whichever transport that first request used, and a verified identical resend in any of these forms is linked to its settled predecessor within the retry window. A turn whose first request carries no recorded progress to compare with, or went over a websocket connection that could not know the history its anchor stood for, refuses such a request. A remote compaction the Codex client resends over HTTP because it never received the reply, which it does up to twice with the same request, is served as a new request linked to the previous attempt, and each attempt is billed once. The Codex client fills part of its turn metadata, the state of the workspace, after a turn's first request may already have gone out, so a resend can carry workspace details its first request lacked; on either form that difference alone does not make it a different request, and such a resend rejoins a websocket turn still running for a connection that dropped without closing as an identical resend does. A Codex client also samples a turn again when the response it read completed without ending the turn (`end_turn: false`) or while input is pending. On the websocket form that request is anchored on the response with only the items the client recorded since, often none, and it is served as an ordinary anchored request. On the HTTP form it carries the previous request's input, then exactly the completed output items that response wrote, then only the developer messages, configuration update or tool manifest the client records between two requests; it is served as a new request linked to the completed one when that request was served over HTTP SSE and its client was sent `response.completed`, within 30 seconds of its settlement, and each request is billed once. Because that is all the request carries, a request with exactly the completed items of a delivered response is served even when the client meant it as a resend of a response it did not read, as an identical resend of a settled response is. A changed, reordered, missing or extra output item, any other item after them, a response the provider ended with `response.incomplete`, a response with more than four completed output items, and a request that follows an identical resend of the same request keep the `409 duplicate_turn` refusal.
+
+A native `/backend-api/codex/responses` turn, over HTTP SSE or websocket, that ends with `response.incomplete` and an `incomplete_details.reason` of `content_filter` admits one kind of resend after the client has received that terminal: the Codex client's guided retry, which carries the original input, the completed output items the client kept and the guidance it appends. Every other resend of that turn, whether identical, with completed items appended or grown, is answered `409 duplicate_turn` before any upstream dispatch, accounting reservation or request row. The guided retry is served as a new request linked to the filtered one, within 30 seconds of the filtered request's settlement and only on the account that served the filtered response, because a reasoning item's encrypted content is read only on the account that produced it. A token refresh of that account keeps the guided retry on it; a credential the operator links, imports or relinks for the account, or a pause or reactivation of the account, after the filtered response refuses it with `409 duplicate_turn`. The client's retry of a guided retry that failed on its account before any output stays on that account as well. When that account is excluded from routing, the guided retry is answered with the retryable `503 no_eligible_backend`, with a `Retry-After` when an open circuit excluded the account, and the client's next retry within the same 30 seconds is served on that account once it is eligible. A guided retry that dispatch refuses because its account binding does not hold is answered `409 duplicate_turn` too, but it is an admitted request: its row records status `409` and the error code `invalid_content_filter_retry_binding`, and the `duplicate_turn` refusal metric does not count it.
+
+Incoming subagent messages can stop Codex sampling after a completed reasoning, commentary or partial-answer item (`partial_answer` is stable answer text that may be followed by more output; a `final_answer` is terminal and never qualifies). On native HTTP and websocket requests, Codex Pooler admits one linked mailbox continuation when the original input, a nonempty ordered prefix of completed output, and new messages addressed to the current agent explain the added history. This applies to ordinary turns and resumes after either remote or local compaction, including when the server finished writing the response after the client stopped reading. Reasoning, commentary and partial-answer identity follows the fields Codex retains; provider-only fields and content the client omits do not make the same item look changed. The predecessor must have settled, with matching authorization and session, inside its retry window. Changed, skipped or reordered retained output, an unfinished tool replayed without its result, and a live predecessor remain fenced. Full and Lite modes keep their respective upstream request contracts.
+
+Native HTTP streaming requests have a separate recovery case: if the stream ends during a single incomplete client tool call, Codex Pooler can admit one identical client retry within 30 seconds. This requires complete stream evidence that no output item or terminal response was completed. Finishing the tool's input alone does not execute it; completing the output item does. Requests with completed output require the completed-output or mailbox proof described above; missing or malformed evidence, changed authorization or changed request contents stay under the duplicate protection. This recovery applies to ordinary native turns and tool continuations in Full and Lite modes.
 
 ## Related references
 
@@ -809,3 +987,5 @@ No. Pool API keys authenticate runtime clients for `/backend-api` and `/v1`. The
 ### Does Codex Pooler store uploaded file bytes?
 
 No. The backend file bridge stores file metadata and uses upstream-backed upload or download URLs. Raw file bytes, upload URLs, prompts, response bodies, media bodies, credentials, and websocket frames are not stored or exposed as public docs evidence.
+
+For multipart `POST /v1/files`, the storage upload URL must use HTTPS and resolve exclusively to public addresses. Codex Pooler checks both address families before creating local file metadata and pins one validated address for every upload attempt. A configured HTTPS proxy receives that literal address in CONNECT, while TLS verification and the storage Host header retain the original hostname. DNS failure, private or reserved answers, and mixed public/private answers are rejected; storage redirects are not followed.

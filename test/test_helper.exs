@@ -1,3 +1,8 @@
+# The suite declares each transport topology explicitly. A development shell
+# may enable owner forwarding; it must not turn direct socket fixtures into
+# owner-driven sockets with a different callback and lifetime contract.
+Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, false)
+
 native_turn_console_filter = :codex_pooler_test_native_turn_console_filter
 
 # This filter belongs only to Logger's default console handler. ExUnit's
@@ -21,7 +26,18 @@ native_turn_console_filter = :codex_pooler_test_native_turn_console_filter
 # load-sensitive files already pick explicitly. Assertions that must stay tight
 # keep passing their own budget; refute_receive keeps the fast default so
 # proving a message never arrives stays cheap.
-ExUnit.start(assert_receive_timeout: 5_000, exclude: [unix_integration: true])
+# Logs are captured per test and shown only for failures, so expected
+# warnings from fault-injection scenarios do not interleave with the dots.
+ExUnit.start(
+  assert_receive_timeout: 5_000,
+  capture_log: true,
+  exclude: [unix_integration: true]
+)
+
+:ok = CodexPooler.TestDurationGuard.start!()
+# Writes each test file's wall time when `make test-fast` (or the caller) names an export file; see TestFileDurations.
+:ok = CodexPooler.TestFileDurations.start!()
+ExUnit.after_suite(fn _stats -> CodexPooler.TestProfiles.verify_loaded_unix_files!() end)
 
 # The cache process can start while the reset test database is still being
 # migrated. Publish one authoritative snapshot before manual sandbox ownership
@@ -31,8 +47,14 @@ settings = CodexPooler.InstanceSettings.ensure_singleton!()
 
 # Keep the authoritative snapshot without background DB timers between tests.
 :ok =
-  CodexPooler.InstanceSettings.Cache.restore_for_test(
-    CodexPooler.InstanceSettings.Cache.snapshot_for_test()
-  )
+  CodexPooler.InstanceSettings.Cache.restore_for_test(CodexPooler.InstanceSettings.Cache.snapshot_for_test())
+
+# Puts back the coverage rows the database writes when a sync test's commits straddle 00:00 UTC.
+# Connected before the guard starts counting, so its connection is not a call the guard sees.
+:ok = CodexPooler.RollupCoverageFence.start!()
+
+# Fails any guarded test that leaves committed rows behind. Started after the harness's own
+# committed row above, so that row is part of the baseline every test is compared with.
+:ok = CodexPooler.CommittedWriteGuard.start!()
 
 Ecto.Adapters.SQL.Sandbox.mode(CodexPooler.Repo, :manual)

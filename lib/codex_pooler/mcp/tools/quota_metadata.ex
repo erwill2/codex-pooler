@@ -146,14 +146,10 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
       title: "List upstream quota metadata",
       description:
         ToolRegistry.metadata_description(
-          use_when:
-            "an MCP client needs bounded discovery of sanitized quota evidence for upstream accounts visible to the authenticated operator",
-          returns:
-            "sanitized upstream account summaries with quota summary and quota window evidence only",
-          never_returns:
-            "raw selectors, raw filter values, auth.json, raw metadata, provider payloads, websocket frames, or raw idempotency keys",
-          filters_limits:
-            "accepts optional pool_id, status, plan_family, freshness_status, routing_usable, limit, and offset; limit is clamped to 1..100 and offset to 0..10000"
+          use_when: "an MCP client needs bounded discovery of sanitized quota evidence for upstream accounts visible to the authenticated operator",
+          returns: "sanitized upstream account summaries with quota summary and quota window evidence only",
+          never_returns: "raw selectors, raw filter values, auth.json, raw metadata, provider payloads, websocket frames, or raw idempotency keys",
+          filters_limits: "accepts optional pool_id, status, plan_family, freshness_status, routing_usable, limit, and offset; limit is clamped to 1..100 and offset to 0..10000"
         ),
       input_schema: @list_input_schema,
       output_schema: @list_output_schema,
@@ -168,14 +164,10 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
       title: "Get upstream quota metadata",
       description:
         ToolRegistry.metadata_description(
-          use_when:
-            "an MCP client needs exact sanitized quota evidence for one visible upstream account",
-          returns:
-            "one sanitized upstream account quota summary, a not-found marker, or structured ambiguity candidates when the selector matches multiple accounts",
-          never_returns:
-            "raw selectors, raw filter values, auth.json, raw metadata, provider payloads, websocket frames, or raw idempotency keys",
-          filters_limits:
-            "selector is required; exact id and stored account id are preferred, label matches can be ambiguous, and ambiguity candidates are bounded to 10"
+          use_when: "an MCP client needs exact sanitized quota evidence for one visible upstream account",
+          returns: "one sanitized upstream account quota summary, a not-found marker, or structured ambiguity candidates when the selector matches multiple accounts",
+          never_returns: "raw selectors, raw filter values, auth.json, raw metadata, provider payloads, websocket frames, or raw idempotency keys",
+          filters_limits: "selector is required; exact id and stored account id are preferred, label matches can be ambiguous, and ambiguity candidates are bounded to 10"
         ),
       input_schema: @get_input_schema,
       output_schema: @get_output_schema,
@@ -405,9 +397,12 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
     header =
       "- account #{text_value(account["label"])} status #{text_value(account["status"])} account #{text_value(account["stored_account_id"])} plan #{text_value(account["plan_family"])}"
 
+    capacity = account["capacity_decision"] || %{}
+    policy_line = "  - provider credits policy #{if(account["allow_provider_credits"] == true, do: "enabled", else: "disabled")}; capacity #{text_value(capacity["capacity_basis"])}; qualification #{text_value(capacity["qualification"])}; account scope (request permission and billing source not guaranteed); reasons #{text_value(Enum.join(capacity["reason_codes"] || [], ", "))}"
+
     quota_lines = Enum.map(account["quota_windows"] || [], &quota_line/1)
 
-    Enum.join([header | quota_lines], "\n")
+    Enum.join([header, policy_line | quota_lines], "\n")
   end
 
   defp quota_line(window) do

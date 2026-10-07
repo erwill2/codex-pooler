@@ -99,7 +99,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
 
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     structured = result["structuredContent"]
 
@@ -108,10 +108,12 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
              "limit",
              "nextOffset",
              "offset",
-             "total"
+             "total",
+             "totalExact"
            ]
 
     assert structured["total"] == 1
+    assert structured["totalExact"] == true
     assert structured["limit"] == 1
     assert structured["offset"] == 0
     assert structured["nextOffset"] == nil
@@ -260,7 +262,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
 
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     items_by_id = Map.new(result["structuredContent"]["items"], &{&1["id"], &1})
 
@@ -454,6 +456,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert result["structuredContent"] == %{
              "items" => [],
              "total" => 0,
+             "totalExact" => true,
              "limit" => 50,
              "offset" => 5,
              "nextOffset" => nil
@@ -489,6 +492,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert result["structuredContent"] == %{
              "items" => [],
              "total" => 0,
+             "totalExact" => true,
              "limit" => 20,
              "offset" => 0,
              "nextOffset" => nil
@@ -690,7 +694,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       |> Enum.count(&String.starts_with?(&1, "- admitted_at="))
 
     assert row_count == 10
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
   end
 
   test "request-log tool rejects malformed semantic filters without echoing date sentinels", %{
@@ -757,7 +761,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert result["isError"] == false
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     assert %{"status" => "ok", "kind" => "request_log", "item" => item} =
              result["structuredContent"]
@@ -1112,7 +1116,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
           raw_body
         ] do
       refute text =~ forbidden
-      refute Jason.encode!(result["structuredContent"]) =~ forbidden
+      refute CodexPooler.JSON.encode!(result["structuredContent"]) =~ forbidden
       refute inspect(result) =~ forbidden
     end
   end
@@ -1229,7 +1233,22 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
         "rejection_error_type" => "invalid_request_error",
         "rejection_error_param" => "input[0].content",
         "rejection_message_present" => true,
-        "rejection_message_bytes" => byte_size(raw_message)
+        "rejection_message_bytes" => byte_size(raw_message),
+        "rejection_supported_values_state" => "present",
+        "rejection_supported_values" => ~w(low medium high)
+      }
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      status: "failed",
+      response_metadata: %{
+        "rejection_error_code" => "invalid_request",
+        # A provider that named no alternatives, and a stored list that no
+        # longer satisfies the parser's bounds, must not read alike
+        # (codex-pooler-findings#177).
+        "rejection_supported_values_state" => "none",
+        "rejection_supported_values" => ["an invalid value"]
       }
     })
 
@@ -1241,12 +1260,16 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     assert [%{"type" => "text", "text" => text}] = result["content"]
     assert %{"item" => item} = result["structuredContent"]
-    assert [attempt] = item["debug"]["attempts"]
+    assert [attempt, none_attempt] = item["debug"]["attempts"]
     assert attempt["rejection_error_code"] == "invalid_request"
     assert attempt["rejection_error_type"] == "invalid_request_error"
     assert attempt["rejection_error_param"] == "input[0].content"
     assert attempt["rejection_message_present"] == true
     assert attempt["rejection_message_bytes"] == byte_size(raw_message)
+    assert attempt["rejection_supported_values_state"] == "present"
+    assert attempt["rejection_supported_values"] == ~w(low medium high)
+    assert none_attempt["rejection_supported_values_state"] == "none"
+    refute Map.has_key?(none_attempt, "rejection_supported_values")
     assert text =~ "rejection_error_code=invalid_request"
     assert text =~ "rejection_message_present=true"
     refute inspect(result) =~ raw_message
@@ -1362,7 +1385,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
 
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     assert %{"status" => "ok", "kind" => "request_log", "item" => item} =
              result["structuredContent"]
@@ -1428,6 +1451,9 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert_ref_prefix(attempt_debug["attempt_ref"], "attempt_")
 
     assert anonymize_refs(attempt_debug) == %{
+             "upstream_model" => "upstream-gpt-6-luna",
+             "served_model" => nil,
+             "model_observation" => nil,
              "attempt_ref" => :attempt_ref,
              "attempt_number" => 1,
              "status" => "failed",
@@ -1525,13 +1551,13 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert %{"status" => "ok", "item" => item} = result["structuredContent"]
     assert [attempt_debug] = item["debug"]["attempts"]
 
+    # The attempt records no `stream_text_frame_count`, so the visibility keys
+    # are absent rather than fabricated (findings#165).
     assert attempt_debug["transport_failure"] == %{
              "reason_class" => "upstream_stream_interrupted",
              "reason" => "closed_before_terminal",
              "phase" => "upstream_close",
-             "pre_visible_output" => false,
-             "terminal_seen" => false,
-             "text_frame_count" => 1
+             "terminal_seen" => false
            }
 
     assert text =~ "1 request log returned"
@@ -2122,7 +2148,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
 
     assert [presented] = list_result["structuredContent"]["items"]
     assert presented["id"] == visible_request.id
-    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_request.id
+    refute CodexPooler.JSON.encode!(list_result["structuredContent"]) =~ hidden_request.id
 
     assert {:ok, hidden_result} =
              ToolDispatch.call("codex_pooler_get_request_log", %{"id" => hidden_request.id}, %{
@@ -2394,8 +2420,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       |> Ecto.Changeset.change(%{
         latency_ms: 321,
         network_error_code: Map.fetch!(attrs, :attempt_error),
-        error_message:
-          Map.get(attrs, :error_message, "raw attempt error message must stay out of MCP output"),
+        error_message: Map.get(attrs, :error_message, "raw attempt error message must stay out of MCP output"),
         response_metadata:
           Map.merge(
             %{"websocket_frame" => "raw debug websocket frame"},
@@ -2414,7 +2439,6 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       pool_id: pool.id,
       api_key_id: api_key.id,
       session_key: session_key,
-      conversation_key: "conversation-#{session_key}",
       pool_upstream_assignment_id: assignment.id,
       status: "active",
       owner_instance_id: "test-instance",
@@ -2526,14 +2550,14 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
   defp assert_output_omits_adversarial_debug_values(result) do
     assert [%{"type" => "text", "text" => text}] = result["content"]
     structured = result["structuredContent"]
-    encoded = Jason.encode!(result)
+    encoded = CodexPooler.JSON.encode!(result)
     inspected = inspect(result)
 
-    refute text =~ Jason.encode!(structured)
+    refute text =~ CodexPooler.JSON.encode!(structured)
 
     for forbidden <- adversarial_forbidden_strings() do
       refute text =~ forbidden
-      refute Jason.encode!(structured) =~ forbidden
+      refute CodexPooler.JSON.encode!(structured) =~ forbidden
       refute encoded =~ forbidden
       refute inspected =~ forbidden
     end
@@ -2585,6 +2609,92 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert item["id"] == request.id
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     item["debug"]
+  end
+
+  test "request-log items name the model the upstream served next to the one sent", %{auth: auth} do
+    pool = pool_fixture(%{slug: "mcp-served-model", name: "MCP Served Model"})
+    %{api_key: api_key} = active_api_key_fixture(pool, %{display_name: "MCP served key"})
+
+    %{assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "served-model-upstream",
+        assignment_label: "served-model-assignment"
+      })
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-6-astra",
+        endpoint: "/backend-api/codex/responses",
+        transport: "websocket",
+        status: "succeeded",
+        usage_status: "usage_known",
+        correlation_id: "mcp-served-model",
+        response_status_code: 200
+      })
+
+    attempt_fixture(request, assignment, %{
+      upstream_model_id: "gpt-6-astra",
+      served_model: "gpt-6-luna",
+      model_observation: %{"version" => 1, "coverage" => "full", "conflict" => true, "first_conflicting_model" => "model-other", "terminal_model" => "gpt-6-luna", "terminal_status" => "completed"},
+      latency_ms: 120
+    })
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_request_logs",
+               %{"pool_id" => pool.id, "limit" => 5},
+               %{auth: auth}
+             )
+
+    assert result["isError"] == false
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+    assert [item] = result["structuredContent"]["items"]
+    assert item["requested_model"] == "gpt-6-astra"
+    assert item["upstream_model"] == "gpt-6-astra"
+    assert item["served_model"] == "gpt-6-luna"
+    assert item["model_conflict_attempts"] == [1]
+
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text =~ "gpt-6-luna"
+
+    assert {:ok, detail} =
+             ToolDispatch.call(
+               "codex_pooler_get_request_log",
+               %{"id" => request.id},
+               %{auth: auth}
+             )
+
+    assert detail["isError"] == false
+    assert :ok = Redaction.assert_mcp_output_safe!(detail)
+    assert detail["structuredContent"]["item"]["served_model"] == "gpt-6-luna"
+    assert detail["structuredContent"]["item"]["upstream_model"] == "gpt-6-astra"
+    assert [observed_attempt] = detail["structuredContent"]["item"]["debug"]["attempts"]
+    assert observed_attempt["model_observation"]["first_conflicting_model"] == "model-other"
+    assert observed_attempt["model_observation"]["conflict"] == true
+    assert [%{"type" => "text", "text" => detail_text}] = detail["content"]
+    assert detail_text =~ "gpt-6-luna"
+    assert detail_text =~ "gpt-6-astra"
+    assert detail_text =~ "first_conflicting_model=model-other"
+  end
+
+  @tag model_provenance: true
+  test "model placeholders in historical public failures are absent in both MCP representations", %{auth: auth} do
+    setup = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(setup.pool)
+    request = request_fixture(setup, %{status: "failed"})
+    attempt_fixture(request, assignment, %{status: "failed", transport: "websocket", upstream_model_id: "model-a", served_model: "unknown", response_metadata: %{"upstream_websocket_bridge" => true, "public_openai_responses_stream" => %{"mode" => "normalized", "created_seen" => false, "visible_seen" => false, "delta_count" => 0, "terminal_seen" => true, "terminal_kind" => "failed"}}})
+
+    assert {:ok, listed} = ToolDispatch.call("codex_pooler_list_request_logs", %{"pool_id" => setup.pool.id}, %{auth: auth})
+    assert [item] = listed["structuredContent"]["items"]
+    assert item["served_model"] == nil
+    refute hd(listed["content"])["text"] =~ "served_model=unknown"
+
+    assert {:ok, detail} = ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{auth: auth})
+    assert detail["structuredContent"]["item"]["served_model"] == nil
+    assert [attempt] = detail["structuredContent"]["item"]["debug"]["attempts"]
+    assert attempt["served_model"] == nil
+    assert attempt["model_observation"] == nil
+    refute hd(detail["content"])["text"] =~ "served_model=unknown"
   end
 
   defp attempt_with_latency(request, assignment, latency_ms, response_metadata \\ %{}) do

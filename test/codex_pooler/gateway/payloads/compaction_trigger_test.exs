@@ -16,6 +16,26 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
   @external_resource @incremental_fixture_path
 
   describe "prepare_bridge/2" do
+    test "streams an unmarked trigger without requiring client-specific metadata" do
+      payload = %{
+        "model" => "sample-model",
+        "stream" => true,
+        "input" => [
+          %{"role" => "user", "content" => "synthetic context"},
+          %{"type" => "compaction_trigger"}
+        ]
+      }
+
+      assert CompactionTrigger.compaction_result_transport(payload) == :sse
+      refute CompactionTrigger.v2_streaming?(payload)
+      assert {:ok, projected} = CompactionTrigger.prepare_bridge("/v1/responses", payload)
+      assert CompactionTrigger.project_responses_payload(projected, :sse)["stream"] == true
+      assert projected["input"] == payload["input"]
+
+      assert CompactionTrigger.prepare_bridge("/backend-api/codex/responses/compact", payload) ==
+               :passthrough
+    end
+
     test "accepts a final native trigger after a zero-byte function output" do
       payload = zero_byte_compaction_payload()
 
@@ -196,7 +216,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
 
       assert contract["v2_trigger_metadata"]
              |> Map.fetch!("x-codex-turn-metadata")
-             |> Jason.decode!() == %{
+             |> CodexPooler.JSON.decode!() == %{
                "window_number" => 0,
                "context_window_id" => "00000000-0000-4000-8000-000000000153",
                "compaction" => %{"implementation" => "responses_compaction_v2"}
@@ -351,7 +371,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
       assert result_transport(%{
                "client_metadata" => %{
                  "x-codex-turn-metadata" =>
-                   Jason.encode!(%{
+                   CodexPooler.JSON.encode!(%{
                      "compaction" => %{"implementation" => "responses_compaction_v2"}
                    })
                }
@@ -361,11 +381,10 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
             %{"client_metadata" => %{"x-codex-turn-metadata" => "not-json"}},
             %{"client_metadata" => %{"x-codex-turn-metadata" => "[]"}},
             %{"client_metadata" => %{"x-codex-turn-metadata" => "true"}},
-            %{"client_metadata" => %{"x-codex-turn-metadata" => Jason.encode!(%{})}},
+            %{"client_metadata" => %{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{})}},
             %{
               "client_metadata" => %{
-                "x-codex-turn-metadata" =>
-                  Jason.encode!(%{"compaction" => %{"implementation" => "other"}})
+                "x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"compaction" => %{"implementation" => "other"}})
               }
             },
             %{"client_metadata" => ["not", "a", "map"]},
@@ -396,7 +415,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
 
       assert fixture["request"]
              |> get_in(["client_metadata", "x-codex-turn-metadata"])
-             |> Jason.decode!()
+             |> CodexPooler.JSON.decode!()
              |> Map.take(["window_number", "context_window_id", "request_kind", "compaction"]) ==
                %{
                  "window_number" => 0,
@@ -439,7 +458,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
 
       assert result_transport(%{
                "client_metadata" => %{
-                 "x-codex-turn-metadata" => Jason.encode!(turn_metadata)
+                 "x-codex-turn-metadata" => CodexPooler.JSON.encode!(turn_metadata)
                }
              }) == :sse
     end
@@ -450,7 +469,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
   defp load_fixture! do
     @fixture_path
     |> File.read!()
-    |> Jason.decode!()
+    |> CodexPooler.JSON.decode!()
   end
 
   defp incremental_scenario!(scenario) do
@@ -461,7 +480,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
   defp load_incremental_fixture! do
     @incremental_fixture_path
     |> File.read!()
-    |> Jason.decode!()
+    |> CodexPooler.JSON.decode!()
   end
 
   defp frame_types(frame), do: Enum.map(frame["input"], & &1["type"])

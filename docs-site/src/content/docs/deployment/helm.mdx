@@ -1,5 +1,7 @@
 ---
-title: Helm
+title: Deploy Codex Pooler on Kubernetes with Helm
+sidebar:
+  label: Helm
 description: Deploy Codex Pooler to Kubernetes from the iCoreTech Helm repository.
 ---
 
@@ -15,7 +17,7 @@ helm repo update
 helm upgrade --install codex-pooler icoretech/codex-pooler \
   --namespace codex-pooler \
   --create-namespace \
-  --version 0.6.22 \
+  --version 0.10.4 \
   --values ./values.production.yaml
 ```
 
@@ -25,7 +27,7 @@ The same chart is also published as an OCI artifact:
 helm upgrade --install codex-pooler oci://ghcr.io/icoretech/charts/codex-pooler \
   --namespace codex-pooler \
   --create-namespace \
-  --version 0.6.22 \
+  --version 0.10.4 \
   --values ./values.production.yaml
 ```
 
@@ -94,6 +96,26 @@ ingress:
 
 Public client examples should use `https://codex-pooler.example.com` as the deployed base URL.
 
+### Streaming ingress timeouts
+
+Long reasoning and compaction requests can stream for more than ten minutes. Configure the ingress controller so active SSE responses are not cut off by a total response-write deadline. This applies to Full and Lite alike; client idle-timeout settings and SSE heartbeats do not extend a fixed response deadline.
+
+For Traefik, set the following in the **Traefik chart's values**, on every entrypoint carrying Codex Pooler traffic:
+
+```yaml
+ports:
+  web:
+    transport:
+      respondingTimeouts:
+        writeTimeout: 0s
+  websecure:
+    transport:
+      respondingTimeouts:
+        writeTimeout: 0s
+```
+
+Keep request-read and keep-alive idle limits appropriate for your installation. `writeTimeout: 0s` disables only the total response-write deadline. These are controller settings, not Codex Pooler chart values or backend `ServersTransport` timeouts; changing shared entrypoints affects every route on them. Verify the rendered arguments and all ingress replicas after rollout. A fixed-duration `client_disconnected` request with streamed deltas but no terminal is a useful diagnostic signal; confirm the client and edge timestamps before attributing the closure.
+
 ## Role topology
 
 The default topology is conservative:
@@ -116,6 +138,14 @@ migrations:
 ```
 
 The migration hook runs database migrations and imports the vendored OpenAI pricing feed. The scheduler keeps scheduled background work separate from request-serving pods.
+
+Complete migrations before starting app pods on the new image. Execution recovery requires the attempt execution-identity columns, their index, and the `execution_terminal_proofs` table; disabling the hook requires completing the same release migrations separately before app startup.
+
+The 0.8.0 upgrade and rollback procedures target PostgreSQL 18. API-key history migrations commit short `NOT VALID` constraint swaps before validating existing rows separately. Migration runners serialize through PostgreSQL advisory locks; interrupted concurrent index builds are checked and repaired on retry when their definitions match. A conflicting index definition requires investigation. These migrations do not make an arbitrary older image compatible: after API-key deletion leaves null-key history, the 0.7.8 image is incompatible with that retained history and the ledger migration refuses to restore required key ownership. Preserve the history and use compatible code; do not treat an image-only rollback as recovery.
+
+Index migrations build and drop their indexes concurrently, so application reads and writes continue during the upgrade. A concurrent index build still has to wait for every transaction on the same database that uses the table or holds an older snapshot, such as a running `pg_dump` backup, a long reporting query or a `psql` session left idle inside a transaction. The migration waits up to five minutes in total for those transactions and logs the blocking sessions (process id, application name, backend type, state and transaction age, never the query text) while it waits; a wait for a table lock held by another session stops after ten seconds. When either budget runs out the migration fails with a message that names the blocking sessions: end them or let them finish, then let the migration run again. PostgreSQL shows the state, backend type and transaction start of a session owned by another database role only to superusers, members of `pg_read_all_stats` and that role, so when the migration role is an ordinary application role, a backup or `psql` session run as another role is listed with those fields as `hidden` and its role name; grant `pg_read_all_stats` to the migration role if you want them in the message. An interrupted index build is dropped and rebuilt on the next run. The migration Job retries up to `migrations.backoffLimit` times within `migrations.activeDeadlineSeconds`, so with the defaults (3 retries, 900 seconds) one long-lived transaction can hold an upgrade for at most 15 minutes before the Job fails.
+
+A `pg_dump` backup leaves out planner statistics unless it was taken with `--statistics`, so a database restored with `psql` or `pg_restore` has no column statistics until autovacuum analyzes each table. Run `ANALYZE` on it (or `vacuumdb --analyze-in-stages`) before the app pods serve traffic again.
 
 ## Metrics collection
 
@@ -154,7 +184,7 @@ Render the monitoring resource before installing:
 ```bash
 helm template codex-pooler icoretech/codex-pooler \
   --namespace codex-pooler \
-  --version 0.6.22 \
+  --version 0.10.4 \
   --set monitoring.serviceMonitor.enabled=true \
   --set monitoring.serviceMonitor.labels.release=kube-prometheus-stack \
   --set monitoring.serviceMonitor.interval=10s \
@@ -181,7 +211,7 @@ curl -fsS --get http://127.0.0.1:9090/api/v1/query \
 
 Useful first queries:
 
-```text
+```promql
 vm_memory_total_bytes{namespace="codex-pooler", job="codex-pooler-app"}
 sum by (pod) (rate(phoenix_endpoint_stop_count{namespace="codex-pooler", job="codex-pooler-app"}[5m]))
 sum by (method, status_class) (rate(codex_pooler_http_request_count{namespace="codex-pooler", job="codex-pooler-app"}[5m]))
@@ -190,7 +220,7 @@ topk(10, sum by (source, command) (rate(codex_pooler_repo_query_count{namespace=
 
 For memory incidents, also collect Kubernetes cgroup metrics such as `container_memory_working_set_bytes`, `container_memory_rss`, restart counters, and OOM counters from your cluster collectors. The app metrics explain BEAM and gateway behavior; cgroup and kube-state-metrics data explain container limits, restarts, and killed pods.
 
-The [monitoring and runtime triage guide](/operators/monitoring/) includes a starter Grafana dashboard JSON and PromQL examples.
+The [Monitoring section](/monitoring/overview/) covers metric collection, the starter Grafana dashboard, PromQL recipes and runtime troubleshooting.
 
 ## Websocket replica caveat
 
@@ -212,6 +242,14 @@ app:
 With that shape, the chart renders `CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING=true`
 on app pods automatically. Render the chart and verify the topology before
 raising `app.replicaCount`.
+
+## Rollout drain
+
+Before an app pod stops, its preStop hook drains it: new work is refused and
+in-flight turns may finish within `app.lifecycle.preStop.drainTimeoutSeconds`
+(85 by default). Turns get about `drainTimeoutSeconds` minus 10.7 seconds; at 10
+or less every drain cuts them at once. If you raise the drain budget, raise
+`app.terminationGracePeriodSeconds` with it.
 
 ## Flux multi-replica example
 
@@ -259,14 +297,16 @@ spec:
         name: icoretech
         namespace: flux-system
   interval: 5m
-  timeout: 3m
+  # Allow time for migrations, pod draining, and readiness checks.
+  timeout: 15m
   install:
     remediation:
-      retries: -1
+      retries: 3
   upgrade:
     remediation:
-      retries: -1
-      strategy: uninstall
+      retries: 3
+      # Restore the previous release if an upgrade fails.
+      strategy: rollback
       remediateLastFailure: true
   values:
     config:
@@ -312,10 +352,9 @@ spec:
                 topologyKey: kubernetes.io/hostname
 ```
 
-When `app.replicaCount` is `2` or higher, the chart enables websocket owner
-forwarding automatically. Keep `clustering.participants.worker` and
-`clustering.participants.scheduler` disabled unless those roles also need BEAM
-cluster membership in your environment.
+When `app.replicaCount` is `2` or higher, the chart enables websocket owner forwarding automatically. Worker and scheduler cluster participation is optional for dead-execution recovery: keep `clustering.participants.worker` and `clustering.participants.scheduler` disabled as in this example unless another feature needs their BEAM membership. These explicit overrides differ from the chart's participant defaults.
+
+Dead-execution recovery reads exact owner-attested PostgreSQL terminal proofs, so workers do not need an eRPC connection to the app owner. The app publishes those proofs asynchronously in bounded batches; database publication time starts their six-hour retention window. A lost or unpublished proof leaves execution death unknown and cannot authorize settlement. App-to-app clustering for websocket owner forwarding remains required in the multi-replica topology above.
 
 ## Render safely before install
 
@@ -323,7 +362,7 @@ Render manifests locally before applying them:
 
 ```bash
 helm template codex-pooler icoretech/codex-pooler \
-  --version 0.6.22 \
+  --version 0.10.4 \
   --set config.host=codex-pooler.example.com \
   --set ingress.enabled=true \
   --set ingress.hosts[0].host=codex-pooler.example.com
@@ -337,7 +376,7 @@ For install or upgrade, provide your production values file from a private path:
 helm upgrade --install codex-pooler icoretech/codex-pooler \
   --namespace codex-pooler \
   --create-namespace \
-  --version 0.6.22 \
+  --version 0.10.4 \
   --values ./values.production.yaml
 ```
 

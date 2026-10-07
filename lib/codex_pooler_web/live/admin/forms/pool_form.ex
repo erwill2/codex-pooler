@@ -13,6 +13,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   alias CodexPooler.Pools.RoutingSettings
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.OptionLoaderFallback
 
@@ -132,8 +133,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
     %{
       "query" => normalize_query(value_for(attrs, "query", "")),
       "status" => if(status in ["all" | @pool_statuses], do: status, else: "all"),
-      "traffic_window" =>
-        attrs |> value_for("traffic_window", "24h") |> normalize_traffic_window()
+      "traffic_window" => attrs |> value_for("traffic_window", "24h") |> normalize_traffic_window()
     }
   end
 
@@ -162,8 +162,8 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       "sticky_http_sessions" => settings.sticky_http_sessions,
       "prompt_cache_affinity_enabled" => settings.prompt_cache_affinity_enabled,
       "v1_compatibility_enabled" => settings.v1_compatibility_enabled,
-      "request_compression_enabled" => settings.request_compression_enabled,
       "allow_image_generation" => settings.allow_image_generation,
+      "allow_audio_transcription" => settings.allow_audio_transcription,
       "upstream_identity_ids" => active_upstream_identity_ids(pool),
       "api_key_ids" => active_api_key_ids(pool)
     }
@@ -214,9 +214,14 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   end
 
   def upstream_identity_options(scope) do
-    case Upstreams.list_upstream_identities_for_pool_management(scope, status: "active") do
+    case Upstreams.list_upstream_identities_for_pool_management(scope) do
       {:ok, identities} ->
-        {Enum.map(identities, &upstream_identity_option/1), []}
+        options =
+          identities
+          |> Enum.reject(&(&1.status == UpstreamIdentity.deleted_status()))
+          |> Enum.map(&upstream_identity_option/1)
+
+        {options, []}
 
       {:error, reason} ->
         empty_admin_options(:upstream_identity_options, reason, %{
@@ -255,6 +260,11 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   end
 
   def status_options, do: Enum.map(@pool_statuses, &{status_label(&1), &1})
+
+  # The editor opens only an active Pool; an inactive one is reactivated from
+  # its card menu first (findings#206 row 206-318).
+  def edit_title(%{status: "active"}), do: "Edit Pool"
+  def edit_title(_pool), do: "Reactivate the Pool before editing"
 
   def delete_title(%{status: "archived"}), do: "Delete archived Pool"
   def delete_title(_pool), do: "Archive the Pool before hard deletion"
@@ -305,8 +315,8 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       "sticky_http_sessions" => false,
       "prompt_cache_affinity_enabled" => true,
       "v1_compatibility_enabled" => true,
-      "request_compression_enabled" => false,
       "allow_image_generation" => true,
+      "allow_audio_transcription" => true,
       "upstream_identity_ids" => [],
       "api_key_ids" => []
     }
@@ -476,9 +486,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
     |> submitted_rows()
     |> Enum.reduce(%{}, fn submitted_row, modes ->
       with exposed_model_id when is_binary(exposed_model_id) <-
-             ModelServingOverride.canonical_exposed_model_id(
-               submitted_value(submitted_row, "exposed_model_id")
-             ),
+             ModelServingOverride.canonical_exposed_model_id(submitted_value(submitted_row, "exposed_model_id")),
            mode when mode in ["auto", "lite", "full"] <-
              normalize_submitted_mode(submitted_value(submitted_row, "mode")),
            true <- MapSet.member?(known_ids, exposed_model_id) do

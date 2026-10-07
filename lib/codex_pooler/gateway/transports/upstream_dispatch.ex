@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   alias CodexPooler.Accounting.ClientRetry
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Runtime.Finalization.ExpiredOwnerGenerationCleanup
 
   alias CodexPooler.Gateway.Payloads.{
     CompactionTrigger,
@@ -19,12 +20,14 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   alias CodexPooler.Gateway.Persistence.SessionContinuity, as: PersistenceSessionContinuity
   alias CodexPooler.Gateway.Transports.BoundedResponseBody
   alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
+  alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
   alias CodexPooler.Gateway.Transports.RejectionBody
+  alias CodexPooler.Gateway.Transports.RetryAfter
   alias CodexPooler.Gateway.Transports.Streaming.RuntimeAdmissionProof
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Gateway.Transports.UpstreamConnectionProbe
   alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
-  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
@@ -35,7 +38,11 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV4
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV5
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV7
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV8
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks
+  alias CodexPooler.Gateway.Websocket.DirectCleanup
+  alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.Repo
   alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.CloudflareCookies
@@ -47,20 +54,14 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   # needs `:body`, `WebsocketAttempt` dispatches on `:terminal`, and
   # `Finalization.Websocket` destructures `:status` and `:headers`. Extend this
   # list whenever a consumer starts requiring another field.
-  @owner_success_fields [:body, :terminal, :status, :headers]
+  @owner_success_fields [:body, :terminal, :status, :headers, :provider_credits_admission]
 
   @regular_runtime_metadata_endpoints [
     "/backend-api/codex/responses",
     "/backend-api/codex/responses/compact"
   ]
-  @regular_runtime_metadata_header_names [
-    "x-codex-turn-metadata",
-    "x-codex-window-id",
-    "x-codex-parent-thread-id",
-    "x-codex-installation-id",
-    "x-codex-turn-state",
-    "x-openai-subagent"
-  ]
+  # The closed client metadata header allowlist and its value bounds live in
+  # `TransportEnvelope` (findings#240); this module only gates them by endpoint.
   @responses_lite_header_name "x-openai-internal-codex-responses-lite"
   @routing_hint_header_name "x-codex-routing-hint"
   @stable_downstream_keys [:active_turn_reconnect?, :correlation_id, :epoch, :pid]
@@ -80,14 +81,12 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
           required(:identity) => UpstreamIdentity.t(),
           required(:observation) => WebsocketOwnerRequest.observation(),
           required(:reset_probe) => ResetProbe.t() | nil,
-          required(:native_codex_response_control) =>
-            CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot.t() | nil,
+          required(:provider_credits_context) => ProviderCreditsAdmission.Context.t(),
+          required(:native_codex_response_control) => CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot.t() | nil,
           required(:assignment_advertised?) => boolean(),
           required(:connection_bound_continuation?) => boolean(),
-          required(:websocket_delivery_mode) =>
-            :relay | :collect_compaction | :collect_full_history,
-          required(:native_compaction_metadata) =>
-            CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata.t() | nil,
+          required(:websocket_delivery_mode) => :relay | :collect_compaction | :collect_full_history,
+          required(:native_compaction_metadata) => CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata.t() | nil,
           required(:effective_serving_mode) => String.t(),
           required(:request_id) => Ecto.UUID.t() | nil,
           required(:attempt_id) => Ecto.UUID.t() | nil,
@@ -97,8 +96,6 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
           required(:native_compaction_capability) =>
             CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability.t()
             | nil,
-          required(:first_compact_collection) =>
-            NativeCompactionAdmission.FirstCompactCollection.t() | nil,
           required(:expected_connection_lifecycle) => map() | nil,
           required(:forward_error_body?) => boolean(),
           required(:native_client_retry_observation) => ClientRetry.Observation.t() | nil,
@@ -113,6 +110,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     alias CodexPooler.Gateway.Payloads.RequestOptions
     alias CodexPooler.Gateway.Payloads.RequestOptions.Transport
     alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
+    alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
     alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
     defstruct [
@@ -121,6 +119,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       :upstream_payload,
       :original_payload,
       :identity,
+      :provider_credits_context,
       :routing_hint_authorized?,
       :accounting_request,
       :accounting_attempt,
@@ -137,6 +136,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
             upstream_payload: binary() | {:multipart, list()},
             original_payload: map() | nil,
             identity: UpstreamIdentity.t(),
+            provider_credits_context: ProviderCreditsAdmission.Context.t() | nil,
             routing_hint_authorized?: boolean(),
             accounting_request: AccountingRequest.t() | nil,
             accounting_attempt: AccountingAttempt.t() | nil,
@@ -160,9 +160,12 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     @max_bytes 65_536
     @timeout_ms 2_000
 
-    @spec drain(Req.Response.t()) :: binary()
-    def drain(%Req.Response{body: %Req.Response.Async{ref: ref}} = response) do
-      deadline = System.monotonic_time(:millisecond) + @timeout_ms
+    # `:timeout_ms` is a test-facing knob for the single absolute drain
+    # deadline; production callers use the 2 s default.
+    @spec drain(Req.Response.t(), keyword()) :: binary()
+    def drain(%Req.Response{body: %Req.Response.Async{ref: ref}} = response, opts \\ []) do
+      timeout_ms = Keyword.get(opts, :timeout_ms, @timeout_ms)
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
       drain(response, ref, deadline, [], 0)
     end
 
@@ -258,12 +261,14 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         opts \\ []
       )
       when is_list(headers) and is_list(opts) do
+    {payload, opts} = Keyword.pop(opts, :payload)
+
     envelope_opts =
       opts
       |> Keyword.put(:include_codex_identity?, true)
       |> Keyword.put(
         :forwarded_headers,
-        regular_runtime_forwarded_metadata_headers(request_options)
+        regular_runtime_forwarded_metadata_headers(request_options, payload)
       )
 
     headers = maybe_put_responses_lite_header(headers, request_options)
@@ -274,64 +279,122 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   @doc false
   @spec regular_runtime_forwarded_metadata_headers(RequestOptions.t()) :: [header()]
-  def regular_runtime_forwarded_metadata_headers(%RequestOptions{
-        transport: %{
-          upstream_endpoint: endpoint,
-          forwarded_metadata_headers: forwarded_headers
-        },
-        openai_compatibility: %{source_endpoint: nil, openai_chat_payload: nil}
-      })
+  def regular_runtime_forwarded_metadata_headers(%RequestOptions{} = request_options),
+    do: regular_runtime_forwarded_metadata_headers(request_options, nil)
+
+  # Native Codex-backend origin: the client's own bounded metadata headers go
+  # upstream as they are, and a usable client `session-id` is never replaced.
+  # When none survives the bounds (a client that names its conversation only
+  # through a Pooler-local alias such as `session_id` or `x-session-id`, or not
+  # at all), the provider gets the same Pool- and key-scoped `session-id` the
+  # `/v1` clause below derives from the request's `prompt_cache_key`, so a
+  # full-history HTTP turn still reaches the replica holding the warm prefix.
+  # The alias itself stays local: it keys the CodexSession but carries no
+  # tenant scope, so forwarding it raw would let two keys that send the same
+  # alias share one provider session. The released Codex client always sends
+  # `session-id` (equal to its `prompt_cache_key` for a root agent), so it
+  # never reaches the derivation (findings#206 row 206-557).
+  #
+  # Precedence: a usable client `session-id`, then the `prompt_cache_key`
+  # derivation, then a derivation from the accepted local continuity alias
+  # (`continuity.session_header`, whichever of `session_id`, `x-session-id`,
+  # `x-session-affinity`, `x-codex-session-id`, `x-codex-conversation-id` or
+  # `x-codex-window-id` keyed the local session) under its own Pool- and
+  # key-scoped namespace. The alias rung serves clients that name their
+  # conversation with an alias and send no `prompt_cache_key` at all, such as
+  # cline's `openai-codex` provider (findings#206 row 206-606). Neither the
+  # alias nor the derived value is ever logged or stored.
+  @doc false
+  @spec regular_runtime_forwarded_metadata_headers(RequestOptions.t(), map() | nil) ::
+          [header()]
+  def regular_runtime_forwarded_metadata_headers(
+        %RequestOptions{
+          transport: %{
+            upstream_endpoint: endpoint,
+            forwarded_metadata_headers: forwarded_headers
+          },
+          openai_compatibility: %{source_endpoint: nil, openai_chat_payload: nil}
+        } = request_options,
+        payload
+      )
       when endpoint in @regular_runtime_metadata_endpoints and is_list(forwarded_headers) do
-    filter_regular_runtime_forwarded_metadata_headers(forwarded_headers)
+    forwarded = TransportEnvelope.bounded_forwarded_metadata_headers(forwarded_headers)
+
+    if List.keymember?(forwarded, "session-id", 0),
+      do: forwarded,
+      else: forwarded ++ derived_native_session_header(request_options, payload)
   end
 
-  def regular_runtime_forwarded_metadata_headers(%RequestOptions{}), do: []
-
-  defp filter_regular_runtime_forwarded_metadata_headers(headers) do
-    Enum.flat_map(headers, fn
-      {name, value} when is_binary(name) and is_binary(value) ->
-        name = String.downcase(name)
-
-        if name in @regular_runtime_metadata_header_names do
-          [{name, maybe_project_turn_metadata_header(name, value)}]
-        else
-          []
-        end
-
-      _other ->
-        []
-    end)
+  # Public `/v1` origin: the client's continuity headers stay local, and the
+  # only provider session header sent upstream is the Pooler-derived
+  # `session-id` synthesized from the request's `prompt_cache_key`, scoped to
+  # the authenticated Pool and API key captured in the runtime context so two
+  # tenants that send the same key never share a provider session. Without a
+  # captured tenant scope nothing is synthesized. It goes through the same
+  # `forwarded_metadata_header/2` bounds as a client header.
+  # `websocket_provider_session_headers/2` applies the same policy to the `/v1`
+  # websocket handshake, where the derived id survives an owner reconnect.
+  def regular_runtime_forwarded_metadata_headers(
+        %RequestOptions{
+          transport: %{upstream_endpoint: endpoint},
+          openai_compatibility: %{source_endpoint: source_endpoint}
+        } = request_options,
+        payload
+      )
+      when endpoint in @regular_runtime_metadata_endpoints and is_binary(source_endpoint) do
+    prompt_cache_session_header(request_options, payload)
   end
 
-  defp maybe_project_turn_metadata_header("x-codex-turn-metadata", value) do
-    case Jason.decode(value) do
-      {:ok, %{"code_mode_tool_names" => _value} = metadata} ->
-        encode_projected_turn_metadata(metadata, value)
+  def regular_runtime_forwarded_metadata_headers(%RequestOptions{}, _payload), do: []
 
-      _other ->
-        value
+  defp prompt_cache_session_header(%RequestOptions{} = request_options, %{"prompt_cache_key" => prompt_cache_key}) do
+    case TransportEnvelope.prompt_cache_session_id(
+           prompt_cache_tenant_scope(request_options),
+           prompt_cache_key
+         ) do
+      session_id when is_binary(session_id) -> forwarded_metadata_header("session-id", session_id)
+      nil -> []
     end
   end
 
-  defp maybe_project_turn_metadata_header(_name, value), do: value
+  defp prompt_cache_session_header(%RequestOptions{}, _payload), do: []
 
-  defp encode_projected_turn_metadata(metadata, original) do
-    case metadata
-         |> Map.delete("code_mode_tool_names")
-         |> Jason.encode(escape: :unicode_safe) do
-      {:ok, projected} -> projected
-      {:error, _error} -> original
+  defp derived_native_session_header(%RequestOptions{} = request_options, payload) do
+    case prompt_cache_session_header(request_options, payload) do
+      [] -> continuity_alias_session_header(request_options)
+      header -> header
     end
   end
+
+  defp continuity_alias_session_header(%RequestOptions{continuity: %{session_header: alias}} = request_options)
+       when is_binary(alias) do
+    case TransportEnvelope.continuity_alias_session_id(prompt_cache_tenant_scope(request_options), alias) do
+      session_id when is_binary(session_id) -> forwarded_metadata_header("session-id", session_id)
+      nil -> []
+    end
+  end
+
+  defp continuity_alias_session_header(%RequestOptions{}), do: []
+
+  defp prompt_cache_tenant_scope(%RequestOptions{runtime: %{tenant_scope: scope}}), do: scope
+  defp prompt_cache_tenant_scope(%RequestOptions{}), do: nil
+
+  # Runtime lookup only: the envelope owns the allowlist, the provider session
+  # names and every value bound, and a compile-time reference to it would add
+  # a forbidden xref edge. `name` must already be lowercase.
+  defp forwarded_metadata_header(name, value),
+    do: TransportEnvelope.bounded_forwarded_metadata_header(name, value)
 
   @spec http_request(DispatchRequest.t()) :: {:ok, Req.Response.t()} | {:error, map()}
-  def http_request(%DispatchRequest{
-        url: url,
-        token: token,
-        upstream_payload: {:multipart, fields},
-        identity: identity,
-        request_options: %RequestOptions{} = opts
-      }) do
+  def http_request(
+        %DispatchRequest{
+          url: url,
+          token: token,
+          upstream_payload: {:multipart, fields},
+          identity: identity,
+          request_options: %RequestOptions{} = opts
+        } = dispatch_request
+      ) do
     timeouts = configured_timeouts(opts)
 
     request_options =
@@ -348,14 +411,18 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
             ])
           )
       ]
-      |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts))
+      |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts, url))
 
-    result = Req.post(url, request_options)
-    CloudflareCookies.store_from_result(url, result)
-    result = maybe_drain_rejection_body(result, opts)
+    with {:ok, receipt} <- admit_http(dispatch_request) do
+      result = OutboundHTTP.post(url, request_options)
+      CloudflareCookies.store_from_result(url, result)
 
-    result
-    |> normalize_upstream_transport_result(identity, opts)
+      result
+      |> RetryAfter.capture()
+      |> maybe_drain_rejection_body(opts)
+      |> normalize_upstream_transport_result(identity, opts)
+      |> ProviderCreditsAdmission.attach_http_receipt(receipt)
+    end
   rescue
     exception in [
       Req.TransportError,
@@ -369,15 +436,17 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       {:error, upstream_transport_error(exception)}
   end
 
-  def http_request(%DispatchRequest{
-        url: url,
-        token: token,
-        upstream_payload: body,
-        original_payload: payload,
-        identity: identity,
-        routing_hint_authorized?: routing_hint_authorized?,
-        request_options: %RequestOptions{} = opts
-      }) do
+  def http_request(
+        %DispatchRequest{
+          url: url,
+          token: token,
+          upstream_payload: body,
+          original_payload: payload,
+          identity: identity,
+          routing_hint_authorized?: routing_hint_authorized?,
+          request_options: %RequestOptions{} = opts
+        } = dispatch_request
+      ) do
     timeouts = configured_timeouts(opts)
 
     upstream_header_list =
@@ -395,7 +464,8 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
                else: "application/json"
              )}
           ],
-          routing_hint: routing_hint_header(body, routing_hint_authorized?, opts)
+          routing_hint: routing_hint_header(body, routing_hint_authorized?, opts),
+          payload: payload
         )
       )
 
@@ -408,10 +478,12 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         retry: false,
         headers: upstream_header_list
       ]
-      |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts))
+      |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts, url))
+
+    streaming? = streaming_request?(payload, opts)
 
     request_options =
-      if streaming_request?(payload, opts) do
+      if streaming? do
         Keyword.put(request_options, :into, :self)
       else
         Keyword.put(
@@ -421,12 +493,17 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         )
       end
 
-    result = Req.post(url, request_options)
-    CloudflareCookies.store_from_result(url, result)
-    result = maybe_drain_rejection_body(result, opts)
+    with {:ok, receipt} <- admit_http(dispatch_request) do
+      {result, connection} = post_observing_connection(url, request_options, streaming?)
+      result = UpstreamConnectionProbe.put_connection(result, connection)
+      CloudflareCookies.store_from_result(url, result)
 
-    result
-    |> normalize_upstream_transport_result(identity, opts)
+      result
+      |> RetryAfter.capture()
+      |> maybe_drain_rejection_body(opts)
+      |> normalize_upstream_transport_result(identity, opts)
+      |> ProviderCreditsAdmission.attach_http_receipt(receipt)
+    end
   rescue
     exception in [
       Req.TransportError,
@@ -440,12 +517,27 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       {:error, upstream_transport_error(exception)}
   end
 
+  # A streamed request also learns whether it opened its connection or reused a pooled one, for the stream timing of
+  # its attempt; a collected body has no use for it.
+  defp post_observing_connection(url, request_options, true) do
+    UpstreamConnectionProbe.observe(fn probe_options -> OutboundHTTP.post(url, request_options ++ probe_options) end)
+  end
+
+  defp post_observing_connection(url, request_options, false), do: {OutboundHTTP.post(url, request_options), nil}
+
+  defp admit_http(%DispatchRequest{provider_credits_context: context, url: url}) do
+    if not is_nil(context) or ProviderCreditsAdmission.generation_endpoint?(URI.parse(url).path),
+      do: ProviderCreditsAdmission.admit(context),
+      else: {:ok, nil}
+  end
+
   @spec websocket_request(DispatchRequest.t()) :: {:ok, map()} | {:error, map()}
   def websocket_request(%DispatchRequest{
         url: url,
         token: token,
         upstream_payload: payload_body,
         identity: identity,
+        provider_credits_context: provider_credits_context,
         routing_hint_authorized?: routing_hint_authorized?,
         accounting_request: request,
         accounting_attempt: attempt,
@@ -455,11 +547,18 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         request_options: %RequestOptions{} = request_options,
         client_retry_dispatch_authority: client_retry_dispatch_authority
       }) do
+    # The final upstream body is read twice on a websocket handshake — for the
+    # routing hint and for the `/v1` derived provider session id — so decode it
+    # once per turn.
+    decoded_payload = decoded_upstream_payload(payload_body)
+
     headers =
       websocket_headers(
         identity,
         token,
-        routing_hint_header(payload_body, routing_hint_authorized?, request_options)
+        routing_hint_header(decoded_payload, routing_hint_authorized?, request_options),
+        request_options,
+        decoded_payload
       )
 
     emit_egress_observation(:websocket, headers, request_options, payload_body)
@@ -474,6 +573,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       timeouts: timeouts,
       mapper: websocket_message_mapper(request_options),
       identity: identity,
+      provider_credits_context: provider_credits_context,
       observation: observation,
       reset_probe: request_options.routing.reset_probe,
       native_codex_response_control: native_codex_response_control,
@@ -491,7 +591,6 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       native_replay_binding: request_options.runtime.native_replay_binding,
       native_replay_proof: request_options.runtime.native_replay_proof,
       provisional_token: request_options.runtime.replay_provisional_token,
-      first_compact_collection: request_options.first_compact_collection,
       native_compaction_metadata:
         if(request_options.transport.websocket_delivery_mode == :collect_full_history,
           do: request_options.payload_context.native_codex_turn_metadata
@@ -577,7 +676,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
           owner_request_forwarder_opts(forwarder_opts, request_options),
           request_options
         )
-        |> owner_request_result(identity, request, attempt, request_options)
+        |> owner_request_result(identity, request, attempt, request_options, request_data.provider_credits_context)
 
       {:error, reason} ->
         owner_request_result({:error, reason}, identity, request, attempt, request_options)
@@ -617,8 +716,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
           do: Map.get(lifecycle, :replay_attempt_id, attempt.id),
           else: Map.get(lifecycle, :eligible_attempt_id, attempt.id)
         ),
-      replay_generation:
-        Map.get(attempt, :replay_generation, Map.get(lifecycle, :replay_generation, 0))
+      replay_generation: Map.get(attempt, :replay_generation, Map.get(lifecycle, :replay_generation, 0))
     }
 
     WebsocketOwnerForwarder.prepare_next_replay_descriptor(
@@ -680,7 +778,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   defp egress_websocket_client_metadata(:none), do: :none
 
   defp egress_websocket_client_metadata(payload) do
-    case Jason.decode(IO.iodata_to_binary(payload)) do
+    case CodexPooler.JSON.decode(IO.iodata_to_binary(payload)) do
       {:ok, %{"client_metadata" => client_metadata}} when is_map(client_metadata) ->
         {:keys, Map.keys(client_metadata)}
 
@@ -717,21 +815,53 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
        }),
        do: true
 
+  # A public `/v1` HTTP turn bridged onto its session's upstream websocket is
+  # bound to that connection the same way when it is anchored: the provider
+  # resolves `previous_response_id` only on the connection that produced the
+  # response and answers `Invalid previous_response_id` on any other, including
+  # a fresh one (findings#232 row 232-277, live probe 2026-09-23).
+  defp connection_bound_continuation?(%RequestOptions{
+         continuity: %{upstream_previous_response_id?: true},
+         transport: %{transport: "websocket"},
+         openai_compatibility: %{public_openai_responses_stream: true}
+       }),
+       do: true
+
+  defp connection_bound_continuation?(%RequestOptions{
+         continuity: %{upstream_previous_response_id?: true},
+         transport: %{upstream_websocket_bridge?: true},
+         openai_compatibility: %{public_openai_responses_stream: true}
+       }),
+       do: true
+
   defp connection_bound_continuation?(%RequestOptions{}), do: false
 
-  defp owner_request_forwarder_opts(forwarder_opts, %RequestOptions{} = request_options) do
+  # A remote turn waits a finite total budget (findings#206 rows 206-305,
+  # 206-317): a local submission waits `:infinity` on the owner process, but a
+  # remote owner that stalls is noticed only when this budget expires, and the
+  # turn abandon (and the client's error) hang on that. An override must be a
+  # positive integer too; `:infinity` is refused here, before any owner call,
+  # instead of failing the erpc client's guard and reading as a lost owner.
+  @doc false
+  @spec owner_request_forwarder_opts(keyword(), RequestOptions.t()) :: keyword()
+  def owner_request_forwarder_opts(forwarder_opts, %RequestOptions{} = request_options) do
     derived_timeout =
       max(
         request_options.timeout_config.receive_timeout_ms + 1_000,
         OperationalSettings.current().websocket_idle_timeout_ms + 1_000
       )
 
-    request_timeout = Keyword.get(forwarder_opts, :request_timeout, derived_timeout)
+    request_timeout = forwarder_opts |> Keyword.get(:request_timeout, derived_timeout) |> finite_remote_turn_budget!()
 
     forwarder_opts
     |> Keyword.delete(:request_timeout)
     |> Keyword.put(:timeout, request_timeout)
   end
+
+  defp finite_remote_turn_budget!(timeout) when is_integer(timeout) and timeout > 0, do: timeout
+
+  defp finite_remote_turn_budget!(timeout),
+    do: raise(ArgumentError, "a remote owner turn needs a positive integer request_timeout, got: #{inspect(timeout)}")
 
   @spec direct_websocket_request_data(
           websocket_request_data(),
@@ -777,11 +907,12 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
           assignment_advertised?: request_data.assignment_advertised?,
           connection_bound_continuation?: request_data.connection_bound_continuation?,
           forward_error_body?: request_data.forward_error_body?,
-          submission_notification?:
-            is_function(request_options.transport.websocket_owner_submission_observer, 0)
+          submission_notification?: is_function(request_options.transport.websocket_owner_submission_observer, 0)
         }
 
-        owner_request_envelope(attrs, request_data, request_options)
+        with {:ok, request} <- owner_request_envelope(attrs, request_data, request_options) do
+          WebsocketOwnerRequestV8.new(%{version: 8, request: request, provider_credits_context: request_data.provider_credits_context})
+        end
 
       _invalid_identity ->
         {:error, {:invalid_field, :upstream_identity_id}}
@@ -791,13 +922,19 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   defp owner_request_envelope(attrs, request_data, request_options) do
     admission = RequestOptions.native_compaction_admission(request_options)
 
-    case request_data.client_retry_dispatch_authority do
-      %ClientRetry.DispatchAuthority{} = authority ->
+    case {request_data.websocket_delivery_mode, request_data.client_retry_dispatch_authority} do
+      {:collect_full_history, %ClientRetry.DispatchAuthority{}} when admission == :none ->
+        owner_full_history_envelope(attrs, request_data, request_options)
+
+      {:collect_full_history, %ClientRetry.DispatchAuthority{}} ->
+        {:error, {:invalid_field, :client_retry_dispatch_authority}}
+
+      {_delivery_mode, %ClientRetry.DispatchAuthority{} = authority} ->
         attrs
         |> Map.merge(%{version: 5, client_retry_dispatch_authority: authority})
         |> WebsocketOwnerRequestV5.new()
 
-      nil ->
+      {_delivery_mode, nil} ->
         owner_request_envelope_without_client_retry(
           attrs,
           request_data,
@@ -850,26 +987,17 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   defp owner_request_envelope_without_replay(attrs, request_data, request_options, admission) do
     case {request_data.websocket_delivery_mode, admission} do
-      {delivery_mode,
-       {:ok, capability, {:forwarded, _session, _lease, _downstream, _opts}, _lifecycle}}
+      {delivery_mode, {:ok, capability, {:forwarded, _session, _lease, _downstream, _opts}, _lifecycle}}
       when delivery_mode in [:relay, :collect_compaction] ->
-        owner_request_v3(
-          attrs,
-          delivery_mode,
-          request_data.effective_serving_mode,
-          capability,
-          nil
-        )
+        owner_request_v3(attrs, delivery_mode, request_data.effective_serving_mode, capability)
 
       {:collect_full_history, :none} ->
-        attrs
-        |> Map.merge(%{
-          version: 6,
-          websocket_delivery_mode: :collect_full_history,
-          native_compaction_metadata: request_data.native_compaction_metadata,
-          effective_serving_mode: String.to_existing_atom(request_data.effective_serving_mode)
-        })
-        |> WebsocketOwnerRequestV6.new()
+        owner_full_history_envelope(attrs, request_data, request_options)
+
+      # Full-history delivery carries no admission; one that is present, or
+      # that no longer validates, cannot be dispatched as if it were absent.
+      {:collect_full_history, _unusable_admission} ->
+        {:error, {:invalid_field, :native_compaction_admission}}
 
       {:collect_compaction, _no_owner_capability} ->
         owner_collect_envelope(attrs, request_data, request_options)
@@ -879,40 +1007,56 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     end
   end
 
-  defp owner_collect_envelope(attrs, request_data, request_options) do
-    case request_options.first_compact_collection do
-      %NativeCompactionAdmission.FirstCompactCollection{} = collection ->
-        owner_request_v3(
-          attrs,
-          :collect_compaction,
-          request_data.effective_serving_mode,
-          nil,
-          collection
-        )
+  defp owner_full_history_envelope(attrs, request_data, request_options) do
+    attrs =
+      Map.merge(attrs, %{
+        version: 6,
+        websocket_delivery_mode: :collect_full_history,
+        native_compaction_metadata: request_data.native_compaction_metadata,
+        effective_serving_mode: String.to_existing_atom(request_data.effective_serving_mode)
+      })
 
-      _no_collection ->
-        if collect_compaction_result?(request_options) do
-          attrs
-          |> Map.put(:version, 2)
-          |> Map.put(:websocket_delivery_mode, :collect_compaction)
-          |> Map.put(
-            :effective_serving_mode,
-            String.to_existing_atom(request_data.effective_serving_mode)
-          )
-          |> WebsocketOwnerRequestV2.new()
-        else
-          WebsocketOwnerRequest.new(Map.put(attrs, :version, 1))
-        end
+    case request_data.client_retry_dispatch_authority do
+      nil ->
+        WebsocketOwnerRequestV6.new(attrs)
+
+      %ClientRetry.DispatchAuthority{} = authority ->
+        attrs
+        |> Map.merge(%{
+          version: 7,
+          client_retry_dispatch_authority: authority,
+          compaction_retry_submit_hold: Map.get(request_options.runtime, :compaction_retry_submit_hold)
+        })
+        |> WebsocketOwnerRequestV7.new()
     end
   end
 
-  defp owner_request_v3(attrs, delivery_mode, serving_mode, capability, collection) do
+  # A collected compaction without an owner capability carries no admission:
+  # the owner authorizes a first full-history compaction's collection only
+  # after the exchange, from the upstream session's result receipt
+  # (findings#270 row 270-204).
+  defp owner_collect_envelope(attrs, request_data, request_options) do
+    if collect_compaction_result?(request_options) do
+      attrs
+      |> Map.put(:version, 2)
+      |> Map.put(:websocket_delivery_mode, :collect_compaction)
+      |> Map.put(
+        :effective_serving_mode,
+        String.to_existing_atom(request_data.effective_serving_mode)
+      )
+      |> WebsocketOwnerRequestV2.new()
+    else
+      WebsocketOwnerRequest.new(Map.put(attrs, :version, 1))
+    end
+  end
+
+  defp owner_request_v3(attrs, delivery_mode, serving_mode, capability) do
     attrs
     |> Map.put(:version, 3)
     |> Map.put(:websocket_delivery_mode, delivery_mode)
     |> Map.put(:effective_serving_mode, String.to_existing_atom(serving_mode))
     |> Map.put(:owner_admission_capability, capability)
-    |> Map.put(:first_compact_collection, collection)
+    |> Map.put(:first_compact_collection, nil)
     |> WebsocketOwnerRequestV3.new()
   end
 
@@ -939,13 +1083,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         lifecycle
 
       _other ->
-        case request_options.first_compact_collection do
-          %NativeCompactionAdmission.FirstCompactCollection{binding: binding} ->
-            %{lifecycle_id: binding.lifecycle_id, generation: binding.generation}
-
-          nil ->
-            nil
-        end
+        nil
     end
   end
 
@@ -964,28 +1102,48 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       owner_request,
       forwarder_opts
     )
-    |> observe_owner_request_submission(request_options)
+    |> observe_owner_request_submission(request_options, owner_request)
   end
 
+  # The public outcome stays `owner_unavailable`; the log keeps which envelope
+  # field refused, so a refusal is never indistinguishable from a lost owner.
   defp submit_owner_websocket_request(
-         {:error, _validation_error},
+         {:error, validation_error},
          _session,
          _owner_lease_token,
          _downstream,
          _forwarder_opts,
-         _request_options
-       ),
-       do: {:error, :owner_unavailable}
+         request_options
+       ) do
+    Logger.warning(
+      "websocket owner request refused before submission " <>
+        "reason=#{owner_request_validation_reason(validation_error)} " <>
+        "request_id=#{DiagnosticTaxonomy.safe_correlator(owner_request_id(request_options))}"
+    )
 
+    {:error, :owner_unavailable}
+  end
+
+  defp owner_request_validation_reason({:invalid_field, field}) when is_atom(field),
+    do: "invalid_field:#{DiagnosticTaxonomy.reason_code(field)}"
+
+  defp owner_request_validation_reason({:unknown_fields, _fields}), do: "unknown_fields"
+
+  # The upstream request runs inside the direct cleanup's upstream-wait span,
+  # the one point where a closing socket may stop this task (findings#206 row
+  # 206-110).
   defp direct_websocket_request(upstream_request, request_options, _identity, request, attempt) do
+    direct_cleanup = request_options.runtime.direct_cleanup
+
     case request_options.transport.upstream_websocket_session do
       pid when is_pid(pid) ->
-        result = UpstreamWebsocketSession.request(pid, upstream_request)
-
-        mark_upstream_websocket_body_visible(result, request, attempt)
+        direct_cleanup
+        |> DirectCleanup.upstream_wait(fn -> UpstreamWebsocketSession.request(pid, upstream_request) end)
+        |> mark_upstream_websocket_body_visible(request, attempt)
 
       _pid ->
-        UpstreamWebsocketSession.request_once(upstream_request)
+        direct_cleanup
+        |> DirectCleanup.upstream_wait(fn -> UpstreamWebsocketSession.request_once(upstream_request) end)
         |> mark_upstream_websocket_body_visible(request, attempt)
     end
   end
@@ -999,7 +1157,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
             session,
             owner_lease_token,
             downstream,
-            Jason.encode!(response_processed_upstream_payload(payload)),
+            CodexPooler.JSON.encode!(response_processed_upstream_payload(payload)),
             forwarder_opts
           )
 
@@ -1017,7 +1175,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          {:ok, :sent} <-
            UpstreamWebsocketSession.send_request_frame(
              pid,
-             Jason.encode!(response_processed_upstream_payload(payload))
+             CodexPooler.JSON.encode!(response_processed_upstream_payload(payload))
            ) do
       :ok
     else
@@ -1189,54 +1347,88 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   defp owner_instance_matches?(_owner_instance_id, _owner_session), do: false
 
-  defp owner_request_result(:ok, _identity, request, attempt, _request_options) do
-    {:ok, %{body: "", terminal: "response.completed", status: 200, headers: []}}
-    |> mark_upstream_websocket_body_visible(request, attempt)
-  end
-
   # An owner success reply crosses a node boundary, so validate the producer's
   # contract before any consumer destructures or combines its values. A bad
   # shape settles as one normal owner-crash failure without logging the reply.
-  defp owner_request_result({:ok, result}, _identity, request, attempt, request_options) do
-    case owner_reply_problem(result) do
-      :ok ->
+  defp owner_request_result({:ok, result}, identity, request, attempt, request_options, expected_context) do
+    case owner_reply_problem(result, expected_context) do
+      :unsent_continuation_guard ->
         mark_upstream_websocket_body_visible({:ok, result}, request, attempt)
+
+      :ok ->
+        receipt = result.provider_credits_admission
+
+        if receipt.context == expected_context and receipt.context.upstream_identity_id == identity.id and
+             receipt.context.request_id == multi_agent_round_request_id(request, request_options) and receipt.context.attempt_id == (attempt && attempt.id),
+           do: mark_upstream_websocket_body_visible({:ok, result}, request, attempt),
+           else: contain_malformed_owner_reply({:invalid, ["provider_credits_admission"]}, request_options)
 
       problem ->
         contain_malformed_owner_reply(problem, request_options)
     end
   end
 
+  defp owner_request_result(result, identity, request, attempt, request_options, _expected_context),
+    do: owner_request_result(result, identity, request, attempt, request_options)
+
+  # An owner's error reply also crosses a node boundary. The owner's own
+  # failure for a turn whose upstream connection process exited carries no
+  # response headers, and the failure finalization reads them: give every
+  # error reply the empty headers the atom errors get (findings#273).
   defp owner_request_result(
          {:error, %{body: _body, reason: _reason} = response},
          _identity,
-         _request,
-         _attempt,
+         request,
+         attempt,
          _request_options
        ) do
-    {:error, response}
+    response =
+      if ExpiredOwnerGenerationCleanup.stopped_caller?(response, request, attempt),
+        do: response,
+        else: ExpiredOwnerGenerationCleanup.strip(response)
+
+    {:error, Map.put_new(response, :headers, [])}
   end
 
   defp owner_request_result({:error, reason}, _identity, _request, _attempt, _request_options) do
     {:error, %{body: "", reason: reason, headers: [], started: false}}
   end
 
+  defp owner_request_result(:ok, _identity, _request, _attempt, _request_options),
+    do: {:error, %{body: "", reason: :owner_unavailable, headers: [], started: false}}
+
+  # The observer tells the socket that the owner's `:complete` will follow the
+  # result, and the socket waits for it before it releases the response task.
+  # The owner sends `:complete` only after relaying a turn's frames: a collected
+  # delivery (`collect_compaction`, `collect_full_history`) comes back whole in
+  # the owner's reply, and the socket writes it itself, so no `:complete`
+  # follows it. On a remote owner the socket then waited for it forever, and
+  # every later frame of the connection queued behind the parked task; a local
+  # owner hid it because that socket releases on its own accepted terminal
+  # (findings#206 row 206-334, two-node run).
   defp observe_owner_request_submission(
          {:websocket_owner_submission_accepted, result},
-         %RequestOptions{transport: %{websocket_owner_submission_observer: observer}}
+         %RequestOptions{transport: %{websocket_owner_submission_observer: observer}},
+         owner_request
        )
        when is_function(observer, 0) do
-    observe_owner_request_submission(observer)
+    if owner_completion_follows?(owner_request), do: observe_owner_request_submission(observer)
     result
   end
 
   defp observe_owner_request_submission(
          {:websocket_owner_submission_accepted, result},
-         %RequestOptions{}
+         %RequestOptions{},
+         _owner_request
        ),
        do: result
 
-  defp observe_owner_request_submission(result, %RequestOptions{}), do: result
+  defp observe_owner_request_submission(result, %RequestOptions{}, _owner_request), do: result
+
+  defp owner_completion_follows?(%WebsocketOwnerRequestV8{request: request}), do: owner_completion_follows?(request)
+
+  defp owner_completion_follows?(owner_request),
+    do: Map.get(owner_request, :websocket_delivery_mode, :relay) == :relay
 
   defp observe_owner_request_submission(observer) do
     observer.()
@@ -1261,6 +1453,27 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     {:error, %{body: "", reason: :owner_crashed, headers: [], started: false}}
   end
 
+  defp owner_reply_problem(%{transport_failure: transport_failure} = reply, _expected_context) do
+    if map_size(TransportFailureReason.sanitize_continuation_generation_guard_metadata(transport_failure)) > 0 do
+      owner_reply_shape_problem(reply, [:body, :terminal, :status, :headers])
+    else
+      owner_reply_problem(reply)
+    end
+  end
+
+  defp owner_reply_problem(reply, _expected_context), do: owner_reply_problem(reply)
+
+  defp owner_reply_shape_problem(reply, fields) do
+    case Enum.reject(fields, &Map.has_key?(reply, &1)) do
+      [] ->
+        invalid = owner_reply_invalid_fields(Map.put(reply, :provider_credits_admission, nil)) -- ["provider_credits_admission"]
+        if invalid == [], do: :unsent_continuation_guard, else: {:invalid, invalid}
+
+      missing ->
+        {:missing, missing}
+    end
+  end
+
   defp owner_reply_problem(reply) when is_map(reply) do
     case Enum.reject(@owner_success_fields, &Map.has_key?(reply, &1)) do
       [] ->
@@ -1282,15 +1495,12 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       {:terminal, not clean_binary?(reply.terminal)},
       {:status, reply.status != 200},
       {:headers, not owner_response_headers?(reply.headers)},
+      {:provider_credits_admission, not ProviderCreditsAdmission.valid_receipt?(reply.provider_credits_admission)},
       {:response_id, invalid_optional_owner_field?(reply, :response_id, &clean_binary?/1)},
-      {:upstream_websocket_connection,
-       invalid_optional_owner_field?(reply, :upstream_websocket_connection, &is_map/1)},
-      {:websocket_frame_headers,
-       invalid_optional_owner_field?(reply, :websocket_frame_headers, &is_map/1)},
-      {:upstream_error_code,
-       invalid_optional_owner_field?(reply, :upstream_error_code, &nil_or_clean_binary?/1)},
-      {:upstream_error_param,
-       invalid_optional_owner_field?(reply, :upstream_error_param, &nil_or_clean_binary?/1)},
+      {:upstream_websocket_connection, invalid_optional_owner_field?(reply, :upstream_websocket_connection, &is_map/1)},
+      {:websocket_frame_headers, invalid_optional_owner_field?(reply, :websocket_frame_headers, &is_map/1)},
+      {:upstream_error_code, invalid_optional_owner_field?(reply, :upstream_error_code, &nil_or_clean_binary?/1)},
+      {:upstream_error_param, invalid_optional_owner_field?(reply, :upstream_error_param, &nil_or_clean_binary?/1)},
       {:transport_failure, invalid_optional_owner_field?(reply, :transport_failure, &is_map/1)}
     ]
     |> Enum.flat_map(fn
@@ -1416,16 +1626,115 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   defp multi_agent_round_request_id(_request, %RequestOptions{} = request_options),
     do: request_options.request_metadata.request_id
 
-  defp websocket_headers(identity, token, routing_hint) do
+  defp websocket_headers(
+         identity,
+         token,
+         routing_hint,
+         %RequestOptions{} = request_options,
+         decoded_payload
+       ) do
     upstream_headers(
       identity,
       token,
       maybe_put_routing_hint_header(
-        [{"openai-beta", "responses_websockets=2026-02-06"}],
+        [
+          {"openai-beta", "responses_websockets=2026-02-06"}
+          | websocket_provider_session_headers(request_options, decoded_payload)
+        ],
         routing_hint
       )
     )
   end
+
+  # The Codex client sends `session-id`, `thread-id` and `x-client-request-id`
+  # on its websocket handshake exactly as on HTTP (openai/codex main c11ed24c2,
+  # core/src/client.rs `build_websocket_headers`, the websocket connect path).
+  # That handshake also carries the client's `x-oai-attestation`,
+  # `OpenAI-Beta`, `x-responsesapi-include-timing-metrics`,
+  # `x-codex-beta-features`, its routing hint and the same compatibility
+  # metadata headers as an HTTP turn. The Pooler sets its own `openai-beta`
+  # value and derives its own routing hint, and deliberately copies none of
+  # the client's per-turn handshake headers onto a reused upstream connection:
+  # one owner socket serves many turns, downstream sockets and API keys of a
+  # Pool, and the attestation is bound to the client's own account. The frame
+  # `client_metadata` carries the per-turn values instead. A native
+  # Codex-backend handshake forwards only the three provider session names the
+  # authenticated downstream native upgrade carried, under the same bounds as
+  # the HTTP route and keeping the first valid value per name. They stay in
+  # the upstream websocket reuse key: a connection opened with one client's
+  # values never serves a turn carrying other values or none. `/v1` origins
+  # (translated, bridged, public websocket) send none.
+  defp websocket_provider_session_headers(
+         %RequestOptions{
+           transport: %{upstream_endpoint: endpoint, forwarded_metadata_headers: headers},
+           openai_compatibility: %{
+             source_endpoint: nil,
+             openai_chat_payload: nil,
+             public_openai_responses_stream: false
+           }
+         },
+         _decoded_payload
+       )
+       when endpoint in @regular_runtime_metadata_endpoints and is_list(headers) do
+    names = TransportEnvelope.provider_session_header_names()
+
+    headers
+    |> Enum.flat_map(fn
+      {name, value} when is_binary(name) and is_binary(value) ->
+        name = String.downcase(name)
+        if name in names, do: forwarded_metadata_header(name, value), else: []
+
+      _other ->
+        []
+    end)
+    |> Enum.uniq_by(fn {name, _value} -> name end)
+  end
+
+  # Public `/v1` origin (bridged HTTP turn and public websocket alike): the
+  # caller's own session headers stay local, and the only provider session
+  # header on the handshake is the Pooler-derived `session-id`, synthesized the
+  # same way as on the `/v1` HTTP path from the raw `prompt_cache_key` of the
+  # final upstream body and the authenticated tenant scope. The routing copy is
+  # nulled for websocket and the stored form is hashed, so the body is the only
+  # source of the production key. Without a tenant scope or a usable key the
+  # handshake sends nothing, exactly as on HTTP.
+  #
+  # The header raises the chance that a turn on a fresh upstream connection
+  # lands on a replica still holding the warm prefix. It is a probability, not
+  # a guarantee, and the earlier local figures here (0.0 without, 0.9856 with)
+  # overstated it. Measured on production over 12 interleaved triples, each on
+  # a provably fresh connection with its own generated prefix: a stable derived
+  # id hit 7 of 9 turns, no `prompt_cache_key` at all hit 2 of 12, and a key
+  # present but changed between turns hit 1 of 12 (Fisher 0.0092 and 0.0022;
+  # changed-key versus no-key is p = 1.0, so it is the *stability* of the id
+  # that does the work, not the presence of a key). Every hit recovered exactly
+  # 11,008 of ~11,900 input tokens and every miss exactly zero, so the hit rate
+  # is the statistic and a mean ratio hides the behaviour. Hits also crossed
+  # upstream accounts in 5 of 7 cases, so the provider's cache is not scoped to
+  # the credential that warmed it. See codex-pooler-findings#133.
+  #
+  # Like every other handshake header except the routing hint it enters
+  # `UpstreamWebsocketSession.request_key/1`, so a later turn that changes or
+  # drops `prompt_cache_key` opens its own connection rather than riding one
+  # whose handshake carried another conversation's id.
+  defp websocket_provider_session_headers(
+         %RequestOptions{
+           transport: %{upstream_endpoint: endpoint},
+           openai_compatibility: %{source_endpoint: source_endpoint}
+         } = request_options,
+         {:ok, %{"prompt_cache_key" => prompt_cache_key}}
+       )
+       when endpoint in @regular_runtime_metadata_endpoints and is_binary(source_endpoint) do
+    case TransportEnvelope.prompt_cache_session_id(
+           prompt_cache_tenant_scope(request_options),
+           prompt_cache_key
+         ) do
+      session_id when is_binary(session_id) -> forwarded_metadata_header("session-id", session_id)
+      nil -> []
+    end
+  end
+
+  defp websocket_provider_session_headers(%RequestOptions{}, _decoded_payload), do: []
 
   defp normalize_upstream_transport_result(
          {:error, %Finch.TransportError{} = exception},
@@ -1486,6 +1795,10 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   defp normalize_upstream_transport_result(result, _identity, _opts), do: result
 
+  # A streaming request's 4xx body is read here, bounded by `RejectionDrain`
+  # (64 KiB, one 2 s deadline). A 429 is read too since findings#206 row
+  # 206-531: a provider usage limit names the account's reset only in its body,
+  # and the last candidate's refusal answers it (`ProviderUsageLimit`).
   defp maybe_drain_rejection_body(
          {:ok,
           %Req.Response{
@@ -1494,7 +1807,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
           } = response},
          %RequestOptions{} = request_options
        )
-       when status in 400..499 and status != 429 do
+       when status in 400..499 do
     body = RejectionDrain.drain(response)
 
     response =
@@ -1610,17 +1923,28 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     end
   end
 
+  # The Codex client (0.148+) sends `model=<slug>[;tier=<tier>]` on every
+  # Codex-backend Responses and compact request, HTTP and websocket handshake
+  # alike. Native and `/v1`-translated turns derive it the same way: only from
+  # the final upstream body (effective model after aliasing, effective tier
+  # after policy and `fast` canonicalization). A caller-supplied header is never
+  # the source.
+  defp routing_hint_header(body, routing_hint_authorized?, %RequestOptions{} = request_options)
+       when is_binary(body) do
+    routing_hint_header(
+      decoded_upstream_payload(body),
+      routing_hint_authorized?,
+      request_options
+    )
+  end
+
   defp routing_hint_header(
-         body,
+         {:ok, %{} = payload},
          true,
-         %RequestOptions{
-           transport: %{upstream_endpoint: endpoint},
-           openai_compatibility: %{source_endpoint: nil, openai_chat_payload: nil}
-         }
+         %RequestOptions{transport: %{upstream_endpoint: endpoint}}
        )
-       when endpoint in @regular_runtime_metadata_endpoints and is_binary(body) do
-    with {:ok, %{} = payload} <- Jason.decode(body),
-         {:ok, model} <- routing_hint_component(Map.get(payload, "model")),
+       when endpoint in @regular_runtime_metadata_endpoints do
+    with {:ok, model} <- routing_hint_component(Map.get(payload, "model")),
          {:ok, service_tier} <- routing_hint_service_tier(payload) do
       case service_tier do
         nil -> "model=#{model}"
@@ -1631,7 +1955,19 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     end
   end
 
-  defp routing_hint_header(_body, _routing_hint_authorized?, %RequestOptions{}), do: nil
+  defp routing_hint_header(_payload, _routing_hint_authorized?, %RequestOptions{}), do: nil
+
+  # The decoded final upstream body, or `:error` for anything that is not a
+  # JSON object. Header derivation reads the body the upstream actually
+  # receives, never a caller-supplied value.
+  defp decoded_upstream_payload(body) when is_binary(body) do
+    case CodexPooler.JSON.decode(body) do
+      {:ok, %{} = payload} -> {:ok, payload}
+      _other -> :error
+    end
+  end
+
+  defp decoded_upstream_payload(_body), do: :error
 
   defp routing_hint_service_tier(payload) do
     case Map.fetch(payload, "service_tier") do

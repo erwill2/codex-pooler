@@ -18,6 +18,9 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
 
   @rejection_token_max_bytes 80
   @rejection_token_pattern ~r/\A[A-Za-z0-9_.-]+\z/
+  @rejection_supported_values_states ~w(present none unparseable)
+  @rejection_supported_values_max 12
+  @rejection_supported_value_max_bytes 32
 
   @list_debug_keys ~w(continuity failure attempt)
   @detail_debug_keys ~w(continuity terminal_state turn attempts)
@@ -34,8 +37,12 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
         api_key_display_name: log.api_key_display_name,
         api_key_prefix: log.api_key_prefix,
         requested_model: log.requested_model,
+        upstream_model: log.upstream_model,
+        served_model: log.served_model,
+        model_conflict_attempts: Map.get(log, :model_conflict_attempts, []),
         transport: log.transport,
         status: log.status,
+        display_status: Map.get(log, :display_status) || log.status,
         usage_status: log.usage_status,
         correlation_id: log.correlation_id,
         response_status_code: log.response_status_code,
@@ -88,8 +95,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
   end
 
   @spec list_text(map()) :: String.t()
-  def list_text(%{"items" => items, "total" => total, "offset" => offset}) do
-    first_line = first_line(items, total, offset)
+  def list_text(%{"items" => items, "total" => total, "offset" => offset} = page) do
+    first_line = first_line(items, total_text(total, Map.get(page, "totalExact", true)), offset)
 
     if items == [] do
       first_line
@@ -102,17 +109,37 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
 
   @spec detail_text(map()) :: String.t()
   def detail_text(%{"status" => "ok", "item" => item}) do
-    ReadableText.detail("request log", detail_text_row(item), detail_text_fields())
+    summary = ReadableText.detail("request log", detail_text_row(item), detail_text_fields())
+    attempts = get_in(item, ["debug", "attempts"]) || []
+
+    rows =
+      Enum.map(attempts, fn attempt ->
+        observation = attempt["model_observation"] || %{}
+
+        attempt
+        |> Map.take(~w(attempt_number upstream_model served_model))
+        |> Map.merge(Map.take(observation, ~w(conflict first_conflicting_model terminal_model terminal_status coverage)))
+        |> Map.put("coverage", observation["coverage"] || "uncollected")
+      end)
+
+    summary <> "\n" <> ReadableText.list("attempt model declarations", rows, ~w(attempt_number upstream_model served_model first_conflicting_model terminal_model terminal_status coverage conflict))
   end
 
   def detail_text(%{"status" => "not_found"}), do: ReadableText.not_found("request log")
 
+  # The text reads each row's displayed status: a client cancellation is
+  # recorded `failed` and shown as `client_cancelled` (`RequestOutcome`); the
+  # structured `status` keeps the recorded value.
   defp first_line(items, total, offset) do
     shown_count = min(length(items), 10)
-    status_text = tally_text(items, "status")
+    status_text = items |> Enum.map(&Map.put(&1, "status", text_status(&1))) |> tally_text("status")
 
     "#{shown_count} request logs returned; total #{total}; offset #{offset}; statuses #{status_text}"
   end
+
+  # An inexact total is a lower bound: more rows than it match.
+  defp total_text(total, true), do: Integer.to_string(total)
+  defp total_text(total, false), do: "more than #{total}"
 
   defp text_rows(items), do: Enum.map(items, &text_row/1)
 
@@ -126,11 +153,14 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       "endpoint",
       "status",
       "requested_model",
+      "served_model",
       "transport",
       "usage_status",
       "latency_ms"
     ])
+    |> Map.put("status", text_status(item))
     |> Map.put("pool", pool_text(item))
+    |> Map.put("model_conflict_attempts", Enum.join(Map.get(item, "model_conflict_attempts", []), ","))
     |> Map.put("retries", Map.get(item, "retry_count") || 0)
     |> maybe_put_continuity_denial_text(Map.get(item, "errors"))
     |> maybe_put_debug_text(Map.get(item, "debug"))
@@ -141,6 +171,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
     |> text_row()
     |> maybe_put_value("response", Map.get(item, "response_status_code"))
     |> Map.put("upstream", upstream_text(item))
+    |> maybe_put_value("upstream_model", Map.get(item, "upstream_model"))
     |> maybe_put_terminal_diagnostics_text(Map.get(item, "debug"))
     |> maybe_put_rejection_metadata_text(Map.get(item, "debug"))
     |> maybe_put_compaction_bridge_text(Map.get(item, "compaction_bridge"))
@@ -157,6 +188,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       {"endpoint", "route"},
       {"status", "status"},
       {"requested_model", "model"},
+      {"served_model", "served_model"},
+      {"model_conflict_attempts", "model_conflict_attempts"},
       {"transport", "transport"},
       {"usage_status", "usage"},
       {"latency_ms", "latency_ms"},
@@ -182,14 +215,17 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       [
         {"response", "response"},
         {"upstream", "upstream", required: true},
+        {"upstream_model", "upstream_model"},
         {"upstream_error_code", "upstream_error_code"},
         {"stream_terminal_type", "stream_terminal_type"},
+        {"compaction_invalid_reason", "compaction_invalid_reason"},
         {"upstream_error_param", "upstream_error_param"},
         {"rejection_error_code", "rejection_error_code"},
         {"rejection_error_type", "rejection_error_type"},
         {"rejection_error_param", "rejection_error_param"},
         {"rejection_message_present", "rejection_message_present"},
         {"rejection_message_bytes", "rejection_message_bytes"},
+        {"rejection_supported_values_state", "rejection_supported_values_state"},
         {"compaction_bridge_applied", "compaction_bridge_applied"},
         {"compaction_result_transport", "compaction_result_transport"},
         {"metadata_summary", "metadata"}
@@ -314,6 +350,10 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
           valid_terminal_identifier(attempt["stream_terminal_type"])
         )
         |> maybe_put_value(
+          "compaction_invalid_reason",
+          valid_terminal_identifier(attempt["compaction_invalid_reason"])
+        )
+        |> maybe_put_value(
           "upstream_error_param",
           valid_upstream_error_param(attempt["upstream_error_param"])
         )
@@ -375,7 +415,38 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       valid_rejection_param(metadata["rejection_error_param"])
     )
     |> maybe_put_valid_rejection_message(metadata)
+    |> maybe_put_valid_supported_values(metadata)
   end
+
+  # `state` and the list stay separate fields so a provider that named no
+  # alternatives, a list this parser refused, and a rejection the field never
+  # applied to remain three readable answers (codex-pooler-findings#177).
+  defp maybe_put_valid_supported_values(
+         metadata,
+         %{"rejection_supported_values_state" => state} = attempt
+       )
+       when state in @rejection_supported_values_states do
+    metadata
+    |> Map.put("rejection_supported_values_state", state)
+    |> maybe_put_value(
+      "rejection_supported_values",
+      valid_supported_values(attempt["rejection_supported_values"])
+    )
+  end
+
+  defp maybe_put_valid_supported_values(metadata, _attempt), do: metadata
+
+  defp valid_supported_values(values) when is_list(values) do
+    valid = Enum.filter(values, &valid_rejection_token/1)
+
+    if valid != [] and length(valid) == length(values) and
+         length(valid) <= @rejection_supported_values_max and
+         Enum.all?(valid, &(byte_size(&1) <= @rejection_supported_value_max_bytes)),
+       do: valid,
+       else: nil
+  end
+
+  defp valid_supported_values(_values), do: nil
 
   defp valid_rejection_token(value) when is_binary(value) do
     if byte_size(value) in 1..@rejection_token_max_bytes and
@@ -441,6 +512,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       [_old_first_line] -> first_line
     end
   end
+
+  defp text_status(item), do: Map.get(item, "display_status") || Map.get(item, "status")
 
   defp tally_text([], _field), do: "none"
 
@@ -551,6 +624,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       rejection_error_param
       rejection_message_present
       rejection_message_bytes
+      rejection_supported_values
+      rejection_supported_values_state
     )
 
     attempt =
@@ -563,6 +638,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       attempt
       |> put_or_delete_terminal_identifier("upstream_error_code")
       |> put_or_delete_terminal_identifier("stream_terminal_type")
+      |> put_or_delete_terminal_identifier("compaction_invalid_reason")
 
     attempt
     |> Map.drop(rejection_keys)

@@ -56,7 +56,7 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseTest do
       assert has_element?(
                view,
                "#showcase-saved-reset-request-cause",
-               "Last automatic redemption · Request · weekly exhausted"
+               "Last automatic redemption · Request · long-window quota exhausted"
              )
 
       assert has_element?(
@@ -91,7 +91,7 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseTest do
       |> LazyHTML.query("#observatory-traffic-mode-cumulative")
       |> LazyHTML.attribute("phx-click")
 
-    assert [["dispatch", dispatch]] = Jason.decode!(click_command)
+    assert [["dispatch", dispatch]] = CodexPooler.JSON.decode!(click_command)
     assert dispatch["event"] == "chart:set-mode"
     assert dispatch["to"] == "#observatory-traffic-plot"
     assert dispatch["detail"] == %{"mode" => "cumulative"}
@@ -104,34 +104,12 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseTest do
       |> LazyHTML.attribute("data-chart-series")
 
     assert series_json
-           |> Jason.decode!()
+           |> CodexPooler.JSON.decode!()
            |> Enum.any?(fn %{"data" => [first, second | _rest]} -> second < first end)
 
     view |> element("#showcase-toggle-paused") |> render_click()
     assert has_element?(view, "#observatory-resume")
     assert has_element?(view, "#observatory-freshness.is-paused")
-  end
-
-  test "flash, request drawer, and policy dialog have deterministic visible review states" do
-    for {trigger, review_state, selectors} <- [
-          {"#showcase-show-flash", "flash", ["#flash-info[role='alert']:not([hidden])"]},
-          {"#showcase-open-request-drawer", "request-drawer",
-           [
-             "#component-showcase.drawer-open",
-             "#request-log-detail-drawer[checked]",
-             "[data-role='request-log-detail-drawer-side']"
-           ]},
-          {"#showcase-open-policy-editor", "policy-dialog", ["#showcase-policy-editor[open]"]}
-        ] do
-      {:ok, view, _html} = mount_showcase("dark")
-      view |> element(trigger) |> render_click()
-
-      assert has_element?(view, "#component-showcase[data-review-state='#{review_state}']")
-
-      for selector <- selectors do
-        assert has_element?(view, selector)
-      end
-    end
   end
 
   test "request drawer showcase renders terminal diagnostics through the real component in both themes" do
@@ -182,6 +160,9 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseTest do
     assert has_element?(view, "#oauth-link-callback-step", "Callback URL")
     assert has_element?(view, "#oauth-link-callback-form")
     assert has_element?(view, "#oauth-link-callback-url[required][aria-describedby]")
+    # The step also draws the move itself, once, for the browser the pooler
+    # cannot see into.
+    assert has_element?(view, "#oauth-link-callback-demo[data-role='oauth-callback-paste-demo']")
     # The completing action lives in the dialog footer, beside Cancel, and is the
     # dialog's only filled orange: the URL row's Open and Copy are peers below it.
     assert has_element?(

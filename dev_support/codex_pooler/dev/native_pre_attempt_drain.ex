@@ -4,6 +4,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
 
   import Ecto.Query
   alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Dev.NativeCompletionDrain
   alias CodexPooler.Gateway.Persistence.CodexTurn
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Repo
@@ -46,6 +47,14 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
     case Process.whereis(__MODULE__) do
       nil -> {:error, :capture_required}
       _ -> GenServer.call(__MODULE__, :drain, @budget + 5_000)
+    end
+  end
+
+  @spec hold_caller() :: :ok | {:error, atom()}
+  def hold_caller do
+    case Process.whereis(__MODULE__) do
+      nil -> {:error, :capture_required}
+      pid -> GenServer.call(pid, :hold_caller)
     end
   end
 
@@ -152,8 +161,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
          {:ok, owner} <- WebsocketOwnerSession.lookup(session_id),
          {:ok, %{active_turn?: false, draining?: false}} <-
            WebsocketOwnerSession.owner_status(owner) do
-      {:reply, :ok,
-       %{state | armed: true, captured: true, pool_id: pool_id, session_id: session_id}}
+      {:reply, :ok, %{state | armed: true, captured: true, pool_id: pool_id, session_id: session_id}}
     else
       _ -> {:reply, {:error, :idle_owner_required}, state}
     end
@@ -180,8 +188,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
 
     case sessions do
       [session_id] ->
-        {:reply, :ok,
-         %{state | armed: true, captured: true, pool_id: pool_id, session_id: session_id}}
+        {:reply, :ok, %{state | armed: true, captured: true, pool_id: pool_id, session_id: session_id}}
 
       _ ->
         {:reply, {:error, :visible_attempt_required}, state}
@@ -219,7 +226,15 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
 
   def handle_call(:drain, _from, state), do: {:reply, {:error, :capture_required}, state}
 
+  def handle_call(:hold_caller, _from, %{captured: true} = state) do
+    {:reply, NativeCompletionDrain.hold(state.pool_id, state.session_id), state}
+  end
+
+  def handle_call(:hold_caller, _from, state),
+    do: {:reply, {:error, :capture_required}, state}
+
   def handle_call(:disarm, _from, state) do
+    NativeCompletionDrain.cleanup()
     :telemetry.detach(@handler)
     if is_pid(state.task), do: send(state.task, {__MODULE__, :release})
     {:stop, :normal, :ok, state}
@@ -228,8 +243,10 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
   def handle_call(:status, _from, state) do
     result = Map.take(state, [:armed, :captured, :drained])
 
-    {:reply, Map.put(result, :task_alive, is_pid(state.task) && Process.alive?(state.task)),
-     state}
+    {:reply,
+     result
+     |> Map.put(:task_alive, is_pid(state.task) && Process.alive?(state.task))
+     |> Map.merge(NativeCompletionDrain.status()), state}
   end
 
   defp empty,
@@ -244,6 +261,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrain do
 
   @impl true
   def terminate(_reason, state) do
+    NativeCompletionDrain.cleanup()
     :telemetry.detach(@handler)
     if is_pid(state.task), do: send(state.task, {__MODULE__, :release})
     :ok

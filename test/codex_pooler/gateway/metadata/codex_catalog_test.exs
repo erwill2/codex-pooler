@@ -2,65 +2,47 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
   use ExUnit.Case, async: false
 
   alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.Metadata.CanonicalModelSource
   alias CodexPooler.Gateway.Metadata.CodexCatalog
-  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
 
-  test "build/3 is independent of operational context-window settings" do
-    previous_env = Application.get_env(:codex_pooler, OperationalSettings)
+  # findings#258 row 258-61: production serves only the canonical pristine
+  # source path; the aggregate-model builder these cases used to exercise had no
+  # caller outside tests and was removed. The cases that still describe served
+  # behaviour run through `build_selected_sources/4`.
 
-    on_exit(fn -> restore_operational_settings(previous_env) end)
+  test "preserves the upstream default and opt-in maximum in the native Codex catalog" do
+    source = Map.put(gpt6_context_metadata(), "slug", "gpt-6-sol-context")
 
-    inputs = {[context_model()], unrestricted_policy(), %{}}
+    assert {:ok, result} =
+             CodexCatalog.build_selected_sources(
+               [{model("gpt-6-sol-context", %{}), source}],
+               unrestricted_policy(),
+               %{},
+               %{}
+             )
 
-    put_context_window_override(128_000)
-    first = apply(CodexCatalog, :build, Tuple.to_list(inputs))
-
-    put_context_window_override(256_000)
-    second = apply(CodexCatalog, :build, Tuple.to_list(inputs))
-
-    assert first.body == second.body
-    assert first.etag == second.etag
-  end
-
-  test "keeps native Codex context raw so the client applies the effective percentage once" do
-    result = CodexCatalog.build([context_model()], unrestricted_policy(), %{})
     [model] = result.body["models"]
 
     assert model["context_window"] == 272_000
-    assert model["max_context_window"] == 272_000
-    assert is_nil(model["auto_compact_token_limit"])
-    assert model["effective_context_window_percent"] == 95
-  end
-
-  test "projects GPT-5.6 long-context metadata into the raw native Codex catalog" do
-    result =
-      CodexCatalog.build(
-        [model("gpt-5.6-context", gpt56_context_metadata())],
-        unrestricted_policy(),
-        %{"gpt-5.6-context" => ["long_context"]},
-        %{}
-      )
-
-    [model] = result.body["models"]
-
-    assert model["context_window"] == 872_000
     assert model["max_context_window"] == 872_000
-    assert model["auto_compact_token_limit"] == 784_800
+    assert model["auto_compact_token_limit"] == nil
     assert model["effective_context_window_percent"] == 95
   end
 
   test "builds a slug-sorted catalog with an exact deterministic weak revision" do
-    result = CodexCatalog.build(Enum.reverse(models()), unrestricted_policy(), %{})
+    sources = [{model("gpt-a", %{}), pristine_source("gpt-a")}, {model("gpt-b", %{}), pristine_source("gpt-b")}]
+
+    assert {:ok, result} = selected(Enum.reverse(sources))
 
     assert Enum.map(result.body["models"], & &1["slug"]) == ["gpt-a", "gpt-b"]
     assert result.etag =~ ~r/^W\/"cp-models-v1-[0-9a-f]{64}"$/
-    assert result == CodexCatalog.build(models(), unrestricted_policy(), %{})
+    assert {:ok, ^result} = selected(sources)
   end
 
   test "canonical fixture source preserves released-client capability booleans" do
     source = %{
-      "slug" => "gpt-5.5",
+      "slug" => "gpt-6-sol",
       "supports_responses" => true,
       "supports_streaming" => true,
       "supports_tools" => true,
@@ -74,11 +56,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
       }
     }
 
-    result =
-      "gpt-5.5"
-      |> model(source)
-      |> put_source_models(%{"assignment-fixture" => source})
-      |> then(&CodexCatalog.build([&1], unrestricted_policy(), %{}))
+    assert {:ok, result} = selected([{model("gpt-6-sol", %{}), source}])
 
     assert [projected] = result.body["models"]
     assert projected["supports_responses"]
@@ -102,9 +80,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
     assert CodexCatalog.etag(atom_body) == CodexCatalog.etag(string_body)
 
     refute CodexCatalog.etag(string_body) ==
-             CodexCatalog.etag(
-               put_in(string_body, ["models", Access.at(0), "values"], [1.0, 1, nil])
-             )
+             CodexCatalog.etag(put_in(string_body, ["models", Access.at(0), "values"], [1.0, 1, nil]))
   end
 
   test "rejects unsupported values and ambiguous equivalent object keys" do
@@ -122,91 +98,25 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
   end
 
   test "changes the revision for any final field or model membership change" do
-    result = CodexCatalog.build(models(), unrestricted_policy(), %{})
+    sources = [{model("gpt-a", %{}), pristine_source("gpt-a")}, {model("gpt-b", %{}), pristine_source("gpt-b")}]
+    [{gpt_a, source_a} | _rest] = sources
 
-    changed_field =
-      CodexCatalog.build(
-        [model("gpt-a", %{"description" => "changed"})],
-        unrestricted_policy(),
-        %{}
-      )
-
-    changed_membership = CodexCatalog.build([hd(models())], unrestricted_policy(), %{})
+    assert {:ok, result} = selected(sources)
+    assert {:ok, changed_field} = selected([{gpt_a, Map.put(source_a, "description", "changed")} | tl(sources)])
+    assert {:ok, changed_membership} = selected([hd(sources)])
 
     refute result.etag == changed_field.etag
     refute result.etag == changed_membership.etag
   end
 
-  test "projects unrestricted, maximum, and enforced reasoning from normalized policy" do
-    model = model("gpt-a", reasoning_metadata())
+  test "missing and malformed effective mode entries default to Full without source fallback" do
+    source = Map.put(pristine_source("gpt-a"), "use_responses_lite", true)
+    sources = [{model("gpt-a", %{}), source}]
 
-    unrestricted = CodexCatalog.build([model], unrestricted_policy(), %{})
-    maximum = CodexCatalog.build([model], policy(maximum_reasoning_effort: "medium"), %{})
-    enforced = CodexCatalog.build([model], policy(enforced_reasoning_effort: "high"), %{})
+    assert {:ok, explicit_lite} =
+             CodexCatalog.build_selected_sources(sources, unrestricted_policy(), %{}, %{"gpt-a" => "lite"})
 
-    assert reasoning_projection(unrestricted) == {~w(low medium high), "medium"}
-    assert reasoning_projection(maximum) == {~w(low medium), "medium"}
-    assert reasoning_projection(enforced) == {["high"], "high"}
-    refute unrestricted.etag == maximum.etag
-    refute maximum.etag == enforced.etag
-  end
-
-  test "different policies with the same final body have the same revision" do
-    model = model("gpt-a", reasoning_metadata())
-
-    unrestricted = CodexCatalog.build([model], unrestricted_policy(), %{})
-    maximum = CodexCatalog.build([model], policy(maximum_reasoning_effort: "ultra"), %{})
-
-    assert unrestricted.body == maximum.body
-    assert unrestricted.etag == maximum.etag
-  end
-
-  test "effective serving modes determine only the emitted Lite boolean and final-body revision" do
-    aggregate_lite_model = model("gpt-a", %{"use_responses_lite" => true})
-    aggregate_full_model = model("gpt-a", %{"use_responses_lite" => false})
-
-    aggregate_lite =
-      CodexCatalog.build(
-        [aggregate_lite_model],
-        unrestricted_policy(),
-        %{},
-        %{}
-      )
-
-    explicit_lite =
-      CodexCatalog.build(
-        [aggregate_full_model],
-        unrestricted_policy(),
-        %{},
-        %{},
-        %{"gpt-a" => "lite"}
-      )
-
-    explicit_full =
-      CodexCatalog.build(
-        [aggregate_lite_model],
-        unrestricted_policy(),
-        %{},
-        %{},
-        %{"gpt-a" => "full"}
-      )
-
-    assert get_in(aggregate_lite.body, ["models", Access.at(0), "use_responses_lite"])
-    assert explicit_lite.body == aggregate_lite.body
-    assert explicit_lite.etag == aggregate_lite.etag
-
-    refute get_in(explicit_full.body, ["models", Access.at(0), "use_responses_lite"])
-    refute explicit_full.body == aggregate_lite.body
-    refute explicit_full.etag == aggregate_lite.etag
-
-    assert get_in(explicit_full.body, ["models", Access.at(0), "supports_parallel_tool_calls"])
-  end
-
-  test "missing and malformed effective mode entries default to Full without aggregate fallback" do
-    aggregate_lite_model = model("gpt-a", %{"use_responses_lite" => true})
-
-    aggregate_fallback =
-      CodexCatalog.build([aggregate_lite_model], unrestricted_policy(), %{}, %{})
+    assert get_in(explicit_lite.body, ["models", Access.at(0), "use_responses_lite"])
 
     for effective_modes <- [
           %{"other-model" => "full"},
@@ -214,39 +124,12 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
           %{"gpt-a" => true},
           %{gpt_a: "full"}
         ] do
-      result =
-        CodexCatalog.build(
-          [aggregate_lite_model],
-          unrestricted_policy(),
-          %{},
-          %{},
-          effective_modes
-        )
+      assert {:ok, result} =
+               CodexCatalog.build_selected_sources(sources, unrestricted_policy(), %{}, effective_modes)
 
       refute get_in(result.body, ["models", Access.at(0), "use_responses_lite"])
-      refute result.body == aggregate_fallback.body
-      refute result.etag == aggregate_fallback.etag
+      refute result.etag == explicit_lite.etag
     end
-  end
-
-  test "filters the complete routable list through normalized model policy" do
-    result =
-      CodexCatalog.build(
-        models(),
-        unrestricted_policy()
-        |> Map.put(:allowed_model_identifiers, ["gpt-b"])
-        |> Map.put(:api_key_id, "ignored-source-identity"),
-        %{}
-      )
-
-    assert Enum.map(result.body["models"], & &1["slug"]) == ["gpt-b"]
-
-    assert result.etag ==
-             CodexCatalog.build(
-               Enum.reverse(models()),
-               Map.delete(result_policy("gpt-b"), :api_key_id),
-               %{}
-             ).etag
   end
 
   test "restrictive reasoning and tier policies preserve included pristine source entries" do
@@ -263,7 +146,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
     results =
       Enum.map(policies, fn policy ->
         assert {:ok, result} =
-                 CodexCatalog.build_selected_sources(sources, policy, %{}, %{}, %{})
+                 CodexCatalog.build_selected_sources(sources, policy, %{}, %{})
 
         result
       end)
@@ -295,12 +178,11 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
                sources,
                unrestricted_policy(),
                %{},
-               %{},
                %{}
              )
 
     assert {:ok, restricted} =
-             CodexCatalog.build_selected_sources(sources, restrictive_policy, %{}, %{}, %{})
+             CodexCatalog.build_selected_sources(sources, restrictive_policy, %{}, %{})
 
     assert restricted.body == %{"models" => [pristine_source("gpt-b")]}
     assert restricted.etag == CodexCatalog.etag(restricted.body)
@@ -339,7 +221,6 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
              CodexCatalog.build_selected_partitions(
                [partition],
                unrestricted_policy(),
-               %{},
                %{},
                %{}
              )
@@ -465,6 +346,392 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
 
       assert partition.assignment_ids ==
                Enum.sort([context.anchor_id, context.sibling_id, context.alternate_id])
+    end
+
+    test "admits reasoning variants and projects the routable family union", context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      max_source =
+        base_source
+        |> Map.put("default_reasoning_level", "max")
+        |> Map.put("description", "alternate reasoning rollout")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "low", "description" => "low"},
+          %{"effort" => "max", "description" => "max"}
+        ])
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => base_source,
+          context.sibling_id => base_source,
+          context.alternate_id => max_source
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{
+                     model.id =>
+                       MapSet.new([
+                         context.anchor_id,
+                         context.sibling_id,
+                         context.alternate_id
+                       ])
+                   }
+                 end
+               )
+
+      assert partition.assignment_ids ==
+               Enum.sort([context.anchor_id, context.sibling_id, context.alternate_id])
+
+      refute partition.routable_selection?
+      assert partition.source["default_reasoning_level"] == base_source["default_reasoning_level"]
+      assert partition.source["description"] == base_source["description"]
+
+      assert Enum.map(partition.source["supported_reasoning_levels"], & &1["effort"]) ==
+               ~w(low high max)
+    end
+
+    # The union used to describe every level by its bare name, which the
+    # released client shows in its reasoning picker (findings#280 point 3).
+    test "keeps the first upstream description of each level in the reasoning union", context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      oldest_source =
+        Map.put(base_source, "supported_reasoning_levels", [
+          %{"effort" => "low", "description" => "low from the oldest source"},
+          %{"effort" => "high"}
+        ])
+
+      newer_source =
+        base_source
+        |> Map.put("default_reasoning_level", "max")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "low", "description" => "low from a newer source"},
+          %{"effort" => "high", "description" => "high from a newer source"},
+          %{"effort" => "xhigh", "description" => " "},
+          %{"effort" => "max", "description" => "max from a newer source"}
+        ])
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => oldest_source,
+          context.sibling_id => oldest_source,
+          context.alternate_id => newer_source
+        })
+
+      expected = [
+        %{"effort" => "low", "description" => "low from the oldest source"},
+        %{"effort" => "high", "description" => "high from a newer source"},
+        %{"effort" => "xhigh", "description" => "xhigh"},
+        %{"effort" => "max", "description" => "max from a newer source"}
+      ]
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{model.id => MapSet.new([context.anchor_id, context.sibling_id, context.alternate_id])}
+                 end
+               )
+
+      assert partition.source["supported_reasoning_levels"] == expected
+
+      assert [served] = build_canonical([model], context.candidates).body["models"]
+      assert served["supported_reasoning_levels"] == expected
+    end
+
+    test "excludes an unroutable variant from the advertised union without removing its allowance",
+         context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      max_source =
+        base_source
+        |> Map.put("default_reasoning_level", "max")
+        |> Map.delete("supported_reasoning_levels")
+        |> Map.put("reasoning_efforts", ["low", "max"])
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => base_source,
+          context.sibling_id => base_source,
+          context.alternate_id => max_source
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{model.id => MapSet.new([context.anchor_id, context.sibling_id])}
+                 end
+               )
+
+      assert partition.assignment_ids ==
+               Enum.sort([context.anchor_id, context.sibling_id, context.alternate_id])
+
+      assert partition.source["default_reasoning_level"] == base_source["default_reasoning_level"]
+      refute Map.has_key?(partition.source, "reasoning_efforts")
+      refute "max" in Enum.map(partition.source["supported_reasoning_levels"], & &1["effort"])
+    end
+
+    test "does not admit a reasoning variant from a different capability family", context do
+      max_source =
+        context.model.metadata["source_assignment_models"][context.alternate_id]
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "low", "description" => "low"},
+          %{"effort" => "max", "description" => "max"}
+        ])
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => context.model.metadata["source_assignment_models"][context.anchor_id],
+          context.sibling_id => context.model.metadata["source_assignment_models"][context.sibling_id],
+          context.alternate_id => max_source
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{
+                     model.id =>
+                       MapSet.new([
+                         context.anchor_id,
+                         context.sibling_id,
+                         context.alternate_id
+                       ])
+                   }
+                 end
+               )
+
+      assert partition.assignment_ids == Enum.sort([context.anchor_id, context.sibling_id])
+      assert partition.source["context_window"] != max_source["context_window"]
+      refute "max" in Enum.map(partition.source["supported_reasoning_levels"], & &1["effort"])
+    end
+
+    test "ranks aggregate capability-family capacity across reasoning variants", context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      max_source =
+        Map.put(base_source, "supported_reasoning_levels", [
+          %{"effort" => "low", "description" => "low"},
+          %{"effort" => "max", "description" => "max"}
+        ])
+
+      older_singleton = Map.put(base_source, "context_window", 111_111)
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => older_singleton,
+          context.sibling_id => base_source,
+          context.alternate_id => max_source
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{
+                     model.id =>
+                       MapSet.new([
+                         context.anchor_id,
+                         context.sibling_id,
+                         context.alternate_id
+                       ])
+                   }
+                 end
+               )
+
+      assert partition.assignment_ids == Enum.sort([context.sibling_id, context.alternate_id])
+      assert partition.partition_count == 2
+      assert partition.source["context_window"] != older_singleton["context_window"]
+
+      assert Enum.map(partition.source["supported_reasoning_levels"], & &1["effort"]) ==
+               ~w(low high max)
+    end
+
+    test "does not leak reasoning metadata from an unroutable family anchor", context do
+      anchor_source =
+        context.model.metadata["source_assignment_models"][context.anchor_id]
+        |> Map.put("default_reasoning_level", "max")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "max", "description" => "max"}
+        ])
+
+      routable_source =
+        context.model.metadata["source_assignment_models"][context.sibling_id]
+        |> Map.delete("default_reasoning_level")
+        |> Map.delete("supported_reasoning_levels")
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => anchor_source,
+          context.sibling_id => routable_source,
+          context.alternate_id => Map.put(anchor_source, "context_window", 111_111)
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{model.id => MapSet.new([context.sibling_id])}
+                 end
+               )
+
+      assert partition.assignment_ids == Enum.sort([context.anchor_id, context.sibling_id])
+      refute Map.has_key?(partition.source, "default_reasoning_level")
+      refute Map.has_key?(partition.source, "supported_reasoning_levels")
+      refute Map.has_key?(partition.source, "reasoning_efforts")
+    end
+
+    test "derives the default only from routable reasoning metadata", context do
+      anchor_source =
+        context.model.metadata["source_assignment_models"][context.anchor_id]
+        |> Map.put("default_reasoning_level", "max")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "max", "description" => "max"}
+        ])
+
+      routable_source =
+        context.model.metadata["source_assignment_models"][context.sibling_id]
+        |> Map.delete("default_reasoning_level")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "max", "description" => "max"},
+          %{"effort" => "low", "description" => "low"}
+        ])
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => anchor_source,
+          context.sibling_id => routable_source,
+          context.alternate_id => Map.put(anchor_source, "context_window", 111_111)
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   %{model.id => MapSet.new([context.sibling_id])}
+                 end
+               )
+
+      assert partition.source["default_reasoning_level"] == "low"
+
+      assert Enum.map(partition.source["supported_reasoning_levels"], & &1["effort"]) ==
+               ~w(low max)
+    end
+
+    test "canonicalizes equivalent reasoning-level order for stable ETags", context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      first =
+        base_source
+        |> Map.put("default_reasoning_level", "high")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "high", "description" => "high"},
+          %{"effort" => "low", "description" => "low"}
+        ])
+
+      second =
+        base_source
+        |> Map.put("default_reasoning_level", "high")
+        |> Map.put("supported_reasoning_levels", [
+          %{"effort" => "low", "description" => "low"},
+          %{"effort" => "high", "description" => "high"}
+        ])
+
+      first_model =
+        put_source_models(context.model, %{
+          context.anchor_id => first,
+          context.sibling_id => second,
+          context.alternate_id => Map.put(first, "context_window", 111_111)
+        })
+
+      second_model =
+        put_source_models(context.model, %{
+          context.anchor_id => first,
+          context.sibling_id => second,
+          context.alternate_id => Map.put(first, "context_window", 111_111)
+        })
+
+      first_partition =
+        CodexCatalog.select_canonical_sources([first_model], context.candidates,
+          routable_assignment_ids_by_model_id: fn ->
+            %{first_model.id => MapSet.new([context.anchor_id])}
+          end
+        )
+
+      second_partition =
+        CodexCatalog.select_canonical_sources([second_model], context.candidates,
+          routable_assignment_ids_by_model_id: fn ->
+            %{second_model.id => MapSet.new([context.sibling_id])}
+          end
+        )
+
+      assert [first_selected] = first_partition
+      assert [second_selected] = second_partition
+      assert first_selected.source == second_selected.source
+
+      assert {:ok, first_catalog} =
+               CodexCatalog.build_selected_partitions(
+                 first_partition,
+                 unrestricted_policy(),
+                 %{},
+                 %{}
+               )
+
+      assert {:ok, second_catalog} =
+               CodexCatalog.build_selected_partitions(
+                 second_partition,
+                 unrestricted_policy(),
+                 %{},
+                 %{}
+               )
+
+      assert first_catalog.body == second_catalog.body
+      assert first_catalog.etag == second_catalog.etag
+    end
+
+    test "resolves routability when only the reasoning default differs", context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      exhausted_anchor = Map.put(base_source, "default_reasoning_level", "high")
+      routable_sibling = Map.put(base_source, "default_reasoning_level", "low")
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => exhausted_anchor,
+          context.sibling_id => routable_sibling,
+          context.alternate_id => Map.put(base_source, "context_window", 111_111)
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   send(self(), :resolved_default_routability)
+                   %{model.id => MapSet.new([context.sibling_id])}
+                 end
+               )
+
+      assert_received :resolved_default_routability
+      assert partition.source["default_reasoning_level"] == "low"
+    end
+
+    test "does not resolve routability for blank versus absent reasoning defaults", context do
+      base_source = context.model.metadata["source_assignment_models"][context.anchor_id]
+
+      model =
+        put_source_models(context.model, %{
+          context.anchor_id => Map.put(base_source, "default_reasoning_level", "   "),
+          context.sibling_id => Map.delete(base_source, "default_reasoning_level"),
+          context.alternate_id =>
+            base_source
+            |> Map.delete("default_reasoning_level")
+            |> Map.delete("context_window")
+        })
+
+      assert [partition] =
+               CodexCatalog.select_canonical_sources([model], context.candidates,
+                 routable_assignment_ids_by_model_id: fn ->
+                   flunk("blank and absent defaults must not trigger a quota read")
+                 end
+               )
+
+      assert partition.partition_count == 1
     end
   end
 
@@ -603,6 +870,69 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
 
     assert get_in(drifted_result.body, ["models", Access.at(0), "description"]) ==
              anchor_source["description"]
+  end
+
+  # `priority` is the model picker's sort order (findings#305 row 498-6). A
+  # source that lists the model at another position, here also with another
+  # default reasoning level as the production sources that motivated the row
+  # do, joins the anchor's partition. The family then has two reasoning
+  # projections and is served through the reasoning union, which keeps the
+  # anchor's default and level entries, so the catalog body and its ETag
+  # equal the control's.
+  test "sources differing only in picker priority form one partition and serve the anchor's priority" do
+    anchor_source = Map.put(pristine_source("gpt-priority"), "priority", 1)
+    joining = Map.merge(anchor_source, %{"priority" => 0, "default_reasoning_level" => "low"})
+    {anchor_id, first_id, second_id} = assignment_ids()
+
+    identical_model =
+      "gpt-priority"
+      |> model(%{"source_assignment_models" => %{}})
+      |> put_source_models(%{anchor_id => anchor_source, first_id => anchor_source, second_id => anchor_source})
+
+    drifted_model =
+      "gpt-priority"
+      |> model(%{"source_assignment_models" => %{}})
+      |> put_source_models(%{anchor_id => anchor_source, first_id => anchor_source, second_id => joining})
+
+    identical_candidates = partition_candidates(identical_model, [anchor_id, first_id, second_id])
+    drifted_candidates = partition_candidates(drifted_model, [anchor_id, first_id, second_id])
+
+    assert [%{assignment_ids: selected_ids, partition_count: 1, source: source}] =
+             CodexCatalog.select_canonical_sources([drifted_model], drifted_candidates)
+
+    assert selected_ids == Enum.sort([anchor_id, first_id, second_id])
+    assert source["priority"] == 1
+
+    identical = build_canonical([identical_model], identical_candidates)
+    drifted_result = build_canonical([drifted_model], drifted_candidates)
+
+    assert drifted_result.body == identical.body
+    assert drifted_result.etag == identical.etag
+    assert get_in(drifted_result.body, ["models", Access.at(0), "priority"]) == 1
+  end
+
+  # Merging can move the anchor: when the source whose priority differs is the
+  # oldest assignment, the merged partition is anchored on it and its fields
+  # are served, priority and description included, which can reorder the
+  # client's model picker and change its default model. Before, the larger
+  # partition of the two newer sources was selected and its oldest member's
+  # fields were served.
+  test "a priority-only difference on the oldest assignment makes it the anchor of the merged partition" do
+    newer_source = Map.put(pristine_source("gpt-priority-anchor"), "priority", 1)
+    oldest_source = Map.merge(newer_source, %{"priority" => 0, "description" => "oldest account copy"})
+    {oldest_id, first_id, second_id} = assignment_ids()
+
+    model =
+      "gpt-priority-anchor"
+      |> model(%{"source_assignment_models" => %{}})
+      |> put_source_models(%{oldest_id => oldest_source, first_id => newer_source, second_id => newer_source})
+
+    candidates = partition_candidates(model, [oldest_id, first_id, second_id])
+
+    assert [%{assignment_ids: selected_ids, partition_count: 1}] = CodexCatalog.select_canonical_sources([model], candidates)
+    assert selected_ids == Enum.sort([oldest_id, first_id, second_id])
+
+    assert [%{"priority" => 0, "description" => "oldest account copy"}] = build_canonical([model], candidates).body["models"]
   end
 
   test "shell capability partitions preserve raw payload while isolating disabled" do
@@ -767,13 +1097,6 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
     assert build_canonical([model], candidates).body == %{"models" => []}
   end
 
-  defp models do
-    [
-      model("gpt-a", %{"reasoning_levels" => [%{"effort" => "low"}, %{"effort" => "high"}]}),
-      model("gpt-b", %{"reasoning_levels" => [%{"effort" => "medium"}]})
-    ]
-  end
-
   defp model(slug, metadata) do
     %Model{
       upstream_model_id: slug,
@@ -799,20 +1122,89 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
 
   defp policy(overrides), do: Map.merge(unrestricted_policy(), Map.new(overrides))
 
-  defp result_policy(model_identifier) do
-    Map.put(unrestricted_policy(), :allowed_model_identifiers, [model_identifier])
+  test "a routable tier superset is advertised verbatim without widening neutral dispatch membership" do
+    {a, b, c} = assignment_ids()
+    source = pristine_source("gpt-tier-fixture")
+    richer = source |> Map.put("service_tiers", source["service_tiers"] ++ [%{"id" => "ultrafast", "name" => "Ultrafast"}]) |> Map.put("additional_speed_tiers", ["ultrafast"])
+    model = model("gpt-tier-fixture", %{}) |> put_source_models(%{a => source, b => source, c => richer})
+    candidates = partition_candidates(model, [a, b, c])
+    opts = [routable_assignment_ids_by_model_id: fn -> %{model.id => MapSet.new([a, b, c])} end]
+    [partition] = CodexCatalog.select_canonical_sources([model], candidates, opts)
+    assert partition.assignment_ids == [a, b]
+    assert partition.source == richer
+    assert {:ok, canonical} = CanonicalModelSource.canonical_source(richer)
+    assert partition.digest == canonical.digest
+    reversed = Map.update!(candidates, model.id, &Enum.reverse/1)
+    assert CodexCatalog.select_canonical_sources([model], reversed, opts) == [partition]
+
+    [blocked] = CodexCatalog.select_canonical_sources([model], candidates, routable_assignment_ids_by_model_id: fn -> %{model.id => MapSet.new([a, b])} end)
+    assert blocked.source == source
   end
 
-  defp reasoning_metadata do
-    %{
-      "default_reasoning_level" => "medium",
-      "supported_reasoning_levels" => [
-        %{"effort" => "low", "description" => "low"},
-        %{"effort" => "medium", "description" => "medium"},
-        %{"effort" => "high", "description" => "high"}
-      ]
-    }
+  for variant <- [:narrower, :disjoint, :default, :absent] do
+    test "tier presentation preserves baseline reasoning fields for #{variant} source metadata" do
+      {a, b, c} = assignment_ids()
+      source = pristine_source("gpt-tier-reasoning")
+      baseline = if unquote(variant) == :absent, do: Map.drop(source, ["default_reasoning_level", "supported_reasoning_levels", "reasoning_efforts"]), else: source
+      richer = Map.put(source, "service_tiers", source["service_tiers"] ++ [%{"id" => "ultrafast"}])
+
+      richer =
+        case unquote(variant) do
+          :narrower -> Map.put(richer, "supported_reasoning_levels", [%{"effort" => "high", "description" => "high"}])
+          :disjoint -> richer |> Map.put("supported_reasoning_levels", [%{"effort" => "max", "description" => "max"}]) |> Map.put("default_reasoning_level", "max")
+          :default -> Map.put(richer, "default_reasoning_level", "low")
+          :absent -> Map.put(richer, "reasoning_efforts", ["max"])
+        end
+
+      model = model("gpt-tier-reasoning", %{}) |> put_source_models(%{a => baseline, b => baseline, c => richer})
+      [partition] = CodexCatalog.select_canonical_sources([model], partition_candidates(model, [a, b, c]))
+      keys = ["default_reasoning_level", "supported_reasoning_levels", "reasoning_efforts"]
+      assert Map.take(partition.source, keys) == Map.take(baseline, keys)
+      assert partition.source["service_tiers"] == richer["service_tiers"]
+      assert Map.drop(partition.source, keys) == Map.drop(richer, keys)
+      assert partition.assignment_ids == [a, b]
+    end
   end
+
+  test "tier presentation retains the existing union of baseline reasoning variants" do
+    {a, b, c} = assignment_ids()
+    source = pristine_source("gpt-tier-reasoning-union")
+    first = Map.put(source, "supported_reasoning_levels", [%{"effort" => "low", "description" => "low"}])
+    second = Map.put(source, "supported_reasoning_levels", [%{"effort" => "high", "description" => "high"}])
+    richer = source |> Map.put("service_tiers", source["service_tiers"] ++ [%{"id" => "ultrafast"}]) |> Map.put("supported_reasoning_levels", [%{"effort" => "max", "description" => "max"}]) |> Map.put("default_reasoning_level", "max")
+    base_model = model("gpt-tier-reasoning-union", %{}) |> put_source_models(%{a => first, b => second})
+    [baseline] = CodexCatalog.select_canonical_sources([base_model], partition_candidates(base_model, [a, b]))
+    model = put_source_models(base_model, %{a => first, b => second, c => richer})
+    [partition] = CodexCatalog.select_canonical_sources([model], partition_candidates(model, [a, b, c]))
+    keys = ["default_reasoning_level", "supported_reasoning_levels", "reasoning_efforts"]
+    assert Map.take(partition.source, keys) == Map.take(baseline.source, keys)
+    assert partition.source["service_tiers"] == richer["service_tiers"]
+    assert partition.assignment_ids == baseline.assignment_ids
+  end
+
+  test "incomparable tier capabilities and changed defaults cannot synthesize a catalog superset" do
+    {a, b, c} = assignment_ids()
+    source = pristine_source("gpt-tier-fixture")
+
+    for change <- [:incomparable, :default, :context, :unknown] do
+      richer = Map.put(source, "service_tiers", source["service_tiers"] ++ [%{"id" => "ultrafast"}])
+
+      {base, richer} =
+        case change do
+          :incomparable -> {Map.put(source, "additional_speed_tiers", ["fast"]), Map.put(richer, "additional_speed_tiers", ["ultrafast"])}
+          :default -> {source, Map.put(richer, "default_service_tier", "ultrafast")}
+          :context -> {source, Map.put(richer, "context_window", 111_111)}
+          :unknown -> {source, Map.put(richer, "future_execution_mode", true)}
+        end
+
+      model = model("gpt-tier-fixture", %{}) |> put_source_models(%{a => base, b => base, c => richer})
+      [partition] = CodexCatalog.select_canonical_sources([model], partition_candidates(model, [a, b, c]))
+      assert partition.source == base
+    end
+  end
+
+  defp selected(sources),
+    do: CodexCatalog.build_selected_sources(sources, unrestricted_policy(), %{}, %{})
 
   defp pristine_source(slug) do
     %{
@@ -877,7 +1269,6 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
              CodexCatalog.build_selected_partitions(
                partitions,
                unrestricted_policy(),
-               %{},
                context_overrides,
                modes
              )
@@ -885,22 +1276,7 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
     result
   end
 
-  defp reasoning_projection(result) do
-    [model] = result.body["models"]
-
-    {Enum.map(model["supported_reasoning_levels"], & &1["effort"]),
-     model["default_reasoning_level"]}
-  end
-
-  defp context_model do
-    model("gpt-context", %{
-      "context_window" => 272_000,
-      "max_context_window" => 272_000,
-      "auto_compact_token_limit" => nil
-    })
-  end
-
-  defp gpt56_context_metadata do
+  defp gpt6_context_metadata do
     %{
       "context_window" => 272_000,
       "max_context_window" => 872_000,
@@ -908,18 +1284,4 @@ defmodule CodexPooler.Gateway.Metadata.CodexCatalogTest do
       "auto_compact_token_limit" => nil
     }
   end
-
-  defp put_context_window_override(context_window) do
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: %OperationalSettings{
-        model_context_window_overrides: %{"gpt-context" => context_window}
-      }
-    )
-  end
-
-  defp restore_operational_settings(nil),
-    do: Application.delete_env(:codex_pooler, OperationalSettings)
-
-  defp restore_operational_settings(previous_env),
-    do: Application.put_env(:codex_pooler, OperationalSettings, previous_env)
 end

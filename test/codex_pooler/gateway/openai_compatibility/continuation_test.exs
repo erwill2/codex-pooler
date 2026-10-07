@@ -18,14 +18,28 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogs}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files
+  alias CodexPooler.Files.UploadUrlPolicy
   alias CodexPooler.Gateway.Payloads.ToolResultShape
   alias CodexPooler.Gateway.Transports.FileBridge
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.BackendCodexTestSupport
+  alias CodexPoolerWeb.Runtime.V1BridgedAnchorSupport, as: BridgedAnchor
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
 
   setup do
     old_files_config = Application.get_env(:codex_pooler, Files, [])
-    old_bridge_config = Application.get_env(:codex_pooler, FileBridge, [])
+    CodexPooler.TestAppEnv.restore_on_exit(FileBridge)
+    CodexPooler.TestAppEnv.restore_on_exit(UploadUrlPolicy)
+
+    Application.put_env(:codex_pooler, UploadUrlPolicy,
+      resolver: fn
+        _host, :inet -> {:ok, [{93, 184, 216, 34}]}
+        _host, :inet6 -> {:error, :nxdomain}
+      end
+    )
 
     Application.put_env(:codex_pooler, Files,
       max_file_size_bytes: 256,
@@ -37,15 +51,40 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       finalize_retry_interval_ms: 0
     )
 
-    on_exit(fn ->
-      Application.put_env(:codex_pooler, Files, old_files_config)
-      Application.put_env(:codex_pooler, FileBridge, old_bridge_config)
-    end)
+    on_exit(fn -> Application.put_env(:codex_pooler, Files, old_files_config) end)
 
     :ok
   end
 
+  # A `/v1` continuation anchored on `previous_response_id` reaches the
+  # provider only bridged onto the upstream websocket connection that produced
+  # the anchor: the provider refuses the parameter over HTTP and on any other
+  # connection, and Codex Pooler answers such a request before dispatch
+  # (findings#232 rows 232-275 and 232-277). The anchored shapes below are
+  # certified on that path (`V1BridgedAnchorSupport`).
   describe "Responses continuation and input-reference behavior" do
+    for forwarding <- [:unset, nil, false] do
+      @tag forwarding: forwarding
+      test "v1 Responses streams over HTTP with forwarding #{inspect(forwarding)}", %{conn: conn, forwarding: forwarding} do
+        CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+
+        case forwarding do
+          :unset -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+          value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
+        end
+
+        upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_disabled_bridge", "object" => "response", "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}}))
+        setup = gateway_setup(upstream)
+        response = conn |> auth(setup) |> post("/v1/responses", %{"model" => setup.model.exposed_model_id, "stream" => true, "input" => "synthetic fixture"})
+
+        assert response.status == 200
+        assert [content_type] = get_resp_header(response, "content-type")
+        assert content_type =~ "text/event-stream"
+        assert [%{method: "POST", path: "/backend-api/codex/responses"}] = FakeUpstream.requests(upstream)
+        assert [%Attempt{status: "succeeded"}] = Repo.all(Attempt)
+      end
+    end
+
     test "v1 Responses forwards stateless programmatic replay in order for collected responses",
          %{
            conn: conn
@@ -230,16 +269,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
 
     @tag :tool_result_previous_response
     test "v1 Responses preserves a referenced program-output continuation", %{conn: conn} do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.require_json_field(
-            "previous_response_id",
-            %{
+          BridgedAnchor.upstream_mode(
+            "resp_v1_program_output_previous",
+            BridgedAnchor.completed_frames(%{
               "id" => "resp_v1_program_output_reference",
               "object" => "response",
               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-            },
-            %{"error" => %{"code" => "missing_tool_context"}}
+            })
           )
         )
 
@@ -247,9 +287,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       program_output = programmatic_replay_input() |> List.last()
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_program_output_previous",
           "input" => [
@@ -258,8 +296,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_program_output_reference"} = json_response(response_conn, 200)
-      assert [captured] = FakeUpstream.requests(upstream)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_program_output_reference")
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_program_output_previous"
 
       assert Enum.map(captured.json["input"], & &1["type"]) == [
@@ -270,16 +308,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
 
     @tag :hosted_shell_history
     test "v1 Responses forwards a referenced hosted-shell output continuation", %{conn: conn} do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.require_json_field(
-            "previous_response_id",
-            %{
-              "id" => "resp_v1_hosted_shell_previous",
+          BridgedAnchor.upstream_mode(
+            "resp_v1_hosted_shell_previous",
+            BridgedAnchor.completed_frames(%{
+              "id" => "resp_v1_hosted_shell_previous_served",
               "object" => "response",
               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-            },
-            %{"error" => %{"code" => "missing_tool_context"}}
+            })
           )
         )
 
@@ -291,16 +330,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       ]
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_hosted_shell_previous",
           "input" => input
         })
 
-      assert %{"id" => "resp_v1_hosted_shell_previous"} = json_response(response_conn, 200)
-      assert [captured] = FakeUpstream.requests(upstream)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_hosted_shell_previous_served")
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_hosted_shell_previous"
       assert captured.json["input"] == input
 
@@ -312,25 +349,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
 
     @tag :tool_result_previous_response
     test "v1 Responses forwards the observed Vercel tool-output continuation shape", %{conn: conn} do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.require_json_field(
-            "previous_response_id",
-            %{
+          BridgedAnchor.upstream_mode(
+            "resp_v1_ai_sdk_previous",
+            BridgedAnchor.completed_frames(%{
               "id" => "resp_v1_ai_sdk_item_reference",
               "object" => "response",
               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-            },
-            %{"error" => %{"code" => "missing_tool_context"}}
+            })
           )
         )
 
       setup = gateway_setup(upstream)
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_ai_sdk_previous",
           "store" => true,
@@ -365,9 +401,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_ai_sdk_item_reference"} = json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_ai_sdk_item_reference")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_ai_sdk_previous"
       assert captured.json["store"] == false
 
@@ -394,16 +430,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     test "v1 Responses forwards a named standalone function-output continuation unchanged", %{
       conn: conn
     } do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.require_json_field(
-            "previous_response_id",
-            %{
+          BridgedAnchor.upstream_mode(
+            "STANDALONE_ANCHOR_SENTINEL",
+            BridgedAnchor.completed_frames(%{
               "id" => "resp_v1_standalone_function_output",
               "object" => "response",
               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-            },
-            %{"error" => %{"code" => "missing_tool_context"}}
+            })
           )
         )
 
@@ -423,18 +460,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       ]
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => previous_response_id,
           "input" => input
         })
 
-      assert %{"id" => "resp_v1_standalone_function_output"} =
-               json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_standalone_function_output")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == previous_response_id
       assert captured.json["input"] == input
 
@@ -454,25 +488,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
 
     @tag :tool_result_previous_response
     test "v1 Responses preserves explicit null Vercel tool-output continuation", %{conn: conn} do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.require_json_field(
-            "previous_response_id",
-            %{
+          BridgedAnchor.upstream_mode(
+            "resp_v1_ai_sdk_null_previous",
+            BridgedAnchor.completed_frames(%{
               "id" => "resp_v1_ai_sdk_null_tool_output",
               "object" => "response",
               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-            },
-            %{"error" => %{"code" => "missing_tool_context"}}
+            })
           )
         )
 
       setup = gateway_setup(upstream)
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_ai_sdk_null_previous",
           "input" => [
@@ -486,9 +519,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_ai_sdk_null_tool_output"} = json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_ai_sdk_null_tool_output")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_ai_sdk_null_previous"
 
       assert [
@@ -513,13 +546,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
          %{
            conn: conn
          } do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "id" => "resp_v1_opencode_replay",
-            "object" => "response",
-            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-          })
+          BridgedAnchor.upstream_mode(
+            "resp_v1_opencode_previous",
+            BridgedAnchor.completed_frames(%{
+              "id" => "resp_v1_opencode_replay",
+              "object" => "response",
+              "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+            })
+          )
         )
 
       setup =
@@ -528,9 +566,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       passthrough_key = "internal_chat_message_metadata_passthrough"
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_opencode_previous",
           "store" => false,
@@ -568,9 +604,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_opencode_replay"} = json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_opencode_replay")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["previous_response_id"] == "resp_v1_opencode_previous"
 
@@ -614,21 +650,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     test "v1 Responses forwards opencode native replay with recovered tool call ids", %{
       conn: conn
     } do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "id" => "resp_v1_opencode_native_replay",
-            "object" => "response",
-            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-          })
+          BridgedAnchor.upstream_mode(
+            "resp_v1_opencode_native_previous",
+            BridgedAnchor.completed_frames(%{
+              "id" => "resp_v1_opencode_native_replay",
+              "object" => "response",
+              "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+            })
+          )
         )
 
       setup = gateway_setup(upstream)
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_opencode_native_previous",
           "store" => false,
@@ -648,9 +687,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_opencode_native_replay"} = json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_opencode_native_replay")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_opencode_native_previous"
 
       assert [
@@ -739,21 +778,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     test "v1 Responses translates Hermes chat-style tool continuations before dispatch", %{
       conn: conn
     } do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "id" => "resp_v1_hermes_tool_replay",
-            "object" => "response",
-            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-          })
+          BridgedAnchor.upstream_mode(
+            "resp_v1_hermes_previous",
+            BridgedAnchor.completed_frames(%{
+              "id" => "resp_v1_hermes_tool_replay",
+              "object" => "response",
+              "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+            })
+          )
         )
 
       setup = gateway_setup(upstream)
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_hermes_previous",
           "store" => false,
@@ -766,9 +808,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_hermes_tool_replay"} = json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_hermes_tool_replay")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_hermes_previous"
 
       assert [
@@ -790,21 +832,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     test "v1 Responses translates Hermes assistant tool-call replay before dispatch", %{
       conn: conn
     } do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "id" => "resp_v1_hermes_assistant_tool_replay",
-            "object" => "response",
-            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-          })
+          BridgedAnchor.upstream_mode(
+            "resp_v1_hermes_assistant_previous",
+            BridgedAnchor.completed_frames(%{
+              "id" => "resp_v1_hermes_assistant_tool_replay",
+              "object" => "response",
+              "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+            })
+          )
         )
 
       setup = gateway_setup(upstream)
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_hermes_assistant_previous",
           "store" => false,
@@ -838,9 +883,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_hermes_assistant_tool_replay"} = json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_hermes_assistant_tool_replay")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_hermes_assistant_previous"
 
       assert [
@@ -871,21 +916,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     test "v1 Responses translates Hermes reasoning and empty assistant replay before dispatch", %{
       conn: conn
     } do
+      BridgedAnchor.enable_bridge!()
+
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "id" => "resp_v1_hermes_reasoning_tool_replay",
-            "object" => "response",
-            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-          })
+          BridgedAnchor.upstream_mode(
+            "resp_v1_hermes_reasoning_previous",
+            BridgedAnchor.completed_frames(%{
+              "id" => "resp_v1_hermes_reasoning_tool_replay",
+              "object" => "response",
+              "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+            })
+          )
         )
 
       setup = gateway_setup(upstream)
 
       response_conn =
-        conn
-        |> auth(setup)
-        |> post("/v1/responses", %{
+        BridgedAnchor.post_anchored(conn, setup, %{
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_hermes_reasoning_previous",
           "store" => false,
@@ -914,10 +962,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
           ]
         })
 
-      assert %{"id" => "resp_v1_hermes_reasoning_tool_replay"} =
-               json_response(response_conn, 200)
+      BridgedAnchor.assert_completed!(response_conn, "resp_v1_hermes_reasoning_tool_replay")
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      captured = BridgedAnchor.anchored_request!(upstream)
       assert captured.json["previous_response_id"] == "resp_v1_hermes_reasoning_previous"
 
       assert [
@@ -1451,7 +1498,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     end
 
     @tag :tool_result_previous_response
-    test "v1 Responses forwards ordinary previous_response_id without a tool-output continuation",
+    test "v1 Responses drops ordinary previous_response_id without a tool-output continuation",
          %{conn: conn} do
       upstream =
         start_upstream(
@@ -1475,7 +1522,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
 
       assert %{"id" => "resp_v1_ordinary_previous_forwarded"} = json_response(response_conn, 200)
       assert [captured] = FakeUpstream.requests(upstream)
-      assert captured.json["previous_response_id"] == "resp_v1_ordinary_previous"
+      refute Map.has_key?(captured.json, "previous_response_id")
     end
 
     @tag :tool_result_previous_response
@@ -1936,7 +1983,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
   end
 
   defp assert_upload_put(file_id, path, body, content_type) do
-    assert_receive {:upload_put, ^file_id, "PUT", ^path, ^body, headers}, 1_000
+    assert_receive {:upload_put, ^file_id, "PUT", ^path, ^body, headers}, @detection_timeout_ms
     assert header!(headers, "content-type") == content_type
     assert header!(headers, "x-ms-blob-type") == "BlockBlob"
     refute Enum.any?(headers, fn {name, _value} -> name in ["authorization", "cookie"] end)

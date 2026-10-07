@@ -3,6 +3,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
 
   use CodexPoolerWeb, :html
 
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaObservationsDialog
+
   attr :id, :string, required: true
   attr :limit, :map, required: true
 
@@ -13,8 +15,32 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
       data-role="upstream-limit-chart"
       data-evidence-state={quota_limit_evidence_state(@limit)}
       data-meter-state={quota_limit_meter_state(@limit)}
-      class="grid min-w-0 gap-1.5"
+      data-measurement-pending={if measurement_pending?(@limit), do: "true", else: nil}
+      class="relative grid min-w-0 gap-1.5"
     >
+      <span
+        :if={measurement_pending?(@limit)}
+        id={pending_description_id(@id)}
+        class="sr-only"
+      >
+        {measurement_pending_label(@limit)}. {measurement_pending_detail(@limit)}
+      </span>
+      <button
+        :if={Map.get(@limit, :observations, []) != []}
+        id={"#{@id}-observations-open"}
+        type="button"
+        class={[
+          "absolute -inset-x-2 -inset-y-1.5 z-10 cursor-pointer rounded border border-transparent transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2",
+          observation_trigger_tone(@limit),
+          measurement_pending?(@limit) && "cursor-help"
+        ]}
+        aria-label={quota_observations_trigger_label(@limit)}
+        aria-describedby={if measurement_pending?(@limit), do: pending_description_id(@id)}
+        title={if measurement_pending?(@limit), do: measurement_pending_detail(@limit)}
+        aria-haspopup="dialog"
+        aria-controls={"#{@id}-observations-dialog"}
+        phx-click={QuotaObservationsDialog.open("#{@id}-observations-dialog")}
+      ><span class="sr-only">Show quota observations</span></button>
       <div class="flex min-w-0 items-center justify-between gap-3 text-xs">
         <span data-role="upstream-limit-title" class="min-w-0 truncate font-medium text-base-content">
           {@limit.label}
@@ -27,7 +53,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
         data-evidence-state={quota_limit_evidence_state(@limit)}
         data-meter-state={quota_limit_meter_state(@limit)}
         aria-label={quota_limit_progress_label(@limit)}
-        title={quota_limit_progress_title(@limit)}
+        aria-describedby={if measurement_pending?(@limit), do: pending_description_id(@id)}
         class={quota_limit_progress_class(@limit)}
         value={if is_nil(@limit.percent), do: nil, else: @limit.percent_value}
         max="100"
@@ -64,7 +90,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
           <span data-role="relative-countdown-value">{strip_in_prefix(@limit.reset_label)}</span>
         </span>
       </div>
+      <%!-- After a reset the bar keeps the last verified value until a usage report confirms the new cycle. The card states
+      that only to assistive technology; the quota observations dialog shows it next to each source. --%>
+      <div :if={context = Map.get(@limit, :saved_reset_context)} class="sr-only">
+        <span data-role="last-verified-quota">{context.label}</span>
+        <span :if={context.candidate?} data-role="unconfirmed-quota-report">{context.candidate_label}</span>
+      </div>
     </div>
+    <QuotaObservationsDialog.dialog
+      :if={Map.get(@limit, :observations, []) != []}
+      id={"#{@id}-observations-dialog"}
+      limit={@limit}
+    />
     """
   end
 
@@ -105,48 +142,75 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_string?(_value), do: false
 
-  defp quota_limit_percent_class(%{percent: %Decimal{} = percent}) do
-    cond do
-      Decimal.compare(percent, Decimal.new(70)) != :lt -> "tabular-nums font-medium text-success"
-      Decimal.compare(percent, Decimal.new(30)) != :lt -> "tabular-nums font-medium text-warning"
-      true -> "tabular-nums font-medium text-error"
+  defp quota_limit_percent_class(%{percent: %Decimal{} = percent} = limit) do
+    if measurement_pending?(limit) do
+      "tabular-nums font-medium text-base-content underline decoration-warning decoration-dotted underline-offset-4"
+    else
+      cond do
+        Decimal.compare(percent, Decimal.new(70)) != :lt ->
+          "tabular-nums font-medium text-success"
+
+        Decimal.compare(percent, Decimal.new(30)) != :lt ->
+          "tabular-nums font-medium text-warning"
+
+        true ->
+          "tabular-nums font-medium text-error"
+      end
     end
   end
 
   defp quota_limit_percent_class(_limit), do: "tabular-nums font-medium text-base-content/50"
 
-  defp quota_limit_progress_class(%{percent: %Decimal{} = percent} = limit) do
-    tone_class =
+  defp observation_trigger_tone(%{percent: %Decimal{} = percent} = limit) do
+    if measurement_pending?(limit) do
+      "hover:border-warning/25 hover:bg-warning/5 focus-visible:outline-warning"
+    else
       cond do
-        Decimal.compare(percent, Decimal.new(70)) != :lt -> "progress-success"
-        Decimal.compare(percent, Decimal.new(30)) != :lt -> "progress-warning"
-        true -> "progress-error"
-      end
+        Decimal.compare(percent, Decimal.new(70)) != :lt ->
+          "hover:border-success/25 hover:bg-success/5 focus-visible:outline-success"
 
-    "progress admin-live-progress #{tone_class}#{credit_burning_class(limit)} h-1.5 w-full"
+        Decimal.compare(percent, Decimal.new(30)) != :lt ->
+          "hover:border-warning/25 hover:bg-warning/5 focus-visible:outline-warning"
+
+        true ->
+          "hover:border-error/25 hover:bg-error/5 focus-visible:outline-error"
+      end
+    end
   end
 
-  defp quota_limit_progress_class(limit),
-    do:
-      "progress admin-live-progress admin-static-unknown-progress progress-neutral#{credit_burning_class(limit)} h-1.5 w-full"
+  defp observation_trigger_tone(_limit),
+    do: "hover:border-base-content/25 hover:bg-base-content/5 focus-visible:outline-base-content"
 
-  defp credit_burning_class(%{burning_credits: true}), do: " progress-striped"
-  defp credit_burning_class(_limit), do: ""
+  defp quota_limit_progress_class(%{percent: %Decimal{} = percent} = limit) do
+    tone_class =
+      if measurement_pending?(limit) do
+        "progress-warning"
+      else
+        cond do
+          Decimal.compare(percent, Decimal.new(70)) != :lt -> "progress-success"
+          Decimal.compare(percent, Decimal.new(30)) != :lt -> "progress-warning"
+          true -> "progress-error"
+        end
+      end
 
-  defp quota_limit_progress_label(%{burning_credits: true} = limit),
-    do: "#{limit.label} credit balance remaining #{limit.percent_label}; credits in use"
+    "progress admin-live-progress #{tone_class} h-1.5 w-full"
+  end
 
-  defp quota_limit_progress_label(%{count_title: count_title} = limit)
-       when is_binary(count_title),
-       do: "#{limit.label} included Codex quota remaining #{limit.percent_label}"
+  defp quota_limit_progress_class(_limit),
+    do: "progress admin-live-progress admin-static-unknown-progress progress-neutral h-1.5 w-full"
 
-  defp quota_limit_progress_label(limit),
-    do: "#{limit.label} remaining #{limit.percent_label}"
+  defp quota_limit_progress_label(limit) do
+    cond do
+      measurement_pending?(limit) ->
+        "#{limit.label} remaining #{limit.percent_label}; #{measurement_pending_detail(limit)}"
 
-  defp quota_limit_progress_title(%{burning_credits: true}),
-    do: "Striped while credits are being consumed after included Codex quota is exhausted."
+      Map.get(limit, :key) in [:primary_5h, :primary_30d, :weekly] ->
+        "#{limit.label} included Codex quota remaining #{limit.percent_label}"
 
-  defp quota_limit_progress_title(_limit), do: nil
+      true ->
+        "#{limit.label} remaining #{limit.percent_label}"
+    end
+  end
 
   defp quota_limit_evidence_state(%{evidence_state: state})
        when state in [:fresh, :stale, :unknown],
@@ -167,4 +231,22 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
        do: state
 
   defp quota_limit_meter_state(_limit), do: "current"
+
+  defp measurement_pending?(%{measurement_pending?: true}), do: true
+  defp measurement_pending?(_limit), do: false
+
+  defp measurement_pending_label(limit), do: Map.get(limit, :measurement_pending_label)
+
+  defp measurement_pending_detail(limit),
+    do: Map.get(limit, :measurement_pending_detail)
+
+  defp pending_description_id(id), do: "#{id}-pending-description"
+
+  defp quota_observations_trigger_label(limit) do
+    if measurement_pending?(limit) do
+      "Show #{limit.label} quota observations; #{limit.percent_label} remaining; #{measurement_pending_detail(limit)}"
+    else
+      "Show #{limit.label} quota observations"
+    end
+  end
 end

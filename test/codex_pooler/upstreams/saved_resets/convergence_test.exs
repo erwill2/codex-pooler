@@ -4,6 +4,9 @@ defmodule CodexPooler.Upstreams.SavedResets.ConvergenceTest do
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Repo
+  alias CodexPooler.Telemetry.RelayEvent
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Quota.CapacityFactsStore
   alias CodexPooler.Upstreams.Quota.Windows
   alias CodexPooler.Upstreams.Quota.Windows.EvidenceStore
   alias CodexPooler.Upstreams.SavedResets.ConfirmationMetadata
@@ -252,8 +255,7 @@ defmodule CodexPooler.Upstreams.SavedResets.ConvergenceTest do
     assert {:ok, :confirmed_by_quota} =
              Convergence.converge(identity, decision_at, "runtime_headers")
 
-    assert_receive {^handler_id, %{count: 1} = measurements,
-                    %{source: "runtime_headers", outcome: "confirmed_by_quota"}}
+    assert_receive {^handler_id, %{count: 1} = measurements, %{source: "runtime_headers", outcome: "confirmed_by_quota"}}
 
     assert is_integer(measurements.applied_to_lifecycle_ms)
     assert measurements.applied_to_lifecycle_ms >= 0
@@ -364,6 +366,41 @@ defmodule CodexPooler.Upstreams.SavedResets.ConvergenceTest do
                     }, %{source: "finalizer", outcome: "confirmed_by_quota"}}
   end
 
+  test "an absurd timestamp drops its duration and keeps the convergence" do
+    # The relay refuses a whole sample whose measurement map the storage layer
+    # cannot hold, so an unclamped duration costs the `count` as well and is
+    # recorded as a refused sample. A convergence is worth more than one of its
+    # durations.
+    handler_id = attach_convergence_handler!([:codex_pooler, :saved_reset, :convergence])
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    ancient = ~U[0001-01-01 00:00:00Z]
+
+    :ok =
+      ConvergenceTelemetry.emit(
+        %{
+          "consumed_at" => DateTime.to_iso8601(ancient),
+          "finished_at" => DateTime.to_iso8601(observed_at),
+          "convergence_source" => "finalizer",
+          "convergence_outcome" => "confirmed_by_quota",
+          "confirmation_timing" => %{
+            "version" => 1,
+            "canonical_confirmed_at" => DateTime.to_iso8601(observed_at)
+          }
+        },
+        observed_at
+      )
+
+    assert_receive {^handler_id, measurements, %{source: "finalizer"}}
+
+    assert measurements.count == 1
+    assert measurements.canonical_to_lifecycle_ms == 0
+    refute Map.has_key?(measurements, :applied_to_canonical_ms)
+    refute Map.has_key?(measurements, :applied_to_lifecycle_ms)
+
+    assert RelayEvent.storable_measurements?(measurements),
+           "the emitted sample is one the relay would refuse whole"
+  end
+
   defp attach_convergence_handler!(event) do
     test_pid = self()
     handler_id = {__MODULE__, :saved_reset_convergence, System.unique_integer([:positive])}
@@ -413,6 +450,54 @@ defmodule CodexPooler.Upstreams.SavedResets.ConvergenceTest do
     assert converged["result"]["applied"] == true
 
     assert RedemptionLifecycle.gateway_auto_latch(converged, DateTime.utc_now()) == :cooldown
+  end
+
+  test "legacy rounded-full permission remains pending and retains its consume latch" do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    consumed_at = DateTime.add(now, -60)
+
+    identity =
+      identity_with_pending(consumed_at,
+        metadata: %{
+          "credential_epoch" => 1,
+          "quota_account_availability" => AccountAvailabilityStore.encode!(:available, now, 1)
+        }
+      )
+
+    upsert_source_window!(identity, Decimal.new(100),
+      source: "codex_usage_api",
+      observed_at: now,
+      metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false}
+    )
+
+    assert {:ok, :unchanged} = Convergence.converge(identity, now)
+    converged = redemption(identity)
+    assert converged["consumed_at"] == DateTime.to_iso8601(consumed_at)
+    assert converged["result"]["applied"] == true
+    assert converged["phase"] == "consumed_pending_probe"
+    assert RedemptionLifecycle.gateway_auto_latch(converged, now) == :blocked_awaiting_quota
+    assert {:ok, :unchanged} = Convergence.converge(identity, now)
+  end
+
+  for credit_permission <- [:available, :unknown, :unavailable] do
+    test "current rounded-full included permission confirms only when credits are #{credit_permission}" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      consumed_at = DateTime.add(now, -60, :second)
+      facts = %CodexPooler.Quotas.CapacityFacts{observed_at: now, credential_epoch: 1, included_permission: :available, credit_permission: unquote(credit_permission), denial_category: :none, balance: "25", has_credits: true, unlimited: false, source_kind: :api_codex_usage}
+      identity = identity_with_pending(consumed_at, metadata: %{"credential_epoch" => 1, "quota_account_availability" => AccountAvailabilityStore.encode!(:available, now, 1), "quota_capacity_facts" => CapacityFactsStore.encode!(facts, 1)})
+      upsert_source_window!(identity, Decimal.new(100), source: "codex_usage_api", observed_at: now, metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false})
+
+      if unquote(credit_permission) == :unavailable do
+        assert {:ok, :confirmed_by_quota} = Convergence.converge(identity, now)
+        assert redemption(identity)["phase"] == "confirmed_by_quota"
+      else
+        assert {:ok, :unchanged} = Convergence.converge(identity, now)
+        assert redemption(identity)["phase"] == "consumed_pending_probe"
+      end
+
+      assert redemption(identity)["consumed_at"] == DateTime.to_iso8601(consumed_at)
+      assert redemption(identity)["result"]["applied"] == true
+    end
   end
 
   test "fresh exhausted evidence reblocks a pending reset" do

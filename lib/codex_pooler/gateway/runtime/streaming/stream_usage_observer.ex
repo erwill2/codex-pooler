@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
   @moduledoc false
 
   alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
+  alias CodexPooler.Gateway.Runtime.Streaming.ModelDeclarationObserver
   alias CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope
 
   @max_candidate_bytes 16_384
@@ -18,6 +19,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
           usage: ResponseUsage.usage() | nil,
           previous_usage: ResponseUsage.usage() | nil,
           previous_terminal?: boolean(),
+          served_model: String.t() | nil,
+          model_observer: ModelDeclarationObserver.t(),
+          model_recorded?: boolean(),
+          previous_model_observer: ModelDeclarationObserver.t(),
           classification: String.t(),
           marker_seen: boolean(),
           valid_object_seen: boolean(),
@@ -46,6 +51,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
       usage: nil,
       previous_usage: nil,
       previous_terminal?: false,
+      served_model: nil,
+      model_observer: ModelDeclarationObserver.new(),
+      model_recorded?: false,
+      previous_model_observer: ModelDeclarationObserver.new(),
       classification: "missing",
       marker_seen: false,
       valid_object_seen: false,
@@ -66,17 +75,33 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
   def observe(_state, _data), do: new()
 
   @spec usage(t() | term()) :: ResponseUsage.usage() | nil
-  def usage(%{usage: %{status: "usage_known"} = usage}), do: usage
+  def usage(%{usage: %{status: "usage_known"} = usage} = state), do: put_served_model(usage, state)
   def usage(_state), do: nil
 
   @spec result(t() | term()) :: ResponseUsage.usage()
   def result(%{envelope: envelope, previous_terminal?: false} = state) do
     if incomplete_or_invalid?(envelope) or (terminal_event?(state) and envelope.usage == nil),
-      do: %{status: "usage_unknown", source: "sse_usage_missing"},
-      else: usage(state) || %{status: "usage_unknown", source: "sse_usage_missing"}
+      do: put_served_model(%{status: "usage_unknown", source: "sse_usage_missing"}, state),
+      else: usage(state) || put_served_model(%{status: "usage_unknown", source: "sse_usage_missing"}, state)
   end
 
-  def result(state), do: usage(state) || %{status: "usage_unknown", source: "sse_usage_missing"}
+  def result(state),
+    do: usage(state) || put_served_model(%{status: "usage_unknown", source: "sse_usage_missing"}, state)
+
+  @doc """
+  The bounded model identifier the first response object of the stream
+  declared, or `nil` when no event has declared one yet.
+  """
+  @spec served_model(t() | term()) :: String.t() | nil
+  def served_model(%{served_model: model}) when is_binary(model), do: model
+  def served_model(_state), do: nil
+
+  defp put_served_model(usage, %{model_observer: observer} = state) do
+    observer = if incomplete_or_invalid?(state.envelope) and not state.previous_terminal?, do: ModelDeclarationObserver.partial(state.previous_model_observer), else: observer
+    ModelDeclarationObserver.put_usage(usage, observer)
+  end
+
+  defp put_served_model(usage, _state), do: usage
 
   @spec resolve(t() | term(), ResponseUsage.usage()) :: ResponseUsage.usage()
   def resolve(%{envelope: %UsageEnvelope{}} = state, _fallback), do: result(state)
@@ -127,8 +152,17 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
     end
   end
 
-  defp scan(%{phase: :ignore} = state, <<_byte, rest::binary>>),
-    do: scan(%{state | cr?: false}, rest)
+  defp scan(%{phase: phase, line_prefix: prefix} = state, data)
+       when phase == :ignore or (phase == :event and byte_size(prefix) == 80) do
+    case :binary.match(data, ["\r", "\n"]) do
+      :nomatch ->
+        %{state | cr?: false}
+
+      {offset, _length} ->
+        <<_ignored::binary-size(^offset), rest::binary>> = data
+        scan(%{state | cr?: false}, rest)
+    end
+  end
 
   defp scan(state, <<byte, rest::binary>>) do
     prefix =
@@ -155,13 +189,18 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
 
   defp end_line(%{phase: :prefix, line_prefix: ""} = state), do: start_event(state)
 
-  defp end_line(%{phase: :event} = state),
-    do: %{
+  defp end_line(%{phase: :event} = state) do
+    # SSE allows event: after data:. Re-evaluate the provisional observation
+    # against the record's final discriminator, never against itself.
+    state = if state.previous_terminal?, do: state, else: %{state | model_observer: state.previous_model_observer, served_model: state.previous_model_observer.first_model, model_recorded?: false}
+
+    %{
       state
       | event_type: event_type(String.trim(state.line_prefix)),
         phase: :prefix,
         line_prefix: ""
     }
+  end
 
   defp end_line(%{phase: :data} = state) do
     %{state | envelope: UsageEnvelope.feed(state.envelope, "\n"), phase: :prefix, line_prefix: ""}
@@ -179,6 +218,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
         else: state
 
     state = finalize_record(state)
+    state = if incomplete_or_invalid?(state.envelope) and not state.previous_terminal?, do: %{state | model_observer: ModelDeclarationObserver.partial(state.previous_model_observer), served_model: state.previous_model_observer.first_model}, else: state
 
     %{
       state
@@ -188,6 +228,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
         line_prefix: "",
         event_type: nil,
         counted?: false,
+        model_recorded?: false,
+        previous_model_observer: state.model_observer,
         previous_usage: state.usage,
         previous_terminal?: state.terminal?
     }
@@ -196,6 +238,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
   defp update_usage(%{previous_terminal?: true} = state), do: state
 
   defp update_usage(state) do
+    state = observe_model_record(state)
     envelope = state.envelope
     count? = envelope.marker_seen? and not state.counted?
     candidate = if envelope.projection, do: %{buffer: envelope.projection.buffer}, else: nil
@@ -211,6 +254,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
     apply_envelope(state, envelope)
   end
 
+  defp observe_model_record(%{model_recorded?: false, envelope: %{done?: true, error: nil} = envelope} = state) do
+    event = %{"model" => envelope.model, "id" => envelope.response_id || envelope.root_id, "type" => envelope.type}
+    observer = if envelope.model_coverage_complete?, do: state.model_observer, else: ModelDeclarationObserver.partial(state.model_observer)
+    observer = ModelDeclarationObserver.observe(observer, event, state.event_type || envelope.type)
+    %{state | model_observer: observer, model_recorded?: true, served_model: observer.first_model}
+  end
+
+  defp observe_model_record(state), do: state
+
   defp apply_envelope(state, %{error: error}) when error != nil,
     do: reject(state, error_class(error))
 
@@ -225,7 +277,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
   defp apply_envelope(state, _envelope), do: state
 
   defp accept(state) do
-    decoded = %{"usage" => state.envelope.usage, "service_tier" => state.envelope.tier}
+    decoded = %{
+      "usage" => state.envelope.usage,
+      "service_tier" => state.envelope.tier,
+      "model" => state.served_model || state.envelope.model
+    }
 
     case ResponseUsage.from_stream_event(decoded) do
       %{status: "usage_known"} = usage -> accept_usage(state, usage)
@@ -301,7 +357,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver do
   defp error_class(_error), do: "malformed"
 
   defp event_type(type)
-       when type in ["response.completed", "response.incomplete", "response.failed"], do: type
+       when type in ~w(chunk response.created response.queued response.in_progress response.completed response.incomplete response.failed response.cancelled), do: type
 
   defp event_type(""), do: nil
   defp event_type(_type), do: "other"

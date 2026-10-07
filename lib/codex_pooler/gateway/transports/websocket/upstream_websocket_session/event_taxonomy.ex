@@ -11,7 +11,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Even
        response.output_text.done
        response.output_text.annotation.added
      )},
-    {"response.output_item", ~w(response.output_item.added response.output_item.done)},
+    {"response.output_item", ~w(response.output_item.added response.output_item.done response.output_item.interrupted)},
     {"response.content_part", ~w(response.content_part.added response.content_part.done)},
     {"response.reasoning", ~w(
        response.reasoning
@@ -31,10 +31,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Even
        response.audio.transcript.delta
        response.audio.transcript.done
      )},
-    {"response.function_call",
-     ~w(response.function_call_arguments.delta response.function_call_arguments.done)},
-    {"response.custom_tool_call",
-     ~w(response.custom_tool_call_input.delta response.custom_tool_call_input.done)},
+    {"response.function_call", ~w(response.function_call_arguments.delta response.function_call_arguments.done)},
+    {"response.custom_tool_call", ~w(response.custom_tool_call_input.delta response.custom_tool_call_input.done)},
     {"response.code_interpreter", ~w(
        response.code_interpreter_call.in_progress
        response.code_interpreter_call.interpreting
@@ -71,7 +69,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Even
        response.mcp_list_tools.failed
      )},
     {"response.metadata", ~w(response.metadata)},
-    {"response.moderation", ~w(response.moderation.started response.moderation.completed)}
+    # The provider's answers to a client's `response.interrupt` (findings#270
+    # row 270-272); neither is a terminal.
+    {"response.interrupt", ~w(response.interrupt.accepted response.interrupt.failed)},
+    {"response.moderation", ~w(response.moderation.started response.moderation.completed)},
+    # The phase event the provider's compaction stream reports between the
+    # announced item and the closed one (measured); not a terminal.
+    {"response.compaction", ~w(response.compaction.compacting)}
   ]
   @known_response_event_family_by_type @known_response_event_families
                                        |> Enum.flat_map(fn {family, event_types} ->

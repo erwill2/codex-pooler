@@ -9,6 +9,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.CompactionTrigger
   alias CodexPooler.Gateway.Payloads.InputShape
+  alias CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata
+  alias CodexPooler.Gateway.Payloads.NativeContentFilterRetry
+  alias CodexPooler.Gateway.Payloads.NativeMailboxContinuation
+  alias CodexPooler.Gateway.Payloads.NativeTurnContinuation
   alias CodexPooler.Gateway.Payloads.PayloadNormalizer
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.CompactionProjectionContext
@@ -46,7 +50,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   @spec decode_payload(binary()) :: {:ok, map()} | {:error, decode_error()}
   def decode_payload(payload) when is_binary(payload) do
-    case Jason.decode(payload) do
+    case CodexPooler.JSON.decode(payload) do
       {:ok, decoded} when is_map(decoded) ->
         {:ok, decoded}
 
@@ -108,6 +112,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   defp prepare_decoded_frame(%{"type" => "response.create"} = payload, opts, push_frame) do
     with :ok <- validate_native_response_model(payload, opts),
+         :ok <- validate_native_stream_flag(payload, opts),
          :ok <- validate_native_compaction_placement(payload, opts),
          {:ok, coerced} <- coerce_request(payload, opts, push_frame) do
       request_options = coerced.request_options
@@ -181,6 +186,30 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   defp validate_native_response_model(_payload, %RequestOptions{}),
     do: {:error, Error.invalid_request("model is required", "model")}
 
+  # The provider websocket answers an explicit `stream: false` with a 400
+  # invalid_request_error, so it is rejected before admission or accounting.
+  # An omitted flag still relays; compaction frames keep their bridge rules.
+  defp validate_native_stream_flag(
+         _payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: true}}
+       ),
+       do: :ok
+
+  defp validate_native_stream_flag(%{"stream" => false} = payload, %RequestOptions{}) do
+    if compaction_trigger_frame?(payload) do
+      :ok
+    else
+      {:error, Error.invalid_request("stream must be true for websocket responses", "stream")}
+    end
+  end
+
+  defp validate_native_stream_flag(_payload, %RequestOptions{}), do: :ok
+
+  defp compaction_trigger_frame?(%{"input" => input}) when is_list(input),
+    do: Enum.any?(input, &match?(%{"type" => "compaction_trigger"}, &1))
+
+  defp compaction_trigger_frame?(_payload), do: false
+
   defp validate_optional_model(payload) do
     case Map.fetch(payload, "model") do
       :error ->
@@ -239,8 +268,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
           provenance: %{
             frame: token,
             validation: %ValidationClaim{} = validation_claim,
-            capability:
-              %Capability{server: capability_server, reference: capability_reference} = capability
+            capability: %Capability{server: capability_server, reference: capability_reference} = capability
           }
         } = prepared
       )
@@ -284,6 +312,39 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   def consume_prepared_frame(_prepared), do: {:error, :invalid}
+
+  @doc """
+  Marks a prepared frame as legitimately waiting in socket state.
+
+  A parked capability refreshes its reclaim timer instead of stopping, so a
+  frame queued behind an in-flight turn or held across an owner handoff still
+  verifies when it is finally dequeued (findings#169). It is reclaimed when the
+  process that sealed it exits.
+  """
+  @spec park_prepared_frame(PreparedWebsocketFrame.t()) :: :ok | {:error, :invalid}
+  def park_prepared_frame(%PreparedWebsocketFrame{provenance: %{capability: capability}}),
+    do: Capability.park(capability)
+
+  def park_prepared_frame(%PreparedWebsocketFrame{}), do: {:error, :invalid}
+
+  @doc """
+  Reclaims the capability of a prepared frame the socket will never dispatch.
+
+  Parking suppresses the capability's reclaim timer for as long as the frame is
+  reachable from socket state (findings#169), and nothing re-arms it, so a frame
+  the socket discards would otherwise keep its capability until the socket exits
+  (findings#172). Releasing produces the same terminal state the timer produced
+  before parking existed: the frame's digest still verifies while its capability
+  is gone, which stays a retryable owner condition rather than a breach
+  (findings#168). A consumed capability is left alone; it deliberately outlives
+  dispatch.
+  """
+  @spec release_prepared_frame(PreparedWebsocketFrame.t()) ::
+          :ok | {:error, :consumed | :invalid}
+  def release_prepared_frame(%PreparedWebsocketFrame{provenance: %{capability: capability}}),
+    do: Capability.release(capability)
+
+  def release_prepared_frame(%PreparedWebsocketFrame{}), do: {:error, :invalid}
 
   @doc false
   @spec attach_native_compaction_admission(
@@ -424,6 +485,94 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   def attach_replay_intent(_prepared, _authorization, _generation), do: {:error, :invalid}
 
+  @doc """
+  Carries the replay claim of the anchored request a full-history resend
+  repeats.
+
+  The runtime preflight found the armed request's anchor-free witness among
+  this frame's alternates (`WebsocketTurnIdentity.replay_claim_alternates/2`),
+  so the frame is that request resent without its anchor. Every later owner,
+  provisional and admission check compares the replay claim byte for byte, so
+  the frame takes the armed request's claim before any of them runs
+  (findings#232 row 232-160). Only an unanchored frame that has alternates can
+  be rebound.
+  """
+  @spec rebind_replay_claim(PreparedWebsocketFrame.t(), <<_::256>>) ::
+          {:ok, PreparedWebsocketFrame.t()} | {:error, :consumed | :invalid | :binding_mismatch}
+  def rebind_replay_claim(
+        %PreparedWebsocketFrame{
+          variant: :native_response_create,
+          native_replay_binding: nil,
+          native_client_retry_witness: %{alternates: [_first | _rest]},
+          request_options: %RequestOptions{continuity: %{previous_response_id: nil}} = request_options
+        } = prepared,
+        replay_claim_digest
+      )
+      when is_binary(replay_claim_digest) and byte_size(replay_claim_digest) == 32 do
+    request_options = RequestOptions.put_continuity(request_options, replay_claim_digest: replay_claim_digest)
+
+    with true <- valid_prepared_frame?(prepared),
+         :ok <- Capability.consume(prepared.provenance.capability, prepared.provenance.frame) do
+      {:ok,
+       seal_prepared_frame(
+         %{prepared | replay_claim_digest: replay_claim_digest, request_options: request_options},
+         prepared.provenance.validation.completed
+       )}
+    else
+      false -> {:error, :invalid}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def rebind_replay_claim(_prepared, _replay_claim_digest), do: {:error, :binding_mismatch}
+
+  @doc """
+  A native turn frame that derived its turn's bare claim, re-keyed to the
+  steered claim of its full-history progress: the gateway found the bare claim
+  held by a request of the turn that recorded a DIFFERENT progress, which no
+  retry of that request can have, so this frame is a later request of the turn
+  the user steered in (findings#206 row 206-412). Only a frame whose own claim
+  is still the bare turn claim can be re-keyed.
+  """
+  @spec steered_turn_claim(PreparedWebsocketFrame.t()) :: {:ok, <<_::256>>, String.t()} | :none
+  def steered_turn_claim(%PreparedWebsocketFrame{
+        variant: :native_response_create,
+        payload: payload,
+        semantic_turn_key: <<_::256>> = semantic_turn_key,
+        turn_claim_key: turn_claim_key,
+        request_options:
+          %RequestOptions{
+            native_compaction_admission: nil,
+            transport: %{transport: "websocket"},
+            payload_context: %{compaction_trigger_bridge?: false},
+            openai_compatibility: %{public_openai_responses_stream: false},
+            continuity: %{request_claim_key: turn_claim_key},
+            extra: %{native_turn_progress: <<_::256>> = progress}
+          } = request_options
+      })
+      when is_binary(turn_claim_key) do
+    if NativeTurnContinuation.request_kind(payload, request_options) == "turn" and NativeTurnContinuation.turn_role(payload) == :opening,
+      do: {:ok, progress, WebsocketTurnIdentity.steered_claim_key(semantic_turn_key, progress)},
+      else: :none
+  end
+
+  def steered_turn_claim(%PreparedWebsocketFrame{}), do: :none
+
+  @spec rebind_steered_turn_claim(PreparedWebsocketFrame.t(), String.t()) ::
+          {:ok, PreparedWebsocketFrame.t()} | {:error, :consumed | :invalid | :binding_mismatch}
+  def rebind_steered_turn_claim(%PreparedWebsocketFrame{request_options: %RequestOptions{} = request_options} = prepared, steered_claim)
+      when is_binary(steered_claim) do
+    case steered_turn_claim(prepared) do
+      {:ok, _progress, ^steered_claim} ->
+        reseal_runtime_frame(prepared, RequestOptions.put_continuity(request_options, request_claim_key: steered_claim))
+
+      _other ->
+        {:error, :binding_mismatch}
+    end
+  end
+
+  def rebind_steered_turn_claim(_prepared, _steered_claim), do: {:error, :binding_mismatch}
+
   @spec reseal_runtime_frame(PreparedWebsocketFrame.t(), RequestOptions.t()) ::
           {:ok, PreparedWebsocketFrame.t()} | {:error, :consumed | :invalid}
   def reseal_runtime_frame(%PreparedWebsocketFrame{} = prepared, %RequestOptions{} = options) do
@@ -443,6 +592,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   @spec replay_eligible?(PreparedWebsocketFrame.t()) :: boolean()
   def replay_eligible?(%PreparedWebsocketFrame{
         variant: :native_response_create,
+        endpoint: endpoint,
         semantic_turn_key: semantic,
         replay_claim_digest: replay,
         payload: payload,
@@ -454,10 +604,25 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
       })
       when is_binary(semantic) and byte_size(semantic) == 32 and
              is_binary(replay) and byte_size(replay) == 32 do
-    ordinary_native_tool_continuation?(payload, options) or replay_request_kind?(payload, options)
+    if endpoint == "/backend-api/codex/responses/compact" or options.payload_context.compaction_trigger_bridge?,
+      do: projected_native_compaction_retry?(endpoint, options),
+      else: ordinary_native_tool_continuation?(payload, options) or replay_request_kind?(payload, options)
   end
 
   def replay_eligible?(%PreparedWebsocketFrame{}), do: false
+
+  # A bridged compaction, and any frame on the compact route, is eligible by
+  # its own rule alone: only its
+  # full-history form on the native websocket, the form the client resends a
+  # compaction it did not complete in (`projected_native_compaction_retry?/2`).
+  # An anchored compaction is never eligible (findings#270 row 270-358): its
+  # anchor binds it to the connection that produced the response it names,
+  # and the owner admits it through its runtime proof. It used to be
+  # ineligible only because the bridged frame kept no turn metadata of its
+  # own to read a kind from, and a tool output it carried could still make it
+  # an ordinary continuation under the kind of the socket's upgrade; with the
+  # client's metadata back on the bridged frame (row 270-368) its kind
+  # `compaction` would make every compaction eligible.
 
   @spec prevalidated_request?(
           map(),
@@ -522,6 +687,19 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
     }
   end
 
+  # `request_options.native_compaction_reservation` is deliberately absent from
+  # both signed bases. It is socket-local scheduling state, not admission
+  # authority: the socket writes it to itself to remember "re-attempt this
+  # reservation once the active turn drains", its only reader re-runs
+  # `reserve_owner_capability/5` from scratch, and every authority-bearing part
+  # of it is already covered here (the turn metadata and phase are derived from
+  # the signed `payload` and `payload_context`; the control ref is a fresh
+  # `make_ref/0` used for trace correlation). The authority is
+  # `native_compaction_admission`, which the owner issues and which is bound
+  # into the capability through `runtime_admission_binding_digest/1` and redeemed
+  # at dispatch — that one stays signed. Signing the reservation instead broke
+  # the frame's own token, because the write happens after the seal and only the
+  # dequeue route unwinds it (findings#168).
   defp prepared_frame_digest(
          %PreparedWebsocketFrame{} = prepared,
          validation_claim,
@@ -547,7 +725,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
       prepared.request_options.runtime.replay_lifecycle_binding,
       prepared.request_options.runtime.replay_generation,
       prepared.request_options.native_compaction_admission,
-      prepared.request_options.native_compaction_reservation,
       prepared.request_options.transport.websocket_delivery_mode,
       validation_claim,
       capability_server,
@@ -585,11 +762,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
       request_options.transport.websocket_delivery_mode,
       request_options.payload_context,
       request_options.native_compaction_admission,
-      request_options.native_compaction_reservation,
+      # No `native_compaction_reservation` here either: no validation family
+      # reads it, so a deferral cannot change which validations were completed.
       RequestOptions.use_responses_lite?(request_options),
-      RequestOptions.OpenAICompatibility.translated_responses_surface?(
-        request_options.openai_compatibility
-      )
+      RequestOptions.OpenAICompatibility.translated_responses_surface?(request_options.openai_compatibility)
     })
   end
 
@@ -701,12 +877,12 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   defp scrub_canonical_metadata_turn_id(%{"x-codex-turn-metadata" => encoded} = client_metadata)
        when is_binary(encoded) do
-    case Jason.decode(encoded) do
+    case CodexPooler.JSON.decode(encoded) do
       {:ok, metadata} when is_map(metadata) ->
         Map.put(
           client_metadata,
           "x-codex-turn-metadata",
-          metadata |> Map.delete("turn_id") |> Jason.encode!()
+          metadata |> Map.delete("turn_id") |> CodexPooler.JSON.encode!()
         )
 
       _validated_earlier ->
@@ -760,7 +936,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   def deliver_result(%{websocket_messages: messages}, push_frame) do
-    Enum.each(messages, fn message -> push_frame.(Jason.encode!(message)) end)
+    Enum.each(messages, fn message -> push_frame.(CodexPooler.JSON.encode!(message)) end)
     :ok
   end
 
@@ -770,16 +946,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   def deliver_result(%{body: body}, push_frame) do
-    push_frame.(Jason.encode!(body))
+    push_frame.(CodexPooler.JSON.encode!(body))
     :ok
   end
 
   defp normalize_websocket_stream_result(:ok), do: :ok
   defp normalize_websocket_stream_result({:ok, _result}), do: :ok
 
-  defp normalize_websocket_stream_result(
-         {:error, %{status: status, code: code, message: message}} = error
-       )
+  defp normalize_websocket_stream_result({:error, %{status: status, code: code, message: message}} = error)
        when is_integer(status) and status > 0 and (is_binary(code) or is_atom(code)) and
               is_binary(message),
        do: error
@@ -843,7 +1017,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
        do: {:ok, :missing}
 
   defp native_turn_identity(%{"type" => "response.create"} = payload, %RequestOptions{} = opts) do
-    case WebsocketTurnIdentity.resolve(payload, codex_session_id(opts)) do
+    case WebsocketTurnIdentity.resolve(payload, turn_claim_scope(payload, opts)) do
       {:ok, identity} -> {:ok, identity}
       :missing -> {:ok, :missing}
       {:error, reason} -> {:error, reason}
@@ -852,11 +1026,83 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   defp native_turn_identity(_payload, %RequestOptions{}), do: {:ok, :missing}
 
-  defp codex_session_id(%RequestOptions{continuity: %{codex_session: %{id: id}}})
-       when is_binary(id),
-       do: id
+  # A websocket frame always carries the canonical document, so the thread scope
+  # is available here whenever the client sends one; a frame without it keeps
+  # the session scope, which is what this call passed before findings#250.
+  defp turn_claim_scope(payload, %RequestOptions{continuity: %{codex_session: session}} = opts)
+       when is_map(session) do
+    WebsocketTurnIdentity.claim_scope(session, NativeTurnContinuation.thread_identity(payload, opts))
+  end
 
-  defp codex_session_id(%RequestOptions{}), do: nil
+  defp turn_claim_scope(_payload, %RequestOptions{}), do: nil
+
+  @doc """
+  The claim scope this frame's native turn identity is derived under.
+
+  Every other derivation of the same frame's semantic turn key (the native
+  compaction admission binding among them) must use this scope, or it names a
+  different turn than the continuity key the frame is sealed and persisted
+  with (findings#225, row 225-90).
+  """
+  @spec native_turn_claim_scope(map(), RequestOptions.t()) :: String.t() | nil
+  def native_turn_claim_scope(payload, %RequestOptions{} = opts) when is_map(payload),
+    do: turn_claim_scope(payload, opts)
+
+  @doc """
+  The durable claim of a turn opening or resume admitted after compaction.
+  The runtime proof must not replace this identity: an identical resend on
+  another connection derives the same claim and is judged by the durable
+  successor policy instead of dispatching under an unrelated generated id.
+  """
+  @spec post_compaction_resume_claim(map(), RequestOptions.t()) :: String.t() | nil
+  def post_compaction_resume_claim(
+        payload,
+        %RequestOptions{continuity: %{semantic_turn_key: semantic_turn_key}} = options
+      )
+      when is_map(payload) and is_binary(semantic_turn_key) do
+    case NativeTurnContinuation.turn_role(payload) do
+      :opening ->
+        # Runtime dispatch may already have projected client metadata away.
+        # Reuse the identity sealed from the original frame before coercion.
+        options.continuity.turn_claim_key
+
+      {:post_compaction_resume, anchor} ->
+        if post_compaction_resume?(payload, options),
+          do: WebsocketTurnIdentity.resume_claim_key(semantic_turn_key, anchor)
+
+      _other ->
+        nil
+    end
+  end
+
+  def post_compaction_resume_claim(_payload, %RequestOptions{}), do: nil
+
+  @doc """
+  The durable claim of a native compaction admitted through the owner's
+  runtime proof, or nil for any other frame.
+
+  It is the claim the same compaction's full-history resend derives
+  (`WebsocketTurnIdentity.remote_compaction_claim_key/3`, bound to the
+  compaction's own window from its turn metadata), so a client cut during the
+  admitted compaction resends into the predecessor's claim and meets the
+  resend policy instead of being served and billed a second time
+  (findings#206 row 206-310), while the turn's next compaction, one window
+  later, takes a claim of its own (findings#270 row 270-351).
+  """
+  @spec admitted_compaction_claim(String.t(), map(), RequestOptions.t()) :: String.t() | nil
+  def admitted_compaction_claim(
+        "/backend-api/codex/responses/compact",
+        payload,
+        %RequestOptions{
+          native_compaction_admission: %RequestOptions.NativeCompactionAdmission{},
+          continuity: %{semantic_turn_key: semantic_turn_key},
+          payload_context: %{native_codex_turn_metadata: %NativeCodexTurnMetadata{request_kind: :compaction, window_id_digest: <<_::256>> = window}}
+        }
+      )
+      when is_map(payload) and is_binary(semantic_turn_key) and byte_size(semantic_turn_key) == 32,
+      do: WebsocketTurnIdentity.remote_compaction_claim_key(semantic_turn_key, window, payload)
+
+  def admitted_compaction_claim(_endpoint, _payload, %RequestOptions{}), do: nil
 
   defp put_native_turn_identity(%RequestOptions{} = request_options, :missing),
     do: request_options
@@ -878,104 +1124,172 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
          } = prepared
        )
        when is_binary(semantic_turn_key) and is_binary(turn_claim_key) do
-    request_claim_key =
-      if ordinary_native_tool_continuation?(payload, request_options) do
-        WebsocketTurnIdentity.request_claim_key(semantic_turn_key, payload)
-      else
-        turn_claim_key
-      end
+    request_claim_key = native_request_claim(prepared, request_options)
 
-    case WebsocketTurnIdentity.replay_claim_digest(semantic_turn_key, payload) do
-      {:ok, replay_claim_digest} ->
-        request_options =
-          RequestOptions.put_continuity(request_options,
-            request_claim_key: request_claim_key,
-            replay_claim_digest: replay_claim_digest
-          )
+    with {:ok, replay_claim_digest} <-
+           WebsocketTurnIdentity.replay_claim_digest(semantic_turn_key, payload),
+         {:ok, witness_digest} <-
+           resend_witness_digest(semantic_turn_key, payload, replay_claim_digest),
+         {:ok, alternates, async_alternates, grown} <- replay_alternates(semantic_turn_key, payload) do
+      request_options =
+        RequestOptions.put_continuity(request_options,
+          request_claim_key: request_claim_key,
+          replay_claim_digest: replay_claim_digest
+        )
 
-        {request_options, witness} =
-          case ClientRetry.original_witness(
-                 replay_claim_digest,
-                 request_options.runtime.api_key_runtime_epoch
-               ) do
-            {:ok, witness} ->
-              {RequestOptions.put_native_client_retry_witness(request_options, witness), witness}
+      {request_options, witness} =
+        case ClientRetry.original_witness(
+               witness_digest,
+               request_options.runtime.api_key_runtime_epoch,
+               alternates ++ (async_alternates -- [witness_digest | alternates]),
+               grown
+             ) do
+          {:ok, witness} ->
+            witness = witness |> NativeMailboxContinuation.attach(semantic_turn_key, payload, request_options) |> NativeContentFilterRetry.attach(semantic_turn_key, payload, request_options)
+            {RequestOptions.put_native_client_retry_witness(request_options, witness), witness}
 
-            {:error, :invalid_witness} ->
-              {request_options, nil}
-          end
+          {:error, :invalid_witness} ->
+            {request_options, nil}
+        end
 
-        {:ok,
-         %{
-           prepared
-           | request_options: request_options,
-             replay_claim_digest: replay_claim_digest,
-             native_client_retry_witness: witness
-         }}
-
-      {:error, _reason} = error ->
-        error
+      {:ok,
+       %{
+         prepared
+         | request_options: request_options,
+           replay_claim_digest: replay_claim_digest,
+           native_client_retry_witness: witness
+       }}
     end
   end
 
   defp put_native_request_claim(%PreparedWebsocketFrame{} = prepared), do: {:ok, prepared}
 
-  defp ordinary_native_tool_continuation?(
-         %{"input" => input} = payload,
-         %RequestOptions{
-           native_compaction_admission: nil,
-           payload_context: %{compaction_trigger_bridge?: false},
-           openai_compatibility: %{public_openai_responses_stream: false}
-         }
-       )
-       when is_list(input) do
-    ordinary_native_turn_continuation?(payload) and ToolResultShape.any?(input) and
-      not native_final_compaction?(input)
-  end
+  # The frame's own trailing-slice alternates (an anchored original's witness
+  # found in its full-history resend, findings#232 row 232-160) and grown-resend
+  # candidates (row 232-232), and those of the frame as it was before the
+  # released client filled its asynchronous turn metadata. The client fills
+  # `workspaces` in its turn metadata document from a git task it starts for
+  # every turn, and nothing on its request path waits for it, so a frame sent
+  # after the task finished can repeat one sent before it (findings#314 row
+  # 314-2, findings#319 row 2). An unanchored frame whose document carries such
+  # a field therefore also names the stripped frame's replay digest (an
+  # unanchored original's witness), its trailing-slice digests (an anchored
+  # original's) and its grown candidates, under the same bounds as its own;
+  # the variants share their input, so its items are hashed once. The claim
+  # and the stored witness stay those of the frame as sent, and nothing derived
+  # from the stripped frame is persisted or logged.
+  defp replay_alternates(semantic_turn_key, payload) do
+    case async_metadata_payload(payload) do
+      {:ok, earlier} ->
+        with {:ok, [alternates, earlier_tails]} <- WebsocketTurnIdentity.replay_claim_alternates_of_variants(semantic_turn_key, [payload, earlier]),
+             {:ok, earlier_digest} <- WebsocketTurnIdentity.replay_claim_digest(semantic_turn_key, earlier),
+             {:ok, grown} <- WebsocketTurnIdentity.grown_resend_candidates_of_variants(semantic_turn_key, [payload, earlier]) do
+          {:ok, alternates, [earlier_digest | earlier_tails], List.flatten(grown)}
+        end
 
-  defp ordinary_native_tool_continuation?(_payload, %RequestOptions{}), do: false
-
-  defp ordinary_native_turn_continuation?(
-         %{
-           "client_metadata" => %{"x-codex-turn-metadata" => metadata}
-         } = payload
-       ),
-       do:
-         match?(%{"request_kind" => "turn"}, canonical_metadata_map(metadata)) or
-           previous_response_present?(payload)
-
-  defp ordinary_native_turn_continuation?(payload), do: previous_response_present?(payload)
-
-  defp native_final_compaction?(input) do
-    Enum.any?(
-      input,
-      &match?(%{"type" => type} when type in ["compaction", "compaction_summary"], &1)
-    )
-  end
-
-  defp previous_response_present?(%{"previous_response_id" => value}) when is_binary(value),
-    do: String.trim(value) != ""
-
-  defp previous_response_present?(_payload), do: false
-
-  defp canonical_metadata_map(metadata) when is_map(metadata), do: metadata
-
-  defp canonical_metadata_map(metadata) when is_binary(metadata) do
-    case Jason.decode(metadata) do
-      {:ok, decoded} when is_map(decoded) -> decoded
-      _invalid -> %{}
+      :none ->
+        with {:ok, alternates} <- WebsocketTurnIdentity.replay_claim_alternates(semantic_turn_key, payload),
+             {:ok, grown} <- WebsocketTurnIdentity.grown_resend_candidates(semantic_turn_key, payload),
+             do: {:ok, alternates, [], grown}
     end
   end
 
-  defp canonical_metadata_map(_metadata), do: %{}
+  defp async_metadata_payload(%{"previous_response_id" => anchor}) when is_binary(anchor) and anchor != "", do: :none
+  defp async_metadata_payload(payload), do: NativeTurnContinuation.without_async_turn_metadata(payload)
+
+  # The digest a failed or replayed predecessor is recognised by when the client
+  # resends it. An unanchored request is resent byte-identically, so it is the
+  # replay claim itself; an anchored one is resent as full history without its
+  # anchor, so its stored witness is the anchor-free digest of its own items,
+  # which that resend finds among its trailing items (findings#232 row 232-160).
+  defp resend_witness_digest(semantic_turn_key, payload, replay_claim_digest) do
+    case WebsocketTurnIdentity.replay_tail_digest(semantic_turn_key, payload) do
+      {:ok, tail_digest} -> {:ok, tail_digest}
+      :unanchored -> {:ok, replay_claim_digest}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp native_request_claim(%PreparedWebsocketFrame{} = prepared, request_options) do
+    payload = prepared.payload
+    semantic_turn_key = prepared.semantic_turn_key
+
+    cond do
+      full_history_native_compaction?(prepared.endpoint, request_options) ->
+        %NativeCodexTurnMetadata{window_id_digest: window} = request_options.payload_context.native_codex_turn_metadata
+        WebsocketTurnIdentity.remote_compaction_claim_key(semantic_turn_key, window, payload)
+
+      # A local compaction's summarization request (findings#282) carries the
+      # turn's own `turn_id` but is not a request of the turn: the turn's opener
+      # holds the bare claim, so it takes a compaction claim over its own
+      # payload, whose client metadata names its window, which an identical
+      # resend and the client's HTTPS fallback of it derive too.
+      NativeTurnContinuation.local_compaction_request?(payload, request_options) ->
+        WebsocketTurnIdentity.native_compaction_claim_key(semantic_turn_key, payload)
+
+      post_compaction_resume?(payload, request_options) ->
+        {:post_compaction_resume, anchor} = NativeTurnContinuation.turn_role(payload)
+        WebsocketTurnIdentity.resume_claim_key(semantic_turn_key, anchor)
+
+      ordinary_native_tool_continuation?(payload, request_options) ->
+        WebsocketTurnIdentity.request_claim_key(semantic_turn_key, payload)
+
+      # A later request of the turn steered in by the user, anchored on the
+      # response its own turn just completed on this socket (findings#206 row
+      # 206-409). It takes the steered claim of its full-history progress, the
+      # claim its full-history resend on another socket and its HTTPS form
+      # derive too, so each of them meets it (row 206-412). Without a known
+      # progress it is claimed per payload like a tool-result continuation.
+      NativeTurnContinuation.steered_continuation?(payload, request_options, semantic_turn_key) ->
+        case request_options.extra do
+          %{native_turn_progress: <<_::256>> = progress} -> WebsocketTurnIdentity.steered_claim_key(semantic_turn_key, progress)
+          _unknown -> WebsocketTurnIdentity.request_claim_key(semantic_turn_key, payload)
+        end
+
+      true ->
+        prepared.turn_claim_key
+    end
+  end
+
+  defp full_history_native_compaction?(
+         "/backend-api/codex/responses/compact",
+         %RequestOptions{
+           native_compaction_admission: nil,
+           transport: %{transport: "websocket", websocket_delivery_mode: :collect_full_history},
+           continuity: %{previous_response_id: nil},
+           payload_context: %{
+             compaction_trigger_bridge?: true,
+             compaction_input_mode: :full_history,
+             compaction_result_mode: :native_websocket,
+             native_codex_turn_metadata: %NativeCodexTurnMetadata{request_kind: :compaction, window_id_digest: <<_::256>>}
+           }
+         }
+       ),
+       do: true
+
+  defp full_history_native_compaction?(_endpoint, %RequestOptions{}), do: false
+
+  # The turn-vs-continuation discriminator is shared with the native HTTP claim
+  # path (findings#212): both transports carry the same `client_metadata`,
+  # anchor and tool-result shapes, so both must read one definition.
+  defp ordinary_native_tool_continuation?(payload, options),
+    do: NativeTurnContinuation.ordinary_tool_continuation?(payload, options)
+
+  defp post_compaction_resume?(payload, options) do
+    NativeTurnContinuation.request_kind(payload, options) == "turn" and
+      match?({:post_compaction_resume, _anchor}, NativeTurnContinuation.turn_role(payload))
+  end
+
+  defp canonical_metadata_map(metadata),
+    do: NativeTurnContinuation.canonical_metadata_map(metadata)
 
   defp replay_request_kind?(
          %{"client_metadata" => %{@canonical_metadata_key => metadata}},
-         %RequestOptions{} = options
+         %RequestOptions{}
        ) do
     case canonical_metadata_map(metadata) do
       %{"request_kind" => kind} when kind in ["turn", "compaction"] ->
-        not valid_final_compaction_admission?(options)
+        true
 
       _other ->
         false
@@ -984,13 +1298,24 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   defp replay_request_kind?(_payload, %RequestOptions{}), do: false
 
-  defp valid_final_compaction_admission?(%RequestOptions{
-         native_compaction_admission:
-           %RequestOptions.NativeCompactionAdmission{capability: %{phase: :final}} = admission
-       }),
-       do: RequestOptions.NativeCompactionAdmission.valid?(admission)
+  defp projected_native_compaction_retry?(
+         "/backend-api/codex/responses/compact",
+         %RequestOptions{
+           native_compaction_admission: nil,
+           transport: %{transport: "websocket", websocket_delivery_mode: :collect_full_history},
+           continuity: %{previous_response_id: nil, request_claim_key: request_claim_key},
+           payload_context: %{
+             compaction_trigger_bridge?: true,
+             compaction_input_mode: :full_history,
+             compaction_result_mode: :native_websocket,
+             native_codex_turn_metadata: %NativeCodexTurnMetadata{request_kind: :compaction}
+           }
+         }
+       )
+       when is_binary(request_claim_key),
+       do: true
 
-  defp valid_final_compaction_admission?(%RequestOptions{}), do: false
+  defp projected_native_compaction_retry?(_endpoint, %RequestOptions{}), do: false
 
   defp namespace_restoring_writer(
          push_frame,
@@ -1021,10 +1346,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   defp restore_custom_tool_call_namespaces(data, namespaces) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok, %{} = decoded} ->
         restored = Responses.restore_custom_tool_call_namespaces(decoded, namespaces)
-        if restored === decoded, do: data, else: Jason.encode!(restored)
+        if restored === decoded, do: data, else: CodexPooler.JSON.encode!(restored)
 
       _invalid ->
         data
@@ -1113,7 +1438,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   defp canonical_sse_data_message(data) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok, %{} = decoded} ->
         {canonical, _decoded} =
           StreamProtocol.canonicalize_codex_responses_json_message(data, decoded)
@@ -1129,7 +1454,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   defp direct_json_message(data) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok, %{} = decoded} ->
         {canonical, _decoded} =
           StreamProtocol.canonicalize_codex_responses_json_message(data, decoded)
@@ -1211,18 +1536,19 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
         downstream_payload = coerced.payload
 
         compact_payload =
-          CompactionTrigger.project_responses_payload(compact_payload, result_transport)
+          compact_payload
+          |> CompactionTrigger.project_responses_payload(if(CompactionTrigger.v2_streaming?(downstream_payload), do: :sse, else: :buffered))
+          |> CompactionTrigger.put_client_fields(downstream_payload)
 
         request_options =
           coerced.request_options
           |> RequestOptions.retarget("/backend-api/codex/responses/compact", compact_payload)
-          |> put_native_compaction_transport(result_transport)
+          |> put_native_compaction_transport(CompactionTrigger.v2_streaming?(downstream_payload))
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
             compaction_result_transport: result_transport,
             compaction_result_mode: :native_websocket,
-            compaction_projection_context:
-              CompactionProjectionContext.new(downstream_payload, compact_payload)
+            compaction_projection_context: CompactionProjectionContext.new(downstream_payload, compact_payload)
           )
           |> put_validated_native_compaction_turn_state(turn_state)
 
@@ -1258,8 +1584,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
     )
   end
 
-  defp put_native_compaction_transport(%RequestOptions{} = request_options, result_transport) do
-    if result_transport == :sse do
+  defp put_native_compaction_transport(%RequestOptions{} = request_options, native_v2?) do
+    if native_v2? do
       RequestOptions.put_transport(request_options,
         transport: "websocket",
         upstream_endpoint: "/backend-api/codex/responses",
@@ -1308,6 +1634,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
       {:ok, compact_payload} ->
         downstream_payload = coerced.payload
+
         compact_payload =
           CompactionTrigger.project_responses_payload(compact_payload, result_transport)
 
@@ -1317,10 +1644,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
           |> put_public_compaction_transport(result_transport)
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
-            compaction_result_transport: result_transport,
+            compaction_result_transport: :sse,
             compaction_result_mode: :public_websocket,
-            compaction_projection_context:
-              CompactionProjectionContext.new(downstream_payload, compact_payload)
+            compaction_projection_context: CompactionProjectionContext.new(downstream_payload, compact_payload)
           )
 
         {:ok,
@@ -1362,8 +1688,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
     end
   end
 
-  defp public_compaction_input_mode(payload), do: CompactionTrigger.compaction_input_mode(payload)
-
   defp put_public_compaction_transport(
          %RequestOptions{payload_context: %{compaction_input_mode: :incremental}} =
            request_options,
@@ -1378,23 +1702,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
     )
   end
 
-  defp put_public_compaction_transport(%RequestOptions{} = request_options, result_transport) do
-    if result_transport == :sse do
-      RequestOptions.put_transport(request_options,
-        transport: "websocket",
-        upstream_endpoint: "/backend-api/codex/responses",
-        route_class: RouteClass.proxy_compact(),
-        websocket_writer: nil,
-        websocket_delivery_mode: :collect_full_history
-      )
-    else
-      RequestOptions.put_transport(request_options,
-        transport: "http_compact_json",
-        upstream_endpoint: "/backend-api/codex/responses",
-        route_class: RouteClass.proxy_compact(),
-        websocket_writer: nil
-      )
-    end
+  defp put_public_compaction_transport(%RequestOptions{} = request_options, _result_transport) do
+    RequestOptions.put_transport(request_options,
+      transport: "http_compact_json",
+      upstream_endpoint: "/backend-api/codex/responses",
+      route_class: RouteClass.proxy_compact(),
+      websocket_writer: nil
+    )
   end
 
   defp maybe_put_backend_turn_state(

@@ -1,5 +1,7 @@
 import Config
 
+config :six, skip_files: [~r{\Adev_support/}]
+
 config :argon2_elixir, t_cost: 1, m_cost: 8
 
 test_postgres_user =
@@ -73,7 +75,18 @@ config :codex_pooler, CodexPooler.Repo,
   port: String.to_integer(test_postgres_port),
   database: test_database,
   pool: Ecto.Adapters.SQL.Sandbox,
-  pool_size: test_repo_pool_size
+  pool_size: test_repo_pool_size,
+  # A non-async test shares its sandbox owner's single connection with every process it starts,
+  # and DBConnection's ownership proxy drops each queued checkout that has waited more than twice
+  # `queue_target` (100 ms by default) at its once-a-second sweep. A response task settles after
+  # its terminal frame reached the client, holding that connection for 100 ms to 1.1 s under load
+  # (measured under a 12-loop CPU hog; more than 3 s during a database restore), so the test's
+  # next read, upgrade or cleanup failed with "dropped from queue" instead of waiting its turn.
+  # In production each of those processes checks out its own pooled connection. 5 s drops only a
+  # waiter stalled for 10 s, well past every measured hold and inside the 15 s query timeout that
+  # bounds the holder's statements (findings#206, findings#232 row 232-222).
+  queue_target: 5_000,
+  parameters: [application_name: "codex_pooler_test"]
 
 config :codex_pooler, Oban,
   notifier: if(test_partition, do: Oban.Notifiers.PG, else: Oban.Notifiers.Postgres),
@@ -87,10 +100,34 @@ config :codex_pooler, CodexPoolerWeb.Endpoint,
   secret_key_base: "0W/ugDYhzDkRIy8rN1FLggPbDBZ7R1yROeLZfr3kArhi78yT+0Cm/5fqIk5ES3dm",
   server: false
 
+# `mix codex_pooler.test` stops the application before it drops a run-scoped database, and
+# stopping runs the websocket rollout drain. Without this, a websocket owner a test leaked holds
+# that exit for the release budget of 50 s. The drain's deadline margin collapses any budget this
+# short to its floor, so a leaked turn is aborted at once; the release environment variable still
+# takes precedence.
+config :codex_pooler, CodexPooler.Gateway.Transports.Websocket.RolloutDrain, shutdown_timeout_ms: 1_000
+
 config :codex_pooler, CodexPooler.Mailer, adapter: Swoosh.Adapters.Test
 config :codex_pooler, dev_features_build_enabled: true
+
+# Tests must never reach the real provider: an identity without an explicit
+# base URL points at a closed local port and fails with connection refused.
+config :codex_pooler, codex_upstream_base_url: "http://127.0.0.1:9"
+
+# The same holds for the provider token endpoint: an identity without a local
+# `base_url`/`token_url` refreshes against the CodexAuth issuer, so a test that
+# forgets to point it at its fake fails fast here instead of calling the real
+# issuer. Tests that exercise OAuth replace the issuer with their own fake.
+config :codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth, issuer: "http://127.0.0.1:9"
 config :codex_pooler, dev_features_enabled: false
 config :codex_pooler, dev_seeds_enabled: true
+
+# The presence heartbeat writes outside any test's sandbox ownership. Tests
+# that need presence rows write them through `CodexPooler.Platform.InstancePresence`
+# inside their own sandbox connection instead.
+config :codex_pooler, CodexPooler.Platform.InstanceHeartbeat, enabled: false
+config :codex_pooler, CodexPooler.Platform.ExecutionProofPublisher, enabled: false
+config :codex_pooler, CodexPooler.Accounting.ExecutionRecovery, enabled: false
 
 # Impeccable live state is read from disk at render time. Point the test env at
 # a directory that never exists so a helper running in the developer's checkout
@@ -100,6 +137,10 @@ config :codex_pooler, impeccable_live_dir: "tmp/test-no-impeccable-live"
 config :swoosh, :api_client, false
 
 config :logger, level: :warning
+
+# Dev tracing restorer: keep the three bounded restore attempts but not a
+# second each (see CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer).
+config :codex_pooler, CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer, restore_timeout_ms: 50
 
 config :phoenix, :plug_init_mode, :runtime
 

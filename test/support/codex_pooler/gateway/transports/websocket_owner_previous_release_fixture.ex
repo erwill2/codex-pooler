@@ -48,8 +48,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
 
     forms = [
       {:attribute, 1, :module, @forwarder},
-      {:attribute, 1, :export,
-       [remote_attach_downstream: 2, remote_attach_downstream: 3, remote_cancel_downstream: 2]},
+      {:attribute, 1, :export, [remote_attach_downstream: 2, remote_attach_downstream: 3, remote_cancel_downstream: 2]},
       owner_lookup_function(:remote_attach_downstream, 2, session, :attach_downstream, []),
       owner_lookup_function(
         :remote_attach_downstream,
@@ -104,9 +103,14 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
     :crypto.hash(:sha256, identified_beam)
   end
 
-  @spec load_synthetic_identity_lookup(node(), binary()) :: {:module, module()}
-  def load_synthetic_identity_lookup(node, identity_id)
-      when is_atom(node) and is_binary(identity_id) do
+  # `identity_ids` is one upstream identity id, or several when the peer's
+  # owner must serve a failover to another account of the Pool.
+  @spec load_synthetic_identity_lookup(node(), binary() | [binary(), ...]) :: {:module, module()}
+  def load_synthetic_identity_lookup(node, identity_id) when is_atom(node) and is_binary(identity_id),
+    do: load_synthetic_identity_lookup(node, [identity_id])
+
+  def load_synthetic_identity_lookup(node, [_ | _] = identity_ids) when is_atom(node) do
+    true = Enum.all?(identity_ids, &is_binary/1)
     module = CodexPooler.Upstreams
     fixture = __MODULE__
 
@@ -117,14 +121,13 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
        [
          {:clause, 1, [{:var, 1, :IdentityId}], [],
           [
-            {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :synthetic_identity}},
-             [{:var, 1, :IdentityId}]}
+            {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :synthetic_identity}}, [{:var, 1, :IdentityId}]}
           ]}
        ]}
     ]
 
     {:ok, ^module, beam} = compile_forms(forms)
-    :erpc.call(node, :persistent_term, :put, [{__MODULE__, :identity_id}, identity_id])
+    :erpc.call(node, :persistent_term, :put, [{__MODULE__, :identity_ids}, identity_ids])
     :erpc.call(node, :code, :purge, [module])
     :erpc.call(node, :code, :delete, [module])
     :erpc.call(node, :code, :load_binary, [module, ~c"synthetic_identity_fixture", beam])
@@ -298,9 +301,10 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
           )
 
         {:ok, _task_supervisor} =
-          Task.Supervisor.start_link(
-            name: CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor
-          )
+          Task.Supervisor.start_link(name: CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor)
+
+        {:ok, _abandoned_submissions} =
+          Registry.start_link(keys: :unique, name: CodexPooler.Gateway.Transports.Websocket.AbandonedSubmissions.Registry)
 
         send(caller, {ready_ref, :ready})
 
@@ -318,7 +322,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
 
   @spec synthetic_identity(binary()) :: struct() | nil
   def synthetic_identity(identity_id) when is_binary(identity_id) do
-    if :persistent_term.get({__MODULE__, :identity_id}) == identity_id do
+    if identity_id in :persistent_term.get({__MODULE__, :identity_ids}, []) do
       %CodexPooler.Upstreams.Schemas.UpstreamIdentity{
         id: identity_id,
         account_label: "mixed-release-fixture",
@@ -441,14 +445,11 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
        [
          {:clause, 1, [{:var, 1, :SessionId}, {:var, 1, :Downstream}], [],
           [
-            {:case, 1,
-             {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :lookup}},
-              [{:var, 1, :SessionId}]},
+            {:case, 1, {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :lookup}}, [{:var, 1, :SessionId}]},
              [
                {:clause, 1, [{:tuple, 1, [{:atom, 1, :ok}, {:var, 1, :OwnerPid}]}], [],
                 [
-                  {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :attach_downstream}},
-                   [{:var, 1, :OwnerPid}, {:var, 1, :Downstream}]}
+                  {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :attach_downstream}}, [{:var, 1, :OwnerPid}, {:var, 1, :Downstream}]}
                 ]},
                {:clause, 1, [{:var, 1, :Error}], [], [{:var, 1, :Error}]}
              ]}
@@ -507,9 +508,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
           ], [],
           [
             notify_protocol_form(fixture, :ensure_remote_owner_4),
-            {:case, 1,
-             {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :lookup}},
-              [{:var, 1, :SessionId}]},
+            {:case, 1, {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :lookup}}, [{:var, 1, :SessionId}]},
              [
                {:clause, 1, [{:tuple, 1, [{:atom, 1, :ok}, {:var, 1, :OwnerPid}]}], [],
                 [
@@ -535,10 +534,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
           ], [],
           [
             notify_protocol_form(fixture, :submit_remote_owner_request_5),
-            {:match, 1, {:tuple, 1, [{:var, 1, :TrackedRequest}, {:var, 1, :Visibility}]},
-             {:call, 1,
-              {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :track_historical_request_visibility}},
-              [{:var, 1, :Request}]}},
+            {:match, 1, {:tuple, 1, [{:var, 1, :TrackedRequest}, {:var, 1, :Visibility}]}, {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :track_historical_request_visibility}}, [{:var, 1, :Request}]}},
             {:call, 1, {:atom, 1, :do_submit_remote_owner_request},
              [
                {:var, 1, :OwnerPid},
@@ -563,8 +559,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
           ], [],
           [
             notify_protocol_form(fixture, :do_submit_remote_owner_request_6),
-            {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :submit_request}},
-             [{:var, 1, :OwnerPid}, {:var, 1, :Downstream}, {:var, 1, :Request}]}
+            {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :submit_request}}, [{:var, 1, :OwnerPid}, {:var, 1, :Downstream}, {:var, 1, :Request}]}
           ]}
        ]}
     ]
@@ -580,8 +575,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
   end
 
   defp notify_protocol_form(fixture, stage) do
-    {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :notify_protocol}},
-     [{:atom, 1, stage}]}
+    {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :notify_protocol}}, [{:atom, 1, stage}]}
   end
 
   @doc false
@@ -606,8 +600,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
        [
          {:clause, 1, [{:var, 1, :SessionId}], [],
           [
-            {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :record_lookup_sentinel}},
-             [{:atom, 1, :owner}]}
+            {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :record_lookup_sentinel}}, [{:atom, 1, :owner}]}
           ]}
        ]}
     ]
@@ -626,8 +619,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
        [
          {:clause, 1, [{:var, 1, :IdentityId}], [],
           [
-            {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :record_lookup_sentinel}},
-             [{:atom, 1, :identity}]}
+            {:call, 1, {:remote, 1, {:atom, 1, fixture}, {:atom, 1, :record_lookup_sentinel}}, [{:atom, 1, :identity}]}
           ]}
        ]}
     ]
@@ -666,13 +658,11 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseFixture do
      [
        {:clause, 1, variables, [],
         [
-          {:case, 1,
-           {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :lookup}}, [session_id]},
+          {:case, 1, {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, :lookup}}, [session_id]},
            [
              {:clause, 1, [{:tuple, 1, [{:atom, 1, :ok}, {:var, 1, :OwnerPid}]}], [],
               [
-                {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, operation}},
-                 [{:var, 1, :OwnerPid} | operation_args]}
+                {:call, 1, {:remote, 1, {:atom, 1, session}, {:atom, 1, operation}}, [{:var, 1, :OwnerPid} | operation_args]}
               ]},
              {:clause, 1, [{:var, 1, :Error}], [], [{:var, 1, :Error}]}
            ]}

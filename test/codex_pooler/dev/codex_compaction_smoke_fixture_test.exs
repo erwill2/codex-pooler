@@ -2,14 +2,23 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures, only: [attempt_fixture: 3, ledger_entry_fixture: 2, request_fixture: 2]
 
+  alias CodexPooler.Access
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Accounting.{LedgerEntry, Request, RequestReplay, RequestReplayEntitlement}
+  alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Dev.CodexCompactionSmokeFixture
   alias CodexPooler.Dev.CodexCompactionSmokeFixture.Journal
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{CodexTurn, SessionContinuity}
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
+  alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
   alias CodexPooler.Gateway.Runtime.Finalization.SideEffects
+  alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Jobs.AccountReconciliationWorker
-  alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.{ModelServingOverride, Pool}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
 
@@ -26,7 +35,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
   test "journal and one-time secret are private, disjoint, and reject links", context do
     paths = Journal.paths(context.root, context.run_id)
     journal = Journal.new(context.run_id, "pool-id", "identity-id", "assignment-id", "model-id")
-    secret = Journal.secret(context.run_id, "raw-key", "key-id", "pool-id", "gpt-5.5")
+    secret = Journal.secret(context.run_id, "raw-key", "key-id", "pool-id", "gpt-6-sol")
 
     assert :ok = Journal.write_journal(paths, journal)
     assert :ok = Journal.write_secret(paths, secret)
@@ -80,7 +89,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
     assert acquired.status == "ready"
     assert acquired.run_id == context.run_id
-    assert acquired.model == "gpt-5.5"
+    assert acquired.model == "gpt-6-sol"
     assert_safe_public_status(acquired, context)
 
     paths = Journal.paths(context.root, context.run_id)
@@ -127,6 +136,64 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
   end
 
   @tag :unix_integration
+  test "the fixture Pool serves a catalog entry Codex can decode as a ModelInfo", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    assert {:ok, secret} = Journal.read_secret(Journal.paths(context.root, context.run_id), context.run_id)
+
+    conn =
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> secret["api_key"])
+      |> Phoenix.ConnTest.dispatch(CodexPoolerWeb.Endpoint, :get, "/backend-api/codex/models")
+
+    assert %{"models" => [model]} = Phoenix.ConnTest.json_response(conn, 200)
+    assert model["slug"] == acquired.model
+    assert codex_model_info_violations(model) == []
+    assert model["context_window"] == 128_000
+    assert model["auto_compact_token_limit"] == 200
+
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+  end
+
+  # The service tier the released Codex client sends for the fixture model when
+  # nothing configures one: `default_service_tier` of `gpt-6-sol` in the
+  # client's bundled `codex-rs/models-manager/models.json` (0.156.1). The
+  # Pooler's runtime filter refuses a non-default tier the assignment's model
+  # metadata does not declare, so a fixture without it answers `503
+  # no_compatible_backend` to every such turn (findings#203/#206, after the
+  # e4ac10ffb move from gpt-5.5, whose bundled entry has no default tier).
+  @bundled_client_default_service_tier "priority"
+
+  @tag :unix_integration
+  test "the fixture model admits the service tier the released client sends by default", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    assert {:ok, secret} = Journal.read_secret(Journal.paths(context.root, context.run_id), context.run_id)
+
+    model = Repo.get_by!(Model, pool_id: secret["pool_id"])
+    assignment = Repo.get!(PoolUpstreamAssignment, acquired.assignment_id)
+    identity = Repo.get!(UpstreamIdentity, acquired.identity_id)
+    source_model = get_in(model.metadata, ["source_assignment_models", assignment.id])
+
+    payload = %{"model" => model.exposed_model_id, "service_tier" => @bundled_client_default_service_tier}
+    request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+    assert {:ok, [{%PoolUpstreamAssignment{id: assignment_id}, _identity}]} =
+             FilterInput.new(%{
+               model: model,
+               endpoint: "/backend-api/codex/responses",
+               payload: payload,
+               request_options: request_options,
+               candidates: [{assignment, identity}]
+             })
+             |> CandidateEligibility.filter_runtime_compatible_candidates()
+
+    assert assignment_id == assignment.id
+    assert Enum.map(source_model["service_tiers"], & &1["id"]) == [@bundled_client_default_service_tier]
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+  end
+
+  @tag :unix_integration
   test "release cancels gateway reconciliation for its exact graph and preserves foreign jobs",
        context do
     options = fixture_options(context)
@@ -145,6 +212,35 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     refute File.exists?(Journal.paths(context.root, context.run_id).root)
     assert Repo.get!(Pool, foreign.pool_id).status == "active"
     assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(foreign_options)
+  end
+
+  # findings#232, row 232-101: a run whose released client never redeems a
+  # pre-visible replay leaves the armed entitlement and its `in_progress`
+  # turn; the isolated runtime runs no Oban, so nothing ever expires it.
+  @tag :unix_integration
+  test "release settles an unredeemed armed replay of the run key before its postconditions",
+       context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    paths = Journal.paths(context.root, context.run_id)
+    assert {:ok, secret} = Journal.read_secret(paths, context.run_id)
+    armed = arm_run_replay!(secret, acquired)
+
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+
+    assert %RequestReplayEntitlement{status: "revoked", closed_at: %DateTime{}} =
+             Repo.get_by!(RequestReplayEntitlement, request_id: armed.request.id)
+
+    assert %Request{status: "failed", last_error_code: "websocket_replay_revoked"} =
+             Repo.get!(Request, armed.request.id)
+
+    assert %CodexTurn{status: status} = Repo.get!(CodexTurn, armed.turn.id)
+    refute status == "in_progress"
+
+    assert Repo.all(from(entry in LedgerEntry, where: entry.request_id == ^armed.request.id, select: entry.entry_kind))
+           |> Enum.frequencies() == %{"reservation" => 1, "settlement" => 1, "release" => 1}
+
+    refute File.exists?(paths.root)
   end
 
   @tag :unix_integration
@@ -260,6 +356,99 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert Application.get_env(:codex_pooler, Repo) == repo
   end
 
+  @tag :unix_integration
+  test "failed override journal write rolls back the row and release remains complete", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    paths = Journal.paths(context.root, context.run_id)
+    original = File.read!(paths.journal)
+    handler = "override-journal-#{context.run_id}"
+    owner = self()
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _, _, metadata, _ ->
+          if self() == owner and String.starts_with?(metadata.query, "INSERT INTO \"pool_model_serving_overrides\"") do
+            File.rm!(paths.journal)
+            File.mkdir!(paths.journal)
+          end
+        end,
+        nil
+      )
+
+    assert {:error, "fixture serving override failed"} = CodexCompactionSmokeFixture.serving_override(Keyword.put(options, :mode, "full"))
+    :telemetry.detach(handler)
+    assert File.dir?(paths.journal)
+    refute Repo.get_by(ModelServingOverride, pool_id: acquired.pool_id)
+    File.rmdir!(paths.journal)
+    File.write!(paths.journal, original)
+    File.chmod!(paths.journal, 0o600)
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+  end
+
+  @tag :unix_integration
+  test "serving override writes through the product and release drops the journalled row", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    paths = Journal.paths(context.root, context.run_id)
+
+    assert {:ok, full} = CodexCompactionSmokeFixture.serving_override(Keyword.put(options, :mode, "full"))
+    assert %{status: "ready", run_id: run_id, model: "gpt-6-sol", serving_mode: "full", serving_override_id: override_id} = full
+    assert run_id == context.run_id
+
+    assert %ModelServingOverride{pool_id: pool_id, exposed_model_id: "gpt-6-sol", mode: "full"} =
+             Repo.get(ModelServingOverride, override_id)
+
+    assert pool_id == acquired.pool_id
+    assert {:ok, %{"serving_override_id" => ^override_id, "state" => "ready"}} = Journal.read_journal(paths, context.run_id)
+
+    # The product write path records the operator audit event a raw insert never would.
+    assert Repo.exists?(from event in AuditEvent, where: event.pool_id == ^pool_id and event.action == "pool.model_serving_modes_update")
+
+    assert {:ok, %{serving_mode: "lite", serving_override_id: ^override_id}} =
+             CodexCompactionSmokeFixture.serving_override(Keyword.put(options, :mode, "lite"))
+
+    assert %ModelServingOverride{mode: "lite"} = Repo.get(ModelServingOverride, override_id)
+
+    assert {:ok, %{serving_mode: "auto", serving_override_id: nil}} =
+             CodexCompactionSmokeFixture.serving_override(Keyword.put(options, :mode, "auto"))
+
+    refute Repo.get(ModelServingOverride, override_id)
+    assert {:ok, %{"serving_override_id" => ^override_id}} = Journal.read_journal(paths, context.run_id)
+
+    assert {:ok, %{serving_override_id: reacquired_id}} =
+             CodexCompactionSmokeFixture.serving_override(Keyword.put(options, :mode, "full"))
+
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+    refute Repo.get(ModelServingOverride, reacquired_id)
+    assert %Pool{status: "archived"} = Repo.get(Pool, pool_id)
+    refute File.exists?(paths.root)
+  end
+
+  @tag :unix_integration
+  test "release refuses an override row the journal does not own", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    now = DateTime.utc_now()
+
+    Repo.insert_all(ModelServingOverride, [
+      %{pool_id: acquired.pool_id, exposed_model_id: "gpt-6-sol", mode: "full", created_at: now, updated_at: now}
+    ])
+
+    assert {:error, "fixture cleanup incomplete; metadata journal retained"} = CodexCompactionSmokeFixture.release(options)
+    assert Repo.exists?(from override in ModelServingOverride, where: override.pool_id == ^acquired.pool_id)
+    Repo.delete_all(from override in ModelServingOverride, where: override.pool_id == ^acquired.pool_id)
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+  end
+
+  test "serving override requires a ready journal", context do
+    assert {:error, "fixture journal is unsafe or invalid"} =
+             CodexCompactionSmokeFixture.serving_override(Keyword.put(fixture_options(context), :mode, "full"))
+  end
+
   test "argument parser accepts only exact acquire/status/release forms", context do
     assert {:ok, :acquire, options} =
              CodexCompactionSmokeFixture.parse_args([
@@ -293,6 +482,22 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert receipt_options[:duplicate_error_count] == 0
 
     assert {:error, _} = CodexCompactionSmokeFixture.parse_args(["status"])
+
+    for mode <- ["full", "lite", "auto"] do
+      assert {:ok, :serving_override, override_options} =
+               CodexCompactionSmokeFixture.parse_args(["serving-override", "--run-id", context.run_id, "--mode", mode])
+
+      assert override_options[:mode] == mode
+    end
+
+    for invalid <- [
+          ["serving-override", "--run-id", context.run_id],
+          ["serving-override", "--run-id", context.run_id, "--mode", "default"],
+          ["serving-override", "--run-id", context.run_id, "--mode", "full", "--upstream-base-url", "http://127.0.0.1:4567"],
+          ["status", "--run-id", context.run_id, "--mode", "full"]
+        ] do
+      assert {:error, _} = CodexCompactionSmokeFixture.parse_args(invalid)
+    end
 
     assert {:error, _} =
              CodexCompactionSmokeFixture.parse_args([
@@ -342,7 +547,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert receipt.logical_turn_fingerprints == []
     assert receipt.request_fingerprints == []
 
-    encoded = Jason.encode!(receipt)
+    encoded = CodexPooler.JSON.encode!(receipt)
     refute encoded =~ context.run_id
     refute encoded =~ context.root
     refute encoded =~ "pool_id"
@@ -359,6 +564,108 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     )
 
     Repo.one!(from job in Oban.Job, where: job.args["pool_id"] == ^acquired.pool_id)
+  end
+
+  # What the released Codex client's catalog decoder needs from each entry
+  # (codex-rs/protocol/src/openai_models.rs): every `ModelInfo` field without a
+  # serde default, in its declared type, plus `base_instructions` or
+  # `model_messages.instructions_template`. A single entry that fails makes the
+  # client discard the Pool catalog and keep its bundled one.
+  defp codex_model_info_violations(model) do
+    checks = [
+      {"slug", &is_binary/1},
+      {"display_name", &is_binary/1},
+      {"shell_type", &(&1 in ~w(unified_exec disabled default local shell_command))},
+      {"visibility", &(&1 in ~w(list hide none))},
+      {"supported_in_api", &is_boolean/1},
+      {"priority", &is_integer/1},
+      {"support_verbosity", &is_boolean/1},
+      {"truncation_policy", &match?(%{"mode" => mode, "limit" => limit} when mode in ["bytes", "tokens"] and is_integer(limit), &1)},
+      {"experimental_supported_tools", &(is_list(&1) and Enum.all?(&1, fn tool -> is_binary(tool) end))},
+      {"supported_reasoning_levels", &(is_list(&1) and Enum.all?(&1, fn level -> match?(%{"effort" => effort, "description" => description} when is_binary(effort) and is_binary(description), level) end))}
+    ]
+
+    field_violations = for {key, valid?} <- checks, not (Map.has_key?(model, key) and valid?.(model[key])), do: key
+
+    instructions? = is_binary(model["base_instructions"]) or is_binary(get_in(model, ["model_messages", "instructions_template"]))
+
+    if instructions?, do: field_violations, else: field_violations ++ ["base_instructions"]
+  end
+
+  # The run key's websocket turn as the owner leaves it after a pre-visible
+  # disconnect: reserved, its generation-zero attempt failed retryable
+  # `client_disconnected`, and the replay armed through the product path.
+  defp arm_run_replay!(secret, acquired) do
+    assert {:ok, auth} = Access.authenticate_api_key(secret["api_key"])
+    model = Repo.get_by!(Model, pool_id: secret["pool_id"])
+    assignment = Repo.get!(PoolUpstreamAssignment, acquired.assignment_id)
+
+    assert {:ok, session} =
+             Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    request =
+      request_fixture(auth, %{
+        model_id: model.id,
+        requested_model: model.exposed_model_id,
+        transport: "websocket",
+        status: "in_progress",
+        usage_status: "usage_pending",
+        completed_at: nil,
+        response_status_code: nil
+      })
+
+    semantic_digest = :crypto.strong_rand_bytes(32)
+
+    request_options =
+      RequestOptions.for_websocket(%{})
+      |> RequestOptions.put_continuity(semantic_turn_key: semantic_digest)
+
+    assert {:ok, turn} = SessionContinuity.start_codex_turn(session, request, request_options)
+
+    attempt =
+      request
+      |> attempt_fixture(assignment, %{status: "in_progress", completed_at: nil, upstream_status_code: nil, usage_status: "usage_pending"})
+      |> Ecto.Changeset.change(%{model_id: model.id})
+      |> Repo.update!()
+
+    request
+    |> ledger_entry_fixture(%{
+      entry_kind: "reservation",
+      amount_status: "recorded",
+      usage_status: "usage_pending",
+      attempt_id: nil,
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      model_id: model.id
+    })
+    |> Ecto.Changeset.change(%{source_event_id: "request:#{request.id}:reservation"})
+    |> Repo.update!()
+
+    session = Repo.reload!(session)
+
+    assert {:ok, _armed} =
+             RequestReplay.arm(%{
+               api_key_id: auth.api_key.id,
+               pool_id: auth.pool.id,
+               codex_session_id: session.id,
+               request_id: request.id,
+               codex_turn_id: turn.id,
+               eligible_attempt_id: attempt.id,
+               api_key_runtime_epoch: auth.api_key.runtime_revocation_epoch,
+               model_id: model.id,
+               model_identifier: model.exposed_model_id,
+               endpoint: request.endpoint,
+               semantic_turn_digest: semantic_digest,
+               replay_claim_digest: :crypto.strong_rand_bytes(32),
+               owner_instance_id: session.owner_instance_id,
+               owner_lease_token: session.owner_lease_token,
+               predecessor_epoch: 1,
+               failure_reason: :client_disconnected,
+               pre_visible_output: true
+             })
+
+    assert %CodexTurn{status: "in_progress"} = Repo.get!(CodexTurn, turn.id)
+    %{request: request, turn: turn}
   end
 
   defp fixture_options(context) do
@@ -390,7 +697,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     refute encoded =~ ~r/"(?:root|journal|secret|path|paths)"/
   end
 
-  defp public_json(status), do: Jason.encode!(status)
+  defp public_json(status), do: CodexPooler.JSON.encode!(status)
 
   defp current_uid do
     {value, 0} = System.cmd("id", ["-u"])

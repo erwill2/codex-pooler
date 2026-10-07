@@ -3,9 +3,19 @@ defmodule CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer do
 
   use GenServer
 
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace, as: TraceEvent
+
   @name __MODULE__
-  @restore_timeout_ms 1_000
+  @default_restore_timeout_ms 1_000
   @restore_attempts 3
+
+  # The attempt count is the contract; the per-attempt wait is only a budget
+  # and the test environment shortens it (config :codex_pooler, __MODULE__).
+  defp restore_timeout_ms do
+    :codex_pooler
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:restore_timeout_ms, @default_restore_timeout_ms)
+  end
 
   @spec start(reference(), reference()) :: {:ok, pid()} | {:error, term()}
   def start(generation, authorization) do
@@ -110,7 +120,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer do
     if restore_complete?(state) do
       {:stop, :normal, {:ok, status_map(state)}, state}
     else
-      timer = Process.send_after(self(), :restore_timeout, @restore_timeout_ms)
+      timer = Process.send_after(self(), :restore_timeout, restore_timeout_ms())
       {:noreply, %{state | stop_from: from, stop_timer: timer}}
     end
   end
@@ -131,39 +141,37 @@ defmodule CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer do
 
   @impl true
   def handle_info({:DOWN, monitor, :process, pid, _reason}, state) do
-    cond do
-      state.collector == pid and state.collector_monitor == monitor ->
-        state =
-          state
-          |> Map.put(:collector, nil)
-          |> Map.put(:collector_monitor, nil)
-          |> Map.put(:collector_cleanup?, true)
-          |> cleanup_tracing()
-          |> request_restore()
+    if state.collector == pid and state.collector_monitor == monitor do
+      state =
+        state
+        |> Map.put(:collector, nil)
+        |> Map.put(:collector_monitor, nil)
+        |> Map.put(:collector_cleanup?, true)
+        |> cleanup_tracing()
+        |> request_restore()
 
-        timer = Process.send_after(self(), :restore_timeout, @restore_timeout_ms)
-        state = %{state | stop_timer: timer, restore_attempt: 1}
-        {:noreply, state}
+      timer = Process.send_after(self(), :restore_timeout, restore_timeout_ms())
+      state = %{state | stop_timer: timer, restore_attempt: 1}
+      {:noreply, state}
+    else
+      state =
+        case state.processes do
+          %{^pid => %{monitor: ^monitor}} -> update_process_state(state, pid, :dead)
+          _other -> state
+        end
 
-      true ->
-        state =
-          case state.processes do
-            %{^pid => %{monitor: ^monitor}} -> update_process_state(state, pid, :dead)
-            _other -> state
-          end
-
-        maybe_finish_stop(state)
+      maybe_finish_stop(state)
     end
   end
 
   def handle_info(:restore_timeout, state) do
     if state.restore_attempt < @restore_attempts do
       state = request_restore(%{state | restore_attempt: state.restore_attempt + 1})
-      timer = Process.send_after(self(), :restore_timeout, @restore_timeout_ms)
+      timer = Process.send_after(self(), :restore_timeout, restore_timeout_ms())
       {:noreply, %{state | stop_timer: timer}}
     else
       state = force_terminate_pending(state)
-      timer = Process.send_after(self(), :forced_down_timeout, @restore_timeout_ms)
+      timer = Process.send_after(self(), :forced_down_timeout, restore_timeout_ms())
       {:noreply, %{state | stop_timer: timer}}
     end
   end
@@ -184,8 +192,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer do
         if Process.alive?(pid) and process.state in [:observable, :restore_pending] do
           send(
             pid,
-            {:native_compaction_trace_sensitivity, :restore, state.generation,
-             state.authorization, self()}
+            {:native_compaction_trace_sensitivity, :restore, state.generation, state.authorization, self()}
           )
 
           {pid, %{process | state: :restore_pending}}
@@ -223,7 +230,7 @@ defmodule CodexPooler.Dev.NativeCompactionTrace.SensitivityRestorer do
     end)
 
     Enum.each(state.patterns, &:erlang.trace_pattern(&1, false, [:local]))
-    CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace.deactivate_mode()
+    TraceEvent.deactivate_mode()
     state
   end
 

@@ -51,7 +51,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.TokenLinking
 
-  @runtime_root Path.join(["tmp", "issue-241", "runtime"])
+  @runtime_root Path.join(["tmp", "responses-tool-compat", "runtime"])
   @model_id "gateway-perf-full"
   @responses_endpoint "/backend-api/codex/responses"
   @lite_http_header "x-openai-internal-codex-responses-lite"
@@ -93,9 +93,8 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
     with :ok <- reject_parser_remainders(positional, invalid),
          :ok <- reject_duplicate_options(args, options),
          :ok <- require_safe_scope(options),
-         {:ok, owner_id} <- required_owner_id(options),
-         {:ok, command} <- command_from_options(options, owner_id) do
-      {:ok, command}
+         {:ok, owner_id} <- required_owner_id(options) do
+      command_from_options(options, owner_id)
     end
   end
 
@@ -133,11 +132,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
   @spec verify_loopback_fake(FakeUpstream.server()) :: :ok | {:error, String.t()}
   def verify_loopback_fake(%{url: url, profiles: profiles, run_id: run_id})
       when is_binary(url) and is_list(profiles) and is_binary(run_id) do
-    uri = URI.parse(url)
-
-    if uri.scheme == "http" and uri.host in ["127.0.0.1", "localhost", "::1"] and
-         is_integer(uri.port) and uri.port > 0 and is_nil(uri.userinfo) and
-         uri.path in [nil, ""] and is_nil(uri.query) and is_nil(uri.fragment) and
+    if loopback_origin?(URI.parse(url)) and
          profiles == [Enum.find(FakeUpstream.profiles(), &(&1["name"] == "opencode-text-ok"))] and
          valid_run_id?(run_id) do
       :ok
@@ -148,6 +143,14 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
 
   def verify_loopback_fake(_fake),
     do: {:error, "fake upstream must be the verified loopback Full profile"}
+
+  defp loopback_origin?(uri) do
+    uri.scheme == "http" and uri.host in ["127.0.0.1", "localhost", "::1"] and
+      is_integer(uri.port) and uri.port > 0 and bare_origin?(uri)
+  end
+
+  defp bare_origin?(uri),
+    do: is_nil(uri.userinfo) and uri.path in [nil, ""] and is_nil(uri.query) and is_nil(uri.fragment)
 
   defp reject_parser_remainders([], []), do: :ok
 
@@ -298,9 +301,8 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
   defp rollback(run_id, reason, opts) do
     cleanup_result =
       with {:ok, journal} <- Journal.read_journal(run_id),
-           {:ok, journal} <- Journal.recover_pools(journal),
-           {:ok, receipt} <- execute_cleanup(journal, remove_run_dir?: true) do
-        {:ok, receipt}
+           {:ok, journal} <- Journal.recover_pools(journal) do
+        execute_cleanup(journal, remove_run_dir?: true)
       end
 
     case cleanup_result do
@@ -508,9 +510,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
   defp provision_catalog(_scope, journal, run_dir, pool) do
     with {:ok, journal} <- intent(journal, run_dir, "catalog", "sync", %{pool_id: pool.id}),
          {:ok, %{sync_run: sync_run, models: _models, partial?: false}} <-
-           Journal.accept_catalog_sync_result(
-             Catalog.sync_pool_catalog(pool, trigger_kind: "manual")
-           ),
+           Journal.accept_catalog_sync_result(Catalog.sync_pool_catalog(pool, trigger_kind: "manual")),
          {:ok, journal} <-
            completed(journal, run_dir, "sync_run", sync_run.id, %{pool_id: pool.id}),
          models = Catalog.list_models(pool),
@@ -620,12 +620,10 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
         end
 
       {:ok, candidates} ->
-        {:error,
-         "routeability preflight failed source_bound=#{source_bound?} quota_precise=#{quota_state == :precise} candidate_count=#{length(candidates)}"}
+        {:error, "routeability preflight failed source_bound=#{source_bound?} quota_precise=#{quota_state == :precise} candidate_count=#{length(candidates)}"}
 
       {:error, _reason} ->
-        {:error,
-         "routeability preflight failed source_bound=#{source_bound?} quota_precise=#{quota_state == :precise} candidate_count=0"}
+        {:error, "routeability preflight failed source_bound=#{source_bound?} quota_precise=#{quota_state == :precise} candidate_count=0"}
     end
   end
 
@@ -636,21 +634,23 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
       Req.post!("http://127.0.0.1:#{@pooler_port}#{@responses_endpoint}",
         headers: [
           {"authorization", "Bearer " <> raw_key},
+          {"content-type", "application/json"},
           {"x-request-id", correlator},
           {"accept", "text/event-stream"}
         ],
-        json: %{
-          "model" => @model_id,
-          "instructions" => "You are a bounded loopback control.",
-          "input" => [
-            %{
-              "type" => "message",
-              "role" => "user",
-              "content" => [%{"type" => "input_text", "text" => "hello"}]
-            }
-          ],
-          "stream" => true
-        },
+        body:
+          CodexPooler.JSON.encode_to_iodata!(%{
+            "model" => @model_id,
+            "instructions" => "You are a bounded loopback control.",
+            "input" => [
+              %{
+                "type" => "message",
+                "role" => "user",
+                "content" => [%{"type" => "input_text", "text" => "hello"}]
+              }
+            ],
+            "stream" => true
+          }),
         retry: false,
         decode_body: false,
         receive_timeout: @traffic_deadline_ms
@@ -674,7 +674,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
   # body itself is deliberately never rendered or retained.
   defp http_failure_reason(status, body) do
     summary =
-      with {:ok, %{"error" => error}} when is_map(error) <- Jason.decode(body),
+      with {:ok, %{"error" => error}} when is_map(error) <- CodexPooler.JSON.decode(body),
            code when is_binary(code) <- Map.get(error, "code"),
            type when is_binary(type) <- Map.get(error, "type"),
            true <- bounded_error_token?(code),
@@ -700,7 +700,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
     ]
 
     payload =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => @model_id,
         "instructions" => "You are a bounded loopback control.",
@@ -752,44 +752,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
 
       true ->
         receive do
-          message ->
-            case Mint.WebSocket.stream(conn, message) do
-              :unknown ->
-                websocket_await_upgrade(conn, ref, status, headers, rest, deadline)
-
-              {:ok, conn, entries} ->
-                status =
-                  status ||
-                    Enum.find_value(entries, fn
-                      {:status, ^ref, code} -> code
-                      _other -> nil
-                    end)
-
-                headers =
-                  headers ||
-                    Enum.find_value(entries, fn
-                      {:headers, ^ref, found} -> found
-                      _other -> nil
-                    end)
-
-                data_entries =
-                  Enum.filter(entries, fn
-                    {:data, ^ref, _data} -> true
-                    _other -> false
-                  end)
-
-                websocket_await_upgrade(
-                  conn,
-                  ref,
-                  status,
-                  headers,
-                  rest ++ data_entries,
-                  deadline
-                )
-
-              {:error, _conn, reason, _responses} ->
-                {:error, "websocket upgrade receive failed: #{safe_reason(reason)}"}
-            end
+          message -> websocket_upgrade_message(conn, ref, message, status, headers, rest, deadline)
         after
           5_000 ->
             websocket_await_upgrade(conn, ref, status, headers, rest, deadline)
@@ -797,26 +760,35 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
     end
   end
 
+  defp websocket_upgrade_message(conn, ref, message, status, headers, rest, deadline) do
+    case Mint.WebSocket.stream(conn, message) do
+      :unknown ->
+        websocket_await_upgrade(conn, ref, status, headers, rest, deadline)
+
+      {:ok, conn, entries} ->
+        status = status || Enum.find_value(entries, &upgrade_status(&1, ref))
+        headers = headers || Enum.find_value(entries, &upgrade_headers(&1, ref))
+        data_entries = Enum.filter(entries, &match?({:data, ^ref, _data}, &1))
+        websocket_await_upgrade(conn, ref, status, headers, rest ++ data_entries, deadline)
+
+      {:error, _conn, reason, _responses} ->
+        {:error, "websocket upgrade receive failed: #{safe_reason(reason)}"}
+    end
+  end
+
+  defp upgrade_status({:status, ref, code}, ref), do: code
+  defp upgrade_status(_entry, _ref), do: nil
+
+  defp upgrade_headers({:headers, ref, found}, ref), do: found
+  defp upgrade_headers(_entry, _ref), do: nil
+
   defp websocket_await_terminal(conn, ref, websocket, initial_entries) do
     deadline = System.monotonic_time(:millisecond) + @traffic_deadline_ms
     websocket_drain_entries(conn, ref, websocket, initial_entries, deadline)
   end
 
   defp websocket_drain_entries(conn, ref, websocket, entries, deadline) do
-    {websocket, terminal} =
-      Enum.reduce(entries, {websocket, nil}, fn
-        {:data, ^ref, data}, {socket, found} ->
-          case Mint.WebSocket.decode(socket, data) do
-            {:ok, socket, frames} ->
-              {socket, found || websocket_terminal_in(frames)}
-
-            {:error, socket, _reason} ->
-              {socket, found}
-          end
-
-        _entry, acc ->
-          acc
-      end)
+    {websocket, terminal} = decode_websocket_terminal(entries, ref, websocket)
 
     cond do
       is_binary(terminal) ->
@@ -827,17 +799,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
 
       true ->
         receive do
-          message ->
-            case Mint.WebSocket.stream(conn, message) do
-              :unknown ->
-                websocket_drain_entries(conn, ref, websocket, [], deadline)
-
-              {:ok, conn, new_entries} ->
-                websocket_drain_entries(conn, ref, websocket, new_entries, deadline)
-
-              {:error, _conn, reason, _responses} ->
-                {:error, "websocket receive failed: #{safe_reason(reason)}"}
-            end
+          message -> websocket_drain_message(conn, ref, websocket, message, deadline)
         after
           5_000 ->
             websocket_drain_entries(conn, ref, websocket, [], deadline)
@@ -845,10 +807,36 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
     end
   end
 
+  defp decode_websocket_terminal(entries, ref, websocket) do
+    Enum.reduce(entries, {websocket, nil}, fn
+      {:data, ^ref, data}, {socket, found} ->
+        case Mint.WebSocket.decode(socket, data) do
+          {:ok, socket, frames} -> {socket, found || websocket_terminal_in(frames)}
+          {:error, socket, _reason} -> {socket, found}
+        end
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp websocket_drain_message(conn, ref, websocket, message, deadline) do
+    case Mint.WebSocket.stream(conn, message) do
+      :unknown ->
+        websocket_drain_entries(conn, ref, websocket, [], deadline)
+
+      {:ok, conn, new_entries} ->
+        websocket_drain_entries(conn, ref, websocket, new_entries, deadline)
+
+      {:error, _conn, reason, _responses} ->
+        {:error, "websocket receive failed: #{safe_reason(reason)}"}
+    end
+  end
+
   defp websocket_terminal_in(frames) do
     Enum.find_value(frames, fn
       {:text, text} ->
-        case Jason.decode(text) do
+        case CodexPooler.JSON.decode(text) do
           {:ok, %{"type" => "response.completed"}} -> "response.completed"
           _other -> nil
         end
@@ -881,14 +869,11 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
         "endpoint" => @responses_endpoint,
         "requested_model" => @model_id,
         "retry_counts" => requests |> Enum.map(& &1.retry_count) |> Enum.uniq(),
-        "model_serving_mode_configured" =>
-          routing_values(requests, "model_serving_mode_configured"),
+        "model_serving_mode_configured" => routing_values(requests, "model_serving_mode_configured"),
         "model_serving_mode" => routing_values(requests, "model_serving_mode"),
         "model_serving_mode_source" => routing_values(requests, "model_serving_mode_source"),
-        "attempt_identity_match" =>
-          Enum.all?(attempts, &(&1.upstream_identity_id == identity.id)),
-        "attempt_assignment_match" =>
-          Enum.all?(attempts, &(&1.pool_upstream_assignment_id == assignment.id)),
+        "attempt_identity_match" => Enum.all?(attempts, &(&1.upstream_identity_id == identity.id)),
+        "attempt_assignment_match" => Enum.all?(attempts, &(&1.pool_upstream_assignment_id == assignment.id)),
         "upstream_request_id_fingerprints" => fingerprint_by_transport
       }
 
@@ -931,8 +916,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
         {:ok, requests}
 
       System.monotonic_time(:millisecond) > deadline ->
-        {:error,
-         "correlated request rows incomplete: #{length(requests)} rows for the shared correlator"}
+        {:error, "correlated request rows incomplete: #{length(requests)} rows for the shared correlator"}
 
       true ->
         Process.sleep(250)
@@ -968,18 +952,13 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
       {Enum.all?(requests, &(&1.retry_count == 0)), "retry_count was not zero"},
       {Enum.all?(requests, &(&1.model_id == model.id)), "request rows resolved another model"},
       {Enum.all?(requests, &(&1.pool_id == pool.id)), "request rows outside the task pool"},
-      {routing_values(requests, "model_serving_mode_configured") == ["full"],
-       "configured serving mode was not full"},
-      {routing_values(requests, "model_serving_mode") == ["full"],
-       "effective serving mode was not full"},
-      {routing_values(requests, "model_serving_mode_source") == ["override"],
-       "serving mode source was not override"},
+      {routing_values(requests, "model_serving_mode_configured") == ["full"], "configured serving mode was not full"},
+      {routing_values(requests, "model_serving_mode") == ["full"], "effective serving mode was not full"},
+      {routing_values(requests, "model_serving_mode_source") == ["override"], "serving mode source was not override"},
       {length(attempts) == 2, "expected exactly one attempt per request"},
       {Enum.all?(attempts, &(&1.attempt_number == 1)), "attempts retried"},
-      {Enum.all?(attempts, &(&1.upstream_identity_id == identity.id)),
-       "attempt identity was not the task identity"},
-      {Enum.all?(attempts, &(&1.pool_upstream_assignment_id == assignment.id)),
-       "attempt assignment was not the task assignment"}
+      {Enum.all?(attempts, &(&1.upstream_identity_id == identity.id)), "attempt identity was not the task identity"},
+      {Enum.all?(attempts, &(&1.pool_upstream_assignment_id == assignment.id)), "attempt assignment was not the task assignment"}
     ]
 
     case Enum.find(checks, fn {ok?, _message} -> not ok? end) do
@@ -1001,47 +980,46 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
       http_entry = captures[http_fingerprint]
       websocket_entry = captures[websocket_fingerprint]
 
-      checks = [
-        {is_map(http_entry), "HTTP wire capture entry missing for the attempt fingerprint"},
-        {is_map(websocket_entry),
-         "websocket wire capture entry missing for the attempt fingerprint"},
-        {is_map(http_entry) and http_entry["upstreamRequestIdFingerprint"] == http_fingerprint,
-         "HTTP capture fingerprint mismatch"},
-        {is_map(websocket_entry) and
-           websocket_entry["upstreamRequestIdFingerprint"] == websocket_fingerprint,
-         "websocket capture fingerprint mismatch"},
-        {is_map(http_entry) and http_entry["httpHeaderNames"] != [],
-         "HTTP capture observed no header names"},
-        {is_map(http_entry) and @lite_http_header not in List.wrap(http_entry["httpHeaderNames"]),
-         "HTTP Lite header reached the fake upstream"},
-        {is_map(websocket_entry) and websocket_entry["websocketClientMetadataKeys"] != [],
-         "websocket capture observed no client metadata keys"},
-        {is_map(websocket_entry) and
-           @websocket_probe_metadata_key in List.wrap(
-             websocket_entry["websocketClientMetadataKeys"]
-           ), "websocket capture did not observe the probe metadata key"},
-        {is_map(websocket_entry) and
-           @lite_websocket_metadata_key not in List.wrap(
-             websocket_entry["websocketClientMetadataKeys"]
-           ), "websocket Lite client metadata reached the fake upstream"}
-      ]
-
-      case Enum.find(checks, fn {ok?, _message} -> not ok? end) do
-        nil ->
-          {:ok,
-           %{
-             "http_header_name_count" => length(http_entry["httpHeaderNames"]),
-             "http_lite_header_present" => false,
-             "websocket_metadata_key_count" =>
-               length(websocket_entry["websocketClientMetadataKeys"]),
-             "websocket_lite_metadata_present" => false,
-             "fingerprints_matched" => true
-           }}
-
-        {_failed, message} ->
-          {:error, "wire evidence failed: #{message}"}
-      end
+      http_entry
+      |> wire_evidence_checks(websocket_entry, http_fingerprint, websocket_fingerprint)
+      |> Enum.find(fn {ok?, _message} -> not ok? end)
+      |> wire_evidence_result(http_entry, websocket_entry)
     end
+  end
+
+  # The first two checks require map entries; every later check reads a
+  # non-map entry as empty, which is never reached as the first failure.
+  defp wire_evidence_checks(http_entry, websocket_entry, http_fingerprint, websocket_fingerprint) do
+    http = if is_map(http_entry), do: http_entry, else: %{}
+    websocket = if is_map(websocket_entry), do: websocket_entry, else: %{}
+    http_header_names = List.wrap(http["httpHeaderNames"])
+    websocket_metadata_keys = List.wrap(websocket["websocketClientMetadataKeys"])
+
+    [
+      {is_map(http_entry), "HTTP wire capture entry missing for the attempt fingerprint"},
+      {is_map(websocket_entry), "websocket wire capture entry missing for the attempt fingerprint"},
+      {http["upstreamRequestIdFingerprint"] == http_fingerprint, "HTTP capture fingerprint mismatch"},
+      {websocket["upstreamRequestIdFingerprint"] == websocket_fingerprint, "websocket capture fingerprint mismatch"},
+      {http["httpHeaderNames"] != [], "HTTP capture observed no header names"},
+      {@lite_http_header not in http_header_names, "HTTP Lite header reached the fake upstream"},
+      {websocket["websocketClientMetadataKeys"] != [], "websocket capture observed no client metadata keys"},
+      {@websocket_probe_metadata_key in websocket_metadata_keys, "websocket capture did not observe the probe metadata key"},
+      {@lite_websocket_metadata_key not in websocket_metadata_keys, "websocket Lite client metadata reached the fake upstream"}
+    ]
+  end
+
+  defp wire_evidence_result({_failed, message}, _http_entry, _websocket_entry),
+    do: {:error, "wire evidence failed: #{message}"}
+
+  defp wire_evidence_result(nil, http_entry, websocket_entry) do
+    {:ok,
+     %{
+       "http_header_name_count" => length(http_entry["httpHeaderNames"]),
+       "http_lite_header_present" => false,
+       "websocket_metadata_key_count" => length(websocket_entry["websocketClientMetadataKeys"]),
+       "websocket_lite_metadata_present" => false,
+       "fingerprints_matched" => true
+     }}
   end
 
   defp read_wire_captures(fake_url) do
@@ -1064,8 +1042,12 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
   defp lite_negative_control(fake_url) do
     response =
       Req.post!(fake_url <> @responses_endpoint,
-        headers: [{@lite_http_header, "true"}],
-        json: %{"model" => @model_id},
+        headers: [
+          {@lite_http_header, "true"},
+          {"content-type", "application/json"},
+          {"accept", "application/json"}
+        ],
+        body: CodexPooler.JSON.encode_to_iodata!(%{"model" => @model_id}),
         retry: false,
         decode_body: false,
         receive_timeout: 10_000
@@ -1177,9 +1159,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
       Repo.delete_all(from lease in BridgeOwnerLease, where: lease.pool_id in ^pool_ids)
 
     {alias_count, _} =
-      Repo.delete_all(
-        from bridge_alias in BridgeSessionAlias, where: bridge_alias.pool_id in ^pool_ids
-      )
+      Repo.delete_all(from bridge_alias in BridgeSessionAlias, where: bridge_alias.pool_id in ^pool_ids)
 
     {session_count, _} =
       Repo.delete_all(from session in CodexSession, where: session.pool_id in ^pool_ids)
@@ -1227,25 +1207,20 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
     plan
     |> Enum.reduce_while({:ok, %{}}, fn resource, {:ok, counts} ->
       kind = resource["kind"]
-      schema = Map.fetch!(schema_by_kind, kind)
-
-      case Repo.get(schema, resource["id"]) do
-        nil ->
-          {:cont, {:ok, Map.update(counts, kind, 0, & &1)}}
-
-        row ->
-          case delete_plan_row(kind, row) do
-            {:ok, _deleted} ->
-              {:cont, {:ok, Map.update(counts, kind, 1, &(&1 + 1))}}
-
-            {:error, reason} ->
-              {:halt, {:error, "cleanup of #{kind} failed: #{safe_reason(reason)}"}}
-          end
-      end
+      delete_plan_resource(kind, Repo.get(Map.fetch!(schema_by_kind, kind), resource["id"]), counts)
     end)
     |> case do
       {:ok, counts} -> {:ok, %{"plan_rows" => counts}}
       error -> error
+    end
+  end
+
+  defp delete_plan_resource(kind, nil, counts), do: {:cont, {:ok, Map.update(counts, kind, 0, & &1)}}
+
+  defp delete_plan_resource(kind, row, counts) do
+    case delete_plan_row(kind, row) do
+      {:ok, _deleted} -> {:cont, {:ok, Map.update(counts, kind, 1, &(&1 + 1))}}
+      {:error, reason} -> {:halt, {:error, "cleanup of #{kind} failed: #{safe_reason(reason)}"}}
     end
   end
 
@@ -1298,9 +1273,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
         Repo.delete_all(from window in AccountQuotaWindow, where: window.id in ^quota_window_ids)
 
       {secret_count, _} =
-        Repo.delete_all(
-          from secret in EncryptedSecret, where: secret.upstream_identity_id in ^identity_ids
-        )
+        Repo.delete_all(from secret in EncryptedSecret, where: secret.upstream_identity_id in ^identity_ids)
 
       {identity_count, _} =
         Repo.delete_all(from identity in UpstreamIdentity, where: identity.id in ^identity_ids)
@@ -1386,10 +1359,7 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
       "requests" => count_where(Request, :id, request_ids),
       "pricing_snapshots" => count_where(PricingSnapshot, :id, pricing_snapshot_ids),
       "quota_windows" => count_where(AccountQuotaWindow, :id, quota_window_ids),
-      "attempts" =>
-        Repo.one(
-          from attempt in Attempt, where: attempt.request_id in ^request_ids, select: count()
-        ),
+      "attempts" => Repo.one(from attempt in Attempt, where: attempt.request_id in ^request_ids, select: count()),
       "upstream_identities" => count_where(UpstreamIdentity, :id, identity_ids),
       "encrypted_secrets" =>
         Repo.one(
@@ -1398,14 +1368,9 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
             select: count()
         ),
       "pools" => count_where(Pool, :id, pool_ids),
-      "pool_models" =>
-        Repo.one(from model in Model, where: model.pool_id in ^pool_ids, select: count()),
-      "pool_sync_runs" =>
-        Repo.one(from sync_run in SyncRun, where: sync_run.pool_id in ^pool_ids, select: count()),
-      "pool_sessions" =>
-        Repo.one(
-          from session in CodexSession, where: session.pool_id in ^pool_ids, select: count()
-        ),
+      "pool_models" => Repo.one(from model in Model, where: model.pool_id in ^pool_ids, select: count()),
+      "pool_sync_runs" => Repo.one(from sync_run in SyncRun, where: sync_run.pool_id in ^pool_ids, select: count()),
+      "pool_sessions" => Repo.one(from session in CodexSession, where: session.pool_id in ^pool_ids, select: count()),
       "codex_turns" =>
         Repo.one(
           from turn in CodexTurn,
@@ -1418,38 +1383,24 @@ defmodule CodexPooler.Dev.ExactAssignmentFullProof do
               ),
             select: count()
         ),
-      "bridge_owner_leases" =>
-        Repo.one(
-          from lease in BridgeOwnerLease, where: lease.pool_id in ^pool_ids, select: count()
-        ),
+      "bridge_owner_leases" => Repo.one(from lease in BridgeOwnerLease, where: lease.pool_id in ^pool_ids, select: count()),
       "bridge_session_aliases" =>
         Repo.one(
           from alias_record in BridgeSessionAlias,
             where: alias_record.pool_id in ^pool_ids,
             select: count()
         ),
-      "bridge_affinities" =>
-        Repo.one(
-          from affinity in BridgeAffinity, where: affinity.pool_id in ^pool_ids, select: count()
-        ),
-      "bridge_demotions" =>
-        Repo.one(
-          from demotion in BridgeDemotion, where: demotion.pool_id in ^pool_ids, select: count()
-        ),
+      "bridge_affinities" => Repo.one(from affinity in BridgeAffinity, where: affinity.pool_id in ^pool_ids, select: count()),
+      "bridge_demotions" => Repo.one(from demotion in BridgeDemotion, where: demotion.pool_id in ^pool_ids, select: count()),
       "routing_circuit_states" =>
         Repo.one(
           from circuit in RoutingCircuitState,
             where: circuit.pool_id in ^pool_ids,
             select: count()
         ),
-      "idempotency_keys" =>
-        Repo.one(from key in IdempotencyKey, where: key.pool_id in ^pool_ids, select: count()),
-      "pool_routing_settings" =>
-        Repo.one(
-          from settings in RoutingSettings, where: settings.pool_id in ^pool_ids, select: count()
-        ),
-      "audit_events" =>
-        Repo.one(from audit in AuditEvent, where: audit.pool_id in ^pool_ids, select: count())
+      "idempotency_keys" => Repo.one(from key in IdempotencyKey, where: key.pool_id in ^pool_ids, select: count()),
+      "pool_routing_settings" => Repo.one(from settings in RoutingSettings, where: settings.pool_id in ^pool_ids, select: count()),
+      "audit_events" => Repo.one(from audit in AuditEvent, where: audit.pool_id in ^pool_ids, select: count())
     }
 
     if plan_gone? and Enum.all?(counts, fn {_key, value} -> value == 0 end) do

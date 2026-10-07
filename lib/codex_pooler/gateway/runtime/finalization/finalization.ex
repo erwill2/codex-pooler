@@ -3,32 +3,52 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   Finalizes gateway runtime dispatch attempts after upstream transport returns.
   """
 
+  alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.OpenAICompatibility.NativeImageResult
   alias CodexPooler.Gateway.Payloads.{CompactionTrigger, RequestOptions}
+  alias CodexPooler.Gateway.Payloads.RequestOptions.{OpenAICompatibility, ResetProbe}
+  alias CodexPooler.Gateway.Runtime.Dispatch.PartitionFallback
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
 
   alias CodexPooler.Gateway.Runtime.Finalization.{
     AttemptSettlement,
+    FlexUnavailable,
     Metadata,
+    NativeRateLimitRelay,
+    ProviderUsageLimit,
     ResponseUsage,
     SettlementAttrs,
     SideEffects,
     Streaming,
+    UsageLimitRefusal,
+    ValidationRejection,
     Websocket
   }
 
+  alias CodexPooler.Gateway.Routing.CandidateEligibility.{FilterInput, PoolReturn, Quota}
+  alias CodexPooler.Gateway.Routing.CircuitRetryAfter
   alias CodexPooler.Gateway.Routing.ModelMetadata
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
-  alias CodexPooler.Gateway.Transports.{MisalignmentPolicyViolation, ModelUnavailability}
+
+  alias CodexPooler.Gateway.Transports.{
+    MisalignmentPolicyViolation,
+    ModelUnavailability,
+    ProviderCreditsAdmission,
+    RetryAfter,
+    TransportFailureReason
+  }
+
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.RouteClass
 
+  @canonical_full_failure_message "upstream request failed"
   @canonical_full_failure_body %{
     "error" => %{
       "code" => "server_error",
-      "message" => "upstream request failed",
+      "message" => @canonical_full_failure_message,
       "type" => "server_error"
     }
   }
@@ -146,17 +166,13 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
        ) do
     cond do
       public_ineligible_misalignment_policy_violation?(status, body, context) ->
-        finalize_upstream_status_failure(response, context, body,
-          failure_projection: :canonical_full
-        )
+        finalize_upstream_status_failure(response, context, body, failure_projection: :canonical_full)
 
       assignment_model_unavailable?(status, body, context) ->
         finalize_assignment_model_unavailable(response, context, body)
 
       true ->
-        finalize_upstream_status_failure(response, context, body,
-          before_finalize: fn -> maybe_record_unauthorized_route_failure(status, context) end
-        )
+        finalize_upstream_status_failure(response, context, body, before_finalize: fn -> record_client_error_route_health(status, context) end)
     end
   end
 
@@ -191,7 +207,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   defp public_ineligible_misalignment_policy_violation?(_status, _body, _context), do: false
 
   defp direct_misalignment_policy_violation_body?(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, %{"error" => %{"code" => code}}} -> code == MisalignmentPolicyViolation.code()
       _other -> false
     end
@@ -202,15 +218,77 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
          context,
          body
        ) do
-    if assignment_model_unavailable?(status, body, context) do
-      finalize_assignment_model_unavailable(response, context, body)
+    cond do
+      FlexUnavailable.response?(response) ->
+        finalize_upstream_status_failure(response, context, body,
+          error_code: "flex_unavailable",
+          before_finalize: fn -> DispatchLifecycle.neutral_completion(context) end
+        )
+
+      assignment_model_unavailable?(status, body, context) ->
+        finalize_assignment_model_unavailable(response, context, body)
+
+      true ->
+        finalize_retryable_status_or_failure(response, context, body)
+    end
+  end
+
+  @spec finalize_policy_denial(ProviderCreditsAdmission.denial(), SelectedCandidateContext.t(), non_neg_integer()) :: {:ok, map()} | {:error, map()} | {:retry, term()}
+  def finalize_policy_denial(denial, %SelectedCandidateContext{} = context, latency) do
+    input =
+      FilterInput.new(%{
+        auth: context.auth,
+        model: context.model,
+        endpoint: context.endpoint,
+        payload: context.payload,
+        request_options: context.request_options,
+        candidates: [{context.assignment, context.identity}]
+      })
+
+    {:error, public_error} = Quota.quota_unavailable_error(input, denial.candidate_exclusions, false)
+    code = if "provider_credits_disabled" in denial.reason_codes, do: "provider_credits_disabled", else: "provider_credit_capacity_unverified"
+
+    metadata =
+      Metadata.route_attempt_metadata(context.request_options)
+      |> Map.put("provider_credits_admission", %{"version" => 1, "capacity_basis" => Atom.to_string(denial.capacity_basis), "reason_codes" => denial.reason_codes, "sent" => false})
+
+    attrs = %{response_status_code: public_error.status, last_error_code: code, error_message: public_error.message, latency_ms: latency, usage: ResponseUsage.undispatched(), usage_status: "not_applicable", attempt_metadata: metadata, before_finalize: fn -> DispatchLifecycle.neutral_completion(context) end}
+
+    settle_policy_denial(context, attrs, public_error, code, metadata, latency)
+  end
+
+  defp settle_policy_denial(context, attrs, public_error, code, metadata, latency) do
+    if retry_policy_denial?(context) do
+      retry_policy_denial_result(AttemptSettlement.record_retryable_failure(context.reserved.request, context.attempt, attrs))
     else
-      finalize_retryable_status_or_failure(response, context, body)
+      failure = SettlementAttrs.failure(context, public_error.status, code, public_error.message, metadata, latency_ms: latency, usage: ResponseUsage.undispatched(), before_finalize: attrs.before_finalize)
+      result = AttemptSettlement.finalize_failure(context.reserved.request, context.attempt, failure, context.request_options.runtime.session_owner_witness)
+      final_policy_denial_result(result, public_error)
+    end
+  end
+
+  defp retry_policy_denial?(context),
+    do: context.allow_retry? and not RequestOptions.connection_bound_compaction?(context.request_options) and not bound_policy_probe?(context)
+
+  defp retry_policy_denial_result({:ok, _attempt}), do: {:retry, :provider_credits_policy_denied}
+  defp retry_policy_denial_result({:stale_generation, finalized}), do: {:ok, finalized}
+  defp retry_policy_denial_result({:error, error}), do: {:error, error}
+  defp final_policy_denial_result({:ok, _finalized}, public_error), do: {:error, public_error}
+  defp final_policy_denial_result({:stale_generation, finalized}, _public_error), do: {:ok, finalized}
+  defp final_policy_denial_result({:error, error}, _public_error), do: {:error, error}
+
+  defp bound_policy_probe?(context) do
+    case context.request_options.routing.reset_probe do
+      %ResetProbe{} = probe -> ResetProbe.bound?(probe)
+      nil -> false
     end
   end
 
   @spec handle_dispatch_error(term(), SelectedCandidateContext.t(), non_neg_integer()) ::
           {:error, map()} | {:retry, term()}
+  def handle_dispatch_error(%{reason: :provider_credits_policy_denied} = denial, %SelectedCandidateContext{} = context, latency),
+    do: finalize_policy_denial(denial, context, latency)
+
   def handle_dispatch_error(reason, %SelectedCandidateContext{} = context, latency) do
     %{
       request_options: request_options
@@ -253,11 +331,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     to: Websocket,
     as: :finalize_terminal
 
+  # A failed websocket finalization may also ask the dispatcher to move to
+  # the next route candidate (`{:retry, code}`) or report an already
+  # finalized request (`{:ok, finalized}`); declaring only `{:error, map()}`
+  # hid the failover contract from callers (findings#208).
   @spec finalize_failed_websocket_response(
           SelectedCandidateContext.t(),
           failed_websocket_finalization()
         ) ::
-          {:error, map()}
+          {:ok, map()} | {:error, map()} | {:retry, term()}
   defdelegate finalize_failed_websocket_response(context, finalization),
     to: Websocket,
     as: :finalize_failed
@@ -289,9 +371,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
               to: Streaming,
               as: :record_retryable_first_event_failure
 
-  @spec finalize_first_event_stream_failure(binary(), stream_failure(), ResponseContext.t()) ::
+  @spec finalize_first_event_stream_failure(binary(), stream_failure(), ResponseContext.t(), keyword()) ::
           stream_finalization_result()
-  defdelegate finalize_first_event_stream_failure(body, failure, response_context),
+  defdelegate finalize_first_event_stream_failure(body, failure, response_context, opts \\ []),
     to: Streaming,
     as: :finalize_first_event_failure
 
@@ -323,7 +405,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
       request_options: request_options
     } = context
 
-    if allow_retry? and not compact_endpoint?(endpoint) do
+    retry_reason = status_retry_reason(response, context, allow_retry? and not compact_endpoint?(endpoint))
+
+    if retry_reason do
       latency = elapsed_ms(context.started)
 
       case AttemptSettlement.record_retryable_failure(reserved.request, attempt, %{
@@ -339,19 +423,42 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
                ),
              before_finalize: fn ->
                SideEffects.observe_http_response(context, response, body)
-               record_status_route_failure(context, status)
+               record_status_route_health(context, response)
              end
            }) do
         {:stale_generation, finalized} -> {:ok, finalized}
-        {:ok, _attempt} -> {:retry, :retryable_status}
+        {:ok, _attempt} -> {:retry, retry_reason}
         {:error, gateway_error} -> {:error, gateway_error}
       end
     else
+      # The last candidate and the compact route (which never moves to another
+      # candidate) record the same route failure the retry branch records: the
+      # upstream answered 5xx or 429, so a half-open probe it answered is
+      # resolved and the failure counts toward opening the circuit. Without it
+      # the probe stayed counted in flight and blocked the assignment until
+      # its lease ran out, and a single-assignment Pool never opened its
+      # circuit on HTTP (findings#254 row 254-50).
       finalize_upstream_status_failure(response, context, body,
-        attempt_status: if(allow_retry?, do: "retryable_failed", else: "failed")
+        attempt_status: if(allow_retry?, do: "retryable_failed", else: "failed"),
+        before_finalize: fn -> record_status_route_health(context, response) end
       )
     end
   end
+
+  # The last candidate of the selected canonical partition refused with a
+  # provider usage limit before any output, and a candidate partition selection
+  # held back can serve the model now: the dispatcher moves the turn there once,
+  # as the next request's partition selection would (findings#206 row 206-586).
+  # The refusal is recorded as the retryable 429 it is.
+  defp status_retry_reason(_response, _context, true), do: :retryable_status
+
+  defp status_retry_reason(response, context, false),
+    do: if(partition_fallback?(response, context), do: :partition_fallback)
+
+  defp partition_fallback?(%Req.Response{status: 429} = response, %SelectedCandidateContext{} = context),
+    do: not compact_endpoint?(context.endpoint) and ProviderUsageLimit.usage_limit_refusal?(response) and PartitionFallback.available?(context)
+
+  defp partition_fallback?(_response, _context), do: false
 
   defp finalize_assignment_model_unavailable(response, context, body) do
     if context.allow_retry? do
@@ -419,7 +526,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
       endpoint: endpoint
     } = context
 
-    if allow_retry? and not compact_endpoint?(endpoint) do
+    if retry_dispatch_error?(allow_retry?, endpoint, reason) do
       case AttemptSettlement.record_retryable_failure(reserved.request, attempt, %{
              last_error_code: code,
              error_message: Metadata.safe_reason(reason),
@@ -443,14 +550,14 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
                attempt_metadata,
                latency_ms: latency,
                before_finalize: fn -> record_dispatch_route_failure(code, context) end
-             )
+             ),
+             context.request_options.runtime.session_owner_witness
            ) do
         {:stale_generation, finalized} ->
           {:ok, finalized}
 
         {:ok, _finalized} ->
-          {:error,
-           error(502, "upstream_request_failed", Metadata.upstream_failure_message(endpoint))}
+          {:error, error(502, "upstream_request_failed", Metadata.upstream_failure_message(endpoint))}
 
         {:error, gateway_error} ->
           {:error, gateway_error}
@@ -458,8 +565,40 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     end
   end
 
+  defp retry_dispatch_error?(allow_retry?, endpoint, reason) do
+    allow_retry? and not compact_endpoint?(endpoint) and
+      TransportFailureReason.retry_safe_before_submission?(reason)
+  end
+
+  # A provider usage limit whose headers exclude the refusing account is a
+  # quota answer, not a route failure: no demotion, no circuit failure
+  # (findings#206 row 206-594; `UsageLimitRefusal`). Every other 5xx and 429
+  # keeps the status route failure.
+  defp record_status_route_health(%SelectedCandidateContext{model: model} = context, %Req.Response{status: status} = response) do
+    if UsageLimitRefusal.route_neutral?(response, model.upstream_model_id),
+      do: DispatchLifecycle.neutral_completion(context),
+      else: record_status_route_failure(context, status)
+  end
+
   defp record_status_route_failure(%SelectedCandidateContext{} = context, status) do
     status |> status_demotion_code() |> record_dispatch_route_failure(context)
+  end
+
+  @doc """
+  Route health of a provider usage limit the upstream websocket answered as
+  its first event, classified as the HTTP `429` of the same refusal
+  (`record_status_route_health/2`): a neutral completion when the frame's
+  headers exclude the account, otherwise the `429` route failure. The refusal
+  completes the candidate's circuit admission whether the turn fails over,
+  hops to a held-back partition or settles on it (findings#325 row 325-5).
+  """
+  @spec record_websocket_usage_limit_route_health(SelectedCandidateContext.t(), map(), String.t()) ::
+          :ok | {:error, map()}
+  def record_websocket_usage_limit_route_health(%SelectedCandidateContext{model: model} = context, headers, denial_code)
+      when is_map(headers) and is_binary(denial_code) do
+    if UsageLimitRefusal.headers_route_neutral?(headers, denial_code, model.upstream_model_id),
+      do: DispatchLifecycle.neutral_completion(context),
+      else: record_status_route_failure(context, 429)
   end
 
   defp record_dispatch_route_failure(code, %SelectedCandidateContext{} = context) do
@@ -469,11 +608,19 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     end
   end
 
-  defp maybe_record_unauthorized_route_failure(401, %SelectedCandidateContext{} = context) do
+  defp record_client_error_route_health(401, %SelectedCandidateContext{} = context) do
     record_dispatch_route_failure("upstream_unauthorized", context)
   end
 
-  defp maybe_record_unauthorized_route_failure(_status, %SelectedCandidateContext{}), do: :ok
+  # Any other non-429 4xx is the client's error and says nothing against the
+  # route: no demotion, no circuit failure. It still proves the upstream
+  # answered, so a half-open probe it answered is resolved neutrally, as the
+  # websocket does for the same refusal; otherwise the probe stayed counted in
+  # flight and blocked every other turn on the assignment until its lease ran
+  # out (findings#254 row 254-32). Outside a probe the neutral completion
+  # writes nothing.
+  defp record_client_error_route_health(_status, %SelectedCandidateContext{} = context),
+    do: DispatchLifecycle.neutral_completion(context)
 
   defp finalize_upstream_status_failure(
          response,
@@ -484,7 +631,6 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     %{
       reserved: reserved,
       attempt: attempt,
-      payload: payload,
       request_options: request_options
     } = context
 
@@ -497,15 +643,28 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
     accounting_message = Keyword.get(opts, :accounting_message, "upstream returned #{status}")
 
+    # Classified once, before settlement, so the persisted bounded
+    # supported-values fact and the message every projection renders come from
+    # the same parse of the same body rather than from two reads of it
+    # (codex-pooler-findings#177).
+    validation_rejection = ValidationRejection.fetch(response, request_options)
+
+    # Decided before settlement so the attempt records the reset the client
+    # is told (findings#206 row 206-553).
+    relayed_usage_limit = if error_code == "flex_unavailable", do: :unknown, else: relayed_usage_limit(response, context)
+
     attrs =
       SettlementAttrs.failure(
         context,
         status,
         error_code,
         accounting_message,
-        Metadata.response_metadata(response, error_code, request_options),
+        response
+        |> Metadata.response_metadata(error_code, request_options)
+        |> Map.merge(ValidationRejection.attempt_metadata(validation_rejection))
+        |> Map.merge(relayed_usage_limit_metadata(relayed_usage_limit)),
         latency_ms: elapsed_ms(context.started),
-        usage: %{status: "usage_unknown", source: "upstream_status"}
+        usage: upstream_status_usage(response)
       )
 
     attrs =
@@ -513,35 +672,95 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
       |> apply_failure_settlement_options(opts)
       |> observe_http_response(context, response, body)
 
-    case AttemptSettlement.finalize_failure(reserved.request, attempt, attrs) do
+    case AttemptSettlement.finalize_failure(
+           reserved.request,
+           attempt,
+           attrs,
+           request_options.runtime.session_owner_witness
+         ) do
       {:stale_generation, finalized} ->
         {:ok, finalized}
 
       {:ok, _finalized} ->
-        headers =
-          Metadata.response_headers(response, RouteClass.streaming?(payload), request_options)
+        case relayed_usage_limit do
+          {:ok, usage_limit_error} ->
+            {:error, usage_limit_error}
 
-        result =
-          failure_result(
-            status,
-            headers,
-            body,
-            request_options,
-            payload,
-            error_code,
-            opts,
-            Metadata.rejection_error(response)
-          )
-
-        case result do
-          {:error, error} -> {:error, error}
-          result -> {:ok, result}
+          :unknown ->
+            unanswered_failure_result(response, context, body, error_code, validation_rejection, opts)
         end
 
       {:error, gateway_error} ->
         {:error, gateway_error}
     end
   end
+
+  # A bridged `/v1` anchor refused by the connection-bound guard reaches here
+  # as the provider's refusal of the same request, but nothing reached the
+  # provider, so no usage applies; every other refused request may have been
+  # received and keeps its unknown usage.
+  defp upstream_status_usage(response) do
+    if Metadata.undispatched_refusal?(response),
+      do: ResponseUsage.undispatched(),
+      else: %{status: "usage_unknown", source: "upstream_status"}
+  end
+
+  defp relayed_failure_result(response, %SelectedCandidateContext{} = context, body, error_code, validation_rejection, opts) do
+    %{payload: payload, request_options: request_options} = context
+    headers = Metadata.response_headers(response, RouteClass.streaming?(payload), request_options)
+
+    # The client reads the rejection's `input[N]` in its own positions;
+    # the attempt above keeps the provider's (findings#254 row 254-61).
+    index_map = request_options.runtime.upstream_input_index_map
+
+    result =
+      if native_rate_limit_relay?(response, request_options) do
+        native_rate_limit_result(response, headers)
+      else
+        failure_result(
+          response.status,
+          headers,
+          body,
+          request_options,
+          payload,
+          error_code,
+          Keyword.put(opts, :validation_rejection, ValidationRejection.for_client(validation_rejection, index_map)),
+          response |> Metadata.rejection_error() |> ValidationRejection.for_client(index_map)
+        )
+      end
+
+    case result do
+      {:error, error} -> {:error, error}
+      result -> {:ok, result}
+    end
+  end
+
+  # A provider usage-limit `429` on the last eligible candidate whose reset
+  # the provider named answers the Pooler's terminal usage-limit refusal on
+  # every HTTP surface, as routing does once every candidate is exhausted
+  # (findings#206 rows 206-508, 206-531). The attempt and the request row
+  # above keep the provider's `429` and `upstream_rate_limited`. The native
+  # compaction bridges keep their own result shapes.
+  defp relayed_usage_limit(%Req.Response{status: 429} = response, %SelectedCandidateContext{request_options: request_options} = context) do
+    if native_compaction_websocket?(request_options) or CompactionTrigger.streaming_result?(request_options),
+      do: :unknown,
+      else: ProviderUsageLimit.error(response, fn -> other_candidates_return(context) end)
+  end
+
+  defp relayed_usage_limit(_response, _context), do: :unknown
+
+  defp relayed_usage_limit_metadata({:ok, usage_limit_error}) do
+    case Contracts.usage_limit_record(usage_limit_error) do
+      record when map_size(record) == 2 -> %{"usage_limit" => record}
+      _none -> %{}
+    end
+  end
+
+  defp relayed_usage_limit_metadata(:unknown), do: %{}
+
+  # The Pool's other candidates, as route filtering classified them (findings#206 row 206-545).
+  defp other_candidates_return(%SelectedCandidateContext{model: model, route_state: route_state, assignment: assignment, request_options: request_options}),
+    do: PoolReturn.others(model, RouteState.route_filter_candidates(route_state), assignment.id, DateTime.utc_now(), request_options)
 
   defp apply_failure_settlement_options(attrs, opts) do
     attrs =
@@ -568,18 +787,30 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
        ) do
     marker = public_input_file_upstream_404?(status, request_options, payload)
 
-    if native_compaction_websocket?(request_options) do
-      {:error, native_compaction_rejection(status, error_code, rejection_error)}
-    else
-      project_failure_result(
-        status,
-        headers,
-        body,
-        request_options,
-        error_code,
-        opts,
-        marker
-      )
+    cond do
+      native_compaction_websocket?(request_options) ->
+        {:error, native_compaction_rejection(status, error_code, rejection_error)}
+
+      CompactionTrigger.streaming_result?(request_options) ->
+        full_failure_result(
+          status,
+          headers,
+          relayable_rejection_error(status, rejection_error),
+          Keyword.get(opts, :validation_rejection),
+          marker
+        )
+
+      true ->
+        project_failure_result(
+          status,
+          headers,
+          body,
+          request_options,
+          error_code,
+          opts,
+          marker,
+          relayable_rejection_error(status, rejection_error)
+        )
     end
   end
 
@@ -590,10 +821,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
          request_options,
          error_code,
          opts,
-         marker
+         marker,
+         relayable_rejection_error
        ) do
-    case {Keyword.get(opts, :failure_projection, :mode_scoped),
-          Metadata.explicit_full_ordinary_responses?(request_options)} do
+    validation_rejection = Keyword.get(opts, :validation_rejection)
+
+    projection = failure_projection(Keyword.get(opts, :failure_projection, :mode_scoped), status, request_options)
+
+    case {projection, Metadata.explicit_full_ordinary_responses?(request_options)} do
+      {:native_final_refusal, _explicit_full?} ->
+        native_refusal_result(status, headers, relayable_rejection_error)
+
       {{:misalignment_policy_violation, summary}, _explicit_full?} ->
         error =
           %{"code" => summary.code, "message" => summary.message}
@@ -601,31 +839,299 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
         %{
           status: status,
-          headers: headers,
-          raw_body: Jason.encode!(%{"error" => error})
+          headers: json_content_type(headers),
+          raw_body: CodexPooler.JSON.encode!(%{"error" => error})
         }
 
       {:canonical_full, _explicit_full?} ->
-        %{status: status, headers: headers, body: canonical_failure_body(request_options)}
+        %{
+          status: status,
+          headers: json_content_type(headers),
+          body: canonical_failure_body(request_options)
+        }
 
       {:mode_scoped, true} ->
-        %{
-          status: status,
-          headers: headers,
-          body: @canonical_full_failure_body,
-          public_input_file_upstream_404?: marker
-        }
+        full_failure_result(
+          status,
+          headers,
+          relayable_rejection_error,
+          validation_rejection,
+          marker
+        )
+
+      {:mode_scoped, false} when is_map(validation_rejection) ->
+        validation_rejection_result(status, headers, validation_rejection)
+
+      {:mode_scoped, false} when status == 400 ->
+        if native_ordinary_responses_route?(request_options),
+          do: native_refusal_result(status, headers, relayable_rejection_error),
+          else: passthrough_failure_result(status, headers, body, request_options, error_code, marker)
 
       {_projection, _explicit_full?} ->
-        %{
-          status: status,
-          headers: headers,
-          raw_body: body,
-          public_stream_startup_error_code:
-            stream_startup_error_code(error_code, request_options),
-          public_input_file_upstream_404?: marker
-        }
+        passthrough_failure_result(status, headers, body, request_options, error_code, marker)
     end
+  end
+
+  defp failure_projection(:mode_scoped, status, request_options) do
+    if native_final_refusal?(status, request_options), do: :native_final_refusal, else: :mode_scoped
+  end
+
+  defp failure_projection(projection, _status, _request_options), do: projection
+
+  defp passthrough_failure_result(status, headers, body, request_options, error_code, marker) do
+    %{
+      status: status,
+      headers: headers,
+      raw_body: body,
+      public_stream_startup_error_code: stream_startup_error_code(error_code, request_options),
+      public_input_file_upstream_404?: marker
+    }
+  end
+
+  # A native 400 refusal outside the relayable validation set (the provider's
+  # codeless refusal, an unknown code, a `{"detail": ...}` body) answers the
+  # Pooler-authored error the native websocket sends for the same refusal,
+  # built from the sanitized tokens only (`ValidationRejection.refusal_error/2`;
+  # the param was already mapped through the turn's input index map). A
+  # streaming request used to get the 400 with an empty body, because the
+  # drain leaves no public body, and the released Codex client then showed an
+  # empty error; a non-streaming one relayed the provider body verbatim
+  # (findings#254 row 254-70). Public `/v1` surfaces keep their own redacted
+  # projection.
+  #
+  # A native refusal with another final 4xx (404, 409, 413, 422, a 403 that
+  # demotes nothing, ...) answers the same error as a 400 whose message names
+  # the provider status, whatever the serving mode, as the native websocket
+  # does since row 254-71: the released Codex client retries every HTTP status
+  # but 400 as an unexpected status, and the Pooler admitted each retry as a
+  # new request that reached the provider again, six provider requests per
+  # turn on the released-client lane (row 254-80). The attempt, the request
+  # row and route health keep the provider status.
+  defp native_refusal_result(status, headers, relayable_rejection_error) do
+    %{
+      status: 400,
+      headers: json_content_type(headers),
+      raw_body: CodexPooler.JSON.encode!(%{"error" => ValidationRejection.refusal_error(relayable_rejection_error, index_map: :identity, upstream_status: status)})
+    }
+  end
+
+  # Every 403 reaching this point completes the route neutrally (a credential
+  # 403 is taken by the HTTP auth refresh before it and answered as its
+  # retryable 503), so a client retry would only reach the same account again.
+  defp native_final_refusal?(status, request_options) do
+    status != 400 and ValidationRejection.final_refusal_status?(status) and native_ordinary_responses_route?(request_options)
+  end
+
+  defp native_ordinary_responses_route?(%RequestOptions{openai_compatibility: %{source_endpoint: nil}} = request_options),
+    do: Metadata.ordinary_responses_route?(request_options)
+
+  defp native_ordinary_responses_route?(%RequestOptions{}), do: false
+
+  # The relayed validation error is the native JSON error envelope whether the
+  # native request streamed (the drain leaves no public body) or not. A
+  # materialized body used to pass through verbatim: the provider message,
+  # which quotes submitted and Pooler-rewritten values, and the provider's
+  # `input[N]`, a position the client never sent under Lite (findings#254 row
+  # 254-54). Public /v1 surfaces project the marker instead.
+  defp validation_rejection_result(status, headers, validation_rejection) do
+    %{
+      status: status,
+      headers: json_content_type(headers),
+      raw_body: CodexPooler.JSON.encode!(%{"error" => ValidationRejection.error(validation_rejection)}),
+      public_validation_rejection: validation_rejection
+    }
+  end
+
+  defp unanswered_failure_result(response, context, _body, "flex_unavailable", _validation_rejection, _opts) do
+    {:ok,
+     %{
+       status: 429,
+       headers: [{"x-should-retry", "false"} | json_content_type(Metadata.response_headers(response, false, context.request_options))],
+       raw_body: CodexPooler.JSON.encode!(%{"error" => FlexUnavailable.error()})
+     }}
+  end
+
+  defp unanswered_failure_result(response, context, body, error_code, validation_rejection, opts) do
+    if public_rate_limit_relay?(response, context.request_options),
+      do: {:error, public_rate_limit_error(context, response)},
+      else: relayed_failure_result(response, context, body, error_code, validation_rejection, opts)
+  end
+
+  # A `/v1` Responses or Chat `429` the terminal usage limit did not answer is
+  # the redacted `rate_limit_error` in Full and Lite alike (Full used to answer
+  # the canonical `server_error`), with `Retry-After` when a sibling taken out
+  # by an open circuit bounds the wait; the same over HTTP and over the
+  # upstream websocket bridge (findings#206 rows 206-531, 206-593).
+  defp public_rate_limit_relay?(%Req.Response{status: 429}, %RequestOptions{openai_compatibility: compatibility} = request_options),
+    do: OpenAICompatibility.translated_responses_surface?(compatibility) and not CompactionTrigger.streaming_result?(request_options)
+
+  defp public_rate_limit_relay?(_response, _request_options), do: false
+
+  defp public_rate_limit_error(%SelectedCandidateContext{} = context, response) do
+    others =
+      context.route_state
+      |> RouteState.route_filter_candidates()
+      |> Enum.reject(fn {assignment, _identity} -> assignment.id == context.assignment.id end)
+
+    error = %{status: 429, code: "upstream_rate_limited", message: "upstream request failed", param: nil, upstream_retry_after: RetryAfter.header(response)}
+
+    case CircuitRetryAfter.current_seconds(context.auth, context.model, others, context.route_class) do
+      seconds when is_integer(seconds) -> Map.put(error, :circuit_retry_after_seconds, seconds)
+      nil -> error
+    end
+  end
+
+  # A native `429` the terminal usage limit did not answer keeps the tokens
+  # the released client classifies it by, in Full and Lite, streaming or not
+  # (findings#206 row 206-589; `NativeRateLimitRelay`). The compaction
+  # bridges keep their own result shapes.
+  defp native_rate_limit_relay?(%Req.Response{status: 429}, request_options) do
+    native_ordinary_responses_route?(request_options) and not native_compaction_websocket?(request_options) and
+      not CompactionTrigger.streaming_result?(request_options)
+  end
+
+  defp native_rate_limit_relay?(_response, _request_options), do: false
+
+  # A relayed reset carries the house retry advice, `Retry-After` plus
+  # `x-should-retry: false` above a minute, as the Pooler's own usage-limit
+  # answer does (findings#206 row 206-597).
+  defp native_rate_limit_result(response, headers) do
+    error = NativeRateLimitRelay.error(response)
+
+    %{
+      status: 429,
+      headers: headers |> json_content_type() |> put_retry_advice(NativeRateLimitRelay.retry_after_seconds(error)),
+      raw_body: CodexPooler.JSON.encode!(%{"error" => error})
+    }
+  end
+
+  defp put_retry_advice(headers, nil), do: headers
+
+  # Pool reset advice takes precedence over the provider's generic retry hint.
+  defp put_retry_advice(headers, seconds),
+    do: Enum.reject(headers, fn {name, _value} -> name == "retry-after" end) ++ Contracts.usage_limit_response_headers(%{status: 429, usage_limit: %{resets_in_seconds: seconds}})
+
+  defp json_content_type(headers) do
+    headers
+    |> Enum.reject(fn {name, _value} -> String.downcase(to_string(name)) == "content-type" end)
+    |> then(&[{"content-type", "application/json"} | &1])
+  end
+
+  # A non-429 4xx rejection already has its sanitized `type`, `code`, and
+  # `param` persisted as attempt metadata and projected into request logs, so
+  # relaying those bounded tokens to the client discloses nothing new. Keeping
+  # them back is actively wrong: the canonical body says `server_error`, which
+  # is in the retryable vocabulary, so an SDK retries a terminal
+  # `invalid_request_error` forever while Pooler has already settled the
+  # request as failed. Only the tokens travel. The provider message and
+  # body stay unpersisted and unrelayed, and the message stays server-owned.
+  #
+  # The relay window is exactly `Metadata.rejection_metadata_status?/1`. A 429
+  # and a 5xx persist no rejection metadata, so there is nothing sanitized to
+  # relay and their bodies stay byte-identical.
+  defp relayable_rejection_error(status, rejection_error) do
+    if Metadata.rejection_metadata_status?(status), do: rejection_error, else: %{}
+  end
+
+  # A Full body is rendered once here for the native route and carried as a
+  # structured `public_full_rejection` for the public `/v1` sender, which
+  # re-renders `param` and `message` from the same constructor through the
+  # caller-facing parameter mapper (codex-pooler-findings#219). Rendering the
+  # message from the provider param and mapping only `param` afterwards left a
+  # Chat client reading `"param": "reasoning_effort"` next to a message naming
+  # `reasoning.effort`. The structured rejection is a projection input only;
+  # the persisted attempt metadata keeps the provider parameter evidence.
+  defp full_failure_result(
+         status,
+         headers,
+         %{type: type} = rejection_error,
+         validation_rejection,
+         marker
+       )
+       when is_binary(type) do
+    rejection = full_rejection(rejection_error, validation_rejection)
+
+    # The relayed body is rebuilt as JSON whatever the request's transport, so
+    # a streaming request whose upstream 400 carried no content-type must not
+    # inherit `text/event-stream` (findings#219).
+    %{
+      status: status,
+      headers: json_content_type(headers),
+      body: full_failure_body(type, rejection),
+      public_full_rejection: rejection,
+      public_input_file_upstream_404?: marker
+    }
+  end
+
+  defp full_failure_result(status, headers, _rejection_error, _validation_rejection, marker) do
+    %{
+      status: status,
+      headers: json_content_type(headers),
+      body: @canonical_full_failure_body,
+      public_input_file_upstream_404?: marker
+    }
+  end
+
+  # `param` is set unconditionally: a rejection carrying a type but no param
+  # emits an explicit `"param": null`, which is what the provider's own error
+  # bodies do and what an OpenAI SDK expects to read.
+  defp full_rejection(rejection_error, validation_rejection) do
+    %{
+      code: ValidationRejection.relayed_code(rejection_error),
+      param: Map.get(rejection_error, :param),
+      supported_values: relayed_supported_values(validation_rejection),
+      supported_values_state: nil
+    }
+  end
+
+  defp full_failure_body(type, %{code: code, param: param} = rejection) do
+    %{
+      "error" => %{
+        "type" => type,
+        "code" => code,
+        "param" => param,
+        "message" => full_failure_message(rejection)
+      }
+    }
+  end
+
+  # Present only when `ValidationRejection.fetch/2` admitted this rejection, so
+  # a 401, a 404, a compact route, an unrecognized code, and every rejection
+  # whose message stated no parseable list all relay the base sentence
+  # unchanged. Those dominate the observed Full rejection population.
+  defp relayed_supported_values(%{supported_values: [_value | _rest] = values}), do: values
+  defp relayed_supported_values(_validation_rejection), do: nil
+
+  # Serving mode must not decide how much a client is told. The non-Full
+  # mode-scoped branch already names the refused parameter, while Full used to
+  # answer the same provider rejection with the canonical
+  # `upstream request failed` (codex-pooler-findings#173), so a
+  # client that moved between Pools saw its diagnostics change for reasons
+  # unrelated to its request — and the advanced override gave the *less*
+  # informative answer.
+  #
+  # Both paths now build the sentence with one constructor,
+  # `ValidationRejection.error/1`, from the code and param this body already
+  # carries as separate fields. Nothing new is disclosed: both tokens are
+  # sanitized, persisted as attempt metadata, and already relayed above.
+  #
+  # The supported-values suffix used to be withheld here
+  # (codex-pooler-findings#173) because it was read from the live provider body
+  # rather than from a persisted field, and #161 left provider prose unrelayed.
+  # It is now parsed once by the same bounded parser, persisted as attempt
+  # metadata next to the code and param, and rendered from that one classified
+  # fact (codex-pooler-findings#177) — so the mode that does *not* rewrite the
+  # client's request stops telling the client less about it. Only the bounded
+  # enumeration travels; the surrounding message stays unrelayed and
+  # unpersisted on every path.
+  # `supported_values_state` is part of `ValidationRejection.rejection()` and is
+  # carried here even though rendering never reads it: the type is what keeps
+  # the four outcomes distinguishable at rest, and a caller that omits the key
+  # is a caller that has not decided which of them it is looking at.
+  defp full_failure_message(rejection) do
+    rejection
+    |> ValidationRejection.error()
+    |> Map.fetch!("message")
   end
 
   defp canonical_failure_body(%RequestOptions{
@@ -667,9 +1173,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   defp public_input_file_upstream_404?(404, %RequestOptions{} = request_options, payload)
        when is_map(payload) do
     request_options.openai_compatibility.source_endpoint == "/v1/responses" and
-      RequestOptions.OpenAICompatibility.translated_responses_surface?(
-        request_options.openai_compatibility
-      ) and contains_input_file?(payload)
+      RequestOptions.OpenAICompatibility.translated_responses_surface?(request_options.openai_compatibility) and contains_input_file?(payload)
   end
 
   defp public_input_file_upstream_404?(_status, _request_options, _payload), do: false
@@ -718,7 +1222,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
                record_dispatch_route_failure(code, context)
              end
-           )
+           ),
+           request_options.runtime.session_owner_witness
          ) do
       {:stale_generation, finalized} -> {:ok, finalized}
       {:ok, _finalized} -> {:error, error(502, code, message)}
@@ -730,7 +1235,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
          %SelectedCandidateContext{endpoint: "/backend-api/transcribe"},
          body
        ) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, %{"text" => text} = decoded} when is_binary(text) -> not is_nil(decoded["error"])
       _invalid -> true
     end
@@ -767,7 +1272,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
                )
              end
            )
-           |> Map.merge(Map.new(attrs))
+           |> Map.merge(Map.new(attrs)),
+           request_options.runtime.session_owner_witness
          ) do
       {:stale_generation, finalized} ->
         {:ok, finalized}
@@ -894,20 +1400,29 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   defp finalize_invalid_compaction(response, context, error, opts \\ []) do
     %{reserved: reserved, attempt: attempt, request_options: request_options} = context
 
+    response_metadata =
+      Metadata.response_metadata(response, error.code, request_options)
+      |> maybe_put_compaction_invalid_reason(error)
+
     attrs =
       SettlementAttrs.failure(
         context,
         error.status,
         error.code,
         error.message,
-        Metadata.response_metadata(response, error.code, request_options),
+        response_metadata,
         latency_ms: elapsed_ms(context.started),
         before_finalize: fn ->
           SideEffects.observe_http_response(context, response, Metadata.response_body(response))
         end
       )
 
-    case AttemptSettlement.finalize_failure(reserved.request, attempt, attrs) do
+    case AttemptSettlement.finalize_failure(
+           reserved.request,
+           attempt,
+           attrs,
+           request_options.runtime.session_owner_witness
+         ) do
       {:stale_generation, finalized} ->
         {:ok, finalized}
 
@@ -923,12 +1438,19 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     end
   end
 
+  defp maybe_put_compaction_invalid_reason(metadata, %{compaction_invalid_reason: reason})
+       when is_binary(reason), do: Map.put(metadata, "compaction_invalid_reason", reason)
+
+  defp maybe_put_compaction_invalid_reason(metadata, _error), do: metadata
+
   defp finalize_successful_json_response(
          response,
          %SelectedCandidateContext{} = context,
          body,
          callbacks
        ) do
+    context = %{context | provider_credits_admission: Req.Response.get_private(response, :provider_credits_admission)}
+
     %{
       reserved: reserved,
       attempt: attempt,
@@ -951,7 +1473,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
                SideEffects.observe_http_response(context, response, body)
                SideEffects.before_finalize_success(context, request_options)
              end
-           )
+           ),
+           request_options.runtime.session_owner_witness
          ) do
       {:stale_generation, finalized} ->
         {:ok, finalized}

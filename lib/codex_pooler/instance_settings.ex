@@ -184,6 +184,7 @@ defmodule CodexPooler.InstanceSettings do
         updated = Settings.mark_loaded(updated, :database)
         _cache_result = Cache.put(updated)
         _ = Cache.broadcast_update(updated)
+        _ = Cache.notify_update(updated)
         record_update_audit(scope, before, updated)
         {:ok, updated}
 
@@ -348,8 +349,7 @@ defmodule CodexPooler.InstanceSettings do
           before.metrics.bearer_token_hmac_digest,
           after_update.metrics.bearer_token_hmac_digest
         ),
-      smtp_auth_state:
-        credential_change(before.smtp.password_ciphertext, after_update.smtp.password_ciphertext),
+      smtp_auth_state: credential_change(before.smtp.password_ciphertext, after_update.smtp.password_ciphertext),
       metrics_fingerprint: after_update.metrics.bearer_token_fingerprint,
       smtp_key_version: after_update.smtp.password_key_version
     }

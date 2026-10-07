@@ -62,9 +62,8 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
           )
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
-            compaction_result_transport: result_transport,
-            compaction_projection_context:
-              CompactionProjectionContext.new(payload, compact_payload)
+            compaction_result_transport: :sse,
+            compaction_projection_context: CompactionProjectionContext.new(payload, compact_payload)
           )
 
         PublicGatewayDispatch.dispatch_coerced(

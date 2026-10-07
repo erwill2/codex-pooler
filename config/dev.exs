@@ -17,7 +17,8 @@ config :codex_pooler, CodexPooler.Repo,
   database: dev_postgres_database,
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
-  pool_size: 10
+  pool_size: 10,
+  parameters: [application_name: "codex_pooler_dev"]
 
 config :codex_pooler, CodexPoolerWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
@@ -31,6 +32,12 @@ config :codex_pooler, CodexPoolerWeb.Endpoint,
     esbuild: {Esbuild, :install_and_run, [:codex_pooler, ~w(--sourcemap=inline --watch)]},
     tailwind: {Tailwind, :install_and_run, [:codex_pooler, ~w(--watch)]}
   ]
+
+# Live reload watches only the directories its patterns cover. The default is
+# the whole working directory, and the patterns are relative, so every Pooler
+# copy other tooling writes under `tmp/` reloaded this server (findings#232).
+config :phoenix_live_reload,
+  dirs: Enum.map(["priv/static", "priv/gettext", "lib/codex_pooler_web"], &Path.expand(&1, Path.expand("..", __DIR__)))
 
 config :codex_pooler, CodexPoolerWeb.Endpoint,
   live_reload: [

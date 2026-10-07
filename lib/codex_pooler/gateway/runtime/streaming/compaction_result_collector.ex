@@ -1,10 +1,13 @@
 defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
   @moduledoc false
 
+  require Logger
+
   alias CodexPooler.Gateway.Payloads.CompactionTrigger
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
+  alias CodexPooler.Gateway.Runtime.Finalization.Metadata
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
@@ -12,13 +15,42 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
   alias CodexPooler.Gateway.Transports.Streaming.StreamRelay
   alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
 
+  # The collect delivery modes accumulate their authoritative compact result in
+  # `Transports.Streaming.CollectedBody`, which latches this internal marker
+  # instead of handing back a truncated stream. Recognizing it keeps an
+  # oversized compact result a distinct diagnosis rather than an
+  # indistinguishable `missing_terminal`.
+  #
+  # The literal is deliberate: reading it from `CollectedBody.overflow_event_type/0`
+  # would make this module compile-connected to a transport module, which the
+  # xref gate forbids. The collector's overflow test builds its body through
+  # `CollectedBody` and asserts this diagnosis, so producer and consumer cannot
+  # drift apart unnoticed.
+  @collected_body_overflow_type "codex_pooler.collected_body_overflow"
+
+  # The closed diagnosis vocabulary. Every collector rejection is projected
+  # through this list before it reaches a log line or durable attempt
+  # metadata, so a newly introduced collector reason degrades to the generic
+  # value instead of leaking an unreviewed term. Tuple reasons are flattened
+  # to their head, keeping `provider_failure` and
+  # `invalid_after_provider_failure` distinguishable.
+  @invalid_reason_codes ~w(
+    compaction_result_too_large
+    duplicate_compaction
+    invalid_after_provider_failure
+    invalid_compaction
+    missing_terminal
+    provider_failure
+  )
+  @generic_invalid_reason "invalid_compaction"
+
   @type collection_error ::
-          :duplicate_compaction
+          :compaction_result_too_large
+          | :duplicate_compaction
           | :invalid_compaction
-          | :missing_compaction
           | :missing_terminal
-          | {:provider_failure, StreamProtocol.terminal_failure(),
-             StreamProtocol.terminal_failure()}
+          | {:provider_failure, StreamProtocol.terminal_failure(), StreamProtocol.terminal_failure(), String.t()}
+          | {:invalid_after_provider_failure, StreamProtocol.terminal_failure(), StreamProtocol.terminal_failure(), String.t()}
 
   @type websocket_collection_result ::
           {:ok, map()}
@@ -29,30 +61,114 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
           {:ok, map()} | {:error, map()}
   def collect(response, %SelectedCandidateContext{} = context, finalization_callbacks) do
     response_context = %ResponseContext{context: context, response: response}
-    state = new_state(compaction_item_mode(context.request_options))
+
+    item_mode =
+      if context.request_options.openai_compatibility.source_endpoint == "/v1/responses",
+        do: :public,
+        else: :native
+
+    state = new_state(item_mode)
 
     case StreamRelay.run(state, response, handlers(response_context, finalization_callbacks)) do
-      {:ok, state} -> state |> finalize_sse_state() |> compact_result()
-      {:error, error} -> {:error, error}
+      {:ok, state} ->
+        case state |> finalize_sse_state() |> compact_result() do
+          {:ok, result} ->
+            headers = Metadata.response_headers(response, false, context.request_options)
+
+            {:ok,
+             %{
+               result
+               | headers: [
+                   {"content-type", "application/json"}
+                   | Enum.reject(headers, &(elem(&1, 0) == "content-type"))
+                 ]
+             }}
+
+          error ->
+            error
+        end
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
-  @spec collect_websocket_body(binary(), :native | :public) :: websocket_collection_result()
-  def collect_websocket_body(body, item_mode \\ :native)
+  # `terminal_source` names who sent the terminal on the decision line: the
+  # provider, or the Pooler's connection-bound guard, whose refusal passes
+  # through here as if the provider had sent it (findings#270 row 270-238).
+  @spec collect_websocket_body(binary(), :native | :public, :provider_terminal | :continuation_guard) :: websocket_collection_result()
+  def collect_websocket_body(body, item_mode \\ :native, terminal_source \\ :provider_terminal)
 
-  def collect_websocket_body(body, item_mode)
-      when is_binary(body) and item_mode in [:native, :public] do
+  def collect_websocket_body(body, item_mode, terminal_source)
+      when is_binary(body) and item_mode in [:native, :public] and terminal_source in [:provider_terminal, :continuation_guard] do
     {:ok, state} = collect_sse_data(new_state(item_mode), body)
-    state |> finalize_sse_state() |> websocket_compact_result()
+    state |> finalize_sse_state() |> websocket_compact_result(terminal_source)
   end
+
+  @spec provider_failure_websocket_event(StreamProtocol.terminal_failure()) :: map()
+  def provider_failure_websocket_event(%{
+        event_type: "response.incomplete",
+        code: code,
+        upstream_code: upstream_code
+      }) do
+    reason = client_incomplete_reason(DiagnosticTaxonomy.identifier(upstream_code || code))
+
+    %{
+      "type" => "response.incomplete",
+      "response" => %{
+        "status" => "incomplete",
+        "incomplete_details" => %{"reason" => reason}
+      }
+    }
+  end
+
+  def provider_failure_websocket_event(%{} = failure) do
+    code =
+      DiagnosticTaxonomy.identifier(failure.upstream_code || failure.code) ||
+        "upstream_terminal_failure"
+
+    error =
+      %{
+        "code" => code,
+        "message" => "upstream rejected the compact request"
+      }
+      |> maybe_put_provider_failure_param(failure.upstream_error_param)
+
+    %{
+      "type" => "response.failed",
+      "error" => error,
+      "response" => %{"status" => "failed", "error" => error}
+    }
+  end
+
+  defp maybe_put_provider_failure_param(error, param) do
+    case UpstreamErrorParam.sanitize(param) do
+      value when is_binary(value) -> Map.put(error, "param", value)
+      nil -> error
+    end
+  end
+
+  # A compaction the provider ended `interrupted` has no summary to hand over.
+  # The released client (0.159.0) reads a relayed `interrupted` as a response
+  # that completed without its end of turn, and a compaction that completed
+  # with no item fails its turn for good; any other reason is an error it
+  # retries by resending the compaction, as it did before it read the reason
+  # (findings#270 row 270-272). The Pooler never relays an interrupt to a
+  # compaction, so only the provider can end one this way.
+  defp client_incomplete_reason("interrupted"), do: "upstream_terminal_failure"
+  defp client_incomplete_reason(nil), do: "upstream_terminal_failure"
+  defp client_incomplete_reason(reason), do: reason
 
   defp new_state(item_mode) do
     %{
       collection: %{
+        started_ms: System.monotonic_time(:millisecond),
         invalid_reason: nil,
         item_mode: item_mode,
         item: nil,
         provider_failure: nil,
+        provider_terminal_param_state: "absent",
+        provider_terminal_witness: nil,
         response: nil,
         terminal_failure: nil,
         terminal?: false
@@ -63,10 +179,27 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
     }
   end
 
-  defp compaction_item_mode(%{openai_compatibility: compatibility}) do
-    if compatibility.source_endpoint == "/v1/responses",
-      do: :public,
-      else: :native
+  # Preserve the native client's fatal quota meaning on the HTTP boundary.
+  # The saved terminal failure still owns the existing accounting and circuit
+  # classification; only a complete, unpoisoned provider terminal is projected.
+  defp compact_result(%{
+         collection:
+           %{
+             item_mode: :native,
+             invalid_reason: {:provider_failure, _, _, _},
+             provider_failure: %{upstream_code: "insufficient_quota", event_type: type, data_type: type} = failure
+           } = collection
+       })
+       when type in ["response.failed", "error"] do
+    log_provider_terminal(collection, failure, elapsed_ms(collection), :provider_terminal, 429)
+
+    {:error,
+     %{
+       status: 429,
+       code: "insufficient_quota",
+       message: "upstream rejected the compact request",
+       compaction_invalid_reason: "provider_failure"
+     }}
   end
 
   defp compact_result(%{collection: %{invalid_reason: nil} = collection}) do
@@ -76,35 +209,45 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
          %{
            status: 200,
            headers: [{"content-type", "application/json"}],
-           raw_body: Jason.encode!(response),
+           raw_body: CodexPooler.JSON.encode!(response),
            compaction_item: collection.item
          }}
 
-      {:error, _reason} ->
-        invalid_compaction_error()
+      {:error, reason} ->
+        log_collector_invalid(collection, reason)
+        invalid_compaction_error(reason)
     end
   end
 
-  defp compact_result(_state), do: invalid_compaction_error()
+  defp compact_result(%{collection: collection}) do
+    log_collector_invalid(collection, collection.invalid_reason)
+    invalid_compaction_error(collection.invalid_reason)
+  end
 
-  defp websocket_compact_result(%{collection: %{provider_failure: %{} = failure}}),
-    do: {:provider_failure, failure}
+  defp websocket_compact_result(%{collection: %{provider_failure: %{} = failure} = collection}, terminal_source) do
+    log_provider_terminal(collection, failure, elapsed_ms(collection), terminal_source)
+    {:provider_failure, failure}
+  end
 
-  defp websocket_compact_result(state), do: compact_result(state)
+  defp websocket_compact_result(state, _terminal_source), do: compact_result(state)
 
   defp compact_response(%{item: item, response: response, terminal?: true})
        when is_map(item) and is_map(response) do
     {:ok,
      response
-     |> Map.take(["id", "usage"])
+     |> Map.take(["id", "usage", "created_at", "model"])
      |> Map.put("status", "completed")
      |> Map.put("output", [item])}
   end
 
   defp compact_response(_collection), do: {:error, :missing_terminal}
 
-  defp handlers(response_context, finalization_callbacks) do
+  defp handlers(
+         %ResponseContext{context: %{request_options: request_options}} = response_context,
+         finalization_callbacks
+       ) do
     %{
+      buffer_telemetry_opts: [request_options: request_options],
       finalize_success: fn _body, state ->
         state = finalize_sse_state(state)
 
@@ -117,15 +260,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
               state
             )
 
-          {:error, _reason} ->
+          {:error, %{compaction_invalid_reason: reason_code} = gateway_error} ->
             case Finalization.finalize_stream_failure(
                    "",
-                   {:terminal_stream_failure, saved_terminal_failure(state)},
+                   {:terminal_stream_failure, saved_terminal_failure(state, reason_code)},
                    response_context,
                    state
                  ) do
-              {:ok, _finalized} -> invalid_compaction_error()
-              {:error, gateway_error} -> {:error, gateway_error}
+              {:ok, _finalized} -> {:error, gateway_error}
+              {:error, settlement_error} -> {:error, settlement_error}
             end
         end
       end,
@@ -150,6 +293,20 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
       write_keepalive: fn state -> {:ok, state} end,
       keepalive_interval_ms: 0
     }
+  end
+
+  defp collect_sse_data(%{collection: %{provider_failure: %{} = failure} = collection} = state, data)
+       when data != "" do
+    {:ok,
+     %{
+       state
+       | collection: %{
+           collection
+           | invalid_reason: :invalid_after_provider_failure,
+             provider_terminal_witness: failure,
+             provider_failure: nil
+         }
+     }}
   end
 
   defp collect_sse_data(%{sse: sse, collection: collection} = state, data) do
@@ -177,7 +334,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
     if buffer != "" and is_map(collection.provider_failure) do
       %{
         state
-        | collection: %{collection | invalid_reason: :invalid_compaction, provider_failure: nil}
+        | collection: %{
+            collection
+            | invalid_reason: :invalid_after_provider_failure,
+              provider_terminal_witness: collection.provider_failure,
+              provider_failure: nil
+          }
       }
     else
       case collect_terminal_buffer(buffer, collection) do
@@ -192,11 +354,21 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
   defp put_collection_error(%{collection: %{invalid_reason: nil} = collection} = state, reason) do
     collection =
       case reason do
-        {:provider_failure, terminal_failure, provider_failure} ->
+        {:provider_failure, terminal_failure, provider_failure, param_state} ->
           %{
             collection
             | terminal_failure: terminal_failure,
-              provider_failure: provider_failure
+              provider_failure: provider_failure,
+              provider_terminal_param_state: param_state
+          }
+
+        {:invalid_after_provider_failure, terminal_failure, provider_failure, param_state} ->
+          %{
+            collection
+            | invalid_reason: :invalid_compaction,
+              terminal_failure: terminal_failure,
+              provider_terminal_param_state: param_state,
+              provider_terminal_witness: provider_failure
           }
 
         _reason ->
@@ -208,8 +380,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
 
   defp put_collection_error(state, _reason), do: state
 
-  defp saved_terminal_failure(%{collection: %{terminal_failure: %{} = failure}}), do: failure
-  defp saved_terminal_failure(_state), do: failure(:invalid_compaction)
+  defp saved_terminal_failure(%{collection: %{terminal_failure: %{} = failure}}, reason_code),
+    do: Map.put(failure, :compaction_invalid_reason, reason_code)
+
+  defp saved_terminal_failure(_state, reason_code),
+    do: Map.put(failure(:invalid_compaction), :compaction_invalid_reason, reason_code)
 
   defp collect_terminal_buffer("", collection), do: {:ok, collection}
 
@@ -228,7 +403,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
       |> StreamProtocol.normalize_sse_event_label()
 
     with data when is_binary(data) <- StreamProtocol.sse_field(buffer, "data"),
-         {:ok, %{} = decoded} <- Jason.decode(data),
+         {:ok, %{} = decoded} <- CodexPooler.JSON.decode(data),
          data_type when is_binary(data_type) <- Map.get(decoded, "type"),
          true <- event_type in [nil, data_type] do
       {:ok, event_type, decoded}
@@ -245,8 +420,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
       {:ok, state} ->
         collect_events(blocks, state)
 
-      {:error, {:provider_failure, _terminal_failure, _provider_failure}} when blocks != [] ->
-        {:error, :invalid_compaction}
+      {:error, {:provider_failure, terminal_failure, provider_failure, param_state}}
+      when blocks != [] ->
+        {:error, {:invalid_after_provider_failure, terminal_failure, provider_failure, param_state}}
 
       {:error, _reason} = error ->
         error
@@ -328,19 +504,26 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
        when type in ["response.completed", "response.done"],
        do: {:error, :missing_terminal}
 
-  defp collect_summarized_event(%{event_type: type} = event_summary, _event, _state)
+  defp collect_summarized_event(
+         _event_summary,
+         %{"type" => @collected_body_overflow_type},
+         _state
+       ),
+       do: {:error, :compaction_result_too_large}
+
+  defp collect_summarized_event(%{event_type: type} = event_summary, event, _state)
        when type in ["error", "response.failed", "response.incomplete"] do
+    param_state = provider_param_state(event, event_summary.upstream_error_param)
+
     case StreamProtocol.terminal_outcome_event(event_summary) do
       {:ok, %{kind: :failed} = outcome} ->
-        {:error,
-         {:provider_failure, terminal_failure(outcome), provider_terminal_failure(outcome)}}
+        {:error, {:provider_failure, terminal_failure(outcome), provider_terminal_failure(outcome), param_state}}
 
       {:ok, %{kind: :incomplete, incomplete_reason: reason} = outcome} when is_binary(reason) ->
         if String.trim(reason) == "" do
           {:error, :invalid_compaction}
         else
-          {:error,
-           {:provider_failure, terminal_failure(outcome), provider_terminal_failure(outcome)}}
+          {:error, {:provider_failure, terminal_failure(outcome), provider_terminal_failure(outcome), param_state}}
         end
 
       _outcome ->
@@ -471,14 +654,129 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
     }
   end
 
-  defp invalid_compaction_error do
+  # `compaction_invalid_reason` is an internal diagnostic field on the gateway
+  # error map. Both the HTTP (`GatewayControllerHelpers.send_error/2`) and the
+  # websocket (`Gateway.Websocket.Adapter.websocket_error/1`) renderers project
+  # a fixed public field set, so it never reaches the wire; finalization copies
+  # it into durable attempt metadata instead.
+  defp invalid_compaction_error(reason) do
     {:error,
      %{
        status: 502,
        code: "invalid_compaction_response",
-       message: "upstream compact stream was invalid"
+       message: "upstream compact stream was invalid",
+       compaction_invalid_reason: invalid_reason_code(reason)
      }}
   end
+
+  @spec invalid_reason_codes() :: [String.t()]
+  def invalid_reason_codes, do: @invalid_reason_codes
+
+  @spec invalid_reason_code(term()) :: String.t()
+  def invalid_reason_code(reason), do: reason |> reason_head() |> closed_reason_code()
+
+  defp reason_head(reason) when is_tuple(reason) and tuple_size(reason) > 0,
+    do: reason_head(elem(reason, 0))
+
+  defp reason_head(reason), do: reason
+
+  defp closed_reason_code(reason) when is_atom(reason),
+    do: closed_reason_code(Atom.to_string(reason))
+
+  defp closed_reason_code(reason) when is_binary(reason) do
+    if reason in @invalid_reason_codes,
+      do: DiagnosticTaxonomy.identifier(reason),
+      else: @generic_invalid_reason
+  end
+
+  defp closed_reason_code(_reason), do: @generic_invalid_reason
+
+  defp log_collector_invalid(collection, reason) do
+    witness = collection.provider_terminal_witness
+    reason_code = provider_reason_code(witness, reason)
+    {param_state, param} = provider_param(witness)
+
+    Logger.warning(fn ->
+      "compact collector terminal decision " <>
+        "source_stage=collector_invalid " <>
+        "code=invalid_compaction_response status=502 " <>
+        "terminal_type=#{collector_terminal_type(witness)} " <>
+        "reason_code=#{reason_code} " <>
+        "param_state=#{param_state}" <>
+        if(is_nil(param), do: "", else: " param=#{param}") <>
+        " elapsed_ms=#{elapsed_ms(collection)}"
+    end)
+  end
+
+  defp log_provider_terminal(collection, failure, elapsed_ms, terminal_source, status \\ nil) do
+    {param_state, param} = provider_param(failure, collection.provider_terminal_param_state)
+
+    Logger.warning(fn ->
+      "compact terminal decision " <>
+        "source_stage=#{terminal_source} " <>
+        "code=#{DiagnosticTaxonomy.identifier(failure.code) || "upstream_terminal_failure"} " <>
+        "status=#{status || provider_failure_status(failure)} " <>
+        "terminal_type=#{failure.event_type || "provider_terminal"} " <>
+        "reason_code=#{provider_terminal_reason_code(failure)} " <>
+        "param_state=#{param_state}" <>
+        if(is_nil(param), do: "", else: " param=#{param}") <>
+        " elapsed_ms=#{elapsed_ms}"
+    end)
+  end
+
+  defp collector_terminal_type(%{}), do: "provider_terminal"
+  defp collector_terminal_type(_witness), do: "collector_invalid"
+
+  defp provider_reason_code(%{upstream_code: code}, _reason) when is_binary(code), do: code
+  defp provider_reason_code(%{code: code}, _reason) when is_binary(code), do: code
+
+  defp provider_reason_code(_witness, reason), do: invalid_reason_code(reason)
+
+  defp provider_terminal_reason_code(%{upstream_code: code}) when is_binary(code), do: code
+  defp provider_terminal_reason_code(%{code: code}) when is_binary(code), do: code
+  defp provider_terminal_reason_code(_failure), do: "provider_terminal"
+
+  defp provider_param(%{upstream_error_param: param}) when is_binary(param),
+    do: {"accepted", param}
+
+  defp provider_param(%{}), do: {"rejected", nil}
+  defp provider_param(_witness), do: {"absent", nil}
+
+  defp provider_param(%{upstream_error_param: param}, _param_state)
+       when is_binary(param),
+       do: {"accepted", param}
+
+  defp provider_param(_failure, param_state) when param_state in ["absent", "rejected"],
+    do: {param_state, nil}
+
+  defp provider_failure_status(%{code: code, upstream_code: upstream_code})
+       when code in ["invalid_request", "invalid_request_error"] or
+              upstream_code in [
+                "misalignment_policy_violation",
+                "previous_response_not_found",
+                "invalid_previous_response_id"
+              ],
+       do: 400
+
+  defp provider_failure_status(_failure), do: 502
+
+  defp provider_param_state(event, sanitized_param) do
+    raw_param =
+      get_in(event, ["response", "error", "param"]) ||
+        get_in(event, ["error", "param"]) ||
+        Map.get(event, "param")
+
+    cond do
+      is_binary(sanitized_param) -> "accepted"
+      is_nil(raw_param) -> "absent"
+      true -> "rejected"
+    end
+  end
+
+  defp elapsed_ms(%{started_ms: started}),
+    do: max(System.monotonic_time(:millisecond) - started, 0)
+
+  defp elapsed_ms(_collection), do: 0
 
   defp rate_limit_state(%{rate_limit: %{buffer: buffer} = state}) when is_binary(buffer),
     do: state

@@ -9,6 +9,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
 
   import Ecto.Query
 
+  alias __MODULE__.Provider
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
@@ -17,7 +18,6 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets.Convergence
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
-  alias __MODULE__.Provider
 
   @scenarios ~w(sibling-barrier ambiguous-replay markerless-legacy first-turn-capacity reblocked-convergence)
   @database "codex_pooler_dev"
@@ -25,16 +25,11 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
   @receipt_root Path.join(["tmp", "saved-reset-safety-probe", "receipts"])
   @receipt_keys ~w(run_fingerprint scenarios status cleanup endpoint_isolated oban_isolated source_sha)
   @scenario_receipt_keys %{
-    "sibling-barrier" =>
-      ~w(consume_count distinct_backend_pids backend_pinned barrier winner_applied loser_code),
-    "ambiguous-replay" =>
-      ~w(target_reused request_reused scope_reused attempt_reused generation_reused scope_fingerprint),
-    "markerless-legacy" =>
-      ~w(legacy_recovery mode provider_requests snooze_seconds next_action_scheduled),
-    "first-turn-capacity" =>
-      ~w(first_turn_vetoed veto_code hard_pin_applied consume_count),
-    "reblocked-convergence" =>
-      ~w(converged repeat provider_requests attempt_preserved)
+    "sibling-barrier" => ~w(consume_count distinct_backend_pids backend_pinned barrier winner_applied loser_code),
+    "ambiguous-replay" => ~w(target_reused request_reused scope_reused attempt_reused generation_reused scope_fingerprint),
+    "markerless-legacy" => ~w(legacy_recovery mode provider_requests snooze_seconds next_action_scheduled),
+    "first-turn-capacity" => ~w(first_turn_vetoed veto_code hard_pin_applied consume_count),
+    "reblocked-convergence" => ~w(converged repeat provider_requests attempt_preserved)
   }
   @probe_slug_prefix "dev-saved-reset-probe-"
 
@@ -210,11 +205,9 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
          {:provider_barrier, provider_pid, :sibling} <- receive_provider_barrier(),
          :ok <- send_start(loser.pid),
          :ok <- Provider.release(provider_pid),
-         {:winner, %{before: ^winner_backend_pid} = winner_pin,
-          {:ok, %{status: :succeeded, applied?: true}}} <-
+         {:winner, %{before: ^winner_backend_pid} = winner_pin, {:ok, %{status: :succeeded, applied?: true}}} <-
            Task.await(winner, 15_000),
-         {:loser, %{before: ^loser_backend_pid} = loser_pin,
-          {:ok, %{status: :noop, code: "gateway_auto_sibling_consume_barrier"}}} <-
+         {:loser, %{before: ^loser_backend_pid} = loser_pin, {:ok, %{status: :noop, code: "gateway_auto_sibling_consume_barrier"}}} <-
            Task.await(loser, 15_000),
          true <- distinct_pinned_backends?(winner_pin, loser_pin),
          1 <- Provider.consume_count(provider) do
@@ -535,9 +528,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
   end
 
   defp clear_account_windows!(identity) do
-    Repo.delete_all(
-      from window in AccountQuotaWindow, where: window.upstream_identity_id == ^identity.id
-    )
+    Repo.delete_all(from window in AccountQuotaWindow, where: window.upstream_identity_id == ^identity.id)
 
     identity
   end
@@ -783,13 +774,9 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
           required(:assignment_ids) => [Ecto.UUID.t()]
         }) :: :ok
   def cleanup_owned!(journal) do
-    Repo.delete_all(
-      from assignment in PoolUpstreamAssignment, where: assignment.id in ^journal.assignment_ids
-    )
+    Repo.delete_all(from assignment in PoolUpstreamAssignment, where: assignment.id in ^journal.assignment_ids)
 
-    Repo.delete_all(
-      from identity in UpstreamIdentity, where: identity.id in ^journal.identity_ids
-    )
+    Repo.delete_all(from identity in UpstreamIdentity, where: identity.id in ^journal.identity_ids)
 
     Repo.delete_all(from pool in Pool, where: pool.id in ^journal.pool_ids)
 
@@ -978,7 +965,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
       File.mkdir_p!(@receipt_root)
       File.chmod!(@receipt_root, 0o700)
       path = Path.join(@receipt_root, "#{run_id}.json")
-      File.write!(path, Jason.encode!(receipt))
+      File.write!(path, CodexPooler.JSON.encode!(receipt))
       File.chmod!(path, 0o600)
       {:ok, receipt}
     end
@@ -1126,7 +1113,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
 
     @type t :: %{agent: pid(), provider_key: pos_integer(), server: pid(), url: String.t()}
 
-    plug Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: Jason
+    plug Plug.Parsers, parsers: [:json], pass: ["*/*"], json_decoder: CodexPooler.JSON
     plug :match
     plug :dispatch
 
@@ -1231,8 +1218,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
           {{:barrier, %{code: "reset"}}, %{state | consume_calls: 1}}
 
         "/api/codex/rate-limit-reset-credits/consume" ->
-          {{:json, 500, %{code: "unexpected_second_consume"}},
-           %{state | consume_calls: state.consume_calls + 1}}
+          {{:json, 500, %{code: "unexpected_second_consume"}}, %{state | consume_calls: state.consume_calls + 1}}
 
         "/api/codex/usage" ->
           {{:json, 200, usage_payload(0)}, state}
@@ -1276,8 +1262,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
           {{:json, 200, %{code: "reset"}}, %{state | consume_calls: 1}}
 
         "/api/codex/rate-limit-reset-credits/consume" ->
-          {{:json, 500, %{code: "unexpected_second_consume"}},
-           %{state | consume_calls: state.consume_calls + 1}}
+          {{:json, 500, %{code: "unexpected_second_consume"}}, %{state | consume_calls: state.consume_calls + 1}}
 
         "/api/codex/usage" ->
           {{:json, 200, usage_payload(0)}, state}
@@ -1288,9 +1273,7 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
     end
 
     defp response_for(state, request),
-      do:
-        {{:json, 500, %{code: "legacy_provider_called"}},
-         %{state | requests: [request | state.requests]}}
+      do: {{:json, 500, %{code: "legacy_provider_called"}}, %{state | requests: [request | state.requests]}}
 
     defp maybe_notify_barrier({:barrier, _payload}, state) do
       send(state.notify, {:saved_reset_probe_provider_barrier, self(), :sibling})
@@ -1308,13 +1291,13 @@ defmodule CodexPooler.Dev.SavedResetSafetyProbe do
       do:
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(status, Jason.encode!(payload))
+        |> Plug.Conn.send_resp(status, CodexPooler.JSON.encode!(payload))
 
     defp respond(conn, {:barrier, payload}),
       do:
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
-        |> Plug.Conn.send_resp(200, Jason.encode!(payload))
+        |> Plug.Conn.send_resp(200, CodexPooler.JSON.encode!(payload))
 
     defp respond(_conn, :close), do: Process.exit(self(), :kill)
     defp credit(suffix), do: %{"id" => "dev-credit-#{suffix}", "status" => "available"}

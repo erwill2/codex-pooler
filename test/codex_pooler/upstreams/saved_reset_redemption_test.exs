@@ -15,20 +15,38 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Jobs.UpstreamEnqueue
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.ProviderCreditsFixtures
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
+  alias CodexPooler.SavedResetConfirmationFixtures
+  alias CodexPooler.TestDiagnostics
+  alias CodexPooler.UpstreamConnPoolTelemetry
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
+  alias CodexPooler.Upstreams.SavedResets.Convergence
   alias CodexPooler.Upstreams.SavedResets.ProbeLease
   alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
   alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  # A task parked at a barrier waits for the test's start or release message,
+  # which the test sends only after up to four detection budgets of its own
+  # (readiness, lock, `pg_blocking_pids` observation). The task's wait must
+  # outlast that chain, or it raises first and hides which step was late
+  # (Drone 1543); the test's `after` always sends the message, so a green run
+  # never spends this.
+  @handoff_timeout_ms 4 * @detection_timeout_ms
 
   @cohort_fixture_transaction_timeout 25_000
   @cohort_fixture_task_timeout 30_000
@@ -47,8 +65,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
              "/backend-api/wham/rate-limit-reset-credits" =>
                {200,
                 %{
-                  "credits" => [%{"id" => "credit_1", "status" => "available"}],
-                  "available_count" => 1
+                  "credits" => [
+                    %{"id" => "credit_1", "status" => "available", "expires_at" => "2026-12-01T00:00:00Z"},
+                    %{"id" => "credit_2", "status" => "available", "expires_at" => "2026-11-01T00:00:00Z"}
+                  ],
+                  "available_count" => 2
                 }},
              "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
              "/api/codex/usage" => {404, %{}},
@@ -86,9 +107,79 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         refute Map.has_key?(redemption, key)
       end
 
-      metadata_json = Jason.encode!(persisted.metadata)
+      metadata_json = CodexPooler.JSON.encode!(persisted.metadata)
       refute metadata_json =~ "credit_1"
       refute metadata_json =~ redeem_request_id
+      # Account expiry preference does not reorder the provider's physical list.
+      TestDiagnostics.puts("EXPIRY_PHYSICAL_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "manual_chatgpt_list_order", consumes: Enum.count(requests, &(&1.method == "POST")), generation_sends: Enum.count(requests, &String.ends_with?(&1.path, "/responses")), first_listed_later_expiry_selected: consume.json["credit_id"] == "credit_1"}))
+    end
+
+    test "redemption list and consume carry the upstream connection idle bound from settings" do
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/backend-api/wham/rate-limit-reset-credits" =>
+               {200,
+                %{
+                  "credits" => [%{"id" => "credit_1", "status" => "available"}],
+                  "available_count" => 1
+                }},
+             "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/backend-api/wham/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      on_exit(fn -> FakeUpstream.stop(fake) end)
+
+      UpstreamConnPoolTelemetry.put_idle_bound!(0)
+      UpstreamConnPoolTelemetry.attach!(FakeUpstream.url(fake))
+
+      %{assignment: assignment} =
+        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api")
+
+      assert {:ok, %{status: :succeeded, applied?: true}} =
+               SavedResetRedemption.redeem(assignment)
+
+      requests = fake |> FakeUpstream.requests() |> Enum.map(&{&1.method, &1.path})
+
+      assert Enum.take(requests, 2) == [
+               {"GET", "/backend-api/wham/rate-limit-reset-credits"},
+               {"POST", "/backend-api/wham/rate-limit-reset-credits/consume"}
+             ]
+
+      assert UpstreamConnPoolTelemetry.drain_events() ==
+               List.duplicate(:conn_max_idle_time_exceeded, length(requests) - 1)
+    end
+
+    test "redemption list, consume, and stale-recovery replay carry the upstream connection idle bound from settings" do
+      UpstreamConnPoolTelemetry.put_idle_bound!(0)
+      fixture = ambiguous_chatgpt_recovery_fixture!()
+      UpstreamConnPoolTelemetry.attach!(FakeUpstream.url(fixture.fake))
+      recovery_now = DateTime.add(fixture.last_provider_dispatched_at, 60, :second)
+      fixture = make_recovery_due!(fixture, recovery_now)
+
+      FakeUpstream.set_mode(fixture.fake, {
+        :path_json,
+        %{
+          "/backend-api/wham/rate-limit-reset-credits" => {200, %{"credits" => [%{"id" => fixture.credit_id, "status" => "available"}]}},
+          "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "already_redeemed"}},
+          "/backend-api/wham/usage" => {200, usage_payload(0)}
+        }
+      })
+
+      assert {:ok, %{status: :succeeded}} = resume_recovery(fixture, recovery_now)
+
+      recovery_requests =
+        fixture.fake |> FakeUpstream.requests() |> Enum.drop(2) |> Enum.map(&{&1.method, &1.path})
+
+      assert Enum.take(recovery_requests, 2) == [
+               {"GET", "/backend-api/wham/rate-limit-reset-credits"},
+               {"POST", "/backend-api/wham/rate-limit-reset-credits/consume"}
+             ]
+
+      assert UpstreamConnPoolTelemetry.drain_events() ==
+               List.duplicate(:conn_max_idle_time_exceeded, length(recovery_requests))
     end
 
     test "persists the ChatGPT target and dispatch reservation before the consume POST" do
@@ -123,9 +214,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           SavedResetRedemption.redeem(assignment)
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                      ^release_ref},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                     @detection_timeout_ms
 
       reserved = Repo.reload!(identity).metadata
       replay = reserved["saved_reset_redemption"]["provider_replay"]
@@ -149,11 +239,153 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
 
       assert {:ok, %{status: :succeeded, applied?: true, code: "already_redeemed"}} =
-               Task.await(task, 5_000)
+               Task.await(task, @detection_timeout_ms)
 
       settled = Repo.reload!(identity).metadata
       refute Map.has_key?(settled, "saved_reset_redemption_target")
       assert settled["saved_reset_redemption"]["provider_replay"]["provider_dispatches"] == 1
+    end
+
+    test "gateway auto settles a zero-dispatch claim when the proof clears before the provider POST" do
+      parent = self()
+      release_ref = make_ref()
+
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/backend-api/wham/rate-limit-reset-credits" =>
+               FakeUpstream.gated_json_headers(
+                 %{
+                   "credits" => [%{"id" => "credit_proof_cleared", "status" => "available"}],
+                   "available_count" => 1
+                 },
+                 notify: parent,
+                 release_ref: release_ref
+               ),
+             "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/backend-api/wham/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api")
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_exhausted_quota!(identity)
+      [window] = SavedResetConfirmationFixtures.weekly_provider_windows(identity.id)
+      assert SavedResetConfirmationFixtures.marker_state(window) == "confirmed"
+      context = gateway_auto_context(assignment, identity, :blocked_weekly_exhaustion)
+      assert [_ref] = context.automatic_confirmation_refs
+
+      task =
+        Task.async(fn ->
+          Sandbox.allow(Repo, parent, self())
+
+          SavedResetRedemption.redeem(assignment,
+            trigger_kind: "gateway_auto",
+            gateway_auto_context: context
+          )
+        end)
+
+      # The local claim is persisted and the credit list is in flight: a newer
+      # allowed provider receipt lands and clears the corroboration.
+      assert_receive {:fake_upstream_gate, :before_headers, gate_pid, ^release_ref}, 15_000
+      claimed = Repo.reload!(identity).metadata["saved_reset_redemption"]
+      assert claimed["phase"] == "consuming"
+      assert claimed["provider_replay"]["provider_dispatches"] == 0
+
+      SavedResetConfirmationFixtures.observe_window!(
+        identity,
+        window,
+        DateTime.utc_now() |> DateTime.truncate(:microsecond),
+        permission: {true, false, :available},
+        used_percent: Decimal.new("32")
+      )
+
+      assert SavedResetConfirmationFixtures.marker_state(window) == "approach"
+      send(gate_pid, {:fake_upstream_release_gate, release_ref})
+
+      assert {:ok, %{status: :noop, applied?: false, code: code}} = Task.await(task, 15_000)
+      assert code in ["gateway_auto_trigger_not_current", "gateway_auto_confirmation_mismatch"]
+
+      assert Enum.map(FakeUpstream.requests(fake), &{&1.method, &1.path}) == [
+               {"GET", "/backend-api/wham/rate-limit-reset-credits"}
+             ]
+
+      settled = Repo.reload!(identity).metadata["saved_reset_redemption"]
+      assert settled["phase"] == "consume_not_applied"
+      assert settled["status"] == "failed"
+      assert settled["result"]["code"] == "consume_not_applied"
+      assert settled["result"]["applied"] == false
+      assert settled["provider_replay"]["provider_dispatches"] == 0
+      assert settled["attempt_id"] == claimed["attempt_id"]
+      assert settled["generation"] == claimed["generation"]
+      refute Map.has_key?(Repo.reload!(identity).metadata, "saved_reset_redemption_target")
+      assert Repo.reload!(identity).metadata["saved_resets"]["available_count"] == 1
+
+      # the settled lifecycle does not block a later genuine claim
+      refute RedemptionLifecycle.blocks_new_redemption?(settled, DateTime.utc_now())
+      TestDiagnostics.puts("EXPIRY_PRESEND_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "proof_prepost_veto", consumes: Enum.count(FakeUpstream.requests(fake), &(&1.method == "POST")), generation_sends: Enum.count(FakeUpstream.requests(fake), &String.ends_with?(&1.path, "/responses")), provider_dispatches: settled["provider_replay"]["provider_dispatches"], topology: "shared_sandbox_transaction"}))
+    end
+
+    test "gateway auto settles a zero-dispatch claim when the bank drops to keep credits before the POST" do
+      parent = self()
+      release_ref = make_ref()
+
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/backend-api/wham/rate-limit-reset-credits" =>
+               FakeUpstream.gated_json_headers(
+                 %{
+                   "credits" => [%{"id" => "credit_bank_dropped", "status" => "available"}],
+                   "available_count" => 1
+                 },
+                 notify: parent,
+                 release_ref: release_ref
+               ),
+             "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/backend-api/wham/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api")
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_exhausted_quota!(identity)
+      context = gateway_auto_context(assignment, identity, :blocked_weekly_exhaustion)
+
+      task =
+        Task.async(fn ->
+          Sandbox.allow(Repo, parent, self())
+
+          SavedResetRedemption.redeem(assignment,
+            trigger_kind: "gateway_auto",
+            gateway_auto_context: context
+          )
+        end)
+
+      assert_receive {:fake_upstream_gate, :before_headers, gate_pid, ^release_ref}, 15_000
+
+      # operator raises keep-credits to the whole bank while the claim is in flight
+      identity
+      |> Repo.reload!()
+      |> UpstreamIdentity.changeset(%{saved_reset_auto_redeem_keep_credits: 1})
+      |> Repo.update!()
+
+      send(gate_pid, {:fake_upstream_release_gate, release_ref})
+
+      assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_keep_credits"}} =
+               Task.await(task, 15_000)
+
+      refute Enum.any?(FakeUpstream.requests(fake), &(&1.method == "POST"))
+      settled = Repo.reload!(identity).metadata["saved_reset_redemption"]
+      assert settled["phase"] == "consume_not_applied"
+      assert settled["provider_replay"]["provider_dispatches"] == 0
+      TestDiagnostics.puts("EXPIRY_PRESEND_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "keep_prepost_veto", consumes: Enum.count(FakeUpstream.requests(fake), &(&1.method == "POST")), generation_sends: Enum.count(FakeUpstream.requests(fake), &String.ends_with?(&1.path, "/responses")), provider_dispatches: settled["provider_replay"]["provider_dispatches"], topology: "shared_sandbox_transaction"}))
     end
 
     test "revalidates assignment status before reserving a provider dispatch" do
@@ -186,14 +418,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           SavedResetRedemption.redeem(assignment)
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                      ^release_ref},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                     @detection_timeout_ms
 
       update_assignment!(assignment, %{status: PoolUpstreamAssignment.paused_status()})
       send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
 
-      assert {:error, :saved_reset_dispatch_reservation_invalid} = Task.await(task, 5_000)
+      assert {:error, :saved_reset_dispatch_reservation_invalid} = Task.await(task, @detection_timeout_ms)
 
       assert [%{method: "GET", path: "/backend-api/wham/rate-limit-reset-credits"}] =
                FakeUpstream.requests(fake)
@@ -237,14 +468,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           SavedResetRedemption.redeem(assignment)
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                      ^release_ref},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                     @detection_timeout_ms
 
       update_assignment!(assignment, %{upstream_identity_id: foreign_identity.id})
       send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
 
-      assert {:error, :saved_reset_dispatch_reservation_invalid} = Task.await(task, 5_000)
+      assert {:error, :saved_reset_dispatch_reservation_invalid} = Task.await(task, @detection_timeout_ms)
 
       assert [%{method: "GET", path: "/backend-api/wham/rate-limit-reset-credits"}] =
                FakeUpstream.requests(fake)
@@ -300,8 +530,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                   ],
                   "available_count" => 2
                 }},
-             "/backend-api/wham/rate-limit-reset-credits/consume" =>
-               {503, %{"code" => "provider_rejected"}}
+             "/backend-api/wham/rate-limit-reset-credits/consume" => {503, %{"code" => "provider_rejected"}}
            }}
         )
 
@@ -321,7 +550,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert redemption["provider_replay"]["provider_dispatches"] == 1
       assert is_binary(locator)
 
-      metadata_json = Jason.encode!(metadata)
+      metadata_json = CodexPooler.JSON.encode!(metadata)
       refute metadata_json =~ "credit_original"
       refute metadata_json =~ "credit_other"
 
@@ -353,8 +582,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                   ],
                   "available_count" => 2
                 }},
-             "/backend-api/wham/rate-limit-reset-credits/consume" =>
-               {503, %{"code" => "provider_failed"}},
+             "/backend-api/wham/rate-limit-reset-credits/consume" => {503, %{"code" => "provider_failed"}},
              "/backend-api/wham/usage" => {200, usage_payload(0)}
            }}
         )
@@ -393,8 +621,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                ],
                "available_count" => 2
              }},
-          "/backend-api/wham/rate-limit-reset-credits/consume" =>
-            {200, %{"code" => "already_redeemed"}},
+          "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "already_redeemed"}},
           "/backend-api/wham/usage" => {200, usage_payload(0)}
         }
       })
@@ -543,9 +770,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       recovery_now = DateTime.add(fixture.last_provider_dispatched_at, 31, :minute)
 
       fixture =
-        make_recovery_due!(fixture, recovery_now,
-          started_at: DateTime.add(recovery_now, -40, :minute)
-        )
+        make_recovery_due!(fixture, recovery_now, started_at: DateTime.add(recovery_now, -40, :minute))
 
       FakeUpstream.set_mode(fixture.fake, {
         :path_json,
@@ -558,8 +783,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                  %{"id" => "credit_retarget_forbidden", "status" => "available"}
                ]
              }},
-          "/backend-api/wham/rate-limit-reset-credits/consume" =>
-            {503, %{"code" => "provider_failed"}}
+          "/backend-api/wham/rate-limit-reset-credits/consume" => {503, %{"code" => "provider_failed"}}
         }
       })
 
@@ -584,19 +808,21 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       usable_now = DateTime.add(usable_fixture.last_provider_dispatched_at, 60, :second)
       usable_fixture = make_recovery_due!(usable_fixture, usable_now)
 
-      assert {:ok, [_window]} =
-               QuotaWindows.upsert_quota_windows(usable_fixture.identity, [
-                 weekly_quota_attrs(Decimal.new("10"),
-                   observed_at: usable_now,
-                   last_sync_at: usable_now,
-                   reset_at: DateTime.add(usable_now, 2, :hour)
-                 )
-               ])
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-      assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
-               resume_recovery(usable_fixture, usable_now)
+      payload =
+        ProviderCreditsFixtures.usage_payload(:included, now: observed_at, credits: :none, reset_after: 14_400)
+        |> Map.put("rate_limit_reset_credits", %{"available_count" => 0})
 
-      assert FakeUpstream.count(usable_fixture.fake) == 1
+      FakeUpstream.set_mode(usable_fixture.fake, {:path_json, ProviderCreditsFixtures.usage_routes(payload)})
+
+      assert {:ok, _identity} = PoolReconciliation.refresh_quota_from_usage(usable_fixture.identity, usable_fixture.assignment, observed_at: observed_at)
+      next_observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      assert {:ok, _identity} = PoolReconciliation.refresh_quota_from_usage(Repo.reload!(usable_fixture.identity), usable_fixture.assignment, observed_at: next_observed_at)
+      assert Enum.any?(QuotaWindows.list_evidence(usable_fixture.identity), &(&1.window_minutes == 10_080 and QuotaWindows.usable_window?(&1, usable_now)))
+
+      assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} = resume_recovery(usable_fixture, usable_now)
+      assert FakeUpstream.physical_counts(usable_fixture.fake).consume == 1
 
       exhausted_fixture = ambiguous_codex_recovery_fixture!()
       exhausted_now = DateTime.add(exhausted_fixture.last_provider_dispatched_at, 60, :second)
@@ -619,6 +845,26 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       redemption = Repo.reload!(exhausted_fixture.identity).metadata["saved_reset_redemption"]
       assert redemption["status"] == "redeeming"
       assert redemption["provider_replay"]["provider_dispatches"] == 2
+    end
+
+    test "stale Codex recovery never settles a captured weekly consume from fresh unrelated 5h evidence" do
+      fixture = ambiguous_codex_recovery_fixture!()
+      recovery_at = DateTime.add(fixture.last_provider_dispatched_at, 60, :second)
+      fixture = make_recovery_due!(fixture, recovery_at)
+      descriptors = Repo.reload!(fixture.identity).metadata["saved_reset_redemption"]["included_window_descriptors"]
+      assert descriptors == [%{"window_kind" => "secondary", "window_minutes" => 10_080}]
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(fixture.identity, [
+                 weekly_quota_attrs(Decimal.new("10"), window_kind: "primary", window_minutes: 300, observed_at: recovery_at, last_sync_at: recovery_at, reset_at: DateTime.add(recovery_at, 2, :hour))
+               ])
+
+      assert {:snooze, 300} = resume_recovery(fixture, recovery_at)
+      persisted = Repo.reload!(fixture.identity).metadata["saved_reset_redemption"]
+      assert persisted["phase"] == "consuming"
+      assert persisted["included_window_descriptors"] == descriptors
+      assert persisted["provider_replay"]["provider_dispatches"] == 2
+      assert FakeUpstream.physical_counts(fixture.fake).consume == 2
     end
 
     test "stale recovery enforces every persisted replay delay at the exact boundary" do
@@ -699,9 +945,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       cutoff_now = DateTime.add(cutoff_fixture.last_provider_dispatched_at, 60, :second)
 
       cutoff_fixture =
-        make_recovery_due!(cutoff_fixture, cutoff_now,
-          started_at: DateTime.add(cutoff_now, -6, :hour)
-        )
+        make_recovery_due!(cutoff_fixture, cutoff_now, started_at: DateTime.add(cutoff_now, -6, :hour))
 
       assert {:snooze, 1_740} = resume_recovery(cutoff_fixture, cutoff_now)
 
@@ -903,16 +1147,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                 }}}
 
             :list_failure ->
-              {persisted.metadata, persisted.chatgpt_account_id,
-               {503, %{"error" => "synthetic list failure"}}}
+              {persisted.metadata, persisted.chatgpt_account_id, {503, %{"error" => "synthetic list failure"}}}
 
             :target_invalid ->
-              {Map.put(persisted.metadata, "saved_reset_redemption_target", "tampered"),
-               persisted.chatgpt_account_id, nil}
+              {Map.put(persisted.metadata, "saved_reset_redemption_target", "tampered"), persisted.chatgpt_account_id, nil}
 
             :target_missing ->
-              {Map.delete(persisted.metadata, "saved_reset_redemption_target"),
-               persisted.chatgpt_account_id, nil}
+              {Map.delete(persisted.metadata, "saved_reset_redemption_target"), persisted.chatgpt_account_id, nil}
 
             :scope_changed ->
               {persisted.metadata, "acct_changed_observe_only_scope", nil}
@@ -1029,16 +1270,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           start_recovery_replica_task(parent, role, fixture)
         end
 
-      assert_receive {:recovery_replica_ready, :first}, 5_000
-      assert_receive {:recovery_replica_ready, :second}, 5_000
+      assert_receive {:recovery_replica_ready, :first}, @detection_timeout_ms
+      assert_receive {:recovery_replica_ready, :second}, @detection_timeout_ms
       Enum.each(tasks, &send(&1.pid, :start_recovery))
 
       assert_receive {:fake_upstream_timeout_barrier, :before_headers, first_pid, ^first_release},
-                     5_000
+                     @detection_timeout_ms
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, second_pid,
-                      ^second_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, second_pid, ^second_release},
+                     @detection_timeout_ms
 
       send(first_pid, {:fake_upstream_release_timeout, first_release})
       send(second_pid, {:fake_upstream_release_timeout, second_release})
@@ -1112,9 +1352,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           end)
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, consume_pid,
-                      ^consume_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, consume_pid, ^consume_release},
+                     @detection_timeout_ms
 
       reserved =
         run_unboxed(fn -> Repo.get!(UpstreamIdentity, fixture.identity_id) end).metadata[
@@ -1130,7 +1369,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         |> Map.put(:now, DateTime.add(DateTime.utc_now(), 31, :minute))
 
       recovery_task = start_recovery_replica_task(parent, :recovery, recovery_fixture)
-      assert_receive {:recovery_replica_ready, :recovery}, 5_000
+      assert_receive {:recovery_replica_ready, :recovery}, @detection_timeout_ms
       send(recovery_task.pid, :start_recovery)
 
       assert {:recovery, {:ok, %{status: :succeeded, applied?: true}}} =
@@ -1206,7 +1445,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         end)
 
       assert_receive {:fake_upstream_timeout_barrier, :before_headers, list_pid, ^list_release},
-                     5_000
+                     @detection_timeout_ms
 
       claimed =
         run_unboxed(fn -> Repo.get!(UpstreamIdentity, fixture.identity_id) end).metadata[
@@ -1222,12 +1461,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         |> Map.put(:now, DateTime.add(DateTime.utc_now(), 31, :minute))
 
       recovery_task = start_recovery_replica_task(parent, :recovery, recovery_fixture)
-      assert_receive {:recovery_replica_ready, :recovery}, 5_000
+      assert_receive {:recovery_replica_ready, :recovery}, @detection_timeout_ms
       send(recovery_task.pid, :start_recovery)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, consume_pid,
-                      ^consume_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, consume_pid, ^consume_release},
+                     @detection_timeout_ms
 
       reserved =
         run_unboxed(fn -> Repo.get!(UpstreamIdentity, fixture.identity_id) end).metadata
@@ -1289,20 +1527,18 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       })
 
       stale_task = start_recovery_replica_task(parent, :stale, fixture)
-      assert_receive {:recovery_replica_ready, :stale}, 5_000
+      assert_receive {:recovery_replica_ready, :stale}, @detection_timeout_ms
       send(stale_task.pid, :start_recovery)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, stale_list_pid,
-                      ^stale_list_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, stale_list_pid, ^stale_list_release},
+                     @detection_timeout_ms
 
       current_task = start_recovery_replica_task(parent, :current, fixture)
-      assert_receive {:recovery_replica_ready, :current}, 5_000
+      assert_receive {:recovery_replica_ready, :current}, @detection_timeout_ms
       send(current_task.pid, :start_recovery)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, current_consume_pid,
-                      ^current_consume_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, current_consume_pid, ^current_consume_release},
+                     @detection_timeout_ms
 
       reserved =
         run_unboxed(fn -> Repo.get!(UpstreamIdentity, fixture.identity_id) end).metadata
@@ -1577,16 +1813,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           start_recovery_replica_task(parent, role, fixture)
         end
 
-      assert_receive {:recovery_replica_ready, :first}, 5_000
-      assert_receive {:recovery_replica_ready, :second}, 5_000
+      assert_receive {:recovery_replica_ready, :first}, @detection_timeout_ms
+      assert_receive {:recovery_replica_ready, :second}, @detection_timeout_ms
       Enum.each(tasks, &send(&1.pid, :start_recovery))
 
       assert_receive {:fake_upstream_timeout_barrier, :before_headers, first_pid, ^first_release},
-                     5_000
+                     @detection_timeout_ms
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, second_pid,
-                      ^second_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, second_pid, ^second_release},
+                     @detection_timeout_ms
 
       send(first_pid, {:fake_upstream_release_timeout, first_release})
       send(second_pid, {:fake_upstream_release_timeout, second_release})
@@ -1633,20 +1868,19 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       })
 
       stale_task = start_recovery_replica_task(parent, :stale, fixture)
-      assert_receive {:recovery_replica_ready, :stale}, 5_000
+      assert_receive {:recovery_replica_ready, :stale}, @detection_timeout_ms
       send(stale_task.pid, :start_recovery)
 
       assert_receive {:fake_upstream_timeout_barrier, :before_headers, stale_pid, ^first_release},
-                     5_000
+                     @detection_timeout_ms
 
       current_fixture = %{fixture | now: DateTime.add(fixture.now, 6, :minute)}
       current_task = start_recovery_replica_task(parent, :current, current_fixture)
-      assert_receive {:recovery_replica_ready, :current}, 5_000
+      assert_receive {:recovery_replica_ready, :current}, @detection_timeout_ms
       send(current_task.pid, :start_recovery)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, current_pid,
-                      ^second_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, current_pid, ^second_release},
+                     @detection_timeout_ms
 
       redemption_keys = ["saved_reset_redemption", "saved_reset_redemption_target"]
 
@@ -1733,20 +1967,19 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       })
 
       stale_task = start_recovery_replica_task(parent, :stale_list, fixture)
-      assert_receive {:recovery_replica_ready, :stale_list}, 5_000
+      assert_receive {:recovery_replica_ready, :stale_list}, @detection_timeout_ms
       send(stale_task.pid, :start_recovery)
 
       assert_receive {:fake_upstream_timeout_barrier, :before_headers, stale_pid, ^list_release},
-                     5_000
+                     @detection_timeout_ms
 
       reserving_fixture = %{fixture | now: DateTime.add(fixture.now, 6, :minute)}
       reserving_task = start_recovery_replica_task(parent, :reserving, reserving_fixture)
-      assert_receive {:recovery_replica_ready, :reserving}, 5_000
+      assert_receive {:recovery_replica_ready, :reserving}, @detection_timeout_ms
       send(reserving_task.pid, :start_recovery)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, reserving_pid,
-                      ^consume_release},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, reserving_pid, ^consume_release},
+                     @detection_timeout_ms
 
       redemption_keys = ["saved_reset_redemption", "saved_reset_redemption_target"]
 
@@ -1847,9 +2080,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       for {scenario, response} <- scenarios do
         {:ok, fake} =
-          FakeUpstream.start_link(
-            {:path_json, %{"/api/codex/rate-limit-reset-credits/consume" => response}}
-          )
+          FakeUpstream.start_link({:path_json, %{"/api/codex/rate-limit-reset-credits/consume" => response}})
 
         on_exit(fn -> FakeUpstream.stop(fake) end)
 
@@ -1884,17 +2115,24 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           FakeUpstream.start_link(
             {:path_json,
              %{
-               "/api/codex/rate-limit-reset-credits/consume" =>
-                 {200, %{"code" => code, "windows_reset" => 1}},
+               "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => code, "windows_reset" => 1}},
                "/api/codex/usage" => {500, %{}}
              }}
           )
 
         on_exit(fn -> FakeUpstream.stop(fake) end)
-        %{assignment: assignment} = assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+        %{assignment: assignment, identity: identity} = assignment_with_fake(fake, "/api/codex/usage", "codex_api")
 
         assert {:ok, %{status: ^expected_status, applied?: ^applied?, code: ^code}} =
                  SavedResetRedemption.redeem(assignment)
+
+        if code == "no_credit" do
+          assert Repo.reload!(identity).metadata["saved_resets"]["available_count"] == 0
+        end
+
+        if code == "nothing_to_reset" do
+          assert Repo.reload!(identity).metadata["saved_resets"]["available_count"] == 1
+        end
       end
     end
 
@@ -1917,8 +2155,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     @tag :saved_reset_redemption_cause
     test "gateway cause is derived from normalized trigger and survives claimed noops and ambiguity" do
       for {trigger, detail, provider_status, provider_code, expected_result} <- [
-            {:blocked_weekly_exhaustion, "exhausted", 200, "nothing_to_reset",
-             {:settled, :noop, "nothing_to_reset"}},
+            {:blocked_weekly_exhaustion, "exhausted", 200, "nothing_to_reset", {:settled, :noop, "nothing_to_reset"}},
             {:threshold_pressure, "threshold", 502, "provider_rejected", :ambiguous}
           ] do
         parent = self()
@@ -1967,25 +2204,24 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
             )
           end)
 
-        assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                        ^release_ref},
-                       5_000
+        assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                       @detection_timeout_ms
 
         claim = Repo.reload!(identity).metadata["saved_reset_redemption"]
         assert claim["status"] == "redeeming"
         assert claim["trigger_detail"] == detail
-        refute Jason.encode!(claim) =~ "caller-controlled-provider-token"
+        refute CodexPooler.JSON.encode!(claim) =~ "caller-controlled-provider-token"
 
         send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
 
         persisted =
           case expected_result do
             {:settled, status, result_code} ->
-              assert {:ok, %{status: ^status, code: ^result_code}} = Task.await(task, 5_000)
+              assert {:ok, %{status: ^status, code: ^result_code}} = Task.await(task, @detection_timeout_ms)
               Repo.reload!(identity).metadata["saved_reset_redemption"]
 
             :ambiguous ->
-              assert {:error, :saved_reset_consume_outcome_ambiguous} = Task.await(task, 5_000)
+              assert {:error, :saved_reset_consume_outcome_ambiguous} = Task.await(task, @detection_timeout_ms)
               redemption = Repo.reload!(identity).metadata["saved_reset_redemption"]
               assert redemption["status"] == "redeeming"
               assert redemption["phase"] == "consuming"
@@ -1994,7 +2230,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           end
 
         assert persisted["trigger_detail"] == detail
-        refute Jason.encode!(persisted) =~ "caller-controlled-provider-token"
+        refute CodexPooler.JSON.encode!(persisted) =~ "caller-controlled-provider-token"
       end
     end
 
@@ -2052,7 +2288,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       # The key is a deterministic function of the persisted attempt id and
       # generation, so the same attempt reproduces it without persisting a
       # raw secret in the identity metadata.
-      refute Jason.encode!(persisted.metadata) =~ first_key
+      refute CodexPooler.JSON.encode!(persisted.metadata) =~ first_key
 
       expected =
         :sha256
@@ -2232,9 +2468,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         )
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api",
-          saved_resets: saved_resets_with_expirations()
-        )
+        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api", saved_resets: saved_resets_with_expirations())
 
       ledger = %{
         "version" => 1,
@@ -2271,7 +2505,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert saved_resets["expires_refresh_attempted_at"] == "2026-07-24T03:00:00Z"
       assert persisted.saved_reset_first_seen_ledger == ledger
 
-      metadata_json = Jason.encode!(persisted.metadata)
+      metadata_json = CodexPooler.JSON.encode!(persisted.metadata)
 
       refute metadata_json =~ "used_credit"
       refute metadata_json =~ "redeem_request_id"
@@ -2287,8 +2521,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         FakeUpstream.start_link(
           {:path_json,
            %{
-             "/backend-api/wham/rate-limit-reset-credits" =>
-               {200, %{"credits" => [], "available_count" => 0}}
+             "/backend-api/wham/rate-limit-reset-credits" => {200, %{"credits" => [], "available_count" => 0}}
            }}
         )
 
@@ -2297,9 +2530,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         |> Map.put("observed_at", "2026-07-24T04:00:00Z")
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api",
-          saved_resets: newer_saved_resets
-        )
+        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api", saved_resets: newer_saved_resets)
 
       opaque_ledger = %{"version" => 99, "payload" => %{"future" => true}}
 
@@ -2325,8 +2556,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         FakeUpstream.start_link(
           {:path_json,
            %{
-             "/backend-api/wham/rate-limit-reset-credits" =>
-               {200, %{"credits" => [], "available_count" => 0}}
+             "/backend-api/wham/rate-limit-reset-credits" => {200, %{"credits" => [], "available_count" => 0}}
            }}
         )
 
@@ -2377,9 +2607,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         )
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api",
-          saved_resets: saved_resets_with_expirations()
-        )
+        assignment_with_fake(fake, "/backend-api/wham/usage", "chatgpt_api", saved_resets: saved_resets_with_expirations())
 
       task =
         Task.async(fn ->
@@ -2390,9 +2618,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           )
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                      ^release_ref},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                     @detection_timeout_ms
 
       superseded = %{
         "status" => "redeeming",
@@ -2409,7 +2636,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
 
-      assert {:ok, %{status: :noop, code: "no_credit"}} = Task.await(task, 5_000)
+      assert {:ok, %{status: :noop, code: "no_credit"}} = Task.await(task, @detection_timeout_ms)
 
       persisted = Repo.reload!(identity)
       assert persisted.metadata["saved_resets"] == before_release.metadata["saved_resets"]
@@ -2465,9 +2692,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           )
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                      ^release_ref},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                     @detection_timeout_ms
 
       newer_saved_resets =
         saved_resets_with_expirations()
@@ -2477,6 +2703,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       update_saved_resets!(identity, newer_saved_resets)
 
       handler_id = "saved-reset-final-update-#{System.unique_integer([:positive])}"
+
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler_id) end)
 
       :ok =
         :telemetry.attach(
@@ -2493,7 +2722,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       try do
         send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
 
-        assert {:ok, %{status: :noop, code: "no_credit"}} = Task.await(task, 5_000)
+        assert {:ok, %{status: :noop, code: "no_credit"}} = Task.await(task, @detection_timeout_ms)
 
         assert drain_identity_updates(task.pid) == 1
 
@@ -2512,8 +2741,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         FakeUpstream.start_link(
           {:path_json,
            %{
-             "/backend-api/wham/rate-limit-reset-credits" =>
-               {200, %{"credits" => [], "available_count" => 0}},
+             "/backend-api/wham/rate-limit-reset-credits" => {200, %{"credits" => [], "available_count" => 0}},
              "/backend-api/wham/usage" => {200, usage_payload(9)}
            }}
         )
@@ -2545,7 +2773,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
             receive do
               {^barrier, :start_redemption} -> :ok
             after
-              5_000 -> raise "timed out waiting to start saved-reset redemption"
+              @handoff_timeout_ms -> raise "timed out waiting to start saved-reset redemption"
             end
 
             SavedResetRedemption.redeem(fixture.assignment_id,
@@ -2554,9 +2782,12 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           end)
         end)
 
-      assert_receive {^barrier, :redemption_backend, redemption_backend_pid}, 5_000
+      assert_receive {^barrier, :redemption_backend, redemption_backend_pid}, @detection_timeout_ms
 
       handler_id = "saved-reset-finalizer-lock-#{System.unique_integer([:positive])}"
+
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler_id) end)
 
       :ok =
         :telemetry.attach(
@@ -2573,7 +2804,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                 receive do
                   {^barrier, :release_finalizer} -> :ok
                 after
-                  5_000 -> raise "timed out waiting to release saved-reset finalizer"
+                  @handoff_timeout_ms -> raise "timed out waiting to release saved-reset finalizer"
                 end
               end
             end
@@ -2583,7 +2814,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       try do
         send(redemption_task.pid, {barrier, :start_redemption})
-        assert_receive {^barrier, :finalizer_locked}, 5_000
+        assert_receive {^barrier, :finalizer_locked}, @detection_timeout_ms
 
         reconciliation_task =
           Task.async(fn ->
@@ -2600,7 +2831,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
             end)
           end)
 
-        assert_receive {^barrier, :reconciliation_backend, reconciliation_backend_pid}, 5_000
+        assert_receive {^barrier, :reconciliation_backend, reconciliation_backend_pid}, @detection_timeout_ms
 
         observation =
           observe_blocked_probe_claim!(reconciliation_backend_pid, redemption_backend_pid)
@@ -2611,10 +2842,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         send(redemption_task.pid, {barrier, :release_finalizer})
 
         assert {:ok, %{status: :noop, code: "no_credit"}} =
-                 Task.await(redemption_task, 5_000)
+                 Task.await(redemption_task, @detection_timeout_ms)
 
-        assert_receive {^barrier, :reconciliation_result, {:ok, %UpstreamIdentity{}}}, 5_000
-        Task.await(reconciliation_task, 5_000)
+        assert_receive {^barrier, :reconciliation_result, {:ok, %UpstreamIdentity{}}}, @detection_timeout_ms
+        Task.await(reconciliation_task, @detection_timeout_ms)
 
         persisted = run_unboxed(fn -> Repo.get!(UpstreamIdentity, fixture.identity_id) end)
 
@@ -2653,12 +2884,17 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     end
 
     test "stale admin in-progress redemption is recovered by manual attempt" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
       {:ok, fake} =
         FakeUpstream.start_link(
           {:path_json,
            %{
              "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
-             "/api/codex/usage" => {200, usage_payload(0)}
+             "/api/codex/usage" =>
+               {200,
+                ProviderCreditsFixtures.usage_payload(:included, now: observed_at, credits: :none, reset_after: 14_400)
+                |> Map.put("rate_limit_reset_credits", %{"available_count" => 0})}
            }}
         )
 
@@ -2680,13 +2916,22 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           }
         )
 
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 weekly_quota_attrs(Decimal.new("100"), observed_at: observed_at, last_sync_at: observed_at, reset_at: DateTime.add(observed_at, 2, :hour))
+               ])
+
       assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
                SavedResetRedemption.redeem(assignment)
 
-      assert [consume_request, usage_request] = FakeUpstream.requests(fake)
+      assert FakeUpstream.physical_counts(fake).consume == 1
 
-      assert consume_request.path == "/api/codex/rate-limit-reset-credits/consume"
-      assert usage_request.path == "/api/codex/usage"
+      first_observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      assert {:ok, _identity} = PoolReconciliation.refresh_quota_from_usage(Repo.reload!(identity), assignment, observed_at: first_observed_at)
+      second_observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      assert {:ok, refreshed_identity} = PoolReconciliation.refresh_quota_from_usage(Repo.reload!(identity), assignment, observed_at: second_observed_at)
+      assert {:ok, _outcome} = Convergence.converge(refreshed_identity, second_observed_at, "reconciliation")
+      assert FakeUpstream.physical_counts(fake).consume == 1
 
       persisted = Repo.reload!(identity)
       assert get_in(persisted.metadata, ["saved_reset_redemption", "status"]) == "succeeded"
@@ -3294,15 +3539,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       snapshot = scheduled_burn_snapshot(as_of, 60 * 60)
 
       scenarios = [
-        {"exhausted alone", [scheduled_burn_window(as_of, "100", 2 * 60 * 60)],
-         scheduled_burn_policy(), "exhausted"},
-        {"threshold over last call", [scheduled_burn_window(as_of, "95", 2 * 60 * 60)],
-         scheduled_burn_policy(%{trigger_mode: "threshold"}), "threshold"},
-        {"last call alone", [scheduled_burn_window(as_of, "25", 2 * 60 * 60)],
-         scheduled_burn_policy(), "last_call"},
-        {"exhausted over threshold and last call",
-         [scheduled_burn_window(as_of, "100", 2 * 60 * 60)],
-         scheduled_burn_policy(%{trigger_mode: "threshold"}), "exhausted"}
+        {"exhausted alone", [scheduled_burn_window(as_of, "100", 2 * 60 * 60)], scheduled_burn_policy(), "exhausted"},
+        {"threshold over last call", [scheduled_burn_window(as_of, "95", 2 * 60 * 60)], scheduled_burn_policy(%{trigger_mode: "threshold"}), "threshold"},
+        {"last call alone", [scheduled_burn_window(as_of, "25", 2 * 60 * 60)], scheduled_burn_policy(), "last_call"},
+        {"exhausted over threshold and last call", [scheduled_burn_window(as_of, "100", 2 * 60 * 60)], scheduled_burn_policy(%{trigger_mode: "threshold"}), "exhausted"}
       ]
 
       for {label, windows, policy, expected_detail} <- scenarios do
@@ -3394,9 +3634,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       for {expires_in_seconds, observed_age_seconds, fresh?} <- scenarios do
         snapshot =
-          scheduled_burn_snapshot(as_of, expires_in_seconds,
-            observed_age_seconds: observed_age_seconds
-          )
+          scheduled_burn_snapshot(as_of, expires_in_seconds, observed_age_seconds: observed_age_seconds)
 
         assert SavedResets.expiration_observation_fresh?(snapshot, as_of) == fresh?
 
@@ -3573,15 +3811,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       scenarios = [
         {[], scheduled_burn_snapshot(as_of, 60 * 60), :burn_condition_absent},
-        {[scheduled_burn_window(as_of, "0", 2 * 60 * 60)],
-         scheduled_burn_snapshot(as_of, 60 * 60), :burn_condition_absent},
-        {[scheduled_burn_window(as_of, "25", 2 * 60 * 60)],
-         scheduled_burn_snapshot(as_of, 60 * 60, observed_at: "invalid"), :expiration_stale},
-        {[scheduled_burn_window(as_of, "25", 30 * 60)], scheduled_burn_snapshot(as_of, 60 * 60),
-         :natural_reset_buffer},
-        {[scheduled_burn_window(as_of, "100", 30 * 60)],
-         scheduled_burn_snapshot(as_of, 60 * 60, observed_age_seconds: 30 * 60),
-         :natural_reset_buffer}
+        {[scheduled_burn_window(as_of, "0", 2 * 60 * 60)], scheduled_burn_snapshot(as_of, 60 * 60), :burn_condition_absent},
+        {[scheduled_burn_window(as_of, "25", 2 * 60 * 60)], scheduled_burn_snapshot(as_of, 60 * 60, observed_at: "invalid"), :expiration_stale},
+        {[scheduled_burn_window(as_of, "25", 30 * 60)], scheduled_burn_snapshot(as_of, 60 * 60), :natural_reset_buffer},
+        {[scheduled_burn_window(as_of, "100", 30 * 60)], scheduled_burn_snapshot(as_of, 60 * 60, observed_age_seconds: 30 * 60), :natural_reset_buffer}
       ]
 
       for {windows, snapshot, reason} <- scenarios do
@@ -3603,8 +3836,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           ],
           {window, policy} <- [
             {scheduled_burn_window(as_of, "100", 2 * 60 * 60), scheduled_burn_policy()},
-            {scheduled_burn_window(as_of, "95", 2 * 60 * 60),
-             scheduled_burn_policy(%{trigger_mode: "threshold"})},
+            {scheduled_burn_window(as_of, "95", 2 * 60 * 60), scheduled_burn_policy(%{trigger_mode: "threshold"})},
             {scheduled_burn_window(as_of, "25", 2 * 60 * 60), scheduled_burn_policy()}
           ] do
         assert {:not_ready, :burn_condition_absent} =
@@ -3639,6 +3871,83 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     end
 
     @tag :saved_reset_redemption_cause
+    test "scheduled available rounded-full quota preserves threshold and last-call policies only" do
+      for {mode, expires_in_seconds, expected} <- [
+            {"blocked", 4 * 60 * 60, :not_ready},
+            {"threshold", 4 * 60 * 60, "threshold"},
+            {"blocked", 60 * 60, "last_call"}
+          ] do
+        %{identity: identity, assignment: assignment, as_of: as_of} =
+          scheduled_expiry_fixture(
+            quota_used_percent: Decimal.new(100),
+            expires_in_seconds: expires_in_seconds,
+            quota_overrides: %{
+              metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false}
+            },
+            policy_attrs: %{saved_reset_auto_redeem_trigger_mode: mode}
+          )
+
+        identity =
+          identity
+          |> Ecto.Changeset.change(
+            metadata:
+              Map.put(
+                identity.metadata,
+                "quota_account_availability",
+                AccountAvailabilityStore.encode!(:available, as_of, 1)
+              )
+          )
+          |> Repo.update!()
+
+        context = gateway_auto_context(assignment, identity, :blocked_weekly_exhaustion)
+        assert {:ok, context} = AutoEligibility.normalize_context(context)
+
+        assert {:noop, "gateway_auto_trigger_not_current"} =
+                 AutoEligibility.validate_locked_gateway_auto(
+                   identity,
+                   assignment,
+                   context,
+                   as_of
+                 )
+
+        result =
+          AutoEligibility.validate_locked_scheduled_expiry(
+            identity,
+            assignment,
+            identity.id,
+            as_of,
+            SavedResets.redemption_receive_timeout_ms()
+          )
+
+        if expected == :not_ready do
+          assert {:noop, "scheduled_expiry_burn_not_ready"} == result
+          refute AutoEligibility.scheduled_expiry_candidate?(identity, as_of)
+        else
+          assert {:ok, %{trigger_detail: ^expected}} = result
+          assert AutoEligibility.scheduled_expiry_candidate?(identity, as_of)
+        end
+      end
+    end
+
+    @tag :monthly_saved_reset
+    test "monthly scheduled last-call rescue consumes through the shared pipeline" do
+      %{as_of: as_of, fake: fake, identity: identity, assignment: assignment} =
+        scheduled_expiry_fixture(
+          quota_overrides: %{
+            window_kind: "primary",
+            window_minutes: 43_200,
+            reset_at: DateTime.add(DateTime.utc_now(), 20, :day)
+          }
+        )
+
+      assert AutoEligibility.scheduled_expiry_candidate?(identity, as_of)
+
+      assert {:ok, %{applied?: true}} =
+               SavedResetRedemption.redeem_scheduled_expiry(assignment, identity.id, started_at: as_of)
+
+      assert provider_consume_count(fake) == 1
+    end
+
     test "eligible scheduled rescue consumes once through the shared redemption pipeline" do
       %{as_of: as_of, fake: fake, identity: identity, assignment: assignment} =
         scheduled_expiry_fixture()
@@ -3669,13 +3978,33 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert Map.take(redemption, scheduled_decision_metadata_keys()) == %{
                "trigger_detail" => "last_call",
                "used_percent_at_decision" => "25",
-               "credit_expires_at_at_decision" =>
-                 DateTime.to_iso8601(DateTime.add(as_of, 1, :hour)),
+               "credit_expires_at_at_decision" => DateTime.to_iso8601(DateTime.add(as_of, 1, :hour)),
                "natural_reset_at_decision" => DateTime.to_iso8601(DateTime.add(as_of, 2, :hour)),
                "decided_at" => DateTime.to_iso8601(as_of)
              }
 
       refute Map.has_key?(redemption, "probe")
+    end
+
+    @tag :monthly_saved_reset
+    test "monthly expiry rescue rejects an independent exhausted five-hour window" do
+      %{as_of: as_of, fake: fake, identity: identity, assignment: assignment} =
+        scheduled_expiry_fixture(quota_overrides: %{window_kind: "primary", window_minutes: 43_200})
+
+      attrs =
+        scheduled_weekly_quota_attrs(as_of, Decimal.new("100"),
+          window_kind: "primary",
+          window_minutes: 300,
+          source: "codex_response_headers"
+        )
+
+      assert {:ok, [_]} = QuotaWindows.upsert_quota_windows(identity, [attrs])
+      refute AutoEligibility.scheduled_expiry_candidate?(identity, as_of)
+
+      assert {:ok, %{applied?: false}} =
+               SavedResetRedemption.redeem_scheduled_expiry(assignment, identity.id, started_at: as_of)
+
+      assert provider_consume_count(fake) == 0
     end
 
     test "persists scheduled fields in the consuming claim before provider I/O" do
@@ -3704,9 +4033,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           )
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                      ^release_ref},
-                     5_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                     @detection_timeout_ms
 
       consuming = Repo.reload!(identity).metadata["saved_reset_redemption"]
       assert consuming["status"] == "redeeming"
@@ -3716,7 +4044,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                Enum.sort(scheduled_decision_metadata_keys())
 
       send(fake_request_pid, {:fake_upstream_release_timeout, release_ref})
-      assert {:ok, %{status: :noop, code: "nothing_to_reset"}} = Task.await(task, 5_000)
+      assert {:ok, %{status: :noop, code: "nothing_to_reset"}} = Task.await(task, @detection_timeout_ms)
     end
 
     test "selects highest usage then latest reset for scheduled decision evidence" do
@@ -4167,11 +4495,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       as_of = ~U[2026-07-29 12:00:00Z]
 
       scenarios = [
-        {:burn_condition_absent, "scheduled_expiry_burn_not_ready",
-         [quota_used_percent: Decimal.new("0")]},
+        {:burn_condition_absent, "scheduled_expiry_burn_not_ready", [quota_used_percent: Decimal.new("0")]},
         {:expiration_stale, "scheduled_expiry_expiration_stale", [stale_expiration?: true]},
-        {:natural_reset_buffer, "scheduled_expiry_natural_reset_buffer",
-         [quota_overrides: %{reset_at: DateTime.add(as_of, 30, :minute)}]}
+        {:natural_reset_buffer, "scheduled_expiry_natural_reset_buffer", [quota_overrides: %{reset_at: DateTime.add(as_of, 30, :minute)}]}
       ]
 
       for {expected_reason, expected_code, opts} <- scenarios do
@@ -4210,14 +4536,20 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     end
 
     @tag :separate_backend_scheduled_expiry_lock_time
-    test "production default resolves scheduled decision time after both row locks" do
+    test "scheduled decision time is read only after both row locks" do
       {:ok, fake} = codex_reset_fake(0)
       on_exit(fn -> FakeUpstream.stop(fake) end)
 
       fixture = committed_scheduled_expiry_race_fixture!(fake)
       on_exit(fn -> cleanup_committed_scheduled_expiry_race_fixture!(fixture) end)
 
-      decision_before = DateTime.utc_now() |> DateTime.add(3, :second)
+      # The reset is still expiring at the pre-lock time (so a pre-lock
+      # decision would have consumed it) while the injected post-lock clock
+      # answers a whole second past expiry, because `expires_soon?` compares
+      # truncated seconds. The clock reports when it is read, so the ordering
+      # is proven by the lock release instead of by waiting for the reset to
+      # expire on the wall clock.
+      decision_before = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       expires_at = DateTime.add(decision_before, 1, :second)
       assignment_id = List.first(fixture.assignment_ids)
 
@@ -4257,36 +4589,43 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
               receive do
                 {^barrier, :release_assignment} -> :released
               after
-                10_000 -> raise "timed out waiting to release scheduled assignment lock"
+                @handoff_timeout_ms -> raise "timed out waiting to release scheduled assignment lock"
               end
             end)
           end)
         end)
 
       try do
-        assert_receive {^barrier, :assignment_locked, holder_backend_pid}, 5_000
+        assert_receive {^barrier, :assignment_locked, holder_backend_pid}, @detection_timeout_ms
 
         redemption_task =
           Task.async(fn ->
             Sandbox.unboxed_run(Repo, fn ->
               send(parent, {barrier, :redemption_backend, backend_pid!()})
-              SavedResetRedemption.redeem_scheduled_expiry(assignment_id, fixture.identity_id)
+
+              SavedResetRedemption.redeem_scheduled_expiry(assignment_id, fixture.identity_id,
+                clock: fn ->
+                  send(parent, {barrier, :clock_read})
+                  DateTime.add(expires_at, 1, :second)
+                end
+              )
             end)
           end)
 
-        assert_receive {^barrier, :redemption_backend, redemption_backend_pid}, 5_000
+        assert_receive {^barrier, :redemption_backend, redemption_backend_pid}, @detection_timeout_ms
 
         observation = observe_blocked_probe_claim!(redemption_backend_pid, holder_backend_pid)
         assert holder_backend_pid in observation.blocking_pids
         assert observation.wait_event_type == "Lock"
 
-        await_after!(DateTime.add(expires_at, 1, :second))
+        refute_received {^barrier, :clock_read}
         send(assignment_holder.pid, {barrier, :release_assignment})
 
-        assert {:ok, :released} = Task.await(assignment_holder, 5_000)
+        assert {:ok, :released} = Task.await(assignment_holder, @detection_timeout_ms)
+        assert_receive {^barrier, :clock_read}, @detection_timeout_ms
 
         assert {:ok, %{status: :noop, code: "scheduled_expiry_not_expiring"}} =
-                 Task.await(redemption_task, 5_000)
+                 Task.await(redemption_task, @detection_timeout_ms)
 
         persisted = run_unboxed(fn -> Repo.get!(UpstreamIdentity, fixture.identity_id) end)
         refute Map.has_key?(persisted.metadata || %{}, "saved_reset_redemption")
@@ -4433,8 +4772,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       %{as_of: as_of, fake: fake, identity: identity, assignment: assignment} =
         scheduled_expiry_fixture(redemption: redemption)
 
-      assert {:ok,
-              %{status: :noop, applied?: false, code: "scheduled_expiry_lifecycle_unavailable"}} =
+      assert {:ok, %{status: :noop, applied?: false, code: "scheduled_expiry_lifecycle_unavailable"}} =
                SavedResetRedemption.redeem_scheduled_expiry(
                  assignment,
                  identity.id,
@@ -4446,9 +4784,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
     test "automatic consume latch noops before provider HTTP" do
       %{as_of: as_of, fake: fake, identity: identity, assignment: assignment} =
-        scheduled_expiry_fixture(
-          redemption: applied_gateway_auto_redemption("confirmed_by_quota", 5)
-        )
+        scheduled_expiry_fixture(redemption: applied_gateway_auto_redemption("confirmed_by_quota", 5))
 
       assert {:ok, %{status: :noop, applied?: false, code: "scheduled_expiry_consume_latched"}} =
                SavedResetRedemption.redeem_scheduled_expiry(
@@ -4466,8 +4802,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       update_identity!(identity, %{status: UpstreamIdentity.paused_status()})
 
-      assert {:ok,
-              %{status: :noop, applied?: false, code: "scheduled_expiry_identity_unavailable"}} =
+      assert {:ok, %{status: :noop, applied?: false, code: "scheduled_expiry_identity_unavailable"}} =
                SavedResetRedemption.redeem_scheduled_expiry(
                  assignment,
                  identity.id,
@@ -4483,8 +4818,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       update_assignment!(assignment, %{status: PoolUpstreamAssignment.paused_status()})
 
-      assert {:ok,
-              %{status: :noop, applied?: false, code: "scheduled_expiry_assignment_unavailable"}} =
+      assert {:ok, %{status: :noop, applied?: false, code: "scheduled_expiry_assignment_unavailable"}} =
                SavedResetRedemption.redeem_scheduled_expiry(
                  assignment,
                  identity.id,
@@ -4528,8 +4862,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     test "scheduled rescue safely rejects a malformed expected identity id" do
       %{as_of: as_of, fake: fake, assignment: assignment} = scheduled_expiry_fixture()
 
-      assert {:ok,
-              %{status: :noop, applied?: false, code: "scheduled_expiry_identity_unavailable"}} =
+      assert {:ok, %{status: :noop, applied?: false, code: "scheduled_expiry_identity_unavailable"}} =
                SavedResetRedemption.redeem_scheduled_expiry(
                  assignment,
                  "not-a-uuid",
@@ -4554,18 +4887,22 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       on_exit(fn -> cleanup_committed_scheduled_expiry_race_fixture!(manual_fixture) end)
       on_exit(fn -> cleanup_committed_scheduled_expiry_race_fixture!(scheduled_fixture) end)
 
+      manual_handler_id = register_claim_lock_handler!()
+
       {manual_result, manual_locks} =
         run_unboxed(fn ->
-          capture_claim_locks_until_identity_update!(fn ->
+          capture_claim_locks_until_identity_update!(manual_handler_id, fn ->
             SavedResetRedemption.redeem(List.first(manual_fixture.assignment_ids),
               started_at: manual_fixture.as_of
             )
           end)
         end)
 
+      scheduled_handler_id = register_claim_lock_handler!()
+
       {scheduled_result, scheduled_locks} =
         run_unboxed(fn ->
-          capture_claim_locks_until_identity_update!(fn ->
+          capture_claim_locks_until_identity_update!(scheduled_handler_id, fn ->
             SavedResetRedemption.redeem_scheduled_expiry(
               List.first(scheduled_fixture.assignment_ids),
               scheduled_fixture.identity_id,
@@ -4839,12 +5176,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     test "an ambiguous sibling consume keeps the cohort fenced without a second POST" do
       {:ok, fake} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             {:json, 500, %{"error" => "synthetic failure"}},
-             {:json, 200, %{"code" => "reset"}},
-             {:json, 200, usage_payload(0)}
-           ]}
+          # The ambiguous first consume is the only provider request this
+          # scenario permits; the sibling barrier must never issue a second POST.
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/api/codex/rate-limit-reset-credits/consume",
+              respond: FakeUpstream.json_response(%{"error" => "synthetic failure"}, 500)
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(fake) end)
@@ -4857,13 +5197,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                  redeem_gateway_auto_target!(fixture, 0, fixture.identity_ids)
                end)
 
-      assert {:ok,
-              %{status: :noop, applied?: false, code: "gateway_auto_sibling_consume_barrier"}} =
+      assert {:ok, %{status: :noop, applied?: false, code: "gateway_auto_sibling_consume_barrier"}} =
                run_unboxed(fn ->
                  redeem_gateway_auto_target!(fixture, 1, fixture.identity_ids)
                end)
 
       assert provider_consume_count(fake) == 1
+      assert :ok = FakeUpstream.verify!(fake)
     end
 
     @tag :saved_reset_cohort_lock_reversed_order
@@ -4973,11 +5313,16 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
     @tag :saved_reset_cohort_lock_200
     @tag timeout: 90_000
+    @tag slow: "creates 200 committed identities to verify one ordered cohort lock"
     test "a 200-member cohort uses one exact ordered identity lock and one assignment lock" do
       {:ok, fake} = codex_reset_fake(0)
       on_exit(fn -> FakeUpstream.stop(fake) end)
 
-      fixture = committed_gateway_auto_cohort_fixture!(fake, :same_pool, 200)
+      # Only the target (index 0) is a capacity and routable candidate, so the
+      # claim reads the 199 siblings' identity rows (cohort lock, sibling
+      # consume fence) and never their weekly windows or confirmation receipts;
+      # skipping that evidence keeps the committed fixture from dominating the test.
+      fixture = committed_gateway_auto_cohort_fixture!(fake, :same_pool, 200, sibling_evidence?: false)
       on_exit(fn -> cleanup_committed_gateway_auto_cohort_fixture!(fixture) end)
 
       input_ids =
@@ -5107,6 +5452,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       gateway_assignment_id = List.last(fixture.assignment_ids)
 
+      # The corroborated evidence above is newer than fixture creation. Both
+      # claimants must sample a clock after that committed observation.
+      fixture = %{fixture | as_of: DateTime.utc_now() |> DateTime.truncate(:microsecond)}
+
       {scheduled_result, gateway_result, scheduled_backend_pid, gateway_backend_pid} =
         run_automatic_claim_race!(
           fixture,
@@ -5124,8 +5473,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
             SavedResetRedemption.redeem(assignment,
               trigger_kind: "gateway_auto",
-              gateway_auto_context:
-                gateway_auto_context(assignment, identity, :blocked_weekly_exhaustion),
+              gateway_auto_context: gateway_auto_context(assignment, identity, :blocked_weekly_exhaustion),
               started_at: fixture.as_of,
               receive_timeout: 15_000
             )
@@ -5181,9 +5529,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       try do
         assert_receive {^barrier, :claim_ready, winner_pid, :winner, winner_backend_pid},
-                       5_000
+                       @detection_timeout_ms
 
-        assert_receive {^barrier, :claim_ready, loser_pid, :loser, loser_backend_pid}, 5_000
+        assert_receive {^barrier, :claim_ready, loser_pid, :loser, loser_backend_pid}, @detection_timeout_ms
 
         assert winner_pid == winner_task.pid
         assert loser_pid == loser_task.pid
@@ -5192,6 +5540,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
         handler_id =
           "saved-reset-probe-lock-#{System.unique_integer([:positive])}"
+
+        # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+        on_exit(fn -> :telemetry.detach(handler_id) end)
 
         :ok =
           :telemetry.attach(
@@ -5206,7 +5557,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                 receive do
                   {^barrier, :release_winner} -> :ok
                 after
-                  5_000 -> raise "timed out waiting to release the saved-reset probe winner"
+                  @handoff_timeout_ms -> raise "timed out waiting to release the saved-reset probe winner"
                 end
               end
             end,
@@ -5216,12 +5567,12 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         try do
           send(winner_task.pid, {barrier, :start_claim})
 
-          assert_receive {^barrier, :claim_started, :winner, ^winner_backend_pid}, 5_000
-          assert_receive {^barrier, :winner_lock_acquired, ^winner_backend_pid}, 5_000
+          assert_receive {^barrier, :claim_started, :winner, ^winner_backend_pid}, @detection_timeout_ms
+          assert_receive {^barrier, :winner_lock_acquired, ^winner_backend_pid}, @detection_timeout_ms
 
           send(loser_task.pid, {barrier, :start_claim})
 
-          assert_receive {^barrier, :claim_started, :loser, ^loser_backend_pid}, 5_000
+          assert_receive {^barrier, :claim_started, :loser, ^loser_backend_pid}, @detection_timeout_ms
 
           observation =
             observe_blocked_probe_claim!(loser_backend_pid, winner_backend_pid)
@@ -5231,11 +5582,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
           send(winner_task.pid, {barrier, :release_winner})
 
-          winner_result = Task.await(winner_task, 5_000)
+          winner_result = Task.await(winner_task, @detection_timeout_ms)
 
           assert {:winner, ^winner_backend_pid, {:ok, :claimed}} = winner_result
 
-          loser_result = Task.await(loser_task, 5_000)
+          loser_result = Task.await(loser_task, @detection_timeout_ms)
 
           assert {:loser, ^loser_backend_pid, {:error, :unavailable}} = loser_result
 
@@ -5289,6 +5640,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       convergence_handler = {__MODULE__, :multi_node_convergence, barrier}
       repo_handler = {__MODULE__, :multi_node_repo, barrier}
 
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(convergence_handler) end)
+
       :ok =
         :telemetry.attach(
           convergence_handler,
@@ -5298,6 +5652,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           end,
           parent
         )
+
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(repo_handler) end)
 
       :ok =
         :telemetry.attach(
@@ -5341,9 +5698,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           end
         ),
         start_multi_node_convergence_actor(parent, barrier, :reconciliation, fixture, fn _stale ->
-          PoolReconciliation.reconcile_pool_account(fixture.pool_id, fixture.assignment_id,
-            quota_windows: [fixture.canonical_window]
-          )
+          PoolReconciliation.reconcile_pool_account(fixture.pool_id, fixture.assignment_id, quota_windows: [fixture.canonical_window])
         end)
       ]
 
@@ -5351,7 +5706,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         ready =
           Enum.map(actors, fn %{role: role, task: task} ->
             task_pid = task.pid
-            assert_receive {^barrier, :ready, ^role, ^task_pid, backend_pid}, 5_000
+            assert_receive {^barrier, :ready, ^role, ^task_pid, backend_pid}, @detection_timeout_ms
             {role, backend_pid}
           end)
 
@@ -5474,8 +5829,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                "convergence_outcome" => "confirmed_by_quota"
              }
 
-      assert_receive {^handler_id, %{count: 1},
-                      %{source: "finalizer", outcome: "confirmed_by_quota"}}
+      assert_receive {^handler_id, %{count: 1}, %{source: "finalizer", outcome: "confirmed_by_quota"}}
 
       refute_receive {^handler_id, _measurements, _metadata}
 
@@ -5580,6 +5934,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       handler_id = "saved-reset-probe-identity-first-#{System.unique_integer([:positive])}"
 
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       :ok =
         :telemetry.attach(
           handler_id,
@@ -5593,7 +5950,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
               receive do
                 {^barrier, :release_claim} -> :ok
               after
-                5_000 -> raise "timed out waiting to release the reassignment probe claim"
+                @handoff_timeout_ms -> raise "timed out waiting to release the reassignment probe claim"
               end
             end
           end,
@@ -5601,8 +5958,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         )
 
       try do
-        assert_receive {^barrier, :claim_backend, claim_backend_pid}, 5_000
-        assert_receive {^barrier, :identity_locked}, 5_000
+        assert_receive {^barrier, :claim_backend, claim_backend_pid}, @detection_timeout_ms
+        assert_receive {^barrier, :identity_locked}, @detection_timeout_ms
 
         reassignment_task =
           Task.async(fn ->
@@ -5619,10 +5976,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
             end)
           end)
 
-        assert_receive {^barrier, :reassignment_backend, reassignment_backend_pid}, 5_000
+        assert_receive {^barrier, :reassignment_backend, reassignment_backend_pid}, @detection_timeout_ms
         assert claim_backend_pid != reassignment_backend_pid
 
-        reassignment_result = Task.await(reassignment_task, 5_000)
+        reassignment_result = Task.await(reassignment_task, @detection_timeout_ms)
 
         assert %PoolUpstreamAssignment{
                  upstream_identity_id: ^foreign_identity_id
@@ -5630,7 +5987,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
         send(claim_task.pid, {barrier, :release_claim})
 
-        assert Task.await(claim_task, 5_000) == {:error, :unavailable}
+        assert Task.await(claim_task, @detection_timeout_ms) == {:error, :unavailable}
         assert persisted_probe!(fixture.identity_id) == nil
       after
         send(claim_task.pid, {barrier, :release_claim})
@@ -5779,9 +6136,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("confirmed_by_upstream", 5)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("confirmed_by_upstream", 5))
 
       identity = enable_saved_reset_auto_redeem!(identity)
       upsert_weekly_exhausted_quota!(identity)
@@ -5810,9 +6165,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("confirmed_by_quota", 5)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("confirmed_by_quota", 5))
 
       identity = enable_saved_reset_auto_redeem!(identity)
       upsert_weekly_exhausted_quota!(identity)
@@ -5831,9 +6184,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("confirmed_by_quota", 40)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("confirmed_by_quota", 40))
 
       identity = enable_saved_reset_auto_redeem!(identity)
       upsert_weekly_exhausted_quota!(identity)
@@ -5853,9 +6204,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("confirmed_by_upstream", 5)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("confirmed_by_upstream", 5))
 
       assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
                SavedResetRedemption.redeem(assignment)
@@ -5868,9 +6217,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: legacy_applied_gateway_auto_redemption(5)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: legacy_applied_gateway_auto_redemption(5))
 
       identity = enable_saved_reset_auto_redeem!(identity)
       upsert_weekly_exhausted_quota!(identity)
@@ -5890,9 +6237,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("confirmed_by_upstream", 5)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("confirmed_by_upstream", 5))
 
       identity =
         enable_saved_reset_auto_redeem!(identity, %{
@@ -5928,9 +6273,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         )
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("confirmed_by_quota", 5)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("confirmed_by_quota", 5))
 
       assert {:error, :saved_reset_consume_outcome_ambiguous} =
                SavedResetRedemption.redeem(assignment)
@@ -5954,9 +6297,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: latched_identity, assignment: latched_assignment} =
-        assignment_with_fake(latched_fake, "/api/codex/usage", "codex_api",
-          redemption: applied_gateway_auto_redemption("reblocked", 5)
-        )
+        assignment_with_fake(latched_fake, "/api/codex/usage", "codex_api", redemption: applied_gateway_auto_redemption("reblocked", 5))
 
       %{identity: identity, assignment: assignment} =
         assignment_with_fake(fake, "/api/codex/usage", "codex_api")
@@ -6069,7 +6410,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert run_unboxed(fn -> Repo.get!(UpstreamIdentity, target_id).metadata end) ==
                before_target
 
-      refute Jason.encode!(before_target) =~ "acct_cohort_lock"
+      refute CodexPooler.JSON.encode!(before_target) =~ "acct_cohort_lock"
     end
 
     test "threshold sibling capacity gate rejects unusable evidence without false vetoes" do
@@ -6408,8 +6749,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
              }
            }
          ], :noop},
-        {:malformed_marker, true,
-         [circuit_metadata: %{"saved_reset_recovery" => %{"attempted" => true}}], :noop},
+        {:malformed_marker, true, [circuit_metadata: %{"saved_reset_recovery" => %{"attempted" => true}}], :noop},
         {:future_marker_version, true,
          [
            circuit_metadata: %{
@@ -6511,8 +6851,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
          ]},
         {:malformed_missing_reset, Decimal.new("20"), [reset_at: nil]},
         {:unknown_precision, Decimal.new("20"), [source_precision: "unknown"]},
-        {:incompatible_model, Decimal.new("20"),
-         [quota_key: "other-model", quota_scope: "model", quota_family: "codex_model"]},
+        {:incompatible_model, Decimal.new("20"), [quota_key: "other-model", quota_scope: "model", quota_family: "codex_model"]},
         {:model_only, Decimal.new("20"),
          [
            quota_key: "test-model",
@@ -6702,6 +7041,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       test_pid = self()
       handler_id = {__MODULE__, System.unique_integer([:positive, :monotonic])}
 
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       :ok =
         :telemetry.attach(
           handler_id,
@@ -6737,17 +7079,28 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
                    gateway_auto_context: context
                  )
 
-        assert_receive {:claim_lock, :cohort}, 1_000
-        assert_receive {:claim_lock, :assignment}, 1_000
+        # Claim phase: sorted cohort, assignment, then the capacity circuits.
+        assert_receive {:claim_lock, :cohort}, @detection_timeout_ms
+        assert_receive {:claim_lock, :assignment}, @detection_timeout_ms
 
-        assert_receive {:claim_lock, :circuits, query,
-                        [_pool_id, locked_ids, "test-model", "proxy_http"]},
-                       1_000
+        assert_receive {:claim_lock, :circuits, query, [_pool_id, locked_ids, "test-model", "proxy_http"]},
+                       @detection_timeout_ms
 
         assert query =~
                  ~r/ORDER BY .*pool_upstream_assignment_id.*updated_at.*created_at.*id.*FOR UPDATE/
 
         assert length(locked_ids) == 3
+
+        # Dispatch reservation: the same lock order is reacquired once before
+        # the provider POST, and nothing is locked again afterwards.
+        assert_receive {:claim_lock, :cohort}, @detection_timeout_ms
+        assert_receive {:claim_lock, :assignment}, @detection_timeout_ms
+
+        assert_receive {:claim_lock, :circuits, reservation_query, [_pool_id, reservation_locked_ids, "test-model", "proxy_http"]},
+                       @detection_timeout_ms
+
+        assert reservation_query == query
+        assert reservation_locked_ids == locked_ids
 
         {:messages, remaining_messages} = Process.info(self(), :messages)
         refute Enum.any?(remaining_messages, &match?({:claim_lock, :circuits, _, _}, &1))
@@ -6793,9 +7146,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {:ok, fake} = codex_reset_fake(0)
 
       %{identity: identity, assignment: assignment} =
-        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
-          redemption: legacy_applied_gateway_auto_redemption(40)
-        )
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api", redemption: legacy_applied_gateway_auto_redemption(40))
 
       identity = enable_saved_reset_auto_redeem!(identity)
       upsert_weekly_exhausted_quota!(identity)
@@ -6881,8 +7232,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
             FakeUpstream.start_link(
               {:path_json,
                %{
-                 "/api/codex/rate-limit-reset-credits/consume" =>
-                   Keyword.get(opts, :consume_response, {200, %{"code" => "reset"}}),
+                 "/api/codex/rate-limit-reset-credits/consume" => Keyword.get(opts, :consume_response, {200, %{"code" => "reset"}}),
                  "/api/codex/usage" => Keyword.get(opts, :usage_response, {200, usage_payload(0)})
                }}
             )
@@ -6974,9 +7324,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           observed_at
 
         :error ->
-          DateTime.to_iso8601(
-            DateTime.add(as_of, -Keyword.get(opts, :observed_age_seconds, 0), :second)
-          )
+          DateTime.to_iso8601(DateTime.add(as_of, -Keyword.get(opts, :observed_age_seconds, 0), :second))
       end
 
     saved_resets = Map.put(saved_resets, "expires_observed_at", observed_at)
@@ -6998,6 +7346,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
   defp scheduled_burn_window(as_of, used_percent, reset_in_seconds) do
     %AccountQuotaWindow{
+      quota_key: "account",
+      quota_scope: "account",
+      quota_family: "account",
+      window_kind: "secondary",
+      window_minutes: 10_080,
       used_percent: Decimal.new(used_percent),
       reset_at: DateTime.add(as_of, reset_in_seconds, :second)
     }
@@ -7012,8 +7365,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         "available_count" => 1,
         "source" => "codex_usage_api",
         "path_style" => path_style,
-        "observed_at" =>
-          DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601(),
+        "observed_at" => DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601(),
         "usage_path" => usage_path,
         "reason" => nil
       })
@@ -7043,10 +7395,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       FakeUpstream.start_link(
         {:path_json,
          %{
-           "/backend-api/wham/rate-limit-reset-credits" =>
-             {200, %{"credits" => [%{"id" => credit_id, "status" => "available"}]}},
-           "/backend-api/wham/rate-limit-reset-credits/consume" =>
-             {503, %{"code" => "provider_failed"}}
+           "/backend-api/wham/rate-limit-reset-credits" => {200, %{"credits" => [%{"id" => credit_id, "status" => "available"}]}},
+           "/backend-api/wham/rate-limit-reset-credits/consume" => {503, %{"code" => "provider_failed"}}
          }}
       )
 
@@ -7078,14 +7428,19 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
   defp ambiguous_codex_recovery_fixture! do
     {:ok, fake} =
-      FakeUpstream.start_link(
-        {:path_json, %{"/api/codex/rate-limit-reset-credits/consume" => :close_before_headers}}
-      )
+      FakeUpstream.start_link({:path_json, %{"/api/codex/rate-limit-reset-credits/consume" => :close_before_headers}})
 
     on_exit(fn -> FakeUpstream.stop(fake) end)
 
     %{identity: identity, assignment: assignment} =
       assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               weekly_quota_attrs(Decimal.new("100"), observed_at: observed_at, last_sync_at: observed_at)
+             ])
 
     assert {:error, :saved_reset_consume_outcome_ambiguous} =
              SavedResetRedemption.redeem(assignment)
@@ -7167,10 +7522,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       FakeUpstream.set_mode(fake, {
         :path_json,
         %{
-          "/backend-api/wham/rate-limit-reset-credits" =>
-            {200, %{"credits" => [%{"id" => credit_id, "status" => "available"}]}},
-          "/backend-api/wham/rate-limit-reset-credits/consume" =>
-            {503, %{"code" => "provider_failed"}}
+          "/backend-api/wham/rate-limit-reset-credits" => {200, %{"credits" => [%{"id" => credit_id, "status" => "available"}]}},
+          "/backend-api/wham/rate-limit-reset-credits/consume" => {503, %{"code" => "provider_failed"}}
         }
       })
 
@@ -7208,11 +7561,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
   defp cleanup_committed_recovery_fixture!(fixture) do
     run_unboxed(fn ->
-      Repo.delete_all(
-        from identity in UpstreamIdentity, where: identity.id == ^fixture.identity_id
-      )
+      CodexPooler.PoolerFixtures.delete_committed_pools!([fixture.pool_id])
 
-      Repo.delete_all(from pool in Pool, where: pool.id == ^fixture.pool_id)
+      Repo.delete_all(from identity in UpstreamIdentity, where: identity.id == ^fixture.identity_id)
     end)
   end
 
@@ -7232,7 +7583,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     receive do
       :start_recovery -> :ok
     after
-      5_000 -> raise "timed out waiting to start saved-reset recovery replica"
+      @handoff_timeout_ms -> raise "timed out waiting to start saved-reset recovery replica"
     end
 
     result =
@@ -7280,24 +7631,31 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   end
 
   defp gateway_auto_context(assignment, identity, trigger, overrides \\ %{}) do
-    Map.merge(
-      %{
-        trigger: trigger,
-        pool_upstream_assignment_id: assignment.id,
-        upstream_identity_id: identity.id,
-        candidate_assignment_ids: [assignment.id],
-        candidate_identity_ids: [identity.id],
-        capacity_assignment_ids: [assignment.id],
-        capacity_identity_ids: [identity.id],
-        cohort_identity_ids: [identity.id],
-        routable_assignment_ids: [assignment.id],
-        routable_identity_ids: [identity.id],
-        route_class: "proxy_http",
-        quota_scope: test_quota_scope(),
-        hard_pinned_continuity?: false
-      },
-      Map.new(overrides)
-    )
+    overrides = Map.new(overrides)
+
+    context =
+      Map.merge(
+        %{
+          trigger: trigger,
+          pool_upstream_assignment_id: assignment.id,
+          upstream_identity_id: identity.id,
+          candidate_assignment_ids: [assignment.id],
+          candidate_identity_ids: [identity.id],
+          capacity_assignment_ids: [assignment.id],
+          capacity_identity_ids: [identity.id],
+          cohort_identity_ids: [identity.id],
+          routable_assignment_ids: [assignment.id],
+          routable_identity_ids: [identity.id],
+          route_class: "proxy_http",
+          quota_scope: test_quota_scope(),
+          hard_pinned_continuity?: false
+        },
+        overrides
+      )
+
+    if Map.has_key?(overrides, :automatic_confirmation_refs),
+      do: context,
+      else: SavedResetConfirmationFixtures.put_confirmation_refs(context)
   end
 
   defp transient_circuit_exclusion(identity_id, circuit_id, overrides \\ %{}) do
@@ -7342,8 +7700,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
     {auth, model} =
       run_unboxed(fn ->
-        {routing_auth!(fixture.pool),
-         model_fixture(fixture.pool, %{exposed_model_id: "test-model"})}
+        {routing_auth!(fixture.pool), model_fixture(fixture.pool, %{exposed_model_id: "test-model"})}
       end)
 
     run_unboxed(fn ->
@@ -7376,7 +7733,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           receive do
             {^barrier, :start_claim} -> :ok
           after
-            5_000 -> raise "timed out waiting to start claim behind probe completion"
+            @handoff_timeout_ms -> raise "timed out waiting to start claim behind probe completion"
           end
 
           send(parent, {barrier, :claim_started, backend_pid})
@@ -7393,6 +7750,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
     handler_id = {__MODULE__, :probe_completion, System.unique_integer([:positive, :monotonic])}
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -7404,14 +7764,14 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       )
 
     try do
-      assert_receive {^barrier, :probe_ready, probe_backend_pid}, 5_000
-      assert_receive {^barrier, :probe_locked, probe_pid}, 5_000
+      assert_receive {^barrier, :probe_ready, probe_backend_pid}, @detection_timeout_ms
+      assert_receive {^barrier, :probe_locked, probe_pid}, @detection_timeout_ms
       send(claim_task.pid, {barrier, :start_claim})
-      assert_receive {^barrier, :claim_started, claim_backend_pid}, 5_000
+      assert_receive {^barrier, :claim_started, claim_backend_pid}, @detection_timeout_ms
       observation = observe_blocked_probe_claim!(claim_backend_pid, probe_backend_pid)
       send(probe_pid, {barrier, :release_probe})
-      {^probe_backend_pid, probe_result} = Task.await(probe_task, 10_000)
-      {^claim_backend_pid, claim_result} = Task.await(claim_task, 10_000)
+      {^probe_backend_pid, probe_result} = Task.await(probe_task, @detection_timeout_ms)
+      {^claim_backend_pid, claim_result} = Task.await(claim_task, @detection_timeout_ms)
 
       %{
         blocking_pids: observation.blocking_pids,
@@ -7445,6 +7805,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     handler_id =
       {__MODULE__, :transient_claim_race, System.unique_integer([:positive, :monotonic])}
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -7456,17 +7819,17 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       )
 
     try do
-      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, 5_000
-      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, 5_000
+      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, @detection_timeout_ms
+      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, @detection_timeout_ms
       send(winner_task.pid, {barrier, :start_claim})
 
-      assert_receive {^barrier, :circuit_lock, :winner, winner_lock, winner_pid}, 5_000
+      assert_receive {^barrier, :circuit_lock, :winner, winner_lock, winner_pid}, @detection_timeout_ms
       send(loser_task.pid, {barrier, :start_claim})
       observation = observe_blocked_probe_claim!(loser_backend_pid, winner_backend_pid)
       send(winner_pid, {barrier, :release_winner})
-      {:winner, ^winner_backend_pid, winner_result} = Task.await(winner_task, 10_000)
+      {:winner, ^winner_backend_pid, winner_result} = Task.await(winner_task, @detection_timeout_ms)
 
-      {:loser, ^loser_backend_pid, loser_result} = Task.await(loser_task, 10_000)
+      {:loser, ^loser_backend_pid, loser_result} = Task.await(loser_task, @detection_timeout_ms)
 
       loser_lock =
         receive do
@@ -7525,17 +7888,19 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           receive do
             {^barrier, :start_insert} -> :ok
           after
-            5_000 -> raise "timed out waiting to start first circuit insert"
+            @handoff_timeout_ms -> raise "timed out waiting to start first circuit insert"
           end
 
           send(parent, {barrier, :insert_started, backend_pid})
 
-          {backend_pid,
-           CircuitState.record_failure(auth, model, assignment, "proxy_http", :first)}
+          {backend_pid, CircuitState.record_failure(auth, model, assignment, "proxy_http", :first)}
         end)
       end)
 
     handler_id = {__MODULE__, :first_insert, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -7549,7 +7914,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
             receive do
               {^barrier, :release_claim} -> :ok
             after
-              10_000 -> raise "timed out waiting to release claim before first circuit insert"
+              @handoff_timeout_ms -> raise "timed out waiting to release claim before first circuit insert"
             end
           end
         end,
@@ -7557,14 +7922,14 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       )
 
     try do
-      assert_receive {^barrier, :claim_ready, claim_backend_pid}, 5_000
-      assert_receive {^barrier, :claim_cohort_locked, claim_pid}, 5_000
+      assert_receive {^barrier, :claim_ready, claim_backend_pid}, @detection_timeout_ms
+      assert_receive {^barrier, :claim_cohort_locked, claim_pid}, @detection_timeout_ms
       send(insert_task.pid, {barrier, :start_insert})
-      assert_receive {^barrier, :insert_started, insert_backend_pid}, 5_000
+      assert_receive {^barrier, :insert_started, insert_backend_pid}, @detection_timeout_ms
       observation = observe_blocked_probe_claim!(insert_backend_pid, claim_backend_pid)
       send(claim_pid, {barrier, :release_claim})
-      {^claim_backend_pid, claim_result} = Task.await(claim_task, 10_000)
-      {^insert_backend_pid, insert_result} = Task.await(insert_task, 10_000)
+      {^claim_backend_pid, claim_result} = Task.await(claim_task, @detection_timeout_ms)
+      {^insert_backend_pid, insert_result} = Task.await(insert_task, @detection_timeout_ms)
 
       %{
         blocking_pids: observation.blocking_pids,
@@ -7637,20 +8002,23 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
   defp cleanup_committed_transient_fixture!(pool_id, identity_ids) do
     Sandbox.unboxed_run(Repo, fn ->
+      owner_ids = CodexPooler.PoolerFixtures.api_key_creator_ids([pool_id])
       delete_pool_if_present!(pool_id)
 
       Repo.delete_all(
         from identity in UpstreamIdentity,
           where: identity.id in ^identity_ids
       )
+
+      # The identities can still name the fixture owner as their creator when the Pool goes, so
+      # the owner is only unreferenced once they are gone too.
+      CodexPooler.AccountsFixtures.delete_unreferenced_fixture_owners!(owner_ids)
     end)
   end
 
   defp delete_pool_if_present!(pool_id) do
-    case Repo.get(Pool, pool_id) do
-      %Pool{} = pool -> Repo.delete!(pool)
-      nil -> :ok
-    end
+    CodexPooler.PoolerFixtures.delete_committed_pools!([pool_id])
+    :ok
   end
 
   defp handle_probe_completion_lock(metadata, parent, barrier) do
@@ -7661,10 +8029,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     end
   end
 
+  # Only the claim-phase circuit lock is the race barrier; the dispatch
+  # reservation re-locks the same capacity rows and must run through.
   defp handle_transient_claim_lock(metadata, parent, barrier) do
     role = Process.get({__MODULE__, barrier, :claim_role})
+    seen_key = {__MODULE__, barrier, :circuit_lock_seen}
 
-    if role in [:winner, :loser] and circuit_lock_query?(metadata) do
+    if role in [:winner, :loser] and circuit_lock_query?(metadata) and
+         is_nil(Process.get(seen_key)) do
+      Process.put(seen_key, true)
       send(parent, {barrier, :circuit_lock, role, circuit_lock_event(metadata), self()})
       maybe_await_transient_winner_release!(role, barrier)
     end
@@ -7679,7 +8052,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     receive do
       {^barrier, ^message} -> :ok
     after
-      10_000 -> raise "timed out waiting to release #{label}"
+      @handoff_timeout_ms -> raise "timed out waiting to release #{label}"
     end
   end
 
@@ -7886,9 +8259,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   defp update_assignment!(%PoolUpstreamAssignment{} = assignment, attrs) do
     assignment
     |> Repo.reload!()
-    |> PoolUpstreamAssignment.changeset(
-      Map.put(attrs, :updated_at, DateTime.utc_now() |> DateTime.truncate(:microsecond))
-    )
+    |> PoolUpstreamAssignment.changeset(Map.put(attrs, :updated_at, DateTime.utc_now() |> DateTime.truncate(:microsecond)))
     |> Repo.update!()
   end
 
@@ -7909,6 +8280,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
              QuotaWindows.upsert_quota_windows(identity, [
                weekly_quota_attrs(Decimal.new("100"), overrides)
              ])
+
+    SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
   end
 
   defp upsert_weekly_pressure_quota!(identity, used_percent, overrides \\ []) do
@@ -7916,6 +8289,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
              QuotaWindows.upsert_quota_windows(identity, [
                weekly_quota_attrs(used_percent, overrides)
              ])
+
+    SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
   end
 
   defp weekly_quota_attrs(used_percent, overrides) do
@@ -8058,6 +8433,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           }
         })
 
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [weekly_quota_attrs(Decimal.new("100"), observed_at: observed_at, last_sync_at: observed_at)])
+
       %{assignment_id: assignment.id, identity_id: identity.id, pool_id: pool.id}
     end)
   end
@@ -8179,20 +8559,23 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   defp cleanup_committed_convergence_race_fixture!(fixture) do
     assert %{circuits: 1, identities: 2, pools: 1} ==
              run_unboxed(fn ->
+               # The circuit row is keyed on the Pool and goes with it, so it is counted first;
+               # the Pool then goes before the identities, while its assignment still names them:
+               # the shared cleanup reads them there to find the saved-reset jobs that name only
+               # the assignment, and to spare an identity another Pool still uses.
                {circuit_count, _rows} =
                  Repo.delete_all(
                    from circuit in RoutingCircuitState,
                      where: circuit.id == ^fixture.circuit_id
                  )
 
+               pool_count = delete_committed_pools!([fixture.pool_id])
+
                {identity_count, _rows} =
                  Repo.delete_all(
                    from identity in UpstreamIdentity,
                      where: identity.id in ^[fixture.identity_id, fixture.sibling_identity_id]
                  )
-
-               {pool_count, _rows} =
-                 Repo.delete_all(from pool in Pool, where: pool.id == ^fixture.pool_id)
 
                %{circuits: circuit_count, identities: identity_count, pools: pool_count}
              end)
@@ -8209,7 +8592,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           receive do
             {^barrier, :start, ^role} -> :ok
           after
-            5_000 -> raise "timed out waiting to start multi-node convergence actor"
+            @handoff_timeout_ms -> raise "timed out waiting to start multi-node convergence actor"
           end
 
           send(parent, {barrier, :started, role})
@@ -8228,14 +8611,16 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   defp cleanup_committed_post_consume_finalizer_fixture!(fixture) do
     assert %{identities: 1, pools: 1} ==
              run_unboxed(fn ->
+               owner_ids = CodexPooler.PoolerFixtures.api_key_creator_ids([fixture.pool_id])
+
+               pool_count =
+                 CodexPooler.PoolerFixtures.delete_committed_pools!([fixture.pool_id], owner_ids)
+
                {identity_count, _rows} =
                  Repo.delete_all(
                    from identity in UpstreamIdentity,
                      where: identity.id == ^fixture.identity_id
                  )
-
-               {pool_count, _rows} =
-                 Repo.delete_all(from pool in Pool, where: pool.id == ^fixture.pool_id)
 
                %{identities: identity_count, pools: pool_count}
              end)
@@ -8329,6 +8714,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   defp create_gateway_auto_cohort_fixture!(fake, pool_mode, identity_count, unique, opts) do
     as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
     after_entry = Keyword.get(opts, :after_entry, fn _entry -> :ok end)
+    sibling_evidence? = Keyword.get(opts, :sibling_evidence?, true)
 
     pools = gateway_auto_cohort_pools(pool_mode, unique, identity_count)
 
@@ -8356,11 +8742,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
         identity = enable_saved_reset_auto_redeem!(identity)
 
-        upsert_weekly_exhausted_quota!(identity,
-          observed_at: as_of,
-          last_sync_at: as_of,
-          reset_at: DateTime.add(as_of, 2, :hour)
-        )
+        if index == 0 or sibling_evidence? do
+          upsert_weekly_exhausted_quota!(identity,
+            observed_at: as_of,
+            last_sync_at: as_of,
+            reset_at: DateTime.add(as_of, 2, :hour)
+          )
+        end
 
         entry = %{assignment_id: assignment.id, identity_id: identity.id}
 
@@ -8380,9 +8768,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
   defp cleanup_owned_cohort_fixture!(account_ids, pool_slugs) do
     run_unboxed(fn ->
-      Repo.delete_all(
-        from identity in UpstreamIdentity, where: identity.chatgpt_account_id in ^account_ids
-      )
+      Repo.delete_all(from identity in UpstreamIdentity, where: identity.chatgpt_account_id in ^account_ids)
 
       Repo.delete_all(from pool in Pool, where: pool.slug in ^pool_slugs)
     end)
@@ -8398,12 +8784,30 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         end
       end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+    monitor = CodexPooler.TestProcess.monitor_flushed(task.pid)
+    result = await_cohort_fixture_task(task, timeout) || Task.shutdown(task, :brutal_kill)
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, @cohort_fixture_task_timeout
+
+    case result do
       {:ok, {:ok, fixture}} -> fixture
       {:ok, {:raised, kind, reason, stacktrace}} -> :erlang.raise(kind, reason, stacktrace)
       nil -> raise "timed out creating committed cohort fixture"
     end
   end
+
+  # `{:after_signal, ref, budget_ms}` starts the fixture budget only once the
+  # fixture body has sent `{ref, :cohort_fixture_entered}`, so an injected
+  # timeout scenario does not have to guess how long entry creation takes
+  # under partition load. The outer wait is failure detection only.
+  defp await_cohort_fixture_task(task, {:after_signal, ref, budget_ms}) do
+    receive do
+      {^ref, :cohort_fixture_entered} -> Task.yield(task, budget_ms)
+    after
+      @cohort_fixture_task_timeout -> Task.yield(task, 0)
+    end
+  end
+
+  defp await_cohort_fixture_task(task, timeout), do: Task.yield(task, timeout)
 
   defp assert_failed_cohort_fixture_cleanup!(failure) do
     {:ok, fake} = codex_reset_fake(0)
@@ -8417,34 +8821,39 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       send(parent, {barrier, self(), entry})
 
       case failure do
-        :failure -> raise "injected cohort fixture failure"
-        :timeout -> receive do: ({^barrier, :release} -> :ok)
+        :failure ->
+          raise "injected cohort fixture failure"
+
+        :timeout ->
+          send(parent, {barrier, :cohort_fixture_entered})
+          receive do: ({^barrier, :release} -> :ok)
       end
     end
 
-    message =
+    {message, timeout} =
       if failure == :failure,
-        do: "injected cohort fixture failure",
-        else: "timed out creating committed cohort fixture"
+        do: {"injected cohort fixture failure", @detection_timeout_ms},
+        else: {"timed out creating committed cohort fixture", {:after_signal, barrier, 100}}
 
     ExUnit.CaptureLog.capture_log(fn ->
       assert_raise RuntimeError, message, fn ->
         committed_gateway_auto_cohort_fixture!(fake, :cross_pool, 2,
           after_entry: after_entry,
-          timeout: 5_000
+          timeout: timeout
         )
       end
     end)
 
-    assert_receive {^barrier, task_pid, partial}, 1_000
+    assert_receive {^barrier, task_pid, partial}, @detection_timeout_ms
     owned = %{identity_ids: [partial.identity_id], pool_ids: partial.pool_ids}
     on_exit(fn -> cleanup_committed_gateway_auto_cohort_fixture!(owned) end)
+
+    # The fixture helper independently monitors the task before waiting or terminating it,
+    # so returning or raising here already proves the task has exited before row cleanup.
     refute Process.alive?(task_pid)
 
     run_unboxed(fn ->
-      refute Repo.exists?(
-               from identity in UpstreamIdentity, where: identity.id == ^partial.identity_id
-             )
+      refute Repo.exists?(from identity in UpstreamIdentity, where: identity.id == ^partial.identity_id)
 
       refute Repo.exists?(
                from assignment in PoolUpstreamAssignment,
@@ -8465,12 +8874,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
   defp cleanup_committed_gateway_auto_cohort_fixture!(fixture) do
     run_unboxed(fn ->
+      # Pools first, so the shared cleanup still sees the assignments that name this cohort's
+      # identities and the saved-reset jobs keyed on them; a sibling cohort's identities and its
+      # jobs stay, because another Pool's assignment still names them.
+      delete_committed_pools!(fixture.pool_ids)
+
       Repo.delete_all(
         from identity in UpstreamIdentity,
           where: identity.id in ^fixture.identity_ids
       )
-
-      Repo.delete_all(from pool in Pool, where: pool.id in ^fixture.pool_ids)
     end)
   end
 
@@ -8579,22 +8991,22 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     :ok = attach_gateway_auto_cohort_barrier(handler_id, parent, barrier)
 
     try do
-      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, 5_000
-      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, 5_000
+      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, @detection_timeout_ms
+      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, @detection_timeout_ms
       assert winner_backend_pid != loser_backend_pid
 
       send(winner_task.pid, {barrier, :start_claim})
 
       assert_receive {^barrier, :cohort_locked, :winner, winner_claim_pid, winner_lock_event},
-                     5_000
+                     @detection_timeout_ms
 
       send(loser_task.pid, {barrier, :start_claim})
-      assert_receive {^barrier, :claim_started, :loser, ^loser_backend_pid}, 5_000
+      assert_receive {^barrier, :claim_started, :loser, ^loser_backend_pid}, @detection_timeout_ms
 
       observation = observe_blocked_probe_claim!(loser_backend_pid, winner_backend_pid)
       send(winner_claim_pid, {barrier, :release_cohort_lock})
 
-      assert_receive {^barrier, :cohort_locked, :loser, loser_claim_pid, loser_lock_event}, 5_000
+      assert_receive {^barrier, :cohort_locked, :loser, loser_claim_pid, loser_lock_event}, @detection_timeout_ms
 
       winner_identity_id = Enum.at(fixture.identity_ids, winner_index)
 
@@ -8661,18 +9073,18 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     :ok = attach_gateway_auto_cohort_barrier(handler_id, parent, barrier)
 
     try do
-      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, 5_000
-      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, 5_000
+      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, @detection_timeout_ms
+      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, @detection_timeout_ms
 
       send(winner_task.pid, {barrier, :start_claim})
 
       assert_receive {^barrier, :cohort_locked, :winner, winner_claim_pid, _winner_lock_event},
-                     5_000
+                     @detection_timeout_ms
 
       send(loser_task.pid, {barrier, :start_claim})
 
       assert_receive {^barrier, :cohort_locked, :loser, loser_claim_pid, _loser_lock_event},
-                     5_000
+                     @detection_timeout_ms
 
       loser_blocking_pids = blocking_pids!(loser_backend_pid)
 
@@ -8752,7 +9164,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     receive do
       {^barrier, :start_claim} -> :ok
     after
-      5_000 -> raise "timed out waiting to start gateway-auto cohort claim"
+      @handoff_timeout_ms -> raise "timed out waiting to start gateway-auto cohort claim"
     end
 
     send(parent, {barrier, :claim_started, role, backend_pid})
@@ -8766,6 +9178,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   end
 
   defp attach_gateway_auto_cohort_barrier(handler_id, parent, barrier) do
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :telemetry.attach(
       handler_id,
       [:codex_pooler, :repo, :query],
@@ -8781,7 +9196,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           receive do
             {^barrier, :release_cohort_lock} -> :ok
           after
-            10_000 -> raise "timed out waiting to release gateway-auto cohort lock"
+            @handoff_timeout_ms -> raise "timed out waiting to release gateway-auto cohort lock"
           end
         end
       end,
@@ -8800,8 +9215,16 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     end)
   end
 
-  defp capture_claim_locks_until_identity_update!(claim_fun) do
+  # The capture runs inside `run_unboxed/1`'s task, where `on_exit/1` raises, so the test process
+  # creates the handler id and registers its detach here first.
+  defp register_claim_lock_handler! do
     handler_id = {__MODULE__, :claim_locks, System.unique_integer([:positive, :monotonic])}
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    handler_id
+  end
+
+  defp capture_claim_locks_until_identity_update!(handler_id, claim_fun) do
     process_key = {__MODULE__, handler_id, :capture?}
     Process.put(process_key, true)
 
@@ -8850,8 +9273,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
     {auth, model} =
       run_unboxed(fn ->
-        {routing_auth!(fixture.pool),
-         model_fixture(fixture.pool, %{exposed_model_id: "test-model"})}
+        {routing_auth!(fixture.pool), model_fixture(fixture.pool, %{exposed_model_id: "test-model"})}
       end)
 
     failure_tasks =
@@ -8875,7 +9297,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         end)
       end)
 
-    failures = Enum.map(failure_tasks, &Task.await(&1, 10_000))
+    failures = Enum.map(failure_tasks, &Task.await(&1, @detection_timeout_ms))
     assert failures |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> length() == 2
     assert Enum.all?(failures, &match?({_pid, {:ok, %RoutingCircuitState{}}}, &1))
 
@@ -8898,7 +9320,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         end)
       end)
 
-    results = Enum.map(redeemers, &Task.await(&1, 10_000))
+    results = Enum.map(redeemers, &Task.await(&1, @detection_timeout_ms))
     assert results |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> length() == 2
 
     assert Enum.all?(results, fn {_pid, result} ->
@@ -8999,6 +9421,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     assert Enum.count(evidence.results, &match?({:ok, %{applied?: true}}, &1)) == 1
     assert length(evidence.results) == 2
     assert provider_consume_count(fixture.fake) == 1
+    TestDiagnostics.puts("EXPIRY_CONCURRENT_RECEIPT " <> CodexPooler.JSON.encode!(%{scenario: "two_redeemers", consumes: provider_consume_count(fixture.fake), generation_sends: Enum.count(FakeUpstream.requests(fixture.fake), &String.ends_with?(&1.path, "/responses")), distinct_backends: evidence.winner_backend_pid != evidence.loser_backend_pid, blocking_witness: evidence.winner_backend_pid in evidence.blocking_pids, applied_results: Enum.count(evidence.results, &match?({:ok, %{applied?: true}}, &1))}))
   end
 
   @tag :saved_reset_transient_circuit_reversed_order
@@ -9033,8 +9456,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
     {auth, model} =
       run_unboxed(fn ->
-        {routing_auth!(fixture.pool),
-         model_fixture(fixture.pool, %{exposed_model_id: "test-model"})}
+        {routing_auth!(fixture.pool), model_fixture(fixture.pool, %{exposed_model_id: "test-model"})}
       end)
 
     evidence = run_first_circuit_insert_behind_claim!(fixture, auth, model, sibling.assignment)
@@ -9054,6 +9476,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     parent = self()
     barrier = make_ref()
     handler_id = {__MODULE__, :claim_shape, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -9079,7 +9504,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       end)
 
     try do
-      assert_receive {^barrier, :claim_persisted, claim_pid}, 10_000
+      assert_receive {^barrier, :claim_persisted, claim_pid}, @detection_timeout_ms
       lock_events = drain_claim_locks(barrier, [])
       requests_while_locked = FakeUpstream.requests(fixture.fake)
       send(claim_pid, {barrier, :release_claim})
@@ -9104,7 +9529,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           receive do
             {^barrier, :release_claim} -> :ok
           after
-            5_000 -> raise "timed out waiting to release captured gateway-auto claim"
+            @handoff_timeout_ms -> raise "timed out waiting to release captured gateway-auto claim"
           end
 
         true ->
@@ -9188,7 +9613,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       BEGIN
         IF NEW.id = '#{identity_id}'::uuid
            AND OLD.metadata #>> '{saved_reset_redemption,provider_replay,provider_dispatches}' = '1'
-           AND NEW.metadata #>> '{saved_reset_redemption,status}' <> 'redeeming' THEN
+           AND OLD.metadata #>> '{saved_reset_redemption,phase}' = 'consuming'
+           AND NEW.metadata #>> '{saved_reset_redemption,phase}' IS DISTINCT FROM 'consuming' THEN
           RAISE EXCEPTION 'synthetic saved-reset finalization failure';
         END IF;
 
@@ -9290,7 +9716,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
              |> ResetProbe.bind(
                fixture.assignment_id,
                fixture.identity_id,
-               "gpt-5.4",
+               "gpt-6-sol",
                "proxy_http"
              )
 
@@ -9306,7 +9732,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         receive do
           {^barrier, :start_claim} -> :ok
         after
-          5_000 -> raise "timed out waiting to start the saved-reset probe claim"
+          @handoff_timeout_ms -> raise "timed out waiting to start the saved-reset probe claim"
         end
 
         send(parent, {barrier, :claim_started, role, backend_pid})
@@ -9344,11 +9770,14 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     tasks = [winner_task, loser_task]
 
     try do
-      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, 5_000
-      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, 5_000
+      assert_receive {^barrier, :claim_ready, :winner, winner_backend_pid}, @detection_timeout_ms
+      assert_receive {^barrier, :claim_ready, :loser, loser_backend_pid}, @detection_timeout_ms
       assert winner_backend_pid != loser_backend_pid
 
       handler_id = "saved-reset-automatic-lock-#{System.unique_integer([:positive])}"
+
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler_id) end)
 
       :ok =
         :telemetry.attach(
@@ -9363,7 +9792,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
               receive do
                 {^barrier, :release_winner} -> :ok
               after
-                5_000 -> raise "timed out waiting to release automatic saved-reset winner"
+                @handoff_timeout_ms -> raise "timed out waiting to release automatic saved-reset winner"
               end
             end
           end,
@@ -9372,10 +9801,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       try do
         send(winner_task.pid, {barrier, :start_claim})
-        assert_receive {^barrier, :winner_lock_acquired}, 5_000
+        assert_receive {^barrier, :winner_lock_acquired}, @detection_timeout_ms
 
         send(loser_task.pid, {barrier, :start_claim})
-        assert_receive {^barrier, :claim_started, :loser, ^loser_backend_pid}, 5_000
+        assert_receive {^barrier, :claim_started, :loser, ^loser_backend_pid}, @detection_timeout_ms
 
         observation = observe_blocked_probe_claim!(loser_backend_pid, winner_backend_pid)
         assert winner_backend_pid in observation.blocking_pids
@@ -9403,7 +9832,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         receive do
           {^barrier, :start_claim} -> :ok
         after
-          5_000 -> raise "timed out waiting to start automatic saved-reset claim"
+          @handoff_timeout_ms -> raise "timed out waiting to start automatic saved-reset claim"
         end
 
         send(parent, {barrier, :claim_started, role, backend_pid})
@@ -9492,6 +9921,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     handler_id =
       "saved-reset-post-consume-finalizer-#{System.unique_integer([:positive, :monotonic])}"
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -9553,7 +9985,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         receive do
           {^handler_id, :start_redemption} -> redeem.()
         after
-          5_000 -> raise "timed out waiting to start saved-reset finalizer race"
+          @handoff_timeout_ms -> raise "timed out waiting to start saved-reset finalizer race"
         end
       end)
     end)
@@ -9601,7 +10033,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   end
 
   defp await_post_consume_redemption_start!(handler_id, redemption_task, trace_probe_claim?) do
-    assert_receive {^handler_id, :redemption_backend, redeem_owner, redemption_backend_pid}, 5_000
+    assert_receive {^handler_id, :redemption_backend, redeem_owner, redemption_backend_pid}, @detection_timeout_ms
     assert redeem_owner == redemption_task.pid
     start_probe_claim_trace(redemption_task, trace_probe_claim?)
     send(redemption_task.pid, {handler_id, :start_redemption})
@@ -9621,11 +10053,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
          release_ref,
          redemption_task
        ) do
-    assert_receive {^handler_id, :dispatch_commit, ^redeem_owner}, 5_000
+    assert_receive {^handler_id, :dispatch_commit, ^redeem_owner}, @detection_timeout_ms
 
-    assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid,
-                    ^release_ref},
-                   5_000
+    assert_receive {:fake_upstream_timeout_barrier, :before_headers, fake_request_pid, ^release_ref},
+                   @detection_timeout_ms
 
     Process.put({__MODULE__, handler_id, :fake_request_pid}, fake_request_pid)
     assert Process.alive?(redemption_task.pid)
@@ -9686,7 +10117,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     assert evidence_backend_pid != redemption_backend_pid
     assert phase_while_refresh_blocked == "consuming"
     assert %AccountQuotaWindow{} = evidence_window
-    assert_receive {^handler_id, :evidence_write, evidence_owner}, 5_000
+    assert_receive {^handler_id, :evidence_write, evidence_owner}, @detection_timeout_ms
     assert evidence_owner != redemption_task.pid
     evidence_window
   end
@@ -9862,7 +10293,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       {Events, %CodexPooler.Events.Event{}} ->
         assert_saved_reset_redemption_broadcast!(fixture)
     after
-      5_000 -> flunk("saved-reset finalizer did not broadcast its committed lifecycle")
+      @detection_timeout_ms -> flunk("saved-reset finalizer did not broadcast its committed lifecycle")
     end
   end
 
@@ -9922,11 +10353,17 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     end)
   end
 
-  defp release_probe_claim_task(task) do
-    case Task.yield(task, 5_000) do
-      {:ok, _result} -> :ok
-      {:exit, _reason} -> :ok
-      nil -> Task.shutdown(task, :brutal_kill)
+  # Tasks already awaited in the `try` body have no reply left to yield;
+  # waiting on them would burn the whole timeout in every `after` block.
+  defp release_probe_claim_task(%Task{pid: pid} = task) do
+    if is_pid(pid) and Process.alive?(pid) do
+      case Task.yield(task, @detection_timeout_ms) do
+        {:ok, _result} -> :ok
+        {:exit, _reason} -> :ok
+        nil -> Task.shutdown(task, :brutal_kill)
+      end
+    else
+      :ok
     end
   end
 
@@ -9940,15 +10377,6 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   defp backend_pid! do
     %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
     backend_pid
-  end
-
-  defp await_after!(%DateTime{} = timestamp) do
-    wait_ms = max(DateTime.diff(timestamp, DateTime.utc_now(), :millisecond) + 50, 0)
-
-    receive do
-    after
-      wait_ms -> :ok
-    end
   end
 
   defp probe_identity_lock_query?(metadata) do
@@ -9971,7 +10399,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   end
 
   defp observe_blocked_probe_claim!(waiter_pid, blocker_pid) do
-    deadline = System.monotonic_time(:millisecond) + 4_000
+    deadline = System.monotonic_time(:millisecond) + @detection_timeout_ms
     do_observe_blocked_probe_claim!(waiter_pid, blocker_pid, deadline)
   end
 

@@ -10,8 +10,21 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
   alias CodexPooler.Upstreams.Quota.Windows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
+  # The tiers the provider's catalog declares for the fixture's text models, in
+  # the shape the upstream sync stores. The released Codex client sends its
+  # bundled default tier (`priority` for gpt-6-sol and gpt-6-luna) when nothing
+  # configures one, and the runtime filter refuses a non-default tier the
+  # assignment does not declare (`503 no_compatible_backend`).
+  @fast_tier %{"id" => "priority", "name" => "Fast", "description" => "1.5x speed"}
+  @provider_service_tiers Map.new(["gpt-6-sol", "gpt-6-luna"], fn id ->
+                            {id, %{"service_tiers" => [@fast_tier], "default_service_tier" => nil, "additional_speed_tiers" => ["fast"]}}
+                          end)
+
+  @synthetic_instructions "Synthetic OpenAI V1 fixture instructions."
+
   @type provisioned :: %{
           required(:text) => Model.t(),
+          required(:preservation_lite) => Model.t(),
           required(:alternate_text) => Model.t(),
           required(:review_decoy) => Model.t(),
           required(:audio) => Model.t(),
@@ -22,12 +35,13 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
   def provision!(pool, assignment, identity) do
     models = %{
       text: upsert!(pool, assignment, text_attributes(assignment)),
+      preservation_lite: upsert!(pool, assignment, preservation_lite_attributes(assignment)),
       review_decoy: upsert!(pool, assignment, review_attributes(assignment)),
       alternate_text:
         upsert!(
           pool,
           assignment,
-          model_attributes("gpt-5.6-terra", "GPT 5.6 Terra", true, true, true, true, assignment, [
+          model_attributes("gpt-6-luna", "GPT 6 Luna", true, true, true, true, assignment, [
             "text",
             "image"
           ])
@@ -74,10 +88,17 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
     end
   end
 
+  defp preservation_lite_attributes(assignment) do
+    attributes = model_attributes("sample-preservation-lite", "Synthetic Preservation Lite", true, true, true, true, assignment, ["text"])
+    metadata = attributes.metadata
+    source = Map.put(metadata["upstream_model"], "use_responses_lite", true)
+    %{attributes | metadata: metadata |> Map.put("upstream_model", source) |> Map.put("source_assignment_models", %{assignment.id => source})}
+  end
+
   defp text_attributes(assignment) do
     model_attributes(
-      "gpt-5.5",
-      "GPT 5.5",
+      "gpt-6-sol",
+      "GPT 6 Sol",
       true,
       true,
       true,
@@ -155,9 +176,9 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
       metadata:
         %{
           "manual_smoke_provisioned" => true,
-          "upstream_model" => source_model_metadata(id, modalities, tools?, reasoning?),
+          "upstream_model" => source_model_metadata(id, display_name, modalities, tools?, reasoning?),
           "source_assignment_models" => %{
-            assignment.id => source_model_metadata(id, modalities, tools?, reasoning?)
+            assignment.id => source_model_metadata(id, display_name, modalities, tools?, reasoning?)
           },
           "input_modalities" => modalities
         }
@@ -165,15 +186,31 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
     }
   end
 
-  defp source_model_metadata(id, modalities, tools?, reasoning?) do
+  # A complete catalog entry: the Pool serves this source entry to Codex clients
+  # at `/backend-api/codex/models`, and a released client pointed at it with
+  # `model_catalog_url` discards the whole catalog when one entry lacks a field
+  # its decoder requires (findings#258 rows 258-34 and 258-42). The instructions
+  # are synthetic, like every other value the fixture serves.
+  defp source_model_metadata(id, display_name, modalities, tools?, reasoning?) do
     %{
       "slug" => id,
+      "display_name" => display_name,
+      "description" => display_name,
       "visibility" => "list",
       "priority" => 20,
+      "supported_in_api" => true,
+      "shell_type" => "shell_command",
+      "support_verbosity" => false,
+      "truncation_policy" => %{"mode" => "tokens", "limit" => 10_000},
+      "experimental_supported_tools" => [],
+      "supported_reasoning_levels" => [],
+      "base_instructions" => @synthetic_instructions,
+      "model_messages" => %{"instructions_template" => @synthetic_instructions},
       "input_modalities" => modalities,
       "supports_tools" => tools?
     }
     |> maybe_put_reasoning_metadata(reasoning?)
+    |> Map.merge(Map.get(@provider_service_tiers, id, %{}))
   end
 
   defp maybe_put_reasoning_metadata(metadata, true) do
@@ -181,7 +218,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Models do
       "context_window" => 272_000,
       "effective_context_window_percent" => 95,
       "capabilities" => %{"reasoning" => true},
-      "supported_reasoning_levels" => ["none"],
+      "supported_reasoning_levels" => [%{"effort" => "none", "description" => "none"}],
       "default_reasoning_level" => "none"
     })
   end

@@ -16,6 +16,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Auth.{AccessTokenExpiry, TokenRefresh, TokenRefreshMetadata}
   alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
+  alias CodexPooler.Upstreams.ProviderCreditsPolicy
   alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -25,6 +26,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     Filter,
     Formatting,
     QuotaProjection,
+    SavedResetOperationProjection,
     SavedResetProjection,
     TokenBurnProjection
   }
@@ -60,6 +62,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:advertised_state) => assignment_advertised_state(),
           required(:model_freshness) => assignment_model_freshness(),
           required(:circuit_readiness) => UpstreamCircuitReadiness.summary(),
+          optional(:routing_readiness) => UpstreamRoutingReadiness.t(),
           required(:recent_traffic) => TokenBurnProjection.pool_traffic()
         }
   @type quota_limit_row :: QuotaProjection.quota_limit_row()
@@ -85,12 +88,28 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:quota_evidence_age) => String.t() | nil,
           required(:credential_expiry) => credential_expiry_projection()
         }
+  @type usage_poll_pause :: %{
+          required(:paused_until) => DateTime.t(),
+          required(:paused_until_label) => String.t(),
+          required(:remaining_label) => String.t(),
+          required(:status_code) => pos_integer() | nil,
+          required(:origin_label) => String.t(),
+          required(:origin_count) => pos_integer()
+        }
   @type token_burn :: TokenBurnProjection.token_burn()
   @type saved_reset_snapshot :: SavedResetProjection.snapshot()
   @type action :: SavedResetProjection.action()
+  @type saved_reset_refresh_cursor :: %{
+          identity_id: Ecto.UUID.t(),
+          credential_epoch: non_neg_integer() | nil,
+          lifecycle_generation: non_neg_integer() | nil,
+          request_generation: String.t()
+        }
   @type account_snapshot :: %{
           required(:identity) => UpstreamIdentity.t(),
           required(:label) => String.t(),
+          required(:can_delete?) => boolean(),
+          required(:deletion_state) => :in_progress | :failed | nil,
           required(:workspace_ref) => String.t(),
           required(:workspace_label) => String.t() | nil,
           required(:subject_ref) => String.t() | nil,
@@ -103,8 +122,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:auth_fresh_label) => String.t(),
           required(:auth_verified_label) => String.t(),
           required(:access_token_label) => String.t(),
-          required(:secret_status) =>
-            :present | :missing | :expired | :refresh_due | :reauth_required,
+          required(:secret_status) => :present | :missing | :expired | :refresh_due | :reauth_required,
           required(:reauth_required?) => boolean(),
           required(:reauth_reason_code) => String.t() | nil,
           required(:reauth_reason_message) => String.t() | nil,
@@ -112,12 +130,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:saved_reset_policy) => SavedResets.auto_policy_projection(),
           required(:saved_reset_redemption_action) => action(),
           required(:saved_reset_confirmation) => QuotaProjection.saved_reset_confirmation() | nil,
+          required(:saved_reset_operation) => SavedResetOperationProjection.t(),
+          required(:saved_reset_refresh_cursor) => saved_reset_refresh_cursor(),
           required(:token_burn) => token_burn(),
           required(:assignments) => [assignment_snapshot()],
           required(:quota_readiness) => quota_readiness(),
           required(:routing_readiness) => routing_readiness(),
+          required(:provider_credits_policy) => %{allow_provider_credits: boolean()},
+          required(:provider_credits_summary) => QuotaProjection.provider_credits_summary(),
+          required(:can_manage_provider_credits?) => boolean(),
           required(:quota_limits) => [quota_limit_row()],
-          required(:identity_observability) => identity_observability()
+          required(:identity_observability) => identity_observability(),
+          required(:usage_poll_pause) => usage_poll_pause() | nil
         }
 
   @terminal_reconciliation_statuses ~w(succeeded partial failed)
@@ -161,9 +185,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
         ]
   def list_visible_accounts(scope, pools, filters, datetime_preferences)
       when is_list(pools) and is_map(filters) and is_map(datetime_preferences) do
-    # :identity_id narrows the projection to one account BEFORE the expensive
-    # per-identity snapshot work; detail pages must not pay fleet cost.
+    # Trusted atom options narrow scoped identities before per-account work.
+    # String-keyed browser filters never establish ownership or monitoring targets.
     {identity_id, filters} = Map.pop(filters, :identity_id)
+    {identity_ids, filters} = Map.pop(filters, :identity_ids, :all)
 
     pools = intersect_visible_pools(scope, pools)
     pool_lookup = Map.new(pools, &{&1.id, &1})
@@ -173,9 +198,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
     identities =
       scope
-      |> Upstreams.list_visible_upstream_identities()
-      |> Enum.filter(&Map.has_key?(assignments, &1.id))
+      |> Upstreams.list_visible_upstream_identities(
+        pool_ids: Enum.map(pools, & &1.id),
+        include_deleted: true,
+        include_unassigned: Map.get(filters, "pool_id") in [nil, ""]
+      )
       |> narrow_to_identity(identity_id)
+      |> narrow_to_identities(identity_ids)
 
     assignments = narrow_assignments_to_identities(assignments, identities)
     circuit_observed_at = DateTime.utc_now()
@@ -190,6 +219,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       attach_assignment_circuit_readiness(assignments, circuit_readiness_by_assignment_id)
 
     token_burns = TokenBurnProjection.summaries(identities)
+    identity_ids = Enum.map(identities, & &1.id)
+    deletion_permissions = Upstreams.account_deletion_permissions(scope, identity_ids)
+    deletion_states = Upstreams.account_deletion_states(identity_ids)
+    credit_policy_permissions = ProviderCreditsPolicy.management_permissions(scope, identity_ids)
+    request_summaries = Jobs.saved_reset_request_summaries(scope, identity_ids, pool_ids: Enum.map(pools, & &1.id))
 
     snapshot_at = DateTime.utc_now()
 
@@ -199,15 +233,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       |> RoutingQuotaSnapshot.load_by_identity_ids(snapshot_at)
 
     identities
-    |> Enum.map(
-      &account_snapshot(
-        &1,
-        assignments,
-        token_burns,
-        datetime_preferences,
-        Map.fetch!(quota_snapshots, &1.id)
-      )
-    )
+    |> Enum.map(fn identity ->
+      deletion_state = Map.get(deletion_states, identity.id)
+
+      identity
+      |> account_snapshot(assignments, token_burns, datetime_preferences, Map.fetch!(quota_snapshots, identity.id), Map.get(request_summaries, identity.id))
+      |> Map.put(:can_manage_provider_credits?, Map.get(credit_policy_permissions, identity.id, false))
+      |> Map.put(:deletion_state, deletion_state)
+      |> Map.put(:can_delete?, Map.get(deletion_permissions, identity.id, false) and deletion_state != :in_progress)
+    end)
     |> Filter.apply(filters)
   end
 
@@ -215,6 +249,28 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   defp narrow_to_identity(identities, identity_id) when is_binary(identity_id),
     do: Enum.filter(identities, &(&1.id == identity_id))
+
+  defp narrow_to_identity(_identities, _identity_id), do: []
+
+  defp narrow_to_identities(identities, :all), do: identities
+
+  defp narrow_to_identities(identities, identity_ids) when is_list(identity_ids) do
+    targets = trusted_identity_ids(identity_ids, [])
+    Enum.filter(identities, &(&1.id in targets))
+  end
+
+  defp narrow_to_identities(_identities, _identity_ids), do: []
+
+  defp trusted_identity_ids([], acc), do: acc
+
+  defp trusted_identity_ids([id | rest], acc) do
+    case Ecto.UUID.cast(id) do
+      {:ok, id} -> trusted_identity_ids(rest, [id | acc])
+      :error -> trusted_identity_ids(rest, acc)
+    end
+  end
+
+  defp trusted_identity_ids(_improper_tail, _acc), do: []
 
   defp narrow_assignments_to_identities(assignments, identities) do
     Map.take(assignments, Enum.map(identities, & &1.id))
@@ -380,16 +436,26 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
          assignments,
          token_burns,
          datetime_preferences,
-         quota_snapshot
+         quota_snapshot,
+         request_summary
        ) do
     snapshot_at = quota_snapshot.as_of
     raw_quota_windows = RoutingQuotaSnapshot.time_visible_raw_windows(quota_snapshot)
     quota_windows = RoutingQuotaSnapshot.effective_windows(quota_snapshot)
     quota_readiness = QuotaProjection.readiness(quota_snapshot, snapshot_at)
     token_burn = Map.fetch!(token_burns, identity.id)
+    redemption = (identity.metadata || %{})["saved_reset_redemption"]
 
     identity_assignments =
       identity_assignments(identity, assignments, quota_readiness, token_burn)
+      |> Enum.map(fn assignment ->
+        readiness =
+          identity
+          |> UpstreamRoutingReadiness.from_inputs(assignment, quota_readiness)
+          |> UpstreamRoutingReadiness.with_model_availability(quota_snapshot, [assignment])
+
+        Map.put(assignment, :routing_readiness, readiness)
+      end)
 
     identity_observability =
       identity_observability(
@@ -408,6 +474,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     routing_readiness =
       identity
       |> UpstreamRoutingReadiness.from_inputs(identity_assignments, quota_readiness)
+      |> UpstreamRoutingReadiness.with_model_availability(quota_snapshot, identity_assignments)
       |> UpstreamRoutingReadiness.with_circuit_visibility(circuit_readiness)
 
     refresh_job = identity |> Jobs.list_recent_token_refresh_jobs(limit: 1) |> List.first()
@@ -440,8 +507,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           identity.auth_verified_at,
           datetime_preferences
         ),
-      access_token_label:
-        access_token_label(identity_observability.credential_expiry, datetime_preferences),
+      access_token_label: access_token_label(identity_observability.credential_expiry, datetime_preferences),
       secret_status: Secrets.secret_status(identity),
       reauth_required?: reauth_required?(identity),
       reauth_reason_code: reauth_reason_code(identity),
@@ -450,7 +516,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       saved_reset_policy: SavedResetProjection.policy(identity),
       saved_reset_confirmation:
         QuotaProjection.saved_reset_confirmation(
-          (identity.metadata || %{})["saved_reset_redemption"] || %{},
+          redemption || %{},
           raw_quota_windows,
           quota_windows,
           snapshot_at
@@ -459,15 +525,36 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       assignments: identity_assignments,
       quota_readiness: quota_readiness,
       routing_readiness: routing_readiness,
+      provider_credits_policy: %{allow_provider_credits: quota_snapshot.allow_provider_credits},
+      provider_credits_summary: QuotaProjection.provider_credits_summary(quota_snapshot),
       quota_limits:
         QuotaProjection.quota_limit_rows(
           quota_windows,
           datetime_preferences,
           snapshot_at,
-          quota_snapshot.credit_balance
+          raw_quota_windows,
+          redemption
         ),
-      identity_observability: identity_observability
+      identity_observability: identity_observability,
+      usage_poll_pause: usage_poll_pause(identity, snapshot_at, datetime_preferences)
     }
+
+    operation =
+      SavedResetOperationProjection.project(%{
+        snapshot_at: snapshot_at,
+        datetime_preferences: datetime_preferences,
+        redemption: redemption,
+        request_summary: request_summary,
+        confirmation: account.saved_reset_confirmation,
+        serving_readiness: account.routing_readiness,
+        usage_poll_pause: account.usage_poll_pause,
+        last_checked_at: snapshot_at
+      })
+
+    account =
+      account
+      |> Map.put(:saved_reset_operation, operation)
+      |> Map.put(:saved_reset_refresh_cursor, saved_reset_refresh_cursor(identity, redemption, request_summary))
 
     Map.put(
       account,
@@ -475,6 +562,43 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       SavedResetProjection.redemption_action(account)
     )
   end
+
+  # Private LiveView invalidation state; never pass this cursor to components or DOM.
+  @spec saved_reset_refresh_cursor(UpstreamIdentity.t(), term(), SavedResetOperationProjection.request_summary() | nil) :: saved_reset_refresh_cursor()
+  defp saved_reset_refresh_cursor(identity, redemption, request_summary) do
+    metadata = identity.metadata || %{}
+
+    %{
+      identity_id: identity.id,
+      credential_epoch: cursor_counter(metadata["credential_epoch"]),
+      lifecycle_generation: cursor_counter(redemption_generation(redemption)),
+      request_generation: :crypto.hash(:sha256, :erlang.term_to_binary(request_summary)) |> Base.encode16(case: :lower)
+    }
+  end
+
+  # The projection reads a malformed redemption value as an unknown outcome; the cursor reads it as no generation.
+  defp redemption_generation(%{"generation" => generation}), do: generation
+  defp redemption_generation(_redemption), do: nil
+
+  defp cursor_counter(value) when is_integer(value) and value >= 0, do: value
+  defp cursor_counter(_value), do: nil
+
+  @doc """
+  Whether a targeted saved-reset status read may replace the account a LiveView shows. `incoming` must
+  name the same account and hold every counter at or above `current`, the cursor the read started from:
+  a counter `current` does not know accepts any value, and a missing counter never replaces a known one.
+  Token refresh advances the credential epoch, so a later epoch is newer data, never a stale read.
+  """
+  @spec newer_saved_reset_refresh_cursor?(saved_reset_refresh_cursor() | term(), saved_reset_refresh_cursor() | term()) :: boolean()
+  def newer_saved_reset_refresh_cursor?(%{identity_id: identity_id} = incoming, %{identity_id: identity_id} = current) do
+    Enum.all?([:credential_epoch, :lifecycle_generation], fn field ->
+      known = Map.get(current, field)
+      read = Map.get(incoming, field)
+      is_nil(known) or (is_integer(read) and read >= known)
+    end)
+  end
+
+  def newer_saved_reset_refresh_cursor?(_incoming, _current), do: false
 
   defp identity_assignments(identity, assignments, quota_readiness, token_burn) do
     assignments
@@ -720,6 +844,34 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     identity
     |> current_token_refresh_status()
     |> Map.get("reason", %{})
+  end
+
+  # The longest running pause is the one that decides when this account's usage
+  # is read again, so it is the one shown; the others are only counted. The
+  # stored origin is a digest, so the operator sees what the provider said and
+  # how, never where.
+  defp usage_poll_pause(%UpstreamIdentity{} = identity, now, datetime_preferences) do
+    case Upstreams.usage_poll_pauses(identity, now) do
+      [] ->
+        nil
+
+      [longest | _others] = pauses ->
+        %{
+          paused_until: longest.not_before,
+          paused_until_label: DateTimeDisplay.format_datetime(longest.not_before, datetime_preferences),
+          remaining_label: Formatting.relative_time_label(longest.not_before, now),
+          status_code: longest.status_code,
+          origin_label: usage_poll_pause_origin_label(longest.status_code, longest.source),
+          origin_count: length(pauses)
+        }
+    end
+  end
+
+  defp usage_poll_pause_origin_label(status_code, source) do
+    status = if status_code, do: "HTTP #{status_code}", else: "a throttling response"
+    instruction = if source == "retry_after", do: "Retry-After", else: "a provider instruction"
+
+    "#{status} with #{instruction}"
   end
 
   defp refresh_job_state(nil), do: nil

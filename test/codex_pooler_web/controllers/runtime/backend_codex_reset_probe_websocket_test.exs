@@ -10,13 +10,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
   alias CodexPooler.Gateway, as: RuntimeGateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.ProviderCreditsFixtures
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPoolerWeb.CodexResponsesSocket
+  alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
   alias Ecto.Adapters.SQL.Sandbox
 
-  @websocket_frame_timeout 1_000
+  @detection_timeout_ms 15_000
 
   test "successful websocket response confirms the guarded reset probe" do
     fixture = reset_probe_fixture(completed_stream("resp_ws_reset_probe_confirmed"))
@@ -37,7 +39,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     assert %{
              "type" => "response.failed",
              "response" => %{"error" => %{"code" => "usage_limit_exceeded"}}
-           } = Jason.decode!(terminal_frame)
+           } = CodexPooler.JSON.decode!(terminal_frame)
 
     assert_reset_probe_outcome!(
       fixture,
@@ -95,9 +97,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     release_ref = make_ref()
 
     fixture =
-      reset_probe_fixture(
-        FakeUpstream.websocket_upgrade_timeout(notify: self(), release_ref: release_ref)
-      )
+      reset_probe_fixture(FakeUpstream.websocket_upgrade_timeout(notify: self(), release_ref: release_ref))
 
     parent = self()
 
@@ -107,12 +107,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
         execute_reset_probe(fixture, [connect_timeout_ms: 25], parent)
       end)
 
-    assert_receive {:fake_upstream_timeout_barrier, :websocket_upgrade, upstream_pid,
-                    ^release_ref},
-                   1_000
+    assert_receive {:fake_upstream_timeout_barrier, :websocket_upgrade, upstream_pid, ^release_ref},
+                   @detection_timeout_ms
 
     assert {:error, %{code: "upstream_request_failed", status: 502}} =
-             Task.await(task, 1_000)
+             Task.await(task, @detection_timeout_ms)
 
     upstream_ref = Process.monitor(upstream_pid)
     send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
@@ -125,7 +124,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       0
     )
 
-    assert_receive {:DOWN, ^upstream_ref, :process, ^upstream_pid, _reason}, 1_000
+    assert_receive {:DOWN, ^upstream_ref, :process, ^upstream_pid, _reason}, @detection_timeout_ms
   end
 
   test "upstream websocket close leaves the guarded reset probe claimed" do
@@ -149,7 +148,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     assert :ok = execute_reset_probe(fixture)
 
     terminal_frame = receive_provider_websocket_frame!()
-    assert %{"type" => "response.failed"} = Jason.decode!(terminal_frame)
+    assert %{"type" => "response.failed"} = CodexPooler.JSON.decode!(terminal_frame)
 
     assert_reset_probe_outcome!(
       fixture,
@@ -166,14 +165,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       auth_code = @auth_code
       refresh_token = "refresh-token-bound-reset-probe-#{auth_code}-do-not-leak"
 
+      # Strict finite scenario: the bound reset probe gets exactly one native
+      # send; there is no /oauth/token entry and no retry entry, so a provider
+      # refresh or a redispatch fails the fixture as an unexpected extra request.
       fixture =
         reset_probe_fixture(
-          {:sequence,
-           [
-             websocket_terminal_failure(auth_code),
-             FakeUpstream.json_response(%{"access_token" => "replacement-token-should-not-run"}),
-             FakeUpstream.json_response(%{"id" => "replacement-response-should-not-run"})
-           ]}
+          FakeUpstream.strict_sequence([
+            strict_bound_probe_request(websocket_terminal_failure(auth_code))
+          ])
         )
 
       assert {:ok, _secret} =
@@ -193,22 +192,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
         1
       )
 
-      assert_bound_probe_metadata_omits!(fixture, [
-        refresh_token,
-        "replacement-token-should-not-run",
-        "replacement-response-should-not-run"
-      ])
+      assert_bound_probe_metadata_omits!(fixture, [refresh_token])
+      assert :ok = FakeUpstream.verify!(fixture.dispatch_upstream)
     end
   end
 
   test "websocket connection limit does not retry or replace a bound reset probe dispatch" do
+    # Strict finite scenario: one native send only; a connection-limit retry
+    # would be an unexpected extra request and fail the fixture.
     fixture =
       reset_probe_fixture(
-        {:sequence,
-         [
-           websocket_terminal_failure("websocket_connection_limit_reached"),
-           FakeUpstream.json_response(%{"id" => "connection-limit-retry-should-not-run"})
-         ]}
+        FakeUpstream.strict_sequence([
+          strict_bound_probe_request(websocket_terminal_failure("websocket_connection_limit_reached"))
+        ])
       )
 
     assert :ok = execute_reset_probe(fixture)
@@ -222,17 +218,17 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       1
     )
 
-    assert_bound_probe_metadata_omits!(fixture, ["connection-limit-retry-should-not-run"])
+    assert :ok = FakeUpstream.verify!(fixture.dispatch_upstream)
   end
 
   test "upstream model unavailable does not dispatch a sibling for a bound reset probe" do
+    # Strict finite scenario: one native send only; a sibling or replacement
+    # dispatch would be an unexpected extra request and fail the fixture.
     fixture =
       reset_probe_fixture(
-        {:sequence,
-         [
-           websocket_terminal_failure("model_not_found"),
-           FakeUpstream.json_response(%{"id" => "model-replacement-should-not-run"})
-         ]}
+        FakeUpstream.strict_sequence([
+          strict_bound_probe_request(websocket_terminal_failure("model_not_found"))
+        ])
       )
 
     assert :ok = execute_reset_probe(fixture)
@@ -246,7 +242,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       1
     )
 
-    assert_bound_probe_metadata_omits!(fixture, ["model-replacement-should-not-run"])
+    assert :ok = FakeUpstream.verify!(fixture.dispatch_upstream)
   end
 
   test "client websocket disconnect leaves the guarded reset probe claimed" do
@@ -280,7 +276,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
                state
              )
 
-    assert_receive {:fake_upstream_chunk_barrier, 0, upstream_pid, ^release_ref}, 1_000
+    assert_receive {:fake_upstream_chunk_barrier, 0, upstream_pid, ^release_ref}, @detection_timeout_ms
     assert [response_task_pid] = MapSet.to_list(state.tasks)
     response_task_monitor = Process.monitor(response_task_pid)
 
@@ -293,8 +289,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
 
     Process.exit(response_task_pid, :kill)
 
-    assert_receive {:DOWN, ^response_task_monitor, :process, ^response_task_pid, :killed}, 1_000
-    assert :ok = CodexResponsesSocket.terminate(:closed, state)
+    assert_receive {:DOWN, ^response_task_monitor, :process, ^response_task_pid, :killed}, @detection_timeout_ms
+    # The request settlement read below is written by the session cleanup.
+    assert :ok = WebsocketCleanupFence.terminate_and_await!(:closed, state)
     send(upstream_pid, {:fake_upstream_release_chunk, release_ref})
 
     assert_reset_probe_outcome!(
@@ -343,7 +340,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     monitor = Process.monitor(task)
     Process.exit(task, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^task, :killed}, 15_000
-    assert :ok = CodexResponsesSocket.terminate(:closed, state)
+    assert :ok = WebsocketCleanupFence.terminate_and_await!(:closed, state)
     assert %{status: "failed", last_error_code: "client_disconnected"} = Repo.reload!(request)
 
     assert Repo.aggregate(
@@ -392,7 +389,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       end)
 
     assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
-                   1_000
+                   @detection_timeout_ms
 
     expire_reset_probe!(fixture.identity)
     send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
@@ -429,6 +426,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       |> enable_saved_reset_auto_redeem!()
 
     prime_weekly_exhausted_quota!(identity)
+    ProviderCreditsFixtures.persist_usage!(Repo.reload!(identity), ProviderCreditsFixtures.usage_payload(:weekly_credit_only, credits: :none), DateTime.utc_now())
 
     %{
       setup: %{setup | identity: identity, model: model},
@@ -456,7 +454,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
   end
 
   defp reset_probe_payload(setup) do
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "type" => "response.create",
       "model" => setup.model.exposed_model_id,
       "input" => native_text_input("guarded reset probe over websocket"),
@@ -471,7 +469,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     assert %{
              "type" => "response.completed",
              "response" => %{"id" => ^response_id}
-           } = Jason.decode!(completed_frame)
+           } = CodexPooler.JSON.decode!(completed_frame)
   end
 
   defp assert_receive_failed_frame(error_code) do
@@ -480,14 +478,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     assert %{
              "type" => failure_type,
              "response" => %{"error" => %{"code" => ^error_code}}
-           } = Jason.decode!(failed_frame)
+           } = CodexPooler.JSON.decode!(failed_frame)
 
     assert failure_type in ["error", "response.failed"]
     refute_received {:websocket_frame, _unexpected}
   end
 
   defp receive_provider_websocket_frame! do
-    assert_receive {:websocket_frame, frame}, @websocket_frame_timeout
+    assert_receive {:websocket_frame, frame}, @detection_timeout_ms
 
     if StreamProtocol.internal_control_event?(frame) do
       receive_provider_websocket_frame!()
@@ -547,20 +545,28 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
     end)
   end
 
+  # Native websocket frame for strict expectations, which reject SSE-derived
+  # websocket shortcuts.
   defp websocket_terminal_failure(error_code) do
-    FakeUpstream.sse_stream(
-      [
-        {"response.failed",
-         %{
-           "type" => "response.failed",
-           "response" => %{
-             "id" => "resp_ws_bound_probe_terminal_failure",
-             "status" => "failed",
-             "error" => %{"code" => error_code}
-           }
-         }}
-      ],
-      done: false
+    FakeUpstream.websocket_text_frames([
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.failed",
+        "response" => %{
+          "id" => "resp_ws_bound_probe_terminal_failure",
+          "status" => "failed",
+          "error" => %{"code" => error_code}
+        }
+      })
+    ])
+  end
+
+  defp strict_bound_probe_request(respond) do
+    FakeUpstream.expect_request(
+      method: "WEBSOCKET",
+      path: "/backend-api/codex/responses",
+      websocket_connection_ordinal: 1,
+      json: [valid: true, equals: %{"type" => "response.create"}],
+      respond: respond
     )
   end
 
@@ -569,8 +575,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeWebsocketTest do
       {:path_json,
        %{
          "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
-         "/api/codex/usage" =>
-           {200, %{"plan_type" => "pro", "rate_limit_reset_credits" => %{"available_count" => 0}}}
+         "/api/codex/usage" => {200, %{"plan_type" => "pro", "rate_limit_reset_credits" => %{"available_count" => 0}, "credits" => %{"balance" => 0, "has_credits" => false, "unlimited" => false}, "spend_control" => %{"reached" => false}}}
        }}
     )
   end

@@ -29,6 +29,12 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
   # This narrows grouping, never the payload: every field below is still served
   # verbatim from the selected anchor source.
   #
+  # `priority` is the model picker's sort order: the released Codex client
+  # reads it only to order its picker and to make the first visible entry
+  # its default model, and no request reads it (findings#305 row 498-6;
+  # accounts whose catalogs list the same model at another position used to
+  # be held back from every turn of it).
+  #
   # Behavioral fields deliberately stay in the digest: `slug`, the
   # context-window family, `use_responses_lite`, `service_tiers`,
   # `supported_reasoning_levels`, `capabilities`, and any field not listed here.
@@ -36,16 +42,25 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
                           default_reasoning_level
                           default_service_tier
                           description
+                          priority
                           visibility
                         ]
 
+  @reasoning_partition_keys ~w[
+                              reasoning_efforts
+                              supported_reasoning_levels
+                            ]
+
   @shell_command_types ~w(default local shell_command unified_exec)
 
-  @type pricing_buckets :: ModelMetadata.pricing_buckets()
   @type context_window_overrides :: ModelMetadata.context_window_overrides()
   @type effective_model_serving_mode :: ModelMetadata.effective_model_serving_mode()
   @type result :: {:ok, map()} | {:error, :invalid_model_metadata}
-  @type canonical_source :: %{required(:digest) => String.t(), required(:source) => map()}
+  @type canonical_source :: %{
+          required(:digest) => String.t(),
+          required(:reasoning_agnostic_digest) => String.t(),
+          required(:source) => map()
+        }
 
   @spec canonical_source(term()) :: {:ok, canonical_source()} | {:error, :invalid_model_metadata}
   def canonical_source(source) when is_map(source) do
@@ -58,33 +73,56 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
         |> normalize_digest_shell_type()
         |> canonical_digest()
 
-      {:ok, %{digest: digest, source: source}}
+      reasoning_agnostic_digest =
+        source
+        |> Map.drop(@digest_excluded_keys ++ @reasoning_partition_keys)
+        |> normalize_digest_shell_type()
+        |> canonical_digest()
+
+      {:ok,
+       %{
+         digest: digest,
+         reasoning_agnostic_digest: reasoning_agnostic_digest,
+         source: source
+       }}
     end
   end
 
   def canonical_source(_source), do: {:error, :invalid_model_metadata}
 
+  @doc "Compares tier variants without changing either advertised source. Other behavioral differences remain fenced."
+  @spec same_service_tier_family?(term(), term()) :: boolean()
+  def same_service_tier_family?(left, right) when is_map(left) and is_map(right) do
+    fields = ~w(service_tiers additional_speed_tiers)
+
+    with {:ok, left} <- canonical_source(Map.drop(left, fields)),
+         {:ok, right} <- canonical_source(Map.drop(right, fields)) do
+      left.reasoning_agnostic_digest == right.reasoning_agnostic_digest
+    else
+      _invalid -> false
+    end
+  end
+
+  def same_service_tier_family?(_left, _right), do: false
+
   @spec project(
           map(),
           Model.t(),
-          pricing_buckets(),
           context_window_overrides(),
           effective_model_serving_mode()
         ) :: result()
   def project(
         source,
         %Model{} = model,
-        pricing_buckets,
         context_window_overrides,
         effective_model_serving_mode
       )
-      when is_map(source) and is_map(pricing_buckets) and is_map(context_window_overrides) do
+      when is_map(source) and is_map(context_window_overrides) do
     with {:ok, %{source: source}} <- canonical_source(source) do
       payload =
         source
         |> ModelMetadata.apply_context_window_policy(
           model,
-          pricing_buckets,
           context_window_overrides
         )
         |> Map.put("use_responses_lite", effective_model_serving_mode == "lite")
@@ -94,7 +132,7 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
     end
   end
 
-  def project(_source, %Model{}, _pricing_buckets, _context_window_overrides, _mode),
+  def project(_source, %Model{}, _context_window_overrides, _mode),
     do: {:error, :invalid_model_metadata}
 
   defp apply_visibility_overlay(payload, %Model{} = model) do

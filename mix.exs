@@ -5,7 +5,7 @@ defmodule CodexPooler.MixProject do
     [
       app: :codex_pooler,
       # x-release-please-start-version
-      version: "0.7.0",
+      version: "0.11.1",
       # x-release-please-end
       elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -25,13 +25,17 @@ defmodule CodexPooler.MixProject do
   def application do
     [
       mod: {CodexPooler.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :xmerl]
     ]
   end
 
   def cli do
     [
       preferred_envs: [
+        "test.partition_weights": :test,
+        "test.product": :test,
+        "test.tooling": :test,
+        "test.unix": :test,
         coverage: :test,
         precommit: :test,
         quality: :test,
@@ -57,42 +61,39 @@ defmodule CodexPooler.MixProject do
   defp deps do
     [
       {:argon2_elixir, "== 4.1.3"},
-      {:phoenix, "== 1.8.13"},
+      {:phoenix, "== 1.8.15"},
       {:phoenix_ecto, "== 4.7.0"},
       {:ecto_sql, "== 3.14.0"},
       {:postgrex, "== 0.22.4"},
       {:phoenix_html, "== 4.3.0"},
       {:phoenix_live_reload, "== 1.7.0", only: :dev},
-      {:phoenix_live_view, "== 1.2.11"},
-      {:lazy_html, "== 0.1.12", only: :test},
+      {:phoenix_live_view, "== 1.2.12"},
+      {:lazy_html, "== 0.1.13", only: :test},
       {:oban, "== 2.24.1"},
       {:phoenix_live_dashboard, "== 0.9.1", only: :dev},
       {:esbuild, "== 0.10.0", runtime: Mix.env() == :dev},
       {:tailwind, "== 0.5.1", runtime: Mix.env() == :dev},
-      {:heroicons,
-       github: "tailwindlabs/heroicons",
-       tag: "v2.2.0",
-       sparse: "optimized",
-       app: false,
-       compile: false,
-       depth: 1},
-      {:swoosh, "== 1.28.0"},
+      {:heroicons, github: "tailwindlabs/heroicons", tag: "v2.2.0", sparse: "optimized", app: false, compile: false, depth: 1},
+      {:swoosh, "== 1.28.1"},
       {:gen_smtp, "== 1.3.0"},
-      {:req, "== 0.7.4"},
-      {:finch, "== 0.23.0"},
-      {:mint, "== 1.10.0"},
+      {:req, "== 0.7.5"},
+      # Finch 0.24 closes an HTTP/1 connection after a request or response error before pooling it.
+      # Mint 1.11 no longer closes one after a receive timeout, so an older Finch would pool it with the
+      # abandoned response still pending and write the next request behind it. Keep Finch >= 0.24 with Mint >= 1.11.
+      {:finch, "== 0.24.0"},
+      {:mint, "== 1.11.0"},
       {:mint_web_socket, "== 1.0.6"},
       {:telemetry_metrics, "== 1.2.0"},
       {:telemetry_metrics_prometheus_core, "== 1.2.1"},
       {:telemetry_poller, "== 1.3.0"},
       {:zoneinfo, "== 0.1.9"},
+      {:tz, "== 0.28.4"},
       {:credo, "== 1.7.19", only: [:dev, :test], runtime: false},
-      {:dialyxir, "== 1.4.7", only: [:dev, :test], runtime: false},
-      {:sobelow, "== 0.15.0", only: [:dev, :test], runtime: false},
-      {:six, "== 0.4.1", only: :test},
+      {:dialyxir, "== 1.4.8", only: [:dev, :test], runtime: false},
+      {:sobelow, "== 0.16.0", only: [:dev, :test], runtime: false},
+      {:six, "== 0.4.2", only: :test},
       {:gettext, "== 1.0.2"},
-      {:jason, "== 1.4.5"},
-      {:dns_cluster, "== 0.3.0"},
+      {:dns_cluster, "== 0.3.1"},
       {:websock, "== 0.5.3"},
       {:websock_adapter, "== 0.6.0"},
       {:bandit, "== 1.12.5"}
@@ -127,6 +128,11 @@ defmodule CodexPooler.MixProject do
         "esbuild codex_pooler --minify",
         "phx.digest"
       ],
+      # Checked, never rewritten: a gate must not mutate the tree it judges.
+      # Drone runs this as its own step and a green local `mix quality` used to
+      # say nothing about it, so an unformatted line reached CI and failed the
+      # build after the whole suite had already passed locally.
+      "quality.format": ["format --check-formatted"],
       "quality.xref": [
         "compile --warnings-as-errors",
         "xref graph --format plain --label compile-connected --fail-above 0 --no-compile"
@@ -134,7 +140,13 @@ defmodule CodexPooler.MixProject do
       "quality.credo": ["credo --strict"],
       "quality.dialyzer": ["compile --warnings-as-errors", "dialyzer --no-compile"],
       "quality.security": ["sobelow --exit --threshold medium --skip"],
-      quality: ["quality.xref", "quality.credo", "quality.dialyzer", "quality.security"],
+      quality: [
+        "quality.format",
+        "quality.xref",
+        "quality.credo",
+        "quality.dialyzer",
+        "quality.security"
+      ],
       coverage: ["test --cover"],
       precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "test"]
     ]

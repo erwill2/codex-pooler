@@ -3,6 +3,8 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
 
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.OpenAICompatibility.Chat
+  alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
   alias CodexPoolerWeb.PublicGatewayResult
@@ -23,7 +25,7 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
                                gateway_call_result())
   @type dispatcher :: (auth(), coerced_request() -> gateway_call_result())
   @type result_adapter :: (gateway_call_result() -> gateway_call_result())
-  @type success_normalizer :: (map(), coerced_request() -> map())
+  @type success_normalizer :: (map(), coerced_request() -> PublicResponse.normalized_body())
   @type auth_opts :: [
           authenticator: authenticator()
         ]
@@ -143,7 +145,8 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
             dispatcher = Keyword.get(opts, :dispatcher, default_dispatcher(conn, opts))
 
             result = dispatcher.(auth, coerced)
-            PublicGatewayResult.send(conn, result, &normalize_success.(&1, coerced))
+
+            PublicGatewayResult.send(conn, result, &normalize_success.(&1, coerced), validation_param: validation_param_mapper(coerced))
 
           {:error, reason} ->
             GatewayHelpers.send_error(conn, reason)
@@ -153,6 +156,11 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
         GatewayHelpers.send_error(conn, reason)
     end
   end
+
+  defp validation_param_mapper(%{chat_payload: %{} = chat_payload}),
+    do: &Chat.public_validation_param(&1, chat_payload)
+
+  defp validation_param_mapper(_coerced), do: &Function.identity/1
 
   defp default_dispatcher(conn, opts) do
     fn auth, coerced -> dispatch_coerced(conn, auth, coerced, opts) end

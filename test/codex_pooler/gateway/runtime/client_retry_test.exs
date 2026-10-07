@@ -133,7 +133,7 @@ defmodule CodexPooler.Gateway.Runtime.ClientRetryTest do
 
     assert {:error, %{status: 502, code: "upstream_request_failed"}} =
              Finalization.finalize_failed_websocket_response(context, %{
-               body: "",
+               body: "data: {\"type\":\"response.created\",\"response\":{\"model\":\"model-old-owner\"}}\n\n",
                headers: [],
                reason: :upstream_websocket_closed_before_terminal,
                native_client_retry_observation: materialized.native_client_retry_observation,
@@ -153,6 +153,8 @@ defmodule CodexPooler.Gateway.Runtime.ClientRetryTest do
 
     assert attempt_id == attempt.id
     assert settled.attempt_number == 1
+    assert settled.served_model == "model-old-owner"
+    assert settled.model_observation == nil
     assert settled.replay_generation == 0
     assert Repo.get!(Accounting.Request, predecessor_before.id) == predecessor_before
 
@@ -376,7 +378,7 @@ defmodule CodexPooler.Gateway.Runtime.ClientRetryTest do
   end
 
   defp successor_claim!(setup) do
-    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    %{rows: [[now]]} = Repo.query!("SELECT clock_timestamp()", [])
     witness_digest = :crypto.strong_rand_bytes(32)
     semantic_digest = :crypto.strong_rand_bytes(32)
 
@@ -486,7 +488,7 @@ defmodule CodexPooler.Gateway.Runtime.ClientRetryTest do
         version: 5,
         url: "https://upstream.example.com/backend-api/codex/responses",
         headers: [{"authorization", "synthetic-value"}],
-        payload: Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => []}),
+        payload: CodexPooler.JSON.encode!(%{"model" => setup.model.exposed_model_id, "input" => []}),
         timeouts: %TimeoutConfig{
           connect_timeout_ms: 1_000,
           pool_timeout_ms: 1_000,

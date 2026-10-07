@@ -3,8 +3,8 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
   import Plug.Conn
 
-  alias CodexPooler.Access
   alias CodexPooler.Gateway.Admission, as: GatewayAdmission
+  alias CodexPooler.Gateway.ErrorClassification
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPoolerWeb.GatewayControllerHelpers
@@ -14,7 +14,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   alias Plug.Conn.Query
   alias Plug.Conn.Utils
 
-  @json_error_type "invalid_request_error"
   @parser_settings_private_key :codex_pooler_runtime_ingress_settings
   @parser_error_scope_private_key :codex_pooler_json_parse_error_scope
 
@@ -70,10 +69,9 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
         |> reject_pruned_runtime_helper()
         |> authenticate_v1_request()
         |> reject_unsupported_v1_request()
-        |> authenticate_multipart_transcribe_request()
-        |> authenticate_protected_backend_raw_request()
         |> authenticate_protected_backend_json_request()
         |> enforce_image_generation_permission()
+        |> enforce_audio_transcription_permission()
         |> maybe_decode_compressed_body(settings)
 
       json_request?(conn) ->
@@ -229,7 +227,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   end
 
   defp decode_mcp_body(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, value} when is_list(value) -> {:ok, %{"_json" => value}}
       {:ok, value} when is_map(value) -> {:ok, value}
       {:ok, _value} -> {:ok, %{"_json_scalar" => true}}
@@ -301,19 +299,11 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   defp reject_unsupported_v1_request(%Plug.Conn{halted: true} = conn), do: conn
 
   defp reject_unsupported_v1_request(conn) do
-    if UnsupportedRoutes.unsupported?(conn) do
-      send_runtime_error(conn, unsupported_v1_error())
-    else
-      conn
+    cond do
+      UnsupportedRoutes.unsupported?(conn) -> send_runtime_error(conn, unsupported_v1_error())
+      UnsupportedRoutes.agents_family?(conn) -> send_runtime_error(conn, unsupported_agents_error())
+      true -> conn
     end
-  end
-
-  defp authenticate_multipart_transcribe_request(conn) do
-    authenticate_when(conn, &multipart_transcribe_request?/1)
-  end
-
-  defp authenticate_protected_backend_raw_request(conn) do
-    authenticate_when(conn, &protected_backend_raw_request?/1)
   end
 
   defp authenticate_protected_backend_json_request(conn) do
@@ -355,21 +345,15 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     do: {:ok, conn}
 
   defp authenticate_runtime_api_request(conn) do
-    conn
-    |> get_req_header("authorization")
-    |> List.first()
-    |> Access.authenticate_authorization_header()
-    |> case do
+    case GatewayControllerHelpers.authenticate(conn) do
       {:ok, auth} -> {:ok, put_private(conn, :runtime_api_auth, auth)}
-      {:error, reason} -> {:error, Map.put(reason, :status, 401), conn}
+      {:error, reason} -> {:error, reason, conn}
     end
   end
 
   defp enforce_image_generation_permission(%Plug.Conn{halted: true} = conn), do: conn
 
-  defp enforce_image_generation_permission(
-         %Plug.Conn{private: %{runtime_api_auth: %{pool: pool}}} = conn
-       ) do
+  defp enforce_image_generation_permission(%Plug.Conn{private: %{runtime_api_auth: %{pool: pool}}} = conn) do
     if image_generation_request?(conn) and not PoolRouting.allow_image_generation?(pool) do
       send_runtime_error(conn, %{
         status: 403,
@@ -394,26 +378,24 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
   defp image_generation_request?(_conn), do: false
 
-  defp multipart_transcribe_request?(conn) do
-    conn.method == "POST" and Path.decoded_segments(conn) == ["backend-api", "transcribe"] and
-      multipart_content_type?(conn)
-  end
+  defp enforce_audio_transcription_permission(%Plug.Conn{halted: true} = conn), do: conn
 
-  defp multipart_content_type?(conn) do
-    conn
-    |> get_req_header("content-type")
-    |> List.first()
-    |> case do
-      nil ->
-        false
-
-      content_type ->
-        content_type |> String.downcase() |> String.starts_with?("multipart/form-data")
+  defp enforce_audio_transcription_permission(%Plug.Conn{method: "POST", private: %{runtime_api_auth: %{pool: pool}}} = conn) do
+    if Path.decoded_segments(conn) in [["backend-api", "transcribe"], ["v1", "audio", "transcriptions"]] and not PoolRouting.allow_audio_transcription?(pool) do
+      send_runtime_error(conn, %{
+        status: 403,
+        code: "audio_transcription_disabled",
+        message: "Audio transcription is disabled for this pool"
+      })
+    else
+      conn
     end
   end
 
+  defp enforce_audio_transcription_permission(conn), do: conn
+
   @spec protected_backend_json_request?(Plug.Conn.t() | term()) :: boolean()
-  def protected_backend_json_request?(%Plug.Conn{method: "POST"} = conn) do
+  def protected_backend_json_request?(%Plug.Conn{method: method} = conn) when method in ["POST", "PUT", "PATCH", "DELETE"] do
     path_info = Path.decoded_segments(conn)
 
     path_info in [
@@ -424,13 +406,12 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
       ["backend-api", "codex", "images", "edits"],
       ["backend-api", "codex", "responses", "compact"],
       ["backend-api", "codex", "v1", "responses", "compact"],
+      ["backend-api", "transcribe"],
       ["backend-api", "files"]
     ] or match?(["backend-api", "files", file_id, "uploaded"] when is_binary(file_id), path_info)
   end
 
   def protected_backend_json_request?(_conn), do: false
-
-  def protected_backend_raw_request?(_conn), do: false
 
   @spec pruned_runtime_helper_request?(Plug.Conn.t()) :: boolean()
   defp pruned_runtime_helper_request?(%Plug.Conn{method: method} = conn) do
@@ -472,15 +453,27 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     }
   end
 
+  defp unsupported_agents_error do
+    %{
+      status: 404,
+      code: "unsupported_endpoint",
+      message: "Unsupported OpenAI /v1 endpoint: the beta Agents API is not supported"
+    }
+  end
+
   defp send_runtime_error(conn, reason) do
     send_runtime_error(conn, reason.status, reason.code, reason.message)
   end
 
+  # findings#191: this plug answers before the controller does, so it authors
+  # its own envelope. It used to hardcode the client class, which typed the
+  # `settings_unavailable` 503 as the caller's fault; the classification is
+  # shared with every other Codex Pooler-authored error instead.
   defp send_runtime_error(conn, status, code, message) do
     body = %{
       "error" => %{
         "message" => message,
-        "type" => @json_error_type,
+        "type" => ErrorClassification.error_type(code, status),
         "code" => to_string(code),
         "param" => nil
       }
@@ -488,7 +481,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(body))
+    |> send_resp(status, CodexPooler.JSON.encode!(body))
     |> halt()
   end
 
@@ -501,7 +494,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(body))
+    |> send_resp(status, CodexPooler.JSON.encode!(body))
     |> halt()
   end
 end

@@ -13,6 +13,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Topology.Direct
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
+  alias CodexPooler.ProviderCreditsDispatchSupport
 
   @detection_timeout_ms 15_000
   @post_accounting_variants [
@@ -25,9 +26,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
     :finalization_failure,
     :compact_collection,
     :compact_ack_success,
-    :compact_ack_failure,
-    :final_success,
-    :final_failure
+    :compact_ack_failure
   ]
 
   @type variant :: atom()
@@ -87,24 +86,22 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
   defp run_post_accounting_variant(:compact_ack_failure, context, handle),
     do: compact_ack_failure(context, handle)
 
-  defp run_post_accounting_variant(:final_success, context, handle),
-    do: final_response(context, handle, :success)
-
-  defp run_post_accounting_variant(:final_failure, context, handle),
-    do: final_response(context, handle, :failure)
-
   defp caller_death_after_send(context, _handle) do
     release_ref = make_ref()
 
+    # Warm-up and the barrier-held compact turn both ride the lineage
+    # connection; nothing may be resubmitted after the caller dies.
+    # provenance: synthetic_adversarial
     mode =
-      {:sequence,
-       [
-         success_mode(),
-         FakeUpstream.websocket_terminal_then_close_barrier(completed_frame(),
-           notify: context.test_pid,
-           release_ref: release_ref
-         )
-       ]}
+      FakeUpstream.strict_sequence([
+        strict_turn(success_mode()),
+        strict_turn(
+          FakeUpstream.websocket_terminal_then_close_barrier(completed_frame(),
+            notify: context.test_pid,
+            release_ref: release_ref
+          )
+        )
+      ])
 
     with_session(context, mode, fn session, upstream ->
       binding = arm_direct_after_warmup!(session, upstream)
@@ -195,6 +192,9 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
       socket = session |> :sys.get_state() |> Map.fetch!(:conn) |> Mint.HTTP.get_socket()
       handler_id = {__MODULE__, :send_failure, make_ref()}
 
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(handler_id) end)
+
       :ok =
         :telemetry.attach(
           handler_id,
@@ -235,8 +235,14 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
   end
 
   defp terminal_failure(context, _handle) do
-    with_session(context, {:sequence, [success_mode(), terminal_failure_mode()]}, fn session,
-                                                                                     upstream ->
+    # provenance: synthetic_adversarial
+    mode =
+      FakeUpstream.strict_sequence([
+        strict_turn(success_mode()),
+        strict_turn(terminal_failure_mode())
+      ])
+
+    with_session(context, mode, fn session, upstream ->
       binding = arm_direct_after_warmup!(session, upstream)
       capability = reserve_accounted!(session, :compact, binding)
       baseline = FakeUpstream.count(upstream)
@@ -296,42 +302,32 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
     end)
   end
 
-  defp final_response(context, _handle, outcome) do
-    final_mode = if outcome == :success, do: success_mode(), else: terminal_failure_mode()
-    mode = {:sequence, [success_mode(), success_mode(), final_mode]}
-
-    with_session(context, mode, fn session, upstream ->
-      binding = arm_direct_after_warmup!(session, upstream)
-      compact_capability = reserve_accounted!(session, :compact, binding)
-
-      {:ok, _result} =
-        UpstreamWebsocketSession.request(session, request(upstream, compact_capability, binding))
-
-      digest = acknowledge_compact!(session, binding, compact_capability)
-      final_binding = final_binding(binding, digest)
-      final_capability = reserve_accounted!(session, :final, final_binding)
-      baseline = FakeUpstream.count(upstream)
-
-      {:ok, _result} =
-        UpstreamWebsocketSession.request(session, request(upstream, final_capability, binding))
-
-      :ok = UpstreamWebsocketSession.acknowledge_final_response(session, outcome)
-
-      observe(session, upstream, baseline, zero_accounting(), %{boundary: :final_response})
-    end)
-  end
-
   defp with_session(_context, mode, fun) do
     {:ok, upstream} = FakeUpstream.start_link(mode)
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     monitor = Process.monitor(session)
 
     try do
-      fun.(session, upstream)
+      observed = fun.(session, upstream)
+      :ok = FakeUpstream.verify!(upstream)
+      observed
     after
       cleanup_session(session, monitor)
       FakeUpstream.stop(upstream)
     end
+  end
+
+  # One strict native turn on the lineage connection. The direct-session
+  # request body is the bare `{"model": ...}` payload, so that is the only
+  # JSON fact asserted here.
+  defp strict_turn(respond) do
+    FakeUpstream.expect_request(
+      method: "WEBSOCKET",
+      path: "/backend-api/codex/responses",
+      websocket_connection_ordinal: 1,
+      json: [valid: true, equals: %{"model" => "gpt-test"}],
+      respond: respond
+    )
   end
 
   defp arm_direct_after_warmup!(session, upstream) do
@@ -413,7 +409,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
     %Request{
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
       headers: [],
-      payload: Jason.encode!(%{"model" => "gpt-test"}),
+      payload: CodexPooler.JSON.encode!(%{"model" => "gpt-test"}),
       request_id: Ecto.UUID.generate(),
       attempt_id: Ecto.UUID.generate(),
       effective_serving_mode: "full",
@@ -423,6 +419,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
       native_compaction_capability: capability,
       expected_connection_lifecycle: lifecycle
     }
+    |> ProviderCreditsDispatchSupport.wire_request!()
   end
 
   defp observe(session, upstream, baseline, accounting, metadata) do
@@ -481,23 +478,13 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
     }
   end
 
-  defp final_binding(binding, digest) do
-    %{
-      binding
-      | window_digest: :crypto.hash(:sha256, "next-window"),
-        context_digest: :crypto.hash(:sha256, "next-context"),
-        window_number: binding.window_number + 1,
-        compaction_item_digest: digest
-    }
-  end
-
   defp success_mode do
     FakeUpstream.websocket_text_frames([completed_frame()])
   end
 
   defp terminal_failure_mode do
     FakeUpstream.websocket_text_frames([
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "response" => %{"status" => "failed", "error" => %{"code" => "server_error"}}
       })
@@ -505,7 +492,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Direct
   end
 
   defp completed_frame do
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "type" => "response.completed",
       "response" => %{"id" => "resp_direct_boundary", "status" => "completed"}
     })

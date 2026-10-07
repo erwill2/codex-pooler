@@ -36,9 +36,15 @@ defmodule CodexPoolerWeb.ConnCase do
     end
   end
 
+  # Runs before the using module's own `setup_all`, so rows that one commits belong to the module
+  # and are compared again once every module-level callback has run.
+  setup_all tags do
+    CodexPooler.CommittedWriteGuard.guard_module!(tags)
+  end
+
   setup tags do
-    CodexPooler.DataCase.setup_sandbox(tags)
-    {:ok, conn: ConnTest.build_conn()}
+    sandbox = CodexPooler.DataCase.setup_sandbox(tags)
+    {:ok, Map.put(sandbox, :conn, ConnTest.build_conn())}
   end
 
   @doc """
@@ -75,6 +81,7 @@ defmodule CodexPoolerWeb.ConnCase do
           activity_registry: atom(),
           deadline: pid(),
           name: atom(),
+          stream_registry: atom(),
           worker_tracker: pid()
         }
   def start_rollout_drain_harness(opts \\ []) do

@@ -28,15 +28,13 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
           required(:image_model) => String.t()
         }
 
-  @type request_compression_mode :: :preserve | :enabled
-
-  @spec provision!(String.t(), request_compression_mode()) :: result()
-  def provision!(upstream_base_url, request_compression_mode) do
+  @spec provision!(String.t()) :: result()
+  def provision!(upstream_base_url) do
     scope = operator_scope!()
     {identity, identity_created?} = ensure_identity!(upstream_base_url)
     {pool, pool_created?} = ensure_pool!(scope)
     ensure_active_pool!(pool)
-    ensure_routing_settings!(pool, request_compression_mode)
+    ensure_routing_settings!(pool)
     {assignment, assignment_created?} = ensure_assignment!(pool, identity)
     ensure_active_assignment!(assignment)
     models = Models.provision!(pool, assignment, identity)
@@ -64,9 +62,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
       scope = Scope.for_user(user, Accounts.roles_for_user(user))
       if Pools.can_manage_pools?(scope), do: scope
     end)
-    |> Kernel.||(
-      raise "OpenAI V1 fixture requires a bootstrapped local operator with pool access"
-    )
+    |> Kernel.||(raise "OpenAI V1 fixture requires a bootstrapped local operator with pool access")
   end
 
   defp ensure_identity!(upstream_base_url) do
@@ -74,7 +70,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
       chatgpt_account_id: @account_id,
       account_label: "OpenAI V1 Smoke Upstream",
       onboarding_method: "import",
-      metadata: %{"base_url" => upstream_base_url}
+      metadata: %{"base_url" => upstream_base_url, "supports_compact_responses" => true}
     }
 
     {identity, created?} = find_or_create_identity!(attributes)
@@ -108,17 +104,19 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
         {identity, true}
 
       {:error, %Ecto.Changeset{errors: errors}} ->
-        if Keyword.has_key?(errors, :chatgpt_account_id) do
-          case Repo.get_by(UpstreamIdentity, chatgpt_account_id: @account_id) do
-            %UpstreamIdentity{} = identity -> {identity, false}
-            nil -> raise "OpenAI V1 fixture identity was not persisted"
-          end
-        else
-          raise "failed to create OpenAI V1 fixture identity"
-        end
+        if Keyword.has_key?(errors, :chatgpt_account_id),
+          do: existing_identity!(),
+          else: raise("failed to create OpenAI V1 fixture identity")
 
       {:error, _reason} ->
         raise "failed to create OpenAI V1 fixture identity"
+    end
+  end
+
+  defp existing_identity! do
+    case Repo.get_by(UpstreamIdentity, chatgpt_account_id: @account_id) do
+      %UpstreamIdentity{} = identity -> {identity, false}
+      nil -> raise "OpenAI V1 fixture identity was not persisted"
     end
   end
 
@@ -151,7 +149,7 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
     pool |> Pool.changeset(%{status: "active", disabled_at: nil}) |> Repo.update!()
   end
 
-  defp ensure_routing_settings!(pool, request_compression_mode) do
+  defp ensure_routing_settings!(pool) do
     settings = Pools.get_routing_settings(pool) || Pools.ensure_routing_settings(pool)
 
     settings
@@ -162,20 +160,14 @@ defmodule CodexPooler.Dev.OpenAIV1Fixture.Provisioner do
       sticky_http_sessions: false,
       v1_compatibility_enabled: true,
       prompt_cache_affinity_enabled: settings.prompt_cache_affinity_enabled,
-      request_compression_enabled:
-        request_compression_enabled(settings, request_compression_mode),
       allow_image_generation: true,
+      allow_audio_transcription: true,
       metadata: settings.metadata || %{},
       created_at: settings.created_at,
       updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
     })
     |> Repo.update!()
   end
-
-  defp request_compression_enabled(_settings, :enabled), do: true
-
-  defp request_compression_enabled(settings, :preserve),
-    do: settings.request_compression_enabled
 
   defp ensure_assignment!(pool, identity) do
     case Repo.get_by(PoolUpstreamAssignment,

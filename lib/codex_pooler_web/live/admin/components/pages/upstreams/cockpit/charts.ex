@@ -5,8 +5,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.UpstreamAccountActions
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.{QuotaLimitRow, SavedResetMeter}
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ProviderCreditsComponents
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents
   alias Phoenix.HTML.Form
 
@@ -43,7 +45,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
       </header>
 
       <div
-        :if={@reported_limits != []}
+        :if={@reported_limits != [] or Map.get(@cockpit.provider_credits_summary, :display_row?, false)}
         id="upstream-quota-limits"
         class="grid gap-4 p-4 md:grid-cols-2"
       >
@@ -51,6 +53,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
           :for={limit <- @reported_limits}
           id={"upstream-quota-limit-#{limit.key}"}
           limit={limit}
+        />
+        <ProviderCreditsComponents.provider_credits_summary
+          id="upstream-provider-credits"
+          summary={@cockpit.provider_credits_summary}
+          trigger_id="provider-credits-policy-open"
+          open_policy={if @cockpit.can_manage_provider_credits? and @cockpit.identity.status != "deleted", do: JS.push_focus() |> JS.push("open_provider_credits_policy")}
         />
       </div>
       <p
@@ -60,6 +68,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
       >
         No quota windows are reported for this account yet.
       </p>
+      <div :if={not Map.get(@cockpit.provider_credits_summary, :display_row?, false) and @cockpit.can_manage_provider_credits? and @cockpit.identity.status != "deleted"} class="px-4 pb-4">
+        <AdminComponents.action_button
+          id="provider-credits-policy-open"
+          label="Provider credits policy"
+          icon="hero-currency-dollar"
+          phx-click={JS.push_focus() |> JS.push("open_provider_credits_policy")}
+          aria-controls="provider-credits-policy-dialog"
+          aria-haspopup="dialog"
+          variant={:secondary}
+        />
+      </div>
 
       <details
         id="saved-reset-bank-disclosure"
@@ -71,7 +90,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
             id="upstream-quota-saved-reset-meter"
             saved_resets={@cockpit.saved_resets}
             saved_reset_policy={@cockpit.saved_reset_policy}
-            saved_reset_confirmation={@cockpit.saved_reset_confirmation}
           />
         </summary>
         <div class="grid gap-3 px-4 pb-3">
@@ -87,6 +105,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
             <SavedResetComponents.saved_reset_expiration_table
               id="cockpit-saved-reset-expiration"
               saved_resets={@cockpit.saved_resets}
+              calendar_path={~p"/admin/upstreams/#{@cockpit.identity.id}/saved-reset-expirations.ics"}
               datetime_preferences={@datetime_preferences}
               empty_label="No expiration dates reported for the available saved resets yet."
             />
@@ -110,6 +129,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
         </summary>
         <.form
           id="saved-reset-policy-form"
+          data-saved-reset-form
           for={@saved_reset_policy_form}
           phx-change="validate_saved_reset_policy"
           phx-submit="save_saved_reset_policy"
@@ -143,10 +163,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
           <div class="flex justify-end border-t border-base-300/70 pt-3">
             <AdminComponents.action_button
               id="saved-reset-policy-submit"
+              data-saved-reset-action="save-policy"
+              data-server-disabled={to_string(@cockpit.assignments.empty?)}
               label="Save policy"
               icon="hero-check"
               type="submit"
               variant={:primary}
+              disabled={@cockpit.assignments.empty?}
+              title={UpstreamAccountActions.assignment_unavailable_reason(@cockpit.assignments.items)}
             />
           </div>
         </.form>
@@ -250,7 +274,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
           label="24h failed"
           value={@cockpit.charts.request_health.kpis.failed_requests_24h}
         />
-        <.health_fact label="Failure rate" value={@model.failure_rate_label} />
+        <.health_fact
+          id="request-health-client-cancelled"
+          label="24h client cancelled"
+          value={@cockpit.charts.request_health.kpis.client_cancelled_requests_24h}
+          title="Requests the client closed before the response finished; not counted as failures"
+        />
+        <.health_fact
+          label="Failure rate"
+          value={@model.failure_rate_label}
+          title="Failed requests over the requests that were not cancelled by the client"
+        />
         <.health_fact
           label="7d requests"
           value={@cockpit.charts.request_health.kpis.total_requests_7d}
@@ -291,7 +325,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
         </p>
         <ul class="sr-only">
           <li :for={point <- @model.points}>
-            {point.label}: {point.success_count} succeeded, {point.failure_count} failed, {point.total_count} total requests
+            {point.label}: {point.success_count} succeeded, {point.failure_count} failed, {point.client_cancelled_count} client cancelled, {point.total_count} total requests
           </li>
         </ul>
       </div>
@@ -316,12 +350,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
     """
   end
 
+  attr :id, :string, default: nil
   attr :label, :string, required: true
   attr :value, :any, required: true
+  attr :title, :string, default: nil
 
   defp health_fact(assigns) do
     ~H"""
-    <div class="grid gap-0.5">
+    <div id={@id} class="grid gap-0.5" title={@title}>
       <span class="text-[10px] font-semibold uppercase tracking-[0.08em] text-base-content/40">
         {@label}
       </span>
@@ -367,23 +403,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
     points = Enum.map(chart.items, &request_health_point/1)
     success_values = Enum.map(points, & &1.success_count)
     failure_values = Enum.map(points, & &1.failure_count)
+    client_cancelled_values = Enum.map(points, & &1.client_cancelled_count)
 
     %{
       points: points,
-      categories: Jason.encode!(Enum.map(points, & &1.label)),
+      categories: CodexPooler.JSON.encode!(Enum.map(points, & &1.label)),
       series:
-        Jason.encode!([
+        CodexPooler.JSON.encode!([
           %{name: "Succeeded", type: "column", data: success_values},
-          %{name: "Failed", type: "column", data: failure_values}
+          %{name: "Failed", type: "column", data: failure_values},
+          %{name: "Client cancelled", type: "column", data: client_cancelled_values}
         ]),
-      units: Jason.encode!(["requests", "failures"]),
-      yaxis: Jason.encode!([%{seriesName: "Succeeded", title: "requests"}]),
-      colors: Jason.encode!(["var(--color-success)", "var(--color-error)"]),
+      units: CodexPooler.JSON.encode!(["requests", "failures", "cancellations"]),
+      yaxis: CodexPooler.JSON.encode!([%{seriesName: "Succeeded", title: "requests"}]),
+      colors: CodexPooler.JSON.encode!(["var(--color-success)", "var(--color-error)", "var(--color-warning)"]),
       failure_rate_label: rate_percent_label(chart.kpis.failure_rate_24h),
       p50_latency_label: latency_label(chart.kpis.p50_latency_ms_24h),
       error_breakdown: Enum.map(chart.kpis.error_breakdown_24h, &error_breakdown_entry/1),
-      summary:
-        "#{Formatting.pluralize_count(chart.kpis.total_requests_7d, "request", "requests")} over seven days; #{chart.kpis.failed_requests_24h} failed in the last 24h; failure rate #{rate_percent_label(chart.kpis.failure_rate_24h)}."
+      summary: "#{Formatting.pluralize_count(chart.kpis.total_requests_7d, "request", "requests")} over seven days; #{chart.kpis.failed_requests_24h} failed in the last 24h; failure rate #{rate_percent_label(chart.kpis.failure_rate_24h)}; #{chart.kpis.client_cancelled_requests_24h} cancelled by the client, not counted as failures."
     }
   end
 
@@ -392,6 +429,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
       label: chart_date_label(item.date),
       success_count: item.success_count,
       failure_count: item.failure_count,
+      client_cancelled_count: item.client_cancelled_count,
       total_count: item.total_count
     }
   end
@@ -422,10 +460,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
 
   defp rate_percent_label(value) when is_integer(value), do: rate_percent_label(value * 1.0)
 
-  defp chart_date_label(
-         <<_year::binary-size(4), "-", month::binary-size(2), "-", day::binary-size(2)>>
-       ),
-       do: month <> "-" <> day
+  defp chart_date_label(<<_year::binary-size(4), "-", month::binary-size(2), "-", day::binary-size(2)>>),
+    do: month <> "-" <> day
 
   defp chart_date_label(date), do: to_string(date)
 end

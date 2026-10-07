@@ -27,13 +27,12 @@ defmodule CodexPooler.Admin.Stats.SourceSummary do
       attempts: length(attempts),
       settlements: length(settlements),
       daily_rollups: length(daily_rollups),
-      codex_turns: length(turns),
+      codex_turns: Enum.sum(Enum.map(turns, & &1.count)),
       audit_events: activity_counts.audit_events,
       jobs: activity_counts.jobs,
       model_usage_source: model_usage_source,
       model_usage_rows: model_usage_rows,
-      usage_source:
-        if(daily_rollups == [], do: :raw_ledger_fallback, else: :raw_ledger_with_rollup_context)
+      usage_source: if(daily_rollups == [], do: :raw_ledger_fallback, else: :raw_ledger_with_rollup_context)
     }
   end
 end

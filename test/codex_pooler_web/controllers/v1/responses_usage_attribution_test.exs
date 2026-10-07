@@ -42,10 +42,15 @@ defmodule CodexPoolerWeb.V1.ResponsesUsageAttributionTest do
       conn: conn
     } do
       attribution =
-        Jason.encode!(%{"items" => List.duplicate(%{"bytes" => String.duplicate("x", 200)}, 500)})
+        CodexPooler.JSON.encode!(%{
+          "items" => List.duplicate(%{"bytes" => String.duplicate("x", 200)}, 500)
+        })
 
       counters =
-        @usage |> Jason.encode!() |> String.trim_leading("{") |> String.trim_trailing("}")
+        @usage
+        |> CodexPooler.JSON.encode!()
+        |> String.trim_leading("{")
+        |> String.trim_trailing("}")
 
       usage =
         case unquote(position) do
@@ -54,11 +59,19 @@ defmodule CodexPoolerWeb.V1.ResponsesUsageAttributionTest do
         end
 
       terminal =
-        ~s({"type":"response.completed","response":{"id":"resp_usage_attribution","status":"completed","usage":#{usage},"output":[]}})
+        ~s({"type":"response.completed","response":{"id":"resp_usage_attribution","model":"model-a","status":"completed","usage":#{usage},"output":[]}})
 
       assert byte_size(terminal) > 65_536
 
-      upstream = start_upstream(FakeUpstream.sse_stream(["data: " <> terminal <> "\n\n"]))
+      upstream =
+        start_upstream(
+          FakeUpstream.sse_stream([
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_usage_attribution\",\"model\":\"model-a\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_usage_attribution\",\"model\":\"model-b\"}}\n\n",
+            "data: " <> terminal <> "\n\n"
+          ])
+        )
+
       setup = gateway_setup(upstream)
       session_key = Ecto.UUID.generate()
       conn = conn |> auth(setup)
@@ -79,11 +92,11 @@ defmodule CodexPoolerWeb.V1.ResponsesUsageAttributionTest do
         assert response.status == 200
         assert length(FakeUpstream.requests(upstream)) == 1
         received = completed_data(response.resp_body)
-        decoded = Jason.decode!(received)
+        decoded = CodexPooler.JSON.decode!(received)
         assert is_integer(decoded["sequence_number"])
 
-        assert digest(Jason.encode!(Map.delete(decoded, "sequence_number"))) ==
-                 digest(Jason.encode!(Jason.decode!(terminal)))
+        assert digest(CodexPooler.JSON.encode!(Map.delete(decoded, "sequence_number"))) ==
+                 digest(CodexPooler.JSON.encode!(CodexPooler.JSON.decode!(terminal)))
 
         assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
         assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
@@ -91,6 +104,10 @@ defmodule CodexPoolerWeb.V1.ResponsesUsageAttributionTest do
         assert request.retry_count == 0
         assert request.usage_status == "usage_known"
         assert attempt.usage_status == "usage_known"
+        assert attempt.served_model == "model-a"
+        assert attempt.model_observation["conflict"] == true
+        assert attempt.model_observation["first_conflicting_model"] == "model-b"
+        assert attempt.model_observation["terminal_model"] == "model-a"
 
         assert attempt.transport ==
                  if(unquote(transport) == :http, do: "http_sse", else: "websocket")
@@ -104,8 +121,7 @@ defmodule CodexPoolerWeb.V1.ResponsesUsageAttributionTest do
                    )
                  )
 
-        assert {settlement.input_tokens, settlement.cached_input_tokens, settlement.output_tokens,
-                settlement.reasoning_tokens, settlement.total_tokens} == {123, 17, 45, 6, 168}
+        assert {settlement.input_tokens, settlement.cached_input_tokens, settlement.output_tokens, settlement.reasoning_tokens, settlement.total_tokens} == {123, 17, 45, 6, 168}
 
         # Standard input 106*10, cached input 17*1, standard output 39*20, reasoning 6*30.
         assert Decimal.equal?(settlement.settled_cost_micros, Decimal.new(2_037))
@@ -132,7 +148,7 @@ defmodule CodexPoolerWeb.V1.ResponsesUsageAttributionTest do
     |> String.split("\n")
     |> Enum.find_value(fn
       "data: " <> json ->
-        case Jason.decode(json) do
+        case CodexPooler.JSON.decode(json) do
           {:ok, %{"type" => "response.completed"}} -> json
           _other -> nil
         end

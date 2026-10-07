@@ -14,6 +14,93 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
 
   setup :register_and_log_in_user
 
+  test "key-wide active request cap creates, reviews, edits and clears independently of model limits",
+       %{conn: conn, scope: scope} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "active-cap", name: "Active cap"})
+    {:ok, view, _} = live(conn, ~p"/admin/api-keys")
+    open_create_dialog(view)
+    select_api_key_section(view, :limits)
+    assert has_element?(view, "#api_key_max_active_requests[min='1']")
+    refute "max_active_requests" in ApiKeyPolicyForm.limit_fields()
+
+    params =
+      api_key_payload(%{
+        "display_name" => "Active cap key",
+        "pool_id" => pool.id,
+        "max_active_requests" => "3",
+        "model_policy_model_identifier" => "sample-model",
+        "model_max_requests_per_minute" => "17"
+      })
+
+    view |> element("#api-key-form") |> render_change(%{"api_key" => params})
+    select_api_key_section(view, :review)
+    assert has_element?(view, "#api-key-review-summary", "Active requests across all models")
+    assert has_element?(view, "#api-key-review-summary", "3")
+    view |> element("#api-key-form") |> render_submit(%{"api_key" => params})
+    key = Repo.get_by!(APIKey, display_name: "Active cap key")
+    assert key.max_active_requests == 3
+
+    assert Repo.get_by!(APIKeyPolicyBinding, api_key_id: key.id, binding_scope: "model").max_requests_per_minute ==
+             17
+
+    view |> element("#edit-api-key-#{key.id}") |> render_click()
+    select_api_key_section(view, :limits)
+    assert has_element?(view, "#api_key_max_active_requests[value='3']")
+    refute has_element?(view, "#api_key_model_max_active_requests")
+
+    view
+    |> element("#api-key-form")
+    |> render_submit(%{"api_key" => %{"max_active_requests" => "2"}})
+
+    assert Repo.get!(APIKey, key.id).max_active_requests == 2
+    view |> element("#edit-api-key-#{key.id}") |> render_click()
+
+    view
+    |> element("#api-key-form")
+    |> render_submit(%{"api_key" => %{"max_active_requests" => ""}})
+
+    assert Repo.get!(APIKey, key.id).max_active_requests == nil
+    {:ok, reopened, _} = live(conn, ~p"/admin/api-keys")
+    reopened |> element("#edit-api-key-#{key.id}") |> render_click()
+    select_api_key_section(reopened, :limits)
+    assert has_element?(reopened, "#api_key_max_active_requests[value='']")
+  end
+
+  test "invalid active request caps stay inline and cannot save", %{conn: conn, scope: scope} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "invalid-active-cap", name: "Invalid cap"})
+
+    {:ok, %{api_key: key}} =
+      Access.create_api_key(scope, pool, %{display_name: "Cap validation", max_active_requests: 4})
+
+    {:ok, view, _} = live(conn, ~p"/admin/api-keys")
+    view |> element("#edit-api-key-#{key.id}") |> render_click()
+    select_api_key_section(view, :limits)
+
+    for value <- ["0", "-1", "1.5", "bad", "2147483648", %{"unexpected" => "value"}] do
+      view
+      |> element("#api-key-form")
+      |> render_change(%{"api_key" => %{"max_active_requests" => value}})
+
+      assert has_element?(view, "#api-key-key-wide-limits", "must be a positive whole number")
+      select_api_key_section(view, :review)
+
+      assert has_element?(
+               view,
+               "#api-key-review-errors",
+               "Active request limit must be a positive whole number"
+             )
+
+      assert has_element?(view, "#api-key-submit[disabled]")
+
+      view
+      |> element("#api-key-form")
+      |> render_submit(%{"api_key" => %{"max_active_requests" => value}})
+
+      assert Repo.get!(APIKey, key.id).max_active_requests == 4
+      select_api_key_section(view, :limits)
+    end
+  end
+
   @tag :create_once_secret
   test "creates an API key and shows the raw secret exactly once", %{conn: conn, scope: scope} do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "one-time-key", name: "One-time Key"})
@@ -139,6 +226,18 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
     assert {:error, :api_key_disabled} = Access.normalize_api_key_policy(edited)
   end
 
+  test "policy form saves enforced ultrafast and retains it when reopened", %{conn: conn, scope: scope} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "ultrafast-form", name: "Ultrafast form"})
+    {:ok, view, _html} = live(conn, ~p"/admin/api-keys")
+    open_create_dialog(view)
+    assert has_element?(view, "#api_key_enforced_service_tier option[value='ultrafast']", "Ultrafast mode")
+    view |> element("#api-key-form") |> render_submit(%{"api_key" => api_key_payload(%{"display_name" => "Ultrafast key", "pool_id" => pool.id, "enforced_service_tier" => "ultrafast"})})
+    api_key = Repo.one!(APIKey)
+    assert api_key.enforced_service_tier == "ultrafast"
+    assert ApiKeyPolicyForm.params_for(api_key, [])["enforced_service_tier"] == "ultrafast"
+    assert {:ok, %{enforced_service_tier: "ultrafast"}} = Access.normalize_api_key_policy(api_key)
+  end
+
   test "service tier form retains one canonical Fast/Priority option and preserves invalid types",
        %{
          scope: scope
@@ -147,6 +246,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
 
     assert Enum.count(options, fn {_label, value} -> value == "priority" end) == 1
     assert {"Fast/Priority mode", "priority"} in options
+    assert {"Ultrafast mode", "ultrafast"} in options
+    assert %{enforced_service_tier: "ultrafast"} = ApiKeyPolicyForm.attrs(%{"enforced_service_tier" => " ULTRAFAST "})
     refute Enum.any?(options, fn {_label, value} -> value == "fast" end)
 
     assert %{enforced_service_tier: "priority"} =
@@ -673,7 +774,6 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
       discovered_model_count: 1,
       upserted_model_count: 1,
       stale_marked_count: 0,
-      retired_count: 0,
       stats: %{}
     })
     |> Repo.insert!()

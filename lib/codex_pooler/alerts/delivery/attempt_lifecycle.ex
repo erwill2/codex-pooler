@@ -44,8 +44,7 @@ defmodule CodexPooler.Alerts.Delivery.AttemptLifecycle do
     cooldown_minutes = cooldown_minutes(incident, channel)
 
     if sent_attempt_within_cooldown?(incident.id, channel.id, cooldown_minutes, timestamp) do
-      {:discard, "alert_delivery_cooldown_suppressed",
-       "alert #{delivery_adapter} delivery is inside the cooldown window"}
+      {:discard, "alert_delivery_cooldown_suppressed", "alert #{delivery_adapter} delivery is inside the cooldown window"}
     else
       :ok
     end
@@ -211,8 +210,7 @@ defmodule CodexPooler.Alerts.Delivery.AttemptLifecycle do
       retryable: retryable,
       failure_code: code,
       failure_message: message,
-      response_metadata:
-        Keyword.get(opts, :response_metadata, %{"delivery_adapter" => delivery_adapter}),
+      response_metadata: Keyword.get(opts, :response_metadata, %{"delivery_adapter" => delivery_adapter}),
       failure_metadata: failure_metadata(delivery_adapter, code, message, retryable),
       created_at: timestamp,
       updated_at: timestamp
@@ -299,7 +297,7 @@ defmodule CodexPooler.Alerts.Delivery.AttemptLifecycle do
           on: rule.id == target.rule_id,
           join: link in AlertRuleChannel,
           on: link.alert_rule_id == rule.id and link.alert_channel_id == ^channel_id,
-          where: target.incident_id == ^incident_id,
+          where: target.incident_id == ^incident_id and rule.state == "active",
           select: max(rule.cooldown_minutes)
       )
 

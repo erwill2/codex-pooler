@@ -3,6 +3,7 @@ defmodule CodexPooler.Upstreams.SavedResets.PostResetEvidenceTest do
 
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.SavedResets.PostResetEvidence
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @now ~U[2026-07-14 03:30:00.000000Z]
   # The credit was consumed ten minutes ago.
@@ -30,6 +31,39 @@ defmodule CodexPooler.Upstreams.SavedResets.PostResetEvidenceTest do
   test "fresh usable post-consume account evidence confirms" do
     windows = [window(used_percent: Decimal.new("0"))]
     assert PostResetEvidence.classify(windows, @consumed_at, @now) == :confirmed
+  end
+
+  test "monthly account evidence confirms zero, reblocks exhaustion and ignores pre-consume data" do
+    for {percent, observed_at, expected} <- [
+          {"0", @now, :confirmed},
+          {"100", @now, :reblocked},
+          {"0", DateTime.add(@consumed_at, -1, :second), :pending}
+        ] do
+      monthly =
+        window(
+          window_kind: "primary",
+          window_minutes: 43_200,
+          used_percent: Decimal.new(percent),
+          observed_at: observed_at
+        )
+
+      assert PostResetEvidence.classify([monthly], @consumed_at, @now) == expected
+    end
+  end
+
+  test "invalid captured resources cannot confirm even when unrelated account capacity is usable" do
+    for descriptors <- [
+          [],
+          [%{}],
+          [%{"window_kind" => "secondary", "window_minutes" => 300}],
+          [%{"window_kind" => "unknown", "window_minutes" => 10_080}],
+          [%{"window_kind" => "secondary", "window_minutes" => 10_080, "extra" => true}],
+          [%{"window_kind" => "secondary", "window_minutes" => "10080"}],
+          %{"window_kind" => "secondary", "window_minutes" => 10_080}
+        ] do
+      identity = %UpstreamIdentity{metadata: %{"saved_reset_redemption" => %{"included_window_descriptors" => descriptors}}}
+      assert PostResetEvidence.classify(identity, [window(used_percent: Decimal.new(0))], @consumed_at, @now) == :pending
+    end
   end
 
   test "fresh exhausted post-consume account evidence reblocks" do

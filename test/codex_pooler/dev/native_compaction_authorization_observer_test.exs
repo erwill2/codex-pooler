@@ -31,7 +31,8 @@ defmodule CodexPooler.Dev.NativeCompactionAuthorizationObserverTest do
              "x-native-compaction-authorization-observer"
            ) == ["pooler-native-compaction-v1"]
 
-    assert %{"schemaVersion" => 1, "counts" => counts} = Jason.decode!(served.resp_body)
+    assert %{"schemaVersion" => 1, "counts" => counts} =
+             CodexPooler.JSON.decode!(served.resp_body)
 
     assert Map.keys(counts) |> Enum.sort() ==
              NativeCompactionAuthorizationObservation.transitions()
@@ -116,20 +117,24 @@ defmodule CodexPooler.Dev.NativeCompactionAuthorizationObserverTest do
   end
 
   test "accepts strict projection JSON only while armed and reset clears projection" do
-    assert conn(:post, "/project", Jason.encode!(%{"breakMode" => "none"}))
+    assert conn(:post, "/project", CodexPooler.JSON.encode!(%{"breakMode" => "none"}))
            |> ObserverPlug.call([])
            |> Map.fetch!(:status) == 400
 
     _reset = conn(:post, "/reset") |> ObserverPlug.call([])
 
     projected =
-      conn(:post, "/project", Jason.encode!(%{"breakMode" => "duplicate-final-replay"}))
+      conn(
+        :post,
+        "/project",
+        CodexPooler.JSON.encode!(%{"breakMode" => "duplicate-final-replay"})
+      )
       |> ObserverPlug.call([])
 
     assert projected.status == 200
 
     malformed =
-      conn(:post, "/project", Jason.encode!(%{"breakMode" => "none", "extra" => true}))
+      conn(:post, "/project", CodexPooler.JSON.encode!(%{"breakMode" => "none", "extra" => true}))
       |> ObserverPlug.call([])
 
     assert malformed.status == 400
@@ -189,6 +194,7 @@ defmodule CodexPooler.Dev.NativeCompactionAuthorizationObserverTest do
     assert NativeCompactionAuthorizationObserver.status()["telemetryHandlers"] == 1
   end
 
+  @tag slow: "races real observer reset and disarm across multiple concurrent lifecycle rounds"
   test "reset racing disarm has a deterministic terminal state without caller failure" do
     for final_operation <- [:arm, :disarm] do
       operations = Enum.map(1..24, fn index -> if rem(index, 2) == 0, do: :arm, else: :disarm end)
@@ -350,6 +356,7 @@ defmodule CodexPooler.Dev.NativeCompactionAuthorizationObserverTest do
     assert :telemetry.list_handlers(@event) == []
   end
 
+  @tag slow: "repeats concurrent observer teardown and repairs an actual orphan telemetry handler"
   test "parallel absent disarms remove an orphan handler and new arm self-heals it" do
     for _round <- 1..3 do
       :ok = NativeCompactionAuthorizationObserver.arm()
@@ -414,6 +421,7 @@ defmodule CodexPooler.Dev.NativeCompactionAuthorizationObserverTest do
     assert :telemetry.list_handlers(@event) == []
   end
 
+  @tag slow: "races 24 real observer arm/disarm operations for both final lifecycle states"
   test "arm racing disarm finishes in one internally consistent state" do
     for final_operation <- [:arm, :disarm] do
       :ok = NativeCompactionAuthorizationObserver.arm()

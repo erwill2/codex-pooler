@@ -19,6 +19,7 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
         ],
         cd: fixture.root,
         env: [
+          {"CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING", nil},
           {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"},
           {"DEV_SERVER_STATE_DIR", fixture.state_dir},
           {"DEV_SERVER_LOG", fixture.log_path},
@@ -35,11 +36,34 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
              "db_up",
              "db_exec",
              "compile",
+             "assets_setup",
+             "assets_build",
+             "docs_deps",
              "create",
              "migrate",
              "pricing",
              "start_owner_forwarding=absent"
            ]
+  end
+
+  test "make dev refuses to start with a failed locked asset installation" do
+    fixture = parallel_make_fixture!()
+
+    {output, code} = System.cmd("make", ["-j4", "DEV_SERVER_LIFECYCLE=#{fixture.lifecycle_path}", "POSTGRES_PORT=#{fixture.postgres_port}", "dev"], cd: fixture.root, env: [{"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}, {"DEV_SERVER_EVENT_LOG", fixture.event_log}, {"DEV_SERVER_ASSET_SETUP_FAIL", "1"}], stderr_to_stdout: true)
+
+    assert code != 0
+    assert output =~ "asset installation failed"
+    assert File.read!(fixture.event_log) |> String.split("\n", trim: true) == ["stop_started", "stop_completed", "db_up", "db_exec", "compile"]
+  end
+
+  test "make dev refuses to start with a failed locked docs dependency installation" do
+    fixture = parallel_make_fixture!()
+
+    {output, code} = System.cmd("make", ["-j4", "DEV_SERVER_LIFECYCLE=#{fixture.lifecycle_path}", "POSTGRES_PORT=#{fixture.postgres_port}", "dev"], cd: fixture.root, env: [{"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}, {"DEV_SERVER_EVENT_LOG", fixture.event_log}, {"DEV_SERVER_DOCS_DEPS_FAIL", "1"}], stderr_to_stdout: true)
+
+    assert code != 0
+    assert output =~ "docs dependency installation failed"
+    assert File.read!(fixture.event_log) |> String.split("\n", trim: true) == ["stop_started", "stop_completed", "db_up", "db_exec", "compile", "assets_setup", "assets_build"]
   end
 
   test "make dev imports websocket owner forwarding from the repository environment" do
@@ -240,6 +264,22 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
     assert output =~ "start or stop will clean it"
   end
 
+  test "an interrupted starting receipt gives a recovery hint without signalling an unproved process" do
+    fixture = server_fixture!(healthy?: false, cwd: File.cwd!())
+    %{receipt_path: receipt_path} = write_stale_receipt!(fixture, pid: fixture.listener_pid)
+    File.write!(receipt_path, File.read!(receipt_path) |> String.replace("state\trunning", "state\tstarting"))
+
+    for action <- ["status", "stop"] do
+      {output, code} = lifecycle(action, fixture)
+      assert code != 0
+      assert output =~ "ownership receipt that is not running"
+      assert output =~ "next:"
+      assert output =~ receipt_path
+      assert process_alive?(fixture.listener_pid)
+      assert File.exists?(receipt_path)
+    end
+  end
+
   test "stop cleans a stale dead-pid receipt without touching other processes" do
     sentinel = server_fixture!(healthy?: false, cwd: temp_dir!("stale-sentinel"))
     fixture = server_fixture!(start?: false, cwd: File.cwd!())
@@ -356,7 +396,15 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
     assert {output, code} = lifecycle("start", fixture, [{"DEV_SERVER_START_ATTEMPTS", "2"}])
     assert code != 0
     assert output =~ "startup diagnostics: pid="
-    assert output =~ "alive=yes listener=yes health=failed"
+
+    # A server that never becomes ready has no deterministic listener state: by
+    # the time diagnostics are collected the port may or may not still be bound,
+    # and CI has observed both. `alive` and `health` are fixed by construction —
+    # the process is kept alive and the fixture never reports healthy — so those
+    # are asserted exactly, and the listener field is asserted to be reported
+    # rather than to hold a particular value. The test's subject is that the
+    # diagnostics are emitted, not that the listener survived.
+    assert output =~ ~r/alive=yes listener=(?:yes|no) health=failed/
     assert output =~ "health url=http://127.0.0.1:#{fixture.port}/healthz"
     assert output =~ "server log=#{fixture.log_path}"
     assert output =~ "inspect the log, correct the reported boot failure, then rerun make dev"
@@ -484,6 +532,7 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
         ;;
       start)
         grep -qx 'pricing' "$DEV_SERVER_EVENT_LOG"
+        grep -qx 'docs_deps' "$DEV_SERVER_EVENT_LOG"
         printf 'start_owner_forwarding=%s\n' "${CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING:-absent}" >> "$DEV_SERVER_EVENT_LOG"
         ;;
       *) exit 2 ;;
@@ -500,14 +549,57 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
     esac
     """)
 
+    # The Makefile routes every Mix call through `mise x --` when mise is on
+    # PATH, which resolves `mix` from the pinned toolchain and so walks straight
+    # past the stub below. That made this fixture depend on the host: green in
+    # CI, where the elixir image has no mise, and red locally with a real `mix`
+    # running in a directory that has no mix.exs. Stubbing mise too makes the
+    # fixture deterministic either way, since `command -v mise` finds this first.
+    File.write!(Path.join(bin_dir, "mise"), """
+    #!/bin/bash
+    set -euo pipefail
+    if [ "${1:-}" = "x" ] || [ "${1:-}" = "exec" ]; then
+      shift
+      [ "${1:-}" = "--" ] && shift
+    fi
+    exec "$@"
+    """)
+
+    File.write!(Path.join(bin_dir, "npm"), """
+    #!/bin/bash
+    set -euo pipefail
+    [ "$*" = 'ci --prefix docs-site' ]
+    grep -qx 'assets_build' "$DEV_SERVER_EVENT_LOG"
+    if [ "${DEV_SERVER_DOCS_DEPS_FAIL:-0}" = 1 ]; then
+      printf 'docs dependency installation failed\n' >&2
+      exit 1
+    fi
+    printf 'docs_deps\n' >> "$DEV_SERVER_EVENT_LOG"
+    """)
+
     File.write!(Path.join(bin_dir, "mix"), """
     #!/bin/bash
     set -euo pipefail
     grep -qx 'stop_completed' "$DEV_SERVER_EVENT_LOG"
     case "$1 ${2:-}" in
       'compile --force') grep -qx 'db_exec' "$DEV_SERVER_EVENT_LOG"; event=compile ;;
-      'ecto.create --quiet') grep -qx 'compile' "$DEV_SERVER_EVENT_LOG"; event=create ;;
-      'ecto.migrate ') grep -qx 'create' "$DEV_SERVER_EVENT_LOG"; event=migrate ;;
+      'assets.setup ')
+        grep -qx 'compile' "$DEV_SERVER_EVENT_LOG"
+        if [ "${DEV_SERVER_ASSET_SETUP_FAIL:-0}" = 1 ]; then
+          printf 'asset installation failed\n' >&2
+          exit 1
+        fi
+        event=assets_setup
+        ;;
+      'assets.build ') grep -qx 'assets_setup' "$DEV_SERVER_EVENT_LOG"; event=assets_build ;;
+      'ecto.create --quiet') grep -qx 'docs_deps' "$DEV_SERVER_EVENT_LOG"; event=create ;;
+      'run --no-start')
+        [ "$#" -eq 4 ]
+        [ "$3" = '-e' ]
+        [ "$4" = 'CodexPooler.Release.migrate()' ]
+        grep -qx 'create' "$DEV_SERVER_EVENT_LOG"
+        event=migrate
+        ;;
       'pricing.import_openai ') grep -qx 'migrate' "$DEV_SERVER_EVENT_LOG"; event=pricing ;;
       *) exit 2 ;;
     esac
@@ -515,7 +607,13 @@ defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
     """)
 
     Enum.each(
-      [lifecycle_path, Path.join(bin_dir, "docker"), Path.join(bin_dir, "mix")],
+      [
+        lifecycle_path,
+        Path.join(bin_dir, "docker"),
+        Path.join(bin_dir, "mix"),
+        Path.join(bin_dir, "mise"),
+        Path.join(bin_dir, "npm")
+      ],
       &File.chmod!(&1, 0o700)
     )
 

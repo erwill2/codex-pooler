@@ -137,6 +137,65 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
     assert response.body == "ok"
   end
 
+  # The Codex backend names its server-assigned request id `x-oai-request-id`;
+  # a fake that only ever emitted `x-request-id` could not make a local lane go
+  # red when the product stopped reading the backend's real name (findings#218
+  # row 218-44). The arm is bounded to the product's own allowlist.
+  test "the upstream request id header arm is bounded to the names the product reads" do
+    assert GatewayPerfFakeUpstream.upstream_request_id_header_names() == [
+             "x-request-id",
+             "x-oai-request-id",
+             "openai-request-id"
+           ]
+
+    assert GatewayPerfFakeUpstream.default_upstream_request_id_header() == "x-request-id"
+
+    assert {:ok, "x-oai-request-id"} =
+             GatewayPerfFakeUpstream.normalize_upstream_request_id_header(" X-OAI-Request-Id ")
+
+    assert {:error, message} =
+             GatewayPerfFakeUpstream.parse_args([
+               "--run-id",
+               "test-run",
+               "--upstream-request-id-header",
+               "x-openai-request-id"
+             ])
+
+    assert message =~ "--upstream-request-id-header must be one of"
+
+    assert {:ok, %{upstream_request_id_header: "x-oai-request-id"}} =
+             GatewayPerfFakeUpstream.parse_args([
+               "--run-id",
+               "test-run",
+               "--upstream-request-id-header",
+               "x-oai-request-id"
+             ])
+
+    assert {:ok, %{upstream_request_id_header: "x-request-id"}} =
+             GatewayPerfFakeUpstream.parse_args(["--run-id", "test-run"])
+  end
+
+  test "the synthetic upstream request id travels on the configured backend header and reaches the product's reader" do
+    alias CodexPooler.Gateway.Payloads.RequestOptions
+    alias CodexPooler.Gateway.Runtime.Finalization.Metadata
+
+    opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{})
+
+    default_server = start_server!("short-ok")
+    default_response = Req.get!(default_server.url <> "/backend-api/codex/models")
+    assert [default_id] = default_response.headers["x-request-id"]
+    refute Map.has_key?(default_response.headers, "x-oai-request-id")
+    assert String.starts_with?(default_id, "perfreq_")
+    assert Metadata.response_metadata(default_response, nil, opts)["upstream_request_id"] == default_id
+
+    backend_server = start_server!("short-ok", upstream_request_id_header: "x-oai-request-id")
+    backend_response = Req.get!(backend_server.url <> "/backend-api/codex/models")
+    assert [backend_id] = backend_response.headers["x-oai-request-id"]
+    refute Map.has_key?(backend_response.headers, "x-request-id")
+    assert String.starts_with?(backend_id, "perfreq_")
+    assert Metadata.response_metadata(backend_response, nil, opts)["upstream_request_id"] == backend_id
+  end
+
   test "Full catalog entry is canonical-source eligible and explicitly non-Lite" do
     model = GatewayPerfFakeUpstream.full_catalog_model()
 
@@ -145,12 +204,17 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
     assert model["capabilities"]["responses"] == true
   end
 
+  @tag slow: "compares actual loopback SSE streams on backend and public routes"
   test "backend and v1 routes emit equivalent successful SSE streams" do
     server = start_server!("short-ok")
 
-    backend = post_stream!(server.url <> "/backend-api/codex/responses")
-    responses = post_stream!(server.url <> "/v1/responses")
-    chat = post_stream!(server.url <> "/v1/chat/completions")
+    [backend, responses, chat] =
+      ["/backend-api/codex/responses", "/v1/responses", "/v1/chat/completions"]
+      |> Task.async_stream(&post_stream!(server.url <> &1), max_concurrency: 3, timeout: @detection_timeout_ms)
+      |> Enum.map(fn result ->
+        assert {:ok, response} = result
+        response
+      end)
 
     assert backend.status == 200
     assert responses.status == 200
@@ -199,7 +263,10 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
   end
 
   test "deterministic failure profiles expose distinct HTTP and stream behavior" do
-    server = start_server!("quota-429,partial-failure,disconnect-midstream,timeout")
+    server = start_server!("quota-429,partial-failure,disconnect-midstream")
+    timeout_server = start_server!("timeout")
+    # This profile intentionally never answers. Cancel its owned connection after
+    # proving the timeout instead of paying the listener's 15-second shutdown grace.
 
     quota = post_stream!(server.url <> "/backend-api/codex/responses?profile=quota-429")
     assert quota.status == 429
@@ -219,13 +286,14 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
     refute disconnected.body =~ "data: [DONE]"
 
     assert {:error, error} =
-             Req.post(server.url <> "/backend-api/codex/responses?profile=timeout",
+             Req.post(timeout_server.url <> "/backend-api/codex/responses?profile=timeout",
                json: %{"model" => "gpt-example"},
                receive_timeout: 100,
                retry: false
              )
 
     assert transport_timeout?(error)
+    stop_timeout_connections!(timeout_server)
   end
 
   test "websocket routes convert stream events into JSON text frames" do
@@ -233,12 +301,17 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
     {conn, websocket, ref} = websocket_connect!(server.url, "/backend-api/codex/responses")
 
     {conn, websocket} =
-      websocket_send_text!(conn, websocket, ref, Jason.encode!(%{"model" => "gpt-example"}))
+      websocket_send_text!(
+        conn,
+        websocket,
+        ref,
+        CodexPooler.JSON.encode!(%{"model" => "gpt-example"})
+      )
 
     {_conn, _websocket, text} = websocket_receive_text!(conn, websocket, ref)
 
     assert %{"type" => "response.output_text.delta", "profile" => "short-ok"} =
-             Jason.decode!(text)
+             CodexPooler.JSON.decode!(text)
   end
 
   test "opencode text profile emits one internally consistent AI SDK response" do
@@ -384,7 +457,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
              "logicalTurnFingerprint" => nil
            }
 
-    encoded = Jason.encode!(observation)
+    encoded = CodexPooler.JSON.encode!(observation)
     refute encoded =~ "encrypted_content"
     refute encoded =~ "authorization"
     refute encoded =~ "client_metadata"
@@ -396,10 +469,10 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
 
     metadata_cases = [
       {%{"turn_id" => "abc"}, "ba7816bf8f01cfea"},
-      {%{"x-codex-turn-metadata" => Jason.encode!(%{"turn_id" => "abc"})}, "ba7816bf8f01cfea"},
+      {%{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"turn_id" => "abc"})}, "ba7816bf8f01cfea"},
       {%{
          "turn_id" => "xyz",
-         "x-codex-turn-metadata" => Jason.encode!(%{"turn_id" => "abc"})
+         "x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"turn_id" => "abc"})
        }, "3608bca1e44ea6c4"},
       {%{"turn_id" => "  "}, nil},
       {%{"turn_id" => 123}, nil},
@@ -443,7 +516,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
         connection_a,
         websocket_a,
         ref_a,
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "input" => [%{"type" => "message", "content" => "RAW_NESTED_SENTINEL"}],
           "store" => false,
           "stream" => true
@@ -458,7 +531,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
         connection_b,
         websocket_b,
         ref_b,
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "input" => [
             %{"type" => "function_call_output", "output" => "RAW_NESTED_SENTINEL"},
             %{"type" => "compaction_trigger"}
@@ -477,7 +550,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
         connection_a,
         websocket_a,
         ref_a,
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "input" => [%{"type" => "compaction"}],
           "store" => false,
           "stream" => true
@@ -530,7 +603,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
     assert Enum.all?(connection_ids, &Regex.match?(~r/\Aws_[a-f0-9]{12}\z/, &1))
     assert length(connection_ids) == 2
 
-    encoded = Jason.encode!(observations)
+    encoded = CodexPooler.JSON.encode!(observations)
     refute encoded =~ "RAW_NESTED_SENTINEL"
     refute encoded =~ "resp_synthetic_anchor"
     refute encoded =~ "function_call_output\",\"output"
@@ -549,21 +622,23 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
 
     GatewayPerfFakeUpstream.write_manifest!(manifest_path, [profile])
 
-    assert [decoded] = manifest_path |> File.read!() |> Jason.decode!()
+    assert [decoded] = manifest_path |> File.read!() |> CodexPooler.JSON.decode!()
     assert MapSet.new(Map.keys(decoded)) == MapSet.new(@manifest_keys)
     assert decoded["name"] == "short-ok"
     refute File.read!(manifest_path) =~ "authorization"
   end
 
-  defp start_server!(selector) do
+  defp start_server!(selector, opts \\ []) do
     assert {:ok, profiles} = GatewayPerfFakeUpstream.profiles_from_selector(selector)
 
     assert {:ok, server} =
              GatewayPerfFakeUpstream.start_link(
-               host: "127.0.0.1",
-               port: 0,
-               profiles: profiles,
-               run_id: "test-run"
+               [
+                 host: "127.0.0.1",
+                 port: 0,
+                 profiles: profiles,
+                 run_id: "test-run"
+               ] ++ opts
              )
 
     on_exit(fn -> GatewayPerfFakeUpstream.stop(server) end)
@@ -572,6 +647,16 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
 
   defp post_stream!(url, headers \\ []) do
     Req.post!(url, headers: headers, json: %{"model" => "gpt-example"}, retry: false)
+  end
+
+  defp stop_timeout_connections!(%{server: server}) do
+    assert {:ok, connections} = ThousandIsland.connection_pids(server)
+
+    for connection <- connections do
+      monitor = Process.monitor(connection)
+      Process.exit(connection, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^connection, _reason}, @detection_timeout_ms
+    end
   end
 
   defp output_text(text) do

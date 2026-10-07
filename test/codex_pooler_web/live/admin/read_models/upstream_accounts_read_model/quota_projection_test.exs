@@ -13,6 +13,40 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
   @snapshot_at ~U[2026-07-25 12:00:00Z]
 
+  @tag :primary_idle_display
+  test "confirmed idle account primary retains starts-on-use presentation across stale evidence" do
+    t0 = DateTime.utc_now() |> DateTime.add(-20, :minute) |> DateTime.truncate(:second)
+    preferences = DateTimeDisplay.preferences_for_user(nil)
+
+    for allowed <- [true, false] do
+      %{identity: identity} = active_upstream_assignment_fixture(pool_fixture(), %{})
+
+      for offset <- [0, 60, 240] do
+        at = DateTime.add(t0, offset, :second)
+
+        payload = %{
+          "plan_type" => "team",
+          "rate_limit" => %{"allowed" => allowed, "limit_reached" => not allowed, "primary_window" => %{"used_percent" => 0, "limit_window_seconds" => 18_000, "reset_after_seconds" => 18_000, "reset_at" => DateTime.to_unix(DateTime.add(at, 18_000, :second))}}
+        }
+
+        assert {:ok, %{windows: [evidence]}} = Evidence.CodexParsers.parse_codex_usage_result(payload, at)
+        assert {:ok, _} = QuotaWindows.EvidenceStore.record_evidence(identity, Evidence.to_window_attrs(evidence), at, at)
+      end
+
+      window = Repo.one!(from window in AccountQuotaWindow, where: window.upstream_identity_id == ^identity.id)
+      assert window.metadata["reset_state"] == "floating"
+      assert DateTime.compare(window.reset_at, DateTime.add(t0, 18_000, :second)) == :eq
+
+      for offset <- [241, 901, 1141] do
+        row = QuotaProjection.quota_limit_rows([window], preferences, DateTime.add(t0, offset, :second)) |> Enum.find(&(&1.key == :primary_5h))
+        assert row.reset_semantics == :floating
+        assert row.reset_display_state == :static
+        assert row.reset_label == "starts on use"
+        assert row.permission_facts == %{allowed: allowed, limit_reached: not allowed}
+      end
+    end
+  end
+
   @tag :quota_projection
   test "keeps a valid post-consume candidate visible when the effective fold selects another source" do
     consumed_at = DateTime.add(@snapshot_at, -5, :minute)
@@ -53,60 +87,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
              @snapshot_at
            ) == %{
              confirmation_state: :awaiting_confirmation,
-             challenged_evidence_state: :candidate_progressing,
-             additional_account_blocker_state: :none,
-             observed_at: DateTime.add(@snapshot_at, -60, :second)
+             challenged_evidence_state: :candidate_progressing
            }
-  end
-
-  @tag :quota_projection
-  test "uses fixed additional-account blocker precedence independent of input order" do
-    consumed_at = DateTime.add(@snapshot_at, -5, :minute)
-
-    challenged =
-      account_window(
-        window_kind: "secondary",
-        window_minutes: 10_080,
-        used_percent: Decimal.new("100"),
-        reset_at: DateTime.add(@snapshot_at, 6, :day),
-        observed_at: @snapshot_at,
-        metadata: candidate_metadata(@snapshot_at)
-      )
-
-    reset_missing =
-      account_window(
-        window_kind: "primary",
-        window_minutes: 300,
-        used_percent: Decimal.new("10"),
-        reset_at: nil,
-        observed_at: @snapshot_at
-      )
-
-    expired =
-      account_window(
-        window_kind: "primary",
-        window_minutes: 43_200,
-        used_percent: Decimal.new("10"),
-        reset_at: DateTime.add(@snapshot_at, -1, :second),
-        observed_at: @snapshot_at
-      )
-
-    for effective_windows <- [
-          [challenged, expired, reset_missing],
-          [reset_missing, challenged, expired],
-          [expired, reset_missing, challenged]
-        ] do
-      projection =
-        QuotaProjection.saved_reset_confirmation(
-          redemption("consumed_pending_probe", consumed_at),
-          [challenged],
-          effective_windows,
-          @snapshot_at
-        )
-
-      assert projection.challenged_evidence_state == :candidate_progressing
-      assert projection.additional_account_blocker_state == :reset_missing
-    end
   end
 
   @tag :quota_projection
@@ -152,13 +134,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         )
 
       assert projection.challenged_evidence_state == :exhausted
-      assert projection.additional_account_blocker_state == :unknown_unusable
       refute inspect(projection) =~ raw_sentinel
     end
   end
 
   @tag :quota_projection
-  test "keeps model-scoped exhaustion outside both account evidence dimensions" do
+  test "keeps model-scoped exhaustion outside the challenged account evidence" do
     consumed_at = DateTime.add(@snapshot_at, -5, :minute)
 
     challenged =
@@ -189,7 +170,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
       )
 
     assert projection.challenged_evidence_state == :candidate_progressing
-    assert projection.additional_account_blocker_state == :none
   end
 
   @tag :quota_projection
@@ -215,7 +195,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
       assert projection.confirmation_state == confirmation_state
       assert projection.challenged_evidence_state == :absent
-      assert projection.additional_account_blocker_state == :none
     end
 
     assert QuotaProjection.saved_reset_confirmation(
@@ -689,17 +668,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         identity_observability(
           now,
           [
-            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -120,
-              code: "quota_refresh_unavailable"
-            ),
+            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -120, code: "quota_refresh_unavailable"),
             reconciliation_assignment("00000000-0000-0000-0000-000000000002", "succeeded", 60),
             reconciliation_assignment("00000000-0000-0000-0000-000000000003", "refreshing", -10),
-            reconciliation_assignment("00000000-0000-0000-0000-000000000004", "failed", -5,
-              finished_at: "malformed"
-            ),
-            reconciliation_assignment("00000000-0000-0000-0000-000000000005", "succeeded", -1,
-              assignment_status: "deleted"
-            )
+            reconciliation_assignment("00000000-0000-0000-0000-000000000004", "failed", -5, finished_at: "malformed"),
+            reconciliation_assignment("00000000-0000-0000-0000-000000000005", "succeeded", -1, assignment_status: "deleted")
           ]
         )
 
@@ -715,9 +688,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         identity_observability(
           now,
           [
-            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -60,
-              code: "quota_refresh_failed"
-            ),
+            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -60, code: "quota_refresh_failed"),
             reconciliation_assignment("00000000-0000-0000-0000-000000000002", "succeeded", -60)
           ]
         )
@@ -1126,12 +1097,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     assert Decimal.equal?(primary.percent, Decimal.new("97"))
     assert primary.percent_value == 97
     assert primary.percent_label == "97%"
-    assert primary.count_label == "601 credits"
-
-    assert primary.count_title ==
-             "601 credits. Credit balance is separate from included Codex quota remaining; it is not a currency amount."
-
-    refute primary.burning_credits
+    assert primary.count_label == nil
+    assert primary.count_title == nil
     assert primary.reset_label == nil
   end
 
@@ -1160,12 +1127,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     assert Decimal.equal?(primary.percent, Decimal.new("0"))
     assert primary.percent_value == 0
     assert primary.percent_label == "0%"
-    assert primary.count_label == "0 credits"
-
-    assert primary.count_title ==
-             "0 credits. Credit balance is depleted; it is not a currency amount or a total capacity."
-
-    refute primary.burning_credits
+    assert primary.count_label == nil
+    assert primary.count_title == nil
   end
 
   @tag :quota_account_projection
@@ -1192,8 +1155,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
     assert is_nil(secondary.count_label)
     assert is_nil(secondary.count_title)
-
-    refute secondary.burning_credits
   end
 
   @tag :quota_spark_projection
@@ -1251,9 +1212,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
     rows =
       [
-        spark_window("secondary", 10_080, observed_at,
-          metadata: %{"reset_state" => "floating", "reset_after_seconds" => 604_800}
-        )
+        spark_window("secondary", 10_080, observed_at, metadata: %{"reset_state" => "floating", "reset_after_seconds" => 604_800})
       ]
       |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
 
@@ -1458,6 +1417,153 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     assert reserve_row.meter_state == :historical
     assert reserve_row.evidence_state == :stale
     assert reserve_row.percent_value == 100
+  end
+
+  test "marks a retained exhausted measurement with newer safe provider evidence as pending confirmation" do
+    selected_observed_at = DateTime.add(@snapshot_at, -2, :minute)
+    candidate_observed_at = DateTime.add(@snapshot_at, -1, :minute)
+    reset_at = DateTime.add(@snapshot_at, 6, :day)
+
+    selected =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: reset_at,
+        observed_at: selected_observed_at,
+        metadata: %{
+          "__quota_confirmed_candidate_v1" => %{
+            "version" => 1,
+            "used_percent" => "32",
+            "reset_at" => DateTime.to_iso8601(reset_at),
+            "observed_at" => DateTime.to_iso8601(candidate_observed_at),
+            "count" => 1
+          },
+          "__quota_candidate_provider_status_v1" => %{
+            "version" => 1,
+            "allowed" => true,
+            "limit_reached" => false,
+            "observed_at" => DateTime.to_iso8601(candidate_observed_at)
+          }
+        }
+      )
+
+    stale_runtime =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_rate_limit_event",
+        used_percent: Decimal.new("32"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@snapshot_at, -1, :hour)
+      )
+
+    stale_headers =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_response_headers",
+        used_percent: Decimal.new("31"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@snapshot_at, -2, :hour)
+      )
+
+    rows =
+      QuotaProjection.quota_limit_rows(
+        [selected],
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at,
+        [selected, stale_runtime, stale_headers]
+      )
+
+    weekly = Enum.find(rows, &(&1.key == :weekly))
+
+    assert weekly.percent_label == "0%"
+    assert weekly.measurement_pending? == true
+
+    assert weekly.measurement_pending_label == "Retained measurement awaits confirmation"
+
+    assert weekly.measurement_pending_detail ==
+             "Retained measurement; newer provider measurement awaits confirmation"
+
+    assert weekly.permission_facts == %{allowed: true, limit_reached: false}
+
+    assert Enum.map(weekly.observations, &{&1.source, &1.remaining, &1.selected?}) == [
+             {"Usage API", "0%", true},
+             {"Rate-limit event", "68%", false},
+             {"Response headers", "69%", false}
+           ]
+  end
+
+  @tag :quota_projection
+  test "keeps consistent and incomplete permission evidence free of a false measurement-pending state" do
+    observed_at = @snapshot_at
+
+    for {metadata, used_percent} <- [
+          {%{"rate_limit_allowed" => false, "rate_limit_reached" => true}, "100"},
+          {%{"rate_limit_allowed" => true, "rate_limit_reached" => false}, "45"},
+          {%{"rate_limit_allowed" => true}, "100"},
+          {%{"rate_limit_reached" => false}, "100"},
+          {%{}, "100"}
+        ] do
+      [weekly] =
+        QuotaProjection.quota_limit_rows(
+          [
+            account_window(
+              window_kind: "secondary",
+              window_minutes: 10_080,
+              used_percent: Decimal.new(used_percent),
+              reset_at: DateTime.add(observed_at, 6, :day),
+              observed_at: observed_at,
+              metadata: metadata
+            )
+          ],
+          DateTimeDisplay.preferences_for_user(nil),
+          observed_at
+        )
+        |> Enum.filter(&(&1.key == :weekly))
+
+      refute weekly.measurement_pending?
+    end
+  end
+
+  @tag :quota_projection
+  test "current usable identity quota overrides a historical failed priming status only for a routable assignment" do
+    historical_failure = %{
+      status: "active",
+      health_status: "active",
+      eligibility_status: "eligible",
+      metadata: %{
+        "quota_priming" => %{"status" => "failed", "reason" => %{"code" => "upstream_status_503"}}
+      }
+    }
+
+    assert %{quota_priming_status: "weekly_only_probe", quota_priming_label: "Weekly-only probe"} =
+             QuotaProjection.put_current_quota_priming(historical_failure, %{
+               state: "weekly_only_probe",
+               routing_ready_now?: true
+             })
+
+    for assignment <- [
+          %{historical_failure | status: "disabled"},
+          %{historical_failure | health_status: "degraded"},
+          %{historical_failure | eligibility_status: "ineligible"}
+        ] do
+      assert %{quota_priming_status: "failed", quota_priming_label: "Quota failed"} =
+               QuotaProjection.put_current_quota_priming(assignment, %{
+                 state: "weekly_only_probe",
+                 routing_ready_now?: true
+               })
+    end
+
+    for readiness <- [
+          %{state: "exhausted", routing_ready_now?: false},
+          %{state: "stale", routing_ready_now?: false},
+          %{state: "missing_evidence", routing_ready_now?: false}
+        ] do
+      assert %{quota_priming_status: "failed", quota_priming_label: "Quota failed"} =
+               QuotaProjection.put_current_quota_priming(historical_failure, readiness)
+    end
   end
 
   defp account_window(attrs) do

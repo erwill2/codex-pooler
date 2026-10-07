@@ -14,10 +14,119 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     {"null", nil}
   ]
 
+  test "SSE raw tool obligations reject completed done and DONE across chunk and newline boundaries" do
+    added = %{"type" => "response.output_item.added", "output_index" => 0, "item" => %{"id" => "tool_integrity", "type" => "function_call", "call_id" => "call_integrity", "name" => "lookup", "arguments" => ""}}
+
+    for terminal <- [sse_event("response.completed", completed("resp_integrity")), sse_event("response.done", done("resp_integrity")), "data: [DONE]\n\n"],
+        separator <- ["\n", "\r\n", "\r"] do
+      source = IO.iodata_to_binary([sse_event("response.output_item.added", added), terminal, sse_event("response.completed", completed("resp_late"))]) |> String.replace("\n", separator)
+
+      {wire, state} =
+        source
+        |> :binary.bin_to_list()
+        |> Enum.reduce({"", StreamProtocol.public_openai_responses_stream_state()}, fn byte, {wire, state} ->
+          {chunk, state} = StreamProtocol.normalize_public_openai_responses_sse_data(<<byte>>, state)
+          {wire <> chunk, state}
+        end)
+
+      events = public_events(wire)
+      assert Enum.map(events, & &1.event) == ["response.output_item.added", "error"]
+      assert state.terminal_kind == :failed
+      assert state.terminal_failure.code == "upstream_stream_error"
+      assert state.terminal_failure.tool_completion_reason == :incomplete_tool_item
+      assert state.sequence.terminal_latched?
+      assert List.last(events).data["error"]["code"] == "server_error"
+      refute wire =~ "incomplete_tool_item"
+    end
+  end
+
+  test "SSE observes raw IDs and indices before fallback normalization and resets per request" do
+    item = %{"id" => "tool_raw", "type" => "custom_tool_call", "call_id" => "call_raw", "name" => "lookup", "input" => ""}
+    added = %{"type" => "response.output_item.added", "output_index" => 0, "item" => item}
+
+    for changed <- [
+          Map.delete(added, "output_index"),
+          Map.put(added, "output_index", "0"),
+          Map.put(added, "item_id", "different"),
+          Map.put(added, "item", Map.drop(item, ["id", "call_id"]))
+        ] do
+      {wire, state} = normalize_sse([sse_event("response.output_item.added", changed), sse_event("response.completed", completed("resp_raw"))])
+      assert List.last(public_events(wire)).event == "error"
+      assert state.terminal_failure.tool_completion_reason == :invalid_tool_correlation
+    end
+
+    {wire, state} = normalize_sse(sse_event("response.completed", completed("resp_fresh")))
+    assert List.last(public_events(wire)).event == "response.completed"
+    assert state.terminal_kind == :completed
+  end
+
+  test "SSE preserves provider non-success with pending tools" do
+    added = %{"type" => "response.output_item.added", "output_index" => 0, "item" => %{"id" => "tool_pending", "type" => "function_call", "call_id" => "call_pending", "name" => "lookup", "arguments" => ""}}
+
+    for type <- ["response.failed", "response.incomplete"] do
+      terminal = %{"type" => type, "response" => %{"id" => "resp_non_success", "status" => String.replace_prefix(type, "response.", "")}}
+      terminal = if type == "response.failed", do: put_in(terminal, ["response", "error"], %{"code" => "upstream_stream_error", "message" => "synthetic failure"}), else: put_in(terminal, ["response", "incomplete_details"], %{"reason" => "max_output_tokens"})
+      {wire, state} = normalize_sse([sse_event("response.output_item.added", added), sse_event(type, terminal)])
+      assert List.last(public_events(wire)).event == type
+      refute Map.has_key?(state.terminal_failure || %{}, :tool_completion_reason)
+    end
+  end
+
+  test "SSE healthy done chunks retain tools unknown events and terminal-only snapshots" do
+    item = %{"id" => "tool_healthy", "type" => "custom_tool_call", "call_id" => "call_healthy", "name" => "lookup", "input" => ""}
+    added = %{"type" => "response.output_item.added", "output_index" => 0, "item" => item}
+    done_item = %{"type" => "response.output_item.done", "output_index" => 0, "item" => item}
+    unknown = %{"type" => "response.future_tool_metadata", "output_index" => 0}
+
+    for separator <- ["\n", "\r\n", "\r"] do
+      source = [sse_event("response.output_item.added", added), sse_event("response.future_tool_metadata", unknown), sse_event("response.output_item.done", done_item), sse_event("response.done", done("resp_valid_chunks"))] |> IO.iodata_to_binary() |> String.replace("\n", separator)
+
+      {wire, state} =
+        source
+        |> :binary.bin_to_list()
+        |> Enum.reduce({"", StreamProtocol.public_openai_responses_stream_state()}, fn byte, {wire, state} ->
+          {chunk, state} = StreamProtocol.normalize_public_openai_responses_sse_data(<<byte>>, state)
+          {wire <> chunk, state}
+        end)
+
+      assert Enum.map(public_events(wire), & &1.event) == ["response.output_item.added", "response.future_tool_metadata", "response.output_item.done", "response.created", "response.completed"]
+      assert state.terminal_kind == :completed
+    end
+
+    {wire, state} = normalize_sse("data: [DONE]\n\n")
+    assert wire == ""
+    assert state.terminal_kind == :completed
+    terminal = put_in(completed("resp_snapshot"), ["response", "output"], [%{"type" => "function_call", "name" => "lookup", "arguments" => "{}"}])
+    {wire, state} = normalize_sse(sse_event("response.completed", terminal))
+    assert List.last(public_events(wire)).event == "response.completed"
+    assert state.terminal_kind == :completed
+  end
+
   @tag :public_terminal_pin
+  test "SSE terminal labels supply a missing JSON type and latch the complete response" do
+    for type <- ["response.completed", "response.incomplete", "response.failed"], separator <- ["", "\n\n"] do
+      status = String.replace_prefix(type, "response.", "")
+      source = "event: " <> type <> "\ndata: " <> CodexPooler.JSON.encode!(%{"response" => %{"id" => "resp_label_only", "status" => status, "output" => []}}) <> separator
+      {wire, state} = normalize_sse(source)
+      assert List.last(public_events(wire)).event == type
+      assert state.sequence.terminal_latched?
+      assert {"", _} = StreamProtocol.normalize_public_openai_responses_sse_data(IO.iodata_to_binary(sse_event("response.completed", completed("resp_late"))), state)
+    end
+  end
+
+  test "public websocket provider anchor miss uses the same typed refusal as HTTP" do
+    frame = %{"type" => "error", "status" => 400, "error" => %{"type" => "invalid_request_error", "message" => "Invalid `previous_response_id`."}}
+    assert {:push, wire, state} = StreamProtocol.normalize_public_openai_responses_websocket_data(CodexPooler.JSON.encode!(frame), StreamProtocol.public_openai_responses_websocket_state())
+    event = CodexPooler.JSON.decode!(wire)
+    assert event["error"]["code"] == "previous_response_not_found"
+    assert event["error"]["param"] == "previous_response_id"
+    assert event["status"] == 400
+    assert state.terminal_latched?
+  end
+
   test "PIN-P01 response.completed remains a completed terminal" do
     frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_pin_completed", "status" => "completed"}
       })
@@ -43,7 +152,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     for {decoded, kind, data_type} <- cases do
       assert {:ok, %{kind: ^kind, data_type: ^data_type}} =
-               decoded |> Jason.encode!() |> StreamProtocol.terminal_outcome()
+               decoded |> CodexPooler.JSON.encode!() |> StreamProtocol.terminal_outcome()
     end
   end
 
@@ -68,7 +177,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     ]
 
     for decoded <- malformed do
-      assert :error = decoded |> Jason.encode!() |> StreamProtocol.terminal_outcome()
+      assert :error = decoded |> CodexPooler.JSON.encode!() |> StreamProtocol.terminal_outcome()
     end
 
     assert :error = StreamProtocol.terminal_outcome(~s({"type":"response.done"))
@@ -134,7 +243,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:drop, ^websocket_state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(malformed),
+               CodexPooler.JSON.encode!(malformed),
                websocket_state
              )
   end
@@ -143,7 +252,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     terminal = completed("resp_public_cr")
 
     source =
-      "event: response.completed\rdata: " <> Jason.encode!(terminal) <> "\r\r"
+      "event: response.completed\rdata: " <> CodexPooler.JSON.encode!(terminal) <> "\r\r"
 
     {output, state} = normalize_sse(source)
 
@@ -166,9 +275,10 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
       |> put_in(["response", "hostile_sibling"], "private-response-sentinel")
 
     for event_line <- ["", "event:\n", "event: \t \n"] do
-      {output, state} = normalize_sse(event_line <> "data: " <> Jason.encode!(failed) <> "\n\n")
+      {output, state} =
+        normalize_sse(event_line <> "data: " <> CodexPooler.JSON.encode!(failed) <> "\n\n")
 
-      assert [%{event: "response.failed", data: decoded}] = public_events(output)
+      assert [%{event: "response.created"}, %{event: "response.failed", data: decoded}] = public_events(output)
       assert decoded["response"]["status"] == "failed"
       assert decoded["response"]["error"]["message"] == "upstream request failed"
       refute output =~ "private-prompt-sentinel"
@@ -188,7 +298,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
       assert late_state.terminal_kind == state.terminal_kind
     end
 
-    mismatch = "event: response.completed\ndata: " <> Jason.encode!(failed) <> "\n\n"
+    mismatch = "event: response.completed\ndata: " <> CodexPooler.JSON.encode!(failed) <> "\n\n"
     {output, state} = normalize_sse(mismatch)
     assert output == ""
     refute state.sequence.terminal_latched?
@@ -219,14 +329,10 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
         end
 
       assert observations == [
-               {:top_level, :sse, %{top_level: fallback, nested: fallback},
-                expected_failed_response(id: "resp_non_map_top_level")},
-               {:top_level, :websocket, %{top_level: fallback, nested: fallback},
-                expected_failed_response(id: "resp_non_map_top_level")},
-               {:nested, :sse, %{top_level: :absent, nested: fallback},
-                expected_failed_response(id: "resp_non_map_nested")},
-               {:nested, :websocket, %{top_level: :absent, nested: fallback},
-                expected_failed_response(id: "resp_non_map_nested")}
+               {:top_level, :sse, %{top_level: fallback, nested: fallback}, expected_failed_response(id: "resp_non_map_top_level")},
+               {:top_level, :websocket, %{top_level: fallback, nested: fallback}, expected_failed_response(id: "resp_non_map_top_level")},
+               {:nested, :sse, %{top_level: :absent, nested: fallback}, expected_failed_response(id: "resp_non_map_nested")},
+               {:nested, :websocket, %{top_level: :absent, nested: fallback}, expected_failed_response(id: "resp_non_map_nested")}
              ]
     end
   end
@@ -290,6 +396,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     end
   end
 
+  @tag slow: "feeds actual 64 MiB terminal and 8 MiB ordinary overflow buffers through the public SSE classifier"
   test "public POST overflow telemetry records the applicable incomplete buffer limit" do
     handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
     test_pid = self()
@@ -299,10 +406,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
       :telemetry.attach(
         handler_id,
         event,
-        fn ^event,
-           %{bytes: bytes, count: count, max_bytes: max_bytes},
-           %{buffer: buffer},
-           ^test_pid ->
+        fn ^event, %{bytes: bytes, count: count, max_bytes: max_bytes}, %{buffer: buffer}, ^test_pid ->
           if self() == test_pid do
             send(test_pid, {
               handler_id,
@@ -521,8 +625,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
   test "public POST and GET latch completed then done and duplicate failed only once" do
     cases = [
       {completed("resp_completed_first"), done("resp_done_second"), "response.completed"},
-      {failed_without_nested_code("resp_failed_first"),
-       failed_without_nested_code("resp_failed_second"), "response.failed"}
+      {failed_without_nested_code("resp_failed_first"), failed_without_nested_code("resp_failed_second"), "response.failed"}
     ]
 
     for {first, second, expected_type} <- cases do
@@ -542,15 +645,15 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
       assert {:push, first_payload, websocket_state} =
                StreamProtocol.normalize_public_openai_responses_websocket_data(
-                 Jason.encode!(first),
+                 CodexPooler.JSON.encode!(first),
                  websocket_state
                )
 
-      assert Jason.decode!(first_payload)["type"] == expected_type
+      assert CodexPooler.JSON.decode!(first_payload)["type"] == expected_type
 
       assert {:drop, ^websocket_state} =
                StreamProtocol.normalize_public_openai_responses_websocket_data(
-                 Jason.encode!(second),
+                 CodexPooler.JSON.encode!(second),
                  websocket_state
                )
 
@@ -577,11 +680,11 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:push, done_payload, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(done("resp_ws_done")),
+               CodexPooler.JSON.encode!(done("resp_ws_done")),
                state
              )
 
-    assert Jason.decode!(done_payload) == %{
+    assert CodexPooler.JSON.decode!(done_payload) == %{
              "type" => "response.completed",
              "sequence_number" => 0,
              "response" => %{
@@ -592,7 +695,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(completed("resp_ws_late")),
+               CodexPooler.JSON.encode!(completed("resp_ws_late")),
                state
              )
 
@@ -601,11 +704,11 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:push, legacy_payload, _fresh_state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(legacy),
+               CodexPooler.JSON.encode!(legacy),
                fresh
              )
 
-    assert Jason.decode!(legacy_payload) == %{
+    assert CodexPooler.JSON.decode!(legacy_payload) == %{
              "type" => "response.completed",
              "sequence_number" => 0,
              "response" => Map.put(legacy, "status", "completed")
@@ -615,10 +718,10 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
   test "public websocket drops invalid JSON and JSON non-objects without advancing state" do
     invalid_frames = [
       "{",
-      Jason.encode!("string"),
-      Jason.encode!([]),
-      Jason.encode!(42),
-      Jason.encode!(nil)
+      CodexPooler.JSON.encode!("string"),
+      CodexPooler.JSON.encode!([]),
+      CodexPooler.JSON.encode!(42),
+      CodexPooler.JSON.encode!(nil)
     ]
 
     for frame <- invalid_frames do
@@ -629,11 +732,11 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
       assert {:push, payload, next_state} =
                StreamProtocol.normalize_public_openai_responses_websocket_data(
-                 Jason.encode!(response_event_map("response.created")),
+                 CodexPooler.JSON.encode!(response_event_map("response.created")),
                  state
                )
 
-      assert Jason.decode!(payload)["sequence_number"] == 0
+      assert CodexPooler.JSON.decode!(payload)["sequence_number"] == 0
       assert next_state.max_seen == 0
       refute next_state.terminal_latched?
     end
@@ -641,16 +744,11 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
   test "public websocket without a stream ID preserves normalized events, sequences, and malformed drops" do
     cases = [
-      {response_event_map("response.created") |> Map.put("sequence_number", 7),
-       "response.created"},
-      {%{"type" => "response.output_text.delta", "delta" => "safe delta", "sequence_number" => 7},
-       "response.output_text.delta"},
-      {completed("resp_no_stream_completed") |> Map.put("sequence_number", 7),
-       "response.completed"},
-      {failed_without_nested_code("resp_no_stream_failed") |> Map.put("sequence_number", 7),
-       "response.failed"},
-      {incomplete("resp_no_stream_incomplete", nil) |> Map.put("sequence_number", 7),
-       "response.incomplete"}
+      {response_event_map("response.created") |> Map.put("sequence_number", 7), "response.created"},
+      {%{"type" => "response.output_text.delta", "delta" => "safe delta", "sequence_number" => 7}, "response.output_text.delta"},
+      {completed("resp_no_stream_completed") |> Map.put("sequence_number", 7), "response.completed"},
+      {failed_without_nested_code("resp_no_stream_failed") |> Map.put("sequence_number", 7), "response.failed"},
+      {incomplete("resp_no_stream_incomplete", nil) |> Map.put("sequence_number", 7), "response.incomplete"}
     ]
 
     for {event, expected_type} <- cases do
@@ -660,11 +758,11 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
       assert {:push, wire, state} =
                StreamProtocol.normalize_public_openai_responses_websocket_data(
-                 Jason.encode!(event),
+                 CodexPooler.JSON.encode!(event),
                  state
                )
 
-      decoded = Jason.decode!(wire)
+      decoded = CodexPooler.JSON.decode!(wire)
 
       assert decoded["type"] == expected_type
       assert decoded["sequence_number"] == 7
@@ -676,7 +774,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(%{
+               CodexPooler.JSON.encode!(%{
                  "type" => "response.completed",
                  "response" => %{"id" => "resp_no_stream_malformed", "status" => "failed"}
                }),
@@ -685,14 +783,14 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:push, wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(
+               CodexPooler.JSON.encode!(
                  response_event_map("response.created")
                  |> Map.put("sequence_number", 0)
                ),
                state
              )
 
-    assert Jason.decode!(wire)["sequence_number"] == 0
+    assert CodexPooler.JSON.decode!(wire)["sequence_number"] == 0
     refute state.terminal_latched?
   end
 
@@ -707,30 +805,26 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:push, wire, _state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(event),
+               CodexPooler.JSON.encode!(event),
                state
              )
 
-    assert Jason.decode!(wire) == Map.put(event, "stream_id", "stream-echo-1")
+    assert CodexPooler.JSON.decode!(wire) == Map.put(event, "stream_id", "stream-echo-1")
   end
 
   test "public websocket stream ID decoration preserves normalized created, delta, and terminal events" do
     stream_id = "stream-echo-2"
 
     cases = [
-      {response_event_map("response.created") |> Map.put("sequence_number", 11),
-       "response.created"},
+      {response_event_map("response.created") |> Map.put("sequence_number", 11), "response.created"},
       {%{
          "type" => "response.output_text.delta",
          "delta" => "safe delta",
          "sequence_number" => 11
        }, "response.output_text.delta"},
-      {completed("resp_stream_completed") |> Map.put("sequence_number", 11),
-       "response.completed"},
-      {failed_without_nested_code("resp_stream_failed") |> Map.put("sequence_number", 11),
-       "response.failed"},
-      {incomplete("resp_stream_incomplete", nil) |> Map.put("sequence_number", 11),
-       "response.incomplete"}
+      {completed("resp_stream_completed") |> Map.put("sequence_number", 11), "response.completed"},
+      {failed_without_nested_code("resp_stream_failed") |> Map.put("sequence_number", 11), "response.failed"},
+      {incomplete("resp_stream_incomplete", nil) |> Map.put("sequence_number", 11), "response.incomplete"}
     ]
 
     for {event, expected_type} <- cases do
@@ -741,18 +835,18 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
       assert {:push, no_id_wire, no_id_state} =
                StreamProtocol.normalize_public_openai_responses_websocket_data(
-                 Jason.encode!(event),
+                 CodexPooler.JSON.encode!(event),
                  no_id_state
                )
 
       assert {:push, with_id_wire, with_id_state} =
                StreamProtocol.normalize_public_openai_responses_websocket_data(
-                 Jason.encode!(event),
+                 CodexPooler.JSON.encode!(event),
                  with_id_state
                )
 
-      no_id_decoded = Jason.decode!(no_id_wire)
-      with_id_decoded = Jason.decode!(with_id_wire)
+      no_id_decoded = CodexPooler.JSON.decode!(no_id_wire)
+      with_id_decoded = CodexPooler.JSON.decode!(with_id_wire)
 
       assert with_id_decoded["type"] == expected_type
       assert with_id_decoded["sequence_number"] == no_id_decoded["sequence_number"]
@@ -774,32 +868,32 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(malformed),
+               CodexPooler.JSON.encode!(malformed),
                state
              )
 
     assert {:push, created_wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(response_event_map("response.created")),
+               CodexPooler.JSON.encode!(response_event_map("response.created")),
                state
              )
 
-    assert Jason.decode!(created_wire)["sequence_number"] == 0
-    assert Jason.decode!(created_wire)["stream_id"] == stream_id
+    assert CodexPooler.JSON.decode!(created_wire)["sequence_number"] == 0
+    assert CodexPooler.JSON.decode!(created_wire)["stream_id"] == stream_id
     refute state.terminal_latched?
 
     assert {:push, completed_wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(completed("resp_stream_terminal")),
+               CodexPooler.JSON.encode!(completed("resp_stream_terminal")),
                state
              )
 
-    assert Jason.decode!(completed_wire)["stream_id"] == stream_id
+    assert CodexPooler.JSON.decode!(completed_wire)["stream_id"] == stream_id
     assert state.terminal_latched?
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(response_event_map("response.created")),
+               CodexPooler.JSON.encode!(response_event_map("response.created")),
                state
              )
   end
@@ -816,17 +910,17 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     native_decoded =
       event
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
       |> Adapter.downstream_response_chunk()
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
 
     assert {:push, decorated_wire, _state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(event),
+               CodexPooler.JSON.encode!(event),
                StreamProtocol.public_openai_responses_websocket_state("stream-echo-4")
              )
 
-    decorated = Jason.decode!(decorated_wire)
+    decorated = CodexPooler.JSON.decode!(decorated_wire)
 
     refute Map.has_key?(sse_decoded, "stream_id")
     refute Map.has_key?(native_decoded, "stream_id")
@@ -843,7 +937,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     assert {:push, wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(raw, state)
 
-    decoded = Jason.decode!(wire)
+    decoded = CodexPooler.JSON.decode!(wire)
 
     assert decoded["type"] == "response.failed"
     assert decoded["response"]["status"] == "failed"
@@ -1088,7 +1182,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
         assert decoded == %{
                  "type" => "response.failed",
-                 "sequence_number" => 0,
+                 "sequence_number" => if(transport == :sse, do: 1, else: 0),
                  "response" => expected_failed_response()
                }
       end
@@ -1103,10 +1197,8 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
       {%{"id" => "resp_valid-id_9"}, expected_failed_response(id: "resp_valid-id_9")},
       {%{"id" => "invalid"}, expected_failed_response()},
       {%{"id" => "resp_" <> String.duplicate("a", 251)}, expected_failed_response()},
-      {%{"incomplete_details" => %{"reason" => "max_output_tokens", "extra" => true}},
-       expected_failed_response(incomplete_details: %{"reason" => "max_output_tokens"})},
-      {%{"incomplete_details" => %{"reason" => "content_filter"}},
-       expected_failed_response(incomplete_details: %{"reason" => "content_filter"})},
+      {%{"incomplete_details" => %{"reason" => "max_output_tokens", "extra" => true}}, expected_failed_response(incomplete_details: %{"reason" => "max_output_tokens"})},
+      {%{"incomplete_details" => %{"reason" => "content_filter"}}, expected_failed_response(incomplete_details: %{"reason" => "content_filter"})},
       {%{"incomplete_details" => %{"reason" => "other"}}, expected_failed_response()},
       {%{"usage" => "invalid"}, expected_failed_response()},
       {%{
@@ -1189,17 +1281,17 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:push, wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(terminal),
+               CodexPooler.JSON.encode!(terminal),
                state
              )
 
-    assert Jason.decode!(wire)["sequence_number"] == 23
+    assert CodexPooler.JSON.decode!(wire)["sequence_number"] == 23
     assert state.max_seen == 23
     assert state.terminal_latched?
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(completed("resp_after_failed")),
+               CodexPooler.JSON.encode!(completed("resp_after_failed")),
                state
              )
   end
@@ -1211,7 +1303,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     nested_extra = "NESTED_PROVIDER_EXTRA_SENTINEL"
 
     raw =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.incomplete",
         "response" => %{
           "id" => "resp_nested_map_error",
@@ -1232,7 +1324,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     assert {:push, wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(raw, state)
 
-    decoded = Jason.decode!(wire)
+    decoded = CodexPooler.JSON.decode!(wire)
 
     assert decoded["type"] == "response.failed"
     assert decoded["response"]["status"] == "failed"
@@ -1255,7 +1347,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(completed("resp_after_nested_map_error")),
+               CodexPooler.JSON.encode!(completed("resp_after_nested_map_error")),
                state
              )
   end
@@ -1267,7 +1359,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     top_extra = "TOP_PROVIDER_EXTRA_SENTINEL"
 
     raw =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "error" => %{
           "code" => "unsafe/code",
@@ -1284,7 +1376,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     assert {:push, wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(raw, state)
 
-    decoded = Jason.decode!(wire)
+    decoded = CodexPooler.JSON.decode!(wire)
 
     assert decoded["type"] == "response.failed"
     assert decoded["response"]["status"] == "failed"
@@ -1314,7 +1406,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     nested_extra = "MISSING_CODE_PROVIDER_EXTRA_SENTINEL"
 
     raw =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "response" => %{
           "id" => "resp_nested_missing_code",
@@ -1333,7 +1425,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
     assert {:push, wire, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(raw, state)
 
-    decoded = Jason.decode!(wire)
+    decoded = CodexPooler.JSON.decode!(wire)
 
     assert decoded == %{
              "response" => expected_failed_response(id: "resp_nested_missing_code"),
@@ -1356,7 +1448,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
       StreamProtocol.public_openai_responses_websocket_state()
       |> Map.put(:max_seen, max_safe - 1)
 
-    nonterminal = Jason.encode!(%{"type" => "keepalive"})
+    nonterminal = CodexPooler.JSON.encode!(%{"type" => "keepalive"})
 
     assert {:error, reason, state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(nonterminal, state)
@@ -1370,7 +1462,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     assert {:drop, ^state} =
              StreamProtocol.normalize_public_openai_responses_websocket_data(
-               Jason.encode!(completed("resp_ws_after_overflow")),
+               CodexPooler.JSON.encode!(completed("resp_ws_after_overflow")),
                state
              )
   end
@@ -1384,7 +1476,7 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
   defp normalize_public_wire(:sse, terminal) do
     {wire, _state} = normalize_sse(sse_event("response.failed", terminal))
-    [%{event: "response.failed", data: decoded}] = public_events(wire)
+    [%{event: "response.created"}, %{event: "response.failed", data: decoded}] = public_events(wire)
     {wire, decoded}
   end
 
@@ -1393,11 +1485,11 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
 
     {:push, wire, _state} =
       StreamProtocol.normalize_public_openai_responses_websocket_data(
-        Jason.encode!(terminal),
+        CodexPooler.JSON.encode!(terminal),
         state
       )
 
-    {wire, Jason.decode!(wire)}
+    {wire, CodexPooler.JSON.decode!(wire)}
   end
 
   defp normalize_completed_public_wire(:sse, terminal) do
@@ -1552,10 +1644,10 @@ defmodule CodexPooler.Gateway.Transports.PublicResponsesTerminalTest do
   end
 
   defp sse_event(type, decoded) do
-    ["event: ", type, "\n", "data: ", Jason.encode!(decoded), "\n\n"]
+    ["event: ", type, "\n", "data: ", CodexPooler.JSON.encode!(decoded), "\n\n"]
   end
 
-  defp sse_data(decoded), do: ["data: ", Jason.encode!(decoded), "\n\n"]
+  defp sse_data(decoded), do: ["data: ", CodexPooler.JSON.encode!(decoded), "\n\n"]
 
   defp public_events(output) do
     output

@@ -19,6 +19,9 @@ defmodule CodexPooler.MCP.MetadataSanitizer do
     provider_message
     raw_anchor
     typed_state
+    usage_poll_cooldown_v1
+    quota_capacity_facts
+    quota_capacity_blocker
     websocket_frame
     websocket_owner_request_v2
   ))

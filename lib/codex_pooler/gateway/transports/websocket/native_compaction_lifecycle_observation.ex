@@ -25,15 +25,25 @@ defmodule CodexPooler.Gateway.Transports.Websocket.NativeCompactionLifecycleObse
     :binding_mismatch,
     :expired,
     :invalid_input,
+    :invalid,
+    :replayed,
     :owner_unavailable,
     :request_rejected,
     :connection_invalidated,
     :connection_closed,
-    :final_success,
     :final_failure,
     :compact_failure,
     :send_failure,
-    :caller_exit
+    :caller_exit,
+    :downstream_detached,
+    :downstream_cancelled,
+    :owner_drained,
+    :stale_owner,
+    :upstream_exited,
+    :capability_rejected,
+    :send_witness_rejected,
+    :handoff_timeout,
+    :replay_retired
   ]
   @phases [
     :ordinary_success,
@@ -69,15 +79,25 @@ defmodule CodexPooler.Gateway.Transports.Websocket.NativeCompactionLifecycleObse
           | :binding_mismatch
           | :expired
           | :invalid_input
+          | :invalid
+          | :replayed
           | :owner_unavailable
           | :request_rejected
           | :connection_invalidated
           | :connection_closed
-          | :final_success
           | :final_failure
           | :compact_failure
           | :send_failure
           | :caller_exit
+          | :downstream_detached
+          | :downstream_cancelled
+          | :owner_drained
+          | :stale_owner
+          | :upstream_exited
+          | :capability_rejected
+          | :send_witness_rejected
+          | :handoff_timeout
+          | :replay_retired
           | :unknown
   @type topology :: :direct | :forwarded | :unknown
   @type t :: %{
@@ -90,6 +110,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.NativeCompactionLifecycleObse
           generation: pos_integer() | nil,
           downstream_epoch: non_neg_integer() | nil
         }
+
+  @doc "Fixed operation vocabulary; any other value is observed as `:unknown`."
+  @spec operations() :: [operation()]
+  def operations, do: @operations
+
+  @doc "Fixed reason vocabulary; any other value is observed as `:unknown`."
+  @spec reasons() :: [reason()]
+  def reasons, do: @reasons
+
+  @doc "Admission phases; `:cleared` is also reported when there was no admission."
+  @spec phases() :: [Admission.phase()]
+  def phases, do: @phases
 
   @spec observe(Admission.t() | nil, Admission.t() | nil, operation(), reason(), topology()) ::
           t()

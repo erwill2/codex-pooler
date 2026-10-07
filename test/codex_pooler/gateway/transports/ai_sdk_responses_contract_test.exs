@@ -133,7 +133,7 @@ defmodule CodexPooler.Gateway.Transports.AISDKResponsesContractTest do
                StreamProtocol.public_openai_responses_stream_state()
              )
 
-    assert [relayed_event] = sse_events(relayed_failed)
+    assert [%{"type" => "response.created"}, relayed_event] = sse_events(relayed_failed)
 
     assert relayed_event == %{
              "type" => "response.failed",
@@ -194,12 +194,12 @@ defmodule CodexPooler.Gateway.Transports.AISDKResponsesContractTest do
     |> String.split("\n\n", trim: true)
     |> Enum.map(fn block ->
       "data: " <> data = Enum.find(String.split(block, "\n"), &String.starts_with?(&1, "data: "))
-      Jason.decode!(data)
+      CodexPooler.JSON.decode!(data)
     end)
   end
 
   defp sse_event(type, data) do
-    "event: #{type}\ndata: #{Jason.encode!(data)}\n\n"
+    "event: #{type}\ndata: #{CodexPooler.JSON.encode!(data)}\n\n"
   end
 
   defp public_responses_stream_opts do

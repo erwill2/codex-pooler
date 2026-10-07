@@ -23,6 +23,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OpenAICompatibility.Responses, as: ResponsesCompat
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Payloads.CompactionTrigger
   alias CodexPooler.Gateway.Transports.Admission
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
@@ -35,12 +36,41 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     RoutingCircuitState
   }
 
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Pools.ModelServingOverride
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Runtime.BackendCodexTestSupport
 
   @websocket_frame_timeout 2_000
+
+  for mode <- ~w(full lite) do
+    @tag :access_programs
+    test "public websocket preserves access programs in #{mode}" do
+      upstream = start_upstream(completed_websocket_response("access_programs"))
+      setup = gateway_setup(upstream)
+      put_public_model_serving_mode!(setup, unquote(mode))
+      port = start_public_endpoint!()
+      {conn, websocket, ref} = public_v1_websocket_connect!(port, setup, "access-programs-#{System.unique_integer([:positive])}")
+
+      try do
+        baseline = settled_post_upgrade_counts!(upstream)
+        {conn, websocket} = send_response_create!(conn, websocket, ref, setup, %{"input" => "synthetic invalid request", "access_programs" => %{"cyber" => "unknown"}})
+        {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+        assert %{"type" => "error", "status" => 400, "error" => %{"code" => "invalid_request", "param" => "access_programs.cyber"}} = CodexPooler.JSON.decode!(frame)
+        assert lifecycle_counts(upstream) == baseline
+
+        for value <- ~w(standard daybreak_blue daybreak_red), reduce: {conn, websocket} do
+          {conn, websocket} ->
+            {conn, websocket} = send_response_create!(conn, websocket, ref, setup, %{"input" => "synthetic access program request", "access_programs" => %{"cyber" => value}})
+            {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+            assert List.last(frames)["type"] == "response.completed"
+            assert List.last(FakeUpstream.requests(upstream)).json["access_programs"] == %{"cyber" => value}
+            {conn, websocket}
+        end
+      after
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
 
   test "public websocket helper preserves every co-decoded Mint text frame in FIFO order" do
     websocket = %Mint.WebSocket{}
@@ -120,6 +150,191 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert attempt.response_metadata["prompt_cache_controls_downgraded"] == true
       refute Map.has_key?(request.request_metadata, "prompt_cache_controls_downgraded")
       conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  # codex issue 46632: the provider answered `gpt-6-astra` with a response
+  # object declaring `gpt-5.6-luna`. The attempt keeps the model it sent and
+  # the one the first lifecycle event declared, so the substitution is visible.
+  test "GET /v1/responses websocket records the model the upstream declared it served" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.created",
+             %{
+               "type" => "response.created",
+               "response" => %{
+                 "id" => "resp_v1_websocket_served",
+                 "status" => "in_progress",
+                 "model" => "gpt-served-variant",
+                 "output" => []
+               }
+             }},
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_v1_websocket_served",
+                 "status" => "completed",
+                 "model" => "gpt-served-variant",
+                 "output" => [],
+                 "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+
+    {conn, websocket, ref} =
+      public_v1_websocket_connect!(
+        port,
+        setup,
+        "served-model-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      {conn, websocket} =
+        send_response_create!(conn, websocket, ref, setup, %{
+          "input" => "synthetic served model websocket request"
+        })
+
+      {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+      assert Enum.map(frames, & &1["type"]) == ["response.created", "response.completed"]
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["model"] == setup.model.upstream_model_id
+
+      assert_receive {Events,
+                      %{
+                        reason: "request_finalized",
+                        payload: %{"status" => "succeeded"}
+                      }},
+                     @websocket_frame_timeout
+
+      assert [request] =
+               Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
+
+      assert request.requested_model == setup.model.exposed_model_id
+
+      assert [attempt] =
+               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^request.id))
+
+      assert attempt.transport == "websocket"
+      assert attempt.status == "succeeded"
+      assert attempt.upstream_model_id == setup.model.upstream_model_id
+      assert attempt.served_model == "gpt-served-variant"
+
+      assert %{items: [log], total: 1} =
+               RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+      assert log.upstream_model == setup.model.upstream_model_id
+      assert log.served_model == "gpt-served-variant"
+      {conn, websocket}
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  # findings#239: the public websocket carries no native controls, so a
+  # provider `headers` object is dropped from every relayed event, top-level
+  # and nested under `response`, not only from the terminal.
+  test "GET /v1/responses websocket relays no provider event header objects" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.created",
+             %{
+               "type" => "response.created",
+               "headers" => %{
+                 "openai-model" => "gpt-event-header-sentinel",
+                 "x-codex-primary-used-percent" => "42"
+               },
+               "response" => %{
+                 "id" => "resp_v1_websocket_event_headers",
+                 "status" => "in_progress",
+                 "output" => [],
+                 "headers" => %{"openai-model" => "gpt-nested-header-sentinel"}
+               }
+             }},
+            {"response.output_text.delta",
+             %{
+               "type" => "response.output_text.delta",
+               "delta" => "hello",
+               "headers" => %{"x-reasoning-included" => "delta-header-sentinel"}
+             }},
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_v1_websocket_event_headers",
+                 "status" => "completed",
+                 "output" => [],
+                 "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+
+    {conn, websocket, ref} =
+      public_v1_websocket_connect!(
+        port,
+        setup,
+        "event-headers-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      {conn, websocket} =
+        send_response_create!(conn, websocket, ref, setup, %{
+          "input" => "synthetic event header websocket request",
+          "stream" => true
+        })
+
+      {conn, websocket, frames} = receive_raw_websocket_until_terminal!(conn, websocket, ref, [])
+      decoded = Enum.map(frames, &CodexPooler.JSON.decode!/1)
+
+      assert Enum.map(decoded, & &1["type"]) == [
+               "response.created",
+               "response.output_text.delta",
+               "response.completed"
+             ]
+
+      for frame <- frames do
+        refute frame =~ ~s("headers")
+        refute frame =~ "-sentinel"
+      end
+
+      for event <- decoded do
+        refute Map.has_key?(event, "headers")
+
+        case event["response"] do
+          %{} = response -> refute Map.has_key?(response, "headers")
+          _absent -> :ok
+        end
+      end
+
+      assert_receive {Events,
+                      %{
+                        reason: "request_finalized",
+                        payload: %{"status" => "succeeded"}
+                      }},
+                     @websocket_frame_timeout
+
+      {conn, websocket}
     after
       Mint.HTTP.close(conn)
     end
@@ -285,7 +500,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                "type" => "error",
                "status" => 503,
                "error" => %{"code" => "no_compatible_backend", "param" => "model"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert FakeUpstream.count(upstream) == 0
       assert Repo.aggregate(Attempt, :count) == 0
@@ -331,7 +546,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           conn,
           websocket,
           ref,
-          Jason.encode!(programmatic_replay_payload(setup))
+          CodexPooler.JSON.encode!(programmatic_replay_payload(setup))
         )
 
       {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
@@ -339,6 +554,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert Enum.map(frames, & &1["type"]) == [
                "response.output_item.added",
                "response.output_item.added",
+               "response.output_item.done",
                "response.completed"
              ]
 
@@ -379,19 +595,15 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert get_in(captured.json, ["input", Access.at(1), "caller", "type"]) == "program"
       assert get_in(captured.json, ["input", Access.at(2), "caller", "type"]) == "direct"
 
-      assert captured.json["tools"] |> Enum.map(& &1["type"]) == [
-               "programmatic_tool_calling",
-               "function"
-             ]
+      assert captured.json["tools"] |> Enum.map(& &1["type"]) == ["function"]
+      refute Map.has_key?(captured.json, "tool_choice")
 
-      assert captured.json["tool_choice"]["type"] == "programmatic_tool_calling"
-
-      assert get_in(captured.json, ["tools", Access.at(1), "allowed_callers"]) == [
+      assert get_in(captured.json, ["tools", Access.at(0), "allowed_callers"]) == [
                "direct",
                "programmatic"
              ]
 
-      assert is_map(get_in(captured.json, ["tools", Access.at(1), "output_schema"]))
+      assert is_map(get_in(captured.json, ["tools", Access.at(0), "output_schema"]))
 
       assert_receive {Events,
                       %{
@@ -421,9 +633,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
              ) == 1
 
       persistence_text =
-        inspect(
-          {request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)}
-        )
+        inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)})
 
       for sentinel <- programmatic_sentinels() do
         refute persistence_text =~ sentinel
@@ -439,13 +649,18 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
   test "GET /v1/responses websocket forwards a named standalone continuation with its anchor" do
     anchor = "resp_v1_websocket_standalone_anchor"
 
+    # The anchor turn carries no previous response; the named standalone
+    # continuation must keep its anchor on the same physical connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           completed_websocket_response(anchor),
-           completed_websocket_response("resp_v1_websocket_standalone_continuation")
-         ]}
+        FakeUpstream.strict_sequence([
+          strict_native_turn(1, completed_websocket_frames(anchor), forbidden: ["previous_response_id"]),
+          strict_native_turn(
+            1,
+            completed_websocket_frames("resp_v1_websocket_standalone_continuation"),
+            equals: %{"previous_response_id" => anchor, "input.0.type" => "item_reference"}
+          )
+        ])
       )
 
     setup = gateway_setup(upstream)
@@ -501,8 +716,37 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert second_request.json["type"] == "response.create"
       assert second_request.json["previous_response_id"] == anchor
       assert second_request.json["input"] == input
+      assert :ok = FakeUpstream.verify!(upstream)
 
       {conn, websocket}
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "GET /v1/responses websocket returns a typed anchor miss from a reused upstream connection" do
+    refusal = CodexPooler.JSON.encode!(%{"type" => "error", "status" => 400, "error" => %{"type" => "invalid_request_error", "message" => "Invalid `previous_response_id`."}})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.strict_sequence([
+          strict_native_turn(1, completed_websocket_frames("resp_actual_opener"), forbidden: ["previous_response_id"]),
+          strict_native_turn(1, FakeUpstream.websocket_text_frames([refusal]), equals: %{"previous_response_id" => "resp_other_anchor"})
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+    {conn, websocket, ref} = public_v1_websocket_connect!(port, setup, "anchor-miss-#{System.unique_integer([:positive])}")
+
+    try do
+      {conn, websocket} = send_response_create!(conn, websocket, ref, setup, %{"input" => "synthetic opener"})
+      {conn, websocket, _frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+      {conn, websocket} = send_response_create!(conn, websocket, ref, setup, %{"previous_response_id" => "resp_other_anchor", "input" => [%{"type" => "function_call_output", "call_id" => "call_synthetic", "output" => "synthetic"}]})
+      {_conn, _websocket, frames} = receive_websocket_until_terminal_or_error!(conn, websocket, ref, [])
+      assert [%{"type" => "error", "status" => 400, "error" => %{"code" => "previous_response_not_found", "param" => "previous_response_id"}}] = frames
+      assert FakeUpstream.count(upstream) == 2
+      assert :ok = FakeUpstream.verify!(upstream)
     after
       Mint.HTTP.close(conn)
     end
@@ -512,34 +756,35 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     provider_wording = "Provider policy wording must not persist."
 
     policy_terminal =
-      FakeUpstream.sse_stream(
-        [
-          {"response.failed",
-           %{
-             "type" => "response.failed",
-             "sequence_number" => 41,
-             "headers" => %{"authorization" => "must-not-survive"},
-             "response" => %{
-               "id" => "resp_public_policy_terminal",
-               "status" => "failed",
-               "error" => %{
-                 "type" => "provider_policy_type",
-                 "code" => "misalignment_policy_violation",
-                 "message" => provider_wording,
-                 "param" => "provider.policy.param",
-                 "provider_sibling" => "must-not-survive"
-               }
-             },
-             "ordinary_sibling" => "must-not-survive"
-           }}
-        ],
-        done: false
-      )
+      websocket_frames([
+        {"response.failed",
+         %{
+           "type" => "response.failed",
+           "sequence_number" => 41,
+           "headers" => %{"authorization" => "must-not-survive"},
+           "response" => %{
+             "id" => "resp_public_policy_terminal",
+             "status" => "failed",
+             "error" => %{
+               "type" => "provider_policy_type",
+               "code" => "misalignment_policy_violation",
+               "message" => provider_wording,
+               "param" => "provider.policy.param",
+               "provider_sibling" => "must-not-survive"
+             }
+           },
+           "ordinary_sibling" => "must-not-survive"
+         }}
+      ])
 
+    # The ordinary turn after the policy terminal must reuse the same physical
+    # upstream connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [policy_terminal, completed_websocket_response("resp_after_public_policy_terminal")]}
+        FakeUpstream.strict_sequence([
+          strict_native_turn(1, policy_terminal),
+          strict_native_turn(1, completed_websocket_frames("resp_after_public_policy_terminal"))
+        ])
       )
 
     setup = gateway_setup(upstream)
@@ -572,7 +817,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                    "message" => ^provider_wording
                  }
                }
-             } = Jason.decode!(failed_frame)
+             } = CodexPooler.JSON.decode!(failed_frame)
 
       refute failed_frame =~ "provider.policy.param"
       refute failed_frame =~ "provider_policy_type"
@@ -601,7 +846,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert %{
                "type" => "response.completed",
                "response" => %{"id" => "resp_after_public_policy_terminal"}
-             } = Jason.decode!(completed_frame)
+             } = CodexPooler.JSON.decode!(completed_frame)
 
       assert_receive {Events,
                       %{
@@ -664,6 +909,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       refute persistence_text =~ "provider.policy.param"
       refute persistence_text =~ "provider_policy_type"
       refute persistence_text =~ "provider_sibling"
+      assert :ok = FakeUpstream.verify!(upstream)
 
       {conn, websocket}
     after
@@ -715,7 +961,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           conn,
           websocket,
           ref,
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "model" => setup.model.exposed_model_id,
             "input" => "synthetic websocket filtered web search request",
@@ -731,7 +977,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert %{
                "type" => "response.completed",
                "response" => %{"id" => "resp_v1_websocket_web_search_domain_filters"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
@@ -798,6 +1044,45 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       {conn, websocket}
     after
       Mint.HTTP.close(conn)
+    end
+  end
+
+  # The reserved `collaboration` namespace must reach the provider exactly as the client declared it, `encrypted: true`
+  # markers included, or the provider refuses the declaration (`400 invalid_request_error`, param `tools`); an ordinary
+  # top-level function still loses the marker.
+  for mode <- ~w(full lite) do
+    test "GET /v1/responses websocket keeps encrypted markers inside namespace functions in #{mode}" do
+      upstream = start_upstream(completed_websocket_response("resp_ws_encrypted_namespace"))
+      setup = gateway_setup(upstream)
+      put_public_model_serving_mode!(setup, unquote(mode))
+      port = start_public_endpoint!()
+      message = %{"type" => "string", "description" => "Message text to queue on the target agent.", "encrypted" => true}
+      parameters = %{"type" => "object", "properties" => %{"target" => %{"type" => "string", "description" => "Agent to message."}, "message" => message}, "required" => ["target", "message"], "additionalProperties" => false}
+      send_message = %{"type" => "function", "name" => "send_message", "description" => "Send a message to an existing agent.", "strict" => false, "parameters" => parameters}
+      namespace_tool = %{"type" => "namespace", "name" => "collaboration", "description" => "Tools for spawning and managing sub-agents.", "tools" => [send_message]}
+      flat_tool = %{send_message | "name" => "send_note"}
+      {conn, websocket, ref} = public_v1_websocket_connect!(port, setup, "encrypted-namespace-#{System.unique_integer([:positive])}")
+
+      try do
+        {conn, websocket} = send_response_create!(conn, websocket, ref, setup, %{"input" => "synthetic encrypted namespace websocket request", "tools" => [namespace_tool, flat_tool]})
+        {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+        assert List.last(frames)["type"] == "response.completed"
+
+        assert [captured] = FakeUpstream.requests(upstream)
+        assert captured.method == "WEBSOCKET"
+
+        manifest =
+          case unquote(mode) do
+            "full" -> captured.json["tools"]
+            "lite" -> Enum.find_value(captured.json["input"], fn item -> item["type"] == "additional_tools" && item["tools"] end)
+          end
+
+        assert [^namespace_tool, captured_flat] = manifest
+        assert get_in(captured_flat, ["parameters", "properties", "message"]) == Map.delete(message, "encrypted")
+        {conn, websocket}
+      after
+        Mint.HTTP.close(conn)
+      end
     end
   end
 
@@ -889,7 +1174,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
       {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert Jason.decode!(frame) == %{
+      assert CodexPooler.JSON.decode!(frame) == %{
                "type" => "error",
                "status" => 400,
                "error" => %{
@@ -951,7 +1236,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                  "message" => "Unsupported parameter: tool_choice",
                  "param" => "tool_choice"
                }
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert FakeUpstream.count(upstream) == 0
 
@@ -1062,9 +1347,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                Repo.all(from(attempt in Attempt, where: attempt.request_id == ^request.id))
 
       persistence_text =
-        inspect(
-          {request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)}
-        )
+        inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)})
 
       for marker <- [prompt_marker, description_marker, grammar_marker, custom_input_marker] do
         refute persistence_text =~ marker
@@ -1076,72 +1359,86 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     end
   end
 
-  test "GET /v1/responses websocket restores omitted and null declared custom namespaces" do
-    name = "websocket_restored_custom_fixture"
+  for topology <- [:direct, :local_owner] do
+    @tag topology: topology
+    test "GET /v1/responses #{topology} websocket restores omitted and null declared custom namespaces",
+         %{topology: topology} do
+      if topology == :local_owner, do: enable_owner_forwarding!()
+      name = "websocket_restored_custom_fixture"
 
-    output = [
-      %{
-        "type" => "custom_tool_call",
-        "name" => name,
-        "call_id" => "call_websocket_omitted",
-        "input" => "websocket_omitted"
-      },
-      %{
-        "type" => "custom_tool_call",
-        "name" => name,
-        "namespace" => nil,
-        "call_id" => "call_websocket_null",
-        "input" => "websocket_null"
-      },
-      %{
-        "type" => "custom_tool_call",
-        "name" => name,
-        "namespace" => "provider.websocket",
-        "call_id" => "call_websocket_explicit",
-        "input" => "websocket_explicit"
-      }
-    ]
+      output = [
+        %{
+          "type" => "custom_tool_call",
+          "name" => name,
+          "call_id" => "call_websocket_omitted",
+          "input" => "websocket_omitted"
+        },
+        %{
+          "type" => "custom_tool_call",
+          "name" => name,
+          "namespace" => nil,
+          "call_id" => "call_websocket_null",
+          "input" => "websocket_null"
+        },
+        %{
+          "type" => "custom_tool_call",
+          "name" => name,
+          "namespace" => "provider.websocket",
+          "call_id" => "call_websocket_explicit",
+          "input" => "websocket_explicit"
+        }
+      ]
 
-    upstream =
-      start_upstream(completed_websocket_response("resp_ws_restored_custom_namespaces", output))
+      upstream =
+        start_upstream(completed_websocket_response("resp_ws_restored_custom_namespaces", output))
 
-    setup = gateway_setup(upstream)
-    assert :ok = Events.subscribe_pool(setup.pool)
-    port = start_public_endpoint!()
+      setup = gateway_setup(upstream)
+      assert :ok = Events.subscribe_pool(setup.pool)
+      port = start_public_endpoint!()
 
-    {conn, websocket, ref} =
-      public_v1_websocket_connect!(
-        port,
-        setup,
-        "namespace-restoration-#{System.unique_integer([:positive])}"
-      )
+      {conn, websocket, ref} =
+        public_v1_websocket_connect!(
+          port,
+          setup,
+          "namespace-restoration-#{System.unique_integer([:positive])}"
+        )
 
-    try do
-      {conn, websocket} =
-        send_response_create!(conn, websocket, ref, setup, %{
-          "input" => "synthetic websocket namespace restoration",
-          "tools" => [
-            %{
-              "type" => "namespace",
-              "name" => "functions",
-              "description" => "Synthetic websocket namespace",
-              "tools" => [%{"type" => "custom", "name" => name}]
-            }
-          ]
-        })
+      try do
+        {conn, websocket} =
+          send_response_create!(conn, websocket, ref, setup, %{
+            "input" => "synthetic websocket namespace restoration",
+            "tools" => [
+              %{
+                "type" => "namespace",
+                "name" => "functions",
+                "description" => "Synthetic websocket namespace",
+                "tools" => [%{"type" => "custom", "name" => name}]
+              }
+            ]
+          })
 
-      {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
-      assert [%{"type" => "response.completed", "response" => %{"output" => calls}}] = frames
+        {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+        assert [%{"type" => "response.completed", "response" => %{"output" => calls}}] = frames
 
-      assert Enum.map(calls, & &1["namespace"]) == [
-               "functions",
-               "functions",
-               "provider.websocket"
-             ]
+        assert Enum.map(calls, & &1["namespace"]) == [
+                 "functions",
+                 "functions",
+                 "provider.websocket"
+               ]
 
-      {conn, websocket}
-    after
-      Mint.HTTP.close(conn)
+        {conn, websocket} =
+          send_response_create!(conn, websocket, ref, setup, %{
+            "input" => "synthetic next turn without tool declarations"
+          })
+
+        {_conn, _websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+        assert [%{"type" => "response.completed", "response" => %{"output" => calls}}] = frames
+        assert Enum.map(calls, & &1["namespace"]) == [nil, nil, "provider.websocket"]
+
+        {conn, websocket}
+      after
+        Mint.HTTP.close(conn)
+      end
     end
   end
 
@@ -1203,7 +1500,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                  "code" => "unsupported_parameter",
                  "param" => "tool_choice"
                }
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert FakeUpstream.count(upstream) == 0
 
@@ -1303,7 +1600,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       "description" => "Synthetic Lite websocket choice fixture",
       "format" => %{
         "type" => "grammar",
-        "definition" => ~s(start: "issue241"),
+        "definition" => ~s(start: "responses_tool"),
         "syntax" => "lark"
       }
     }
@@ -1334,7 +1631,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                  "code" => "unsupported_parameter",
                  "param" => "tool_choice"
                }
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert FakeUpstream.count(upstream) == 0
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -1459,7 +1756,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                  "code" => "invalid_request",
                  "param" => "tools"
                }
-             } = Jason.decode!(error_frame)
+             } = CodexPooler.JSON.decode!(error_frame)
 
       assert lifecycle_counts(upstream) == post_upgrade_baseline
       refute_received {Events, %{reason: "request_finalized"}}
@@ -1531,7 +1828,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                  "code" => "invalid_json_schema",
                  "param" => "text.format.schema"
                }
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert lifecycle_counts(upstream) == post_upgrade_baseline
       refute_received {Events, %{reason: "request_finalized"}}
@@ -1592,17 +1889,17 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
     try do
       {conn, websocket} =
-        Enum.reduce(malformed_programmatic_payloads(setup), {conn, websocket}, fn payload,
-                                                                                  {conn,
-                                                                                   websocket} ->
+        Enum.reduce(malformed_programmatic_payloads(setup), {conn, websocket}, fn payload, {conn, websocket} ->
           post_upgrade_baseline = settled_post_upgrade_counts!(upstream)
 
           {conn, websocket} =
-            public_websocket_send_text!(conn, websocket, ref, Jason.encode!(payload))
+            public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
 
           {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-          assert %{"type" => "error", "status" => 400, "error" => error} = Jason.decode!(frame)
+          assert %{"type" => "error", "status" => 400, "error" => error} =
+                   CodexPooler.JSON.decode!(frame)
+
           assert error["code"] == "invalid_request"
           assert error["param"] in ["input", "tools"]
           assert lifecycle_counts(upstream) == post_upgrade_baseline
@@ -1617,8 +1914,9 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
   end
 
   test "GET /v1/responses websocket strips reserved metadata before dispatch" do
-    reserved_sentinel = "RESERVED_TOOL_METADATA_SENTINEL"
-    upstream = start_upstream(completed_websocket_response("resp_ws_reserved_metadata_stripped"))
+    upstream =
+      start_upstream(FakeUpstream.sse_stream(programmatic_response_events(), done: false))
+
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
@@ -1632,39 +1930,40 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
     try do
       {conn, websocket} =
-        send_response_create!(conn, websocket, ref, setup, %{
-          "input" => [
-            %{
-              "type" => "function_call_output",
-              "call_id" => "call_reserved_tool_metadata",
-              "output" => "synthetic reserved tool metadata output",
-              "internal_chat_message_metadata_passthrough" => %{
-                "turn_id" => "turn_reserved_tool_metadata",
-                "executed_tool_calls" => reserved_sentinel
+        public_websocket_send_text!(
+          conn,
+          websocket,
+          ref,
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => [
+              %{
+                "type" => "function_call_output",
+                "call_id" => "call_reserved_tool_metadata",
+                "output" => "synthetic reserved tool metadata output",
+                "internal_chat_message_metadata_passthrough" => %{
+                  "executed_tool_calls" => "RESERVED_TOOL_METADATA_SENTINEL"
+                }
               }
-            }
-          ]
-        })
+            ],
+            "stream" => true
+          })
+        )
 
-      {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
-      assert Enum.map(frames, & &1["type"]) == ["response.completed"]
+      {_conn, _websocket, frames} =
+        receive_websocket_until_terminal_or_error!(conn, websocket, ref, [])
 
+      assert List.last(frames)["type"] == "response.completed"
+      assert FakeUpstream.count(upstream) == 1
       assert [captured] = FakeUpstream.requests(upstream)
-      assert [function_output] = captured.json["input"]
-      assert function_output["type"] == "function_call_output"
-
-      assert function_output["internal_chat_message_metadata_passthrough"] == %{
-               "turn_id" => "turn_reserved_tool_metadata"
-             }
-
-      refute inspect(captured.json) =~ reserved_sentinel
-
-      assert_successful_websocket_lifecycle!(setup)
+      refute inspect(captured.json) =~ "RESERVED_TOOL_METADATA_SENTINEL"
 
       persistence_text = inspect(RequestLogs.list(setup.pool))
+
+      refute inspect(frames) =~ "RESERVED_TOOL_METADATA_SENTINEL"
       refute persistence_text =~ "internal_chat_message_metadata_passthrough"
-      refute persistence_text =~ reserved_sentinel
-      refute persistence_text =~ "turn_reserved_tool_metadata"
+      refute persistence_text =~ "RESERVED_TOOL_METADATA_SENTINEL"
 
       {conn, websocket}
     after
@@ -1709,7 +2008,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
         {{conn, _websocket, frames}, log} =
           with_log(fn ->
             {conn, websocket} =
-              public_websocket_send_text!(conn, websocket, ref, Jason.encode!(payload))
+              public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
 
             {conn, websocket, frames} =
               receive_websocket_until_terminal!(conn, websocket, ref, [])
@@ -1778,9 +2077,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     requests = Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
 
     attempts =
-      Repo.all(
-        from(attempt in Attempt, where: attempt.request_id in ^Enum.map(requests, & &1.id))
-      )
+      Repo.all(from(attempt in Attempt, where: attempt.request_id in ^Enum.map(requests, & &1.id)))
 
     assert length(requests) == 4
     assert Enum.all?(requests, &(&1.status == "succeeded" and &1.transport == "websocket"))
@@ -1978,7 +2275,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           conn,
           websocket,
           ref,
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "model" => setup.model.exposed_model_id,
             "input" => input,
@@ -1995,6 +2292,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     end
   end
 
+  @tag slow: "executes anchored compaction on direct and forwarded real websocket connections in both Full and Lite"
   test "direct and owner-forwarded GET /v1/responses collect anchored compaction on the lineage connection in Full and Lite" do
     for {owner_forwarding?, mode} <- [
           {false, "full"},
@@ -2021,16 +2319,21 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
         "summary" => "plaintext-websocket-summary-must-drop"
       }
 
+      # The anchored compaction turn must keep its lineage anchor and ride the
+      # same physical connection as the lineage turn in every lane.
       upstream =
         start_upstream(
-          {:sequence,
-           [
-             completed_websocket_response(previous_response_id),
-             public_compaction_websocket_response(
-               "resp_v1_websocket_compaction_trigger_#{mode}",
-               compact_item
-             )
-           ]}
+          FakeUpstream.strict_sequence([
+            strict_native_turn(1, completed_websocket_frames(previous_response_id), forbidden: ["previous_response_id"]),
+            strict_native_turn(
+              1,
+              public_compaction_websocket_frames(
+                "resp_v1_websocket_compaction_trigger_#{mode}",
+                compact_item
+              ),
+              equals: %{"previous_response_id" => previous_response_id}
+            )
+          ])
         )
 
       setup = gateway_setup(upstream, compact?: true)
@@ -2077,25 +2380,43 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           receive_websocket_until_terminal_or_error!(conn, websocket, ref, [])
 
         assert Enum.map(frames, & &1["type"]) == [
+                 "response.created",
+                 "response.output_item.added",
                  "response.output_item.done",
                  "response.completed"
                ]
 
-        assert Enum.map(frames, & &1["sequence_number"]) == [0, 1]
+        assert Enum.map(frames, & &1["sequence_number"]) == [0, 1, 2, 3]
         assert Enum.all?(frames, &(&1["stream_id"] == stream_id))
 
-        done_item = get_in(List.first(frames), ["item"])
+        assert get_in(List.first(frames), ["response", "status"]) == "in_progress"
+
+        assert get_in(List.first(frames), ["response", "id"]) ==
+                 get_in(List.last(frames), ["response", "id"])
+
+        added_item = get_in(Enum.at(frames, 1), ["item"])
+        done_item = get_in(Enum.at(frames, 2), ["item"])
         completed_item = get_in(List.last(frames), ["response", "output", Access.at(0)])
 
+        assert Enum.map(Enum.slice(frames, 1, 2), & &1["output_index"]) == [0, 0]
+        assert added_item == done_item
         assert done_item == completed_item
+        refute Map.has_key?(get_in(List.first(frames), ["response"]), "usage")
+
+        # The upstream item had a null id; the public item carries the id
+        # derived from its encrypted content, which replay strips again
+        # (findings#254).
+        encrypted_content = "synthetic-websocket-trigger-encrypted-#{mode}"
 
         assert done_item == %{
                  "type" => "compaction",
-                 "encrypted_content" => "synthetic-websocket-trigger-encrypted-#{mode}",
-                 "id" => nil
+                 "encrypted_content" => encrypted_content,
+                 "id" => CompactionTrigger.public_compaction_item_id(encrypted_content)
                }
 
-        assert {:ok, %{payload: %{"input" => [^done_item]}}} =
+        replayed_item = Map.delete(done_item, "id")
+
+        assert {:ok, %{payload: %{"input" => [^replayed_item]}}} =
                  ResponsesCompat.coerce(%{
                    "model" => setup.model.exposed_model_id,
                    "input" => [done_item]
@@ -2158,13 +2479,14 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
         refute persisted =~ "native-websocket-turn-must-drop"
         refute persisted =~ "plaintext-websocket-summary-must-drop"
         refute persisted =~ "returned metadata must not select request transport"
+        assert :ok = FakeUpstream.verify!(upstream)
       after
         Mint.HTTP.close(conn)
       end
     end
   end
 
-  test "GET /v1/responses websocket forwards a compaction previous_response_id without tool output" do
+  test "GET /v1/responses websocket refuses a compaction anchor missing on the upstream connection" do
     upstream =
       start_upstream(
         FakeUpstream.json_response(%{
@@ -2202,16 +2524,9 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       {_conn, _websocket, frames} =
         receive_websocket_until_terminal_or_error!(conn, websocket, ref, [])
 
-      assert Enum.map(frames, & &1["type"]) == [
-               "response.output_item.done",
-               "response.completed"
-             ]
+      assert [%{"type" => "error", "status" => 400, "error" => %{"code" => "previous_response_not_found"}}] = frames
 
-      assert [captured] = FakeUpstream.requests(upstream)
-      assert captured.json["previous_response_id"] ==
-               "resp_v1_websocket_compaction_without_tool_output"
-
-      assert List.last(captured.json["input"]) == %{"type" => "compaction_trigger"}
+      assert [] = FakeUpstream.requests(upstream)
     after
       Mint.HTTP.close(conn)
     end
@@ -2221,9 +2536,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     old_config = Application.get_env(:codex_pooler, OperationalSettings)
     Admission.reset_for_test()
 
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: compact_saturation_settings()
-    )
+    Application.put_env(:codex_pooler, OperationalSettings, settings: compact_saturation_settings())
 
     on_exit(fn ->
       Admission.reset_for_test()
@@ -2256,7 +2569,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
       {_conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert Jason.decode!(frame) == %{
+      assert CodexPooler.JSON.decode!(frame) == %{
                "type" => "error",
                "status" => 503,
                "error" => %{
@@ -2284,21 +2597,28 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
   test "owner-forwarded websocket completes local compact work and starts the queued ordinary turn" do
     enable_owner_forwarding!()
 
+    # Local compact work collects HTTP SSE; the queued ordinary turn then rides
+    # the owner's websocket.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.json_response(%{
-             "id" => "resp_local_compact",
-             "output" => [
-               %{
-                 "type" => "compaction",
-                 "encrypted_content" => "synthetic-local-compact-content"
-               }
-             ]
-           }),
-           completed_websocket_response("resp_after_local_compact")
-         ]}
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            json: [valid: true, required: ["input"]],
+            respond:
+              FakeUpstream.compaction_stream(%{
+                "id" => "resp_local_compact",
+                "output" => [
+                  %{
+                    "type" => "compaction",
+                    "encrypted_content" => "synthetic-local-compact-content"
+                  }
+                ]
+              })
+          ),
+          strict_native_turn(1, completed_websocket_frames("resp_after_local_compact"))
+        ])
       )
 
     setup = gateway_setup(upstream, compact?: true)
@@ -2330,6 +2650,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
         receive_websocket_until_terminal_or_error!(conn, websocket, ref, [])
 
       assert Enum.map(compact_frames, & &1["type"]) == [
+               "response.created",
+               "response.output_item.added",
                "response.output_item.done",
                "response.completed"
              ]
@@ -2345,6 +2667,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert [compact_request, ordinary_request] = FakeUpstream.requests(upstream)
       assert compact_request.method == "POST"
       assert ordinary_request.method == "WEBSOCKET"
+      assert :ok = FakeUpstream.verify!(upstream)
     after
       Mint.HTTP.close(conn)
     end
@@ -2355,7 +2678,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
     upstream =
       start_upstream(
-        FakeUpstream.json_response(%{
+        FakeUpstream.compaction_stream(%{
           "output" => [
             %{"type" => "compaction"},
             %{"type" => "compaction_summary", "encrypted_content" => encrypted_later}
@@ -2382,14 +2705,14 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
       {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert Jason.decode!(frame) == %{
+      assert CodexPooler.JSON.decode!(frame) == %{
                "type" => "error",
                "status" => 502,
                "error" => %{
-                 "type" => "invalid_request_error",
+                 # findings#184: a 502 upstream compaction failure is server class.
+                 "type" => "server_error",
                  "code" => "invalid_compaction_response",
-                 "message" =>
-                   "upstream compact response did not include encrypted compaction content",
+                 "message" => "upstream compact stream was invalid",
                  "param" => nil
                }
              }
@@ -2470,14 +2793,13 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
           {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-          assert Jason.decode!(frame) == %{
+          assert CodexPooler.JSON.decode!(frame) == %{
                    "type" => "error",
                    "status" => 400,
                    "error" => %{
                      "type" => "invalid_request_error",
                      "code" => "invalid_request",
-                     "message" =>
-                       "compaction_trigger must be the final input item and must follow visible input",
+                     "message" => "compaction_trigger must be the final input item and must follow visible input",
                      "param" => "input"
                    }
                  }
@@ -2533,12 +2855,12 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       {{conn, websocket, error_frame}, log} =
         with_log(fn ->
           {conn, websocket} =
-            public_websocket_send_text!(conn, websocket, ref, Jason.encode!(payload))
+            public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
 
           public_websocket_receive_text!(conn, websocket, ref)
         end)
 
-      assert Jason.decode!(error_frame) == %{
+      assert CodexPooler.JSON.decode!(error_frame) == %{
                "type" => "error",
                "status" => 400,
                "error" => %{
@@ -2574,7 +2896,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           conn,
           websocket,
           ref,
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "model" => setup.model.exposed_model_id,
             "input" => [hd(replay_proven_compaction_items()), compaction_replay_user_item()],
@@ -2621,8 +2943,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     enable_owner_forwarding!()
 
     visible_event =
-      {"response.output_text.delta",
-       %{"type" => "response.output_text.delta", "delta" => "synthetic visible output"}}
+      {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "synthetic visible output"}}
 
     upstream =
       start_upstream(
@@ -2649,7 +2970,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           conn,
           websocket,
           ref,
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "model" => setup.model.exposed_model_id,
             "input" => "synthetic interruption input",
@@ -2660,19 +2981,19 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       {conn, websocket, visible_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert Jason.decode!(visible_frame)["type"] == "response.output_text.delta"
+      assert CodexPooler.JSON.decode!(visible_frame)["type"] == "response.output_text.delta"
 
       {conn, websocket, error_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert Jason.decode!(error_frame) == %{
+      assert CodexPooler.JSON.decode!(error_frame) == %{
                "type" => "error",
                "status" => 502,
                "error" => %{
-                 "type" => "invalid_request_error",
+                 # findings#184: a 502 is server class.
+                 "type" => "server_error",
                  "code" => "server_error",
-                 "message" =>
-                   "upstream request failed: stream interrupted before terminal response event",
+                 "message" => "upstream request failed: stream interrupted before terminal response event",
                  "param" => nil
                }
              }
@@ -2715,8 +3036,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       start_upstream(
         FakeUpstream.websocket_sse_then_close(
           [
-            {"response.output_text.delta",
-             %{"type" => "response.output_text.delta", "delta" => "synthetic visible output"}}
+            {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "synthetic visible output"}}
           ],
           code: 1001,
           reason: "synthetic interrupted stream"
@@ -2749,7 +3069,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           {conn, websocket, error_frame} =
             public_websocket_receive_text!(conn, websocket, ref)
 
-          {conn, websocket, Jason.decode!(delta_frame), Jason.decode!(error_frame)}
+          {conn, websocket, CodexPooler.JSON.decode!(delta_frame), CodexPooler.JSON.decode!(error_frame)}
         end)
 
       assert delta_frame["type"] == "response.output_text.delta"
@@ -2825,8 +3145,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       start_upstream(
         FakeUpstream.sse_stream(
           [
-            {"response.output_text.delta",
-             %{"type" => "response.output_text.delta", "delta" => "synthetic cited reply"}},
+            {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "synthetic cited reply"}},
             {"response.completed", %{"type" => "response.completed", "response" => response}}
           ],
           done: false
@@ -2901,8 +3220,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     source_events = hosted_shell_response_events()
 
     provider_frames =
-      ["{", Jason.encode!(["not", "an", "object"])] ++
-        Enum.map(source_events, &Jason.encode!/1)
+      ["{", CodexPooler.JSON.encode!(["not", "an", "object"])] ++
+        Enum.map(source_events, &CodexPooler.JSON.encode!/1)
 
     upstream = start_upstream(FakeUpstream.websocket_text_frames(provider_frames))
     setup = gateway_setup(upstream)
@@ -2943,7 +3262,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                  "code" => "invalid_request",
                  "param" => "input"
                }
-             } = Jason.decode!(error_wire)
+             } = CodexPooler.JSON.decode!(error_wire)
 
       assert lifecycle_counts(upstream) == post_upgrade_baseline
       assert FakeUpstream.count(upstream) == 0
@@ -2978,7 +3297,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
       sse_source =
         Enum.map_join(source_events, fn event ->
-          "event: #{event["type"]}\ndata: #{Jason.encode!(event)}\n\n"
+          "event: #{event["type"]}\ndata: #{CodexPooler.JSON.encode!(event)}\n\n"
         end)
 
       {normalized_sse, _state} =
@@ -3107,8 +3426,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
       {{conn, websocket}, log} =
         with_log(fn ->
-          Enum.reduce(malformed_annotations, {conn, websocket}, fn annotations,
-                                                                   {conn, websocket} ->
+          Enum.reduce(malformed_annotations, {conn, websocket}, fn annotations, {conn, websocket} ->
             {conn, websocket} =
               send_response_create!(conn, websocket, ref, setup, %{
                 "stream_id" => stream_id,
@@ -3127,7 +3445,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
               })
 
             {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
-            decoded = Jason.decode!(frame)
+            decoded = CodexPooler.JSON.decode!(frame)
 
             assert decoded["type"] == "error"
             assert decoded["status"] == 400
@@ -3203,7 +3521,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
               })
 
             {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
-            decoded = Jason.decode!(frame)
+            decoded = CodexPooler.JSON.decode!(frame)
 
             assert decoded["type"] == "error"
             assert decoded["status"] == 400
@@ -3255,16 +3573,25 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
          }
        }}
 
+    # Both creates must be submitted in FIFO order on the same physical
+    # connection. The held-terminal barrier has no native websocket flavour,
+    # so the first entry cannot declare `method: "WEBSOCKET"`; the connection
+    # ordinal pins the transport instead.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.delayed_terminal_sse_stream([], first_terminal,
-             notify: self(),
-             release_ref: release_ref
-           ),
-           completed_websocket_response("resp_fifo_second")
-         ]}
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}],
+            respond:
+              FakeUpstream.delayed_terminal_sse_stream([], first_terminal,
+                notify: self(),
+                release_ref: release_ref
+              )
+          ),
+          strict_native_turn(1, completed_websocket_frames("resp_fifo_second"))
+        ])
       )
 
     setup = gateway_setup(upstream)
@@ -3290,8 +3617,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           "stream_id" => stream_id
         })
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid,
-                      ^release_ref},
+      assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
                      @websocket_frame_timeout
 
       assert FakeUpstream.count(upstream) == 1
@@ -3299,8 +3625,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
       {conn, websocket, first_frame} = public_websocket_receive_text!(conn, websocket, ref)
       {conn, websocket, second_frame} = public_websocket_receive_text!(conn, websocket, ref)
-      first = Jason.decode!(first_frame)
-      second = Jason.decode!(second_frame)
+      first = CodexPooler.JSON.decode!(first_frame)
+      second = CodexPooler.JSON.decode!(second_frame)
 
       assert {first["type"], first["response"]["id"], first["stream_id"]} ==
                {"response.completed", "resp_fifo_first", stream_id}
@@ -3316,6 +3642,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                not Map.has_key?(captured.json, "stream_id")
              end)
 
+      assert :ok = FakeUpstream.verify!(upstream)
+
       {conn, websocket}
     after
       Mint.HTTP.close(conn)
@@ -3326,13 +3654,13 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     first_id = "lane-different-first"
     second_id = "lane-different-second"
 
+    # Distinct stream ids still share one physical upstream connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           completed_websocket_response("resp_different_first"),
-           completed_websocket_response("resp_different_second")
-         ]}
+        FakeUpstream.strict_sequence([
+          strict_native_turn(1, completed_websocket_frames("resp_different_first")),
+          strict_native_turn(1, completed_websocket_frames("resp_different_second"))
+        ])
       )
 
     setup = gateway_setup(upstream)
@@ -3361,8 +3689,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
         })
 
       {conn, websocket, second_frame} = public_websocket_receive_text!(conn, websocket, ref)
-      first = Jason.decode!(first_frame)
-      second = Jason.decode!(second_frame)
+      first = CodexPooler.JSON.decode!(first_frame)
+      second = CodexPooler.JSON.decode!(second_frame)
 
       assert {first["response"]["id"], first["stream_id"]} ==
                {"resp_different_first", first_id}
@@ -3377,6 +3705,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       assert Enum.all?(FakeUpstream.requests(upstream), fn captured ->
                not Map.has_key?(captured.json, "stream_id")
              end)
+
+      assert :ok = FakeUpstream.verify!(upstream)
 
       {conn, websocket}
     after
@@ -3412,7 +3742,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
         attrs
       )
 
-    public_websocket_send_text!(conn, websocket, ref, Jason.encode!(payload))
+    public_websocket_send_text!(conn, websocket, ref, CodexPooler.JSON.encode!(payload))
   end
 
   defp websocket_compaction_trigger_input(text) do
@@ -3469,26 +3799,64 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     )
   end
 
-  defp public_compaction_websocket_response(response_id, item) do
-    FakeUpstream.sse_stream(
-      [
-        {"response.output_item.done",
-         %{
-           "type" => "response.output_item.done",
-           "item" => item
-         }},
-        {"response.completed",
-         %{
-           "type" => "response.completed",
-           "response" => %{
-             "id" => response_id,
-             "status" => "completed",
-             "output" => [item],
-             "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
-           }
-         }}
-      ],
-      done: false
+  # Native websocket frames for `{event_type, payload}` tuples: one text frame
+  # per event, no SSE framing.
+  defp websocket_frames(events) do
+    FakeUpstream.websocket_text_frames(Enum.map(events, fn {_type, payload} -> CodexPooler.JSON.encode!(payload) end))
+  end
+
+  defp completed_websocket_frames(response_id, output \\ []) do
+    websocket_frames([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => response_id,
+           "status" => "completed",
+           "output" => output,
+           "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+         }
+       }}
+    ])
+  end
+
+  defp public_compaction_websocket_frames(response_id, item) do
+    websocket_frames([
+      {"response.output_item.done",
+       %{
+         "type" => "response.output_item.done",
+         "item" => item
+       }},
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => response_id,
+           "status" => "completed",
+           "output" => [item],
+           "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+         }
+       }}
+    ])
+  end
+
+  # One strict native public websocket turn pinned to a physical upstream
+  # connection.
+  defp strict_native_turn(connection_ordinal, respond, json_expectations \\ []) do
+    FakeUpstream.expect_request(
+      method: "WEBSOCKET",
+      path: "/backend-api/codex/responses",
+      websocket_connection_ordinal: connection_ordinal,
+      json:
+        Keyword.merge(
+          [valid: true, equals: %{"type" => "response.create"}],
+          json_expectations,
+          fn
+            :equals, base, extra -> Map.merge(base, extra)
+            _key, _base, extra -> extra
+          end
+        ),
+      respond: respond
     )
   end
 
@@ -3600,12 +3968,19 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     if owner_forwarding?, do: enable_owner_forwarding!()
 
     completion =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_after_invalid_frames", "status" => "completed"}
       })
 
-    invalid_frames = ["{", Jason.encode!("string"), Jason.encode!([]), Jason.encode!(42), "null"]
+    invalid_frames = [
+      "{",
+      CodexPooler.JSON.encode!("string"),
+      CodexPooler.JSON.encode!([]),
+      CodexPooler.JSON.encode!(42),
+      "null"
+    ]
+
     upstream = start_upstream(FakeUpstream.websocket_text_frames(invalid_frames ++ [completion]))
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
@@ -3624,7 +3999,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           conn,
           websocket,
           ref,
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "model" => setup.model.exposed_model_id,
             "input" => "synthetic invalid provider frame input",
@@ -3638,7 +4013,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
                "type" => "response.completed",
                "sequence_number" => 0,
                "response" => %{"status" => "completed"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert_receive {Events,
                       %{
@@ -3666,32 +4041,8 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
   end
 
   defp enable_owner_forwarding! do
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
-
-    on_exit(fn ->
-      stop_registered_websocket_owner_sessions()
-
-      case previous do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
-    end)
-  end
-
-  defp stop_registered_websocket_owner_sessions do
-    capture_log(fn ->
-      WebsocketOwnerSession.Registry
-      |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-      |> Enum.each(&stop_registered_websocket_owner_session/1)
-    end)
-  end
-
-  defp stop_registered_websocket_owner_session(session_id) do
-    case WebsocketOwnerSession.lookup(session_id) do
-      {:ok, owner_pid} -> GenServer.stop(owner_pid, :shutdown, 1_000)
-      _other -> :ok
-    end
   end
 
   defp public_sse_events(body) do
@@ -3711,16 +4062,27 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     data = lines |> Enum.find(&String.starts_with?(&1, "data: ")) |> strip_sse_prefix("data: ")
 
     if is_binary(event) and is_binary(data) and data != "[DONE]" do
-      %{"event" => event, "data" => Jason.decode!(data)}
+      %{"event" => event, "data" => CodexPooler.JSON.decode!(data)}
     end
   end
 
   defp strip_sse_prefix(nil, _prefix), do: nil
   defp strip_sse_prefix(line, prefix), do: String.replace_prefix(line, prefix, "")
 
+  defp receive_raw_websocket_until_terminal!(conn, websocket, ref, frames) do
+    {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+    frames = [frame | frames]
+
+    if CodexPooler.JSON.decode!(frame)["type"] == "response.completed" do
+      {conn, websocket, Enum.reverse(frames)}
+    else
+      receive_raw_websocket_until_terminal!(conn, websocket, ref, frames)
+    end
+  end
+
   defp receive_websocket_until_terminal!(conn, websocket, ref, frames) do
     {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
-    decoded = Jason.decode!(frame)
+    decoded = CodexPooler.JSON.decode!(frame)
     frames = [decoded | frames]
 
     if decoded["type"] == "response.completed" do
@@ -3732,7 +4094,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
 
   defp receive_websocket_until_terminal_or_error!(conn, websocket, ref, frames) do
     {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
-    decoded = Jason.decode!(frame)
+    decoded = CodexPooler.JSON.decode!(frame)
     frames = [decoded | frames]
 
     if decoded["type"] in ["response.completed", "error"] do
@@ -3750,8 +4112,9 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       "store" => true,
       "generate" => true,
       "input" => programmatic_input_items(),
+      # The hosted `programmatic_tool_calling` tool and a choice naming it are not declared: the Codex backend refuses the
+      # tool on Full and the choice on every mode (findings#333).
       "tools" => [
-        %{"type" => "programmatic_tool_calling"},
         %{
           "type" => "function",
           "name" => "lookup_fixture",
@@ -3759,8 +4122,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           "allowed_callers" => ["direct", "programmatic"],
           "output_schema" => %{"$id" => "PROGRAMMATIC_SCHEMA_SENTINEL", "type" => "object"}
         }
-      ],
-      "tool_choice" => %{"type" => "programmatic_tool_calling"}
+      ]
     }
   end
 
@@ -3811,6 +4173,12 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
        }}
     end)
     |> Kernel.++([
+      {"response.output_item.done",
+       %{
+         "type" => "response.output_item.done",
+         "output_index" => 1,
+         "item" => programmatic_input_items() |> Enum.at(1) |> Map.put("status", "completed")
+       }},
       {"response.completed",
        %{
          "type" => "response.completed",
@@ -4051,8 +4419,6 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
           "syntax" => "lark"
         }
       },
-      %{"type" => "programmatic_tool_calling"},
-      %{"type" => "web_search_preview"},
       %{"type" => "web_search"},
       %{"type" => "image_generation"}
     ]
@@ -4063,9 +4429,7 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       %{"type" => "custom", "name" => "custom_allowed_fixture"},
       %{"type" => "web_search"},
       %{"type" => "function", "name" => "lookup_allowed_fixture"},
-      %{"type" => "programmatic_tool_calling"},
       %{"type" => "image_generation"},
-      %{"type" => "web_search_preview"},
       %{"type" => "function", "name" => "lookup_allowed_fixture"},
       %{"type" => "web_search"}
     ]

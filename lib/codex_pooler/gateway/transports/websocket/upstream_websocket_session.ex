@@ -6,15 +6,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   require Logger
 
   alias CodexPooler.Accounting.ClientRetry
-  alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
   alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
+  alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+  alias CodexPooler.Gateway.Runtime.Streaming.ModelDeclarationObserver
   alias CodexPooler.Gateway.Transports.NativeCodexResponseControl
   alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
+  alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
+  alias CodexPooler.Gateway.Transports.Streaming.CollectedBody
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
   alias CodexPooler.Gateway.Transports.Streaming.RuntimeAdmissionProof
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesToolCompletion
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
   alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
   alias CodexPooler.Gateway.Transports.Websocket.ForwardedOwnerRequestHandoff
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Binding
@@ -28,6 +35,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace
   alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
   alias CodexPooler.Gateway.Transports.Websocket.OrdinarySuccessResult
+  alias CodexPooler.Gateway.Transports.Websocket.ResponseInterrupt
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.CloseDiagnostics
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState.Delivery
@@ -35,7 +44,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketFrameWriter
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks
+  alias CodexPooler.Gateway.Websocket.Adapter
+  alias CodexPooler.Platform.ExecutionIdentity
+  alias CodexPooler.RouteClass
 
   @default_keepalive_interval_ms 25_000
   @dev_features_build_enabled Application.compile_env(
@@ -44,6 +57,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
                                 false
                               )
   @connection_lifecycle_keys [:lifecycle_id, :generation]
+  # The terminals of a response the provider completed. Only these record a
+  # response id or a collected compaction; they, and a response the client
+  # interrupted (`context_kept_terminal?/2`), record a serving mode.
+  @completed_terminals ["response.completed", "response.done"]
+  # The budget of a caller's call to the session's compaction admission.
+  @admission_call_timeout_ms 1_000
   @five_seconds_ms :timer.seconds(5)
   @thirty_seconds_ms :timer.seconds(30)
   @one_minute_ms :timer.minutes(1)
@@ -74,9 +93,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
           required(:terminal) => binary(),
           required(:status) => 200,
           required(:headers) => response_headers(),
+          required(:provider_credits_admission) => ProviderCreditsAdmission.Receipt.t(),
           optional(:response_id) => String.t(),
           optional(:response_usage) => ResponseUsage.usage() | nil,
           optional(:ordinary_success_result) => OrdinarySuccessResult.t(),
+          optional(:native_client_retry_observation) => ClientRetry.Observation.t() | nil,
           optional(:first_compact_result) => FirstCompactResult.t(),
           optional(:upstream_websocket_connection) => upstream_websocket_connection(),
           optional(:websocket_frame_headers) => map(),
@@ -96,10 +117,39 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   @type request_result :: {:ok, request_success()} | {:error, request_failure()}
   @type send_result :: {:ok, :sent} | {:error, term()}
   @type invalidation_result :: :ok | {:error, :upstream_websocket_not_connected}
+  @type connection_closed_signal ::
+          {:upstream_websocket_connection_closed, pid(),
+           %{
+             required(:cause) => CloseDiagnostics.cause(),
+             required(:lifecycle_id) => Ecto.UUID.t(),
+             required(:generation) => pos_integer(),
+             required(:connection_requests) => pos_integer()
+           }}
 
+  # `connection_close_subscriber: pid` names the one process that learns when
+  # a connection that carried at least one request closes outside a request
+  # for a cause in `CloseDiagnostics.anchor_invalidating_causes/0`, as a
+  # `t:connection_closed_signal/0` sent right after the connection closed.
+  # `generation` names the closed connection (the next one is
+  # `generation + 1`) and `connection_requests` counts the requests sent on
+  # it. The provider closes an idle connection (its 60-minute limit, a
+  # restart) without the downstream client seeing it, and the client's next
+  # request then carries a `previous_response_id` only the closed connection
+  # could resolve (findings#270). The subscriber survives every close and
+  # reconnect; the session neither links to nor monitors it, so a subscriber
+  # that is gone only misses the message.
+  #
+  # `admission_topology: :forwarded` marks the session a websocket owner
+  # holds: the owner keeps the native compaction admission, and the lifecycle
+  # observations this session still emits for its connections (a clear with
+  # nothing to clear, a rejected capability) name the owner's topology
+  # instead of `:direct` (findings#270 row 270-163). It survives every
+  # reconnect.
   @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(_opts \\ []) do
-    case GenServer.start_link(__MODULE__, :new) do
+  def start_link(opts \\ []) when is_list(opts) do
+    init_arg = {:new, Keyword.get(opts, :connection_close_subscriber), Keyword.get(opts, :admission_topology, :direct)}
+
+    case GenServer.start_link(__MODULE__, init_arg) do
       {:ok, pid} = result ->
         _trace = NativeCompactionTrace.enroll(:upstream_session, pid)
         result
@@ -117,11 +167,35 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       request_error(:upstream_websocket_session_unavailable, %{})
   end
 
+  # A frame waits for the session like a request does. The session serves one
+  # call at a time and holds a request's call until its turn settles, so a frame
+  # sent while a turn is still collecting upstream frames is served right after
+  # it, on the same connection; the turn's own connect and receive timeouts end
+  # a stalled turn. A fixed call bound only abandoned the reply: the queued
+  # frame still went upstream once the turn ended, while the caller had already
+  # answered its client that the forward failed and recorded nothing
+  # (findings#206 row 206-322). A session that stops still ends the call at
+  # once, as `upstream_websocket_session_unavailable`.
   @spec send_request_frame(pid(), binary()) :: send_result()
   def send_request_frame(pid, payload) when is_pid(pid) and is_binary(payload) do
-    GenServer.call(pid, {:send_text, payload}, 1_000)
+    GenServer.call(pid, {:send_text, payload}, :infinity)
   catch
     :exit, _reason -> {:error, :upstream_websocket_session_unavailable}
+  end
+
+  @doc """
+  Hands the session a client's `response.interrupt` for the response it names
+  (`ResponseInterrupt`, findings#270 row 270-272). The session writes it only
+  while that response is in flight on its connection as a relayed turn and no
+  terminal of it has been read; otherwise it drops it. Either way it logs the
+  one line the interrupt leaves. The call never waits: a session serving a
+  turn reads the message inside that turn's receive loop.
+  """
+  @spec interrupt(pid(), ResponseInterrupt.t()) :: :ok
+  def interrupt(pid, %{response_id: response_id, mode: mode} = interrupt)
+      when is_pid(pid) and is_binary(response_id) and is_binary(mode) do
+    send(pid, {:upstream_websocket_interrupt, interrupt})
+    :ok
   end
 
   @spec connection_lifecycle_snapshot(pid()) ::
@@ -134,9 +208,30 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   def connection_lifecycle_snapshot(_pid), do: {:error, :invalid_input}
 
+  # The connection a native compaction admission names is usable only while
+  # it is this session's open connection: a compaction's final, or the next
+  # compaction, sent after the provider closed it cannot reach the provider
+  # (findings#275). `generation` is the open connection's, nil between two
+  # connections.
+  @spec live_connection(pid()) ::
+          {:ok, %{lifecycle_id: Ecto.UUID.t(), generation: pos_integer() | nil}} | {:error, :unavailable | :invalid_input}
+  def live_connection(pid) when is_pid(pid) do
+    GenServer.call(pid, :live_connection, 1_000)
+  catch
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  def live_connection(_pid), do: {:error, :invalid_input}
+
+  @spec producer_identity(pid()) :: map() | :unknown
+  def producer_identity(pid) when is_pid(pid) do
+    GenServer.call(pid, :producer_identity, 1_000)
+  catch
+    :exit, _reason -> :unknown
+  end
+
   @spec compaction_reservation_snapshot(pid()) ::
-          {:ok,
-           %{lifecycle_id: Ecto.UUID.t(), generation: pos_integer(), serving_mode: :full | :lite}}
+          {:ok, %{lifecycle_id: Ecto.UUID.t(), generation: pos_integer(), serving_mode: :full | :lite}}
           | {:error, atom()}
   def compaction_reservation_snapshot(pid) when is_pid(pid),
     do: admission_call(pid, :compaction_reservation_snapshot)
@@ -163,7 +258,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         %FirstCompactResult{} = result
       )
       when is_pid(pid) do
-    admission_call(pid, {:authorize_first_compact_collection, binding, result})
+    confirmation_call(pid, {:authorize_first_compact_collection, binding, result})
   end
 
   def authorize_first_compact_collection(_pid, _binding, _control_ref),
@@ -173,7 +268,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
           :ok | {:error, atom()}
   def record_first_compact_collected(pid, %FirstCompactCollection{} = provenance)
       when is_pid(pid) do
-    admission_call(pid, {:record_first_compact_collected, provenance})
+    confirmation_call(pid, {:record_first_compact_collected, provenance})
   end
 
   def record_first_compact_collected(_pid, _provenance), do: {:error, :invalid_input}
@@ -219,19 +314,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
           {:success, <<_::256>>, Confirmation.t(), non_neg_integer()} | :failure
         ) :: :ok | {:error, atom()}
   def acknowledge_compact_finalization(pid, acknowledgement) when is_pid(pid) do
-    admission_call(pid, {:acknowledge_compact_finalization, acknowledgement})
+    confirmation_call(pid, {:acknowledge_compact_finalization, acknowledgement})
   end
 
   def acknowledge_compact_finalization(_pid, _acknowledgement),
     do: {:error, :invalid_input}
-
-  @spec acknowledge_final_response(pid(), :success | :failure) :: :ok | {:error, atom()}
-  def acknowledge_final_response(pid, acknowledgement)
-      when is_pid(pid) and acknowledgement in [:success, :failure] do
-    admission_call(pid, {:acknowledge_final_response, acknowledgement})
-  end
-
-  def acknowledge_final_response(_pid, _acknowledgement), do: {:error, :invalid_input}
 
   @spec clear_compaction_admission(pid()) :: :ok | {:error, :unavailable}
   def clear_compaction_admission(pid) when is_pid(pid) do
@@ -255,8 +342,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   def compaction_admission_phase(_pid), do: {:error, :invalid_input}
 
   defp admission_call(pid, message) do
-    GenServer.call(pid, message, 1_000)
+    GenServer.call(pid, message, @admission_call_timeout_ms)
   catch
+    :exit, _reason -> {:error, :unavailable}
+  end
+
+  # The steps that confirm a compaction the provider already served keep a
+  # session that did not answer within the call budget (`timeout`: it may
+  # still apply the step when it does) apart from one that is gone
+  # (`unavailable`), which the runtime tells apart when it decides whether the
+  # client still gets that compaction (findings#270 row 270-249).
+  defp confirmation_call(pid, message) do
+    GenServer.call(pid, message, @admission_call_timeout_ms)
+  catch
+    :exit, {:timeout, _call} -> {:error, :timeout}
     :exit, _reason -> {:error, :unavailable}
   end
 
@@ -295,10 +394,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   end
 
   @impl GenServer
-  def init(:new) do
-    sensitivity = NativeCompactionTrace.configure_process_sensitivity(:upstream_session)
+  def init(:new), do: init({:new, nil, :direct})
+  def init({:new, subscriber}), do: init({:new, subscriber, :direct})
 
-    {:ok, put_trace_sensitivity(new_connection_lifecycle_state(), sensitivity)}
+  def init({:new, subscriber, admission_topology}) do
+    sensitivity = NativeCompactionTrace.configure_process_sensitivity(:upstream_session)
+    _producer_identity = ExecutionIdentity.producer()
+
+    state =
+      new_connection_lifecycle_state()
+      |> put_trace_sensitivity(sensitivity)
+      |> put_connection_close_subscriber(subscriber)
+      |> put_admission_topology(admission_topology)
+
+    {:ok, state}
   end
 
   @impl GenServer
@@ -345,8 +454,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   else
     def handle_call(
-          {:native_compaction_trace_sensitivity, :observe, _generation, _authorization,
-           _restorer},
+          {:native_compaction_trace_sensitivity, :observe, _generation, _authorization, _restorer},
           _from,
           state
         ),
@@ -359,23 +467,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     caller_monitor = Process.monitor(caller_pid)
 
     try do
-      case request_on_connection(state, key, request, {caller_pid, caller_monitor}) do
-        {:ok, result, state} ->
-          {:reply, result, maybe_schedule_keepalive(state)}
+      {:ok, result, state} =
+        request_on_connection(state, key, request, {caller_pid, caller_monitor})
 
-        {:retry, state, previous_connection} ->
-          {:ok, result, state} =
-            state
-            |> close_state()
-            |> request_on_reconnected(
-              key,
-              request,
-              previous_connection,
-              {caller_pid, caller_monitor}
-            )
-
-          {:reply, result, maybe_schedule_keepalive(state)}
-      end
+      {:reply, result, maybe_schedule_keepalive(state)}
     after
       Process.demonitor(caller_monitor, [:flush])
     end
@@ -385,17 +480,23 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     {:reply, connection_lifecycle_state(state), state}
   end
 
+  def handle_call(:live_connection, _from, state), do: {:reply, {:ok, live_connection_state(state)}, state}
+
+  def handle_call(:producer_identity, _from, state), do: {:reply, ExecutionIdentity.producer(), state}
+
+  # An armed compaction has no bound, and a final or a collection past its
+  # own has ended (findings#270 rows 270-317 and 270-289). A snapshot of one
+  # that ended answers `expired`, the reason it did: read through
+  # `admission_state/1` it was an empty admission, and the reservation it
+  # refused was logged `cause=owner_unavailable` like every other refusal
+  # (row 270-334).
   def handle_call(:compaction_reservation_snapshot, _from, state) do
+    stored = Map.get(state, :native_compaction_admission, %NativeCompactionAdmission{phase: :cleared})
+
     result =
-      with %{phase: phase, binding: %Binding{} = binding, expires_at_ms: expires}
-           when phase in [:pending_compact, :pending_final] and is_integer(expires) <-
-             admission_state(state),
-           true <- expires >= System.system_time(:millisecond),
-           :ok <- validate_direct_binding(state, binding),
-           true <- binding.serving_mode in [:full, :lite] do
-        {:ok, Map.take(binding, [:lifecycle_id, :generation, :serving_mode])}
-      else
-        _invalid -> {:error, :owner_unavailable}
+      case NativeCompactionAdmission.expire_unconsumed(stored, System.system_time(:millisecond)) do
+        {:expired, _cleared} -> {:error, :expired}
+        {:active, admission} -> reservation_snapshot(state, admission)
       end
 
     {:reply, result, state}
@@ -440,8 +541,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     do: {:reply, {:error, :invalid_input}, state}
 
   def handle_call(
-        {:authorize_first_compact_collection, %Binding{} = binding,
-         %FirstCompactResult{} = receipt},
+        {:authorize_first_compact_collection, %Binding{} = binding, %FirstCompactResult{} = receipt},
         _from,
         state
       ) do
@@ -461,21 +561,25 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       {:ok, admission, provenance} ->
         admission = %{admission | compaction_item_digest: receipt.item_digest}
 
-        {:reply, {:ok, provenance},
-         state |> Map.delete(:first_compact_result) |> put_admission(admission)}
+        {:reply, {:ok, provenance}, state |> Map.delete(:first_compact_result) |> put_admission(admission)}
 
       {:error, reason} ->
-        {:reply, {:error, reason}, state}
+        authorize_closed_connection_first_compact(state, binding, receipt, {:error, reason})
 
       false ->
-        {:reply, {:error, :invalid_transition}, state}
+        authorize_closed_connection_first_compact(state, binding, receipt, {:error, :invalid_transition})
     end
+  end
+
+  def handle_call({:record_first_compact_collected, provenance}, _from, %{closed_connection_collection: %NativeCompactionAdmission{phase: :ordinary_success, first_compact_collection: %FirstCompactCollection{}}} = state)
+      when not is_map_key(state, :native_compaction_admission) do
+    record_closed_connection_first_collection(state, provenance)
   end
 
   def handle_call({:record_first_compact_collected, provenance}, _from, state) do
     admission = admission_state(state)
 
-    case NativeCompactionAdmission.record_first_compact_collected(admission, provenance) do
+    case NativeCompactionAdmission.record_first_compact_collected(admission, provenance, System.system_time(:millisecond)) do
       {:ok, admission} ->
         {:reply, :ok, put_admission(state, admission)}
 
@@ -530,15 +634,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         {:reply, :ok, put_admission(state, admission)}
 
       {:error, reason} ->
-        :ok =
-          NativeCompactionAuthorizationObservation.log_accounting_rejection(
-            admission_state(state),
-            capability,
-            :direct,
-            reason
-          )
+        if closed_under_capability?(state, capability) do
+          {:reply, {:error, :connection_closed}, state}
+        else
+          :ok =
+            NativeCompactionAuthorizationObservation.log_accounting_rejection(
+              admission_state(state),
+              capability,
+              :direct,
+              reason
+            )
 
-        {:reply, {:error, reason}, clear_rejected_capability(state, capability, reason)}
+          {:reply, {:error, reason}, clear_rejected_capability(state, capability, reason)}
+        end
     end
   end
 
@@ -564,8 +672,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     do: {:reply, :ok, clear_admission(state, :compact_failure)}
 
   def handle_call(
-        {:acknowledge_compact_finalization,
-         {:success, digest, %Confirmation{} = confirmation, expires_at_ms}},
+        {:acknowledge_compact_finalization, {:success, digest, %Confirmation{} = confirmation, expires_at_ms}},
         _from,
         state
       ) do
@@ -583,7 +690,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         {:reply, :ok, put_admission(state, admission)}
 
       {:error, reason} ->
-        {:reply, {:error, reason}, state}
+        confirm_closed_connection_collection(state, reason, digest, confirmation, expires_at_ms)
 
       {:error, reason, admission} ->
         {:reply, {:error, reason},
@@ -597,18 +704,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   def handle_call({:acknowledge_compact_finalization, _invalid}, _from, state),
     do: {:reply, {:error, :invalid_input}, clear_admission(state, :invalid_input)}
 
-  def handle_call({:acknowledge_final_response, :success}, _from, state) do
-    case NativeCompactionAdmission.clear_consumed(admission_state(state)) do
-      {:ok, _admission} -> {:reply, :ok, clear_admission(state, :final_success)}
-      {:error, reason} -> {:reply, {:error, reason}, clear_admission(state, reason)}
-    end
-  end
-
-  def handle_call({:acknowledge_final_response, :failure}, _from, state),
-    do: {:reply, :ok, clear_admission(state, :final_failure)}
-
+  # The explicit clear control: the runtime rejected the request the
+  # admission was reserved for (`Service.clear_native_compaction_admission`).
   def handle_call(:clear_compaction_admission, _from, state),
-    do: {:reply, :ok, clear_admission(state)}
+    do: {:reply, :ok, clear_admission(state, :request_rejected)}
 
   def handle_call({:clear_compaction_admission, %Capability{} = capability}, _from, state) do
     case NativeCompactionAdmission.clear_owned(admission_state(state), capability) do
@@ -616,8 +715,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         {:reply, :ok, clear_admission(state, :request_rejected)}
 
       {:error, reason} ->
-        observe_admission(state, state, :reject, :stale_capability)
-        {:reply, {:error, reason}, state}
+        if closed_under_capability?(state, capability) do
+          {:reply, :ok, state}
+        else
+          observe_admission(state, state, :reject, :stale_capability)
+          {:reply, {:error, reason}, state}
+        end
     end
   end
 
@@ -626,8 +729,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   def handle_call({:send_text, payload}, _from, %{conn: _conn} = state) do
     case send_text(state, payload) do
-      {:ok, state} -> {:reply, {:ok, :sent}, maybe_schedule_keepalive(state)}
-      {:error, reason, state} -> {:reply, {:error, reason}, close_state(state)}
+      {:ok, state} ->
+        {:reply, {:ok, :sent}, maybe_schedule_keepalive(state)}
+
+      {:error, reason, state} ->
+        {:reply, {:error, reason}, close_between_requests(state, :send_failed, transport_reason: reason)}
     end
   end
 
@@ -635,7 +741,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     do: {:reply, {:error, :upstream_websocket_not_connected}, state}
 
   def handle_call(:invalidate_connection, _from, %{conn: _conn} = state) do
-    {:reply, :ok, invalidate_state(state)}
+    :ok = CloseDiagnostics.log_close(state, :invalidated)
+    {:reply, :ok, close_and_signal(state, :invalidated, &invalidate_state/1)}
   end
 
   def handle_call(:invalidate_connection, _from, state),
@@ -656,11 +763,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       case send_frame(state, {:ping, payload}) do
         {:ok, state} ->
           state
+          |> mark_ping_sent()
           |> schedule_pong_deadline(payload)
           |> schedule_keepalive()
 
-        {:error, _reason, state} ->
-          close_state(state)
+        {:error, reason, state} ->
+          close_between_requests(state, :ping_send_failed, transport_reason: reason)
       end
 
     {:noreply, state}
@@ -672,7 +780,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         {:upstream_websocket_pong_deadline, token},
         %{keepalive_pong_token: token} = state
       ) do
-    {:noreply, close_state(state)}
+    {:noreply, close_between_requests(state, :pong_deadline)}
   end
 
   def handle_info({:upstream_websocket_pong_deadline, _token}, state), do: {:noreply, state}
@@ -708,14 +816,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
+  # An interrupt that reaches a session with no turn in flight names a response
+  # that already ended, or one that never ran here.
+  def handle_info({:upstream_websocket_interrupt, _interrupt}, state) do
+    :ok = ResponseInterrupt.log(:session_idle, interrupt_topology(state))
+    {:noreply, state}
+  end
+
   def handle_info(message, %{conn: conn} = state) do
     case Mint.WebSocket.stream(conn, message) do
       {:ok, conn, responses} ->
         state = %{state | conn: conn}
         {:noreply, handle_async_parts(state, responses)}
 
-      {:error, conn, _reason, _responses} ->
-        {:noreply, close_state(%{state | conn: conn})}
+      {:error, conn, reason, _responses} ->
+        state = %{state | conn: conn}
+        {:noreply, close_between_requests(state, idle_transport_cause(reason), transport_reason: reason)}
 
       :unknown ->
         {:noreply, state}
@@ -741,12 +857,25 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
        do: {:ok, state}
 
   defp ensure_connection(state, key, url, headers, timeouts, request_caller) do
-    state = close_state(state)
+    state = close_replaced_connection(state, key)
 
     ConnectionUpgrade.connect_state(state, key, url, headers, timeouts, request_caller)
   end
 
-  defp request_key(%Request{} = request), do: {request.url, request.headers}
+  # Like the Codex client, a connection keeps the routing hint of the handshake
+  # that opened it: a later turn's tier or model hint never forces a reconnect.
+  # Every other header still scopes the connection, including the provider
+  # session headers (`session-id`, `thread-id`, `x-client-request-id`): a
+  # reusable owner can serve several downstream sockets and API keys of one
+  # Pool, so a turn whose values differ or are absent opens its own connection
+  # instead of riding one whose handshake carried another client's session.
+  defp request_key(%Request{} = request),
+    do: {request.url, Enum.reject(request.headers, &routing_hint_header?/1)}
+
+  defp routing_hint_header?({name, _value}) when is_binary(name),
+    do: String.downcase(name) == "x-codex-routing-hint"
+
+  defp routing_hint_header?(_header), do: false
 
   defp request_on_connection(state, key, %Request{} = request, request_caller) do
     reused_connection? = reusable_connection?(state, key)
@@ -755,64 +884,29 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
     case request_once_on_connection(state, key, request, connection_usage, request_caller) do
       {:ok, result, state} ->
-        if reconnect_reused_connection?(reused_connection?, request, result) do
-          {:retry, state, result_connection_metadata(result)}
-        else
-          {:ok, result, state}
-        end
-
-      {:error, reason, state} ->
-        if reconnect_reused_connection?(reused_connection?, request, reason) do
-          {:retry, state, nil}
-        else
-          result = request_error(reason, state)
-          state = close_state(state)
-          {:ok, result, state}
-        end
-    end
-  end
-
-  defp reset_probe?(%Request{reset_probe: %ResetProbe{} = probe}), do: ResetProbe.bound?(probe)
-  defp reset_probe?(%Request{}), do: false
-
-  defp collect_compaction?(%Request{websocket_delivery_mode: mode})
-       when mode in [:collect_compaction, :collect_full_history], do: true
-
-  defp collect_compaction?(%Request{}), do: false
-
-  defp reconnect_reused_connection?(false, %Request{}, _result_or_reason), do: false
-
-  defp reconnect_reused_connection?(true, %Request{} = request, result_or_reason) do
-    not reset_probe?(request) and not collect_compaction?(request) and
-      pre_response_reconnectable?(result_or_reason)
-  end
-
-  defp reusable_connection?(%{key: key, conn: _conn}, key), do: true
-  defp reusable_connection?(_state, _key), do: false
-
-  defp request_on_reconnected(
-         state,
-         key,
-         %Request{} = request,
-         previous_connection,
-         request_caller
-       ) do
-    connection_usage = %{reused: false, reconnected: true}
-
-    case request_once_on_connection(state, key, request, connection_usage, request_caller) do
-      {:ok, result, state} ->
         {:ok, result, state}
 
       {:error, reason, state} ->
-        result =
-          reason
-          |> request_error(state)
-          |> maybe_put_result_connection_metadata(previous_connection)
-
+        result = request_error(reason, state)
         state = close_state(state)
         {:ok, result, state}
     end
   end
+
+  defp collect_compaction?(%Request{websocket_delivery_mode: mode})
+       when mode in [:collect_compaction, :collect_full_history],
+       do: true
+
+  defp collect_compaction?(%Request{}), do: false
+
+  # Only a collecting turn pays for the larger accumulator; a relayed turn keeps
+  # the bounded diagnostic retention alone.
+  defp new_collected_body(%Request{} = request) do
+    if collect_compaction?(request), do: CollectedBody.empty(), else: CollectedBody.disabled()
+  end
+
+  defp reusable_connection?(%{key: key, conn: _conn}, key), do: true
+  defp reusable_connection?(_state, _key), do: false
 
   defp request_once_on_connection(
          state,
@@ -827,14 +921,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       writer: request.writer,
       timeouts: request.timeouts,
       message_mapper: request.message_mapper,
+      public_tool_completion: new_public_tool_completion(request),
       frame_observer: request.frame_observer,
       native_codex_response_control: Map.get(request, :native_codex_response_control),
       delivery: %Delivery{
         mode: request.websocket_delivery_mode,
         effective_serving_mode: request.effective_serving_mode
       },
+      collected_body: new_collected_body(request),
       request_caller_pid: request_caller_pid,
       request_caller_monitor: request_caller_monitor,
+      request_id: request.request_id,
+      attempt_id: request.attempt_id,
       native_client_retry_observation: request.native_client_retry_observation,
       # Tolerant access: during a rolling deploy an owner-forwarded request may
       # have been built by a replica that predates this field. nil keeps the
@@ -874,9 +972,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
          receive_state,
          connection_usage
        ) do
-    if collect_compaction?(request) and
-         not collect_connection_eligible?(state, key, request, connection_usage) do
-      guard_connection_bound_continuation(state, receive_state, connection_usage)
+    if (public_openai_responses_mapper?(request.message_mapper) and Map.get(request, :connection_bound_continuation?, false) and not reusable_connection?(state, key)) or
+         (collect_compaction?(request) and
+            not collect_connection_eligible?(state, key, request, connection_usage)) do
+      reason = if connection_use(connection_usage) == :reused and Map.get(state, :last_successful_effective_serving_mode) != request.effective_serving_mode, do: :previous_response_serving_mode_mismatch, else: :previous_response_generation_mismatch
+      guard_connection_bound_continuation(state, receive_state, connection_usage, reason)
     else
       connect_and_send_eligible_request(
         state,
@@ -903,18 +1003,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
        ) do
     case ensure_connection(state, key, url, headers, timeouts, request_caller(receive_state)) do
       {:ok, state} ->
-        connection_use = connection_use(connection_usage)
+        {upgrade_frames, state} = Map.pop(state, :upgrade_frames, [])
 
-        if Map.get(request, :connection_bound_continuation?, false) and
-             connection_use != :reused do
-          guard_connection_bound_continuation(state, receive_state, connection_usage)
-        else
-          send_request_payload(state, request, receive_state, connection_usage)
+        case settle_upgrade_frames(state, receive_state, upgrade_frames, connection_usage) do
+          {:ok, state, receive_state} ->
+            send_on_connection(state, request, receive_state, connection_usage)
+
+          {:failed, result, state} ->
+            {:ok, put_result_connection_metadata(result, state, connection_usage), state}
         end
 
       {:error, :client_disconnected, state} ->
         result = request_caller_down_result(state, receive_state)
-        state = invalidate_state(state)
+        state = invalidate_cancelled_request(state, receive_state, :connect)
         {:ok, put_result_connection_metadata(result, state, connection_usage), state}
 
       {:error, reason, state} ->
@@ -925,6 +1026,78 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
         {:error, reason, state}
     end
+  end
+
+  defp send_on_connection(state, request, receive_state, connection_usage) do
+    connection_use = connection_use(connection_usage)
+
+    cond do
+      not Map.get(request, :connection_bound_continuation?, false) ->
+        send_request_payload(state, request, receive_state, connection_usage)
+
+      connection_use != :reused ->
+        guard_connection_bound_continuation(state, receive_state, connection_usage)
+
+      lite_anchor_on_full_context?(state, request) ->
+        guard_connection_bound_continuation(state, receive_state, connection_usage, :previous_response_serving_mode_mismatch)
+
+      true ->
+        send_request_payload(state, request, receive_state, connection_usage)
+    end
+  end
+
+  # Frames that arrived in the same read as the `101` come out of the upgrade already decoded and in order
+  # (`ConnectionUpgrade`), by the websocket that holds that read's decoder state. The peer wrote them before this
+  # request existed, so what ends the connection ends the request before its payload is written, through the
+  # `handle_frame/2` clauses a frame read during the request takes: a Close fails it with the peer's own code and
+  # reason size, a frame the decoder rejected or a binary frame fails it as it would later, and a Ping gets its Pong.
+  # The failure says the payload never left (`upstream_committed` false) and keeps the phase of the same failure read
+  # later, never `connect`: that phase takes the same-assignment retry and the `/v1` bridge's HTTP fallback. Text
+  # frames wait in the receive state and fold through `handle_frames/3` ahead of the first read
+  # (`await_sent_request/2`), the path they take when they arrive in a read of their own; nothing is relayed before
+  # the payload is written. One bounded info line records what the upgrade carried (findings#304).
+  defp settle_upgrade_frames(state, %ReceiveState{} = receive_state, [], _connection_usage), do: {:ok, state, receive_state}
+
+  defp settle_upgrade_frames(state, %ReceiveState{} = receive_state, frames, connection_usage) do
+    receive_state = %{receive_state | connection_use: connection_use(connection_usage)}
+    outcome = Enum.reduce_while(frames, {:continue, state, receive_state, []}, &settle_upgrade_frame/2)
+    :ok = Logger.info(upgrade_frames_line(state, frames))
+
+    case outcome do
+      {:continue, state, receive_state, text_frames} ->
+        {:ok, state, %{receive_state | upgrade_frames: Enum.reverse(text_frames)}}
+
+      {:failure, _state, _receive_state, _reason} = halted ->
+        {{:error, failure}, state} = finish_receive_result(halted)
+        {:failed, {:error, put_in(failure, [:transport_failure, "upstream_committed"], false)}, state}
+    end
+  end
+
+  defp settle_upgrade_frame({:text, _text} = frame, {:continue, state, receive_state, text_frames}),
+    do: {:cont, {:continue, state, receive_state, [frame | text_frames]}}
+
+  defp settle_upgrade_frame(frame, {:continue, state, receive_state, text_frames}) do
+    case handle_frame(frame, {:continue, state, receive_state}) do
+      {:cont, {:continue, state, receive_state}} -> {:cont, {:continue, state, receive_state, text_frames}}
+      {:halt, halted} -> {:halt, halted}
+    end
+  end
+
+  # Counts by frame kind and the first Close's code only, never a payload, a close reason or a Ping's bytes.
+  defp upgrade_frames_line(state, frames) do
+    counts = Enum.frequencies_by(frames, &elem(&1, 0))
+
+    close_code =
+      Enum.find_value(frames, "none", fn
+        {:close, code, _reason} -> coalesced_close_code(code)
+        _frame -> nil
+      end)
+
+    lifecycle = connection_lifecycle_state(state)
+
+    "upstream websocket upgrade frames handled frames=#{length(frames)} " <>
+      Enum.map_join(~w(ping pong text binary close error)a, " ", &"#{&1}=#{Map.get(counts, &1, 0)}") <>
+      " close_code=#{close_code} lifecycle_id=#{lifecycle.lifecycle_id} generation=#{lifecycle.generation}"
   end
 
   defp collect_connection_eligible?(
@@ -953,16 +1126,30 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   defp request_caller(%ReceiveState{}), do: nil
 
-  defp guard_connection_bound_continuation(state, receive_state, connection_usage) do
-    terminal =
-      StreamProtocol.canonicalize_native_codex_responses_json_message(
-        ~s({"type":"error","error":{"code":"previous_response_not_found"}})
-      )
-
-    decoded = decode_text_frame(terminal)
+  # A connection-bound anchor is refused before anything is sent when the
+  # context it continues cannot be the one the request expects: the connection
+  # is not the one that produced the anchor, or the anchor is Lite and the
+  # provider context was built under Full. Lite sends its tool manifest and
+  # instructions message only on a request that opens a context (findings#232
+  # row 232-184), so an anchored Lite delta on a context opened under Full would
+  # reach the provider with no tools and no base instructions (row 232-210).
+  # The client answers `previous_response_not_found` with a full request
+  # without the anchor, which opens a Lite context with the prefix.
+  #
+  # A public `/v1` bridged anchor has no client that retries
+  # `previous_response_not_found`; it gets the refusal the provider sends for
+  # the same request on a connection that did not produce the anchor (a
+  # codeless 400 `invalid_request_error`, findings#232 row 232-277, live probe
+  # 2026-09-23), which the bridge answers like the provider's own refusal.
+  defp guard_connection_bound_continuation(state, receive_state, connection_usage, reason \\ :previous_response_generation_mismatch) do
+    {terminal, decoded, mapped, mapped_decoded} = connection_bound_miss_frame(receive_state.message_mapper)
 
     {:halt, {:terminal, state, receive_state, "error"}} =
-      handle_text_frame(state, receive_state, terminal, decoded, terminal, decoded)
+      handle_text_frame(state, receive_state, terminal, decoded, mapped, mapped_decoded)
+
+    # The guard's own refusal: the provider never received the request, so the
+    # connection stays usable and is not retired like after a provider refusal.
+    receive_state = %{receive_state | provider_refusal?: false}
 
     {{:ok, result}, state} =
       finish_receive_result({:terminal, state, receive_state, "error"})
@@ -973,7 +1160,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       |> Map.put(
         :transport_failure,
         TransportFailureReason.transport_failure_metadata(
-          :previous_response_generation_mismatch,
+          reason,
           %{connection_use: connection_use(connection_usage)}
         )
       )
@@ -981,15 +1168,56 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     {:ok, put_result_connection_metadata({:ok, result}, state, connection_usage), state}
   end
 
+  defp connection_bound_miss_frame(mapper) do
+    if public_openai_responses_mapper?(mapper) do
+      terminal =
+        CodexPooler.JSON.encode!(%{
+          "type" => "error",
+          "status" => 400,
+          "error" => %{"type" => "invalid_request_error", "message" => ErrorCodes.invalid_previous_response_id_message()}
+        })
+
+      decoded = decode_text_frame(terminal)
+      {mapped, mapped_decoded} = map_message(terminal, decoded, mapper)
+      {terminal, decoded, mapped, mapped_decoded}
+    else
+      terminal =
+        StreamProtocol.canonicalize_native_codex_responses_json_message(~s({"type":"error","error":{"code":"previous_response_not_found"}}))
+
+      decoded = decode_text_frame(terminal)
+      {terminal, decoded, terminal, decoded}
+    end
+  end
+
+  defp public_openai_responses_mapper?(mapper),
+    do: mapper == (&StreamProtocol.normalize_public_openai_responses_json_message/1)
+
+  # Only a Lite anchor on a context opened under Full lacks anything: the Full
+  # context holds no tool manifest and no instructions message, and the Lite
+  # anchored request carries neither. The reverse flip is sent: a Full anchored
+  # request carries its tools and instructions at top level, so the provider
+  # gets them whatever the context holds, and a replay kept in the mode it
+  # started with may legitimately be followed by a Full turn on its connection.
+  # The mode is known only for a context whose last response on this connection
+  # completed (`maybe_record_successful_serving_mode/3`); without one the plain
+  # reuse rule applies.
+  #
+  # A public `/v1` bridged anchor is bound to its connection too (findings#232
+  # row 232-277) but is never refused for the mode: it carries the declared
+  # Lite prefix, which gives the Full context what it lacks
+  # (`PayloadNormalizer.responses_lite_prefix/6`, row 232-270), while an anchor
+  # off its connection has no such remedy.
+  defp lite_anchor_on_full_context?(state, %Request{effective_serving_mode: "lite", message_mapper: mapper}),
+    do: not public_openai_responses_mapper?(mapper) and Map.get(state, :last_successful_effective_serving_mode) == "full"
+
+  defp lite_anchor_on_full_context?(_state, %Request{}), do: false
+
   defp send_request_payload(state, %Request{} = request, receive_state, connection_usage) do
     state = state |> Map.delete(:first_compact_result) |> Map.delete(:ordinary_success_result)
 
-    {state, receive_state} =
-      begin_connection_request(state, receive_state, connection_usage)
-
     if request_caller_down?(receive_state) do
       result = request_caller_down_result(state, receive_state)
-      state = state |> invalidate_state() |> complete_connection_request()
+      state = state |> invalidate_cancelled_request(receive_state, :before_payload) |> complete_connection_request()
       {:ok, put_result_connection_metadata(result, state, connection_usage), state}
     else
       send_authorized_request_payload(state, request, receive_state, connection_usage)
@@ -997,7 +1225,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   end
 
   defp send_authorized_request_payload(state, request, receive_state, connection_usage) do
-    with {:ok, state, consumed_phase} <- consume_request_capability(state, request),
+    with {:ok, receipt} <- ProviderCreditsAdmission.admit(request.provider_credits_context),
+         :ok <- require_live_request_caller(receive_state),
+         {:ok, request} <- authorize_forwarded_generation(request, receipt),
+         :ok <- require_live_request_caller(receive_state),
+         :ok <- observe_payload_write(request),
+         {state, receive_state} <- begin_connection_request(state, receive_state, connection_usage),
+         {:ok, state, consumed_phase} <- consume_request_capability(state, request),
+         :ok <- require_live_request_caller(receive_state),
          :ok <- trace_physical_send(:physical_send_started, request, :started),
          {:ok, state} <- send_text(state, request.payload),
          :ok <- trace_physical_send(:physical_send_finished, request, :ok) do
@@ -1011,8 +1246,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         |> maybe_record_successful_serving_mode(result, receive_state)
         |> complete_connection_request()
 
+      result = put_admission_receipt(result, receipt)
       {:ok, put_result_connection_metadata(result, state, connection_usage), state}
     else
+      {:error, :client_disconnected} ->
+        result = request_caller_down_result(state, receive_state)
+        state = state |> invalidate_cancelled_request(receive_state, :before_payload) |> complete_connection_request()
+        {:ok, put_result_connection_metadata(result, state, connection_usage), state}
+
+      {:error, %{reason: :provider_credits_policy_denied} = denial} ->
+        {:ok, {:error, Map.merge(denial, %{body: "", headers: []})}, state}
+
+      {:error, reason} when reason in [:owner_unavailable, :payload_write_refused] ->
+        {:ok, {:error, %{reason: :owner_unavailable, body: "", headers: [], started: false}}, state}
+
       {:error, state} ->
         :ok =
           trace_physical_send(:physical_send_finished, request, {:error, :capability_rejected})
@@ -1024,7 +1271,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
         state =
           state
-          |> clear_admission()
+          |> clear_admission(:send_failure)
           |> Map.put(:transport_failure_phase, :send_payload)
           |> Map.put(:transport_failure_source, :payload_send_error)
 
@@ -1032,11 +1279,65 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
+  defp require_live_request_caller(receive_state),
+    do: if(request_caller_down?(receive_state), do: {:error, :client_disconnected}, else: :ok)
+
+  # The forwarder that submitted the request through an owner learns here,
+  # before the payload can leave, that it is about to (findings#327): an owner
+  # that dies from now on may have handed the turn to the provider, so the
+  # forwarder settles it instead of submitting it to a replacement owner. A
+  # refusal means the forwarder already took the turn back from a dead owner,
+  # so this request ends unsent, with one line (findings#329 row J). A failing
+  # observer is logged and the write goes ahead, as a failing frame observer
+  # is.
+  defp observe_payload_write(%Request{payload_write_observer: observer} = request) when is_function(observer, 0) do
+    case run_payload_write_observer(observer) do
+      :ok ->
+        :ok
+
+      :refused ->
+        Logger.info(
+          "upstream websocket payload write refused reason_code=turn_claimed " <>
+            "request_id=#{DiagnosticTaxonomy.safe_correlator(request.request_id)} " <>
+            "attempt_id=#{DiagnosticTaxonomy.safe_correlator(request.attempt_id)}"
+        )
+
+        {:error, :payload_write_refused}
+    end
+  end
+
+  defp observe_payload_write(%Request{}), do: :ok
+
+  defp run_payload_write_observer(observer) do
+    case observer.() do
+      :ok -> :ok
+      _refused -> :refused
+    end
+  rescue
+    exception -> report_payload_write_observer_failure(:error, exception.__struct__)
+  catch
+    kind, _reason when kind in [:throw, :exit] -> report_payload_write_observer_failure(kind, nil)
+  end
+
+  defp report_payload_write_observer_failure(failure_kind, exception_class) do
+    Logger.warning(
+      "upstream websocket payload write observer failed operation=observe_payload_write " <>
+        "failure_kind=#{failure_kind} exception_class=#{exception_class || "none"}"
+    )
+  end
+
+  defp authorize_forwarded_generation(%Request{forwarded_owner: owner} = request, receipt) when is_pid(owner),
+    do: WebsocketOwnerSession.authorize_generation_send(owner, request, receipt)
+
+  defp authorize_forwarded_generation(%Request{} = request, _receipt), do: {:ok, request}
+
+  defp put_admission_receipt({tag, result}, receipt) when tag in [:ok, :error] and is_map(result),
+    do: {tag, Map.put(result, :provider_credits_admission, receipt)}
+
   defp retain_first_compact_result({:ok, result} = response, state, request) do
     case FirstCompactResult.from_collection(request, result, connection_lifecycle_state(state)) do
       {:ok, receipt} ->
-        {{:ok, Map.put(result, :first_compact_result, receipt)},
-         Map.put(state, :first_compact_result, receipt)}
+        {{:ok, Map.put(result, :first_compact_result, receipt)}, Map.put(state, :first_compact_result, receipt)}
 
       :error ->
         {response, state}
@@ -1050,8 +1351,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       {:ok, receipt} ->
         {:ok, response} = result
 
-        {{:ok, Map.put(response, :ordinary_success_result, receipt)},
-         Map.put(state, :ordinary_success_result, receipt)}
+        {{:ok, Map.put(response, :ordinary_success_result, receipt)}, Map.put(state, :ordinary_success_result, receipt)}
 
       :error ->
         {result, state}
@@ -1073,12 +1373,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp emit_compact_acknowledged(nil),
     do: NativeCompactionAuthorizationObservation.emit(:compact_acknowledged, :direct)
 
-  @type consumed_admission_phase ::
-          :compact
-          | :final
-          | :native_replay
-          | {:first_full_history_compact, FirstCompactCollection.t()}
-          | nil
+  @type consumed_admission_phase :: :compact | :final | :native_replay | nil
 
   @spec consume_request_capability(map(), Request.t()) ::
           {:ok, map(), consumed_admission_phase()} | {:error, map()}
@@ -1088,7 +1383,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
            native_replay_binding: %NativeReplayAdmission.Binding{} = binding,
            native_replay_proof: %RuntimeAdmissionProof{} = proof,
            native_compaction_capability: nil,
-           first_compact_collection: nil,
            forwarded_owner_send_handoff: nil
          }
        ) do
@@ -1122,23 +1416,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       {:ok, put_admission(state, admission), capability.phase}
     else
       _rejected -> {:error, clear_admission(state, :stale_capability)}
-    end
-  end
-
-  defp consume_request_capability(
-         state,
-         %Request{
-           native_compaction_capability: nil,
-           first_compact_collection: %FirstCompactCollection{} = provenance,
-           expected_connection_lifecycle: expected_lifecycle,
-           forwarded_owner_send_handoff: nil
-         }
-       ) do
-    if expected_lifecycle == connection_lifecycle_state(state) and
-         FirstCompactCollection.valid?(provenance) do
-      {:ok, state, {:first_full_history_compact, provenance}}
-    else
-      {:error, clear_admission(state, :request_rejected)}
     end
   end
 
@@ -1183,10 +1460,17 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp normalized_forwarded_serving_mode(:lite), do: {:ok, :lite}
   defp normalized_forwarded_serving_mode(_mode), do: {:error, :invalid_serving_mode}
 
-  defp finalize_consumed_request(state, {:ok, _result}, :compact, _request) do
-    case NativeCompactionAdmission.record_compact_collected(admission_state(state)) do
+  # A consumed compaction is collected only when the provider completed it. A
+  # provider failure (`response.failed`, an error frame) ends the request with a
+  # terminal result as well, and counting it as collected left the admission
+  # `collected_unconfirmed`: the released client's full-history retry of the
+  # failed compaction was then served and billed, and refused its first-compact
+  # authorization with `502 invalid_compaction_response` (findings#281). It ends
+  # the admission as any failed compaction does.
+  defp finalize_consumed_request(state, {:ok, %{terminal: terminal}}, :compact, request) when terminal in @completed_terminals do
+    case NativeCompactionAdmission.record_compact_collected(admission_state(state), System.system_time(:millisecond)) do
       {:ok, admission} -> put_admission(state, admission)
-      {:error, _reason} -> clear_admission(state)
+      {:error, reason} -> state |> clear_admission(reason) |> collect_closed_connection_compaction(request)
     end
   end
 
@@ -1203,51 +1487,59 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     state
   end
 
-  defp finalize_consumed_request(
-         state,
-         {:ok, _result},
-         {:first_full_history_compact, %FirstCompactCollection{} = provenance},
-         _request
-       ) do
-    case NativeCompactionAdmission.record_first_compact_collected(
-           admission_state(state),
-           provenance
-         ) do
-      {:ok, admission} -> put_admission(state, admission)
-      {:error, _reason} -> clear_admission(state)
-      {:error, _reason, admission} -> put_admission(state, admission)
-    end
-  end
+  defp finalize_consumed_request(state, _result, :compact, _request),
+    do: clear_admission(state, :compact_failure)
 
-  defp finalize_consumed_request(state, {:error, _result}, phase, _request)
-       when phase in [:compact, :final],
-       do: clear_admission(state)
-
-  defp finalize_consumed_request(
-         state,
-         {:error, _result},
-         {:first_full_history_compact, %FirstCompactCollection{}},
-         _request
-       ),
-       do: clear_admission(state)
+  defp finalize_consumed_request(state, {:error, _result}, :final, _request),
+    do: clear_admission(state, :final_failure)
 
   defp finalize_consumed_request(state, _result, nil, _request), do: state
 
   defp maybe_record_successful_serving_mode(
          %{conn: _conn} = state,
-         {:ok, %{terminal: terminal}},
+         {:ok, %{terminal: terminal} = result},
          %ReceiveState{delivery: %Delivery{effective_serving_mode: mode}}
        )
-       when terminal in ["response.completed", "response.done"] and mode in ["full", "lite"] do
-    Map.put(state, :last_successful_effective_serving_mode, mode)
+       when mode in ["full", "lite"] do
+    if context_kept_terminal?(terminal, Map.get(result, :upstream_error_code)),
+      do: Map.put(state, :last_successful_effective_serving_mode, mode),
+      else: state
   end
 
   defp maybe_record_successful_serving_mode(state, _result, %ReceiveState{}), do: state
 
+  # The idle keepalive only runs between requests, while this process waits in
+  # its GenServer loop. A submitted turn blocks that loop in `receive_events/2`
+  # for as long as the provider stays silent (a long reasoning pause, a held
+  # turn), so without an in-flight ping the peer or an intermediary sees no
+  # client data and can close the socket on its own idle timeout, failing a
+  # turn that was still running upstream (Bandit's default 60 s, the smoke
+  # proxy-drain lane, icoretech/codex-pooler-findings#206 row 206-142). The
+  # keepalive clock restarts at the submission and keeps pinging on the same
+  # interval until the request ends; the reply re-arms the idle keepalive.
   defp await_sent_request(state, receive_state) do
     :erlang.garbage_collect(self())
-    {result, state} = receive_events(state, receive_state)
+    state = schedule_keepalive(state)
+    receive_state = renew_receive_deadline(receive_state)
+
+    {result, state} =
+      case receive_state.upgrade_frames do
+        [] ->
+          receive_events(state, receive_state)
+
+        # Text frames the peer wrote behind the `101` come before anything this loop reads, in the order they came
+        # (`settle_upgrade_frames/4`).
+        frames ->
+          state |> handle_frames(frames, %{receive_state | upgrade_frames: []}) |> finish_receive_result()
+      end
+
     {:ok, result, state}
+  end
+
+  # Only response data renews this idle deadline. Local keepalive ticks and
+  # peer control frames prove connection liveness, not response progress.
+  defp renew_receive_deadline(%ReceiveState{} = receive_state) do
+    %{receive_state | receive_deadline_ms: System.monotonic_time(:millisecond) + receive_state.timeouts.receive_timeout_ms}
   end
 
   defp request_error(reason, state) do
@@ -1271,16 +1563,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
      )}
   end
 
-  defp maybe_put_result_connection_metadata({status, result}, connection)
-       when status in [:ok, :error] and is_map(connection) do
-    {status, Map.put(result, :upstream_websocket_connection, connection)}
-  end
-
-  defp maybe_put_result_connection_metadata(result, _connection), do: result
-
-  defp result_connection_metadata({_status, result}),
-    do: Map.get(result, :upstream_websocket_connection)
-
   @spec upstream_websocket_connection(map(), connection_usage()) ::
           upstream_websocket_connection()
   defp upstream_websocket_connection(
@@ -1296,19 +1578,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   end
 
   defp request_error_transport_failure(reason, state) do
+    phase = Map.get(state, :transport_failure_phase, :request)
+
     attrs =
       %{
-        phase: Map.get(state, :transport_failure_phase, :request),
-        termination_source:
-          Map.get(state, :transport_failure_source) || request_failure_source(reason),
+        phase: phase,
+        termination_source: Map.get(state, :transport_failure_source) || request_failure_source(reason),
         pre_visible_output: true,
         terminal_seen: false,
         text_frame_count: 0
       }
+      |> maybe_mark_pre_submission_failure(phase)
       |> Map.merge(Map.get(state, :current_request_diagnostics, %{}))
 
     TransportFailureReason.transport_failure_metadata(reason, attrs)
   end
+
+  defp maybe_mark_pre_submission_failure(attrs, :connect),
+    do: Map.put(attrs, :upstream_committed, false)
+
+  defp maybe_mark_pre_submission_failure(attrs, _phase), do: attrs
 
   defp request_failure_source(:upstream_websocket_session_unavailable), do: :session_unavailable
   defp request_failure_source(_reason), do: nil
@@ -1386,18 +1675,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
-  defp pre_response_reconnectable?({:error, %{body: "", reason: reason}}),
-    do: pre_response_reconnectable?(reason)
-
-  defp pre_response_reconnectable?(:upstream_websocket_closed_before_terminal), do: true
-  defp pre_response_reconnectable?(:closed), do: true
-  defp pre_response_reconnectable?(:econnreset), do: true
-
-  defp pre_response_reconnectable?(%Mint.TransportError{reason: reason}),
-    do: pre_response_reconnectable?(reason)
-
-  defp pre_response_reconnectable?(_reason), do: false
-
   defp send_text(%{conn: conn, ref: ref, websocket: websocket} = state, text) do
     _trace =
       NativeCompactionTrace.emit_full(:upstream_websocket_frame_sent, %{
@@ -1461,11 +1738,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     socket = mint_socket(conn)
     request_caller_pid = receive_state.request_caller_pid
     request_caller_monitor = receive_state.request_caller_monitor
+    keepalive_token = Map.get(state, :keepalive_token)
 
     receive do
       {:DOWN, ^request_caller_monitor, :process, ^request_caller_pid, _reason}
       when is_reference(request_caller_monitor) and is_pid(request_caller_pid) ->
-        {request_caller_down_result(state, receive_state), invalidate_state(state)}
+        {request_caller_down_result(state, receive_state), invalidate_cancelled_request(state, receive_state, :receive)}
 
       {:tcp, ^socket, _data} = message ->
         handle_event_message(state, receive_state, message)
@@ -1487,12 +1765,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
       {:upstream_websocket_pong_deadline, token} ->
         handle_pong_deadline_message(state, receive_state, token)
+
+      {:upstream_websocket_keepalive, ^keepalive_token} when is_reference(keepalive_token) ->
+        send_in_flight_keepalive(state, receive_state)
+
+      {:upstream_websocket_interrupt, interrupt} ->
+        handle_interrupt_message(state, receive_state, interrupt)
     after
-      receive_state.timeouts.receive_timeout_ms ->
+      max(receive_state.receive_deadline_ms - System.monotonic_time(:millisecond), 0) ->
         result =
           {:error,
            %{
              body: receive_body(receive_state),
+             response_usage: receive_model_usage(receive_state),
              reason: :upstream_websocket_receive_timeout,
              headers: state.headers,
              upstream_error_param: receive_state.terminal_upstream_error_param,
@@ -1510,6 +1795,64 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         {result, invalidate_state(state)}
     end
   end
+
+  # An in-flight ping only keeps the connection visibly alive; it arms no pong
+  # deadline, so a provider that answers late never fails a running turn that
+  # the receive timeout still covers. A pong deadline armed by an idle ping
+  # before the request keeps its existing meaning. A ping that cannot be written
+  # fails the turn exactly like a Pong that cannot be written.
+  defp send_in_flight_keepalive(state, %ReceiveState{} = receive_state) do
+    case send_frame(state, {:ping, unique_keepalive_payload()}) do
+      {:ok, state} ->
+        receive_events(state |> mark_ping_sent() |> schedule_keepalive(), receive_state)
+
+      {:error, reason, state} ->
+        receive_state = %{receive_state | termination_source: :websocket_control_send_error}
+        finish_receive_result({:failure, state, receive_state, {:websocket_control_send_failed, reason}})
+    end
+  end
+
+  # The provider resolves an interrupt only on the connection that carries the
+  # response it names, and only while that response runs: it answers with
+  # `response.interrupt.accepted`, `response.output_item.interrupted` for an
+  # item it had open and the terminal `response.incomplete` (reason
+  # `interrupted`), which this loop reads and relays like any other frame. A
+  # collected turn (a compaction) is never interrupted: the released client
+  # sends no interrupt for one, and its result is not relayed as it arrives.
+  # An interrupt that cannot be written does what a ping that cannot be
+  # written does: the connection is gone, and the turn fails with it.
+  defp handle_interrupt_message(state, %ReceiveState{} = receive_state, interrupt) do
+    case interrupt_disposition(receive_state, interrupt) do
+      :write ->
+        case send_text(state, ResponseInterrupt.frame(interrupt)) do
+          {:ok, state} ->
+            :ok = ResponseInterrupt.log(:written, interrupt_topology(state))
+            receive_events(state, receive_state)
+
+          {:error, reason, state} ->
+            :ok = ResponseInterrupt.log(:session_unavailable, interrupt_topology(state))
+            receive_state = %{receive_state | termination_source: :websocket_control_send_error}
+            finish_receive_result({:failure, state, receive_state, {:websocket_control_send_failed, reason}})
+        end
+
+      outcome ->
+        :ok = ResponseInterrupt.log(outcome, interrupt_topology(state))
+        receive_events(state, receive_state)
+    end
+  end
+
+  defp interrupt_disposition(%ReceiveState{delivery: %Delivery{mode: mode}}, _interrupt) when mode != :relay, do: :not_relay
+
+  defp interrupt_disposition(%ReceiveState{message_mapper: mapper} = receive_state, interrupt) do
+    cond do
+      public_openai_responses_mapper?(mapper) -> :not_relay
+      receive_state.terminal_seen? -> :terminal_seen
+      is_binary(receive_state.response_id) and receive_state.response_id == interrupt.response_id -> :write
+      true -> :response_mismatch
+    end
+  end
+
+  defp interrupt_topology(state), do: if(Map.get(state, :admission_topology) == :forwarded, do: :owner, else: :direct)
 
   defp request_caller_down?(%ReceiveState{
          request_caller_pid: request_caller_pid,
@@ -1529,6 +1872,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     {:error,
      %{
        body: receive_body(receive_state),
+       response_usage: receive_model_usage(receive_state),
        reason: :client_disconnected,
        headers: Map.get(state, :headers, []),
        upstream_error_param: receive_state.terminal_upstream_error_param,
@@ -1572,18 +1916,52 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     |> Enum.reduce_while({:continue, state, receive_state}, &handle_part/2)
     |> case do
       {:continue, state, receive_state} ->
-        {transport_error_result(state, receive_state, reason), state}
+        {transport_error_result(state, receive_state, reason), close_state(state)}
 
       halted ->
         {result, state} = finish_receive_result(halted)
-        {result, close_state(state)}
+        {result, close_after_transport_error(state, halted, reason)}
     end
   end
+
+  # A terminal decoded beside the transport error completed its request, so
+  # the connection closes after that request like any close between requests:
+  # one close line, and the subscriber is told, since the client now holds the
+  # terminal's response as an anchor (findings#270). A retryable pre-visible
+  # first frame also ends its exchange and would have kept the connection, as
+  # its coalesced Close shows, so it closes the same way. Both closes used to
+  # leave no trace. Any other halt failed its request, which records the close.
+  defp close_after_transport_error(state, {:terminal, _state, _receive_state, _terminal, _trailing}, reason),
+    do: close_after_exchange(state, idle_transport_cause(reason), transport_reason: reason)
+
+  defp close_after_transport_error(
+         state,
+         {:failure, _state, %ReceiveState{termination_source: :upstream_terminal_event}, _failure, _trailing},
+         reason
+       ),
+       do: close_after_exchange(state, idle_transport_cause(reason), transport_reason: reason)
+
+  defp close_after_transport_error(state, _halted, _reason), do: close_state(state)
+
+  # A close at the end of an exchange is logged before the request call records
+  # the exchange's completion, so it records it first: the line's `idle_ms`
+  # then counts from this exchange, not from the one before it or `none`.
+  defp close_after_exchange(state, cause, details) do
+    state
+    |> mark_exchange_completed()
+    |> close_between_requests(cause, details)
+  end
+
+  defp mark_exchange_completed(%{conn: _conn} = state),
+    do: Map.put(state, :last_request_completed_at_monotonic_ms, System.monotonic_time(:millisecond))
+
+  defp mark_exchange_completed(state), do: state
 
   defp transport_error_result(state, %ReceiveState{} = receive_state, reason) do
     {:error,
      %{
        body: receive_body(receive_state),
+       response_usage: receive_model_usage(receive_state),
        reason: reason,
        headers: state.headers,
        upstream_error_param: receive_state.terminal_upstream_error_param,
@@ -1606,6 +1984,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       {:error,
        %{
          body: receive_body(receive_state),
+         response_usage: receive_model_usage(receive_state),
          reason: :upstream_websocket_pong_deadline,
          headers: state.headers,
          upstream_error_param: receive_state.terminal_upstream_error_param,
@@ -1652,44 +2031,167 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         receive_events(state, %{receive_state | transport_signal: nil})
 
       {:terminal, state, receive_state, terminal} ->
-        result =
-          %{
-            body: receive_body(receive_state),
-            terminal: terminal,
-            response_usage: receive_state.response_usage,
-            status: 200,
-            headers: Map.get(state, :headers, []),
-            upstream_error_code: receive_state.terminal_upstream_error_code,
-            upstream_error_param: receive_state.terminal_upstream_error_param,
-            websocket_frame_headers: receive_state.websocket_frame_headers
-          }
-          |> maybe_put_success_response_id(terminal, receive_state.response_id)
+        finish_terminal_result(state, receive_state, terminal, [])
 
-        {{:ok, result}, state}
+      {:terminal, state, receive_state, terminal, trailing_frames} ->
+        finish_terminal_result(state, receive_state, terminal, trailing_frames)
 
       {:failure, state, receive_state, reason} ->
-        {{:error,
-          %{
-            body: receive_body(receive_state),
-            reason: reason,
-            headers: Map.get(state, :headers, []),
-            upstream_error_param: receive_state.terminal_upstream_error_param,
-            websocket_frame_headers: receive_state.websocket_frame_headers,
-            transport_failure:
-              transport_failure_metadata(reason, state, receive_state,
-                phase: failure_phase(reason)
-              ),
-            native_client_retry_observation: final_client_retry_observation(receive_state)
-          }}, state}
+        finish_failure_result(state, receive_state, reason, [])
+
+      {:failure, state, receive_state, reason, trailing_frames} ->
+        finish_failure_result(state, receive_state, reason, trailing_frames)
     end
   end
 
+  # A retryable pre-visible first frame fails the request with
+  # `upstream_terminal_event` and keeps the connection for reuse, so a Close or
+  # Ping decoded behind it in the same read gets the same drain the terminal
+  # gives its trailing frames (icoretech/codex-pooler-findings#203). Every other
+  # failure retires or invalidates the connection and carries no trailing frames.
+  # The error result is built from the pre-drain state, like the terminal's.
+  defp finish_failure_result(state, receive_state, reason, trailing_frames) do
+    next_state =
+      if receive_state.termination_source == :upstream_terminal_event and
+           not exhausted_connection?(receive_state),
+         do: drain_trailing_frames(state, trailing_frames, :retryable_first_frame),
+         else: retire_exhausted_connection(state, receive_state)
+
+    {{:error,
+      %{
+        body: receive_body(receive_state),
+        response_usage: receive_model_usage(receive_state),
+        reason: reason,
+        headers: Map.get(state, :headers, []),
+        upstream_error_param: receive_state.terminal_upstream_error_param,
+        websocket_frame_headers: receive_state.websocket_frame_headers,
+        transport_failure: transport_failure_metadata(reason, state, receive_state, phase: failure_phase(reason)),
+        native_client_retry_observation: final_client_retry_observation(receive_state)
+      }}, next_state}
+  end
+
+  # A peer may coalesce its Close with the terminal frame in a single TCP write,
+  # and `Mint.WebSocket.decode/2` then hands this session both frames in one
+  # decoded batch. The terminal ends the request, so every frame decoded behind
+  # it used to be discarded and a coalesced Close was never answered: the peer
+  # waited on an acknowledgement that never arrived, and the next request reused
+  # a socket the peer had already closed
+  # (icoretech/codex-pooler-findings#251). The trailing frames now go through
+  # the same `handle_async_frames/2` the idle path uses, so a Close closes the
+  # connection and takes it out of reuse, and a Ping still gets its Pong,
+  # exactly as when either arrives in a read of its own. The success result is
+  # built from the pre-drain state so the upgrade response headers survive the
+  # close. Trailing data frames keep the behaviour they have always had: a text
+  # or binary frame decoded after the terminal is not mapped, not written
+  # downstream, not appended to the retained body, and not counted.
+  defp finish_terminal_result(state, receive_state, terminal, trailing_frames) do
+    result =
+      %{
+        body: terminal_body(receive_state),
+        terminal: terminal,
+        native_client_retry_observation: final_client_retry_observation(receive_state),
+        response_usage: receive_model_usage(receive_state),
+        status: 200,
+        headers: Map.get(state, :headers, []),
+        upstream_error_code: receive_state.terminal_upstream_error_code,
+        upstream_error_param: receive_state.terminal_upstream_error_param,
+        public_tool_completion_reason: receive_state.public_tool_completion_reason,
+        websocket_frame_headers: receive_state.websocket_frame_headers
+      }
+      |> maybe_put_success_response_id(terminal, receive_state.response_id)
+
+    state = drain_trailing_frames(state, trailing_frames, :terminal)
+    state = if receive_state.public_tool_completion_reason, do: close_and_signal(state, :invalidated, &invalidate_state/1), else: state
+
+    {{:ok, result}, maybe_retire_exhausted_connection(state, receive_state)}
+  end
+
+  # Drains the frames decoded behind a halting frame through the idle path and,
+  # when one of them is a peer Close, records one bounded info line so an
+  # operator can see the drain run: which halt it followed, the close code and
+  # the connection lifecycle it retired (icoretech/codex-pooler-findings#225).
+  defp drain_trailing_frames(state, [], _halt), do: state
+
+  defp drain_trailing_frames(state, trailing_frames, halt) when halt in [:terminal, :retryable_first_frame] do
+    state
+    |> mark_exchange_completed()
+    |> handle_async_frames(trailing_frames, {:trailing, halt})
+  end
+
+  defp coalesced_close_code(code) when is_integer(code) and code in 1000..4999, do: code
+  defp coalesced_close_code(nil), do: "none"
+  defp coalesced_close_code(_code), do: "invalid"
+
+  defp maybe_retire_exhausted_connection(state, receive_state) do
+    cond do
+      exhausted_connection?(receive_state) -> retire_exhausted_connection(state, receive_state)
+      receive_state.provider_refusal? and Map.has_key?(state, :conn) -> retire_refused_connection(state)
+      true -> state
+    end
+  end
+
+  # The provider refuses a request it will not generate for with the wrapped
+  # `{"type": "error", "status": 400, ...}` frame and, for the refusals it
+  # sends before validating the payload (an unsupported parameter or tool
+  # type, an anchor it cannot resolve), answers nothing more on that
+  # connection and drops it without a Close frame about 3 s later (direct
+  # probe 2026-10-06, findings#333, Full and Lite). A request sent on it in
+  # that window is lost: it failed `502 upstream_request_failed` when the drop
+  # came. The connection is retired at the refusal, so the next request of
+  # the socket opens a fresh one; an anchor that connection produced is lost
+  # with it, as the provider's drop loses it.
+  defp retire_refused_connection(state) do
+    lifecycle = connection_lifecycle_state(state)
+
+    Logger.info(
+      "websocket connection retirement decision " <>
+        "reason_code=provider_refusal " <>
+        "lifecycle_id=#{lifecycle.lifecycle_id} old_generation=#{lifecycle.generation}"
+    )
+
+    close_state(state)
+  end
+
+  defp provider_refusal_frame?(%{"type" => "error"} = decoded),
+    do: Map.get(decoded, "status", Map.get(decoded, "status_code")) == 400
+
+  defp provider_refusal_frame?(_decoded), do: false
+
+  defp retire_exhausted_connection(state, receive_state) do
+    if exhausted_connection?(receive_state) do
+      lifecycle = connection_lifecycle_state(state)
+
+      Logger.info(
+        "websocket connection retirement decision " <>
+          "reason_code=websocket_connection_limit_reached " <>
+          "lifecycle_id=#{lifecycle.lifecycle_id} old_generation=#{lifecycle.generation}"
+      )
+    end
+
+    close_state(state)
+  end
+
+  defp exhausted_connection?(%ReceiveState{
+         terminal_upstream_error_code: "websocket_connection_limit_reached"
+       }),
+       do: true
+
+  defp exhausted_connection?(%ReceiveState{}), do: false
+
   defp reduce_receive_result({:continue, _state, _receive_state} = result), do: {:cont, result}
 
-  defp reduce_receive_result({:terminal, _state, _receive_state, _terminal} = result),
+  # Only `handle_part/2` folds through here, so every terminal that reaches
+  # this function came from `reduce_frames/2` and carries the frames decoded
+  # behind it in the same read. The four-element terminal exists solely for
+  # `guard_connection_bound_continuation/3`, which hands its synthetic terminal
+  # straight to `finish_receive_result/1` and never passes through this fold.
+  defp reduce_receive_result({:terminal, _state, _receive_state, _terminal, _trailing} = result),
     do: {:halt, result}
 
   defp reduce_receive_result({:failure, _state, _receive_state, _reason} = result),
+    do: {:halt, result}
+
+  defp reduce_receive_result({:failure, _state, _receive_state, _reason, _trailing} = result),
     do: {:halt, result}
 
   defp handle_data(state, data, %ReceiveState{} = receive_state) do
@@ -1712,33 +2214,37 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         case Mint.WebSocket.decode(websocket, data) do
           {:ok, websocket, frames} ->
             state = %{state | websocket: websocket}
-            {:cont, handle_async_frames(state, frames)}
+            {:cont, handle_async_frames(state, frames, :idle)}
 
-          {:error, _websocket, _reason} ->
-            {:halt, close_state(state)}
+          {:error, websocket, reason} ->
+            state = %{state | websocket: websocket}
+            {:halt, close_between_requests(state, :decode_error, transport_reason: reason)}
         end
 
       {:done, _ref}, state ->
-        {:halt, close_state(state)}
+        {:halt, close_between_requests(state, :transport_closed, transport_reason: :closed)}
 
       _part, state ->
         {:cont, state}
     end)
   end
 
-  defp handle_async_frames(state, frames) do
+  # `context` is `:idle` for a read the session takes between requests and
+  # `{:trailing, halt}` for frames decoded behind a halting frame of a request.
+  # Only the frame that actually retires the connection supplies the close cause.
+  defp handle_async_frames(state, frames, context) do
     Enum.reduce_while(frames, state, fn
       {:ping, payload}, state ->
         case send_frame(state, {:pong, payload}) do
           {:ok, state} -> {:cont, state}
-          {:error, _reason, state} -> {:halt, close_state(state)}
+          {:error, reason, state} -> {:halt, close_async(state, context, :pong_send_failed, transport_reason: reason)}
         end
 
       {:pong, payload}, state ->
         {:cont, clear_matching_pong(state, payload)}
 
-      {:close, _code, _reason}, state ->
-        {:halt, close_state(state)}
+      {:close, code, reason}, state ->
+        {:halt, close_async(state, context, :peer_close_frame, close_code: code, close_reason: reason)}
 
       {:text, _text}, state ->
         {:cont, state}
@@ -1746,63 +2252,252 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       {:binary, _data}, state ->
         {:cont, state}
 
-      {:error, _reason}, state ->
-        {:halt, close_state(state)}
+      {:error, reason}, state ->
+        {:halt, close_async(state, context, :frame_error, transport_reason: reason)}
     end)
   end
+
+  defp close_async(state, :idle, cause, details), do: close_between_requests(state, cause, details)
+
+  # A provider Close sent right after a response (its connection-age limit, a
+  # restart) can arrive in the same read as the terminal (findings#270), so
+  # the subscriber is told here too, inside the request call: before its reply
+  # and after every frame the request relayed.
+  defp close_async(state, {:trailing, halt}, :peer_close_frame, details) do
+    lifecycle = connection_lifecycle_state(state)
+    Logger.info("upstream websocket coalesced close drained reason_code=peer_close_frame halt=#{halt} close_code=#{coalesced_close_code(Keyword.get(details, :close_code))} lifecycle_id=#{lifecycle.lifecycle_id} generation=#{lifecycle.generation}")
+    close_and_signal(state, :peer_close_frame, &close_state/1)
+  end
+
+  defp close_async(state, {:trailing, _halt}, cause, details), do: close_between_requests(state, cause, details)
+
+  # Every close of a live connection outside a request leaves one bounded
+  # diagnostic line before the connection state is dropped (findings#206 row
+  # 206-356); a close inside a request is recorded on the attempt instead.
+  defp close_between_requests(state, cause, details \\ []) do
+    :ok = CloseDiagnostics.log_close(state, cause, details)
+    close_and_signal(state, cause, &close_state/1)
+  end
+
+  # The signal is built from the state before the close, which drops the
+  # connection's request count, and sent once the connection is closed.
+  defp close_and_signal(state, cause, close) do
+    signal = connection_closed_signal(state, cause)
+    closed = close.(state)
+    :ok = send_connection_closed_signal(signal)
+    closed
+  end
+
+  # Nothing to tell without a subscriber or a live connection, for a cause
+  # that ends no anchor, or for a connection that never carried a request: a
+  # connection that sent nothing produced no response to anchor on.
+  defp connection_closed_signal(%{conn: _conn, connection_close_subscriber: subscriber} = state, cause)
+       when is_pid(subscriber) do
+    requests = Map.get(state, :connection_request_count, 0)
+
+    if is_integer(requests) and requests > 0 and CloseDiagnostics.anchor_invalidating_cause?(cause) do
+      {subscriber, {:upstream_websocket_connection_closed, self(), %{cause: cause, lifecycle_id: state.lifecycle_id, generation: state.generation, connection_requests: requests}}}
+    else
+      nil
+    end
+  end
+
+  defp connection_closed_signal(_state, _cause), do: nil
+
+  defp send_connection_closed_signal({subscriber, message}) do
+    send(subscriber, message)
+    :ok
+  end
+
+  defp send_connection_closed_signal(nil), do: :ok
+
+  defp close_replaced_connection(%{conn: _conn, key: old_key} = state, key) do
+    close_between_requests(state, :request_key_changed, key_change: {old_key, key})
+  end
+
+  defp close_replaced_connection(state, _key), do: close_state(state)
+
+  defp idle_transport_cause(%Mint.TransportError{reason: :closed}), do: :transport_closed
+  defp idle_transport_cause(_reason), do: :transport_error
+
+  defp mark_ping_sent(state), do: Map.put(state, :last_ping_sent_at_monotonic_ms, System.monotonic_time(:millisecond))
 
   defp handle_frames(state, frames, %ReceiveState{} = receive_state) do
-    Enum.reduce_while(frames, {:continue, state, receive_state}, fn
-      {:text, raw_text}, {:continue, state, receive_state} ->
-        raw_decoded = decode_text_frame(raw_text)
+    reduce_frames(frames, {:continue, state, receive_state})
+  end
 
-        {mapped_text, mapped_decoded} =
-          map_message(raw_text, raw_decoded, receive_state.message_mapper)
+  # Folded by hand rather than with `Enum.reduce_while/3` so the terminal can
+  # hand the frames decoded behind it in the same read to the caller instead of
+  # dropping them (icoretech/codex-pooler-findings#251); `finish_terminal_result/4`
+  # drains them. A retryable pre-visible first frame (`upstream_terminal_event`)
+  # also keeps the connection, so its failure carries them the same way
+  # (icoretech/codex-pooler-findings#203). Every other halt ends the receive for
+  # a reason that retires or invalidates the connection anyway, so it carries
+  # nothing.
+  defp reduce_frames([], result), do: result
 
-        handle_text_frame(
-          state,
-          receive_state,
-          raw_text,
-          raw_decoded,
-          mapped_text,
-          mapped_decoded
-        )
+  defp reduce_frames([frame | trailing_frames], {:continue, _state, _receive_state} = result) do
+    case handle_frame(frame, result) do
+      {:cont, next_result} ->
+        reduce_frames(trailing_frames, next_result)
 
-      {:ping, payload}, {:continue, state, receive_state} ->
-        case send_frame(state, {:pong, payload}) do
-          {:ok, state} ->
-            {:cont, {:continue, state, receive_state}}
+      {:halt, {:terminal, state, receive_state, terminal}} ->
+        {:terminal, state, receive_state, terminal, trailing_frames}
 
-          {:error, reason, state} ->
-            receive_state = %{
-              receive_state
-              | termination_source: :websocket_control_send_error
-            }
+      {:halt, {:failure, state, %ReceiveState{termination_source: :upstream_terminal_event} = receive_state, reason}} ->
+        {:failure, state, receive_state, reason, trailing_frames}
 
-            {:halt, {:failure, state, receive_state, {:websocket_control_send_failed, reason}}}
-        end
+      {:halt, halted_result} ->
+        halted_result
+    end
+  end
 
-      {:pong, payload}, {:continue, state, receive_state} ->
-        {:cont, {:continue, clear_matching_pong(state, payload), receive_state}}
+  defp handle_frame({:text, raw_text}, {:continue, state, receive_state}) do
+    receive_state = renew_receive_deadline(receive_state)
+    raw_decoded = decode_text_frame(raw_text)
 
-      {:close, code, reason}, {:continue, state, receive_state} ->
+    {source_text, source_decoded, receive_state} =
+      guard_public_tool_completion(raw_text, raw_decoded, receive_state)
+
+    {mapped_text, mapped_decoded} =
+      if receive_state.public_tool_completion_reason,
+        do: {source_text, source_decoded},
+        else: map_message(source_text, source_decoded, receive_state.message_mapper)
+
+    handle_text_frame(
+      state,
+      receive_state,
+      if(receive_state.public_tool_completion_reason, do: raw_text, else: source_text),
+      if(receive_state.public_tool_completion_reason, do: raw_decoded, else: source_decoded),
+      mapped_text,
+      mapped_decoded
+    )
+  end
+
+  defp handle_frame({:ping, payload}, {:continue, state, receive_state}) do
+    case send_frame(state, {:pong, payload}) do
+      {:ok, state} ->
+        {:cont, {:continue, state, receive_state}}
+
+      {:error, reason, state} ->
         receive_state = %{
           receive_state
-          | peer_close_metadata: TransportFailureReason.peer_close_metadata(code, reason),
-            termination_source: :peer_close_frame
+          | termination_source: :websocket_control_send_error
         }
 
-        {:halt, {:failure, state, receive_state, :upstream_websocket_closed_before_terminal}}
-
-      {:binary, _data}, {:continue, state, receive_state} ->
-        receive_state = %{receive_state | termination_source: :unexpected_binary_frame}
-        {:halt, {:failure, state, receive_state, :unexpected_upstream_websocket_binary}}
-    end)
+        {:halt, {:failure, state, receive_state, {:websocket_control_send_failed, reason}}}
+    end
   end
 
-  defp append_receive_body(%ReceiveState{body: body} = receive_state, text) do
-    %{receive_state | body: RetainedBody.append(body, ["data: ", text, "\n\n"])}
+  defp handle_frame({:pong, payload}, {:continue, state, receive_state}),
+    do: {:cont, {:continue, clear_matching_pong(state, payload), receive_state}}
+
+  defp handle_frame({:close, code, reason}, {:continue, state, receive_state}) do
+    receive_state = %{
+      receive_state
+      | peer_close_metadata: TransportFailureReason.peer_close_metadata(code, reason),
+        termination_source: :peer_close_frame
+    }
+
+    {:halt, {:failure, state, receive_state, :upstream_websocket_closed_before_terminal}}
   end
+
+  defp handle_frame({:binary, _data}, {:continue, state, receive_state}) do
+    receive_state = %{receive_state | termination_source: :unexpected_binary_frame}
+    {:halt, {:failure, state, receive_state, :unexpected_upstream_websocket_binary}}
+  end
+
+  # The decoder reports a frame it cannot read in-band as `{:error, reason}`. It fails the request like the decode
+  # error of `handle_data/3`; without this clause the session crashed on it (findings#304). Only the leading atom of
+  # the reason is kept, because Mint's frame errors can carry the frame's own bytes.
+  defp handle_frame({:error, reason}, {:continue, state, receive_state}) do
+    receive_state = %{receive_state | termination_source: :websocket_decode_error}
+    {:halt, {:failure, state, receive_state, {:websocket_decode_failed, frame_error_class(reason)}}}
+  end
+
+  defp frame_error_class(reason) when is_atom(reason), do: reason
+  defp frame_error_class(reason) when is_tuple(reason) and tuple_size(reason) > 0 and is_atom(elem(reason, 0)), do: elem(reason, 0)
+  defp frame_error_class(_reason), do: :unreadable_frame
+
+  defp new_public_tool_completion(%Request{message_mapper: mapper, websocket_delivery_mode: :relay}) do
+    if mapper == (&StreamProtocol.normalize_public_openai_responses_json_message/1),
+      do: PublicResponsesToolCompletion.new_state()
+  end
+
+  defp new_public_tool_completion(%Request{}), do: nil
+
+  defp guard_public_tool_completion(text, decoded, %ReceiveState{public_tool_completion: nil} = receive_state),
+    do: {text, decoded, receive_state}
+
+  defp guard_public_tool_completion(text, %{"type" => type, "response" => response} = decoded, receive_state)
+       when type in ["response.failed", "response.incomplete", "error"] and not is_map(response) and not is_nil(response) do
+    tracker = PublicResponsesToolCompletion.observe(receive_state.public_tool_completion, decoded)
+    repaired_text = StreamProtocol.normalize_public_openai_responses_json_message(text)
+    {repaired_text, CodexPooler.JSON.decode!(repaired_text), %{receive_state | public_tool_completion: tracker}}
+  end
+
+  defp guard_public_tool_completion(text, decoded, receive_state) do
+    tracker = PublicResponsesToolCompletion.observe(receive_state.public_tool_completion, decoded)
+    receive_state = %{receive_state | public_tool_completion: tracker}
+
+    with %{} <- decoded,
+         false <- decoded["type"] in ["response.failed", "response.incomplete", "error"],
+         {:ok, %{kind: :completed}} <- StreamProtocol.terminal_outcome(nil, decoded),
+         {:error, reason} <- PublicResponsesToolCompletion.completion_verdict(tracker) do
+      event = Adapter.websocket_error(%{status: 500, code: :server_error, message: StreamProtocol.synthetic_public_openai_responses_failure_message(), param: nil})
+      receive_state = %{receive_state | public_tool_completion_reason: reason, terminal_upstream_error_code: "upstream_stream_error"}
+      {CodexPooler.JSON.encode!(event), event, receive_state}
+    else
+      _outcome -> {text, decoded, receive_state}
+    end
+  end
+
+  defp append_receive_body(
+         %ReceiveState{body: body, collected_body: collected_body} = receive_state,
+         text
+       ) do
+    data = sse_data_block(text)
+    telemetry_opts = buffer_telemetry_opts(receive_state)
+
+    %{
+      receive_state
+      | body: RetainedBody.append(body, data, telemetry_opts),
+        collected_body: append_collected_body(collected_body, data, telemetry_opts)
+    }
+  end
+
+  # The retained and collected bodies are SSE, and the finalizer reads the
+  # turn's terminal back out of them (usage, terminal code, provider rejection
+  # fields), so a multi-line frame gets one `data:` line per text line
+  # (findings#254 row 254-60).
+  defp sse_data_block(text), do: [SSEParser.data_lines(text), "\n\n"]
+
+  defp append_collected_body(collected_body, data, telemetry_opts) do
+    appended = CollectedBody.append(collected_body, data)
+
+    if CollectedBody.overflow?(appended) and not CollectedBody.overflow?(collected_body) do
+      BufferTelemetry.record_oversized_incomplete(
+        "collected_body",
+        CollectedBody.bytes(appended),
+        CollectedBody.max_bytes(),
+        telemetry_opts
+      )
+    end
+
+    appended
+  end
+
+  # A truncated retained body can only be attributed once the metric says which
+  # transport and route class produced it. A collecting turn is admitted as
+  # `proxy_compact` inside the outer websocket route class.
+  defp buffer_telemetry_opts(%ReceiveState{delivery: %Delivery{mode: mode}}) do
+    [transport: "websocket", route_class: buffer_route_class(mode)]
+  end
+
+  defp buffer_route_class(mode) when mode in [:collect_compaction, :collect_full_history],
+    do: RouteClass.proxy_compact()
+
+  defp buffer_route_class(_mode), do: RouteClass.proxy_websocket()
 
   defp handle_text_frame(
          state,
@@ -1825,12 +2520,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     terminal_discriminator = TerminalDiscriminator.classify(mapped_decoded)
 
     collected_text =
-      if receive_state.delivery.mode == :collect_full_history, do: raw_text, else: mapped_text
+      collected_text(
+        receive_state,
+        raw_text,
+        mapped_text,
+        terminal_discriminator
+      )
 
     receive_state =
       raw_decoded
       |> maybe_put_terminal_upstream_error(receive_state)
       |> maybe_put_response_id(raw_decoded)
+      |> maybe_put_served_model(raw_decoded)
       |> put_websocket_frame_headers(raw_decoded)
       |> increment_text_frame_count()
       |> capture_terminal_usage(raw_decoded, terminal_discriminator)
@@ -1863,9 +2564,45 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
+  defp collected_text(
+         %ReceiveState{delivery: %Delivery{mode: :collect_full_history}},
+         raw_text,
+         mapped_text,
+         %TerminalDiscriminator{terminal: terminal}
+       )
+       when terminal in ["response.failed", "response.incomplete", "error"] and
+              raw_text != mapped_text,
+       do: mapped_text
+
+  defp collected_text(
+         %ReceiveState{delivery: %Delivery{mode: :collect_full_history}},
+         raw_text,
+         _mapped_text,
+         _terminal_discriminator
+       ),
+       do: raw_text
+
+  defp collected_text(
+         %ReceiveState{},
+         _raw_text,
+         mapped_text,
+         _terminal_discriminator
+       ),
+       do: mapped_text
+
   defp capture_terminal_usage(receive_state, decoded, %TerminalDiscriminator{terminal: terminal})
        when is_binary(terminal) do
-    %{receive_state | response_usage: ResponseUsage.from_stream_event(decoded)}
+    usage = ResponseUsage.from_stream_event(decoded)
+
+    # The first response object declared the served model; the terminal event
+    # repeats it, so the earlier declaration wins when both exist.
+    usage =
+      case receive_state.served_model do
+        nil -> usage
+        model -> Map.put(usage, :served_model, model)
+      end
+
+    %{receive_state | response_usage: usage}
   end
 
   defp capture_terminal_usage(receive_state, _decoded, _discriminator), do: receive_state
@@ -1948,14 +2685,60 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
          %{} = decoded,
          %ReceiveState{downstream_output_started?: false} = receive_state
        ) do
-    decoded
-    |> StreamProtocol.event_summary()
-    |> retryable_pre_visible_terminal_event(receive_state)
+    retryable_pre_visible_terminal_event(
+      StreamProtocol.event_summary(decoded),
+      receive_state,
+      decoded
+    )
   end
 
   defp retryable_first_text_frame(_raw_text, %ReceiveState{}), do: :error
 
-  defp retryable_pre_visible_terminal_event(event, receive_state) do
+  defp retryable_pre_visible_terminal_event(event, receive_state, decoded) do
+    case quota_exhausted_first_event(event, decoded) do
+      {:ok, failure} -> {:ok, {:quota_exhausted_first_event, failure}}
+      :error -> retryable_auth_first_event(event, receive_state)
+    end
+  end
+
+  defp quota_exhausted_first_event(event, decoded) do
+    with {:ok, %{code: code} = failure} <- StreamProtocol.terminal_failure_event(event),
+         true <- code in ["usage_limit_reached", "usage_limit_exceeded"],
+         true <- valid_quota_usage_shape?(decoded) do
+      {:ok, Map.put(failure, :quota_rejection_before_output?, true)}
+    else
+      _other -> :error
+    end
+  end
+
+  defp valid_quota_usage_shape?(%{} = decoded) do
+    valid_quota_usage_field?(decoded) and
+      case Map.get(decoded, "response") do
+        %{} = response -> valid_quota_usage_field?(response)
+        _absent -> true
+      end
+  end
+
+  defp valid_quota_usage_field?(envelope) do
+    case Map.fetch(envelope, "usage") do
+      :error ->
+        true
+
+      {:ok, nil} ->
+        true
+
+      {:ok, %{} = usage} ->
+        match?(
+          %{status: "usage_known", total_tokens: 0},
+          ResponseUsage.from_stream_event(%{"usage" => usage})
+        )
+
+      _malformed ->
+        false
+    end
+  end
+
+  defp retryable_auth_first_event(event, receive_state) do
     case StreamProtocol.auth_refresh_first_terminal_failure(event) do
       {:ok, failure} -> {:ok, {:auth_refresh_first_event, failure}}
       :error -> retryable_assignment_model_unavailable_event(event, receive_state)
@@ -2039,8 +2822,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
           | terminal_upstream_error_code:
               receive_state.terminal_upstream_error_code ||
                 StreamProtocol.upstream_error_code(decoded),
-            terminal_upstream_error_param:
-              receive_state.terminal_upstream_error_param || UpstreamErrorParam.extract(decoded)
+            terminal_upstream_error_param: receive_state.terminal_upstream_error_param || UpstreamErrorParam.extract(decoded),
+            provider_refusal?: receive_state.provider_refusal? or provider_refusal_frame?(decoded)
         }
 
       _other ->
@@ -2052,10 +2835,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     do: receive_state
 
   defp maybe_put_success_response_id(result, terminal, response_id)
-       when terminal in ["response.completed", "response.done"] and is_binary(response_id),
+       when terminal in @completed_terminals and is_binary(response_id),
        do: Map.put(result, :response_id, response_id)
 
   defp maybe_put_success_response_id(result, _terminal, _response_id), do: result
+
+  # A response whose provider context stays on its connection for the next
+  # request anchored on it: one the provider completed, and one the client
+  # interrupted, whose follow-up the provider resolves on the same connection
+  # (findings#270 row 270-272). Every other terminal ends the response for good.
+  defp context_kept_terminal?(terminal, _upstream_error_code) when terminal in @completed_terminals, do: true
+  defp context_kept_terminal?("response.incomplete", "interrupted"), do: true
+  defp context_kept_terminal?(_terminal, _upstream_error_code), do: false
 
   @response_identity_event_types [
     "response.created",
@@ -2087,6 +2878,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   defp maybe_put_response_id(%ReceiveState{} = receive_state, _decoded), do: receive_state
 
+  defp maybe_put_served_model(%ReceiveState{} = receive_state, %{} = decoded) do
+    observer = ModelDeclarationObserver.observe(receive_state.model_observer || ModelDeclarationObserver.new(), decoded)
+    %{receive_state | served_model: observer.first_model, model_observer: observer}
+  end
+
+  defp maybe_put_served_model(%ReceiveState{} = receive_state, _decoded),
+    do: %{receive_state | model_observer: ModelDeclarationObserver.partial(receive_state.model_observer || ModelDeclarationObserver.new())}
+
+  defp receive_model_usage(receive_state) do
+    usage = receive_state.response_usage || ResponseUsage.from_websocket_body(receive_body(receive_state))
+    ModelDeclarationObserver.put_usage(usage, receive_state.model_observer || ModelDeclarationObserver.new())
+  end
+
   defp bounded_response_id(response_id) when is_binary(response_id) do
     response_id = String.trim(response_id)
 
@@ -2111,6 +2915,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   defp receive_body(%ReceiveState{body: body}), do: websocket_body(body)
 
+  # A collected turn's body is the authoritative compact result rather than
+  # error diagnostics, so a completed or provider-terminal collection reads the
+  # whole accumulated turn. Every other result keeps the bounded diagnostic
+  # suffix.
+  defp terminal_body(%ReceiveState{collected_body: :disabled} = receive_state),
+    do: receive_body(receive_state)
+
+  defp terminal_body(%ReceiveState{collected_body: collected_body}),
+    do: CollectedBody.read(collected_body)
+
   defp observe_native_client_retry(
          %ReceiveState{native_client_retry_observation: nil} = receive_state,
          _decoded
@@ -2125,8 +2939,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
     %{
       receive_state
-      | native_client_retry_observation:
-          ClientRetry.observe_frame(observation, decoded, observed_at)
+      | native_client_retry_observation: ClientRetry.observe_frame(observation, decoded, observed_at)
     }
   end
 
@@ -2173,7 +2986,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
          } = receive_state
        ) do
     metadata = NativeCodexResponseControl.pooler_metadata_event(models_etag, state.headers)
-    write_frame(receive_state.writer, Jason.encode!(metadata), %TerminalDiscriminator{})
+
+    write_frame(
+      receive_state.writer,
+      CodexPooler.JSON.encode!(metadata),
+      %TerminalDiscriminator{}
+    )
+
     %{receive_state | native_metadata_emitted?: true}
   end
 
@@ -2214,27 +3033,55 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp sanitize_downstream_text({text, %{} = decoded}, %TurnSnapshot{}) when is_binary(text) do
     case NativeCodexResponseControl.sanitize_websocket_event(decoded) do
       :unchanged -> {text, decoded}
-      {:changed, sanitized} -> {Jason.encode!(sanitized), sanitized}
+      {:changed, sanitized} -> {CodexPooler.JSON.encode!(sanitized), sanitized}
       {:error, :invalid_event} -> {text, decoded}
     end
   end
 
+  # Without a Pooler snapshot the turn is a public /v1 origin (the snapshot is
+  # built only for native Responses origins), and the public contract carries
+  # no native controls: `headers` and `response.headers` are dropped on every
+  # relayed event, not only the terminal (findings#239). A terminal event is
+  # always re-encoded canonically, dropped headers or not, because the
+  # retained terminal body is pinned to `encode!(decode!(text))` (usage
+  # attribution); a non-terminal event keeps its bytes when nothing was
+  # dropped. A relayed `codex.response.metadata` keeps only its ETag strip
+  # because its header object is the event's payload.
   defp sanitize_downstream_text({text, %{} = decoded}, _native_snapshot) when is_binary(text) do
     case Map.get(decoded, "type") do
       type
       when type in ["response.completed", "response.failed", "response.incomplete", "error"] ->
-        sanitized = Map.drop(decoded, ["headers"])
-        {Jason.encode!(sanitized), sanitized}
+        sanitized = public_event_without_headers(decoded)
+        {CodexPooler.JSON.encode!(sanitized), sanitized}
+
+      "codex.response.metadata" ->
+        decoded
+        |> NativeCodexResponseControl.strip_untrusted_models_etag()
+        |> reencode_when_changed(text, decoded)
 
       _other ->
-        {text, decoded}
+        decoded
+        |> NativeCodexResponseControl.drop_event_headers()
+        |> reencode_when_changed(text, decoded)
     end
   end
 
   defp sanitize_downstream_text({text, decoded}, _native_snapshot), do: {text, decoded}
 
+  defp public_event_without_headers(decoded) do
+    case NativeCodexResponseControl.drop_event_headers(decoded) do
+      {:changed, sanitized} -> sanitized
+      _unchanged -> decoded
+    end
+  end
+
+  defp reencode_when_changed({:changed, sanitized}, _text, _decoded),
+    do: {CodexPooler.JSON.encode!(sanitized), sanitized}
+
+  defp reencode_when_changed(_unchanged, text, decoded), do: {text, decoded}
+
   defp decode_text_frame(text) do
-    case Jason.decode(text) do
+    case CodexPooler.JSON.decode(text) do
       {:ok, %{} = decoded} -> decoded
       {:ok, _decoded} -> :non_object_json
       {:error, _reason} -> :undecodable
@@ -2266,8 +3113,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     |> Map.put(:keepalive_token, token)
   end
 
-  defp cancel_keepalive(%{keepalive_ref: ref} = state) when is_reference(ref) do
-    Process.cancel_timer(ref)
+  # `request_once/1` runs a turn in the caller's process, so a keepalive that
+  # fired while that turn was finishing must not stay behind in the caller's
+  # mailbox.
+  defp cancel_keepalive(%{keepalive_ref: ref, keepalive_token: token} = state)
+       when is_reference(ref) do
+    if Process.cancel_timer(ref) == false do
+      receive do
+        {:upstream_websocket_keepalive, ^token} -> :ok
+      after
+        0 -> :ok
+      end
+    end
 
     state
     |> Map.delete(:keepalive_ref)
@@ -2340,20 +3197,32 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   defp close_state(%{conn: conn} = state) do
     {:ok, _conn} = Mint.HTTP.close(conn)
-
-    state
-    |> cancel_keepalive()
-    |> cancel_pong_deadline()
-    |> clear_admission(:connection_closed)
-    |> disconnected_state()
+    close_connection_state(state)
   end
 
-  defp close_state(state) do
+  defp close_state(state), do: close_connection_state(state)
+
+  # A compaction collected on the closing connection and not confirmed yet
+  # keeps its admission as the one confirmation it can still accept
+  # (`confirm_closed_connection_collection/5`, findings#275). A Close that
+  # arrives in the compaction's own terminal read closes the connection
+  # before the collection is recorded, so a consumed compaction is kept too
+  # and recorded as collected once its request succeeded
+  # (`collect_closed_connection_compaction/2`). A first full-history
+  # compaction not authorized yet keeps its result as the one authorization it
+  # can still accept (`authorize_closed_connection_first_compact/4`, findings#270
+  # row 270-200).
+  defp close_connection_state(state) do
+    collection = admission_state(state)
+    first_compact = Map.get(state, :first_compact_result)
+
     state
     |> cancel_keepalive()
     |> cancel_pong_deadline()
     |> clear_admission(:connection_closed)
     |> disconnected_state()
+    |> then(&if(collection.phase in [:consumed_compact, :collected_unconfirmed], do: Map.put(&1, :closed_connection_collection, collection), else: &1))
+    |> then(&if(match?(%FirstCompactResult{}, first_compact), do: Map.put(&1, :closed_connection_first_compact, first_compact), else: &1))
   end
 
   defp invalidate_state(state) do
@@ -2362,11 +3231,21 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     |> Map.put(:reconnect_pending?, true)
   end
 
+  defp invalidate_cancelled_request(state, receive_state, phase) do
+    closed = invalidate_state(state)
+    :ok = CloseDiagnostics.log_cancelled_request_close(state, receive_state, phase)
+    closed
+  end
+
   defp disconnected_state(state) do
     lifecycle =
       state
       |> connection_lifecycle_state()
       |> preserve_trace_sensitivity(state)
+      |> preserve_connection_close_subscriber(state)
+      |> preserve_admission_topology(state)
+      |> preserve_closed_connection_collection(state)
+      |> preserve_closed_connection_first_compact(state)
 
     if Map.get(state, :reconnect_pending?, false) do
       Map.put(lifecycle, :reconnect_pending?, true)
@@ -2375,8 +3254,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
+  # A collection that no acknowledgement confirmed within its bound reads as
+  # ended, so an acknowledgement lost with its caller no longer refuses the
+  # connection's next ordinary success and first full-history compaction after
+  # the provider served and billed them (findings#270 row 270-249). A final
+  # that did not come within its bound reads as ended too, so the ordinary
+  # turn a late final runs as arms the next compaction again (row 270-289).
+  # The next admission written replaces it.
   defp admission_state(state) do
-    Map.get(state, :native_compaction_admission, %NativeCompactionAdmission{phase: :cleared})
+    admission = Map.get(state, :native_compaction_admission, %NativeCompactionAdmission{phase: :cleared})
+
+    case NativeCompactionAdmission.expire_unconsumed(admission, System.system_time(:millisecond)) do
+      {:expired, cleared} -> cleared
+      {:active, admission} -> admission
+    end
   end
 
   defp put_admission(state, admission) do
@@ -2413,6 +3304,89 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       else: next
   end
 
+  # The provider closed the connection a compaction ran on between its
+  # collection and its confirmation (findings#275). The close cleared the
+  # admission, which kept only the collection it waited to confirm; a
+  # confirmation that collection accepts is answered `:ok` with nothing armed,
+  # so the client gets the compaction it was billed for and its final runs as
+  # an ordinary turn on the next connection. Any other confirmation is refused
+  # as before.
+  defp confirm_closed_connection_collection(state, reason, digest, confirmation, expires_at_ms) do
+    with %NativeCompactionAdmission{phase: :cleared} <- admission_state(state),
+         %NativeCompactionAdmission{phase: :collected_unconfirmed} = collection <- Map.get(state, :closed_connection_collection),
+         {:ok, _unarmed} <- NativeCompactionAdmission.confirm_compact(collection, digest, confirmation, expires_at_ms) do
+      :ok = emit_compact_acknowledged(collection.capability)
+      {:reply, :ok, Map.delete(state, :closed_connection_collection)}
+    else
+      _refused -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  # The provider closed the connection a first full-history compaction ran on
+  # between its collection and its authorization (findings#270 row 270-200).
+  # The close kept the compaction's result as the one authorization it can
+  # still accept: that authorization succeeds once, and the admission it opens
+  # stays with the closed connection (`closed_connection_collection`), never
+  # the session's, where the collection is recorded
+  # (`record_closed_connection_first_collection/2`) and confirmed with nothing
+  # armed (`confirm_closed_connection_collection/5`). Any other authorization
+  # is refused as before.
+  defp authorize_closed_connection_first_compact(state, binding, receipt, refusal) do
+    with %FirstCompactResult{} = kept <- Map.get(state, :closed_connection_first_compact),
+         true <- kept == receipt and receipt.owner == self() and FirstCompactResult.binding_matches?(receipt, binding),
+         {:ok, admission} <- NativeCompactionAdmission.ordinary_success(binding),
+         {:ok, admission, provenance} <- NativeCompactionAdmission.authorize_first_compact_collection(admission, receipt.result_ref) do
+      collection = %{admission | compaction_item_digest: receipt.item_digest}
+      {:reply, {:ok, provenance}, state |> Map.delete(:closed_connection_first_compact) |> Map.put(:closed_connection_collection, collection)}
+    else
+      _refused -> {:reply, refusal, state}
+    end
+  end
+
+  defp record_closed_connection_first_collection(state, provenance) do
+    case NativeCompactionAdmission.record_first_compact_collected(state.closed_connection_collection, provenance, System.system_time(:millisecond)) do
+      {:ok, collected} -> {:reply, :ok, Map.put(state, :closed_connection_collection, collected)}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      {:error, reason, _cleared} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp collect_closed_connection_compaction(state, %Request{native_compaction_capability: %Capability{} = capability}) do
+    with %NativeCompactionAdmission{phase: :consumed_compact} = consumed <- Map.get(state, :closed_connection_collection),
+         true <- NativeCompactionAdmission.owns_capability?(consumed, capability),
+         {:ok, collected} <- NativeCompactionAdmission.record_compact_collected(consumed, System.system_time(:millisecond)) do
+      Map.put(state, :closed_connection_collection, collected)
+    else
+      _other -> state
+    end
+  end
+
+  defp collect_closed_connection_compaction(state, _request), do: state
+
+  # The connection a reserved compaction was bound to closed before the
+  # reservation's accounting started, and the close ended the admission with it
+  # (`close_connection_state/1`, `connection_closed`). Starting that accounting
+  # used to answer `invalid_transition`, which the runtime turned into `500
+  # gateway_reservation_failed` with two `[error]` lines for what is the close
+  # the reservation's own check answers with the retryable 503 (findings#275,
+  # findings#284). The step now says `connection_closed`, and the runtime's
+  # clear of that capability finds nothing left to clear.
+  #
+  # `Capability.t()` narrows the binding to a `Binding`, so Dialyzer marks the
+  # fallback unreachable, but a malformed capability (no binding) still reaches
+  # this step at runtime and must keep the session alive.
+  @dialyzer {:no_match, closed_under_capability?: 2}
+  defp closed_under_capability?(state, %Capability{binding: %Binding{lifecycle_id: lifecycle_id, generation: generation}} = capability),
+    do: not NativeCompactionAdmission.owns_capability?(admission_state(state), capability) and live_connection_state(state) != %{lifecycle_id: lifecycle_id, generation: generation}
+
+  defp closed_under_capability?(_state, _capability), do: false
+
+  # The open connection, generation nil between connections.
+  defp live_connection_state(state) do
+    generation = if Map.has_key?(state, :conn) and state.generation > 0, do: state.generation
+    %{lifecycle_id: state.lifecycle_id, generation: generation}
+  end
+
   defp clear_rejected_capability(state, capability, reason) do
     if NativeCompactionAdmission.owns_capability?(admission_state(state), capability) do
       clear_admission(state, reason)
@@ -2422,7 +3396,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
-  defp clear_admission(state, reason \\ :request_rejected) do
+  # No default reason: every clear names its cause, so a lifecycle `:clear`
+  # observation never reports a request rejection that did not happen
+  # (findings#258 rows 258-50/258-60).
+  defp clear_admission(state, reason) do
     next =
       state
       |> Map.delete(:native_compaction_admission)
@@ -2440,7 +3417,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         Map.get(after_state, :native_compaction_admission),
         operation,
         reason,
-        :direct
+        Map.get(before_state, :admission_topology, :direct)
       )
 
     Logger.debug(fn -> "native compaction lifecycle " <> inspect(observation) end)
@@ -2467,6 +3444,46 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
+  # Only a pid subscribes, so a session started without one keeps exactly the
+  # state it always had.
+  defp put_connection_close_subscriber(state, subscriber) when is_pid(subscriber),
+    do: Map.put(state, :connection_close_subscriber, subscriber)
+
+  defp put_connection_close_subscriber(state, _subscriber), do: state
+
+  defp preserve_connection_close_subscriber(lifecycle, state) do
+    case Map.fetch(state, :connection_close_subscriber) do
+      {:ok, subscriber} -> Map.put(lifecycle, :connection_close_subscriber, subscriber)
+      :error -> lifecycle
+    end
+  end
+
+  # Only an owner's session carries the key, so every other session keeps
+  # exactly the state it always had.
+  defp put_admission_topology(state, :forwarded), do: Map.put(state, :admission_topology, :forwarded)
+  defp put_admission_topology(state, _admission_topology), do: state
+
+  defp preserve_admission_topology(lifecycle, state) do
+    case Map.fetch(state, :admission_topology) do
+      {:ok, admission_topology} -> Map.put(lifecycle, :admission_topology, admission_topology)
+      :error -> lifecycle
+    end
+  end
+
+  defp preserve_closed_connection_collection(lifecycle, state) do
+    case Map.fetch(state, :closed_connection_collection) do
+      {:ok, collection} -> Map.put(lifecycle, :closed_connection_collection, collection)
+      :error -> lifecycle
+    end
+  end
+
+  defp preserve_closed_connection_first_compact(lifecycle, state) do
+    case Map.fetch(state, :closed_connection_first_compact) do
+      {:ok, first_compact} -> Map.put(lifecycle, :closed_connection_first_compact, first_compact)
+      :error -> lifecycle
+    end
+  end
+
   defp emit_reservation_observations(%Capability{} = capability) do
     # One successful owner reserve operation proves both issuance and the
     # immediately stored reserved state. Neither fact is emitted on failure.
@@ -2481,6 +3498,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       })
 
     :ok
+  end
+
+  defp reservation_snapshot(state, admission) do
+    with %{phase: phase, binding: %Binding{} = binding} when phase in [:pending_compact, :pending_final] <- admission,
+         :ok <- validate_direct_binding(state, binding),
+         true <- binding.serving_mode in [:full, :lite] do
+      {:ok, Map.take(binding, [:lifecycle_id, :generation, :serving_mode])}
+    else
+      _invalid -> {:error, :owner_unavailable}
+    end
   end
 
   defp validate_direct_binding(state, %Binding{topology: %Direct{}} = binding) do
@@ -2503,14 +3530,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp status_message_class({:send_text, _payload}), do: :send_text
   defp status_message_class(:invalidate_connection), do: :invalidate_connection
   defp status_message_class(:connection_lifecycle_snapshot), do: :lifecycle_snapshot
+  defp status_message_class(:live_connection), do: :live_connection
   defp status_message_class(:compaction_admission_phase), do: :admission_phase
   defp status_message_class(:clear_compaction_admission), do: :admission_clear
 
   defp status_message_class({operation, _arg})
        when operation in [
               :record_first_compact_collected,
-              :acknowledge_compact_finalization,
-              :acknowledge_final_response
+              :acknowledge_compact_finalization
             ],
        do: operation
 

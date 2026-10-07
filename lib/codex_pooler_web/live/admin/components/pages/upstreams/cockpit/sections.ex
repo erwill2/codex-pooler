@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: AccountFormatting
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReinviteLink
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.RoutePath
@@ -82,9 +83,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
         </div>
       </div>
 
-      <%!-- Unreachable through load_visible, which only projects identities
-      holding a visible-pool assignment; kept as a guard for cockpits built
-      from other account snapshots. --%>
       <div :if={@cockpit.assignments.empty?} class="p-4">
         <AdminComponents.empty_state
           id="upstream-assignments-empty"
@@ -182,7 +180,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   @doc """
   Actions rail: every lifecycle/recovery action, always visible; unavailable
-  actions stay disabled with the gating reason as tooltip and hint.
+  actions stay disabled with the gating reason as tooltip and hint. Below the
+  `sm` breakpoint, where a tooltip cannot be reached on touch, the reason is
+  also shown as a line under the action.
   """
   attr :cockpit, :map, required: true
   attr :confirming_saved_reset_redemption, :map, default: nil
@@ -243,41 +243,38 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           id={"cockpit-redeem-saved-reset-upstream-account-#{@cockpit.identity.id}"}
           icon="hero-bolt"
           label="Redeem saved reset"
+          data-saved-reset-action="open-redemption"
+          data-server-disabled={to_string(!@cockpit.actions.redeem_saved_reset.available?)}
           action={@cockpit.actions.redeem_saved_reset}
           phx-click="open_saved_reset_redemption_confirmation"
           phx-value-id={@cockpit.identity.id}
           phx-value-pool-id={default_pool_id(@cockpit)}
         />
-        <div
+        <AdminComponents.saved_reset_confirmation
           :if={confirming_saved_reset_redemption?(@confirming_saved_reset_redemption, @cockpit)}
           id="cockpit-saved-reset-redemption-confirmation"
-          class="grid gap-2.5 border-t border-warning/20 bg-warning/5 px-4 py-3"
-        >
-          <p class="text-xs leading-5 text-base-content/70">
-            Queues one manual redemption for this account, separate from the auto redeem policy.
-          </p>
-          <div class="flex flex-wrap items-center gap-2">
-            <button
-              id="cockpit-saved-reset-redemption-confirm"
-              type="button"
-              phx-click="redeem_saved_reset"
-              phx-value-id={@cockpit.identity.id}
-              phx-value-pool-id={default_pool_id(@cockpit)}
-              class="btn btn-primary btn-xs gap-1.5"
-            >
-              <.icon name="hero-check" class="size-3.5" />
-              <span>Confirm redemption</span>
-            </button>
-            <button
-              id="cockpit-saved-reset-redemption-cancel"
-              type="button"
-              phx-click="cancel_saved_reset_redemption"
-              class="btn btn-ghost btn-xs text-base-content/60 hover:text-base-content"
-            >
-              Keep resets in bank
-            </button>
-          </div>
+          identity_id={@cockpit.identity.id}
+          surface={:cockpit}
+          confirm_id="cockpit-saved-reset-redemption-confirm"
+          cancel_id="cockpit-saved-reset-redemption-cancel"
+          confirm_event={Phoenix.LiveView.JS.push("redeem_saved_reset", value: %{"id" => @cockpit.identity.id, "pool-id" => @confirming_saved_reset_redemption.pool_id})}
+          disabled={!@cockpit.actions.redeem_saved_reset.available?}
+        />
+        <div :if={@cockpit.saved_reset_operation.refreshable? || @cockpit.saved_reset_operation.show_latest_receipt?} class="px-4 py-3">
+          <AdminComponents.saved_reset_operation
+            identity_id={@cockpit.identity.id}
+            surface={:cockpit}
+            operation={@cockpit.saved_reset_operation}
+            refreshing={Map.get(@cockpit, :saved_reset_status_refreshing?, false)}
+          />
         </div>
+        <.rail_action
+          id={"cockpit-download-reset-calendar-#{@cockpit.identity.id}"}
+          icon="hero-calendar-days"
+          label="Download reset calendar"
+          action={@cockpit.actions.download_reset_calendar}
+          href={~p"/admin/upstreams/#{@cockpit.identity.id}/saved-reset-expirations.ics"}
+        />
         <.rail_action
           id={"cockpit-rename-upstream-account-#{@cockpit.identity.id}"}
           icon="hero-pencil-square"
@@ -305,18 +302,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   attr :icon, :string, required: true
   attr :label, :string, required: true
   attr :action, :map, required: true
+  attr :href, :string, default: nil
   attr :variant, :atom, default: :neutral, values: [:neutral, :danger]
   attr :rest, :global, include: ~w(phx-click phx-value-id phx-value-pool-id navigate)
 
   defp rail_action(assigns) do
-    if assigns.rest[:navigate] do
+    if assigns.action.available? && (assigns.href || assigns.rest[:navigate]) do
       ~H"""
-      <.link id={@id} class={rail_action_class(@variant, @action.available?)} {@rest}>
+      <.link id={@id} href={@href} class={rail_action_class(@variant, @action.available?)} {@rest}>
         <.icon name={@icon} class="size-4 shrink-0" />
         <span class="min-w-0 truncate">{@label}</span>
       </.link>
       """
     else
+      assigns =
+        assigns
+        |> assign(:reason_id, "#{assigns.id}-reason")
+        |> assign(:show_reason?, !assigns.action.available? and is_binary(assigns.action.reason))
+
       ~H"""
       <button
         id={@id}
@@ -324,6 +327,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
         class={rail_action_class(@variant, @action.available?)}
         disabled={!@action.available?}
         title={@action.reason}
+        aria-describedby={@show_reason? && @reason_id}
         {@rest}
       >
         <.icon name={@icon} class="size-4 shrink-0" />
@@ -335,6 +339,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           unavailable
         </span>
       </button>
+      <%!-- A tooltip cannot be reached on touch, so below `sm` the reason also shows as text under the action. From `sm` it stays in the title only. --%>
+      <p
+        :if={@show_reason?}
+        id={@reason_id}
+        data-role="cockpit-action-reason"
+        class="-mt-1.5 pr-4 pb-2.5 pl-[42px] text-xs leading-4 text-base-content/60 sm:hidden"
+      >
+        {@action.reason}
+      </p>
       """
     end
   end
@@ -385,6 +398,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   """
   attr :cockpit, :map, required: true
   attr :datetime_preferences, :map, required: true
+  attr :request_data_loaded?, :boolean, default: true
+  attr :request_data_loading?, :boolean, default: false
 
   def recent_events_section(assigns) do
     ~H"""
@@ -401,6 +416,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           </p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
+          <span
+            :if={@request_data_loading?}
+            id="upstream-event-summary-loading"
+            class="inline-flex items-center gap-1.5 text-xs text-base-content/55"
+            role="status"
+          >
+            <.icon name="hero-arrow-path" class="admin-loading-icon size-3.5" />
+            <span>Loading recent activity</span>
+          </span>
           <.link
             id="upstream-event-summary-request-logs-link"
             href={Formatting.request_logs_path(@cockpit)}
@@ -496,17 +520,63 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
         </article>
       </div>
 
-      <div :if={@cockpit.recent_events.items == []} class="p-4">
+      <div
+        :if={!@request_data_loaded? && @request_data_loading? && @cockpit.recent_events.items == []}
+        class="p-4"
+      >
         <AdminComponents.empty_state
-          id="upstream-event-summary-empty"
-          title="No recent upstream events"
-          description="Request failures and audit activity for this account will appear here."
+          id="upstream-event-summary-loading-state"
+          title="Loading recent activity"
+          description="Request and account events will appear here when the current snapshot is ready."
+          icon="hero-arrow-path"
+          loading?={true}
+        />
+      </div>
+
+      <div
+        :if={!@request_data_loaded? && !@request_data_loading? && @cockpit.recent_events.items == []}
+        class="p-4"
+      >
+        <AdminComponents.empty_state
+          id="upstream-event-summary-error-state"
+          title="Recent activity is not available"
+          description="Refresh the account data to try again."
           icon="hero-clipboard-document-list"
         />
       </div>
+
+      <div :if={@request_data_loaded? && @cockpit.recent_events.items == []} class="p-4">
+        <AdminComponents.empty_state
+          id="upstream-event-summary-empty"
+          title="No recent upstream events"
+          description={recent_events_empty_description(@cockpit.recent_events.searched_attempt_limit)}
+          icon="hero-clipboard-document-list"
+        />
+      </div>
+
+      <p
+        :if={@request_data_loaded? && @cockpit.recent_events.items != [] && @cockpit.recent_events.searched_attempt_limit}
+        id="upstream-event-summary-request-window"
+        class="border-t border-base-300/50 px-4 py-2 text-xs leading-5 text-base-content/55"
+      >
+        {searched_attempts_label(@cockpit.recent_events.searched_attempt_limit)}; older request history is in Request logs.
+      </p>
     </section>
     """
   end
+
+  # The request walk reads a bounded window of each assignment's newest
+  # attempts; when older attempts were left unread the page says what was
+  # searched instead of implying the whole history is clean.
+  defp recent_events_empty_description(nil),
+    do: "Request failures and audit activity for this account will appear here."
+
+  defp recent_events_empty_description(limit),
+    do: "No failed or retried requests in the #{searched_attempts_scope(limit)} and no account changes; older request history is in Request logs."
+
+  defp searched_attempts_label(limit), do: "Failed and retried requests are searched in the #{searched_attempts_scope(limit)}"
+
+  defp searched_attempts_scope(limit), do: "latest #{AccountFormatting.format_integer(limit)} attempts of each Pool assignment"
 
   defp routing_readiness(%{header: %{routing_readiness: readiness}}) when is_map(readiness),
     do: readiness
@@ -545,18 +615,33 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   defp request_note(%{kpis: %{total_requests_24h: 0}}), do: nil
 
+  # Client cancellations are neither failures nor part of the rate's base, so
+  # the note counts the requests that ran to an outcome of their own and names
+  # the cancellations it left out.
+  defp request_note(%{state: state, kpis: %{total_requests_24h: total, client_cancelled_requests_24h: total}})
+       when state in ["healthy", "degraded", "failed"],
+       do: "All #{total} requests in the last 24h were cancelled by the client"
+
   defp request_note(%{state: state, kpis: kpis})
        when state in ["healthy", "degraded", "failed"] do
-    base =
-      "#{kpis.failed_requests_24h} of #{kpis.total_requests_24h} requests failed in the last 24h (#{format_rate(kpis.failure_rate_24h)})"
+    cancelled = kpis.client_cancelled_requests_24h
 
-    case state do
-      "healthy" -> base <> ", within the expected range for upstream calls"
-      _degraded -> base
-    end
+    base =
+      "#{kpis.failed_requests_24h} of #{kpis.total_requests_24h - cancelled} requests failed in the last 24h (#{format_rate(kpis.failure_rate_24h)})"
+
+    note =
+      case state do
+        "healthy" -> base <> ", within the expected range for upstream calls"
+        _degraded -> base
+      end
+
+    note <> client_cancelled_note(cancelled)
   end
 
   defp request_note(_request_health), do: nil
+
+  defp client_cancelled_note(0), do: ""
+  defp client_cancelled_note(count), do: "; #{count} cancelled by the client not counted"
 
   defp format_rate(rate) when is_float(rate),
     do: :erlang.float_to_binary(rate, decimals: 1) <> "%"

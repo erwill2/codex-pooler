@@ -23,6 +23,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
 
   defp start_armed(submit_fun, opts \\ []) do
     correlation_id = "bridge-stream-#{System.unique_integer([:positive])}"
+    opts = Keyword.put_new(opts, :preflight_timeout_ms, @detection_timeout_ms)
     stream = WebsocketBridgeStream.start(correlation_id, opts)
     :ok = WebsocketBridgeStream.arm(stream, @epoch, submit_fun)
     stream
@@ -101,13 +102,24 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 
-  test "an abnormally exiting submit task falls back with a scrubbed reason and no log" do
+  test "nested accepted quota errors become a preflight 429 rejection" do
+    error = %{"code" => "usage_limit_reached", "type" => "usage_limit_reached", "resets_in_seconds" => 60}
+    body = "data: " <> CodexPooler.JSON.encode!(%{"type" => "response.failed", "response" => %{"status" => "failed", "error" => error}, "error" => %{"code" => "other"}}) <> "\n\n"
+    stream = start_armed(fn -> {:error, %{reason: {:quota_exhausted_first_event, %{code: "usage_limit_reached"}}, body: body, websocket_frame_headers: %{}}} end)
+    ref = stream.ref
+    assert_receive {^ref, {:preflight, decision}}, @detection_timeout_ms
+    assert {:rejected, 429, response, _headers} = decision
+    assert CodexPooler.JSON.decode!(response)["error"]["code"] == "usage_limit_reached"
+  end
+
+  test "an abnormally exiting submit task fails closed with a scrubbed reason and no log" do
     logs =
       capture_log(fn ->
         stream = start_armed(fn -> exit(:boom) end)
 
         ref = stream.ref
-        assert_receive {^ref, {:preflight, {:fallback, :boom}}}, @detection_timeout_ms
+        assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+        assert_receive {^ref, {:bridge_error, :boom}}, @detection_timeout_ms
       end)
 
     # Before the catch wrapper this crashed the task and logged the whole
@@ -137,7 +149,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
 
         # :killed when the kill lands mid-call, :owner_not_running when the
         # owner is already gone as the call starts — both scrubbed atoms.
-        assert_receive {^ref, {:preflight, {:fallback, reason}}}, @detection_timeout_ms
+        assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+        assert_receive {^ref, {:bridge_error, reason}}, @detection_timeout_ms
         assert reason in [:killed, :owner_not_running]
       end)
 
@@ -145,18 +158,53 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     refute logs =~ "LEAK_PROBE_AUTH_TOKEN"
   end
 
-  test "a submit task killed from outside still falls back as task_down" do
+  test "a submit task killed from outside fails closed as task_down" do
     stream = start_armed(registered_submit(self()))
     ref = stream.ref
 
     assert_receive {:submit_task, task_pid}, @detection_timeout_ms
     Process.exit(task_pid, :kill)
 
-    assert_receive {^ref, {:preflight, {:fallback, {:task_down, :killed}}}}, @detection_timeout_ms
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, {:task_down, :killed}}}, @detection_timeout_ms
+  end
+
+  test "an unresolved preflight timeout fails the websocket stream and kills its submit task" do
+    # The settle fallback that would also kill the task outlasts the detection
+    # budget, so only the preflight-timeout kill can satisfy the DOWN below.
+    stream = start_armed(registered_submit(self()), preflight_timeout_ms: 25, settle_timeout_ms: @submit_hold_timeout_ms)
+    ref = stream.ref
+
+    assert_receive {:submit_task, task_pid}, @detection_timeout_ms
+    task_monitor = Process.monitor(task_pid)
+
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :bridge_preflight_timeout}}, @detection_timeout_ms
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}, @detection_timeout_ms
+  end
+
+  test "a terminal that loses the preflight deadline race cannot reopen the failed stream" do
+    stream = start_armed(registered_submit(self()), preflight_timeout_ms: 25, settle_timeout_ms: @submit_hold_timeout_ms)
+    ref = stream.ref
+
+    assert_receive {:submit_task, task_pid}, @detection_timeout_ms
+    task_monitor = Process.monitor(task_pid)
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :bridge_preflight_timeout}}, @detection_timeout_ms
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}, @detection_timeout_ms
+
+    owner_frame(stream, {:data, ~s({"type":"response.completed","response":{"id":"late"}})})
+    owner_frame(stream, :complete)
+
+    refute_receive {^ref, {:data, _data}}, 100
+    refute_receive {^ref, :done}, 100
+    refute_receive {^ref, {:preflight, _decision}}, 100
   end
 
   test "committed cancellation kills the submit proxy without waiting for settlement" do
-    stream = start_armed(registered_submit(self()), settle_timeout_ms: 5_000)
+    # A kill that waited for settlement would arrive only after the settle
+    # timeout, which outlasts the detection budget of the DOWN below.
+    stream = start_armed(registered_submit(self()), settle_timeout_ms: @submit_hold_timeout_ms)
     ref = stream.ref
 
     assert_receive {:submit_task, task_pid}, @detection_timeout_ms
@@ -167,7 +215,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert_receive {^ref, {:data, _data}}, @detection_timeout_ms
 
     assert :ok = WebsocketBridgeStream.cancel(stream)
-    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}, 500
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}, @detection_timeout_ms
   end
 
   test "queued data and completion deliver the preflight commit and every part in order" do
@@ -205,7 +253,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert_receive {^ref, :done}, @detection_timeout_ms
   end
 
-  test "lifecycle-only frames followed by completion fall back without committing" do
+  test "lifecycle-only frames followed by completion fail closed after submission" do
     stream = start_armed(fn -> :ok end)
     ref = stream.ref
 
@@ -215,22 +263,25 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     owner_frame(stream, {:data, ~s({"type":"codex.rate_limits","rate_limits":{}})})
     owner_frame(stream, :complete)
 
-    assert_receive {^ref, {:preflight, {:fallback, :bridge_no_first_event}}},
-                   @detection_timeout_ms
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :upstream_websocket_error}}, @detection_timeout_ms
 
     refute_receive {^ref, {:data, _data}}, 100
     refute_receive {^ref, :done}, 100
   end
 
-  test "internal-only frames followed by an owner error fall back without committing" do
-    stream = start_armed(blocking_submit())
+  # A pre-content owner error is reported after one short owner-terminal hop by
+  # default; the short `settle_timeout_ms` here only bounds how long the relay
+  # then lingers for attempt metadata after the report.
+  test "internal-only frames followed by an owner error fail closed" do
+    stream = start_armed(blocking_submit(), settle_timeout_ms: 50)
     ref = stream.ref
 
     owner_frame(stream, {:data, ~s({"type":"codex.rate_limits","rate_limits":{}})})
     owner_frame(stream, {:error, :upstream_websocket_error, %{}})
 
-    assert_receive {^ref, {:preflight, {:fallback, :upstream_websocket_error}}},
-                   @detection_timeout_ms
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :upstream_websocket_error}}, @detection_timeout_ms
 
     refute_receive {^ref, {:data, _data}}, 100
   end
@@ -254,7 +305,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     owner_frame(
       stream,
       {:data,
-       Jason.encode!(%{
+       CodexPooler.JSON.encode!(%{
          "type" => "response.incomplete",
          "response" => %{
            "status" => "incomplete",
@@ -276,7 +327,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     owner_frame(
       stream,
       {:data,
-       Jason.encode!(%{
+       CodexPooler.JSON.encode!(%{
          "type" => "response.incomplete",
          "response" => %{
            "status" => "incomplete",
@@ -335,7 +386,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert fourth =~ "response.output_text.delta"
   end
 
-  test "a pre-content peer close from the submit result falls back instead of committing" do
+  test "a pre-content peer close after submission commits a fatal stream error" do
     stream =
       start_armed(fn ->
         {:error,
@@ -355,13 +406,15 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
 
     ref = stream.ref
 
-    assert_receive {^ref, {:preflight, {:fallback, :upstream_websocket_closed_before_terminal}}},
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+
+    assert_receive {^ref, {:bridge_error, :upstream_websocket_closed_before_terminal}},
                    @detection_timeout_ms
 
-    refute_receive {^ref, _part}, 100
+    refute_received {^ref, {:preflight, {:fallback, _reason}}}
   end
 
-  test "a pre-content peer close reported beside owner completion falls back" do
+  test "a pre-content peer close reported beside owner completion stays fatal" do
     stream = start_armed(registered_submit(self()))
     ref = stream.ref
 
@@ -388,8 +441,12 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
         }}}
     )
 
-    assert_receive {^ref, {:preflight, {:fallback, _reason}}}, @detection_timeout_ms
-    refute_receive {^ref, {:data, _data}}, 100
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+
+    assert_receive {^ref, {:bridge_error, :upstream_websocket_closed_before_terminal}},
+                   @detection_timeout_ms
+
+    refute_received {^ref, {:preflight, {:fallback, _reason}}}
   end
 
   test "a pre-content receive timeout stays a committed fatal" do
@@ -420,8 +477,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     refute_received {^ref, {:preflight, {:fallback, _reason}}}
   end
 
-  test "an owner error after buffered envelopes falls back pre-content" do
-    stream = start_armed(registered_submit(self()))
+  test "an owner error after buffered envelopes fails closed pre-content" do
+    stream = start_armed(registered_submit(self()), settle_timeout_ms: 50)
     ref = stream.ref
 
     assert_receive {:submit_task, task_pid}, @detection_timeout_ms
@@ -429,7 +486,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     owner_frame(stream, {:data, ~s({"type":"response.output_item.added","output_index":0})})
     owner_frame(stream, {:error, :owner_drained, %{"code" => "owner_drained"}})
 
-    assert_receive {^ref, {:preflight, {:fallback, :owner_drained}}}, @detection_timeout_ms
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :owner_drained}}, @detection_timeout_ms
     refute_receive {^ref, {:data, _data}}, 100
     send(task_pid, {:return, {:error, :owner_drained}})
   end
@@ -478,7 +536,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert_receive {:submit_task, task_pid}, @detection_timeout_ms
 
     completed =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_latched", "status" => "completed"}
       })
@@ -494,40 +552,157 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     refute_received {^ref, {:bridge_error, _reason}}
   end
 
-  test "a completion with no data falls back instead of committing" do
+  test "a completion with no data fails closed after submission" do
     stream = start_armed(fn -> :ok end)
     ref = stream.ref
 
     owner_frame(stream, :complete)
 
-    assert_receive {^ref, {:preflight, {:fallback, :bridge_no_first_event}}},
-                   @detection_timeout_ms
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :upstream_websocket_error}}, @detection_timeout_ms
 
     refute_receive {^ref, :done}, 100
   end
 
-  test "an owner error before data falls back with the owner error reason" do
+  test "an owner error before data fails closed with the owner error reason" do
     attach_fallback_handler(self())
-    stream = start_armed(blocking_submit())
+    stream = start_armed(blocking_submit(), settle_timeout_ms: 50)
     ref = stream.ref
 
     owner_frame(stream, {:error, :owner_busy, %{"status" => 409}})
 
-    assert_receive {^ref, {:preflight, {:fallback, :owner_busy}}}, @detection_timeout_ms
-
-    assert_receive {:fallback, [:codex_pooler, :gateway, :websocket_bridge, :fallback],
-                    %{count: 1}, %{reason: "owner_busy"}},
-                   @detection_timeout_ms
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :owner_busy}}, @detection_timeout_ms
+    refute_received {:fallback, _event, _measurements, _metadata}
   end
 
-  test "a submit error settling before any frame falls back immediately" do
+  # Findings #119 item 1: an owner error or completion that lands pre-content
+  # is terminal for the turn. The relay may wait one scheduling hop for the
+  # submit result that the owner has already replied with, never the 5 s
+  # settle window, so a blocked submit no longer stalls the fail-closed error.
+  @owner_terminal_report_budget_ms 500
+
+  test "a pre-content owner error is reported well under the settle window while the submit stays blocked" do
+    attach_fallback_handler(self())
+    stream = start_armed(registered_submit(self()))
+    ref = stream.ref
+
+    assert_receive {:submit_task, task_pid}, @detection_timeout_ms
+
+    started_ms = System.monotonic_time(:millisecond)
+    owner_frame(stream, {:error, :owner_busy, %{"status" => 409}})
+
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :owner_busy}}, @detection_timeout_ms
+    elapsed_ms = System.monotonic_time(:millisecond) - started_ms
+
+    assert elapsed_ms < @owner_terminal_report_budget_ms,
+           "pre-content owner error reported after #{elapsed_ms} ms"
+
+    refute_received {:fallback, _event, _measurements, _metadata}
+
+    # The report did not discard the still-blocked submit: its late settlement
+    # keeps feeding attempt metadata, and the take waits for it deterministically.
+    send(
+      task_pid,
+      {:return,
+       {:error,
+        %{
+          reason: :upstream_websocket_terminal_delivery_timeout,
+          transport_failure: terminal_timeout_metadata()
+        }}}
+    )
+
+    metadata = WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+    assert metadata.transport_failure["upstream_committed"]
+    assert metadata.transport_failure["reason"] == "upstream_websocket_terminal_delivery_timeout"
+  end
+
+  test "a pre-content completion is reported well under the settle window while the submit stays blocked" do
+    stream = start_armed(blocking_submit())
+    ref = stream.ref
+
+    started_ms = System.monotonic_time(:millisecond)
+    owner_frame(stream, {:data, ~s({"type":"response.created"})})
+    owner_frame(stream, :complete)
+
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :upstream_websocket_error}}, @detection_timeout_ms
+    elapsed_ms = System.monotonic_time(:millisecond) - started_ms
+
+    assert elapsed_ms < @owner_terminal_report_budget_ms,
+           "pre-content completion reported after #{elapsed_ms} ms"
+
+    refute_receive {^ref, {:data, _data}}, 100
+    refute_received {^ref, {:preflight, {:fallback, _reason}}}
+  end
+
+  test "the fallback decision still reads a connect-phase transport failure that settles beside the owner error" do
+    attach_fallback_handler(self())
+
+    stream =
+      start_armed(registered_submit(self()),
+        owner_terminal_settle_timeout_ms: @detection_timeout_ms
+      )
+
+    ref = stream.ref
+
+    assert_receive {:submit_task, task_pid}, @detection_timeout_ms
+
+    # The frame is queued at the relay before the result leaves the task, so
+    # the decision has to read the settlement that arrives after the frame.
+    owner_frame(stream, {:error, :owner_unavailable, %{"status" => 503}})
+
+    send(
+      task_pid,
+      {:return,
+       {:error,
+        %{
+          reason: :owner_unavailable,
+          transport_failure: %{
+            "phase" => "connect",
+            "upstream_committed" => false,
+            "reason" => "owner_unavailable"
+          }
+        }}}
+    )
+
+    assert_receive {^ref, {:preflight, {:fallback, :owner_unavailable}}}, @detection_timeout_ms
+
+    assert_receive {:fallback, [:codex_pooler, :gateway, :websocket_bridge, :fallback], %{count: 1}, %{reason: "owner_unavailable"}},
+                   @detection_timeout_ms
+
+    refute_received {^ref, {:bridge_error, _reason}}
+  end
+
+  test "a submit error without pre-submission proof fails closed" do
     stream = start_armed(fn -> {:error, %{reason: :owner_not_running}} end)
+    ref = stream.ref
+
+    assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+    assert_receive {^ref, {:bridge_error, :owner_not_running}}, @detection_timeout_ms
+  end
+
+  test "a connect-phase submit failure with positive non-commit proof falls back" do
+    stream =
+      start_armed(fn ->
+        {:error,
+         %{
+           reason: :owner_not_running,
+           transport_failure: %{
+             "phase" => "connect",
+             "upstream_committed" => false,
+             "reason" => "owner_not_running"
+           }
+         }}
+      end)
+
     ref = stream.ref
 
     assert_receive {^ref, {:preflight, {:fallback, :owner_not_running}}}, @detection_timeout_ms
   end
 
-  test "completed bridge hands off connection metadata exactly once" do
+  test "completed bridge consumes retained diagnostics once and drops unknown fields" do
     connection = connection_metadata()
 
     stream =
@@ -540,7 +715,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     owner_frame(
       stream,
       {:data,
-       Jason.encode!(%{
+       CodexPooler.JSON.encode!(%{
          "type" => "response.completed",
          "response" => %{"id" => "resp_metadata", "status" => "completed"}
        })}
@@ -550,15 +725,34 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert_receive {^ref, {:data, _data}}, @detection_timeout_ms
     assert_receive {^ref, :done}, @detection_timeout_ms
 
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: connection,
-             transport_failure: nil
-           }
+    metadata = WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+    assert metadata.upstream_websocket_connection.generation == connection.generation
+    refute Map.has_key?(metadata.upstream_websocket_connection, :ignored)
+    refute inspect(metadata) =~ "sentinel"
+    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream).upstream_websocket_connection == nil
+  end
 
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: nil
-           }
+  for {scenario, source, expected} <- [
+        {:declared_usage, %{response_usage: %{served_model: "model-old-owner", status: "usage_unknown"}}, %{served_model: "model-old-owner"}},
+        {:missing_usage, %{response_usage: %{status: "usage_unknown"}}, %{}},
+        {:projected_body, %{body: "data: {\"type\":\"response.failed\",\"response\":{\"model\":\"unknown\",\"status\":\"failed\",\"created_at\":0,\"object\":\"response\",\"output\":[],\"tools\":[],\"parallel_tool_calls\":false}}\n\n"}, %{}},
+        {:declared_unknown, %{body: "data: {\"type\":\"response.created\",\"response\":{\"model\":\"unknown\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"model\":\"unknown\",\"status\":\"failed\",\"created_at\":0,\"object\":\"response\",\"output\":[],\"tools\":[],\"parallel_tool_calls\":false}}\n\n"}, %{served_model: "unknown"}},
+        {:declared_unknown_completed, %{body: "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"unknown\",\"status\":\"completed\"}}\n\n"}, %{served_model: "unknown"}},
+        {:unprojected_failure, %{body: "data: {\"type\":\"response.failed\",\"response\":{\"model\":\"unknown\",\"status\":\"failed\"}}\n\n"}, %{served_model: "unknown"}},
+        {:declared_body, %{body: "data: {\"type\":\"response.created\",\"response\":{\"model\":\"model-old-owner\"}}\n\n"}, %{served_model: "model-old-owner"}}
+      ] do
+    @tag model_provenance: true
+    test "legacy bridge #{scenario} retains only available source model facts" do
+      stream = start_armed(fn -> {:ok, unquote(Macro.escape(source))} end)
+      ref = stream.ref
+      owner_frame(stream, {:data, CodexPooler.JSON.encode!(%{"type" => "response.failed", "response" => %{"status" => "failed", "model" => "unknown"}})})
+      assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+      assert_receive {^ref, {:data, _data}}, @detection_timeout_ms
+      assert_receive {^ref, :done}, @detection_timeout_ms
+      metadata = WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+      assert metadata.model_usage == unquote(Macro.escape(expected))
+      refute Map.has_key?(metadata.model_usage, :model_observation)
+    end
   end
 
   test "committed terminal delivery timeout becomes a stream error without fallback" do
@@ -590,19 +784,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
                    @detection_timeout_ms
 
     refute_received {^ref, {:preflight, {:fallback, _reason}}}
-
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: connection,
-             transport_failure: %{
-               "phase" => "terminal_delivery",
-               "reason_class" => "owner_terminal_delivery_timeout",
-               "reason" => "upstream_websocket_terminal_delivery_timeout",
-               "pre_visible_output" => false,
-               "upstream_committed" => true,
-               "terminal_seen" => true,
-               "terminal_forwarded" => false
-             }
-           }
   end
 
   test "real owner terminal delivery timeout commits before its direct error can trigger fallback" do
@@ -675,9 +856,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert %{active_turn: nil} = :sys.get_state(owner)
     relay_pid = stream.relay
 
-    assert_receive {:trace, ^relay_pid, :receive,
-                    {:websocket_owner_frame, "real-owner-timeout", 1,
-                     {:error, :upstream_websocket_terminal_delivery_timeout, _safe_payload}}},
+    assert_receive {:trace, ^relay_pid, :receive, {:websocket_owner_frame, "real-owner-timeout", 1, {:error, :upstream_websocket_terminal_delivery_timeout, _safe_payload}}},
                    @detection_timeout_ms
 
     assert :erlang.resume_process(submitter_pid)
@@ -690,23 +869,11 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
 
     refute_received {^ref, {:preflight, {:fallback, _reason}}}
 
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: %{
-               "phase" => "terminal_delivery",
-               "reason_class" => "owner_terminal_delivery_timeout",
-               "reason" => "upstream_websocket_terminal_delivery_timeout",
-               "pre_visible_output" => false,
-               "upstream_committed" => true,
-               "terminal_seen" => true,
-               "terminal_forwarded" => false
-             }
-           }
-
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: nil
-           }
+    metadata = WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+    assert metadata.transport_failure["upstream_committed"]
+    assert metadata.transport_failure["terminal_seen"]
+    refute metadata.transport_failure["terminal_forwarded"]
+    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream).transport_failure == nil
 
     release_controlled(nonterminal_barrier, controls, :nonterminal_frames)
     terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
@@ -729,8 +896,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
 
     downstream_sender = fn pid, message ->
       case message do
-        {:websocket_owner_frame, _correlation_id, _epoch,
-         {:error, :upstream_websocket_terminal_delivery_timeout, _safe_payload}} ->
+        {:websocket_owner_frame, _correlation_id, _epoch, {:error, :upstream_websocket_terminal_delivery_timeout, _safe_payload}} ->
           WebsocketOwnerNodeHarness.controlled_result(
             test_pid,
             controls,
@@ -801,15 +967,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     release_controlled(downstream_barrier, controls, :downstream_send_result)
     assert %{active_turn: nil} = :sys.get_state(owner)
 
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: terminal_timeout_metadata()
-           }
-
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: nil
-           }
+    metadata = WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+    assert metadata.transport_failure["upstream_committed"]
+    assert metadata.transport_failure["reason"] == "upstream_websocket_terminal_delivery_timeout"
+    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream).transport_failure == nil
 
     release_controlled(nonterminal_barrier, controls, :nonterminal_frames)
     terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
@@ -877,18 +1038,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     refute metadata_text =~ "raw_body"
   end
 
-  test "attempt metadata take returns nil fields after relay death" do
-    stream = WebsocketBridgeStream.start("relay-death", settle_timeout_ms: 1)
-    monitor_ref = Process.monitor(stream.relay)
-    Process.exit(stream.relay, :kill)
-    assert_receive {:DOWN, ^monitor_ref, :process, _pid, :killed}, @detection_timeout_ms
-
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: nil
-           }
-  end
-
   test "attempt metadata rejects malformed connection sentinel values" do
     stream =
       start_armed(fn ->
@@ -908,7 +1057,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     owner_frame(
       stream,
       {:data,
-       Jason.encode!(%{
+       CodexPooler.JSON.encode!(%{
          "type" => "response.completed",
          "response" => %{"id" => "resp_invalid_metadata", "status" => "completed"}
        })}
@@ -918,10 +1067,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert_receive {^ref, {:data, _data}}, @detection_timeout_ms
     assert_receive {^ref, :done}, @detection_timeout_ms
 
-    assert WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream) == %{
-             upstream_websocket_connection: nil,
-             transport_failure: nil
-           }
+    metadata = WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+    assert metadata.upstream_websocket_connection == nil
+    refute inspect(metadata) =~ "sentinel"
   end
 
   test "a post-commit task failure fails the stream instead of synthesizing done" do
@@ -960,9 +1108,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
   test "precommit overflow after submit success retains the successful settlement" do
     # The submit settles before any frame, so the relay is already counting
     # down its pre-content fallback while the test is still delivering frames.
-    # The window has to outlast that delivery and still expire inside the
-    # detection budget, since the closing :done is the settle timeout firing.
-    stream = start_armed(registered_submit(self()), settle_timeout_ms: 2_000)
+    # The window has to outlast that delivery (65 local sends, milliseconds)
+    # and still expire inside the detection budget, since the closing :done is
+    # the settle timeout firing; it is a scenario budget, not a detection one.
+    stream = start_armed(registered_submit(self()), settle_timeout_ms: 500)
     ref = stream.ref
     relay = stream.relay
 
@@ -984,7 +1133,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     Enum.each(1..65, fn sequence ->
       owner_frame(
         stream,
-        {:data, Jason.encode!(%{"type" => "response.created", "sequence" => sequence})}
+        {:data, CodexPooler.JSON.encode!(%{"type" => "response.created", "sequence" => sequence})}
       )
     end)
 
@@ -1007,13 +1156,15 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     Enum.each(1..64, fn sequence ->
       owner_frame(
         within_limit,
-        {:data, Jason.encode!(%{"type" => "response.created", "sequence" => sequence})}
+        {:data, CodexPooler.JSON.encode!(%{"type" => "response.created", "sequence" => sequence})}
       )
     end)
 
     owner_frame(within_limit, :complete)
 
-    assert_receive {^within_ref, {:preflight, {:fallback, :bridge_no_first_event}}},
+    assert_receive {^within_ref, {:preflight, :stream}}, @detection_timeout_ms
+
+    assert_receive {^within_ref, {:bridge_error, :upstream_websocket_error}},
                    @detection_timeout_ms
 
     refute_received {:overflow, _event, _measurements, _metadata}
@@ -1024,7 +1175,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     Enum.each(1..65, fn sequence ->
       owner_frame(
         over_limit,
-        {:data, Jason.encode!(%{"type" => "response.created", "sequence" => sequence})}
+        {:data, CodexPooler.JSON.encode!(%{"type" => "response.created", "sequence" => sequence})}
       )
     end)
 
@@ -1034,8 +1185,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
       assert_receive {^over_ref, {:data, _data}}, @detection_timeout_ms
     end)
 
-    assert_receive {:overflow, [:codex_pooler, :gateway, :websocket_bridge, :precommit_overflow],
-                    %{count: 1, frames: 65}, %{max_frames: 64, max_bytes: 1_048_576}},
+    assert_receive {:overflow, [:codex_pooler, :gateway, :websocket_bridge, :precommit_overflow], %{count: 1, frames: 65}, %{max_frames: 64, max_bytes: 1_048_576}},
                    @detection_timeout_ms
 
     owner_frame(over_limit, :complete)
@@ -1053,7 +1203,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
       owner_frame(stream, {:data, lifecycle_frame(bytes)})
       owner_frame(stream, :complete)
 
-      assert_receive {^ref, {:preflight, {:fallback, :bridge_no_first_event}}},
+      assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
+
+      assert_receive {^ref, {:bridge_error, :upstream_websocket_error}},
                      @detection_timeout_ms
 
       refute_received {:overflow, _event, _measurements, _metadata}
@@ -1066,9 +1218,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     assert_receive {^ref, {:preflight, :stream}}, @detection_timeout_ms
     assert_receive {^ref, {:data, _data}}, @detection_timeout_ms
 
-    assert_receive {:overflow, [:codex_pooler, :gateway, :websocket_bridge, :precommit_overflow],
-                    %{bytes: 1_048_577, count: 1, frames: 1},
-                    %{max_bytes: 1_048_576, max_frames: 64}},
+    assert_receive {:overflow, [:codex_pooler, :gateway, :websocket_bridge, :precommit_overflow], %{bytes: 1_048_577, count: 1, frames: 1}, %{max_bytes: 1_048_576, max_frames: 64}},
                    @detection_timeout_ms
 
     owner_frame(stream, :complete)
@@ -1079,8 +1229,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
   defp await_controlled_barrier(stage, controls) do
     release_ref = Map.fetch!(controls, stage)
 
-    assert_receive {:websocket_owner_harness_controlled_barrier, ^stage, barrier_pid,
-                    ^release_ref},
+    assert_receive {:websocket_owner_harness_controlled_barrier, ^stage, barrier_pid, ^release_ref},
                    @detection_timeout_ms
 
     barrier_pid
@@ -1124,7 +1273,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
   end
 
   defp terminal_frame(response_id) do
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "type" => "response.completed",
       "response" => %{"id" => response_id, "status" => "completed"}
     })

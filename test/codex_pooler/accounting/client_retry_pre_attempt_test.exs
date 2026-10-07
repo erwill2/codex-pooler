@@ -1,4 +1,19 @@
 defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
+  # PREDICATE tests, not drain tests. `predecessor_fixture/1` below stamps
+  # `websocket_pre_attempt_drain` onto the request itself and then asserts that
+  # `ClientRetry` admits or refuses the resend. That is deliberate and correct
+  # input for a predicate -- the predicate's job is to decide, not to produce --
+  # and the `mutate/2` cases depend on being able to vary it freely.
+  #
+  # What it cannot do is notice that nothing *writes* the marker, which is
+  # exactly what happened: the key had never been set once in ~1,000,000
+  # production requests while this file was green
+  # (icoretech/codex-pooler-findings#160, #170).
+  #
+  # The PRODUCER -- a real drain writing the marker and the release, with the
+  # real predicate reading them back and admitting the resend -- is covered in
+  # `test/codex_pooler_web/controllers/runtime/backend_codex_pre_attempt_drain_resend_test.exs`.
+  # If this file is green and that one is not, the capability does not exist.
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.AccountingTestSupport
@@ -9,12 +24,69 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
     Attempt,
     ClientRetry,
     LedgerEntry,
+    PreAttemptRelease,
     Request,
     RequestClientRetryLink
   }
 
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
   alias CodexPooler.Repo
+
+  test "native retry completion uses database time despite a future application clock" do
+    before = database_now()
+    fixture = predecessor_fixture(%{now: DateTime.add(before, 60, :second)})
+    assert DateTime.compare(fixture.request.completed_at, before) in [:eq, :gt]
+    assert DateTime.compare(fixture.request.completed_at, database_now()) in [:eq, :lt]
+    assert {:ok, %ClientRetry.SuccessorClaim{}} = claim(fixture)
+  end
+
+  test "attempt finalization uses database time only for native retry witnesses" do
+    for native? <- [true, false], attempted? <- [true, false] do
+      setup = accounting_setup(%{price_version: "clock-#{System.unique_integer([:positive])}"})
+      before = database_now()
+      future = DateTime.add(before, 60, :second)
+
+      witness =
+        if native?,
+          do:
+            ClientRetry.original_witness!(
+              :crypto.strong_rand_bytes(32),
+              setup.api_key.runtime_revocation_epoch
+            )
+
+      {:ok, %{request: claimed}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+          endpoint: "/backend-api/codex/responses",
+          correlation_id: Ecto.UUID.generate(),
+          native_client_retry_witness: witness
+        })
+
+      {:ok, %{request: reserved}} =
+        Accounting.reserve(setup.auth, setup.model, %{"model" => setup.model.exposed_model_id}, %{
+          transport: "websocket",
+          endpoint: claimed.endpoint,
+          correlation_id: claimed.correlation_id,
+          turn_claim: claimed
+        })
+
+      {:ok, result} =
+        if attempted? do
+          {:ok, attempt} = Accounting.create_attempt(reserved, setup.assignment)
+          Accounting.finalize_failure(reserved, attempt, %{now: future})
+        else
+          Accounting.finalize_reservation_failure(reserved, %{now: future})
+        end
+
+      if attempted?, do: assert(result.attempt.completed_at == result.request.completed_at)
+
+      if native? do
+        assert DateTime.compare(result.request.completed_at, before) in [:eq, :gt]
+        assert DateTime.compare(result.request.completed_at, database_now()) in [:eq, :lt]
+      else
+        assert result.request.completed_at == future
+      end
+    end
+  end
 
   test "a drained accepted claim with no turn or ledger receives one fresh successor" do
     fixture = claimed_predecessor_fixture()
@@ -27,23 +99,23 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
     refute Repo.exists?(from attempt in Attempt, where: attempt.request_id == ^fixture.request.id)
   end
 
-  test "claimed-only retry rejects changed scope and incomplete cancellation evidence" do
-    for mutation <- [
-          :marker,
-          :active,
-          :attempt,
-          :expired,
-          :future,
-          :witness,
-          :payload,
-          :epoch,
-          :anchor,
-          :model,
-          :endpoint,
-          :claim
-        ] do
-      fixture = claimed_predecessor_fixture() |> mutate(mutation)
-      assert {:error, _} = claim(fixture), "accepted #{mutation}"
+  for mutation <- [
+        :marker,
+        :active,
+        :attempt,
+        :expired,
+        :future,
+        :witness,
+        :payload,
+        :epoch,
+        :anchor,
+        :model,
+        :endpoint,
+        :claim
+      ] do
+    test "claimed-only retry rejects #{mutation} evidence" do
+      fixture = claimed_predecessor_fixture() |> mutate(unquote(mutation))
+      assert {:error, _} = claim(fixture), "accepted #{unquote(mutation)}"
 
       refute Repo.exists?(
                from link in RequestClientRetryLink,
@@ -131,28 +203,29 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
              claim(%{fixture | opts: Map.put(wrong, :owner_lease_token, token)})
   end
 
-  test "incomplete or unsafe zero-attempt drain evidence never creates a successor" do
-    for mutation <- [
-          :marker,
-          :ordinary_failure,
-          :active,
-          :visible,
-          :attempt,
-          :release,
-          :settlement,
-          :expired,
-          :future,
-          :witness,
-          :payload,
-          :epoch,
-          :anchor,
-          :model,
-          :endpoint
-        ] do
+  for mutation <- [
+        :marker,
+        :ordinary_failure,
+        :active,
+        :visible,
+        :attempt,
+        :release,
+        :phase,
+        :settlement,
+        :expired,
+        :future,
+        :witness,
+        :payload,
+        :epoch,
+        :anchor,
+        :model,
+        :endpoint
+      ] do
+    test "zero-attempt drain rejects #{mutation} evidence without a successor" do
       fixture = predecessor_fixture()
-      fixture = mutate(fixture, mutation)
+      fixture = mutate(fixture, unquote(mutation))
       count = Repo.aggregate(Request, :count)
-      assert {:error, _reason} = claim(fixture), "accepted #{mutation}"
+      assert {:error, _reason} = claim(fixture), "accepted #{unquote(mutation)}"
       assert Repo.aggregate(Request, :count) == count
 
       refute Repo.exists?(
@@ -193,7 +266,7 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
     }
   end
 
-  defp predecessor_fixture do
+  defp predecessor_fixture(completion_attrs \\ %{}) do
     setup =
       accounting_setup(%{price_version: "pre-attempt-#{System.unique_integer([:positive])}"})
 
@@ -219,17 +292,27 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
       })
 
     {:ok, %{request: request}} =
-      Accounting.finalize_reservation_failure(reserved, %{
-        last_error_code: "owner_drained",
-        usage_status: "usage_unknown",
-        response_status_code: 499
-      })
+      Accounting.finalize_reservation_failure(
+        reserved,
+        Map.merge(
+          %{
+            last_error_code: "owner_drained",
+            usage_status: "usage_unknown",
+            response_status_code: 499,
+            pre_attempt_phase: PreAttemptRelease.turn_interrupted()
+          },
+          completion_attrs
+        )
+      )
 
+    # Stamped input: production writes this marker from
+    # `Interruption.interrupt_direct_request/2` on a `%DirectCleanup{}` receipt,
+    # which needs a live socket and owner and so cannot run here. See the module
+    # comment for where the producer is covered.
     request =
       Repo.update!(
         Ecto.Changeset.change(request,
-          request_metadata:
-            Map.put(request.request_metadata || %{}, "websocket_pre_attempt_drain", true)
+          request_metadata: Map.put(request.request_metadata || %{}, "websocket_pre_attempt_drain", true)
         )
       )
 
@@ -341,6 +424,27 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
     fixture
   end
 
+  # `owner_drained` on its own no longer proves the boundary. A release that
+  # carries the reason but declares some other phase -- or declares none, as
+  # every pre-#187 interruption release did -- is not the drain this predicate
+  # is allowed to admit a successor for.
+  defp mutate(fixture, :phase) do
+    release = Repo.get_by!(LedgerEntry, request_id: fixture.request.id, entry_kind: "release")
+
+    Repo.update!(
+      Ecto.Changeset.change(release,
+        details:
+          Map.put(
+            release.details,
+            PreAttemptRelease.detail_key(),
+            PreAttemptRelease.unrecorded()
+          )
+      )
+    )
+
+    fixture
+  end
+
   defp mutate(fixture, :settlement) do
     release = Repo.get_by!(LedgerEntry, request_id: fixture.request.id, entry_kind: "release")
     Repo.update!(Ecto.Changeset.change(release, entry_kind: "settlement"))
@@ -349,5 +453,10 @@ defmodule CodexPooler.Accounting.ClientRetryPreAttemptTest do
 
   defp update_request(fixture, attrs) do
     %{fixture | request: Repo.update!(Ecto.Changeset.change(fixture.request, attrs))}
+  end
+
+  defp database_now do
+    %{rows: [[now]]} = Repo.query!("SELECT clock_timestamp()", [])
+    now
   end
 end

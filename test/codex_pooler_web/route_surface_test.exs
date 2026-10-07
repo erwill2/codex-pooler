@@ -8,9 +8,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     application_routes =
       routes
-      |> Enum.reject(
-        &(String.starts_with?(&1.path, "/dev") or String.starts_with?(&1.path, "/live"))
-      )
+      |> Enum.reject(&(String.starts_with?(&1.path, "/dev") or String.starts_with?(&1.path, "/live")))
       |> Enum.map(&{&1.verb, &1.path})
       |> Enum.sort()
 
@@ -25,8 +23,10 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/admin/alerts"},
                {:get, "/admin/api-keys"},
                {:get, "/admin/audit-logs"},
+               {:get, "/admin/incidents"},
                {:get, "/admin/invites"},
                {:get, "/admin/jobs"},
+               {:get, "/admin/lens"},
                {:get, "/admin/operators"},
                {:get, "/admin/pools"},
                {:get, "/admin/request-logs"},
@@ -35,6 +35,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/admin/system"},
                {:get, "/admin/upstreams"},
                {:get, "/admin/upstreams/:id"},
+               {:get, "/admin/upstreams/:id/saved-reset-expirations.ics"},
                {:get, "/api/codex/usage"},
                {:get, "/backend-api/codex/models"},
                {:get, "/backend-api/codex/responses"},
@@ -115,6 +116,26 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     refute Enum.any?(routes, fn {_verb, path, _plug, _opts} ->
              path in ["/api/admin/alerts", "/dashboard/alerts"]
+           end)
+  end
+
+  test "OpenAI incidents admin route is an authenticated read-only LiveView surface" do
+    routes =
+      CodexPoolerWeb.Router
+      |> Phoenix.Router.routes()
+      |> Enum.map(&{&1.verb, &1.path, &1.plug, &1.plug_opts})
+
+    assert {:get, "/admin/incidents", Phoenix.LiveView.Plug, :index} =
+             Enum.find(routes, fn {verb, path, _plug, _opts} ->
+               verb == :get and path == "/admin/incidents"
+             end)
+
+    refute Enum.any?(routes, fn {verb, path, _plug, _opts} ->
+             path == "/admin/incidents" and verb != :get
+           end)
+
+    refute Enum.any?(routes, fn {_verb, path, _plug, _opts} ->
+             path in ["/api/admin/incidents", "/dashboard/incidents"]
            end)
   end
 

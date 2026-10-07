@@ -2,6 +2,7 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
   use ExUnit.Case, async: true
 
   alias CodexPooler.Quotas.AdditionalMeterIdentity
+  alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.WindowSelector
 
@@ -14,6 +15,29 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
     "codex_other",
     "gpt-5.3-codex-spark"
   ]
+
+  test "legacy weekly account slots normalize before descriptor selection without mutating input" do
+    legacy =
+      account_window(
+        window_kind: "primary",
+        window_minutes: 10_080,
+        reset_at: DateTime.add(@as_of, 7, :day)
+      )
+
+    canonical = %{legacy | window_kind: "secondary"}
+
+    for windows <- [[legacy, canonical], [canonical, legacy]] do
+      assert [selected] = WindowSelector.logical_windows(windows, @as_of)
+      assert selected.window_kind == "secondary"
+      assert WindowClassifier.weekly_secondary?(selected)
+      assert WindowSelector.best_account_window([selected], :weekly_secondary, @as_of) == selected
+      assert WindowSelector.best_account_primary_variant([selected], @as_of) == nil
+    end
+
+    assert legacy.window_kind == "primary"
+    assert WindowSelector.best_account_window([], :primary_5h, @as_of) == nil
+    assert WindowSelector.logical_windows([], @as_of) == []
+  end
 
   test "prefers measured account evidence over a later zero-capacity usage outlier" do
     outlier =
@@ -147,6 +171,39 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
            ]
   end
 
+  test "an expired exhausted row loses to a stale row of the running cycle in both candidate orders" do
+    # Usage polling failed: every row is stale, and the rate-limit-event row
+    # still describes a cycle that ended weeks ago at 100%.
+    expired_exhausted =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_rate_limit_event",
+        merge_precedence: 90,
+        used_percent: Decimal.new("100"),
+        reset_at: DateTime.add(@as_of, -20, :day),
+        observed_at: DateTime.add(@as_of, -27, :day)
+      )
+
+    stale_running =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("30"),
+        reset_at: DateTime.add(@as_of, 3, :day),
+        observed_at: DateTime.add(@as_of, -2, :hour)
+      )
+
+    for windows <- [[expired_exhausted, stale_running], [stale_running, expired_exhausted]] do
+      assert WindowSelector.logical_windows(windows, @as_of) == [stale_running]
+    end
+
+    # With no running-cycle row left, the expired row is the only evidence and
+    # stays until it is past retention, when it is ignored as if pruned.
+    assert WindowSelector.logical_windows([expired_exhausted], @as_of) == [expired_exhausted]
+    assert WindowSelector.logical_windows([expired_exhausted], DateTime.add(@as_of, 11, :day)) == []
+  end
+
   test "same-cycle rows with countdown jitter are not rejected" do
     # Resets within the margin describe the same running cycle.
     fresh_zero =
@@ -200,6 +257,60 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
            ]
   end
 
+  test "a twice-confirmed usable usage reading supersedes fresh exhausted header evidence" do
+    reset_at = DateTime.add(@as_of, 7, :day)
+
+    exhausted_headers =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_response_headers",
+        merge_precedence: 80,
+        used_percent: Decimal.new("100"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@as_of, -120, :second)
+      )
+
+    confirmed_usage =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("20"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@as_of, -30, :second),
+        metadata: usage_coherence(2, reset_at, DateTime.add(@as_of, -30, :second))
+      )
+
+    single_usage = %{
+      confirmed_usage
+      | metadata: usage_coherence(1, reset_at, DateTime.add(@as_of, -30, :second))
+    }
+
+    # One coherent reading is a suspicion: the exhausted row still wins.
+    assert WindowSelector.logical_windows([single_usage, exhausted_headers], @as_of) == [
+             exhausted_headers
+           ]
+
+    # Two coherent readings are a recovery: the exhausted row stops competing.
+    assert WindowSelector.logical_windows([confirmed_usage, exhausted_headers], @as_of) == [
+             confirmed_usage
+           ]
+
+    # A newer exhausted observation is not overridden by older confirmations.
+    newer_exhausted = %{exhausted_headers | observed_at: @as_of}
+
+    assert WindowSelector.logical_windows([confirmed_usage, newer_exhausted], @as_of) == [
+             newer_exhausted
+           ]
+
+    # A confirmation that aged past the freshness TTL no longer overrides.
+    later = DateTime.add(@as_of, 16, :minute)
+
+    assert WindowSelector.logical_windows([confirmed_usage, exhausted_headers], later) == [
+             exhausted_headers
+           ]
+  end
+
   test "anchored runtime Spark evidence remains selected over newer floating usage evidence" do
     floating_usage =
       spark_window(
@@ -225,7 +336,7 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
            ]
   end
 
-  test "codex02 and codex03 floating Spark evidence remains selected without an anchored row" do
+  test "two accounts' floating Spark evidence remains selected without an anchored row" do
     for reset_at <- [~U[2026-07-28 12:10:00Z], ~U[2026-07-28 12:14:00Z]] do
       floating_usage =
         spark_window(
@@ -529,12 +640,10 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
       expected_inactive_key =
         case scope do
           "model" ->
-            {"model", "unrelated-family", "unrelated-model", nil, "unrelated-quota", "secondary",
-             10_080}
+            {"model", "unrelated-family", "unrelated-model", nil, "unrelated-quota", "secondary", 10_080}
 
           "upstream_model" ->
-            {"upstream_model", "unrelated-family", nil, "unrelated-upstream-model",
-             "unrelated-quota", "secondary", 10_080}
+            {"upstream_model", "unrelated-family", nil, "unrelated-upstream-model", "unrelated-quota", "secondary", 10_080}
         end
 
       assert WindowSelector.logical_key(inactive_alias) == expected_inactive_key
@@ -665,6 +774,87 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
     assert WindowSelector.logical_windows([earlier, later], @as_of) == [later]
   end
 
+  test "twice-confirmed runtime readings supersede a fresh exhausted usage reading of the same cycle" do
+    reset_at = DateTime.add(@as_of, 5, :day)
+
+    exhausted_usage =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@as_of, -60, :second),
+        metadata: %{"rate_limit_allowed" => false, "rate_limit_reached" => true}
+      )
+
+    confirmed_headers =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_response_headers",
+        merge_precedence: 80,
+        used_percent: Decimal.new("37"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@as_of, -72, :second),
+        metadata: runtime_coherence(2, reset_at, DateTime.add(@as_of, -72, :second))
+      )
+
+    single_headers = %{
+      confirmed_headers
+      | metadata: runtime_coherence(1, reset_at, DateTime.add(@as_of, -72, :second))
+    }
+
+    # One runtime reading is a suspicion: the exhausted usage row still wins.
+    assert WindowSelector.logical_windows([single_headers, exhausted_usage], @as_of) == [
+             exhausted_usage
+           ]
+
+    # Two coherent runtime readings observed within the tolerance before the
+    # exhausted usage reading supersede it.
+    assert WindowSelector.logical_windows([confirmed_headers, exhausted_usage], @as_of) == [
+             confirmed_headers
+           ]
+
+    # An exhausted usage reading observed more than the tolerance after the
+    # last runtime confirmation keeps winning.
+    later_exhausted = %{exhausted_usage | observed_at: DateTime.add(@as_of, 5, :minute)}
+    later = DateTime.add(@as_of, 6, :minute)
+
+    assert WindowSelector.logical_windows([confirmed_headers, later_exhausted], later) == [
+             later_exhausted
+           ]
+  end
+
+  defp runtime_coherence(count, reset_at, last_observed_at) do
+    %{
+      "__quota_runtime_coherence_v1" => %{
+        "version" => 1,
+        "count" => count,
+        "used_percent" => "37",
+        "reset_at" => DateTime.to_iso8601(reset_at),
+        "first_observed_at" => DateTime.to_iso8601(DateTime.add(last_observed_at, -60, :second)),
+        "last_observed_at" => DateTime.to_iso8601(last_observed_at),
+        "allowed" => true,
+        "limit_reached" => false
+      }
+    }
+  end
+
+  defp usage_coherence(count, reset_at, last_observed_at) do
+    %{
+      "__quota_usage_coherence_v1" => %{
+        "version" => 1,
+        "count" => count,
+        "used_percent" => "20",
+        "reset_at" => DateTime.to_iso8601(reset_at),
+        "first_observed_at" => DateTime.to_iso8601(DateTime.add(last_observed_at, -60, :second)),
+        "last_observed_at" => DateTime.to_iso8601(last_observed_at),
+        "allowed" => true,
+        "limit_reached" => false
+      }
+    }
+  end
+
   defp account_window(attrs) do
     observed_at = Keyword.get(attrs, :observed_at, @as_of)
 
@@ -793,8 +983,7 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelectorTest do
   end
 
   defp canonical_spark_key("upstream_model") do
-    {"upstream_model", "codex_model", nil, "gpt-5.3-codex-spark", "codex_spark", "secondary",
-     10_080}
+    {"upstream_model", "codex_model", nil, "gpt-5.3-codex-spark", "codex_spark", "secondary", 10_080}
   end
 
   defp qf001_explicit_floating(attrs \\ []) do

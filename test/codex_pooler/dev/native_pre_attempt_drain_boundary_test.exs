@@ -1,5 +1,6 @@
 defmodule CodexPooler.Dev.NativePreAttemptDrainBoundaryTest do
   use ExUnit.Case, async: false
+  use CodexPooler.CommittedWriteGuard
   import Ecto.Query
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
   alias CodexPooler.{Access, FakeUpstream, Repo}
@@ -9,15 +10,15 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainBoundaryTest do
   alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag capture_log: true
+  @tag slow: "boots the real owner control boundary, captures a committed reservation and observes actual response-task release"
   test "captures a real committed reservation once and releases its actual response task" do
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
     Sandbox.mode(Repo, :auto)
 
     on_exit(fn ->
       NativePreAttemptDrain.disarm()
       Sandbox.mode(Repo, :manual)
-      Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, previous)
     end)
 
     upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
@@ -25,7 +26,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainBoundaryTest do
 
     on_exit(fn ->
       Sandbox.unboxed_run(Repo, fn ->
-        Repo.delete!(setup.pool)
+        CodexPooler.PoolerFixtures.delete_committed_pools!([setup.pool.id])
         Repo.delete!(setup.identity)
         Repo.delete!(setup.pricing)
       end)
@@ -42,7 +43,7 @@ defmodule CodexPooler.Dev.NativePreAttemptDrainBoundaryTest do
     :ok = NativePreAttemptDrain.arm(setup.pool.id)
 
     payload =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => setup.model.exposed_model_id,
         "input" => [],

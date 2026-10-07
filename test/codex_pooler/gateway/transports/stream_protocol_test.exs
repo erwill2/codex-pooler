@@ -62,10 +62,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         "response" => %{"id" => "resp_terminal_fragment", "status" => "completed"}
       }
 
-      fragment = "event: response.completed\ndata: #{Jason.encode!(event)}"
+      fragment = "event: response.completed\ndata: #{CodexPooler.JSON.encode!(event)}"
 
       assert StreamProtocol.sse_field(fragment, "event") == "response.completed"
-      assert StreamProtocol.sse_field(fragment, "data") == Jason.encode!(event)
+      assert StreamProtocol.sse_field(fragment, "data") == CodexPooler.JSON.encode!(event)
     end
   end
 
@@ -99,27 +99,103 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert StreamProtocol.terminal_failure(frame) == :error
     end
 
-    test "classifies failure-coded response.incomplete as failed" do
-      frame =
-        sse_event("response.incomplete", %{
-          "type" => "response.incomplete",
-          "response" => %{
-            "id" => "resp_failed_incomplete",
-            "status" => "incomplete",
-            "incomplete_details" => %{"reason" => "context_length_exceeded"}
-          }
-        })
+    test "classifies release-known failure reasons in response.incomplete as failed" do
+      for code <- [
+            "context_length_exceeded",
+            "invalid_prompt",
+            "bio_policy",
+            "cyber_policy",
+            "misalignment_policy_violation",
+            "usage_not_included",
+            "slow_down",
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded"
+          ] do
+        frame =
+          sse_event("response.incomplete", %{
+            "type" => "response.incomplete",
+            "response" => %{
+              "id" => "resp_failed_incomplete",
+              "status" => "incomplete",
+              "incomplete_details" => %{"reason" => code}
+            }
+          })
 
-      assert {:ok, %{kind: :failed, failure: failure}} = StreamProtocol.terminal_outcome(frame)
-      assert failure.code == "context_length_exceeded"
-      assert failure.event_type == "response.incomplete"
+        assert {:ok, %{kind: :failed, failure: failure}} = StreamProtocol.terminal_outcome(frame)
+        assert failure.code == code
+        assert failure.event_type == "response.incomplete"
 
-      normalized = StreamProtocol.normalize_codex_responses_sse_data(frame)
-      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(normalized)
-      assert data["type"] == "response.failed"
-      assert data["response"]["status"] == "failed"
-      assert data["error"]["code"] == "context_length_exceeded"
-      assert data["response"]["error"]["code"] == "context_length_exceeded"
+        normalized = StreamProtocol.normalize_codex_responses_sse_data(frame)
+        assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(normalized)
+        assert data["type"] == "response.failed"
+        assert data["response"]["status"] == "failed"
+        assert data["error"]["code"] == code
+        assert data["response"]["error"]["code"] == code
+      end
+    end
+
+    test "keeps the released client terminal retry policy explicit" do
+      # Mirrors the latest released Codex client
+      # (`codex-api/src/sse/responses.rs` `process_responses_event` and
+      # `protocol/src/error.rs` `retry_delay`): `slow_down` became a retried
+      # rate limit and the three spend/credit codes became a final quota error.
+      retryable = ["server_error", "upstream_terminal_failure", "rate_limit_exceeded", "slow_down"]
+
+      terminal = [
+        "context_length_exceeded",
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "usage_not_included",
+        "cyber_policy",
+        "misalignment_policy_violation",
+        "invalid_prompt",
+        "bio_policy",
+        "server_is_overloaded"
+      ]
+
+      for code <- retryable do
+        assert StreamProtocol.ErrorCodes.codex_compaction_terminal_retryable?(
+                 "response.failed",
+                 code
+               )
+      end
+
+      for code <- terminal do
+        refute StreamProtocol.ErrorCodes.codex_compaction_terminal_retryable?(
+                 "response.failed",
+                 code
+               )
+      end
+
+      assert StreamProtocol.ErrorCodes.codex_compaction_terminal_retryable?(
+               "response.incomplete",
+               "max_output_tokens"
+             )
+    end
+
+    test "classifies the spend and credit codes for route health like insufficient_quota" do
+      # The latest released client treats these as a final quota error
+      # (findings#258 row 258-02). They say the account cannot serve, not that
+      # the request was wrong, so like `insufficient_quota` they stay route
+      # failures that demote the assignment; `slow_down` is a retried rate
+      # limit and stays neutral (findings#258 row 258-24).
+      for code <- [
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded"
+          ] do
+        refute StreamProtocol.ErrorCodes.health_neutral_error_code?(code)
+        refute StreamProtocol.ErrorCodes.provider_overload_error_code?(code)
+        assert StreamProtocol.ErrorCodes.incomplete_failure_reason?(code)
+      end
+
+      assert StreamProtocol.ErrorCodes.health_neutral_error_code?("slow_down")
+      assert StreamProtocol.ErrorCodes.incomplete_failure_reason?("slow_down")
     end
 
     test "classifies workspace credit depletion response.incomplete as failed" do
@@ -166,7 +242,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "recognizes the closed control set in direct JSON and SSE data" do
       for type <- ["codex.rate_limits", "codex.response.metadata"] do
-        direct = Jason.encode!(%{"type" => type})
+        direct = CodexPooler.JSON.encode!(%{"type" => type})
         sse = sse_event(type, %{"type" => type})
 
         assert StreamProtocol.internal_control_event?(direct)
@@ -179,7 +255,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "keeps unknown Codex, response, and terminal events visible" do
       future_control = "codex.future_control"
-      direct = Jason.encode!(%{"type" => future_control})
+      direct = CodexPooler.JSON.encode!(%{"type" => future_control})
       sse = sse_event(future_control, %{"type" => future_control})
 
       refute StreamProtocol.internal_control_event?(%{"type" => future_control})
@@ -192,7 +268,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
       for type <- ["response.created", "response.failed"] do
         assert StreamProtocol.downstream_visible_event?(%{"type" => type})
-        assert StreamProtocol.downstream_visible_event?(Jason.encode!(%{"type" => type}))
+
+        assert StreamProtocol.downstream_visible_event?(CodexPooler.JSON.encode!(%{"type" => type}))
+
         assert StreamProtocol.stream_data_visible?(sse_event(type, %{"type" => type}))
       end
     end
@@ -214,8 +292,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
   @tag :websocket_owner_pin
   test "PIN-P04 backend POST SSE preserves decoded done and legacy JSON bytes across LF and CRLF" do
     fixtures = [
-      {"response.done",
-       ~s({"type":"response.done","response":{"id":"resp_pin_backend_post_done"}})},
+      {"response.done", ~s({"type":"response.done","response":{"id":"resp_pin_backend_post_done"}})},
       {nil, ~s({ "id" : "resp_pin_backend_post_legacy" })}
     ]
 
@@ -419,12 +496,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         [
           "event: response.completed\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{
               "id" => "resp_explicit_state",
               "output" => [
                 %{
+                  "type" => "message",
                   "content" => [
                     %{"type" => "output_text", "text" => "split terminal text"}
                   ]
@@ -472,7 +550,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
       assert state.summary.terminal_kind == nil
       assert state.summary.terminal_status == nil
-      refute Jason.encode!(state.summary) =~ raw_status
+      refute CodexPooler.JSON.encode!(state.summary) =~ raw_status
     end
 
     test "buffers a large terminal across chunks until its JSON is complete" do
@@ -482,13 +560,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         [
           "event: response.completed\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{
               "id" => "resp_large_terminal_without_separator",
               "status" => "completed",
               "output" => [
                 %{
+                  "type" => "message",
                   "content" => [
                     %{
                       "type" => "output_text",
@@ -516,7 +595,12 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
       assert Enum.map(events, & &1["event"]) == [
                "response.created",
+               "response.output_item.added",
+               "response.content_part.added",
                "response.output_text.delta",
+               "response.output_text.done",
+               "response.content_part.done",
+               "response.output_item.done",
                "response.completed"
              ]
 
@@ -534,7 +618,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         [
           "event:response.completed\n",
           "data:",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{
               "id" => "resp_no_space_sse_fields",
@@ -566,7 +650,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         [
           "event: response.output_text.delta\n",
           "data: ",
-          Jason.encode!(%{"type" => "response.output_text.delta", "delta" => "split text"})
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.output_text.delta",
+            "delta" => "split text"
+          })
         ]
         |> IO.iodata_to_binary()
 
@@ -580,7 +667,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert chunk =~ "split text"
     end
 
-    test "emits early response.failed without synthetic success prefix" do
+    test "opens early response.failed with a created snapshot and no synthesized output" do
       state = StreamProtocol.public_openai_responses_stream_state()
 
       failed =
@@ -597,8 +684,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert {chunk, _state} =
                StreamProtocol.normalize_public_openai_responses_sse_data(failed, state)
 
-      assert String.starts_with?(chunk, "event: response.failed\n")
-      refute chunk =~ "event: response.created\n"
+      assert String.starts_with?(chunk, "event: response.created\n")
+      assert chunk =~ "event: response.failed\n"
       refute chunk =~ "event: response.output_text.delta\n"
     end
 
@@ -619,7 +706,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert {chunk, _state} =
                StreamProtocol.normalize_public_openai_responses_sse_data(failed, state)
 
-      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
       assert data["error"]["code"] == "context_length_exceeded"
       assert data["error"]["message"] == "upstream request failed"
 
@@ -648,7 +735,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
              }
     end
 
-    test "emits early top-level error without synthetic success prefix" do
+    test "opens early top-level error with a created snapshot and no synthesized output" do
       state = StreamProtocol.public_openai_responses_stream_state()
 
       error =
@@ -664,8 +751,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert {chunk, _state} =
                StreamProtocol.normalize_public_openai_responses_sse_data(error, state)
 
-      assert String.starts_with?(chunk, "event: error\n")
-      refute chunk =~ "event: response.created\n"
+      assert String.starts_with?(chunk, "event: response.created\n")
+      assert chunk =~ "event: error\n"
       refute chunk =~ "event: response.output_text.delta\n"
     end
   end
@@ -703,8 +790,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert data["error"] == %{
                "type" => "server_error",
                "code" => "server_error",
-               "message" =>
-                 "upstream request failed: stream interrupted before terminal response event",
+               "message" => "upstream request failed: stream interrupted before terminal response event",
                "param" => nil
              }
 
@@ -736,9 +822,30 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
   end
 
   describe "wrapped websocket/direct JSON terminal error frames" do
+    # A provider 429 frame is masked into the public `response.failed` by the
+    # owner mapper and normalized again by the public websocket; both passes
+    # type its redacted error `rate_limit_error` like the `/v1` HTTP answer of
+    # the same throttle, and a 5xx stays `server_error` (findings#254 row
+    # 254-82).
+    for {status, type} <- [{429, "rate_limit_error"}, {503, "server_error"}] do
+      @tag provider_status: status, masked_type: type
+      test "the public owner mapper types a masked provider #{status} frame #{type}, stable on a second pass", %{provider_status: status, masked_type: type} do
+        frame = CodexPooler.JSON.encode!(%{"type" => "error", "status" => status, "error" => %{"type" => "server_error", "code" => "synthetic_#{status}", "message" => "synthetic provider detail"}})
+        expected_error = %{"code" => "synthetic_#{status}", "message" => "upstream request failed", "type" => type}
+
+        first = StreamProtocol.normalize_public_openai_responses_json_message(frame)
+        assert %{"type" => "response.failed", "response" => %{"error" => ^expected_error}} = first_decoded = CodexPooler.JSON.decode!(first)
+        assert Map.get(first_decoded, "error", expected_error) == expected_error
+        refute first =~ "synthetic provider detail"
+
+        second = StreamProtocol.normalize_public_openai_responses_json_message(first)
+        assert CodexPooler.JSON.decode!(second) == first_decoded
+      end
+    end
+
     test "emits the exact native previous-response retry event at the downstream adapter" do
       frame =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "status" => 404,
           "error" => %{
@@ -768,11 +875,44 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       adapted = Adapter.downstream_response_chunk(frame)
       remapped = Adapter.downstream_response_chunk(mapped)
 
-      assert mapped == Jason.encode!(expected)
-      assert adapted == Jason.encode!(expected)
-      assert remapped == Jason.encode!(expected)
-      assert Jason.decode!(adapted) == expected
+      assert mapped == CodexPooler.JSON.encode!(expected)
+      assert adapted == CodexPooler.JSON.encode!(expected)
+      assert remapped == CodexPooler.JSON.encode!(expected)
+      assert CodexPooler.JSON.decode!(adapted) == expected
       refute adapted =~ "synthetic upstream detail"
+    end
+
+    # The provider's codeless websocket refusal of an anchor its connection did
+    # not produce gets the `previous_response_not_found` code with its fixed
+    # message on the upstream pass, and becomes the guard's own retry event on
+    # the socket's pass (findings#232 row 232-278).
+    test "gives the provider's codeless anchor refusal the previous_response_not_found code" do
+      refusal = ~s({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Invalid `previous_response_id`."}})
+
+      coded = %{
+        "type" => "error",
+        "status" => 400,
+        "error" => %{"type" => "invalid_request_error", "code" => "previous_response_not_found", "message" => "Invalid `previous_response_id`."}
+      }
+
+      upstream_pass = StreamProtocol.canonicalize_native_codex_responses_json_message(refusal)
+      assert CodexPooler.JSON.decode!(upstream_pass) == coded
+      assert {^upstream_pass, ^coded} = StreamProtocol.canonicalize_native_codex_responses_json_message(refusal, CodexPooler.JSON.decode!(refusal))
+
+      assert %{"type" => "error", "status" => 400, "error" => %{"code" => "previous_response_not_found", "message" => "Previous response was not found. Retrying the full request."}} =
+               upstream_pass
+               |> StreamProtocol.canonicalize_native_codex_responses_json_message()
+               |> CodexPooler.JSON.decode!()
+
+      for near_miss <- [
+            ~s({"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_request","message":"Invalid `previous_response_id`."}}),
+            ~s({"type":"error","status":400,"error":{"type":"invalid_request_error","message":"Invalid `previous_response_id`. Extra."}}),
+            ~s({"type":"error","status":404,"error":{"type":"invalid_request_error","message":"Invalid `previous_response_id`."}}),
+            ~s({"type":"error","error":{"type":"invalid_request_error","message":"Invalid `previous_response_id`."}}),
+            ~s({"type":"error","status":400,"error":{"type":"server_error","message":"Invalid `previous_response_id`."}})
+          ] do
+        refute StreamProtocol.canonicalize_native_codex_responses_json_message(near_miss) =~ "previous_response_not_found", near_miss
+      end
     end
 
     test "delegates native retry near-misses to existing canonicalization" do
@@ -796,21 +936,21 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
       assert %{"type" => "response.failed", "error" => %{"code" => "stream_incomplete"}} =
                invalid_previous_response_id
-               |> Jason.encode!()
+               |> CodexPooler.JSON.encode!()
                |> StreamProtocol.canonicalize_native_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert missing_code ==
                missing_code
-               |> Jason.encode!()
+               |> CodexPooler.JSON.encode!()
                |> StreamProtocol.canonicalize_native_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert %{"type" => "response.failed", "error" => %{"code" => "stream_incomplete"}} =
                wrong_event_type
-               |> Jason.encode!()
+               |> CodexPooler.JSON.encode!()
                |> StreamProtocol.canonicalize_native_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
     end
 
     test "normalizes blank native misalignment policy messages and preserves nonblank wording" do
@@ -850,9 +990,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                  }
                } =
                  event
-                 |> Jason.encode!()
+                 |> CodexPooler.JSON.encode!()
                  |> StreamProtocol.canonicalize_native_codex_responses_json_message()
-                 |> Jason.decode!()
+                 |> CodexPooler.JSON.decode!()
       end
 
       provider_message = "Provider policy wording remains exact."
@@ -875,9 +1015,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                    }
                  }
                }
-               |> Jason.encode!()
+               |> CodexPooler.JSON.encode!()
                |> StreamProtocol.canonicalize_native_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
     end
 
     test "normalizes type-only public failures before the first websocket mapper and stateful adapter" do
@@ -934,10 +1074,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                 }
               }
           end
-          |> Jason.encode!()
+          |> CodexPooler.JSON.encode!()
 
         mapped = options |> capture_upstream_message_mapper() |> then(& &1.(frame))
-        mapped_decoded = Jason.decode!(mapped)
+        mapped_decoded = CodexPooler.JSON.decode!(mapped)
 
         refute Map.has_key?(mapped_decoded, "headers")
         refute mapped =~ provider_type
@@ -949,8 +1089,11 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
         state = Adapter.public_responses_turn_state()
         assert {:push, pushed, next_state} = Adapter.downstream_response_chunk(mapped, state)
-        assert Jason.decode!(pushed)["sequence_number"] == 0
-        assert get_in(Jason.decode!(pushed), error_path(location) ++ ["code"]) == "upstream_error"
+        assert CodexPooler.JSON.decode!(pushed)["sequence_number"] == 0
+
+        assert get_in(CodexPooler.JSON.decode!(pushed), error_path(location) ++ ["code"]) ==
+                 "upstream_error"
+
         assert next_state.terminal_latched?
       end
     end
@@ -971,7 +1114,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       mapper = capture_upstream_message_mapper(options)
 
       previous_response =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "error" => %{
             "code" => "previous_response_not_found",
@@ -980,7 +1123,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         })
 
       incomplete =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.incomplete",
           "error" => %{"type" => "provider_type_must_not_win"},
           "response" => %{
@@ -993,26 +1136,21 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                "type" => "response.failed",
                "error" => %{"code" => "stream_incomplete"},
                "response" => %{"error" => %{"code" => "stream_incomplete"}}
-             } = previous_response |> mapper.() |> Jason.decode!()
+             } = previous_response |> mapper.() |> CodexPooler.JSON.decode!()
 
       assert %{
                "type" => "response.failed",
                "error" => %{"code" => "context_length_exceeded"},
                "response" => %{"error" => %{"code" => "context_length_exceeded"}}
-             } = incomplete |> mapper.() |> Jason.decode!()
+             } = incomplete |> mapper.() |> CodexPooler.JSON.decode!()
     end
 
     test "extracts the first present validated upstream error param by exact precedence" do
       fixtures = [
-        {"response.error.param",
-         %{"response" => %{"error" => %{"param" => " input[0].content "}}}, "input[0].content"},
+        {"response.error.param", %{"response" => %{"error" => %{"param" => " input[0].content "}}}, "input[0].content"},
         {"error.param", %{"error" => %{"param" => "tools[12].name"}}, "tools[12].name"},
-        {"response.status_details.error.param",
-         %{"response" => %{"status_details" => %{"error" => %{"param" => "items[9999]"}}}},
-         "items[9999]"},
-        {"status_details.error.param",
-         %{"status_details" => %{"error" => %{"param" => "reasoning.effort"}}},
-         "reasoning.effort"},
+        {"response.status_details.error.param", %{"response" => %{"status_details" => %{"error" => %{"param" => "items[9999]"}}}}, "items[9999]"},
+        {"status_details.error.param", %{"status_details" => %{"error" => %{"param" => "reasoning.effort"}}}, "reasoning.effort"},
         {"top-level error param", %{"type" => "error", "param" => "model"}, "model"}
       ]
 
@@ -1033,7 +1171,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         }
       }
 
-      assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(precedence))
+      assert {:ok, failure} =
+               StreamProtocol.terminal_failure(CodexPooler.JSON.encode!(precedence))
+
       assert failure.upstream_error_param == "first"
     end
 
@@ -1065,7 +1205,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
           "error" => %{"code" => "server_error", "param" => candidate}
         }
 
-        assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(payload))
+        assert {:ok, failure} = StreamProtocol.terminal_failure(CodexPooler.JSON.encode!(payload))
         assert failure.upstream_error_param == String.trim(candidate)
       end
 
@@ -1075,7 +1215,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
           "error" => %{"code" => "server_error", "param" => candidate}
         }
 
-        assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(payload))
+        assert {:ok, failure} = StreamProtocol.terminal_failure(CodexPooler.JSON.encode!(payload))
         assert failure.upstream_error_param == nil
       end
 
@@ -1085,7 +1225,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         "error" => %{"code" => "server_error"}
       }
 
-      assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(non_error_top_level))
+      assert {:ok, failure} =
+               StreamProtocol.terminal_failure(CodexPooler.JSON.encode!(non_error_top_level))
+
       assert failure.upstream_error_param == nil
     end
 
@@ -1102,10 +1244,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         "param" => "also_lower_priority"
       }
 
-      assert {:ok, event} = StreamProtocol.first_complete_event(Jason.encode!(payload))
+      assert {:ok, event} = StreamProtocol.first_complete_event(CodexPooler.JSON.encode!(payload))
       assert event.upstream_error_param == nil
 
-      assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(payload))
+      assert {:ok, failure} = StreamProtocol.terminal_failure(CodexPooler.JSON.encode!(payload))
       assert failure.upstream_error_param == nil
 
       summary_text = inspect({event, failure})
@@ -1222,7 +1364,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
     end
 
     test "canonicalizes typeless detail-only websocket frames as terminal failures" do
-      frame = Jason.encode!(%{"detail" => "synthetic upstream detail must stay out of metadata"})
+      frame =
+        CodexPooler.JSON.encode!(%{
+          "detail" => "synthetic upstream detail must stay out of metadata"
+        })
 
       assert {:ok, event} = StreamProtocol.first_complete_event(frame)
       assert event.event_type == "response.failed"
@@ -1236,7 +1381,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert %{"type" => "response.failed", "error" => error, "response" => response} =
                frame
                |> StreamProtocol.canonicalize_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert error["code"] == "upstream_terminal_failure"
       assert error["message"] == "upstream websocket returned terminal detail"
@@ -1249,7 +1394,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "masks previous-response nested errors when status is present" do
       frame =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "status" => 400,
           "error" => %{
@@ -1266,7 +1411,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert %{"type" => "response.failed", "error" => error, "response" => response} =
                frame
                |> StreamProtocol.canonicalize_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert error["code"] == "stream_incomplete"
       assert error["message"] ==
@@ -1276,7 +1421,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "masks previous-response nested errors when status_code replaces status" do
       frame =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "status_code" => 400,
           "error" => %{
@@ -1293,7 +1438,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert %{"type" => "response.failed", "error" => error, "response" => response} =
                frame
                |> StreamProtocol.canonicalize_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert error["code"] == "stream_incomplete"
       assert error["message"] ==
@@ -1303,7 +1448,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "uses nested rate limit code from status_code wrapped errors" do
       frame =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "status_code" => 429,
           "error" => %{
@@ -1319,7 +1464,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert %{"type" => "response.failed", "error" => error, "response" => response} =
                frame
                |> StreamProtocol.canonicalize_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert error["code"] == "rate_limit_exceeded"
       assert response["error"]["code"] == "rate_limit_exceeded"
@@ -1327,7 +1472,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "classifies top-level status_code errors without nested error safely" do
       frame =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "status_code" => 500,
           "message" => "upstream failed"
@@ -1340,7 +1485,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert %{"type" => "response.failed", "error" => error, "response" => response} =
                frame
                |> StreamProtocol.canonicalize_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert error["code"] == "server_error"
       assert error["message"] == "upstream failed"
@@ -1349,7 +1494,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
     test "uses nested server_error code when status is absent" do
       frame =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "error",
           "error" => %{
             "code" => "server_error",
@@ -1364,7 +1509,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert %{"type" => "response.failed", "error" => error, "response" => response} =
                frame
                |> StreamProtocol.canonicalize_codex_responses_json_message()
-               |> Jason.decode!()
+               |> CodexPooler.JSON.decode!()
 
       assert error["code"] == "server_error"
       assert response["error"]["code"] == "server_error"
@@ -1451,6 +1596,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
           }
         })
 
+      # `X-OpenAI-Request-ID` stays in the input as a negative control: the
+      # allowlist admits only the request id names the metadata writer reads,
+      # and that name was never one of them.
       assert websocket_error_frame_headers(frame) == %{
                "openai-request-id" => "openai-req",
                "x-codex-primary-reset-at" => "2026-05-25T12:00:00Z",
@@ -1460,7 +1608,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                "x-codex-secondary-reset-at" => "2026-05-25T12:30:00Z",
                "x-codex-secondary-used-percent" => "true",
                "x-codex-secondary-window-minutes" => "false",
-               "x-openai-request-id" => "x-openai-req",
                "x-ratelimit-limit-requests" => "1200",
                "x-ratelimit-remaining-requests" => "0",
                "x-ratelimit-reset-requests" => "1717171717",
@@ -1541,7 +1688,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
     data = lines |> Enum.find(&String.starts_with?(&1, "data: ")) |> strip_sse_prefix("data: ")
 
     if is_binary(event) and is_binary(data) and data != "[DONE]" do
-      %{"event" => event, "data" => Jason.decode!(data)}
+      %{"event" => event, "data" => CodexPooler.JSON.decode!(data)}
     end
   end
 
@@ -1557,7 +1704,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
   defp strip_sse_prefix(line, prefix), do: String.replace_prefix(line, prefix, "")
 
   defp sse_event(event, payload) do
-    "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
+    "event: " <> event <> "\n" <> "data: " <> CodexPooler.JSON.encode!(payload) <> "\n\n"
   end
 
   defp terminal_event(error) do
@@ -1594,7 +1741,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
         "message" => "rate limited"
       }
     })
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp capture_upstream_message_mapper(options) do

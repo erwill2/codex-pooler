@@ -5,35 +5,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
 
-  @incomplete_failure_reason_codes [
-    "upstream_request_timeout",
-    "stream_incomplete",
-    "server_error",
-    "overloaded_error",
-    "server_is_overloaded",
-    "websocket_connection_limit_reached",
-    "invalid_api_key",
-    "invalid_authentication",
-    "context_length_exceeded",
-    "insufficient_quota",
-    "credit_balance_exhausted",
-    "organization_spend_limit_exceeded",
-    "project_spend_limit_exceeded",
-    "organization_usage_limit_exceeded",
-    "invalid_previous_response_id",
-    "invalid_request",
-    "invalid_request_error",
-    "previous_response_not_found",
-    "rate_limit_exceeded",
-    "unauthorized",
-    "usage_limit_exceeded",
-    "usage_limit_reached",
-    "workspace_member_credits_depleted",
-    "workspace_member_usage_limit_reached",
-    "workspace_owner_credits_depleted",
-    "workspace_owner_usage_limit_reached"
-  ]
-
   @type t :: %{
           required(:event_type) => String.t() | nil,
           required(:error_code) => String.t() | nil,
@@ -74,8 +45,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
   @spec incomplete_failure?(map()) :: boolean()
   def incomplete_failure?(event) do
     Map.get(event, :explicit_error?) == true or
-      incomplete_failure_reason?(Map.get(event, :incomplete_reason)) or
-      incomplete_failure_reason?(Map.get(event, :upstream_error_code))
+      ErrorCodes.incomplete_failure_reason?(Map.get(event, :incomplete_reason)) or
+      ErrorCodes.incomplete_failure_reason?(Map.get(event, :upstream_error_code))
   end
 
   @spec typeless_detail_error?(map()) :: boolean()
@@ -101,7 +72,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
   end
 
   defp direct_stream_event_summary(data) when is_binary(data) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok, %{} = decoded} ->
         decoded =
           if typeless_detail_error?(decoded),
@@ -125,9 +96,4 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
     ErrorCodes.nested_string(decoded, ["response", "incomplete_details", "reason"]) ||
       ErrorCodes.nested_string(decoded, ["incomplete_details", "reason"])
   end
-
-  defp incomplete_failure_reason?(reason) when reason in @incomplete_failure_reason_codes,
-    do: true
-
-  defp incomplete_failure_reason?(_reason), do: false
 end

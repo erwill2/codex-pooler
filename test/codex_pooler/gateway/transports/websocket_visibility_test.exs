@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
   import CodexPooler.PoolerFixtures
   import ExUnit.CaptureLog
 
+  alias CodexPooler.Accounting
   alias CodexPooler.Accounting.LedgerEntry
   alias CodexPooler.Accounting.RequestReplay
   alias CodexPooler.FakeUpstream
@@ -15,7 +16,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks
   alias CodexPooler.Gateway.Websocket
-  alias CodexPooler.Pools.Pool
+  alias CodexPooler.ProviderCreditsDispatchSupport
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -55,14 +56,14 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
     try do
       assert {:error, :cancelled} =
                Repo.transaction(fn ->
-                 writer.(Jason.encode!(%{"type" => "response.created"}))
+                 writer.(CodexPooler.JSON.encode!(%{"type" => "response.created"}))
                  Repo.rollback(:cancelled)
                end)
 
       assert drain_frames() == 1
       assert Repo.reload!(fixture.turn).first_visible_output_at == nil
       assert {:ok, _armed} = RequestReplay.arm(arm_input(fixture))
-      writer.(Jason.encode!(%{"type" => "response.output_text.delta", "delta" => ""}))
+      writer.(CodexPooler.JSON.encode!(%{"type" => "response.output_text.delta", "delta" => ""}))
       assert drain_frames() == 0
     after
       WebsocketRequestCallbacks.end_request()
@@ -82,20 +83,23 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
     parent = self()
     observation = observation(fixture)
     observer = WebsocketRequestCallbacks.frame_observer(fixture.identity, observation)
-    {:ok, upstream} = FakeUpstream.start_link(FakeUpstream.websocket_text_frames(frames(1)))
+    # The first frame written must commit visibility: a lifecycle frame never
+    # does (findings#232 row 232-161), so the writer fails on output.
+    {:ok, upstream} = FakeUpstream.start_link(FakeUpstream.websocket_text_frames(tl(frames(1))))
     on_exit(fn -> FakeUpstream.stop(upstream) end)
 
     request = %UpstreamWebsocketSession.Request{
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
       headers: [],
       payload: "{}",
-      timeouts:
-        RequestOptions.for_websocket(%{receive_timeout_ms: @detection_timeout_ms}).timeout_config,
+      timeouts: RequestOptions.for_websocket(%{receive_timeout_ms: @detection_timeout_ms}).timeout_config,
       request_id: fixture.request.id,
       attempt_id: fixture.attempt.id,
       frame_observer: observer,
       writer: fn _frame -> throw(:synthetic_writer_failure) end
     }
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request, identity: fixture.identity)
 
     assert catch_throw(UpstreamWebsocketSession.request_once(request)) ==
              :synthetic_writer_failure
@@ -104,6 +108,9 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
 
     fixture.attempt |> Ecto.Changeset.change(status: "failed") |> Repo.update!()
     handler = "visibility-failure-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler) end)
 
     :ok =
       :telemetry.attach(
@@ -115,7 +122,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
 
     try do
       event = %{"type" => "response.output_text.delta", "delta" => ""}
-      observer.(Jason.encode!(event), event)
+      observer.(CodexPooler.JSON.encode!(event), event)
       assert drain_queries(handler, []) != []
     after
       :telemetry.detach(handler)
@@ -164,6 +171,9 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
     on_exit(fn -> FakeUpstream.stop(upstream) end)
     parent = self()
     handler = "websocket-visibility-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler) end)
 
     :ok =
       :telemetry.attach(
@@ -225,6 +235,22 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
           correlation_id: "visibility"
         })
 
+      options =
+        Websocket.websocket_owner_response_options(
+          %{},
+          fixture.session,
+          fixture.session.owner_lease_token,
+          downstream
+        )
+
+      assert {:ok, _request} =
+               Accounting.bind_websocket_owner(
+                 %{pool: fixture.pool, api_key: fixture.api_key},
+                 fixture.request,
+                 fixture.attempt,
+                 options
+               )
+
       descriptor = %{
         semantic_turn_key: <<1::256>>,
         replay_claim_digest: <<2::256>>,
@@ -241,17 +267,16 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
 
       result =
         WebsocketOwnerSession.submit_request(owner, downstream, %UpstreamWebsocketSession.Request{
+          provider_credits_context: ProviderCreditsDispatchSupport.context!(fixture.identity, request_id: fixture.request.id, attempt_id: fixture.attempt.id),
           url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
           headers: [],
           payload: "{}",
-          timeouts:
-            RequestOptions.for_websocket(%{receive_timeout_ms: @detection_timeout_ms}).timeout_config,
+          timeouts: RequestOptions.for_websocket(%{receive_timeout_ms: @detection_timeout_ms}).timeout_config,
           message_mapper: & &1,
           effective_serving_mode: "full",
           request_id: fixture.request.id,
           attempt_id: fixture.attempt.id,
-          frame_observer:
-            WebsocketRequestCallbacks.frame_observer(fixture.identity, observation(fixture))
+          frame_observer: WebsocketRequestCallbacks.frame_observer(fixture.identity, observation(fixture))
         })
 
       {result, owner}
@@ -282,6 +307,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
 
     assert log == ""
     assert Repo.reload!(fixture.request).status == "succeeded"
+    assert Repo.reload!(fixture.attempt).status == "succeeded"
+    assert Repo.reload!(fixture.turn).status == "succeeded"
 
     assert Repo.aggregate(
              from(e in LedgerEntry,
@@ -316,6 +343,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
       |> RequestOptions.for_websocket(%{"model" => "example-model"})
 
     UpstreamDispatch.websocket_request(%UpstreamDispatch.Request{
+      provider_credits_context: ProviderCreditsDispatchSupport.context!(fixture.identity, request_id: fixture.request.id, attempt_id: fixture.attempt.id),
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
       token: "redacted",
       upstream_payload: "{}",
@@ -333,7 +361,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
     ([%{"type" => "response.created"}] ++
        List.duplicate(%{"type" => "response.output_text.delta", "delta" => ""}, deltas) ++
        [%{"type" => "response.completed", "response" => %{"id" => "resp_example"}}])
-    |> Enum.map(&Jason.encode!/1)
+    |> Enum.map(&CodexPooler.JSON.encode!/1)
   end
 
   defp drain_frames(count \\ 0) do
@@ -450,11 +478,9 @@ defmodule CodexPooler.Gateway.Transports.WebsocketVisibilityTest do
             where: entitlement.request_id == ^fixture.request.id
         )
 
-        Repo.delete_all(from pool in Pool, where: pool.id == ^fixture.pool.id)
+        CodexPooler.PoolerFixtures.delete_committed_pools!([fixture.pool.id])
 
-        Repo.delete_all(
-          from identity in UpstreamIdentity, where: identity.id == ^fixture.identity.id
-        )
+        Repo.delete_all(from identity in UpstreamIdentity, where: identity.id == ^fixture.identity.id)
       end)
     end)
 

@@ -14,7 +14,7 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata do
             trigger: :auto | :manual,
             reason: :user_requested | :context_limit | :model_downshift | :comp_hash_changed,
             implementation: :responses | :responses_compaction_v2 | :responses_compact,
-            phase: :standalone_turn | :pre_turn | :mid_turn,
+            phase: :standalone_turn | :pre_turn | :mid_turn | :post_turn,
             strategy: :memento | :prefix_compaction
           }
   end
@@ -46,7 +46,14 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata do
 
   @canonical_key "x-codex-turn-metadata"
   @canonical_param "client_metadata.x-codex-turn-metadata"
-  @max_metadata_bytes 4_096
+  # Caps only the decode work: the frame carrying the value is already bounded by the websocket
+  # frame limit. The released Codex 0.156.0 sends 742 bytes by default, but the value also carries
+  # `tool_namespaces_info` when `[features.tool_registry] turn_metadata_includes_tool_info` is on
+  # for a Responses Lite model (2,379 bytes with the harness tools alone, 22,504 bytes with 120 MCP
+  # tools, about 170 bytes per tool) and up to 16 `responses_api_metadata` entries (3,910 bytes at
+  # the maximum). The earlier 4,096-byte cap refused every websocket turn of such a client as
+  # `malformed_canonical` (findings#258 row 258-91).
+  @max_metadata_bytes 262_144
   @max_identifier_bytes 256
   @max_window_number 18_446_744_073_709_551_615
   @digest_salt "native_compaction_admission:v1"
@@ -115,10 +122,66 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata do
   @spec context_id_digest(String.t()) :: digest()
   def context_id_digest(value), do: digest(:context_window_id, value)
 
+  @doc """
+  The digest of a canonical turn metadata document's `window_id`
+  (`window_id_digest/1`), validated as `parse/2` validates a compaction's, or
+  `:error` when the document names no usable window. A native HTTP request
+  carries the document in its `x-codex-turn-metadata` header, so this names
+  the window a websocket frame's parsed metadata names for the same document.
+  """
+  @spec canonical_window_digest(term()) :: {:ok, digest()} | :error
+  def canonical_window_digest(canonical) when is_map(canonical) do
+    case required_identifier(canonical, "window_id") do
+      {:ok, window_id} -> {:ok, window_id_digest(window_id)}
+      {:error, _reason} -> :error
+    end
+  end
+
+  def canonical_window_digest(_canonical), do: :error
+
   @spec compaction_item_digest(map()) :: digest()
   def compaction_item_digest(item) when is_map(item) do
     digest(:native_compaction_item, :erlang.term_to_binary(item, [:deterministic]))
   end
+
+  @doc """
+  The thread of a released Codex client's window id, `<thread>:<window number>`
+  (`codex-rs/core/src/session/mod.rs` `current_window/0`), or `:error` for any
+  other shape.
+  """
+  @spec window_thread(String.t()) :: {:ok, String.t()} | :error
+  def window_thread(window) when is_binary(window) do
+    case String.split(window, ":") do
+      [thread, number] when thread != "" and number != "" ->
+        if String.match?(number, ~r/\A[0-9]{1,20}\z/), do: {:ok, thread}, else: :error
+
+      _other ->
+        :error
+    end
+  end
+
+  @doc """
+  The window before a released Codex client's window id, on the same thread.
+  The client numbers a thread's windows from 0 and moves to the next one after
+  every compaction it completes, local or remote, and on a token-budget new
+  window (`codex-rs/core/src/state/auto_compact_window.rs` `advance/0`), so the
+  previous window is the one the thread used right before. Only a canonical
+  number above 0, within the identifier bound, has one; anything else answers
+  `:none`.
+  """
+  @spec previous_window(String.t()) :: {:ok, String.t()} | :none
+  def previous_window(window) when is_binary(window) and byte_size(window) <= @max_identifier_bytes do
+    with {:ok, thread} <- window_thread(window),
+         [_thread, digits] <- String.split(window, ":"),
+         {number, ""} when number > 0 and number <= @max_window_number <- Integer.parse(digits),
+         true <- Integer.to_string(number) == digits do
+      {:ok, thread <> ":" <> Integer.to_string(number - 1)}
+    else
+      _other -> :none
+    end
+  end
+
+  def previous_window(_window), do: :none
 
   defp fetch_canonical(%{"client_metadata" => client_metadata}) when is_map(client_metadata) do
     case Map.fetch(client_metadata, @canonical_key) do
@@ -139,7 +202,7 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata do
 
   defp decode_canonical(value)
        when is_binary(value) and byte_size(value) <= @max_metadata_bytes do
-    case Jason.decode(value) do
+    case CodexPooler.JSON.decode(value) do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       {:ok, _other} -> invalid(:malformed_canonical, @canonical_param)
       {:error, _reason} -> invalid(:malformed_canonical, @canonical_param)
@@ -299,7 +362,11 @@ defmodule CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata do
            enum(compaction, "phase", %{
              "standalone_turn" => :standalone_turn,
              "pre_turn" => :pre_turn,
-             "mid_turn" => :mid_turn
+             "mid_turn" => :mid_turn,
+             # Codex >= 0.156.0 opt-in compaction right after the final answer
+             # (`model_post_turn_compact_threshold_percent`, openai/codex#46541):
+             # same socket and turn id, anchored on the turn's response.
+             "post_turn" => :post_turn
            }),
          {:ok, strategy} <-
            enum(compaction, "strategy", %{

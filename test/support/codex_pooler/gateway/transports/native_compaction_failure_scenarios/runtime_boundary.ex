@@ -32,6 +32,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Runtim
 
   alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Gateway.Websocket.ResponseTask
+  alias CodexPooler.ProviderCreditsDispatchSupport
   alias CodexPooler.Repo
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.Runtime.BackendCodexTestSupport
@@ -53,7 +54,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Runtim
     correlation_id = correlation_id(:validation_admission_overload)
 
     malformed_payload =
-      Jason.encode!(%{"model" => fixture.model.exposed_model_id, "input" => "invalid"})
+      CodexPooler.JSON.encode!(%{"model" => fixture.model.exposed_model_id, "input" => "invalid"})
 
     malformed_options = request_options(fixture.auth, correlation_id, %{})
 
@@ -362,8 +363,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Runtim
           from(attempt in Attempt, where: attempt.request_id in ^request_ids),
           :count
         ),
-      turns:
-        Repo.aggregate(from(turn in CodexTurn, where: turn.request_id in ^request_ids), :count),
+      turns: Repo.aggregate(from(turn in CodexTurn, where: turn.request_id in ^request_ids), :count),
       reservations:
         Repo.aggregate(
           from(entry in LedgerEntry,
@@ -503,7 +503,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Runtim
     {:ok, upstream} =
       FakeUpstream.start_link(
         FakeUpstream.websocket_text_frames([
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{"status" => "completed", "id" => "resp_runtime_seed"}
           })
@@ -512,13 +512,17 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Runtim
 
     on_exit(fn -> FakeUpstream.stop(upstream) end)
 
+    request_id = Ecto.UUID.generate()
+    attempt_id = Ecto.UUID.generate()
+
     {:ok, result} =
       UpstreamWebsocketSession.request(owner, %WebsocketRequest{
+        provider_credits_context: ProviderCreditsDispatchSupport.context!(nil, model: "sample-model", upstream_model: "sample-model", request_id: request_id, attempt_id: attempt_id),
         url: FakeUpstream.url(upstream) <> @endpoint,
         headers: [],
-        payload: Jason.encode!(%{"model" => "sample-model"}),
-        request_id: Ecto.UUID.generate(),
-        attempt_id: Ecto.UUID.generate(),
+        payload: CodexPooler.JSON.encode!(%{"model" => "sample-model"}),
+        request_id: request_id,
+        attempt_id: attempt_id,
         effective_serving_mode: "full",
         timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
         writer: fn _frame -> :ok end,
@@ -529,13 +533,13 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Runtim
   end
 
   defp start_activity_registry! do
-    name = {:global, {__MODULE__, :activity_registry, make_ref()}}
+    name = :"native-compaction-activity-registry-#{System.unique_integer([:positive])}"
     start_supervised!({ActivityRegistry, name: name})
     name
   end
 
   defp start_admission_server! do
-    name = {:global, {__MODULE__, :admission, make_ref()}}
+    name = :"native-compaction-admission-#{System.unique_integer([:positive])}"
     start_supervised!({Admission, name: name})
     name
   end

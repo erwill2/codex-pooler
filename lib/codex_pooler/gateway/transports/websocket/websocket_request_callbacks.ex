@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
   alias CodexPooler.Accounting.{ClientRetry, RequestReplayEntitlement}
   alias CodexPooler.Accounting.Request, as: AccountingRequest
   alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Runtime.Finalization.SettlementRetry
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
@@ -16,6 +17,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV4
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV5
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV6
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV7
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV8
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
@@ -54,6 +57,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
              | WebsocketOwnerRequestV3.validation_error()
              | WebsocketOwnerRequestV4.validation_error()
              | WebsocketOwnerRequestV6.validation_error()
+             | WebsocketOwnerRequestV7.validation_error()
+             | WebsocketOwnerRequestV8.validation_error()
              | WebsocketOwnerRequestV5.validation_error()}
 
   @spec mapper(WebsocketOwnerRequest.mapper() | term()) ::
@@ -75,19 +80,31 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
           | WebsocketOwnerRequestV3.t()
           | WebsocketOwnerRequestV4.t()
           | WebsocketOwnerRequestV6.t()
+          | WebsocketOwnerRequestV7.t()
+          | WebsocketOwnerRequestV8.t()
           | WebsocketOwnerRequestV5.t()
           | map(),
           writer()
         ) ::
           {:ok, Request.t()} | {:error, materialize_error()}
+  def materialize(%WebsocketOwnerRequestV8{} = envelope, writer) do
+    with :ok <- WebsocketOwnerRequestV8.validate(envelope),
+         {:ok, request} <- materialize(envelope.request, writer) do
+      {:ok, %{request | provider_credits_context: envelope.provider_credits_context}}
+    else
+      {:error, {:invalid_field, _field} = reason} -> {:error, {:invalid_owner_request, reason}}
+      {:error, {:unknown_fields, _fields} = reason} -> {:error, {:invalid_owner_request, reason}}
+      {:error, _reason} = error -> error
+    end
+  end
+
   def materialize(%WebsocketOwnerRequestV3{} = owner_request, nil) do
     with :ok <- validate_v3(owner_request),
          %UpstreamIdentity{} = identity <-
            Upstreams.get_upstream_identity(owner_request.upstream_identity_id),
          {:ok, message_mapper} <- mapper(owner_request.mapper) do
       capability = owner_request.owner_admission_capability
-      first_compact_collection = owner_request.first_compact_collection
-      binding = if capability, do: capability.binding, else: first_compact_collection.binding
+      binding = capability.binding
 
       {:ok,
        %Request{
@@ -103,10 +120,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
          native_codex_response_control: owner_request.native_codex_response_control,
          request_id: owner_request.observation.request_id,
          attempt_id: owner_request.observation.attempt_id,
-         native_client_retry_observation:
-           native_client_retry_observation(owner_request.observation),
+         native_client_retry_observation: native_client_retry_observation(owner_request.observation),
          native_compaction_capability: capability,
-         first_compact_collection: first_compact_collection,
          expected_connection_lifecycle: %{
            lifecycle_id: binding.lifecycle_id,
            generation: binding.generation
@@ -180,8 +195,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
          native_codex_response_control: owner_request.native_codex_response_control,
          request_id: owner_request.observation.request_id,
          attempt_id: owner_request.observation.attempt_id,
-         native_client_retry_observation:
-           native_client_retry_observation(owner_request.observation),
+         native_client_retry_observation: native_client_retry_observation(owner_request.observation),
          native_replay_binding: owner_request.native_replay_binding,
          native_replay_proof: owner_request.native_replay_proof,
          provisional_token: owner_request.provisional_token,
@@ -202,6 +216,17 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
 
   def materialize(%WebsocketOwnerRequestV3{}, _writer), do: {:error, :invalid_writer}
 
+  def materialize(%WebsocketOwnerRequestV7{} = owner_request, nil) do
+    with :ok <- validate_v7(owner_request),
+         :ok <- validate_client_retry_owner_request(owner_request),
+         {:ok, full_history} <- WebsocketOwnerRequestV7.full_history_request(owner_request),
+         {:ok, request} <- materialize(full_history, nil) do
+      {:ok, %{request | client_retry_dispatch_authority: owner_request.client_retry_dispatch_authority}}
+    end
+  end
+
+  def materialize(%WebsocketOwnerRequestV7{}, _writer), do: {:error, :invalid_writer}
+
   def materialize(%WebsocketOwnerRequestV6{} = owner_request, nil) do
     with :ok <- validate_v6(owner_request),
          %UpstreamIdentity{} = identity <-
@@ -221,8 +246,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
          native_codex_response_control: owner_request.native_codex_response_control,
          request_id: owner_request.observation.request_id,
          attempt_id: owner_request.observation.attempt_id,
-         native_client_retry_observation:
-           native_client_retry_observation(owner_request.observation),
+         native_client_retry_observation: native_client_retry_observation(owner_request.observation),
          assignment_advertised?: owner_request.assignment_advertised?,
          connection_bound_continuation?: owner_request.connection_bound_continuation?,
          websocket_delivery_mode: :collect_full_history,
@@ -258,8 +282,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
          native_codex_response_control: owner_request.native_codex_response_control,
          request_id: owner_request.observation.request_id,
          attempt_id: owner_request.observation.attempt_id,
-         native_client_retry_observation:
-           native_client_retry_observation(owner_request.observation),
+         native_client_retry_observation: native_client_retry_observation(owner_request.observation),
          assignment_advertised?: owner_request.assignment_advertised?,
          connection_bound_continuation?: owner_request.connection_bound_continuation?,
          websocket_delivery_mode: :collect_compaction,
@@ -295,8 +318,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
          native_codex_response_control: owner_request.native_codex_response_control,
          request_id: owner_request.observation.request_id,
          attempt_id: owner_request.observation.attempt_id,
-         native_client_retry_observation:
-           native_client_retry_observation(owner_request.observation),
+         native_client_retry_observation: native_client_retry_observation(owner_request.observation),
          effective_serving_mode: owner_request.observation.mode,
          assignment_advertised?: owner_request.assignment_advertised?,
          connection_bound_continuation?: owner_request.connection_bound_continuation?,
@@ -306,6 +328,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
       nil -> {:error, :upstream_identity_not_found}
       {:error, :invalid_mapper} -> {:error, {:invalid_owner_request, {:invalid_field, :mapper}}}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_v7(request) do
+    case WebsocketOwnerRequestV7.validate(request) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:invalid_owner_request, reason}}
     end
   end
 
@@ -463,19 +492,31 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
       committed_visibility?(attempt) ->
         callback.(authority)
 
-      StreamProtocol.internal_control_event?(data) ->
+      StreamProtocol.lifecycle_only_event?(data) ->
         if current_generation_snapshot?(request_id, attempt), do: callback.(authority), else: :ok
 
       true ->
-        with_visible_attempt(request_id, attempt, fn -> callback.(authority) end)
+        # Observation is best-effort; the actual writer owns the bounded
+        # authorization retry. Retrying here doubles that window because the
+        # upstream session deliberately rescues observer exceptions.
+        case SessionContinuity.authorize_codex_turn_visibility(request_id, attempt) do
+          {:ok, :committed} ->
+            cache_committed_visibility(attempt)
+            callback.(authority)
+
+          {:ok, _not_committed} ->
+            callback.(authority)
+
+          {:error, :stale_generation} ->
+            :ok
+        end
     end
   end
 
   defp current_generation_snapshot?(request_id, %Attempt{replay_generation: generation}) do
     not Repo.exists?(
       from entitlement in RequestReplayEntitlement,
-        where:
-          entitlement.request_id == ^request_id and entitlement.replay_generation != ^generation
+        where: entitlement.request_id == ^request_id and entitlement.replay_generation != ^generation
     )
   end
 
@@ -496,7 +537,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
       committed_visibility?(attempt) ->
         callback.(authority)
 
-      StreamProtocol.internal_control_event?(data) ->
+      # Control and lifecycle frames never commit the turn's visibility: a
+      # client cut after only `response.created` saw nothing (findings#232
+      # row 232-161).
+      StreamProtocol.lifecycle_only_event?(data) ->
         with_current_internal_attempt(request_id, attempt, fn -> callback.(authority) end)
 
       true ->
@@ -541,7 +585,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
   end
 
   defp with_visible_attempt(request_id, attempt, callback) do
-    case SessionContinuity.authorize_codex_turn_visibility(request_id, attempt) do
+    request = %AccountingRequest{id: request_id, transport: "websocket"}
+    result = SettlementRetry.run(:visible_output, request, attempt, fn -> SessionContinuity.authorize_codex_turn_visibility(request_id, attempt) end, subject: "visible output mark", fallback: "withheld_output")
+
+    case result do
       {:ok, :committed} ->
         cache_committed_visibility(attempt)
         callback.()
@@ -591,7 +638,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketRequestCallbacks do
   defp validate_writer(_writer), do: {:error, :invalid_writer}
 
   defp emit_downstream_observation(observation, text) when is_binary(text) do
-    case Jason.decode(text) do
+    case CodexPooler.JSON.decode(text) do
       {:ok, %{} = decoded} -> emit_product_observation(observation, :pooler_to_codex, decoded)
       _not_json -> :ok
     end

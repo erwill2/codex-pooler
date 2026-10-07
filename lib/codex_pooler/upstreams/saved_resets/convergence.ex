@@ -113,8 +113,8 @@ defmodule CodexPooler.Upstreams.SavedResets.Convergence do
          %DateTime{} = consumed_at <- consumed_at(redemption) do
       windows = Windows.list_evidence(identity)
 
-      case windows
-           |> PostResetEvidence.classify(consumed_at, now)
+      case identity
+           |> PostResetEvidence.classify(windows, consumed_at, now)
            |> phase_for_classification(redemption, now) do
         nil -> nil
         target -> {target, windows}
@@ -162,9 +162,7 @@ defmodule CodexPooler.Upstreams.SavedResets.Convergence do
           "finished_at" => DateTime.to_iso8601(now),
           "terminal_reason" => terminal_reason(target)
         })
-        |> Map.merge(
-          ConfirmationMetadata.build(source, outcome, windows, consumed_at(redemption), now)
-        )
+        |> Map.merge(ConfirmationMetadata.build(source, outcome, windows, consumed_at(redemption), now))
 
       _updated_identity =
         identity

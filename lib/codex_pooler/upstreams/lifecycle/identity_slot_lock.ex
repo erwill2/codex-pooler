@@ -13,6 +13,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentitySlotLock do
 
   @resource_prefix "identity-slot:v1:"
   @resource_domain "codex-pooler.identity-slot"
+  @secret_active "active"
 
   @type normalized_identity :: %{
           required(:chatgpt_account_id) => String.t() | nil,
@@ -78,6 +79,10 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentitySlotLock do
       |> Enum.uniq()
       |> Enum.sort()
 
+    Enum.each(identity_ids, fn identity_id ->
+      Repo.query!("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [identity_id])
+    end)
+
     identities =
       Repo.all(
         from identity in UpstreamIdentity,
@@ -99,7 +104,9 @@ defmodule CodexPooler.Upstreams.Lifecycle.IdentitySlotLock do
     secrets =
       Repo.all(
         from secret in EncryptedSecret,
-          where: secret.upstream_identity_id in ^locked_identity_ids,
+          where:
+            secret.upstream_identity_id in ^locked_identity_ids and
+              secret.status == ^@secret_active,
           order_by: [asc: secret.id],
           lock: "FOR UPDATE"
       )

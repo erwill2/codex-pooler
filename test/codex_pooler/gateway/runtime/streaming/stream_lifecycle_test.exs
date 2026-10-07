@@ -38,6 +38,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias Ecto.Adapters.SQL.Sandbox
 
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
   @endpoint_path "/backend-api/codex/responses"
   @public_responses_endpoint "/v1/responses"
 
@@ -197,17 +201,21 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       }
     }
 
-    assert :ok = Streaming.emit_stream_outcome("interrupted", "websocket", "websocket")
+    assert :ok = Streaming.emit_stream_outcome("failed", "websocket", "websocket")
 
     assert_receive {
       [:codex_pooler, :gateway, :stream, :outcome],
       %{count: 1},
       %{
-        outcome: "interrupted",
+        outcome: "failed",
         downstream_transport: "websocket",
         upstream_transport: "websocket"
       }
     }
+
+    assert_raise FunctionClauseError, fn ->
+      Streaming.emit_stream_outcome("interrupted", "websocket", "websocket")
+    end
   end
 
   test "stream success persists public Responses summary metadata" do
@@ -325,7 +333,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                    finalization_callbacks()
                  )
 
-        assert_receive {:stream_finalization, %{upstream_transport: ^expected_transport}}, 1_000
+        assert_receive {:stream_finalization, %{upstream_transport: ^expected_transport}}, @detection_timeout_ms
       end
     end)
   end
@@ -540,7 +548,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       %Req.Response{
         status: 503,
         headers: replay_rate_limit_headers("91"),
-        body: Jason.encode!(replay_rate_limit_error("92"))
+        body: CodexPooler.JSON.encode!(replay_rate_limit_error("92"))
       }
 
     assert {:ok, %{stale_generation?: true}} =
@@ -680,7 +688,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                %Req.Response{
                  status: 200,
                  headers: replay_rate_limit_headers("41"),
-                 body: Jason.encode!(%{"id" => "resp_current_observer"})
+                 body: CodexPooler.JSON.encode!(%{"id" => "resp_current_observer"})
                },
                context,
                finalization_callbacks()
@@ -701,9 +709,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
     request_options =
       request_options(auth, request_payload, setup)
-      |> RequestOptions.put_transport(
-        websocket_writer: fn _frame -> send(self(), :stale_frame) end
-      )
+      |> RequestOptions.put_transport(websocket_writer: fn _frame -> send(self(), :stale_frame) end)
 
     assert {:ok, reserved} =
              Accounting.reserve(auth, setup.model, request_payload, %{
@@ -797,9 +803,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   @tag :replay_generation_race
   test "stale 401 and misalignment responses run no route effect before authority" do
     for {status, body} <- [
-          {401, Jason.encode!(%{"error" => %{"code" => "invalid_api_key"}})},
+          {401, CodexPooler.JSON.encode!(%{"error" => %{"code" => "invalid_api_key"}})},
           {403,
-           Jason.encode!(%{
+           CodexPooler.JSON.encode!(%{
              "error" => %{
                "code" => MisalignmentPolicyViolation.code(),
                "message" => "synthetic policy rejection"
@@ -817,8 +823,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                Accounting.reserve(auth, setup.model, request_payload, %{
                  endpoint: @endpoint_path,
                  transport: "websocket",
-                 correlation_id:
-                   "stale-http-route-#{status}-#{System.unique_integer([:positive])}",
+                 correlation_id: "stale-http-route-#{status}-#{System.unique_integer([:positive])}",
                  request_metadata: %{}
                })
 
@@ -943,8 +948,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                Accounting.reserve(auth, setup.model, payload, %{
                  endpoint: @endpoint_path,
                  transport: "http_sse",
-                 correlation_id:
-                   "stream-outcome-interrupted-#{System.unique_integer([:positive])}",
+                 correlation_id: "stream-outcome-interrupted-#{System.unique_integer([:positive])}",
                  request_metadata: %{}
                })
 
@@ -985,8 +989,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @endpoint_path,
                transport: "http_sse",
-               correlation_id:
-                 "stream-outcome-request-finalized-#{System.unique_integer([:positive])}",
+               correlation_id: "stream-outcome-request-finalized-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -1036,8 +1039,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @endpoint_path,
                transport: "http_sse",
-               correlation_id:
-                 "stream-outcome-attempt-finalized-#{System.unique_integer([:positive])}",
+               correlation_id: "stream-outcome-attempt-finalized-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -1081,6 +1083,48 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
       refute_receive {:stream_outcome, _metadata}, 50
     end)
+  end
+
+  for outcome <- [:retryable, :terminal], provenance <- [:current, :legacy, :absent] do
+    @tag model_provenance: true
+    test "#{outcome} first-event bridge failure keeps #{provenance} model absence authoritative" do
+      {setup, _first, _second} = stream_retry_setup(FakeUpstream.sse_stream([]), FakeUpstream.sse_stream([]))
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+      payload = payload(setup)
+      request_options = request_options(auth, payload, setup)
+      {:ok, reserved} = Accounting.reserve(auth, setup.model, payload, %{endpoint: @endpoint_path, transport: "http_sse", correlation_id: Ecto.UUID.generate(), request_metadata: %{}})
+      {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+      observation = %{"version" => 1, "coverage" => "full", "conflict" => nil, "terminal_model" => nil, "first_conflicting_model" => nil, "terminal_status" => "failed"}
+
+      result =
+        case unquote(provenance) do
+          :current -> %{response_usage: %{status: "usage_unknown", model_observation: observation}}
+          :legacy -> %{response_usage: %{status: "usage_unknown"}}
+          :absent -> %{}
+        end
+
+      stream = WebsocketBridgeStream.start(Ecto.UUID.generate())
+      :ok = WebsocketBridgeStream.arm(stream, 1, fn -> {:ok, result} end)
+      event = CodexPooler.JSON.encode!(%{"type" => "response.failed", "response" => %{"model" => "unknown", "status" => "failed"}})
+      send(stream.relay, {:websocket_owner_frame, stream.correlation_id, 1, {:data, event}})
+      ref = stream.ref
+      assert_receive {^ref, {:preflight, :stream}}
+      assert_receive {^ref, {:data, _}}
+      assert_receive {^ref, :done}
+
+      context = %ResponseContext{context: retry_context(setup, auth, request_options, reserved.request, candidates: [{setup.assignment, setup.identity}], attempt: attempt), response: %{sse_response() | body: stream}}
+      body = "data: " <> event <> "\n\n"
+      failure = %{code: "server_error", upstream_code: nil, event_type: "response.failed"}
+
+      case unquote(outcome) do
+        :retryable -> assert {:ok, %Attempt{}} = Streaming.record_retryable_first_event_failure(body, failure, context, record_health?: false)
+        :terminal -> assert {:ok, %{}} = Streaming.finalize_first_event_failure(body, failure, context)
+      end
+
+      saved = Repo.reload!(attempt)
+      assert saved.served_model == nil
+      assert saved.model_observation == if(unquote(provenance) == :current, do: observation, else: nil)
+    end
   end
 
   test "first-event stream outcomes emit only after terminal settlement" do
@@ -1137,8 +1181,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                Accounting.reserve(auth, setup.model, payload, %{
                  endpoint: @endpoint_path,
                  transport: "http_sse",
-                 correlation_id:
-                   "stream-outcome-first-event-#{System.unique_integer([:positive])}",
+                 correlation_id: "stream-outcome-first-event-#{System.unique_integer([:positive])}",
                  request_metadata: %{}
                })
 
@@ -1172,8 +1215,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                Accounting.reserve(auth, setup.model, payload, %{
                  endpoint: @endpoint_path,
                  transport: "http_sse",
-                 correlation_id:
-                   "stream-outcome-health-failure-#{System.unique_integer([:positive])}",
+                 correlation_id: "stream-outcome-health-failure-#{System.unique_integer([:positive])}",
                  request_metadata: %{}
                })
 
@@ -1201,6 +1243,44 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
       refute_received {:stream_outcome, _metadata}
     end)
+  end
+
+  # findings#294: with no attempt there is nothing to settle and the answer is
+  # the accounting failure either way; the route health it records is
+  # best-effort, so a transient database failure there is dropped instead of
+  # raising out of the connection process. PostgreSQL raises the failure
+  # itself from a trigger on the route-health tables, inside this test's
+  # sandbox transaction.
+  for {errcode, outcome} <- [{"query_canceled", :dropped}, {"check_violation", :raised}] do
+    test "an attemptless first-event failure whose route health meets #{errcode} is #{outcome}" do
+      {setup, _first_upstream, _second_upstream} = stream_retry_setup(FakeUpstream.sse_stream([]), FakeUpstream.sse_stream([]))
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+      payload = payload(setup)
+      request_options = request_options(auth, payload, setup)
+
+      {:ok, reserved} =
+        Accounting.reserve(auth, setup.model, payload, %{endpoint: @endpoint_path, transport: "http_sse", correlation_id: Ecto.UUID.generate(), request_metadata: %{}})
+
+      context = %ResponseContext{
+        context: retry_context(setup, auth, request_options, reserved.request, candidates: [{setup.assignment, setup.identity}], attempt: nil),
+        response: sse_response()
+      }
+
+      failure = %{code: "upstream_request_timeout", upstream_code: nil, event_type: "response.failed"}
+      fail_route_health_writes!(unquote(errcode))
+
+      case unquote(outcome) do
+        :dropped ->
+          {result, logs} = with_log([level: :warning], fn -> Streaming.finalize_first_event_failure("", failure, context) end)
+          assert {:error, %{status: 500, code: "gateway_accounting_failed"}} = result
+
+          assert logs =~
+                   "gateway route health dropped after a transient database failure stage=first_event_failure request_id=#{reserved.request.id} reason_class=postgres_query_canceled"
+
+        :raised ->
+          assert_raise Postgrex.Error, ~r/check_violation/, fn -> Streaming.finalize_first_event_failure("", failure, context) end
+      end
+    end
   end
 
   test "HTTP stream settlement failure emits once after a real accounting rollback" do
@@ -1265,8 +1345,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
     assert Repo.aggregate(
              from(entry in CodexPooler.Accounting.LedgerEntry,
-               where:
-                 entry.request_id == ^reserved.request.id and entry.entry_kind == "settlement"
+               where: entry.request_id == ^reserved.request.id and entry.entry_kind == "settlement"
              ),
              :count,
              :id
@@ -1335,6 +1414,172 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     assert summary["terminal_kind"] == "failed"
     assert summary["finish_class"] == "failed"
     assert summary["synthetic_terminal_sent"] == true
+
+    # The relay is the only witness of downstream visibility, and this stream
+    # did reach the client, so the corrected field must still read false.
+    assert attempt.response_metadata["transport_failure"]["pre_visible_output"] == false
+  end
+
+  test "a drained bridge stream keeps drain provenance and records true pre-visible output" do
+    {setup, _first_upstream, _second_upstream} =
+      stream_retry_setup(
+        FakeUpstream.sse_stream([]),
+        FakeUpstream.sse_stream([])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = payload(setup)
+
+    request_options =
+      request_options(auth, payload, setup,
+        endpoint: @public_responses_endpoint,
+        public_openai_responses_stream: true
+      )
+
+    assert {:ok, reserved} =
+             Accounting.reserve(auth, setup.model, payload, %{
+               endpoint: @public_responses_endpoint,
+               transport: "http_sse",
+               correlation_id: "bridged-owner-drain-#{System.unique_integer([:positive])}",
+               request_metadata: %{}
+             })
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+    context =
+      retry_context(setup, auth, request_options, reserved.request,
+        endpoint: @public_responses_endpoint,
+        candidates: [{setup.assignment, setup.identity}],
+        attempt: attempt
+      )
+
+    # A bridge relay that was drained before relaying a byte. The bridge
+    # reports its own failures wrapped, and the missing-terminal path wraps
+    # that again because a bridge stream is always downstream-committed, so
+    # this is the exact reason finalization receives when the bridge error
+    # arrives ahead of the deferred-stream drain signal.
+    state = DownstreamStream.initial_state(:relay, request_options, :websocket_bridge)
+
+    assert {synthetic_terminal, state} =
+             DownstreamStream.synthetic_terminal_failure(
+               state,
+               {:upstream_websocket_bridge, :owner_drained}
+             )
+
+    assert is_binary(synthetic_terminal)
+
+    response_context = %ResponseContext{context: context, response: sse_response()}
+
+    capture_stream_outcome_telemetry(fn ->
+      assert {:ok, _finalized} =
+               Streaming.finalize_failure(
+                 synthetic_terminal,
+                 {:upstream_stream_interrupted, {:upstream_websocket_bridge, :owner_drained}},
+                 response_context,
+                 state
+               )
+
+      assert_received {:stream_outcome, %{outcome: "interrupted", downstream_transport: "http_sse"}}
+    end)
+
+    request = Repo.reload!(reserved.request)
+    assert request.status == "failed"
+    assert request.last_error_code == "owner_drained"
+    # The turn was cut by us, so the request row keeps the owner-side 499
+    # rather than the upstream's 200.
+    assert request.response_status_code == 499
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.network_error_code == "owner_drained"
+
+    # Nothing reached the client, and the corrected field must say so instead
+    # of the reason-derived hardcoded false.
+    assert attempt.response_metadata["transport_failure"]["pre_visible_output"] == true
+
+    # Draining is our own lifecycle event: it must not demote the upstream or
+    # open its circuit.
+    assert Repo.aggregate(from(d in BridgeDemotion), :count) == 0
+    assert Repo.aggregate(from(c in RoutingCircuitState), :count) == 0
+  end
+
+  # One vocabulary decides the SSE terminal outcome: an owner that crashed
+  # interrupted the bridged turn exactly like an owner that drained, keeping
+  # its own code and the owner-side 499, while a forwarding refusal such as
+  # backpressure keeps the generic bridge classification and fails the turn
+  # (findings#228).
+  for {reason, outcome, code, status} <- [
+        {:owner_crashed, "interrupted", "owner_crashed", 499},
+        {:owner_unavailable, "interrupted", "owner_unavailable", 499},
+        {:owner_busy, "failed", "upstream_stream_error", 200}
+      ] do
+    test "a bridge stream cut by #{reason} settles with the #{outcome} stream outcome" do
+      {setup, _first_upstream, _second_upstream} =
+        stream_retry_setup(FakeUpstream.sse_stream([]), FakeUpstream.sse_stream([]))
+
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+      payload = payload(setup)
+
+      request_options =
+        request_options(auth, payload, setup,
+          endpoint: @public_responses_endpoint,
+          public_openai_responses_stream: true
+        )
+
+      assert {:ok, reserved} =
+               Accounting.reserve(auth, setup.model, payload, %{
+                 endpoint: @public_responses_endpoint,
+                 transport: "http_sse",
+                 correlation_id: "bridged-#{unquote(reason)}-#{System.unique_integer([:positive])}",
+                 request_metadata: %{}
+               })
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      context =
+        retry_context(setup, auth, request_options, reserved.request,
+          endpoint: @public_responses_endpoint,
+          candidates: [{setup.assignment, setup.identity}],
+          attempt: attempt
+        )
+
+      state = DownstreamStream.initial_state(:relay, request_options, :websocket_bridge)
+
+      assert {synthetic_terminal, state} =
+               DownstreamStream.synthetic_terminal_failure(
+                 state,
+                 {:upstream_websocket_bridge, unquote(reason)}
+               )
+
+      response_context = %ResponseContext{context: context, response: sse_response()}
+
+      capture_stream_outcome_telemetry(fn ->
+        assert {:ok, _finalized} =
+                 Streaming.finalize_failure(
+                   synthetic_terminal,
+                   {:upstream_stream_interrupted, {:upstream_websocket_bridge, unquote(reason)}},
+                   response_context,
+                   state
+                 )
+
+        assert_received {:stream_outcome, %{outcome: unquote(outcome), downstream_transport: "http_sse"}}
+        refute_received {:stream_outcome, _other}
+      end)
+
+      request = Repo.reload!(reserved.request)
+      assert request.status == "failed"
+      assert request.last_error_code == unquote(code)
+      assert request.response_status_code == unquote(status)
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.network_error_code == unquote(code)
+
+      # An owner loss is our own lifecycle event and never demotes the upstream
+      # or opens its circuit; the refusal control keeps the generic path.
+      if unquote(outcome) == "interrupted" do
+        assert Repo.aggregate(from(d in BridgeDemotion), :count) == 0
+        assert Repo.aggregate(from(c in RoutingCircuitState), :count) == 0
+      end
+    end
   end
 
   test "stream partial failure prefers known observer usage over a truncated retained body" do
@@ -1612,8 +1857,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @endpoint_path,
                transport: "websocket",
-               correlation_id:
-                 "websocket-connection-limit-exhausted-#{System.unique_integer([:positive])}",
+               correlation_id: "websocket-connection-limit-exhausted-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -1805,7 +2049,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       end)
 
     assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
-                   1_000
+                   @detection_timeout_ms
 
     log =
       capture_log(fn ->
@@ -1883,8 +2127,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @endpoint_path,
                transport: "http_sse",
-               correlation_id:
-                 "upstream-stream-interrupted-#{System.unique_integer([:positive])}",
+               correlation_id: "upstream-stream-interrupted-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -1938,8 +2181,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @public_responses_endpoint,
                transport: "http_sse",
-               correlation_id:
-                 "tagged-upstream-stream-interrupted-#{System.unique_integer([:positive])}",
+               correlation_id: "tagged-upstream-stream-interrupted-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -2016,8 +2258,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @public_responses_endpoint,
                transport: "http_sse",
-               correlation_id:
-                 "websocket-terminal-delivery-timeout-#{System.unique_integer([:positive])}",
+               correlation_id: "websocket-terminal-delivery-timeout-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -2047,8 +2288,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
     send(
       stream.relay,
-      {:websocket_owner_frame, stream.correlation_id, nil,
-       {:data, ~s({"type":"response.output_text.delta","delta":"visible"})}}
+      {:websocket_owner_frame, stream.correlation_id, nil, {:data, ~s({"type":"response.output_text.delta","delta":"visible"})}}
     )
 
     assert_receive {^stream_ref, {:preflight, :stream}}, 2_000
@@ -2209,8 +2449,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @public_responses_endpoint,
                transport: "http_sse",
-               correlation_id:
-                 "untagged-upstream-stream-interrupted-#{System.unique_integer([:positive])}",
+               correlation_id: "untagged-upstream-stream-interrupted-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -2281,8 +2520,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @endpoint_path,
                transport: "http_sse",
-               correlation_id:
-                 "upstream-stream-neutral-probe-#{System.unique_integer([:positive])}",
+               correlation_id: "upstream-stream-neutral-probe-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -2339,8 +2577,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
              Accounting.reserve(auth, setup.model, payload, %{
                endpoint: @endpoint_path,
                transport: "http_sse",
-               correlation_id:
-                 "terminal-request-attempt-fence-#{System.unique_integer([:positive])}",
+               correlation_id: "terminal-request-attempt-fence-#{System.unique_integer([:positive])}",
                request_metadata: %{}
              })
 
@@ -2406,9 +2643,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
   for {case_name, health_neutral_code, health_headers} <- [
         {"misalignment_policy_violation", "misalignment_policy_violation", %{}},
+        {"invalid_prompt", "invalid_prompt", %{}},
+        {"bio_policy", "bio_policy", %{}},
         {"server_error", "server_error", %{}},
         {"overloaded_error", "overloaded_error", %{}},
         {"server_is_overloaded", "server_is_overloaded", %{}},
+        {"slow_down", "slow_down", %{}},
         {"workspace_owner_credits_depleted", "workspace_owner_credits_depleted", %{}},
         {"workspace_member_credits_depleted", "workspace_member_credits_depleted", %{}},
         {"workspace_owner_credits_depleted header", "upstream_stream_error",
@@ -2459,8 +2699,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                Accounting.reserve(auth, setup.model, payload, %{
                  endpoint: @endpoint_path,
                  transport: "http_sse",
-                 correlation_id:
-                   "terminal-#{health_neutral_code}-probe-#{System.unique_integer([:positive])}",
+                 correlation_id: "terminal-#{health_neutral_code}-probe-#{System.unique_integer([:positive])}",
                  request_metadata: %{}
                })
 
@@ -2515,7 +2754,19 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
         assert attempt.response_metadata["upstream_error_param"] == "reasoning.summary"
       end
 
-      assert Repo.all(from(d in BridgeDemotion)) == []
+      # Overload terminals are the one health-neutral family that now steers the
+      # next turn. The circuit is still untouched — an overload says the provider
+      # refused the work, not that the account is unhealthy — but an
+      # ordering-only demotion keeps the next turn off the account that just
+      # refused it. Every other health-neutral code is unchanged.
+      if health_neutral_code in ["overloaded_error", "server_is_overloaded"] do
+        assert [%BridgeDemotion{} = demotion] = Repo.all(from(d in BridgeDemotion))
+        assert demotion.reason_code == "provider_overloaded"
+        assert demotion.status == "active"
+        assert demotion.pool_upstream_assignment_id == setup.assignment.id
+      else
+        assert Repo.all(from(d in BridgeDemotion)) == []
+      end
 
       assert %RoutingCircuitState{} = updated = Repo.get!(RoutingCircuitState, circuit.id)
       assert updated.status == "half_open"
@@ -2535,6 +2786,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
         {setup.fallback_assignment, setup.fallback_identity}
       ])
 
+    route_state = RouteState.new(%{visible_model: setup.model, candidates: candidates}) |> RouteState.preload_routing_snapshots(auth, setup.model, request_options)
+
     %SelectedCandidateContext{
       auth: auth,
       endpoint: endpoint,
@@ -2542,13 +2795,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       model: setup.model,
       reserved: %{request: request},
       request_options: request_options,
+      route_state: route_state,
       route_plan:
         BridgeRing.plan_route(%{
           auth: auth,
           model: setup.model,
           candidates: candidates,
           route_plan_input: RoutePlanInput.from_reserved(%{request: request}),
-          request_options: request_options
+          request_options: request_options,
+          route_state: route_state
         }),
       assignment: setup.assignment,
       identity: setup.identity,
@@ -2737,12 +2992,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       }
     }
 
-    "event: codex.rate_limits\ndata: #{Jason.encode!(event)}\n\n"
+    "event: codex.rate_limits\ndata: #{CodexPooler.JSON.encode!(event)}\n\n"
   end
 
   defp stale_invalid_response(:invalid_json, context) do
-    {%Req.Response{status: 200, headers: [{"content-type", ["application/json"]}], body: "{"},
-     Map.put(context, :payload, Map.put(context.payload, "stream", false))}
+    {%Req.Response{status: 200, headers: [{"content-type", ["application/json"]}], body: "{"}, Map.put(context, :payload, Map.put(context.payload, "stream", false))}
   end
 
   defp stale_invalid_response(:invalid_compaction, context) do
@@ -2762,7 +3016,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     {%Req.Response{
        status: 200,
        headers: [{"content-type", ["application/json"]}],
-       body: Jason.encode!(%{"status" => "completed", "output" => []})
+       body: CodexPooler.JSON.encode!(%{"status" => "completed", "output" => []})
      },
      %{
        context
@@ -2846,7 +3100,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       "provider_sibling" => "private-sibling"
     }
 
-    ~s(event: response.failed\ndata: #{Jason.encode!(%{"type" => "response.failed", "error" => error, "response" => %{"status" => "failed", "error" => error}})}\n\n)
+    ~s(event: response.failed\ndata: #{CodexPooler.JSON.encode!(%{"type" => "response.failed", "error" => error, "response" => %{"status" => "failed", "error" => error}})}\n\n)
   end
 
   defp misalignment_half_open_circuit!(setup) do
@@ -2890,8 +3144,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                  %{
                    request_id: deterministic_rotation_seed(2, 0),
                    upstream_endpoint: @endpoint_path,
-                   correlation_id:
-                     "misalignment-#{request_suffix}-#{System.unique_integer([:positive])}"
+                   correlation_id: "misalignment-#{request_suffix}-#{System.unique_integer([:positive])}"
                  },
                  @endpoint_path,
                  request_payload
@@ -2969,8 +3222,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
 
     "event: response.in_progress\ndata: " <>
       ~s({"type":"response.in_progress","response":{"usage":) <>
-      Jason.encode!(usage) <>
-      ~s(,"output":#{Jason.encode!(tail)}}}) <>
+      CodexPooler.JSON.encode!(usage) <>
+      ~s(,"output":#{CodexPooler.JSON.encode!(tail)}}}) <>
       "\n\n"
   end
 
@@ -2998,6 +3251,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     handler_id = "stream-lifecycle-#{System.unique_integer([:positive])}"
     parent = self()
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -3018,6 +3274,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   defp capture_stream_outcome_telemetry(fun) do
     handler_id = "stream-outcome-#{System.unique_integer([:positive])}"
     parent = self()
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -3063,7 +3322,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     assert {:ok, stream_conn} = stream.(stream_conn)
 
     if Keyword.get(opts, :wait_for_barrier?, true) do
-      assert_receive {:fake_upstream_timeout_barrier, _stage, upstream_pid, ^release_ref}, 1_000
+      assert_receive {:fake_upstream_timeout_barrier, _stage, upstream_pid, ^release_ref}, @detection_timeout_ms
       send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
     end
 
@@ -3128,6 +3387,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       effective_model: setup.model.exposed_model_id,
       api_key_policy: policy
     )
+  end
+
+  defp fail_route_health_writes!(errcode) do
+    Repo.query!("CREATE FUNCTION stream_lifecycle_route_health_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic route health failure' USING ERRCODE = '#{errcode}'; END $$")
+
+    for table <- ["bridge_demotions", "routing_circuit_states"] do
+      Repo.query!("CREATE TRIGGER stream_lifecycle_route_health_gate BEFORE INSERT OR UPDATE ON #{table} FOR EACH ROW EXECUTE FUNCTION stream_lifecycle_route_health_gate()")
+    end
+
+    :ok
   end
 
   defp invalid_request(id) do

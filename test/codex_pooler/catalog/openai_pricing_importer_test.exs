@@ -1,69 +1,19 @@
 defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Accounting
   alias CodexPooler.Catalog.{OpenAIPricingImporter, PricingSnapshot}
+  alias CodexPooler.FakeUpstream
   alias CodexPooler.Repo
+  alias CodexPooler.UpstreamConnPoolTelemetry
   alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
 
+  import CodexPooler.AccountingTestSupport, only: [accounting_setup: 0]
   import CodexPooler.PoolerFixtures
 
   @fixture Path.expand("../../fixtures/pricing/openai/2026-07-28.json", __DIR__)
   @target Path.expand("../../../priv/pricing/openai/pricing.json", __DIR__)
-  @target_sha256 "cd74a2827b92610b89288fa511c78ec63ed76017a912d95470085abc03b0fe56"
-  @target_generated_at "2026-09-03T19:40:10.049982Z"
-  @removed_identifiers [
-    "computer-use-preview",
-    "gpt-3.5-0301",
-    "gpt-3.5-turbo-0613",
-    "gpt-3.5-turbo-16k-0613",
-    "gpt-4-0125-preview",
-    "gpt-4-0314",
-    "gpt-4-1106-preview",
-    "gpt-4-1106-vision-preview",
-    "gpt-4-32k",
-    "gpt-4o-audio-preview",
-    "gpt-4o-mini-audio-preview",
-    "gpt-4o-mini-realtime-preview",
-    "gpt-4o-mini-search-preview",
-    "gpt-4o-realtime-preview",
-    "gpt-4o-search-preview",
-    "gpt-5-chat-latest",
-    "gpt-5-codex",
-    "gpt-5.1-chat-latest",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
-    "gpt-5.2-codex",
-    "o1-mini",
-    "o3-deep-research",
-    "o4-mini-deep-research"
-  ]
-  @reviewed_rates %{
-    "gpt-6-astra" => %{
-      "standard" => ["10.0", "1.0", "12.5", "50.0"],
-      "fast" => ["20.0", "2.0", "25.0", "100.0"]
-    },
-    "gpt-5.6-luna" => %{
-      "standard" => ["0.2", "0.02", "0.25", "1.2"],
-      "fast" => ["0.4", "0.04", "0.5", "2.4"]
-    },
-    "gpt-5.6-terra" => %{
-      "standard" => ["2.0", "0.2", "2.5", "12.0"],
-      "fast" => ["4.0", "0.4", "5.0", "24.0"]
-    },
-    "gpt-5.6-sol" => %{
-      "standard" => ["4.0", "0.4", "5.0", "20.0"],
-      "fast" => ["8.0", "0.8", "10.0", "40.0"]
-    }
-  }
-  @reviewed_fast_long_context_rates %{
-    "gpt-6-astra" => ["40.0", "4.0", "50.0", "150.0"],
-    "gpt-5.6-luna" => ["0.8", "0.08", "1.0", "3.6"],
-    "gpt-5.6-terra" => ["8.0", "0.8", "10.0", "36.0"],
-    "gpt-5.6-sol" => ["16.0", "1.6", "20.0", "60.0"]
-  }
-  @reviewed_fast_long_context_unavailable ~w(gpt-5.4 gpt-5.5)
   @barrier_timeout 5_000
   @actor_timeout 10_000
 
@@ -80,14 +30,209 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
 
     source_url = "https://user:secret@example.com/pricing.json"
 
-    assert {:error,
-            %{code: :http_transport_failed, message: "pricing catalog transport failed"} = error} =
+    assert {:error, %{code: :http_transport_failed, message: "pricing catalog transport failed"} = error} =
              OpenAIPricingImporter.import_url(source_url)
 
     rendered_error = inspect(error)
     refute rendered_error =~ "credential-bearing transport detail"
     refute rendered_error =~ source_url
     refute rendered_error =~ "secret"
+  end
+
+  test "invalid import locations cannot insert pricing rows" do
+    before_count = Repo.aggregate(PricingSnapshot, :count)
+
+    for value <- [nil, 42, [], %{}] do
+      assert {:error, %{code: :invalid_path}} = OpenAIPricingImporter.import_file(value)
+      assert {:error, %{code: :invalid_url}} = OpenAIPricingImporter.import_url(value)
+    end
+
+    assert Repo.aggregate(PricingSnapshot, :count) == before_count
+  end
+
+  test "missing files return a bounded read error without inserting rows" do
+    before_count = Repo.aggregate(PricingSnapshot, :count)
+
+    missing =
+      Path.join(System.tmp_dir!(), "missing-pricing-#{System.unique_integer([:positive])}")
+
+    assert {:error, %{code: :file_read_failed, message: message}} =
+             OpenAIPricingImporter.import_file(missing)
+
+    assert message == :enoent |> :file.format_error() |> to_string()
+    assert Repo.aggregate(PricingSnapshot, :count) == before_count
+  end
+
+  test "HTTP imports canonicalize aliases across repeat fetches without creating models" do
+    prices = %{"default" => %{"input" => 1, "output" => 2}}
+    payload = valid_payload("http-alias-model", %{"fast" => prices, "priority" => prices})
+
+    canonical_payload =
+      put_in(payload, ["models", "http-alias-model", "prices"], %{"priority" => prices})
+
+    models_before = Repo.aggregate(CodexPooler.Catalog.Model, :count)
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: FakeUpstream.json_response(payload)
+          ),
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: FakeUpstream.json_response(canonical_payload)
+          )
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    url = FakeUpstream.url(upstream) <> "/pricing.json"
+
+    assert {:ok, %{inserted: 1}} = OpenAIPricingImporter.import_url(url)
+
+    snapshot =
+      Repo.one!(from row in PricingSnapshot, where: row.model_identifier == "http-alias-model")
+
+    assert snapshot.config["service_tier"] == "priority"
+    assert snapshot.source_url == url
+    assert {:ok, %{inserted: 0}} = OpenAIPricingImporter.import_url(url)
+
+    assert Repo.one!(from row in PricingSnapshot, where: row.model_identifier == "http-alias-model") == snapshot
+
+    assert Repo.aggregate(CodexPooler.Catalog.Model, :count) == models_before
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  test "HTTP imports carry the outbound connection idle bound from settings" do
+    payload = valid_payload("http-idle-bound-model")
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        # provenance: synthetic_adversarial (two scheduled fetches reusing one origin)
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: FakeUpstream.json_response(payload)
+          ),
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: FakeUpstream.json_response(payload)
+          )
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    url = FakeUpstream.url(upstream) <> "/pricing.json"
+
+    UpstreamConnPoolTelemetry.put_idle_bound!(0)
+    UpstreamConnPoolTelemetry.attach!(url)
+
+    assert {:ok, %{inserted: 1}} = OpenAIPricingImporter.import_url(url)
+    assert {:ok, %{inserted: 0}} = OpenAIPricingImporter.import_url(url)
+
+    assert :ok = FakeUpstream.verify!(upstream)
+    assert UpstreamConnPoolTelemetry.drain_events() == [:conn_max_idle_time_exceeded]
+  end
+
+  test "HTTP status, invalid JSON and incompatible catalogs fail without writes" do
+    before_count = Repo.aggregate(PricingSnapshot, :count)
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: {:raw_body, 503, "temporary upstream error", []}
+          ),
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: {:raw_body, 200, "not JSON", []}
+          ),
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: FakeUpstream.json_response(%{"models" => []})
+          )
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    url = FakeUpstream.url(upstream) <> "/pricing.json"
+
+    assert {:error, %{code: :http_error, message: "pricing catalog returned HTTP 503"}} =
+             OpenAIPricingImporter.import_url(url)
+
+    assert {:error, %{code: :invalid_json}} = OpenAIPricingImporter.import_url(url)
+
+    assert {:error, %{code: :incompatible_pricing_catalog}} =
+             OpenAIPricingImporter.import_url(url)
+
+    assert Repo.aggregate(PricingSnapshot, :count) == before_count
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  test "HTTP imports skip flat default per-minute models without writing their rows" do
+    flat_identifier = "flat-minute-model"
+    token_identifier = "flat-minute-token-model"
+
+    payload =
+      payload_with_models("2026-07-28T00:00:00Z", [token_identifier, flat_identifier])
+      |> put_in(["models", flat_identifier, "category"], "realtime_audio")
+      |> put_in(["models", flat_identifier, "categories"], ["realtime_audio"])
+      |> put_in(["models", flat_identifier, "pricing_type"], "per_minute")
+      |> put_in(["models", flat_identifier, "pricing_types"], ["per_minute"])
+      |> put_in(["models", flat_identifier, "prices"], %{
+        "standard" => %{"default" => %{"price_per_minute" => 1}}
+      })
+
+    # provenance: observed openai-json-pricing flat per-minute shape (2026-09-11); values synthetic
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "GET",
+            path: "/pricing.json",
+            respond: FakeUpstream.json_response(payload)
+          )
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    url = FakeUpstream.url(upstream) <> "/pricing.json"
+
+    assert {:ok, %{inserted: 1, skipped: 1, total: 2}} = OpenAIPricingImporter.import_url(url)
+
+    assert Repo.exists?(from row in PricingSnapshot, where: row.model_identifier == ^token_identifier)
+
+    refute Repo.exists?(from row in PricingSnapshot, where: row.model_identifier == ^flat_identifier)
+
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  test "malformed URL strings return bounded errors without writes" do
+    before_count = Repo.aggregate(PricingSnapshot, :count)
+
+    for url <- [
+          "",
+          "not a URL",
+          "ftp://example.com/pricing.json",
+          "http://",
+          "http://[invalid",
+          "http://example.com:bad",
+          "http://example.com:0",
+          "http://example.com:65536"
+        ] do
+      assert {:error, %{code: :invalid_url}} = OpenAIPricingImporter.import_url(url)
+    end
+
+    assert Repo.aggregate(PricingSnapshot, :count) == before_count
   end
 
   test "imports revision 2 rows from the immutable fixture idempotently" do
@@ -101,122 +246,60 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     assert second.skipped == 90
 
     rows =
-      Repo.all(
-        from snapshot in PricingSnapshot, where: snapshot.price_version == ^first.price_version
-      )
+      Repo.all(from snapshot in PricingSnapshot, where: snapshot.price_version == ^first.price_version)
 
     assert length(rows) == 208
     assert Enum.all?(rows, &(&1.config["importer_format_revision"] == "2"))
     refute Enum.any?(rows, &(&1.config["service_tier"] == "fast"))
   end
 
-  test "imports the reviewed September 3 target as canonical revision 2 rows" do
-    payload = @target |> File.read!() |> Jason.decode!()
-
-    assert Map.keys(payload["models"]) |> Enum.filter(&(&1 in @removed_identifiers)) == []
-
-    Enum.each(@reviewed_rates, fn {identifier, tiers} ->
-      Enum.each(tiers, fn {tier, expected} ->
-        assert source_rates(payload, identifier, tier) == Enum.map(expected, &Decimal.new/1)
-      end)
-    end)
-
-    Enum.each(@reviewed_fast_long_context_rates, fn {identifier, expected} ->
-      assert source_rates(payload, identifier, "fast", "long_context") ==
-               Enum.map(expected, &Decimal.new/1)
-    end)
-
-    Enum.each(@reviewed_fast_long_context_unavailable, fn identifier ->
-      assert get_in(payload, ["models", identifier, "prices", "fast", "long_context"]) == %{
-               "available" => false
-             }
-    end)
-
-    assert {:ok, first} = OpenAIPricingImporter.import_file(@target)
-    assert first.price_version == "#{@target_generated_at}:importer-format-2"
-    assert first.inserted == 181
-    assert first.skipped == 82
-
-    rows =
-      Repo.all(
-        from snapshot in PricingSnapshot, where: snapshot.price_version == ^first.price_version
-      )
-
-    assert length(rows) == 181
-    assert Enum.all?(rows, &(&1.config["importer_format_revision"] == "2"))
-    refute Enum.any?(rows, &(&1.config["service_tier"] == "fast"))
-    refute Enum.any?(rows, &(&1.model_identifier in @removed_identifiers))
-
-    Enum.each(@reviewed_rates, fn {identifier, tiers} ->
-      assert_snapshot_rates(rows, identifier, "standard", tiers["standard"])
-      assert_snapshot_rates(rows, identifier, "priority", tiers["fast"])
-    end)
-
-    Enum.each(@reviewed_fast_long_context_rates, fn {identifier, expected} ->
-      assert_snapshot_rates(rows, identifier, "priority", expected, "long_context")
-    end)
-
-    Enum.each(@reviewed_fast_long_context_unavailable, fn identifier ->
-      assert Enum.any?(rows, fn row ->
-               row.model_identifier == identifier and
-                 row.config["service_tier"] == "priority" and
-                 row.config["price_bucket"] == "long_context" and
-                 row.config["availability"] == "unavailable"
-             end)
-    end)
-
-    assert {:ok, %{inserted: 0, skipped: 82}} = OpenAIPricingImporter.import_file(@target)
+  # Settle real requests after the release entrypoint imports the vendored target,
+  # with the model shaped as catalog sync discovers it (`pricing_ref` defaults to
+  # `openai/<upstream id>`, which no snapshot names), so the price has to come
+  # through the accounting identifier precedence exactly as in production.
+  test "the vendored target prices gpt-6-sol requests at its standard and priority rates" do
+    assert_imported_target_settles("gpt-6-sol", default: "3280", priority: "6560")
   end
 
-  test "target checksum, exact rates, removals, and schema descriptors detect drift" do
-    raw = File.read!(@target)
-    payload = Jason.decode!(raw)
-    expected_rates = @reviewed_fast_long_context_rates["gpt-5.6-luna"] |> Enum.map(&Decimal.new/1)
+  test "the vendored target prices gpt-6-luna requests at its standard and priority rates" do
+    assert_imported_target_settles("gpt-6-luna", default: "164", priority: "328")
+  end
 
-    one_byte_path = write_raw!(raw <> " ")
-    refute file_sha256(one_byte_path) == @target_sha256
+  test "the vendored target prices gpt-6.1-sol requests at its standard and priority rates" do
+    assert_imported_target_settles("gpt-6.1-sol", default: "3240", priority: "6480")
+  end
 
-    rate_mutation =
-      put_in(
-        payload,
-        ["models", "gpt-5.6-luna", "prices", "fast", "long_context", "input"],
-        9
-      )
+  test "the vendored target imports every ultrafast context bucket including cache writes" do
+    payload = @target |> File.read!() |> CodexPooler.JSON.decode!()
+    assert {:ok, imported} = OpenAIPricingImporter.import_file(@target)
+    rows = Repo.all(from row in PricingSnapshot, where: row.price_version == ^imported.price_version)
 
-    rate_path = write_json!(rate_mutation)
+    for {bucket, rates} <- [
+          {"default", ["60.0", "6.0", "75.0", "300.0"]},
+          {"short_context", ["60.0", "6.0", "75.0", "300.0"]},
+          {"long_context", ["120.0", "12.0", "150.0", "450.0"]}
+        ] do
+      assert source_rates(payload, "gpt-6-astra", "ultrafast", bucket) == Enum.map(rates, &Decimal.new/1)
+      assert_snapshot_rates(rows, "gpt-6-astra", "ultrafast", rates, bucket)
+    end
+  end
 
-    refute source_rates(
-             Jason.decode!(File.read!(rate_path)),
-             "gpt-5.6-luna",
-             "fast",
-             "long_context"
-           ) ==
-             expected_rates
+  test "the vendored target settles gpt-6-astra at its served ultrafast rate" do
+    assert_imported_target_settles("gpt-6-astra", ultrafast: "98400")
+  end
 
-    removal_mutation =
-      payload
-      |> put_in(["models", hd(@removed_identifiers)], payload["models"]["babbage-002"])
-      |> put_in(["models", hd(@removed_identifiers), "model"], hd(@removed_identifiers))
-      |> Map.put("models_count", 80)
-
-    removal_path = write_json!(removal_mutation)
-
-    assert Map.keys(Jason.decode!(File.read!(removal_path))["models"])
-           |> Enum.filter(&(&1 in @removed_identifiers)) == [hd(@removed_identifiers)]
-
-    schema_mutation =
-      put_in(
-        payload,
-        ["models", "gpt-4o-mini-transcribe", "prices", "standard", "transcription"],
-        %{"estimated_cost" => nil}
-      )
-
+  test "malformed image batch rates reject the whole catalog without snapshot writes" do
+    payload = @target |> File.read!() |> CodexPooler.JSON.decode!()
     count = Repo.aggregate(PricingSnapshot, :count)
 
-    assert {:error, %{code: :incompatible_pricing_catalog}} =
-             OpenAIPricingImporter.import_file(write_json!(schema_mutation))
+    for model <- ~w(gpt-image-2.5-flare gpt-image-2.5-sunburst), bucket <- ~w(image text) do
+      invalid = put_in(payload, ["models", model, "prices", "batch", bucket, "input"], "1")
 
-    assert Repo.aggregate(PricingSnapshot, :count) == count
+      assert {:error, %{code: :incompatible_pricing_catalog}} =
+               OpenAIPricingImporter.import_file(write_json!(invalid))
+
+      assert Repo.aggregate(PricingSnapshot, :count) == count
+    end
   end
 
   test "equal fast and priority aliases emit one canonical row with Decimal equality" do
@@ -384,19 +467,15 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     assert {:ok, %{inserted: 1, skipped: 1, total: 2}} =
              OpenAIPricingImporter.import_file(write_json!(payload))
 
-    assert Repo.exists?(
-             from row in PricingSnapshot, where: row.model_identifier == ^token_identifier
-           )
+    assert Repo.exists?(from row in PricingSnapshot, where: row.model_identifier == ^token_identifier)
 
-    refute Repo.exists?(
-             from row in PricingSnapshot, where: row.model_identifier == ^live_identifier
-           )
+    refute Repo.exists?(from row in PricingSnapshot, where: row.model_identifier == ^live_identifier)
   end
 
   test "duplicate raw JSON keys and normalized model collisions fail without writes" do
     duplicate =
       String.replace(
-        Jason.encode!(valid_payload()),
+        CodexPooler.JSON.encode!(valid_payload()),
         ~s("tools_count":1),
         ~s("tools_count":1,"tools_count":1)
       )
@@ -416,9 +495,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     assert {:error, %{code: :incompatible_pricing_catalog}} =
              OpenAIPricingImporter.import_file(write_json!(collision))
 
-    refute Repo.exists?(
-             from row in PricingSnapshot, where: row.model_identifier == "sample-model"
-           )
+    refute Repo.exists?(from row in PricingSnapshot, where: row.model_identifier == "sample-model")
   end
 
   test "revision 2 canonical import preserves revision 1 fast rows and attempt references" do
@@ -501,8 +578,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
 
     refute Repo.exists?(
              from row in PricingSnapshot,
-               where:
-                 row.model_identifier == "removed-model" and row.price_version == ^child_version
+               where: row.model_identifier == "removed-model" and row.price_version == ^child_version
            )
 
     assert Map.take(Repo.get!(PricingSnapshot, removed.id), Map.keys(frozen)) == frozen
@@ -525,6 +601,9 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
 
     handler_id = "pricing-import-idempotence-#{unique}"
     insert_count = :counters.new(1, [])
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -591,6 +670,9 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
       end,
       cache_write: fn snapshot ->
         Ecto.Changeset.change(snapshot, cache_write_token_micros: Decimal.new(9))
+      end,
+      unknown_cache_write: fn snapshot ->
+        Ecto.Changeset.change(snapshot, cache_write_token_micros: nil)
       end,
       output: fn snapshot ->
         Ecto.Changeset.change(snapshot, output_token_micros: Decimal.new(9))
@@ -738,6 +820,67 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
            )
   end
 
+  # Each tier is the one the provider reports on the response. `default` is sent
+  # without a requested tier, as Codex does, and prices from the `standard` rows;
+  # `priority` is requested and served. 1_000 input tokens of which 400 cached
+  # and 200 output tokens cost 600 * input + 400 * cached_input + 200 * output
+  # at that tier's default-bucket rates, in micro-dollars.
+  defp assert_imported_target_settles(identifier, expected_costs) do
+    assert {:ok, %{price_version: price_version}} = CodexPooler.Catalog.import_openai_pricing_from_priv()
+
+    setup = accounting_setup()
+
+    model =
+      setup.pool
+      |> model_fixture(%{exposed_model_id: identifier, upstream_model_id: identifier})
+      |> Ecto.Changeset.change(pricing_ref: "openai/#{identifier}")
+      |> Repo.update!()
+
+    for {tier, expected_cost} <- expected_costs do
+      correlation_id = "corr-#{identifier}-#{tier}-#{System.unique_integer([:positive])}"
+      payload = %{"model" => identifier, "max_output_tokens" => 200}
+      payload = if tier == :default, do: payload, else: Map.put(payload, "service_tier", to_string(tier))
+      snapshot_tier = if tier == :default, do: "standard", else: to_string(tier)
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 model,
+                 payload,
+                 %{correlation_id: correlation_id}
+               )
+
+      assert reserved.pricing_status == "priced"
+      assert reserved.pricing_snapshot.model_identifier == identifier
+      assert reserved.pricing_snapshot.price_version == price_version
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 1_000,
+                   cached_input_tokens: 400,
+                   output_tokens: 200,
+                   total_tokens: 1_200,
+                   service_tier: to_string(tier)
+                 },
+                 %{response_status_code: 200}
+               )
+
+      settled = Repo.get!(PricingSnapshot, result.settlement.pricing_snapshot_id)
+      assert settled.model_identifier == identifier
+      assert settled.price_version == price_version
+      assert settled.config["service_tier"] == snapshot_tier
+      assert settled.config["price_bucket"] == "default"
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(expected_cost))
+    end
+  end
+
   defp valid_payload(
          identifier \\ "sample-model",
          tiers \\ %{"standard" => %{"default" => %{"input" => 1, "output" => 2}}},
@@ -829,7 +972,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     Ecto.Changeset.change(snapshot, config: Map.put(snapshot.config, key, value))
   end
 
-  defp source_rates(payload, identifier, tier, price_bucket \\ "default") do
+  defp source_rates(payload, identifier, tier, price_bucket) do
     bucket = get_in(payload, ["models", identifier, "prices", tier, price_bucket])
 
     Enum.map(["input", "cached_input", "cache_write", "output"], fn key ->
@@ -840,7 +983,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
   defp decimal_from_json_number(value) when is_integer(value), do: Decimal.new(value)
   defp decimal_from_json_number(value) when is_float(value), do: Decimal.from_float(value)
 
-  defp assert_snapshot_rates(rows, identifier, tier, expected, price_bucket \\ "default") do
+  defp assert_snapshot_rates(rows, identifier, tier, expected, price_bucket) do
     snapshot =
       Enum.find(rows, fn row ->
         row.model_identifier == identifier and row.config["service_tier"] == tier and
@@ -858,13 +1001,6 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
 
     assert Enum.zip_with(actual, expected, &Decimal.equal?(&1, Decimal.new(&2)))
            |> Enum.all?()
-  end
-
-  defp file_sha256(path) do
-    path
-    |> File.read!()
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
   end
 
   defp persisted_snapshot_fields(snapshot) do
@@ -900,6 +1036,9 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
     parent = self()
     barrier = make_ref()
     handler_id = "pricing-import-race-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -1037,7 +1176,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporterTest do
 
   defp shutdown_task(_task), do: :ok
 
-  defp write_json!(payload), do: payload |> Jason.encode!() |> write_raw!()
+  defp write_json!(payload), do: payload |> CodexPooler.JSON.encode!() |> write_raw!()
 
   defp write_raw!(raw) do
     path =

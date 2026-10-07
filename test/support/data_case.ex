@@ -17,8 +17,12 @@ defmodule CodexPooler.DataCase do
   use ExUnit.CaseTemplate
 
   alias CodexPooler.Access.APIKeys.TouchDebounce
+  alias CodexPooler.CommittedWriteGuard
   alias CodexPooler.InstanceSettings
   alias CodexPooler.Repo
+  alias CodexPooler.RollupCoverageFence
+  alias CodexPooler.TestLoggerLevel
+  alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
   alias Ecto.Adapters.SQL.Sandbox
 
   using do
@@ -34,9 +38,14 @@ defmodule CodexPooler.DataCase do
     end
   end
 
+  # Runs before the using module's own `setup_all`, so rows that one commits belong to the module
+  # and are compared again once every module-level callback has run.
+  setup_all tags do
+    CommittedWriteGuard.guard_module!(tags)
+  end
+
   setup tags do
     CodexPooler.DataCase.setup_sandbox(tags)
-    :ok
   end
 
   @doc """
@@ -47,24 +56,62 @@ defmodule CodexPooler.DataCase do
   Handing the published entry back keeps every test's cache consistent with the
   database it can actually see; otherwise a leaked version makes later tests
   ignore their own settings broadcasts as stale.
+
+  It also puts the test under `CodexPooler.CommittedWriteGuard`, which fails
+  the test when it leaves committed rows behind, and starts a sync test at the
+  configured Logger level (`CodexPooler.TestLoggerLevel`).
   """
   def setup_sandbox(tags) do
+    # A level restore an earlier test lost to a queued logger handler removal
+    # must not reach this test. Async tests never change the global level.
+    unless tags[:async], do: TestLoggerLevel.reset!()
+
+    guard = CommittedWriteGuard.begin_test!(tags)
     pid = Sandbox.start_owner!(Repo, shared: not tags[:async])
+
+    # Registered before every other `on_exit` of the test so that it runs after
+    # all of them: after the sandbox owner stops and after each cleanup the test
+    # registers. The owner's own sandbox calls above belong to the harness.
+    :ok = CommittedWriteGuard.register_verify!(guard)
+
+    # Registered before the owner's stop, so it runs after the owner stopped and before the guard
+    # verifies: the coverage rows a commit across 00:00 UTC makes the database write go back.
+    :ok = RollupCoverageFence.fence_test!(tags)
+
     settings_cache = InstanceSettings.snapshot_cache_for_test()
 
     on_exit(fn -> stop_sandbox(pid, settings_cache) end)
+
+    %{sandbox_owner: pid, sandbox_settings_cache: settings_cache}
   end
 
-  @doc false
+  @doc """
+  Stops the test's sandbox owner and restores the settings cache.
+
+  Runs automatically on exit. A test that committed rows outside the sandbox
+  (`Sandbox.unboxed_run/2`) and then touched them inside the sandboxed
+  transaction must call this before deleting those rows, because the open
+  sandbox transaction still holds their row locks; the exit callback then
+  finds the owner already stopped and does nothing more.
+
+  Before the owner stops it waits for every websocket session cleanup still
+  running (`WebsocketCleanupFence.await_session_cleanups!/0`), in every test,
+  whether or not the test installed the websocket cleanup fence.
+  """
   @spec stop_sandbox(pid(), term()) :: :ok
   def stop_sandbox(pid, settings_cache) do
+    # A websocket session cleanup deferred past `terminate/2` and still running
+    # would otherwise reach its next query after the owner stopped and lose its
+    # writes on an `OwnershipError` (findings#206 row 206-405).
+    if Process.alive?(pid), do: WebsocketCleanupFence.await_session_cleanups!()
+
     TouchDebounce.reset()
 
     # Reconciliation can still use the shared connection without changing the snapshot.
     # The synchronous restore drains that work and cancels its timer before owner exit.
     InstanceSettings.restore_cache_for_test(settings_cache)
 
-    Sandbox.stop_owner(pid)
+    if Process.alive?(pid), do: Sandbox.stop_owner(pid), else: :ok
   end
 
   @doc """

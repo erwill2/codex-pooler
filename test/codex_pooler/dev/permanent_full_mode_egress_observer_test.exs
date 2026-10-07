@@ -50,8 +50,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
       transport: :websocket,
       client_request_id: "smoke-ws-correlator",
       header_names: ["authorization"],
-      websocket_client_metadata:
-        {:keys, ["ws_request_header_x_openai_internal_codex_responses_lite"]}
+      websocket_client_metadata: {:keys, ["ws_request_header_x_openai_internal_codex_responses_lite"]}
     })
 
     entry = PermanentFullModeEgressObserver.captures()["smoke-ws-correlator"]
@@ -110,7 +109,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
              "pooler-egress-v1"
            ]
 
-    assert Jason.decode!(reset.resp_body) == %{"status" => "reset"}
+    assert CodexPooler.JSON.decode!(reset.resp_body) == %{"status" => "reset"}
 
     :telemetry.execute(@event, %{count: 1}, %{
       transport: :websocket,
@@ -129,7 +128,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
              "pooler-egress-v1"
            ]
 
-    body = Jason.decode!(served.resp_body)
+    body = CodexPooler.JSON.decode!(served.resp_body)
     assert body["plug-correlator"]["httpHeaderNames"] == ["authorization"]
     # A poisoned entry omits the websocket keys entirely: downstream validation
     # rejects the malformed entry instead of reading absence as proof.
@@ -181,7 +180,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
       conn(:get, "/")
       |> ObserverPlug.call([])
 
-    body = Jason.decode!(served.resp_body)
+    body = CodexPooler.JSON.decode!(served.resp_body)
     refute Map.has_key?(body["overflow-correlator"], "httpHeaderNames")
   end
 
@@ -201,7 +200,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
 
     assert armed.status == 200
 
-    assert Jason.decode!(armed.resp_body) == %{
+    assert CodexPooler.JSON.decode!(armed.resp_body) == %{
              "armed" => true,
              "telemetryHandlers" => 1,
              "captureEntries" => 1
@@ -217,7 +216,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
              "pooler-egress-v1"
            ]
 
-    assert Jason.decode!(disarmed.resp_body) == %{
+    assert CodexPooler.JSON.decode!(disarmed.resp_body) == %{
              "status" => "disarmed",
              "armed" => false,
              "telemetryHandlers" => 0,
@@ -236,7 +235,7 @@ defmodule CodexPooler.Dev.PermanentFullModeEgressObserverTest do
       conn(:get, "/status")
       |> ObserverPlug.call([])
 
-    assert Jason.decode!(after_disarm.resp_body) == %{
+    assert CodexPooler.JSON.decode!(after_disarm.resp_body) == %{
              "armed" => false,
              "telemetryHandlers" => 0,
              "captureEntries" => 0

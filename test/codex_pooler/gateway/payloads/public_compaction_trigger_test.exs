@@ -144,11 +144,16 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
     end
   end
 
-  test "public modes preserve ID absence, null, or binary exactly" do
+  # Every public compaction item carries a string id, as the SDK types and
+  # stream helpers require: a nonblank upstream id is kept byte for byte,
+  # anything else gets the id derived from the encrypted content, which the
+  # `/v1` input adapter drops again on replay (findings#254).
+  test "public modes keep a nonblank upstream item id and derive one otherwise" do
     for {id_name, source_id, expected_id} <- [
-          {:absent, :absent, :absent},
-          {:null, nil, nil},
-          {:empty, "", ""},
+          {:absent, :absent, :derived},
+          {:null, nil, :derived},
+          {:empty, "", :derived},
+          {:blank, " \t", :derived},
           {:binary, " opaque item id ", " opaque item id "}
         ] do
       source_item =
@@ -161,10 +166,19 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
                  :response
                )
 
-      item = adapted.raw_body |> Jason.decode!() |> get_in(["output", Access.at(0)])
+      item = adapted.raw_body |> CodexPooler.JSON.decode!() |> get_in(["output", Access.at(0)])
 
-      if expected_id == :absent do
-        refute Map.has_key?(item, "id")
+      if expected_id == :derived do
+        derived = CompactionTrigger.public_compaction_item_id("opaque-#{id_name}")
+        assert Map.fetch!(item, "id") == derived
+        assert derived =~ ~r/\Acmp_[0-9a-f]{40}\z/
+        assert CompactionTrigger.derived_public_compaction_item_id?(derived, "opaque-#{id_name}")
+        refute CompactionTrigger.derived_public_compaction_item_id?(derived, "opaque-other")
+
+        assert {:ok, %{payload: %{"input" => [replayed]}}} =
+                 Responses.coerce(%{"model" => "gpt-public-compaction-fixture", "input" => [item]})
+
+        assert replayed == Map.delete(item, "id")
       else
         assert Map.fetch!(item, "id") == expected_id
       end
@@ -186,11 +200,30 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
                 %{
                   status: 502,
                   code: "invalid_compaction_response",
-                  message:
-                    "upstream compact response did not include encrypted compaction content"
+                  message: "upstream compact response did not include encrypted compaction content",
+                  compaction_invalid_reason: "missing_encrypted_content"
                 }} = CompactionTrigger.adapt_gateway_result(gateway_result(source), mode)
       end
     end
+  end
+
+  test "adaptation failures retain a bounded internal reason" do
+    assert {:error,
+            %{
+              code: "invalid_compaction_response",
+              compaction_invalid_reason: "invalid_json"
+            }} =
+             CompactionTrigger.adapt_gateway_result(
+               {:ok, %{status: 200, headers: [], raw_body: "{invalid"}},
+               :response
+             )
+
+    assert {:error,
+            %{
+              code: "invalid_compaction_response",
+              compaction_invalid_reason: "missing_encrypted_content"
+            }} =
+             CompactionTrigger.adapt_gateway_result(gateway_result(%{}), :response)
   end
 
   test "public selection uses top-level summary only without an output compact candidate" do
@@ -206,7 +239,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
                :response
              )
 
-    assert get_in(Jason.decode!(adapted.raw_body), ["output", Access.at(0)]) ==
+    assert get_in(CodexPooler.JSON.decode!(adapted.raw_body), ["output", Access.at(0)]) ==
              expected_public_item()
   end
 
@@ -225,7 +258,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
     }
 
     request_without_marker = %{
-      "input" => [returned_item, %{"type" => "compaction_trigger"}],
+      "input" => [returned_item],
       "client_metadata" => %{}
     }
 
@@ -235,7 +268,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
       put_in(
         request_without_marker,
         ["client_metadata", "x-codex-turn-metadata"],
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "compaction" => %{"implementation" => "responses_compaction_v2"},
           "additive" => %{"ignored" => true}
         })
@@ -247,7 +280,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
       put_in(
         request_without_marker,
         ["client_metadata", "x-codex-turn-metadata"],
-        Jason.encode!(%{"compaction" => %{"implementation" => "other"}})
+        CodexPooler.JSON.encode!(%{"compaction" => %{"implementation" => "other"}})
       )
 
     assert CompactionTrigger.compaction_result_transport(request_with_wrong_marker) == :buffered
@@ -265,7 +298,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
                :response
              )
 
-    assert get_in(Jason.decode!(adapted.raw_body), ["output", Access.at(0)]) == %{
+    assert get_in(CodexPooler.JSON.decode!(adapted.raw_body), ["output", Access.at(0)]) == %{
              "type" => "compaction",
              "encrypted_content" => "opaque-separation-content",
              "id" => "cmp_separation"
@@ -277,7 +310,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
      %{
        status: 200,
        headers: [{"content-type", "application/json"}],
-       raw_body: Jason.encode!(body)
+       raw_body: CodexPooler.JSON.encode!(body)
      }}
   end
 
@@ -328,19 +361,51 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
   end
 
   defp public_result(%{raw_body: body}, :response) do
-    response = Jason.decode!(body)
+    response = CodexPooler.JSON.decode!(body)
     {response, response["output"]}
   end
 
   defp public_result(%{raw_body: body}, :public_sse) do
-    [done, completed] = sse_events(body)
+    assert String.ends_with?(body, "data: [DONE]\n\n")
+    [created, added, done, completed] = sse_events(body)
+
+    assert Enum.map([created, added, done, completed], &{&1["type"], &1["sequence_number"]}) == [
+             {"response.created", 0},
+             {"response.output_item.added", 1},
+             {"response.output_item.done", 2},
+             {"response.completed", 3}
+           ]
+
     response = completed["response"]
-    {response, [done["item"] | response["output"]]}
+
+    assert created["response"] ==
+             response |> Map.delete("usage") |> Map.merge(%{"status" => "in_progress", "output" => []})
+
+    assert added["output_index"] == 0
+    assert done["output_index"] == 0
+    {response, [added["item"], done["item"] | response["output"]]}
   end
 
-  defp public_result(%{websocket_messages: [done, completed]}, :websocket) do
+  # The public websocket speaks the same item grammar as the public SSE body:
+  # the downstream socket stamps sequence numbers and the stream id itself
+  # (findings#254).
+  defp public_result(%{websocket_messages: [created, added, done, completed] = messages}, :websocket) do
+    assert Enum.map(messages, & &1["type"]) == [
+             "response.created",
+             "response.output_item.added",
+             "response.output_item.done",
+             "response.completed"
+           ]
+
+    refute Enum.any?(messages, &Map.has_key?(&1, "sequence_number"))
     response = completed["response"]
-    {response, [done["item"] | response["output"]]}
+
+    assert created["response"] ==
+             response |> Map.delete("usage") |> Map.merge(%{"status" => "in_progress", "output" => []})
+
+    assert added["output_index"] == 0
+    assert done["output_index"] == 0
+    {response, [added["item"], done["item"] | response["output"]]}
   end
 
   defp maybe_put_source_id(item, :absent), do: item
@@ -354,7 +419,7 @@ defmodule CodexPooler.Gateway.Payloads.PublicCompactionTriggerTest do
       block
       |> String.split("\n")
       |> Enum.find_value(fn
-        "data: " <> data -> Jason.decode!(data)
+        "data: " <> data -> CodexPooler.JSON.decode!(data)
         _line -> nil
       end)
     end)

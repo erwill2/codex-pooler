@@ -1,5 +1,5 @@
 defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest do
-  use ExUnit.Case, async: false
+  use CodexPooler.DataCase, async: false
 
   @moduletag capture_log: true
 
@@ -8,9 +8,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
+  alias CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector
   alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
-  alias CodexPooler.Gateway.Transports.TransportFailureReason
   alias CodexPooler.Gateway.Transports.UpstreamDispatch
   alias CodexPooler.Gateway.Transports.Websocket.ForwardedOwnerRequestHandoff
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
@@ -19,7 +19,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Confirmation
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Topology.Direct
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAuthorizationObservation
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionLifecycleObservation
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.CloseDiagnostics
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketFrameWriter
@@ -29,10 +31,53 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @timeouts %{connect_timeout_ms: 1_000, receive_timeout_ms: 1_000}
 
+  # Scenario timeouts for a request the test ends itself (a barrier release, an
+  # injected close or frame, a caller exit) while the upstream is held: both
+  # stay beyond every detection budget, so a test stalled at the barrier cannot
+  # see the session's own connect or receive timeout end the request first
+  # (findings#206 row 206-291). Tests about those timeouts keep @timeouts.
+  @held_timeouts %{connect_timeout_ms: 60_000, receive_timeout_ms: 60_000}
+
+  # The raw peer's wait for the next frame header is an idle wait, not a
+  # detection budget: the session closing its socket or stop_raw_websocket_peer/1
+  # ends it. At one second a test stalled between two requests found the peer
+  # gone and the next request on a new connection (findings#206 row 206-291).
+  @raw_peer_idle_timeout_ms 60_000
+
+  # How long a split-upgrade peer holds its next fragment for the test's
+  # release. A fixture timer, not a detection budget: the test releases it after
+  # its own detection waits, so it stays beyond them (findings#206 row 206-320).
+  @raw_peer_release_timeout_ms 60_000
+
+  @raw_websocket_peer_terminal_then_control_modes [
+    :terminal_then_coalesced_close,
+    :terminal_then_coalesced_ping,
+    :terminal_then_invalid_text,
+    :terminal_then_invalid_text_then_close,
+    :terminal_then_delayed_close
+  ]
+
+  @raw_websocket_peer_retryable_first_then_control_modes [
+    :retryable_first_then_coalesced_close,
+    :retryable_first_then_coalesced_ping,
+    :retryable_first_then_delayed_close
+  ]
+
   # Detection budget for observing a call the session itself already bounds by
   # @timeouts. It has to stay above those scenario timeouts, or a loaded run
   # gives up on a request that was still allowed to be in flight.
   @detection_timeout_ms 5_000
+
+  # Detection budget for a notification, frame or DOWN the test waits for;
+  # no session call bounds it, so it takes the suite's 15 s detection budget
+  # rather than @detection_timeout_ms.
+  @message_detection_timeout_ms 15_000
+
+  # Real keepalive and pong-deadline timers the pong-liveness tests never let
+  # fire: both stay far beyond @detection_timeout_ms, and the tests deliver the
+  # armed timer messages themselves.
+  @held_keepalive_interval_ms 60_000
+  @held_pong_timeout_ms 120_000
 
   defmodule ForwardedHandoffProbe do
     use GenServer
@@ -106,7 +151,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     request = %{
       websocket_request(FakeUpstream.url(upstream))
       | headers: [{"x-private-status", header_marker}],
-        payload: Jason.encode!(%{"input" => payload_marker})
+        payload: CodexPooler.JSON.encode!(%{"input" => payload_marker})
     }
 
     assert {:ok, %{terminal: "response.completed"}} =
@@ -381,12 +426,171 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
              UpstreamWebsocketSession.request(session, final_request)
 
     assert :consumed_final = UpstreamWebsocketSession.compaction_admission_phase(session)
-    assert :ok = UpstreamWebsocketSession.acknowledge_final_response(session, :success)
-    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
 
     assert observer.() ==
              expected_native_compaction_counts()
              |> Map.drop([:compact_runtime_proof_redeemed, :final_runtime_proof_redeemed])
+  end
+
+  # The provider's Close coalesced with a compaction's terminal closes the
+  # connection between the compaction's collection and its confirmation
+  # (findings#275). The close clears the admission but keeps the collection
+  # as the one confirmation it can still accept: that confirmation succeeds
+  # once and arms nothing, so the client gets its compaction and the final
+  # runs as an ordinary turn; any other confirmation is refused as before.
+  test "direct compaction whose connection closed behind its terminal is confirmed once without arming a final" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(session, ordinary_request(raw_websocket_request(peer.url, self())))
+
+    assert_receive {:upstream_websocket_frame, _warmup_frame}, @detection_timeout_ms
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    assert UpstreamWebsocketSession.live_connection(session) == {:ok, lifecycle}
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    expires_at_ms = System.system_time(:millisecond) + 30_000
+    assert :ok = UpstreamWebsocketSession.arm_compact(session, binding, expires_at_ms, ordinary_receipt)
+    control_ref = make_ref()
+    assert {:ok, capability} = UpstreamWebsocketSession.reserve_compaction(session, :compact, binding, control_ref, System.system_time(:millisecond))
+    assert :ok = UpstreamWebsocketSession.mark_compaction_accounting_started(session, capability, System.system_time(:millisecond))
+
+    set_raw_websocket_peer_response_mode(peer, :terminal_then_coalesced_close)
+    request = %{raw_websocket_request(peer.url, self()) | native_compaction_capability: capability, expected_connection_lifecycle: lifecycle}
+    assert {:ok, %{terminal: "response.completed"}} = UpstreamWebsocketSession.request(session, request)
+
+    # The Close came in the terminal's read: the connection and its admission
+    # are gone before anything confirmed the compaction.
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+    assert UpstreamWebsocketSession.live_connection(session) == {:ok, %{lifecycle | generation: nil}}
+
+    digest = :crypto.hash(:sha256, "synthetic-compaction-item")
+    confirmation = %Confirmation{source_phase: :compact, source_control_ref: control_ref, binding: %{binding | compaction_item_digest: digest}}
+    finalization = &UpstreamWebsocketSession.acknowledge_compact_finalization(session, {:success, digest, &1, expires_at_ms})
+
+    assert {:error, :invalid_transition} = finalization.(%{confirmation | source_control_ref: make_ref()})
+    assert :ok = finalization.(confirmation)
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+    assert {:error, :invalid_transition} = finalization.(confirmation)
+  end
+
+  # findings#270 row 270-334: a final past its bound answers the reservation
+  # snapshot `expired`, the reason the admission ended, where it answered the
+  # `owner_unavailable` of every other refusal and the socket logged the
+  # refused reservation `cause=owner_unavailable`. One node, direct topology,
+  # raw websocket peer, Full.
+  test "direct reservation snapshot answers expired for a final past its bound" do
+    %{session: session, peer: peer, binding: binding, lifecycle: lifecycle} = armed_direct_admission()
+    capability = reserve_and_start_direct(session, :compact, binding)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, %{
+               raw_websocket_request(peer.url, self())
+               | native_compaction_capability: capability,
+                 expected_connection_lifecycle: lifecycle
+             })
+
+    digest = :crypto.hash(:sha256, "synthetic-expired-final-compaction-item")
+    confirmation = %Confirmation{source_phase: :compact, source_control_ref: capability.control_ref, binding: %{binding | compaction_item_digest: digest}}
+    assert :ok = UpstreamWebsocketSession.acknowledge_compact_finalization(session, {:success, digest, confirmation, System.system_time(:millisecond) - 1})
+
+    assert {:error, :expired} = UpstreamWebsocketSession.compaction_reservation_snapshot(session)
+  end
+
+  describe "direct native compaction admission clear reasons" do
+    @short_receive_timeouts %{connect_timeout_ms: 1_000, receive_timeout_ms: 150}
+
+    # findings#258 row 258-60: every clear on the direct upstream session names
+    # its cause instead of defaulting to `:request_rejected`, the one reason that
+    # stays reserved for the runtime's explicit clear after it rejected the
+    # request. One node, direct topology, raw websocket peer, Full.
+    test "an unsuccessful compact-phase exchange clears as compact_failure" do
+      %{session: session, peer: peer, binding: binding, lifecycle: lifecycle} = armed_direct_admission()
+      attach_direct_admission_clear_observer(binding.lifecycle_id)
+
+      capability = reserve_and_start_direct(session, :compact, binding)
+      set_raw_websocket_peer_response_mode(peer, :hold)
+
+      assert {:error, _reason} =
+               UpstreamWebsocketSession.request(session, %{
+                 raw_websocket_request(peer.url, self())
+                 | native_compaction_capability: capability,
+                   expected_connection_lifecycle: lifecycle,
+                   timeouts: @short_receive_timeouts
+               })
+
+      assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+      # The receive timeout retires the connection first; the exchange's own
+      # clear then names the failed compact phase.
+      assert drain_direct_admission_clear_reasons() == [:connection_closed, :compact_failure]
+    end
+
+    test "an unsuccessful final-phase exchange clears as final_failure" do
+      %{session: session, peer: peer, binding: binding, lifecycle: lifecycle} = armed_direct_admission()
+      attach_direct_admission_clear_observer(binding.lifecycle_id)
+
+      final_binding = confirm_direct_compact(session, peer, binding, lifecycle)
+      final_capability = reserve_and_start_direct(session, :final, final_binding)
+      set_raw_websocket_peer_response_mode(peer, :hold)
+
+      assert {:error, _reason} =
+               UpstreamWebsocketSession.request(session, %{
+                 raw_websocket_request(peer.url, self())
+                 | native_compaction_capability: final_capability,
+                   expected_connection_lifecycle: lifecycle,
+                   timeouts: @short_receive_timeouts
+               })
+
+      assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+      assert drain_direct_admission_clear_reasons() == [:connection_closed, :final_failure]
+    end
+
+    test "the explicit clear control is the one request_rejected clear" do
+      %{session: session, binding: binding} = armed_direct_admission()
+      attach_direct_admission_clear_observer(binding.lifecycle_id)
+
+      capability = reserve_and_start_direct(session, :compact, binding)
+      assert :ok = UpstreamWebsocketSession.clear_compaction_admission(session, capability)
+      assert [:request_rejected] = drain_direct_admission_clear_reasons()
+    end
+
+    # findings#258 row 258-130: the clear reasons were only in a debug log line
+    # and an unexported telemetry event, so production could not see them. The
+    # real session clears reach the exported counter; a close on a session that
+    # never held an admission, which every upstream connection close runs
+    # through the same clear path, is not counted.
+    test "admission clears reach the exported counter by reason, stage and topology" do
+      metric =
+        Enum.find(
+          CodexPoolerWeb.Telemetry.prometheus_metrics(),
+          &(&1.name == [:codex_pooler, :gateway, :native_compaction, :admission_clear, :count])
+        )
+
+      assert metric
+      registry = :"native_compaction_admission_clear_#{System.unique_integer([:positive])}"
+      start_supervised!({TelemetryMetricsPrometheus.Core, metrics: [metric], name: registry, start_async: false})
+
+      %{session: session, binding: binding} = armed_direct_admission()
+      _capability = reserve_and_start_direct(session, :compact, binding)
+      assert :ok = UpstreamWebsocketSession.close(session)
+
+      {:ok, never_armed} = UpstreamWebsocketSession.start_link([])
+      assert :ok = UpstreamWebsocketSession.close(never_armed)
+
+      body = TelemetryMetricsPrometheus.Core.scrape(registry)
+
+      assert body =~
+               ~s(codex_pooler_gateway_native_compaction_admission_clear_count{reason="connection_closed",stage="compacting",topology="direct"} 1)
+
+      refute body =~ ~s(stage="unknown")
+
+      # Every admission phase maps to a named stage, so a phase added to the
+      # admission cannot silently land in "unknown".
+      for phase <- NativeCompactionLifecycleObservation.phases(), phase != :cleared do
+        assert metric.tag_values.(%{reason: :final_failure, phase_from: phase, topology: :forwarded}).stage in ~w(armed compacting finalizing)
+      end
+    end
   end
 
   test "direct admission failures and replay emit no successful transition facts" do
@@ -405,10 +609,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     binding = direct_admission_binding(lifecycle, ordinary_receipt)
     assert :ok = UpstreamWebsocketSession.arm_compact(session, binding, 30_000, ordinary_receipt)
 
-    assert {:error, :expired} =
+    # An armed compaction has no bound any more (findings#270 row 270-317), so
+    # the refusal is a reservation of the wrong phase.
+    assert {:error, :invalid_transition} =
              UpstreamWebsocketSession.reserve_compaction(
                session,
-               :compact,
+               :final,
                binding,
                make_ref(),
                30_001
@@ -562,18 +768,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     owner = self()
 
-    request_pid =
-      spawn(fn ->
-        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
-      end)
-
+    # Held timeouts: with the 1 s receive timeout a late kill found the request
+    # already timed out, so its DOWN carried `:normal` and the caller-death
+    # path was never taken (findings#206 row 206-320 (e)).
+    held_request = %{raw_websocket_request(peer.url, owner) | timeouts: @held_timeouts}
+    request_pid = spawn(fn -> UpstreamWebsocketSession.request(session, held_request) end)
     request_monitor = Process.monitor(request_pid)
 
-    assert_receive {:raw_upstream_websocket_request, 2, 2}, @detection_timeout_ms
+    assert_receive {:raw_upstream_websocket_request, 2, 2}, @message_detection_timeout_ms
     Process.exit(request_pid, :kill)
 
     assert_receive {:DOWN, ^request_monitor, :process, ^request_pid, :killed},
-                   @detection_timeout_ms
+                   @message_detection_timeout_ms
 
     _ = :sys.get_state(session)
     assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
@@ -731,12 +937,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert {:error, :invalid_input} =
              UpstreamWebsocketSession.acknowledge_compact_finalization(session, :invalid)
 
-    assert {:error, :invalid_input} =
-             UpstreamWebsocketSession.acknowledge_final_response(session, :invalid)
-
-    assert {:error, :invalid_input} =
-             UpstreamWebsocketSession.acknowledge_final_response(:bad, :success)
-
     assert {:error, :invalid_input} = UpstreamWebsocketSession.clear_compaction_admission(:bad)
     assert {:error, :invalid_input} = UpstreamWebsocketSession.compaction_admission_phase(:bad)
   end
@@ -851,7 +1051,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     request = %{
       websocket_request(FakeUpstream.url(upstream))
       | headers: [{"x-private-crash", header_marker}],
-        payload: Jason.encode!(%{"input" => payload_marker}),
+        payload: CodexPooler.JSON.encode!(%{"input" => payload_marker}),
         writer: fn _text -> raise "synthetic writer crash" end
     }
 
@@ -908,7 +1108,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert_receive {:mapped_terminal_frame, frame}
 
     assert %{"type" => "response.failed", "error" => %{"code" => "upstream_terminal_failure"}} =
-             Jason.decode!(frame)
+             CodexPooler.JSON.decode!(frame)
 
     assert body =~ "upstream_terminal_failure"
     refute body =~ "synthetic terminal detail"
@@ -917,7 +1117,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   @tag :websocket_owner_regression
   test "RED-R01 response.done followed by clean close completes before close classification" do
     frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.done",
         "response" => %{"id" => "resp_red_done", "status" => "completed"}
       })
@@ -937,13 +1137,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "malformed response.done stays nonterminal until a valid terminal arrives" do
     malformed =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.done",
         "response" => %{"id" => "resp_malformed_done", "status" => "failed"}
       })
 
     completed =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_after_malformed", "status" => "completed"}
       })
@@ -976,7 +1176,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       }
     }
 
-    upstream = start_upstream(FakeUpstream.websocket_text_frames([Jason.encode!(frame)]))
+    upstream =
+      start_upstream(FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(frame)]))
+
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
     parent = self()
@@ -992,7 +1194,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     expected_frame = Map.delete(frame, "headers")
 
     assert Map.take(result, [:body, :status, :terminal, :websocket_frame_headers]) == %{
-             body: "data: #{Jason.encode!(frame)}\n\n",
+             body: "data: #{CodexPooler.JSON.encode!(frame)}\n\n",
              status: 200,
              terminal: "response.failed",
              websocket_frame_headers: %{
@@ -1009,7 +1211,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
            end)
 
     assert_receive {:characterization_writer_frame, downstream_frame}
-    assert Jason.decode!(downstream_frame) == expected_frame
+    assert CodexPooler.JSON.decode!(downstream_frame) == expected_frame
     refute downstream_frame =~ "private-header-characterization"
   end
 
@@ -1018,7 +1220,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     malformed = ~s({"type":"response.output_text.delta")
 
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "response" => %{
           "id" => "resp_decoded_observer",
@@ -1066,7 +1268,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "mapper and writer callback failures remain terminal for the upstream session" do
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_mandatory_callback_failure", "status" => "completed"}
       })
@@ -1097,8 +1299,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         assert {:error, %{reason: :upstream_websocket_session_unavailable}} =
                  UpstreamWebsocketSession.request(session, request)
 
-        assert_receive {:DOWN, ^monitor, :process, ^session,
-                        {%RuntimeError{}, callback_stacktrace}},
+        assert_receive {:DOWN, ^monitor, :process, ^session, {%RuntimeError{}, callback_stacktrace}},
                        @detection_timeout_ms
 
         {expected_function, expected_arity} =
@@ -1118,7 +1319,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "observer exception throw and exit are contained before exactly-once terminal delivery" do
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_optional_observer_failure", "status" => "completed"}
       })
@@ -1134,11 +1335,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
         upstream =
           start_upstream(
-            {:sequence,
-             [
-               FakeUpstream.websocket_text_frames([terminal]),
-               websocket_success("resp_after_optional_observer_failure")
-             ]}
+            # provenance: synthetic_adversarial
+            FakeUpstream.strict_sequence([
+              strict_websocket_turn(FakeUpstream.websocket_text_frames([terminal])),
+              strict_websocket_success("resp_after_optional_observer_failure")
+            ])
           )
 
         {:ok, session} = GenServer.start(UpstreamWebsocketSession, :new)
@@ -1164,8 +1365,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         assert {:ok, %{terminal: "response.completed", status: 200}} = result
         assert_receive {:observer_called, ^failure_kind}
 
-        assert_receive {:observer_failure_writer, ^failure_kind, ^terminal,
-                        %{terminal: "response.completed"}}
+        assert_receive {:observer_failure_writer, ^failure_kind, ^terminal, %{terminal: "response.completed"}}
 
         refute_received {:observer_called, ^failure_kind}
         refute_received {:observer_failure_writer, ^failure_kind, _frame, _discriminator}
@@ -1185,6 +1385,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
                  )
 
         assert Process.alive?(session)
+        assert :ok = FakeUpstream.verify!(upstream)
         :ok = UpstreamWebsocketSession.close(session)
       end
     )
@@ -1192,7 +1393,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "two-argument writers receive the mapped terminal discriminator" do
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_writer_discriminator", "status" => "completed"}
       })
@@ -1217,7 +1418,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "native snapshot emits metadata before a sanitized terminal failure while observers retain raw data" do
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "headers" => %{
           "openai-model" => "frame-model",
@@ -1255,7 +1456,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert metadata_event(metadata) == %{"x-models-etag" => "pooler-etag"}
     assert_receive {:native_metadata_frame, sanitized_terminal}
 
-    assert Jason.decode!(sanitized_terminal) == %{
+    assert CodexPooler.JSON.decode!(sanitized_terminal) == %{
              "type" => "response.failed",
              "headers" => %{"openai-model" => "frame-model"},
              "response" => %{
@@ -1306,7 +1507,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
            }
 
     assert_receive {:upstream_websocket_frame, accepted}
-    assert %{"id" => _id} = Jason.decode!(accepted)
+    assert %{"id" => _id} = CodexPooler.JSON.decode!(accepted)
     refute metadata =~ "provider-etag"
     refute metadata =~ "hostile-cookie"
     refute metadata =~ "hostile-request-id"
@@ -1316,13 +1517,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert_receive {:upstream_websocket_frame, reused_metadata}
     assert metadata_event(reused_metadata) == metadata_event(metadata)
     assert_receive {:upstream_websocket_frame, reused_accepted}
-    assert %{"id" => _id} = Jason.decode!(reused_accepted)
+    assert %{"id" => _id} = CodexPooler.JSON.decode!(reused_accepted)
     refute_received {:upstream_websocket_frame, _extra}
   end
 
   test "native snapshot removes malformed top-level and nested header containers" do
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "headers" => ["invalid-container"],
         "response" => %{"status" => "completed", "headers" => "invalid-container"}
@@ -1347,7 +1548,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert metadata_event(metadata) == %{"x-models-etag" => "pooler-etag"}
     assert_receive {:malformed_metadata_frame, sanitized}
 
-    assert Jason.decode!(sanitized) == %{
+    assert CodexPooler.JSON.decode!(sanitized) == %{
              "type" => "response.completed",
              "response" => %{"status" => "completed"}
            }
@@ -1360,7 +1561,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "native snapshot emits none for retryable first output and once for later accepted output" do
     retryable =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "error",
         "status" => 400,
         "headers" => %{"authorization" => "retry-hostile-auth"},
@@ -1372,18 +1573,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       })
 
     accepted =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"status" => "completed"}
       })
 
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.websocket_text_frames([retryable]),
-           FakeUpstream.websocket_text_frames([accepted])
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(FakeUpstream.websocket_text_frames([retryable])),
+          strict_websocket_turn(FakeUpstream.websocket_text_frames([accepted]))
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -1416,6 +1617,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert_receive {:retry_metadata_frame, ^accepted}
     assert_receive {:retry_metadata_observer, ^accepted, %{"type" => "response.completed"}}
     refute_received {:retry_metadata_frame, _extra}
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "native websocket preserves a structural child text delta byte-for-byte" do
@@ -1441,19 +1643,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     assert_receive {:native_child_delta_frame, ^child_delta}
     assert_receive {:native_child_delta_frame, terminal_frame}
-    assert %{"type" => "response.completed"} = Jason.decode!(terminal_frame)
+    assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(terminal_frame)
   end
 
   test "same-key requests reuse one FakeUpstream connection and process replacement opens another" do
     upstream =
       start_upstream(
-        {:sequence,
-         Enum.map(1..3, fn index ->
-           FakeUpstream.json_response(%{
-             "id" => "resp_ws_connection_characterization_#{index}",
-             "object" => "response"
-           })
-         end)}
+        # Strict finite scenario: the same-key requests share the first physical
+        # connection and the replacement session must open a second one.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence(
+          Enum.map([{1, 1}, {2, 1}, {3, 2}], fn {index, connection_ordinal} ->
+            strict_websocket_success("resp_ws_connection_characterization_#{index}",
+              websocket_connection_ordinal: connection_ordinal
+            )
+          end)
+        )
       )
 
     request = websocket_request(FakeUpstream.url(upstream))
@@ -1478,7 +1683,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     monitor = Process.monitor(session)
     :ok = UpstreamWebsocketSession.close(session)
-    assert_receive {:DOWN, ^monitor, :process, ^session, :normal}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^session, :normal}, @message_detection_timeout_ms
 
     {:ok, replacement} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(replacement) end)
@@ -1499,17 +1704,513 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert first_request.websocket_connection_id == second_request.websocket_connection_id
     assert replacement_request.websocket_connection_id != first_request.websocket_connection_id
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
-  test "characterization reconnects the same session lifecycle after a preterminal peer close" do
+  test "routing hint changes reuse the connection while an account header change opens another" do
+    first_hint = "model=provider-routing-model;tier=priority"
+    other_model_hint = "model=provider-other-model"
+
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success("resp_ws_characterized_initial"),
-           FakeUpstream.websocket_sse_then_close([]),
-           websocket_success("resp_ws_characterized_reconnect")
-         ]}
+        # Tier and model hint changes ride the first physical connection, whose
+        # handshake keeps the first hint; an account header change reconnects.
+        # provenance: observed released Codex client source core/src/client.rs websocket_connection (reconnect only on endpoint change or close; replies invented)
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_hint_priority",
+            websocket_connection_ordinal: 1,
+            headers: [
+              required: %{
+                "x-codex-routing-hint" => first_hint,
+                "chatgpt-account-id" => "account-a"
+              }
+            ]
+          ),
+          strict_websocket_success("resp_ws_hint_default_tier",
+            websocket_connection_ordinal: 1,
+            headers: [required: %{"x-codex-routing-hint" => first_hint}]
+          ),
+          strict_websocket_success("resp_ws_hint_model_switch",
+            websocket_connection_ordinal: 1,
+            headers: [required: %{"x-codex-routing-hint" => first_hint}]
+          ),
+          strict_websocket_success("resp_ws_hint_account_switch",
+            websocket_connection_ordinal: 2,
+            headers: [
+              required: %{
+                "x-codex-routing-hint" => other_model_hint,
+                "chatgpt-account-id" => "account-b"
+              }
+            ]
+          )
+        ])
+      )
+
+    base_request = websocket_request(FakeUpstream.url(upstream))
+
+    request = fn account, hint ->
+      %{
+        base_request
+        | headers: [{"chatgpt-account-id", account}, {"x-codex-routing-hint", hint}]
+      }
+    end
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, first_result} =
+             UpstreamWebsocketSession.request(session, request.("account-a", first_hint))
+
+    first_lifecycle = lifecycle_state(session)
+    assert_connection_metadata(first_result, first_lifecycle, false, false)
+
+    assert {:ok, default_tier_result} =
+             UpstreamWebsocketSession.request(
+               session,
+               request.("account-a", "model=provider-routing-model")
+             )
+
+    assert_connection_metadata(default_tier_result, first_lifecycle, true, false)
+
+    assert {:ok, model_switch_result} =
+             UpstreamWebsocketSession.request(session, request.("account-a", other_model_hint))
+
+    assert_connection_metadata(model_switch_result, first_lifecycle, true, false)
+
+    assert {:ok, account_switch_result} =
+             UpstreamWebsocketSession.request(session, request.("account-b", other_model_hint))
+
+    refute account_switch_result.upstream_websocket_connection.reused
+    assert FakeUpstream.websocket_connection_count(upstream) == 2
+
+    assert [first_id, first_id, first_id, account_id] =
+             Enum.map(FakeUpstream.requests(upstream), & &1.websocket_connection_id)
+
+    refute account_id == first_id
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  test "provider session header values scope connection reuse" do
+    session_a = %{
+      "session-id" => "session-a",
+      "thread-id" => "thread-a",
+      "x-client-request-id" => "thread-a"
+    }
+
+    session_b = %{
+      "session-id" => "session-b",
+      "thread-id" => "thread-b",
+      "x-client-request-id" => "thread-b"
+    }
+
+    upstream =
+      start_upstream(
+        # The same client session values ride one connection; other values or
+        # none open another, so a handshake never carries a different session.
+        # provenance: observed released Codex client source core/src/client.rs build_websocket_headers and websocket_connection (session headers fixed per client connection; replies invented)
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_session_a_first",
+            websocket_connection_ordinal: 1,
+            headers: [required: session_a]
+          ),
+          strict_websocket_success("resp_ws_session_a_second",
+            websocket_connection_ordinal: 1,
+            headers: [required: session_a]
+          ),
+          strict_websocket_success("resp_ws_session_b",
+            websocket_connection_ordinal: 2,
+            headers: [required: session_b]
+          ),
+          strict_websocket_success("resp_ws_session_absent",
+            websocket_connection_ordinal: 3,
+            headers: [forbidden: Map.keys(session_a)]
+          )
+        ])
+      )
+
+    base_request = websocket_request(FakeUpstream.url(upstream))
+
+    request = fn session_headers ->
+      %{
+        base_request
+        | headers: [{"chatgpt-account-id", "account-a"} | Enum.sort(session_headers)]
+      }
+    end
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, first_result} = UpstreamWebsocketSession.request(session, request.(session_a))
+    first_lifecycle = lifecycle_state(session)
+    assert_connection_metadata(first_result, first_lifecycle, false, false)
+
+    assert {:ok, second_result} = UpstreamWebsocketSession.request(session, request.(session_a))
+    assert_connection_metadata(second_result, first_lifecycle, true, false)
+
+    assert {:ok, other_session_result} =
+             UpstreamWebsocketSession.request(session, request.(session_b))
+
+    refute other_session_result.upstream_websocket_connection.reused
+
+    assert {:ok, absent_result} = UpstreamWebsocketSession.request(session, request.(%{}))
+    refute absent_result.upstream_websocket_connection.reused
+
+    assert FakeUpstream.websocket_connection_count(upstream) == 3
+
+    assert [first_id, first_id, other_id, absent_id] =
+             Enum.map(FakeUpstream.requests(upstream), & &1.websocket_connection_id)
+
+    assert length(Enum.uniq([first_id, other_id, absent_id])) == 3
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  test "ordinary successful and request-terminal work keep one connection reusable" do
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_response("resp_ws_ordinary_success_before_terminal", 1),
+          strict_websocket_turn(FakeUpstream.websocket_terminal_failure("invalid_request_error"),
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}]
+          ),
+          strict_websocket_response("resp_ws_ordinary_success_after_terminal", 1)
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = generation_request(FakeUpstream.url(upstream))
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert {:ok, %{terminal: "response.failed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert %{1 => 3} = generation_request_counts(upstream)
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  @tag :findings116
+  test "connection-limit fixture withholds its terminal and records one queued next send" do
+    terminal_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial (response.failed envelope variants; #116 saw a type error terminal)
+        FakeUpstream.strict_sequence([
+          strict_websocket_response("resp_ws_limit_fixture_warmup", 1),
+          strict_websocket_turn(
+            FakeUpstream.websocket_connection_limit_terminal_barrier(
+              shape: :nested,
+              notify: self(),
+              release_ref: terminal_ref
+            ),
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}]
+          ),
+          strict_websocket_response("resp_ws_limit_fixture_next", 2)
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = generation_request(FakeUpstream.url(upstream), @held_timeouts)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    terminal_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+    assert_receive {:fake_upstream_websocket_barrier, :before_terminal, websocket_pid, ^terminal_ref},
+                   @message_detection_timeout_ms
+
+    assert FakeUpstream.websocket_connection_alive?(upstream, 1)
+
+    parent = self()
+
+    next_task =
+      Task.async(fn ->
+        send(parent, :findings116_next_request_task_started)
+        UpstreamWebsocketSession.request(session, request)
+      end)
+
+    assert_receive :findings116_next_request_task_started, @message_detection_timeout_ms
+    send(websocket_pid, {:fake_upstream_release_websocket, terminal_ref})
+
+    assert {:error, %{reason: {:retryable_first_event, %{code: "websocket_connection_limit_reached"}}}} =
+             Task.await(terminal_task, @message_detection_timeout_ms)
+
+    assert {:ok, %{terminal: "response.completed"}} = Task.await(next_task, @message_detection_timeout_ms)
+
+    assert %{1 => 2, 2 => 1} = generation_request_counts(upstream)
+    refute FakeUpstream.websocket_connection_alive?(upstream, 1)
+
+    assert {:error, :not_found} =
+             FakeUpstream.close_websocket_connection(upstream, 1,
+               notify: self(),
+               close_ref: make_ref()
+             )
+
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  for terminal_shape <- [:top_level, :nested] do
+    @tag :findings116
+    @tag :strict_fake_upstream
+    test "connection-limit terminal from #{terminal_shape} retires peer-open connection before next send" do
+      terminal_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          # provenance: synthetic_adversarial (response.failed envelope variants; #116 saw a type error terminal)
+          FakeUpstream.strict_sequence([
+            strict_websocket_response(
+              "resp_ws_limit_warmup_#{unquote(terminal_shape)}",
+              1
+            ),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              path: "/backend-api/codex/responses",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond:
+                FakeUpstream.websocket_connection_limit_terminal_barrier(
+                  shape: unquote(terminal_shape),
+                  notify: self(),
+                  release_ref: terminal_ref
+                )
+            ),
+            strict_websocket_response("resp_ws_limit_next_#{unquote(terminal_shape)}", 2),
+            strict_websocket_response(
+              "resp_ws_limit_after_late_close_#{unquote(terminal_shape)}",
+              2
+            )
+          ])
+        )
+
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+      request = generation_request(FakeUpstream.url(upstream), @held_timeouts)
+
+      assert {:ok, %{terminal: "response.completed"}} =
+               UpstreamWebsocketSession.request(session, request)
+
+      generation_one = lifecycle_state(session)
+      old_socket = session_socket(session)
+      terminal_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+      assert_receive {:fake_upstream_websocket_barrier, :before_terminal, websocket_pid, ^terminal_ref},
+                     @message_detection_timeout_ms
+
+      assert FakeUpstream.websocket_connection_alive?(upstream, 1)
+      peer_monitor = Process.monitor(websocket_pid)
+
+      previous_logger_level = Logger.level()
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: previous_logger_level) end)
+
+      {failure_result, retirement_log} =
+        with_log([level: :info], fn ->
+          send(websocket_pid, {:fake_upstream_release_websocket, terminal_ref})
+          Task.await(terminal_task, @message_detection_timeout_ms)
+        end)
+
+      assert {:error,
+              %{
+                reason: {:retryable_first_event, %{code: "websocket_connection_limit_reached"}}
+              } = failure} = failure_result
+
+      assert retirement_log =~ "websocket connection retirement decision"
+      assert retirement_log =~ "reason_code=websocket_connection_limit_reached"
+      assert retirement_log =~ "lifecycle_id=#{generation_one.lifecycle_id}"
+      assert retirement_log =~ "old_generation=#{generation_one.generation}"
+
+      assert_connection_metadata(failure, generation_one, true, false)
+      assert_disconnected_lifecycle(session, generation_one)
+
+      assert_receive {:DOWN, ^peer_monitor, :process, ^websocket_pid, _reason},
+                     @message_detection_timeout_ms
+
+      refute FakeUpstream.websocket_connection_alive?(upstream, 1)
+
+      assert {:ok, %{terminal: "response.completed"} = next_result} =
+               UpstreamWebsocketSession.request(session, request)
+
+      generation_two = %{generation_one | generation: generation_one.generation + 1}
+      assert_connection_metadata(next_result, generation_two, false, false)
+      assert lifecycle_state(session) == generation_two
+      assert %{1 => 2, 2 => 1} = generation_request_counts(upstream)
+
+      send(session, {:tcp_closed, old_socket})
+      _late_close_processed = :sys.get_state(session)
+
+      assert {:ok, %{terminal: "response.completed"} = reused_result} =
+               UpstreamWebsocketSession.request(session, request)
+
+      assert_connection_metadata(reused_result, generation_two, true, false)
+      assert lifecycle_state(session) == generation_two
+      assert %{1 => 2, 2 => 2} = generation_request_counts(upstream)
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
+  end
+
+  @tag :findings116
+  test "connection-limit after rate-limit control retires connection and clears connection state" do
+    rate_limits =
+      CodexPooler.JSON.encode!(%{
+        "type" => "codex.rate_limits",
+        "rate_limits" => %{"primary" => %{"used_percent" => 42}}
+      })
+
+    limit = connection_limit_terminal(:top_level)
+
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial (response.failed envelope variants; #116 saw a type error terminal)
+        FakeUpstream.strict_sequence([
+          strict_websocket_response("resp_ws_limit_after_control_warmup", 1),
+          strict_websocket_turn(FakeUpstream.websocket_text_frames([rate_limits, limit]),
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}]
+          ),
+          strict_websocket_response("resp_ws_limit_after_control_next", 2)
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = ordinary_request(generation_request(FakeUpstream.url(upstream)))
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: receipt}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    generation_one = lifecycle_state(session)
+    binding = direct_admission_binding(generation_one, receipt)
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               System.system_time(:millisecond) + 30_000,
+               receipt
+             )
+
+    assert :pending_compact = UpstreamWebsocketSession.compaction_admission_phase(session)
+    peer_pid = websocket_connection_pid(upstream, 1)
+    peer_monitor = Process.monitor(peer_pid)
+
+    assert {:error,
+            %{
+              reason: {:retryable_first_event, %{code: "websocket_connection_limit_reached"}}
+            } = failure} = UpstreamWebsocketSession.request(session, request)
+
+    assert_connection_metadata(failure, generation_one, true, false)
+
+    assert status_state(:sys.get_status(session)) == %{
+             lifecycle_id: generation_one.lifecycle_id,
+             generation: generation_one.generation,
+             connected?: false,
+             reconnect_pending?: false,
+             request_active?: false,
+             keepalive_pending?: false,
+             pong_pending?: false,
+             admission_phase: :cleared
+           }
+
+    assert_receive {:DOWN, ^peer_monitor, :process, ^peer_pid, _reason}, @detection_timeout_ms
+
+    assert {:ok, %{terminal: "response.completed"} = next_result} =
+             UpstreamWebsocketSession.request(session, request)
+
+    generation_two = %{generation_one | generation: generation_one.generation + 1}
+    assert_connection_metadata(next_result, generation_two, false, false)
+    assert %{1 => 2, 2 => 1} = generation_request_counts(upstream)
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  @tag :findings116
+  test "connection-limit after response.created retires connection without replaying visible work" do
+    created =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.created",
+        "response" => %{"id" => "resp_ws_limit_visible"}
+      })
+
+    limit = connection_limit_terminal(:nested)
+
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial (response.failed envelope variants; #116 saw a type error terminal)
+        FakeUpstream.strict_sequence([
+          strict_websocket_response("resp_ws_limit_visible_warmup", 1),
+          strict_websocket_turn(FakeUpstream.websocket_text_frames([created, limit]),
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}]
+          ),
+          strict_websocket_response("resp_ws_limit_visible_next", 2)
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = generation_request(FakeUpstream.url(upstream))
+    parent = self()
+
+    visible_request = %{
+      request
+      | writer: fn frame -> send(parent, {:visible_limit_frame, frame}) end
+    }
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    generation_one = lifecycle_state(session)
+    peer_pid = websocket_connection_pid(upstream, 1)
+    peer_monitor = Process.monitor(peer_pid)
+
+    assert {:ok,
+            %{
+              terminal: "error",
+              upstream_error_code: "websocket_connection_limit_reached"
+            } = terminal_result} = UpstreamWebsocketSession.request(session, visible_request)
+
+    assert_receive {:visible_limit_frame, ^created}, @detection_timeout_ms
+    assert_receive {:visible_limit_frame, ^limit}, @detection_timeout_ms
+    assert_connection_metadata(terminal_result, generation_one, true, false)
+    assert_disconnected_lifecycle(session, generation_one)
+    assert_receive {:DOWN, ^peer_monitor, :process, ^peer_pid, _reason}, @detection_timeout_ms
+
+    assert %{1 => 2} = generation_request_counts(upstream)
+
+    assert {:ok, %{terminal: "response.completed"} = next_result} =
+             UpstreamWebsocketSession.request(session, request)
+
+    generation_two = %{generation_one | generation: generation_one.generation + 1}
+    assert_connection_metadata(next_result, generation_two, false, false)
+    assert %{1 => 2, 2 => 1} = generation_request_counts(upstream)
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  test "a preterminal peer close does not replay the accepted request" do
+    upstream =
+      start_upstream(
+        # Strict finite scenario: the accepted request must not be replayed after
+        # the reused connection closes without a terminal.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_characterized_initial",
+            websocket_connection_ordinal: 1
+          ),
+          strict_websocket_turn(FakeUpstream.websocket_sse_then_close([]),
+            websocket_connection_ordinal: 1
+          )
+        ])
       )
 
     request = websocket_request(FakeUpstream.url(upstream))
@@ -1522,11 +2223,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     generation_one = %{initial_lifecycle | generation: 1}
     assert_connection_metadata(first_result, generation_one, false, false)
 
-    assert {:ok, second_result} = UpstreamWebsocketSession.request(session, request)
-    generation_two = %{initial_lifecycle | generation: 2}
-    assert_connection_metadata(second_result, generation_two, false, true)
-    assert lifecycle_state(session) == generation_two
-    assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert {:error, second_result} = UpstreamWebsocketSession.request(session, request)
+    assert second_result.reason == :upstream_websocket_closed_before_terminal
+    assert second_result.transport_failure["upstream_committed"] == true
+    assert_connection_metadata(second_result, generation_one, true, false)
+    assert lifecycle_state(session).generation == generation_one.generation
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert length(FakeUpstream.requests(upstream)) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "controlled terminal-plus-close releases the terminal before the peer close" do
@@ -1549,7 +2253,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
     parent = self()
-    request = websocket_request(FakeUpstream.url(upstream))
+    request = websocket_request(FakeUpstream.url(upstream), @held_timeouts)
 
     request = %{
       request
@@ -1561,21 +2265,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         UpstreamWebsocketSession.request(session, request)
       end)
 
-    assert_receive {:fake_upstream_websocket_barrier, :before_terminal, barrier_pid,
-                    ^release_ref},
-                   1_000
+    assert_receive {:fake_upstream_websocket_barrier, :before_terminal, barrier_pid, ^release_ref},
+                   @message_detection_timeout_ms
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
 
-    assert_receive {:controlled_terminal_frame, frame}, 1_000
-    assert %{"type" => "response.completed"} = Jason.decode!(frame)
+    assert_receive {:controlled_terminal_frame, frame}, @message_detection_timeout_ms
+    assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(frame)
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
-             Task.await(request_task, 1_000)
+             Task.await(request_task, @message_detection_timeout_ms)
 
-    assert_receive {:fake_upstream_websocket_barrier, :before_close, close_barrier_pid,
-                    ^release_ref},
-                   1_000
+    assert_receive {:fake_upstream_websocket_barrier, :before_close, close_barrier_pid, ^release_ref},
+                   @message_detection_timeout_ms
 
     send(close_barrier_pid, {:fake_upstream_release_websocket, release_ref})
 
@@ -1600,11 +2302,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     request_task =
       Task.async(fn ->
-        UpstreamWebsocketSession.request(session, websocket_request(FakeUpstream.url(upstream)))
+        UpstreamWebsocketSession.request(session, websocket_request(FakeUpstream.url(upstream), @held_timeouts))
       end)
 
     assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref},
-                   1_000
+                   @message_detection_timeout_ms
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
 
@@ -1626,7 +2328,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
                 "last_upstream_event_class" => "none",
                 "terminal_candidate_seen" => false
               }
-            }} = Task.await(request_task, 1_000)
+            }} = Task.await(request_task, @message_detection_timeout_ms)
 
     assert Process.alive?(session)
     assert lifecycle_state(session).generation == 1
@@ -1654,8 +2356,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       :telemetry.attach(
         handler_id,
         [:codex_pooler, :repo, :query],
-        fn _event, _measurements, _metadata, %{parent: parent, session: session} ->
-          if self() == session, do: send(parent, :t7_frame_sql_query)
+        fn _event, _measurements, metadata, %{parent: parent, session: session} ->
+          if self() == session do
+            if String.contains?(metadata.query, ~s("allow_provider_credits")), do: send(parent, :t7_admission_sql_query), else: send(parent, :t7_frame_sql_query)
+          end
         end,
         %{parent: parent, session: session}
       )
@@ -1682,7 +2386,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert metadata["terminal_seen"] == false
     assert metadata["terminal_candidate_seen"] == false
     refute inspect(metadata) =~ "private reasoning fragment"
+    assert_received :t7_admission_sql_query
     refute_received :t7_frame_sql_query
+  end
+
+  test "close after an unknown response event returns the bounded reason authority was lost" do
+    raw_event_type = "response.private_event_sentinel_deadbeef"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.websocket_sse_then_close([
+          {raw_event_type, %{"type" => raw_event_type, "delta" => "private frame sentinel"}}
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = %{
+      websocket_request(FakeUpstream.url(upstream))
+      | native_client_retry_observation: ClientRetry.new_observation()
+    }
+
+    assert {:error,
+            %{
+              reason: :upstream_websocket_closed_before_terminal,
+              native_client_retry_observation: observation
+            }} = UpstreamWebsocketSession.request(session, request)
+
+    assert :ineligible = ClientRetry.final_observation_metadata(observation)
+
+    assert {:ok, diagnostics} = ClientRetry.authority_loss_metadata(observation)
+    assert diagnostics == %{"version" => 1, "authority_lost_reason" => "unknown_response_event"}
+    refute inspect(diagnostics) =~ raw_event_type
+    refute inspect(diagnostics) =~ "private frame sentinel"
   end
 
   test "peer close after an arbitrary nonterminal event records only bounded protocol buckets" do
@@ -1809,7 +2546,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
     parent = self()
-    request = websocket_request(FakeUpstream.url(upstream))
+    request = websocket_request(FakeUpstream.url(upstream), @held_timeouts)
     request = %{request | writer: fn frame -> send(parent, {:coalesced_frame, frame}) end}
 
     request_task =
@@ -1818,13 +2555,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       end)
 
     assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref},
-                   1_000
+                   @message_detection_timeout_ms
 
     socket = session_socket(session)
     :ok = :gen_tcp.close(socket)
 
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_ws_coalesced_terminal", "status" => "completed"}
       })
@@ -1832,11 +2569,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     send(session, {:tcp, socket, server_text_frame(terminal)})
 
     assert {:ok, %{terminal: "response.completed", status: 200, body: body}} =
-             Task.await(request_task, 1_000)
+             Task.await(request_task, @message_detection_timeout_ms)
 
     assert body =~ "resp_ws_coalesced_terminal"
-    assert_receive {:coalesced_frame, frame}, 1_000
-    assert %{"type" => "response.completed"} = Jason.decode!(frame)
+    assert_receive {:coalesced_frame, frame}, @message_detection_timeout_ms
+    assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(frame)
     assert Process.alive?(session)
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
@@ -1857,7 +2594,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
     parent = self()
-    request = websocket_request(FakeUpstream.url(upstream))
+    request = websocket_request(FakeUpstream.url(upstream), @held_timeouts)
     request = %{request | writer: fn frame -> send(parent, {:coalesced_delta_frame, frame}) end}
 
     request_task =
@@ -1866,13 +2603,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       end)
 
     assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref},
-                   1_000
+                   @message_detection_timeout_ms
 
     socket = session_socket(session)
     :ok = :gen_tcp.close(socket)
 
     delta =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.output_text.delta",
         "delta" => "coalesced partial output"
       })
@@ -1884,7 +2621,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
               body: body,
               reason: %Mint.TransportError{},
               transport_failure: %{"phase" => "receive", "terminal_seen" => false} = failure
-            }} = Task.await(request_task, 1_000)
+            }} = Task.await(request_task, @message_detection_timeout_ms)
 
     assert body =~ "coalesced partial output"
     assert failure["termination_source"] == "mint_transport_error"
@@ -1892,7 +2629,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert failure["websocket_buffer_bucket"] == "empty"
     assert failure["websocket_fragment_open"] == false
     assert failure["text_frame_count"] == 1
-    assert_receive {:coalesced_delta_frame, delta_frame}, 1_000
+    assert_receive {:coalesced_delta_frame, delta_frame}, @message_detection_timeout_ms
     assert delta_frame =~ "coalesced partial output"
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
@@ -1914,11 +2651,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     request_task =
       Task.async(fn ->
-        UpstreamWebsocketSession.request(session, websocket_request(FakeUpstream.url(upstream)))
+        UpstreamWebsocketSession.request(session, websocket_request(FakeUpstream.url(upstream), @held_timeouts))
       end)
 
     assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref},
-                   1_000
+                   @message_detection_timeout_ms
 
     socket = session_socket(session)
     send(session, {:tcp, socket, <<0x01, 3, "abc", 0x80, 10, "def">>})
@@ -1933,7 +2670,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
                 "websocket_buffer_bucket" => "bytes_1_125",
                 "websocket_fragment_open" => true
               }
-            }} = Task.await(request_task, 1_000)
+            }} = Task.await(request_task, @message_detection_timeout_ms)
 
     send(barrier_pid, {:fake_upstream_release_websocket, release_ref})
   end
@@ -1941,13 +2678,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   test "reused failure records finite connection age ordinal and idle buckets" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success("resp_ws_before_reused_close"),
-           FakeUpstream.websocket_sse_then_close([
-             %{"type" => "response.created", "response" => %{"id" => "resp_ws_reused_close"}}
-           ])
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_before_reused_close",
+            websocket_connection_ordinal: 1
+          ),
+          strict_websocket_turn(
+            FakeUpstream.websocket_sse_then_close([
+              %{"type" => "response.created", "response" => %{"id" => "resp_ws_reused_close"}}
+            ]),
+            websocket_connection_ordinal: 1
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -1975,17 +2717,27 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
              "connection_age_bucket" => "under_1m",
              "connection_idle_bucket" => "under_5s"
            }
+
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "invalidation closes only the current connection and reconnects on the next explicit request" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success("resp_ws_before_invalidation"),
-           websocket_success("resp_ws_after_invalidation"),
-           websocket_success("resp_ws_reused_after_invalidation")
-         ]}
+        # Strict finite scenario: the request after invalidation must open a
+        # replacement connection, and the following request must reuse it.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_before_invalidation",
+            websocket_connection_ordinal: 1
+          ),
+          strict_websocket_success("resp_ws_after_invalidation",
+            websocket_connection_ordinal: 2
+          ),
+          strict_websocket_success("resp_ws_reused_after_invalidation",
+            websocket_connection_ordinal: 2
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2016,6 +2768,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert first_request.websocket_connection_id != second_request.websocket_connection_id
     assert second_request.websocket_connection_id == third_request.websocket_connection_id
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "invalidation without a current connection returns a bounded error and preserves lifecycle" do
@@ -2045,15 +2798,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     writer = fn frame -> send(parent, {:controlled_owner_frame, frame}) end
     send_task = Task.async(fn -> upstream.send.(upstream_pid, "request", writer) end)
 
-    assert_receive {:websocket_owner_harness_controlled_barrier, :task_result, task_barrier,
-                    task_ref},
-                   1_000
+    assert_receive {:websocket_owner_harness_controlled_barrier, :task_result, task_barrier, task_ref},
+                   @message_detection_timeout_ms
 
     assert task_ref == controls.task_result
 
-    assert_receive {:websocket_owner_harness_controlled_barrier, :nonterminal_frames,
-                    nonterminal_barrier, nonterminal_ref},
-                   1_000
+    assert_receive {:websocket_owner_harness_controlled_barrier, :nonterminal_frames, nonterminal_barrier, nonterminal_ref},
+                   @message_detection_timeout_ms
 
     assert nonterminal_ref == controls.nonterminal_frames
 
@@ -2064,21 +2815,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         :nonterminal_frames
       )
 
-    assert_receive {:controlled_owner_frame, "nonterminal"}, 1_000
+    assert_receive {:controlled_owner_frame, "nonterminal"}, @message_detection_timeout_ms
 
-    assert_receive {:websocket_owner_harness_controlled_barrier, :terminal_frames,
-                    terminal_barrier, terminal_ref},
-                   1_000
+    assert_receive {:websocket_owner_harness_controlled_barrier, :terminal_frames, terminal_barrier, terminal_ref},
+                   @message_detection_timeout_ms
 
     assert terminal_ref == controls.terminal_frames
 
     :ok =
       WebsocketOwnerNodeHarness.release_controlled(terminal_barrier, controls, :terminal_frames)
 
-    assert_receive {:controlled_owner_frame, "terminal"}, 1_000
+    assert_receive {:controlled_owner_frame, "terminal"}, @message_detection_timeout_ms
 
     :ok = WebsocketOwnerNodeHarness.release_controlled(task_barrier, controls, :task_result)
-    assert Task.await(send_task, 1_000) == {:ok, :task_result}
+    assert Task.await(send_task, @detection_timeout_ms) == {:ok, :task_result}
 
     for {stage, expected} <- [
           downstream_send_result: :downstream_sent,
@@ -2089,13 +2839,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
           WebsocketOwnerNodeHarness.controlled_result(parent, controls, stage, expected)
         end)
 
-      assert_receive {:websocket_owner_harness_controlled_barrier, ^stage, barrier_pid,
-                      release_ref},
-                     1_000
+      assert_receive {:websocket_owner_harness_controlled_barrier, ^stage, barrier_pid, release_ref},
+                     @message_detection_timeout_ms
 
       assert release_ref == Map.fetch!(controls, stage)
       :ok = WebsocketOwnerNodeHarness.release_controlled(barrier_pid, controls, stage)
-      assert Task.await(result_task, 1_000) == expected
+      assert Task.await(result_task, @detection_timeout_ms) == expected
     end
 
     timer_target = self()
@@ -2110,28 +2859,37 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         )
       end)
 
-    assert_receive {:websocket_owner_harness_controlled_barrier, :timer_message, timer_barrier,
-                    timer_ref},
-                   1_000
+    assert_receive {:websocket_owner_harness_controlled_barrier, :timer_message, timer_barrier, timer_ref},
+                   @message_detection_timeout_ms
 
     assert timer_ref == controls.timer_message
     :ok = WebsocketOwnerNodeHarness.release_controlled(timer_barrier, controls, :timer_message)
-    assert_receive {:controlled_timer, ^timer_ref}, 1_000
-    assert Task.await(timer_task, 1_000) == :ok
+    assert_receive {:controlled_timer, ^timer_ref}, @message_detection_timeout_ms
+    assert Task.await(timer_task, @detection_timeout_ms) == :ok
 
     upstream.close.(upstream_pid)
   end
 
-  test "advances generations 1,1,2 through reuse and transparent reconnect" do
+  test "does not transparently replay an accepted request after a reused connection closes" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success("resp_ws_generation_1"),
-           websocket_success("resp_ws_generation_1_reused"),
-           FakeUpstream.websocket_sse_then_close([]),
-           websocket_success("resp_ws_generation_2")
-         ]}
+        # Strict finite scenario: all three sends ride the first physical
+        # connection and the interrupted request must not be replayed.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_generation_1",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}, required: ["input.0"]]
+          ),
+          strict_websocket_success("resp_ws_generation_1_reused",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}, required: ["input.0"]]
+          ),
+          strict_websocket_turn(FakeUpstream.websocket_sse_then_close([]),
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create"}, required: ["input.0"]]
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2141,7 +2899,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     request = %{
       websocket_request(FakeUpstream.url(upstream))
-      | payload: Jason.encode!(%{"type" => "response.create", "input" => [handoff]})
+      | payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "input" => [handoff]})
     }
 
     initial_lifecycle = lifecycle_state(session)
@@ -2157,34 +2915,35 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert lifecycle_state(session) == generation_one
     assert_connection_metadata(reused_result, generation_one, true, false)
 
-    assert {:ok, reconnected_result} = UpstreamWebsocketSession.request(session, request)
+    assert {:error, interrupted_result} = UpstreamWebsocketSession.request(session, request)
+    assert interrupted_result.reason == :upstream_websocket_closed_before_terminal
+    assert interrupted_result.transport_failure["upstream_committed"] == true
+    assert lifecycle_state(session).generation == 1
 
-    generation_two = %{initial_lifecycle | generation: 2}
-    assert lifecycle_state(session) == generation_two
-    assert_connection_metadata(reconnected_result, generation_two, false, true)
-
-    assert [first_request, second_request, interrupted_request, reconnected_request] =
+    assert [first_request, second_request, interrupted_request] =
              FakeUpstream.requests(upstream)
 
     assert first_request.websocket_connection_id == second_request.websocket_connection_id
     assert interrupted_request.websocket_connection_id == first_request.websocket_connection_id
-    assert reconnected_request.websocket_connection_id != first_request.websocket_connection_id
 
-    assert Enum.map([first_request, second_request, interrupted_request, reconnected_request], fn
+    assert Enum.map([first_request, second_request, interrupted_request], fn
              captured -> captured.json["input"]
-           end) == List.duplicate([handoff], 4)
+           end) == List.duplicate([handoff], 3)
 
-    assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "request_once uses an invocation-scoped lifecycle and reaches generation one" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success("resp_ws_once_first"),
-           websocket_success("resp_ws_once_second")
-         ]}
+        # Strict finite scenario: each request_once invocation opens its own
+        # physical connection.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_once_first", websocket_connection_ordinal: 1),
+          strict_websocket_success("resp_ws_once_second", websocket_connection_ordinal: 2)
+        ])
       )
 
     request = websocket_request(FakeUpstream.url(upstream))
@@ -2206,6 +2965,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert_connection_metadata(second_result, second_connected, false, false)
     assert second_initial.lifecycle_id != first_initial.lifecycle_id
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "does not advance generation when TCP connection fails" do
@@ -2339,18 +3099,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     initial_lifecycle = lifecycle_state(session)
     owner = self()
 
-    request_task =
-      Task.async(fn ->
-        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
-      end)
+    # The test releases the held upgrade itself, so the connect deadline is not
+    # the claim: held timeouts keep a stalled test from timing the upgrade out.
+    request = %{raw_websocket_request(peer.url, owner) | timeouts: @held_timeouts}
+    request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
     assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
-                   @detection_timeout_ms
+                   @message_detection_timeout_ms
 
     assert_stack_eventually_in(session, ConnectionUpgrade, :await_upgrade, 5)
     send(peer_pid, :release_raw_upstream_websocket_upgrade)
 
-    assert {:ok, result} = Task.await(request_task, @detection_timeout_ms)
+    assert {:ok, result} = Task.await(request_task, @message_detection_timeout_ms)
     assert_connection_metadata(result, %{initial_lifecycle | generation: 1}, false, false)
     assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
 
@@ -2365,16 +3125,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
     owner = self()
 
-    task =
-      Task.async(fn ->
-        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
-      end)
+    request = %{raw_websocket_request(peer.url, owner) | timeouts: @held_timeouts}
+    task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
     assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :partial_headers, peer_pid},
-                   @detection_timeout_ms
+                   @message_detection_timeout_ms
 
     send(peer_pid, :release_raw_upstream_websocket_upgrade)
-    assert {:ok, _result} = Task.await(task, @detection_timeout_ms)
+    assert {:ok, _result} = Task.await(task, @message_detection_timeout_ms)
     assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
   end
 
@@ -2401,18 +3159,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     peer = start_raw_websocket_peer(upgrade_mode: :split_forbidden)
     owner = self()
 
-    result_task =
-      Task.async(fn ->
-        UpstreamWebsocketSession.request_once(raw_websocket_request(peer.url, owner))
-      end)
+    request = %{raw_websocket_request(peer.url, owner) | timeouts: @held_timeouts}
+    result_task = Task.async(fn -> UpstreamWebsocketSession.request_once(request) end)
 
     assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :forbidden_status, peer_pid},
-                   @detection_timeout_ms
+                   @message_detection_timeout_ms
 
     send(peer_pid, :release_raw_upstream_websocket_upgrade)
 
     assert {:error, %{body: "", reason: {:websocket_upgrade_failed, 403, headers}}} =
-             Task.await(result_task, @detection_timeout_ms)
+             Task.await(result_task, @message_detection_timeout_ms)
 
     assert {"content-length", "0"} in headers
     refute_received {:raw_upstream_websocket_upgrade_payload, 1, _bytes}
@@ -2424,53 +3180,64 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
     owner = self()
 
-    task =
-      Task.async(fn ->
-        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
-      end)
+    # Held timeouts: only the caller's death, never the connect deadline, can
+    # close the connection here.
+    request = %{raw_websocket_request(peer.url, owner) | timeouts: @held_timeouts}
+    task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
     assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
-                   @detection_timeout_ms
+                   @message_detection_timeout_ms
 
     assert Task.shutdown(task, :brutal_kill) == nil
     send(peer_pid, :release_raw_upstream_websocket_upgrade)
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 500)
+
+    assert :closed =
+             wait_for_raw_websocket_connection_closed(1, @message_detection_timeout_ms)
+
     refute_received {:raw_upstream_websocket_upgrade_payload, 1, _bytes}
   end
 
+  # The upgrade deadline runs on a clock the test answers (the test-only
+  # `:upgrade_clock` timeout), so the session reads an expired deadline exactly
+  # when the terminal upgrade bytes already wait in its mailbox, however late
+  # the test runs. The 80 ms real deadline it replaces started before the test
+  # could suspend the session, so a late test lost the race (findings#206 row
+  # 206-320).
   test "queued terminal upgrade data wins at an expired monotonic deadline" do
     peer = start_raw_websocket_peer(upgrade_mode: :split_status)
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
-    request = %{
-      raw_websocket_request(peer.url, self())
-      | timeouts: %{connect_timeout_ms: 80, receive_timeout_ms: 1_000}
-    }
-
     owner = self()
-    request = %{request | writer: fn text -> send(owner, {:upstream_websocket_frame, text}) end}
+    clock = answered_upgrade_clock(owner)
+    request = %{raw_websocket_request(peer.url, owner) | timeouts: Map.put(@held_timeouts, :upgrade_clock, clock)}
+    deadline_ms = @held_timeouts.connect_timeout_ms
 
     task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
+    # Deadline set, then the first receive's remaining time: nothing expired.
+    assert answer_upgrade_clock(0) == session
+    assert answer_upgrade_clock(0) == session
+
     assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
-                   @detection_timeout_ms
+                   @message_detection_timeout_ms
 
-    :erlang.suspend_process(session)
+    # The session folded the status line and asks for the remaining time of its
+    # next receive; it waits in the clock read until the test answers.
+    assert_receive {:upgrade_clock_read, ^session, read_ref}, @message_detection_timeout_ms
 
-    try do
-      send(peer_pid, :release_raw_upstream_websocket_upgrade)
+    send(peer_pid, :release_raw_upstream_websocket_upgrade)
 
-      assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :terminal_queued},
-                     @detection_timeout_ms
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :terminal_queued},
+                   @message_detection_timeout_ms
 
-      await_test_timer(120)
-    after
-      :erlang.resume_process(session)
-    end
+    assert await_socket_data_delivered(session, System.monotonic_time(:millisecond) + @message_detection_timeout_ms)
 
-    assert {:ok, _result} = Task.await(task, @detection_timeout_ms)
-    assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
+    send(session, {read_ref, deadline_ms + 1})
+
+    assert {:ok, _result} = Task.await(task, @message_detection_timeout_ms)
+    assert_receive {:upstream_websocket_frame, _frame}, @message_detection_timeout_ms
+    refute_received {:upgrade_clock_read, _reader, _ref}
   end
 
   test "queued nonterminal upgrade data folds once and then respects the expired deadline" do
@@ -2554,19 +3321,24 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert cleanup.client_socket_count == 0
   end
 
-  test "failed reconnect preserves the last successful generation" do
+  test "ambiguous close preserves the last successful generation without reconnect" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success("resp_ws_before_failed_reconnect"),
-           FakeUpstream.websocket_sse_then_close([]),
-           FakeUpstream.websocket_upgrade_error(
-             %{"error" => %{"code" => "reconnect_rejected"}},
-             status: 503
-           ),
-           websocket_success("resp_ws_after_failed_reconnect")
-         ]}
+        # Strict finite scenario: the ambiguous close must not trigger a
+        # transparent reconnect send; only the later explicit request opens the
+        # replacement connection.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_before_failed_reconnect",
+            websocket_connection_ordinal: 1
+          ),
+          strict_websocket_turn(FakeUpstream.websocket_sse_then_close([]),
+            websocket_connection_ordinal: 1
+          ),
+          strict_websocket_success("resp_ws_after_explicit_request",
+            websocket_connection_ordinal: 2
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2583,7 +3355,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     assert {:error, failed_reconnect} = UpstreamWebsocketSession.request(session, request)
 
-    assert %{body: "", reason: {:websocket_upgrade_failed, 503, _headers}} = failed_reconnect
+    assert %{body: "", reason: :upstream_websocket_closed_before_terminal} = failed_reconnect
     assert_connection_metadata(failed_reconnect, established_lifecycle, true, false)
 
     assert_disconnected_lifecycle(session, established_lifecycle)
@@ -2598,6 +3370,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert lifecycle_state(session) == recovered_lifecycle
     assert_connection_metadata(recovered_result, recovered_lifecycle, false, false)
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "failure after a successful initial send carries only safe connection metadata" do
@@ -2672,6 +3445,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     :ok = UpstreamWebsocketSession.close(session)
 
     request = %Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: "https://example.com/backend-api/codex/responses",
       headers: [],
       payload: "{}",
@@ -2720,55 +3494,66 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     first_release_ref = make_ref()
     second_release_ref = make_ref()
 
-    events = [
-      %{
-        "type" => "response.created",
-        "response" => %{"id" => "resp_ws_mailbox"}
-      },
-      %{
-        "type" => "response.completed",
-        "response" => %{"id" => "resp_ws_mailbox"}
-      }
-    ]
+    frames =
+      Enum.map(
+        [
+          %{"type" => "response.created", "response" => %{"id" => "resp_ws_mailbox"}},
+          %{"type" => "response.completed", "response" => %{"id" => "resp_ws_mailbox"}}
+        ],
+        &CodexPooler.JSON.encode!/1
+      )
 
+    # Strict finite scenario: the turn is held frame by frame so the processed
+    # ack can be queued while frames are still being collected, and the ack is
+    # the only other send on the same connection; the fake replies nothing to
+    # it, so its consumption is observed through the ack's own barrier.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.barrier_sse_stream(events,
-             notify: parent,
-             release_ref: first_release_ref,
-             barrier_after: 1
-           ),
-           FakeUpstream.barrier_sse_stream(events,
-             notify: parent,
-             release_ref: second_release_ref,
-             barrier_after: 1
-           )
-         ]}
+        # provenance: synthetic_adversarial (minimal created/completed pair; barriers schedule the queued call)
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(
+            FakeUpstream.barrier_websocket_frames(frames,
+              notify: parent,
+              release_ref: first_release_ref
+            ),
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"model" => "upstream-test-model"}]
+          ),
+          strict_websocket_turn(
+            FakeUpstream.barrier_websocket_frames([],
+              notify: parent,
+              release_ref: second_release_ref
+            ),
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.processed", "response_id" => "resp_ws_mailbox"}
+            ]
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     request =
       %Request{
+        provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
         url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
         headers: [{"authorization", "Bearer synthetic-upstream-token"}],
         payload:
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "model" => "upstream-test-model",
             "input" => [%{"type" => "message", "role" => "user", "content" => "sample"}],
             "stream" => true
           }),
-        timeouts: @timeouts,
+        timeouts: @held_timeouts,
         writer: fn text -> send(parent, {:upstream_websocket_frame, text}) end,
         message_mapper: nil
       }
 
     request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
-    assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
-    assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^first_release_ref}, 1_000
+    assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^first_release_ref}, @message_detection_timeout_ms
 
     # The fake's barrier notification races the session's own send path: the
     # server can announce the barrier while the client is still streaming the
@@ -2780,34 +3565,80 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       Task.async(fn ->
         UpstreamWebsocketSession.send_request_frame(
           session,
-          Jason.encode!(%{"type" => "response.processed", "response_id" => "resp_ws_mailbox"})
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.processed",
+            "response_id" => "resp_ws_mailbox"
+          })
         )
       end)
 
-    send(barrier_pid, {:fake_upstream_release_chunk, first_release_ref})
+    # response.created is pushed; the queued call stays queued while the turn
+    # is still collecting frames. The frame's call has no bound of its own, so
+    # a stalled test cannot see it give up (findings#206 row 206-321).
+    assert :ok = FakeUpstream.release_frame(upstream, first_release_ref)
+    assert_receive {:fake_upstream_frame_barrier, 1, _handler, ^first_release_ref}, @message_detection_timeout_ms
+    assert_receive {:upstream_websocket_frame, _created}, @message_detection_timeout_ms
+    refute Task.yield(send_task, 0)
 
-    assert {:ok, %{terminal: "response.completed", status: 200}} = Task.await(request_task, 1_000)
-    assert_receive {:fake_upstream_chunk_sent, 2}, 1_000
-    assert_receive {:fake_upstream_chunk_sent, 3}, 1_000
+    # response.completed is pushed and the turn settles before the queued call
+    # is served.
+    assert :ok = FakeUpstream.release_frame(upstream, first_release_ref)
+    assert {:ok, %{terminal: "response.completed", status: 200}} = Task.await(request_task, @message_detection_timeout_ms)
+    assert_receive {:fake_upstream_frame_barrier, 2, _handler, ^first_release_ref}, @message_detection_timeout_ms
+    assert {:ok, :sent} = Task.await(send_task, @message_detection_timeout_ms)
 
-    assert {:ok, :sent} = Task.await(send_task, 1_000)
-    assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
-    assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^second_release_ref}, 1_000
+    # The fake reads the ack only once the trailing barrier is released.
+    refute_received {:fake_upstream_frame_barrier, 0, _handler, ^second_release_ref}
+    assert :ok = FakeUpstream.release_frame(upstream, first_release_ref)
+    assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^second_release_ref}, @message_detection_timeout_ms
+    assert :ok = FakeUpstream.release_frame(upstream, second_release_ref)
 
-    send(barrier_pid, {:fake_upstream_release_chunk, second_release_ref})
+    assert [turn_request, ack_request] = FakeUpstream.requests(upstream)
+    assert turn_request.websocket_connection_id == ack_request.websocket_connection_id
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
 
-    assert_receive {:fake_upstream_chunk_sent, 2}, 1_000
-    assert_receive {:fake_upstream_chunk_sent, 3}, 1_000
+  # A request frame has no call bound of its own (findings#206 row 206-322), so
+  # a session that stops while the frame waits in its mailbox must still end the
+  # call at once instead of leaving the caller waiting.
+  test "a queued request frame answers unavailable at once when the session stops" do
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    Process.unlink(session)
+    session_monitor = Process.monitor(session)
+    :ok = :sys.suspend(session)
+
+    send_task =
+      Task.async(fn ->
+        UpstreamWebsocketSession.send_request_frame(
+          session,
+          CodexPooler.JSON.encode!(%{"type" => "response.processed", "response_id" => "resp_ws_stopped_session"})
+        )
+      end)
+
+    assert_stack_eventually_in(send_task.pid, UpstreamWebsocketSession, :send_request_frame, 2, @message_detection_timeout_ms)
+    assert_message_queue_eventually_nonempty(session)
+
+    Process.exit(session, :kill)
+    assert_receive {:DOWN, ^session_monitor, :process, ^session, :killed}, @message_detection_timeout_ms
+    assert {:error, :upstream_websocket_session_unavailable} = Task.await(send_task, @message_detection_timeout_ms)
   end
 
   test "opens a new upstream websocket connection when bearer changes between turns" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.json_response(%{"id" => "resp_ws_old_token", "object" => "response"}),
-           FakeUpstream.json_response(%{"id" => "resp_ws_new_token", "object" => "response"})
-         ]}
+        # Strict finite scenario: the bearer change must open a second physical
+        # connection carrying the new authorization header.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_success("resp_ws_old_token",
+            websocket_connection_ordinal: 1,
+            headers: [required: %{"authorization" => "Bearer old-upstream-token"}]
+          ),
+          strict_websocket_success("resp_ws_new_token",
+            websocket_connection_ordinal: 2,
+            headers: [required: %{"authorization" => "Bearer new-upstream-token"}]
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2817,10 +3648,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     request = fn label, bearer, content ->
       %Request{
+        provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
         url: url,
         headers: [{"authorization", "Bearer #{bearer}"}],
         payload:
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "model" => "upstream-test-model",
             "input" => [%{"type" => "message", "role" => "user", "content" => content}],
             "stream" => true
@@ -2837,8 +3669,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
                request.(:old_token_turn, "old-upstream-token", "first turn")
              )
 
-    assert_receive {:upstream_websocket_frame, :old_token_turn, old_frame}, 1_000
-    assert %{"id" => "resp_ws_old_token"} = Jason.decode!(old_frame)
+    assert_receive {:upstream_websocket_frame, :old_token_turn, old_frame}, @message_detection_timeout_ms
+    assert %{"id" => "resp_ws_old_token"} = CodexPooler.JSON.decode!(old_frame)
     generation_one = %{initial_lifecycle | generation: 1}
     assert lifecycle_state(session) == generation_one
     assert_connection_metadata(old_key_result, generation_one, false, false)
@@ -2849,8 +3681,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
                request.(:new_token_turn, "new-upstream-token", "second turn")
              )
 
-    assert_receive {:upstream_websocket_frame, :new_token_turn, new_frame}, 1_000
-    assert %{"id" => "resp_ws_new_token"} = Jason.decode!(new_frame)
+    assert_receive {:upstream_websocket_frame, :new_token_turn, new_frame}, @message_detection_timeout_ms
+    assert %{"id" => "resp_ws_new_token"} = CodexPooler.JSON.decode!(new_frame)
     generation_two = %{initial_lifecycle | generation: 2}
     assert lifecycle_state(session) == generation_two
     assert_connection_metadata(new_key_result, generation_two, false, false)
@@ -2860,11 +3692,193 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert Map.new(first_request.headers)["authorization"] == "Bearer old-upstream-token"
     assert Map.new(second_request.headers)["authorization"] == "Bearer new-upstream-token"
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
+  for {close_arrival, response_mode} <- [
+        {"coalesced with the terminal in one read", :terminal_then_coalesced_close},
+        {"in a read of its own after the terminal", :terminal_then_delayed_close}
+      ] do
+    @response_mode response_mode
+
+    test "answers an upstream close that arrives #{close_arrival} and reconnects for the next request" do
+      peer =
+        start_raw_websocket_peer(
+          response_mode: @response_mode,
+          upgrade_headers: [{"x-upgrade-witness", "present"}]
+        )
+
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+      request = raw_websocket_request(peer.url, self())
+      initial_lifecycle = lifecycle_state(session)
+
+      {result, log} =
+        with_info_log(fn ->
+          result = UpstreamWebsocketSession.request(session, request)
+          release_delayed_peer_close!(@response_mode)
+          assert :closed = wait_for_raw_websocket_connection_closed(1, @message_detection_timeout_ms)
+          assert_disconnected_lifecycle(session, %{initial_lifecycle | generation: 1})
+          result
+        end)
+
+      assert {:ok, %{terminal: "response.completed", status: 200, headers: headers}} = result
+      assert_coalesced_close_log(log, @response_mode, "terminal", initial_lifecycle)
+
+      # The peer closed the same connection that carried the terminal, so the
+      # success result still has to name the upgrade response it was read from.
+      assert {"x-upgrade-witness", "present"} in headers
+
+      established_lifecycle = %{initial_lifecycle | generation: 1}
+
+      assert_disconnected_lifecycle(session, established_lifecycle)
+
+      set_raw_websocket_peer_response_mode(peer, :terminal)
+
+      assert {:ok, %{terminal: "response.completed", status: 200}} =
+               UpstreamWebsocketSession.request(session, request)
+
+      assert lifecycle_state(session) == %{initial_lifecycle | generation: 2}
+      connection_count = raw_websocket_peer_connection_count(peer)
+      cleanup = stop_raw_websocket_peer(peer)
+
+      assert cleanup.alive_tasks == []
+      assert cleanup.client_socket_count == 0
+      assert connection_count == 2
+    end
+  end
+
+  # The adjacent halt of the #251 shape: a retryable pre-visible first frame
+  # (here a quota denial) fails the request with `upstream_terminal_event`, and
+  # that failure keeps the connection for reuse, so a Close decoded behind it in
+  # the same read must still close the connection (icoretech/codex-pooler-findings#203).
+  for {close_arrival, response_mode} <- [
+        {"coalesced with a retryable first frame in one read", :retryable_first_then_coalesced_close},
+        {"in a read of its own after a retryable first frame", :retryable_first_then_delayed_close}
+      ] do
+    @response_mode response_mode
+
+    test "answers an upstream close that arrives #{close_arrival} and reconnects for the next request" do
+      peer = start_raw_websocket_peer(response_mode: @response_mode)
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+      request = raw_websocket_request(peer.url, self())
+      initial_lifecycle = lifecycle_state(session)
+
+      {result, log} =
+        with_info_log(fn ->
+          result = UpstreamWebsocketSession.request(session, request)
+          release_delayed_peer_close!(@response_mode)
+          assert :closed = wait_for_raw_websocket_connection_closed(1, @message_detection_timeout_ms)
+          assert_disconnected_lifecycle(session, %{initial_lifecycle | generation: 1})
+          result
+        end)
+
+      assert {:error, %{reason: {:quota_exhausted_first_event, %{code: "usage_limit_reached"}}}} = result
+      assert_coalesced_close_log(log, @response_mode, "retryable_first_frame", initial_lifecycle)
+      refute log =~ "synthetic quota denial"
+
+      refute_received {:upstream_websocket_frame, _frame}
+
+      assert_disconnected_lifecycle(session, %{initial_lifecycle | generation: 1})
+
+      set_raw_websocket_peer_response_mode(peer, :terminal)
+
+      assert {:ok, %{terminal: "response.completed", status: 200}} =
+               UpstreamWebsocketSession.request(session, request)
+
+      assert lifecycle_state(session) == %{initial_lifecycle | generation: 2}
+      connection_count = raw_websocket_peer_connection_count(peer)
+      cleanup = stop_raw_websocket_peer(peer)
+
+      assert cleanup.alive_tasks == []
+      assert cleanup.client_socket_count == 0
+      assert connection_count == 2
+    end
+  end
+
+  for mode <- [:terminal_then_invalid_text, :terminal_then_invalid_text_then_close] do
+    @tag trailing_mode: mode
+    test "a trailing malformed text frame logs the actual close cause for #{mode}", %{trailing_mode: mode} do
+      peer = start_raw_websocket_peer(response_mode: mode)
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+      request = raw_websocket_request(peer.url, self())
+
+      {result, log} =
+        with_info_log(fn ->
+          result = UpstreamWebsocketSession.request(session, request)
+          assert_disconnected_lifecycle(session, %{lifecycle_state(session) | generation: 1})
+          result
+        end)
+
+      assert {:ok, %{terminal: "response.completed"}} = result
+      assert log =~ "reason_code=frame_error"
+      refute log =~ "reason_code=peer_close_frame"
+      set_raw_websocket_peer_response_mode(peer, :terminal)
+      assert {:ok, %{terminal: "response.completed"}} = UpstreamWebsocketSession.request(session, request)
+      assert raw_websocket_peer_connection_count(peer) == 2
+    end
+  end
+
+  test "pongs an upstream ping coalesced behind a retryable first frame and keeps the connection" do
+    peer = start_raw_websocket_peer(response_mode: :retryable_first_then_coalesced_ping)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+
+    assert {:error, %{reason: {:quota_exhausted_first_event, %{code: "usage_limit_reached"}}}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert_receive {:raw_upstream_websocket_control, :pong, 1, _ping_count, 14}, @message_detection_timeout_ms
+
+    set_raw_websocket_peer_response_mode(peer, :terminal)
+
+    assert {:ok, %{terminal: "response.completed", status: 200}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert raw_websocket_peer_connection_count(peer) == 1
+  end
+
+  test "pongs an upstream ping coalesced behind the terminal in one read" do
+    peer = start_raw_websocket_peer(response_mode: :terminal_then_coalesced_ping)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+
+    assert {:ok, %{terminal: "response.completed", status: 200}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert_receive {:raw_upstream_websocket_control, :pong, 1, _ping_count, 14}, @message_detection_timeout_ms
+
+    # A ping behind the terminal is answered without retiring the connection:
+    # the next request still reuses it.
+    set_raw_websocket_peer_response_mode(peer, :terminal)
+
+    assert {:ok, %{terminal: "response.completed", status: 200}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert raw_websocket_peer_connection_count(peer) == 1
+  end
+
+  # The pong-liveness tests hold the real keepalive and pong-deadline timers
+  # far beyond the detection budget and deliver each timer message themselves,
+  # with the token the session armed (findings#206 row 206-193). Racing the real
+  # timers made them fail about once in 110-140 runs: the next request could
+  # start after a 120 ms deadline had fired, and a close observed within 150 ms
+  # of a 35 ms deadline could miss its window under load. Each test still reads
+  # the armed deadline's own timer and requires the configured pong timeout.
   @tag :upstream_websocket_pong_liveness
   test "opens a new upstream websocket connection after missing keepalive pong deadline" do
-    with_short_keepalive(keepalive_interval_ms: 80, keepalive_pong_timeout_ms: 35)
+    with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
 
     peer = start_raw_websocket_peer()
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2879,10 +3893,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     established_lifecycle = %{initial_lifecycle | generation: 1}
     assert lifecycle_state(session) == established_lifecycle
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
 
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 150)
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+    assert_pong_deadline_armed!(session, @held_pong_timeout_ms)
+
+    fire_pong_deadline!(session)
+    assert :closed = wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
     assert_disconnected_lifecycle(session, established_lifecycle)
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
@@ -2899,7 +3917,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @tag :upstream_websocket_pong_liveness
   test "does not close outstanding keepalive before a longer pong timeout expires" do
-    with_short_keepalive(keepalive_interval_ms: 25, keepalive_pong_timeout_ms: 120)
+    # The pong timeout is twice the keepalive interval: the deadline must be
+    # the pong timeout, and the keepalive tick that comes due while the pong is
+    # outstanding neither pings again nor closes the connection.
+    with_held_keepalive(keepalive_interval_ms: @held_keepalive_interval_ms, keepalive_pong_timeout_ms: 2 * @held_keepalive_interval_ms)
 
     peer = start_raw_websocket_peer()
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2911,16 +3932,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
 
-    assert :timeout = wait_for_raw_websocket_connection_closed(1, 40)
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+    pong_token = assert_pong_deadline_armed!(session, 2 * @held_keepalive_interval_ms)
 
+    fire_keepalive!(session)
+    assert %{keepalive_pong_token: ^pong_token} = :sys.get_state(session)
+
+    # The request answers after anything the peer saw before it on the same
+    # connection, so a second ping would already have been reported.
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
 
+    refute_received {:raw_upstream_websocket_control, :ping, 1, 2, _payload_bytes}
+    refute_received {:raw_upstream_websocket_connection_closed, 1}
     assert raw_websocket_peer_connection_count(peer) == 1
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
+
+    fire_pong_deadline!(session)
+    assert :closed = wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
@@ -2935,7 +3966,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @tag :upstream_websocket_pong_liveness
   test "keeps upstream websocket connection reusable after exact keepalive pong" do
-    with_short_keepalive()
+    with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
 
     peer = start_raw_websocket_peer(pong_mode: :match_active_ping)
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2947,10 +3978,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 2, _payload_bytes}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 3, _payload_bytes}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
+
+    for ping_count <- 1..3 do
+      fire_keepalive!(session)
+      assert_receive {:raw_upstream_websocket_control, :ping, 1, ^ping_count, _payload_bytes}, @detection_timeout_ms
+      await_pong_deadline_cleared!(session)
+    end
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
@@ -2965,7 +3999,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @tag :upstream_websocket_pong_liveness
   test "opens a new upstream websocket connection after mismatched keepalive pong deadline" do
-    with_short_keepalive(keepalive_interval_ms: 80, keepalive_pong_timeout_ms: 35)
+    with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
 
     peer = start_raw_websocket_peer(pong_mode: :send_mismatched_pong)
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -2977,9 +4011,21 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, 1_000
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 150)
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
+
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+    pong_token = assert_pong_deadline_armed!(session, @held_pong_timeout_ms)
+
+    # The peer wrote its mismatched pong before this request's answer, so the
+    # session has read it once the request returns; the deadline must survive.
+    assert {:ok, %{terminal: "response.completed", status: 200}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert %{keepalive_pong_token: ^pong_token} = :sys.get_state(session)
+
+    fire_pong_deadline!(session)
+    assert :closed = wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
@@ -2994,7 +4040,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @tag :upstream_websocket_pong_liveness
   test "opens a new upstream websocket connection after stale old-payload keepalive pong deadline" do
-    with_short_keepalive(keepalive_interval_ms: 80, keepalive_pong_timeout_ms: 35)
+    with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
 
     peer = start_raw_websocket_peer(pong_mode: :match_active_ping)
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -3006,13 +4052,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
+
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+    await_pong_deadline_cleared!(session)
 
     set_raw_websocket_peer_pong_mode(peer, :send_first_ping_payload)
 
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 2, _payload_bytes}, 1_000
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 150)
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 2, _payload_bytes}, @detection_timeout_ms
+    pong_token = assert_pong_deadline_armed!(session, @held_pong_timeout_ms)
+
+    # The stale pong, the first ping's payload, precedes this request's answer.
+    assert {:ok, %{terminal: "response.completed", status: 200}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert %{keepalive_pong_token: ^pong_token} = :sys.get_state(session)
+
+    fire_pong_deadline!(session)
+    assert :closed = wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
@@ -3025,44 +4084,738 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert connection_count == 2
   end
 
+  # Every close of a live upstream connection outside a request leaves one
+  # bounded info line naming the cause, who closed, the close code and reason
+  # class, the idle and connection ages, the connection's request count and
+  # the lifecycle it retired; the next request's fresh connection carries the
+  # same lifecycle at the next generation (findings#206 row 206-356). The
+  # peer writes each close on the established connection itself, so no timer
+  # decides when it arrives.
+  for {reason_label, close_reason, expected_reason} <- [
+        {"an allowlisted identifier", "idle-timeout", "idle-timeout"},
+        {"free text", "going away now", :fingerprint},
+        {"provider id", "resp_" <> String.duplicate("a", 40), :fingerprint},
+        {"credential-like content", "sk-proj-synthetic-peer-content", :fingerprint},
+        {"unknown peer content", "arbitrary_private_identifier", :fingerprint}
+      ] do
+    @close_reason close_reason
+    @expected_reason expected_reason
+
+    test "an idle peer Close with #{reason_label} as its reason logs one bounded close line" do
+      peer = start_raw_websocket_peer()
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+      request = raw_websocket_request(peer.url, self())
+      initial_lifecycle = lifecycle_state(session)
+
+      assert {:ok, first_result} = UpstreamWebsocketSession.request(session, request)
+      established_lifecycle = %{initial_lifecycle | generation: 1}
+      assert_connection_metadata(first_result, established_lifecycle, false, false)
+
+      log =
+        close_idle_connection_from_peer!(peer, session, fn server_socket ->
+          :ok = :gen_tcp.send(server_socket, raw_websocket_server_close_frame(4001, @close_reason))
+        end)
+
+      assert_disconnected_lifecycle(session, established_lifecycle)
+
+      expected_reason =
+        case @expected_reason do
+          :fingerprint -> "sha256_" <> String.slice(Base.encode16(:crypto.hash(:sha256, @close_reason), case: :lower), 0, 12)
+          reason -> reason
+        end
+
+      assert_single_close_line!(log,
+        reason_code: "peer_close_frame",
+        closed_by: "peer",
+        close_code: "4001",
+        close_reason: expected_reason,
+        transport_reason: "none",
+        connection_requests: "1",
+        pong_pending: "false",
+        ping_age_ms: "none",
+        lifecycle: established_lifecycle
+      )
+
+      refute log =~ "going away now"
+      refute log =~ "synthetic-upstream-token"
+
+      assert {:ok, second_result} = UpstreamWebsocketSession.request(session, request)
+      assert_connection_metadata(second_result, %{initial_lifecycle | generation: 2}, false, false)
+      assert raw_websocket_peer_connection_count(peer) == 2
+    end
+  end
+
+  test "an idle transport close without a Close frame logs transport_closed" do
+    peer = start_raw_websocket_peer()
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+    initial_lifecycle = lifecycle_state(session)
+
+    assert {:ok, _result} = UpstreamWebsocketSession.request(session, request)
+    established_lifecycle = %{initial_lifecycle | generation: 1}
+
+    log =
+      close_idle_connection_from_peer!(peer, session, fn server_socket ->
+        :ok = :gen_tcp.shutdown(server_socket, :write)
+      end)
+
+    assert_disconnected_lifecycle(session, established_lifecycle)
+
+    assert_single_close_line!(log,
+      reason_code: "transport_closed",
+      closed_by: "peer",
+      close_code: "none",
+      close_reason: "none",
+      transport_reason: "closed",
+      connection_requests: "1",
+      pong_pending: "false",
+      ping_age_ms: "none",
+      lifecycle: established_lifecycle
+    )
+
+    assert {:ok, second_result} = UpstreamWebsocketSession.request(session, request)
+    assert_connection_metadata(second_result, %{initial_lifecycle | generation: 2}, false, false)
+  end
+
+  @tag :upstream_websocket_pong_liveness
+  test "a missed idle pong deadline logs the Pooler's own close with the pending ping" do
+    with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
+
+    peer = start_raw_websocket_peer()
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+    initial_lifecycle = lifecycle_state(session)
+
+    assert {:ok, _result} = UpstreamWebsocketSession.request(session, request)
+    established_lifecycle = %{initial_lifecycle | generation: 1}
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
+
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+    assert_pong_deadline_armed!(session, @held_pong_timeout_ms)
+
+    {:closed, log} =
+      with_info_log(fn ->
+        fire_pong_deadline!(session)
+        wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
+      end)
+
+    assert_disconnected_lifecycle(session, established_lifecycle)
+
+    assert_single_close_line!(log,
+      reason_code: "pong_deadline",
+      closed_by: "pooler",
+      close_code: "none",
+      close_reason: "none",
+      transport_reason: "none",
+      connection_requests: "1",
+      pong_pending: "true",
+      ping_age_ms: :integer,
+      lifecycle: established_lifecycle
+    )
+  end
+
+  test "a request under another reuse key logs the replaced connection with header names only" do
+    peer = start_raw_websocket_peer()
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+    initial_lifecycle = lifecycle_state(session)
+
+    assert {:ok, _result} = UpstreamWebsocketSession.request(session, request)
+
+    rotated = %{
+      request
+      | headers: [{"authorization", "Bearer rotated-upstream-token"}, {"session-id", "rotated-session-value"}]
+    }
+
+    {result, log} = with_info_log(fn -> UpstreamWebsocketSession.request(session, rotated) end)
+    assert {:ok, second_result} = result
+    assert_connection_metadata(second_result, %{initial_lifecycle | generation: 2}, false, false)
+
+    assert_single_close_line!(log,
+      reason_code: "request_key_changed",
+      closed_by: "pooler",
+      close_code: "none",
+      close_reason: "none",
+      transport_reason: "none",
+      connection_requests: "1",
+      pong_pending: "false",
+      ping_age_ms: "none",
+      lifecycle: %{initial_lifecycle | generation: 1}
+    )
+
+    assert log =~ "key_change=headers changed_headers=credential,session-id "
+    refute log =~ "authorization"
+    refute log =~ "synthetic-upstream-token"
+    refute log =~ "rotated-upstream-token"
+    refute log =~ "rotated-session-value"
+  end
+
+  test "an explicit invalidation logs the invalidated connection" do
+    peer = start_raw_websocket_peer()
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+    initial_lifecycle = lifecycle_state(session)
+    assert {:ok, _result} = UpstreamWebsocketSession.request(session, request)
+
+    {:ok, log} = with_info_log(fn -> UpstreamWebsocketSession.invalidate_connection(session) end)
+
+    assert_single_close_line!(log,
+      reason_code: "invalidated",
+      closed_by: "pooler",
+      close_code: "none",
+      close_reason: "none",
+      transport_reason: "none",
+      connection_requests: "1",
+      pong_pending: "false",
+      ping_age_ms: "none",
+      lifecycle: %{initial_lifecycle | generation: 1}
+    )
+  end
+
+  test "a peer close inside a request is recorded on the request and logs no between-requests line" do
+    peer = start_raw_websocket_peer(response_mode: :peer_close)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = raw_websocket_request(peer.url, self())
+
+    {result, log} =
+      with_info_log(fn ->
+        result = UpstreamWebsocketSession.request(session, request)
+        _state = :sys.get_state(session)
+        result
+      end)
+
+    assert {:error, %{reason: :upstream_websocket_closed_before_terminal}} = result
+    refute log =~ "closed between requests"
+  end
+
+  # A `previous_response_id` resolves only on the connection that produced
+  # it, and the downstream client never sees the provider close an idle
+  # connection (its 60-minute limit, a restart). The session tells its
+  # subscriber when a connection that carried a request closes outside a
+  # request, so the client's socket can be closed and the next request sent
+  # whole (findings#270). Every signal is asserted with `assert_received`
+  # after a reply or state read from the session, which the session sends
+  # after the signal; every absence after the same kind of marker.
+  describe "connection close subscriber" do
+    test "only a pid given at start subscribes" do
+      starts = [
+        fn -> UpstreamWebsocketSession.start_link() end,
+        fn -> UpstreamWebsocketSession.start_link([]) end,
+        fn -> UpstreamWebsocketSession.start_link(connection_close_subscriber: nil) end,
+        fn -> GenServer.start(UpstreamWebsocketSession, :new) end
+      ]
+
+      for start <- starts do
+        {:ok, session} = start.()
+        on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+        assert Enum.sort(Map.keys(:sys.get_state(session))) == [:generation, :lifecycle_id]
+      end
+
+      session = start_subscribed_session!()
+      assert %{connection_close_subscriber: subscriber} = :sys.get_state(session)
+      assert subscriber == self()
+    end
+
+    # `decode_error` has no session test: with mint_web_socket 1.0.6 and no
+    # negotiated extension, `Mint.WebSocket.decode/2` reports bytes it cannot
+    # decode in-band, which the session closes as `frame_error`, and never
+    # returns an error of its own.
+    test "every close cause but a reuse-key change ends the closed connection's anchors" do
+      assert CloseDiagnostics.anchor_invalidating_causes() == [
+               :peer_close_frame,
+               :transport_closed,
+               :transport_error,
+               :ping_send_failed,
+               :pong_send_failed,
+               :send_failed,
+               :pong_deadline,
+               :decode_error,
+               :frame_error,
+               :invalidated
+             ]
+
+      for cause <- CloseDiagnostics.anchor_invalidating_causes() do
+        assert CloseDiagnostics.anchor_invalidating_cause?(cause)
+      end
+
+      refute CloseDiagnostics.anchor_invalidating_cause?(:request_key_changed)
+      refute CloseDiagnostics.anchor_invalidating_cause?(:request_caller_down)
+      refute CloseDiagnostics.anchor_invalidating_cause?("peer_close_frame")
+    end
+
+    for close_code <- [1000, 1012] do
+      @close_code close_code
+
+      test "an idle peer Close #{close_code} signals peer_close_frame with the closed generation and its request count" do
+        peer = start_raw_websocket_peer()
+        session = start_subscribed_session!()
+        request = raw_websocket_request(peer.url, self())
+        lifecycle = lifecycle_state(session)
+
+        assert {:ok, _first} = UpstreamWebsocketSession.request(session, request)
+        assert {:ok, _second} = UpstreamWebsocketSession.request(session, request)
+
+        log =
+          close_idle_connection_from_peer!(peer, session, fn server_socket ->
+            :ok = :gen_tcp.send(server_socket, raw_websocket_server_close_frame(@close_code))
+          end)
+
+        assert log =~ "reason_code=peer_close_frame closed_by=peer close_code=#{@close_code} "
+        assert_close_signal!(session, lifecycle, 1, :peer_close_frame, 2)
+        assert_subscribed_disconnected!(session, %{lifecycle | generation: 1})
+      end
+    end
+
+    test "an idle transport close signals transport_closed" do
+      {session, peer, lifecycle} = subscribed_session_after_one_request!()
+
+      log = close_idle_connection_from_peer!(peer, session, fn server_socket -> :ok = :gen_tcp.shutdown(server_socket, :write) end)
+
+      assert log =~ "reason_code=transport_closed closed_by=peer close_code=none close_reason=none transport_reason=closed "
+      assert_close_signal!(session, lifecycle, 1, :transport_closed, 1)
+    end
+
+    # The driver's own error message for the session's socket: a peer reset
+    # reaches the session as a plain close unless its socket asks for
+    # `show_econnreset`, so the error is delivered the way the driver would.
+    test "an idle transport error signals transport_error" do
+      {session, _peer, lifecycle} = subscribed_session_after_one_request!()
+
+      {_state, log} =
+        with_info_log(fn ->
+          send(session, {:tcp_error, session_socket(session), :econnreset})
+          :sys.get_state(session)
+        end)
+
+      assert log =~ "reason_code=transport_error closed_by=transport close_code=none close_reason=none transport_reason=econnreset "
+      assert_close_signal!(session, lifecycle, 1, :transport_error, 1)
+    end
+
+    test "a keepalive ping that cannot be written signals ping_send_failed" do
+      with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
+      {session, _peer, lifecycle} = subscribed_session_after_one_request!()
+
+      :ok = :gen_tcp.close(session_socket(session))
+      {:ok, log} = with_info_log(fn -> fire_keepalive!(session) end)
+
+      assert log =~ "reason_code=ping_send_failed closed_by=transport "
+      assert_close_signal!(session, lifecycle, 1, :ping_send_failed, 1)
+    end
+
+    # A connection that still reads but can no longer write. The session's
+    # socket turns passive first, so the peer's close answering the half-close
+    # is never delivered ahead of the ping; the ping comes in the driver's
+    # message shape and the session re-arms the socket to read it.
+    test "a pong that cannot be written signals pong_send_failed" do
+      {session, _peer, lifecycle} = subscribed_session_after_one_request!()
+      socket = session_socket(session)
+      :ok = :inet.setopts(socket, active: false)
+      :ok = :gen_tcp.shutdown(socket, :write)
+
+      {_state, log} =
+        with_info_log(fn ->
+          send(session, {:tcp, socket, raw_websocket_server_ping_frame("unanswerable-ping")})
+          :sys.get_state(session)
+        end)
+
+      assert log =~ "reason_code=pong_send_failed closed_by=transport "
+      assert_close_signal!(session, lifecycle, 1, :pong_send_failed, 1)
+    end
+
+    test "a frame forwarded between requests that cannot be written signals send_failed" do
+      {session, _peer, lifecycle} = subscribed_session_after_one_request!()
+
+      :ok = :gen_tcp.close(session_socket(session))
+      {result, log} = with_info_log(fn -> UpstreamWebsocketSession.send_request_frame(session, ~s({"type":"response.processed"})) end)
+
+      assert {:error, _reason} = result
+      assert log =~ "reason_code=send_failed closed_by=transport "
+      assert_close_signal!(session, lifecycle, 1, :send_failed, 1)
+    end
+
+    test "a missed idle pong deadline signals pong_deadline" do
+      with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
+      {session, _peer, lifecycle} = subscribed_session_after_one_request!()
+
+      fire_keepalive!(session)
+      assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+      assert_pong_deadline_armed!(session, @held_pong_timeout_ms)
+
+      {_state, log} =
+        with_info_log(fn ->
+          fire_pong_deadline!(session)
+          :sys.get_state(session)
+        end)
+
+      assert log =~ "reason_code=pong_deadline closed_by=pooler "
+      assert_close_signal!(session, lifecycle, 1, :pong_deadline, 1)
+    end
+
+    test "an idle text frame that is not UTF-8 signals frame_error" do
+      {session, peer, lifecycle} = subscribed_session_after_one_request!()
+
+      log = close_idle_connection_from_peer!(peer, session, fn server_socket -> :ok = :gen_tcp.send(server_socket, <<0x81, 1, 0xFF>>) end)
+
+      assert log =~ "reason_code=frame_error closed_by=pooler "
+      assert_close_signal!(session, lifecycle, 1, :frame_error, 1)
+    end
+
+    test "an explicit invalidation signals invalidated before its reply" do
+      {session, _peer, lifecycle} = subscribed_session_after_one_request!()
+
+      {result, log} = with_info_log(fn -> UpstreamWebsocketSession.invalidate_connection(session) end)
+
+      assert result == :ok
+      assert log =~ "reason_code=invalidated closed_by=pooler "
+      assert_close_signal!(session, lifecycle, 1, :invalidated, 1)
+      assert %{reconnect_pending?: true, connection_close_subscriber: subscriber} = :sys.get_state(session)
+      assert subscriber == self()
+    end
+
+    for {response_mode, halt, relays_terminal?} <- [
+          {:terminal_then_coalesced_close, "terminal", true},
+          {:retryable_first_then_coalesced_close, "retryable_first_frame", false}
+        ] do
+      @response_mode response_mode
+      @halt halt
+      @relays_terminal relays_terminal?
+
+      test "a Close coalesced behind the #{halt} is signalled before the request returns" do
+        peer = start_raw_websocket_peer(response_mode: @response_mode)
+        session = start_subscribed_session!()
+        request = raw_websocket_request(peer.url, self())
+        lifecycle = lifecycle_state(session)
+
+        {result, log} = with_info_log(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+        {:messages, messages} = Process.info(self(), :messages)
+        signal_index = Enum.find_index(messages, &match?({:upstream_websocket_connection_closed, ^session, _signal}, &1))
+        frame_index = Enum.find_index(messages, &match?({:upstream_websocket_frame, _text}, &1))
+        assert is_integer(signal_index)
+
+        if @relays_terminal do
+          assert {:ok, %{terminal: "response.completed"}} = result
+          assert is_integer(frame_index) and frame_index < signal_index
+        else
+          assert {:error, %{reason: {:quota_exhausted_first_event, %{code: "usage_limit_reached"}}}} = result
+          assert frame_index == nil
+        end
+
+        assert_close_signal!(session, lifecycle, 1, :peer_close_frame, 1)
+        assert_coalesced_close_log(log, @response_mode, @halt, lifecycle)
+        assert_subscribed_disconnected!(session, %{lifecycle | generation: 1})
+      end
+    end
+
+    # A trailing frame that retires the connection for another cause than a
+    # Close goes through the ordinary close line, still inside the request.
+    test "a malformed frame behind the terminal is signalled as frame_error before the request returns" do
+      peer = start_raw_websocket_peer(response_mode: :terminal_then_invalid_text)
+      session = start_subscribed_session!()
+      lifecycle = lifecycle_state(session)
+
+      {result, log} = with_info_log(fn -> UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self())) end)
+
+      assert {:ok, %{terminal: "response.completed"}} = result
+      {:messages, messages} = Process.info(self(), :messages)
+      frame_index = Enum.find_index(messages, &match?({:upstream_websocket_frame, _text}, &1))
+      signal_index = Enum.find_index(messages, &match?({:upstream_websocket_connection_closed, ^session, _signal}, &1))
+      assert is_integer(frame_index) and is_integer(signal_index) and frame_index < signal_index
+
+      assert_close_signal!(session, lifecycle, 1, :frame_error, 1)
+      assert log =~ "reason_code=frame_error closed_by=pooler "
+      assert_exchange_end_idle_ms!(log)
+      assert_subscribed_disconnected!(session, %{lifecycle | generation: 1})
+    end
+
+    test "a terminal decoded beside a transport error signals transport_error and logs one close line" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.websocket_close_without_terminal_barrier(
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      session = start_subscribed_session!()
+      lifecycle = lifecycle_state(session)
+      parent = self()
+      request = websocket_request(FakeUpstream.url(upstream), @held_timeouts)
+      request = %{request | writer: fn frame -> send(parent, {:coalesced_frame, frame}) end}
+      request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+      assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref}, @message_detection_timeout_ms
+      on_exit(fn -> send(barrier_pid, {:fake_upstream_release_websocket, release_ref}) end)
+
+      terminal =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.completed",
+          "response" => %{"id" => "resp_ws_signal_beside_transport_error", "status" => "completed"}
+        })
+
+      {result, log} =
+        with_info_log(fn ->
+          socket = session_socket(session)
+          :ok = :gen_tcp.close(socket)
+          send(session, {:tcp, socket, server_text_frame(terminal)})
+          result = Task.await(request_task, @message_detection_timeout_ms)
+          _state = :sys.get_state(session)
+          result
+        end)
+
+      assert {:ok, %{terminal: "response.completed", status: 200}} = result
+
+      {:messages, messages} = Process.info(self(), :messages)
+      frame_index = Enum.find_index(messages, &match?({:coalesced_frame, _frame}, &1))
+      signal_index = Enum.find_index(messages, &match?({:upstream_websocket_connection_closed, ^session, _signal}, &1))
+      assert is_integer(frame_index) and is_integer(signal_index) and frame_index < signal_index
+
+      assert_close_signal!(session, lifecycle, 1, :transport_error, 1)
+      assert length(String.split(log, "upstream websocket connection closed between requests")) == 2
+      assert log =~ "reason_code=transport_error closed_by=transport close_code=none close_reason=none transport_reason=einval "
+      assert log =~ " connection_requests=1 "
+      assert log =~ " lifecycle_id=#{lifecycle.lifecycle_id} generation=1"
+      assert_exchange_end_idle_ms!(log)
+      refute log =~ "resp_ws_signal_beside_transport_error"
+      assert_subscribed_disconnected!(session, %{lifecycle | generation: 1})
+    end
+
+    # A retryable pre-visible first frame keeps its connection when nothing
+    # else happens (its coalesced Close is drained like the terminal's), so a
+    # transport error decoded beside it closes the connection after the
+    # exchange, not inside it: one close line and the signal. The native
+    # socket drops that signal (its task has no accepted terminal yet).
+    test "a retryable first frame decoded beside a transport error signals transport_error and logs one close line" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.websocket_close_without_terminal_barrier(
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      session = start_subscribed_session!()
+      lifecycle = lifecycle_state(session)
+      parent = self()
+      request = websocket_request(FakeUpstream.url(upstream), @held_timeouts)
+      request = %{request | writer: fn frame -> send(parent, {:relayed_frame, frame}) end}
+      request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+      assert_receive {:fake_upstream_websocket_barrier, :before_close, barrier_pid, ^release_ref}, @message_detection_timeout_ms
+      on_exit(fn -> send(barrier_pid, {:fake_upstream_release_websocket, release_ref}) end)
+
+      first_frame =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.failed",
+          "response" => %{
+            "id" => "resp_ws_retryable_beside_transport_error",
+            "status" => "failed",
+            "error" => %{"code" => "usage_limit_reached", "message" => "synthetic quota denial"}
+          }
+        })
+
+      {result, log} =
+        with_info_log(fn ->
+          socket = session_socket(session)
+          :ok = :gen_tcp.close(socket)
+          send(session, {:tcp, socket, raw_websocket_server_text_frame(first_frame)})
+          result = Task.await(request_task, @message_detection_timeout_ms)
+          _state = :sys.get_state(session)
+          result
+        end)
+
+      assert {:error, %{reason: {:quota_exhausted_first_event, %{code: "usage_limit_reached"}}}} = result
+      refute_received {:relayed_frame, _frame}
+      assert_close_signal!(session, lifecycle, 1, :transport_error, 1)
+      assert length(String.split(log, "upstream websocket connection closed between requests")) == 2
+      assert log =~ "reason_code=transport_error closed_by=transport close_code=none close_reason=none transport_reason=einval "
+      assert log =~ " connection_requests=1 "
+      assert_exchange_end_idle_ms!(log)
+      refute log =~ "synthetic quota denial"
+      assert_subscribed_disconnected!(session, %{lifecycle | generation: 1})
+    end
+
+    test "the subscriber is kept across a close and hears the next generation's close" do
+      {session, peer, lifecycle} = subscribed_session_after_one_request!()
+
+      _log = close_idle_connection_from_peer!(peer, session, fn server_socket -> :ok = :gen_tcp.send(server_socket, raw_websocket_server_close_frame(1000)) end)
+
+      assert_close_signal!(session, lifecycle, 1, :peer_close_frame, 1)
+      assert_subscribed_disconnected!(session, %{lifecycle | generation: 1})
+
+      assert {:ok, second} = UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+      assert_connection_metadata(second, %{lifecycle | generation: 2}, false, false)
+
+      _log = close_idle_connection_from_peer!(peer, session, fn server_socket -> :ok = :gen_tcp.shutdown(server_socket, :write) end, 2)
+
+      assert_close_signal!(session, lifecycle, 2, :transport_closed, 1)
+      assert_subscribed_disconnected!(session, %{lifecycle | generation: 2})
+    end
+
+    test "a connection replaced for another reuse key signals nothing" do
+      {session, peer, lifecycle} = subscribed_session_after_one_request!()
+      rotated = %{raw_websocket_request(peer.url, self()) | headers: [{"authorization", "Bearer rotated-upstream-token"}]}
+
+      {result, log} = with_info_log(fn -> UpstreamWebsocketSession.request(session, rotated) end)
+
+      assert {:ok, second} = result
+      assert_connection_metadata(second, %{lifecycle | generation: 2}, false, false)
+      assert log =~ "reason_code=request_key_changed closed_by=pooler "
+      refute_received {:upstream_websocket_connection_closed, _session, _signal}
+    end
+
+    test "a connection that carried no request signals nothing when it closes" do
+      peer = start_raw_websocket_peer()
+      session = start_subscribed_session!()
+      request = raw_websocket_request(peer.url, self())
+
+      # An anchored request meeting a fresh connection is refused before
+      # anything is sent, so the connection it opened carries no request.
+      assert {:ok, %{terminal: "error", upstream_error_code: "previous_response_not_found"}} =
+               UpstreamWebsocketSession.request(session, %{request | connection_bound_continuation?: true})
+
+      log =
+        close_idle_connection_from_peer!(peer, session, fn server_socket ->
+          :ok = :gen_tcp.send(server_socket, raw_websocket_server_close_frame(1000))
+        end)
+
+      refute_received {:raw_upstream_websocket_request, 1, _request_count}
+      assert log =~ "reason_code=peer_close_frame closed_by=peer close_code=1000 "
+      assert log =~ " connection_requests=0 "
+      refute_received {:upstream_websocket_connection_closed, _session, _signal}
+    end
+
+    test "a peer Close inside a request signals nothing" do
+      peer = start_raw_websocket_peer(response_mode: :peer_close)
+      session = start_subscribed_session!()
+
+      assert {:error, %{reason: :upstream_websocket_closed_before_terminal}} =
+               UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+
+      refute_received {:upstream_websocket_connection_closed, _session, _signal}
+    end
+
+    test "a receive timeout signals nothing" do
+      peer = start_raw_websocket_peer(response_mode: :hold)
+      session = start_subscribed_session!()
+      request = %{raw_websocket_request(peer.url, self()) | timeouts: %{connect_timeout_ms: 1_000, receive_timeout_ms: 100}}
+
+      assert {:error, %{reason: :upstream_websocket_receive_timeout}} = UpstreamWebsocketSession.request(session, request)
+      refute_received {:upstream_websocket_connection_closed, _session, _signal}
+      assert %{reconnect_pending?: true} = :sys.get_state(session)
+    end
+
+    test "closing the session signals nothing" do
+      {session, _peer, _lifecycle} = subscribed_session_after_one_request!()
+      monitor = Process.monitor(session)
+
+      assert :ok = UpstreamWebsocketSession.close(session)
+      assert_receive {:DOWN, ^monitor, :process, ^session, :normal}, @message_detection_timeout_ms
+      refute_received {:upstream_websocket_connection_closed, _session, _signal}
+    end
+
+    test "a subscriber that is gone leaves the session serving" do
+      # Trapped, so a session tied to its subscriber fails the assertions below
+      # instead of taking the test process down with it.
+      Process.flag(:trap_exit, true)
+      subscriber = spawn(fn -> receive do: (:never_sent -> :ok) end)
+      peer = start_raw_websocket_peer()
+      session = start_subscribed_session!(subscriber)
+      request = raw_websocket_request(peer.url, self())
+      lifecycle = lifecycle_state(session)
+
+      subscriber_monitor = Process.monitor(subscriber)
+      Process.exit(subscriber, :kill)
+      assert_receive {:DOWN, ^subscriber_monitor, :process, ^subscriber, :killed}, @message_detection_timeout_ms
+
+      assert {:ok, _first} = UpstreamWebsocketSession.request(session, request)
+
+      _log =
+        close_idle_connection_from_peer!(peer, session, fn server_socket ->
+          :ok = :gen_tcp.send(server_socket, raw_websocket_server_close_frame(1000))
+        end)
+
+      assert {:ok, second} = UpstreamWebsocketSession.request(session, request)
+      assert_connection_metadata(second, %{lifecycle | generation: 2}, false, false)
+      assert Process.alive?(session)
+      refute_received {:EXIT, ^session, _reason}
+    end
+  end
+
+  for pong_mode <- [:ignore_ping, :match_active_ping] do
+    test "in-flight keepalive cannot extend a silent response timeout with #{pong_mode}" do
+      with_short_keepalive(keepalive_interval_ms: 25, keepalive_pong_timeout_ms: @held_pong_timeout_ms)
+
+      peer = start_raw_websocket_peer(response_mode: :hold, pong_mode: unquote(pong_mode))
+      session = start_supervised!(UpstreamWebsocketSession)
+      task_supervisor = start_supervised!({Task.Supervisor, []})
+      request = %{raw_websocket_request(peer.url, self()) | timeouts: %{connect_timeout_ms: 1_000, receive_timeout_ms: 300}}
+      request_task = Task.Supervisor.async_nolink(task_supervisor, fn -> UpstreamWebsocketSession.request(session, request) end)
+
+      assert_receive {:raw_upstream_websocket_request, 1, 1}, @message_detection_timeout_ms
+      assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @message_detection_timeout_ms
+
+      result = Task.yield(request_task, @detection_timeout_ms) || Task.shutdown(request_task, :brutal_kill)
+
+      assert {:ok, {:error, %{reason: :upstream_websocket_receive_timeout, transport_failure: %{"termination_source" => "pooler_receive_timeout"}}}} = result
+      assert :closed = wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
+      refute Map.has_key?(:sys.get_state(session), :conn)
+    end
+  end
+
   @tag :upstream_websocket_pong_liveness
   test "active receive loop fails promptly when pong deadline fires during an in-flight request" do
-    with_short_keepalive(keepalive_interval_ms: 25, keepalive_pong_timeout_ms: 150)
+    with_held_keepalive(keepalive_pong_timeout_ms: @held_pong_timeout_ms)
 
     peer = start_raw_websocket_peer()
     {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
-    request = raw_websocket_request(peer.url, self())
+    # Held timeouts: the in-flight request can end only through the injected
+    # pong deadline, which the reason below names, never through its own
+    # receive timeout while the test is late to deliver the deadline.
+    request = %{raw_websocket_request(peer.url, self()) | timeouts: @held_timeouts}
 
     assert {:ok, %{terminal: "response.completed", status: 200}} =
              UpstreamWebsocketSession.request(session, request)
 
-    assert_receive {:upstream_websocket_frame, terminal_frame}, 1_000
-    assert %{"id" => _id} = Jason.decode!(terminal_frame)
+    assert_receive {:upstream_websocket_frame, terminal_frame}, @detection_timeout_ms
+    assert %{"id" => _id} = CodexPooler.JSON.decode!(terminal_frame)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @detection_timeout_ms
+
+    fire_keepalive!(session)
+    assert_receive {:raw_upstream_websocket_control, :ping, 1, 1, _payload_bytes}, @detection_timeout_ms
+    pong_token = assert_pong_deadline_armed!(session, @held_pong_timeout_ms)
 
     set_raw_websocket_peer_response_mode(peer, :hold_after_created)
-    started_at = System.monotonic_time(:millisecond)
     request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
-    assert_receive {:upstream_websocket_frame, created_frame}, 1_000
-    assert %{"type" => "response.created"} = Jason.decode!(created_frame)
+    assert_receive {:upstream_websocket_frame, created_frame}, @detection_timeout_ms
+    assert %{"type" => "response.created"} = CodexPooler.JSON.decode!(created_frame)
 
-    result =
-      case Task.yield(request_task, 600) do
-        {:ok, result} ->
-          result
-
-        nil ->
-          Task.shutdown(request_task, :brutal_kill)
-          :request_still_waiting
-      end
-
-    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    # The request is in the session's receive loop; the idle-armed deadline
+    # fires there and ends it, long before its held receive timeout could.
+    send(session, {:upstream_websocket_pong_deadline, pong_token})
+    result = Task.await(request_task, @message_detection_timeout_ms)
 
     assert {:error,
             %{
@@ -3076,10 +4829,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
               }
             }} = result
 
-    assert elapsed_ms < 600
     assert body =~ "response.created"
     assert Process.alive?(session)
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 150)
+    assert :closed = wait_for_raw_websocket_connection_closed(1, @detection_timeout_ms)
 
     set_raw_websocket_peer_response_mode(peer, :terminal)
 
@@ -3099,29 +4851,88 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
-    request = %{
-      raw_websocket_request(peer.url, self())
-      | timeouts: %{connect_timeout_ms: 1_000, receive_timeout_ms: 5_000}
-    }
+    request_id = Ecto.UUID.generate()
+    attempt_id = Ecto.UUID.generate()
+    request = %{raw_websocket_request(peer.url, self()) | timeouts: @held_timeouts, request_id: request_id, attempt_id: attempt_id}
 
     initial_lifecycle = lifecycle_state(session)
     request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_request, 1, 1}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @message_detection_timeout_ms
+    assert_receive {:raw_upstream_websocket_request, 1, 1}, @message_detection_timeout_ms
 
-    assert Task.shutdown(request_task, :brutal_kill) == nil
-    assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
-    assert lifecycle_state(session) == %{initial_lifecycle | generation: 1}
+    {closed_lifecycle, log} =
+      with_info_log(fn ->
+        assert Task.shutdown(request_task, :brutal_kill) == nil
+        assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
+        lifecycle_state(session)
+      end)
+
+    assert closed_lifecycle == %{initial_lifecycle | generation: 1}
+    assert log =~ "upstream websocket request connection closed reason_code=request_caller_down closed_by=pooler close_completed=true"
+    assert log =~ "request_id=#{request_id} attempt_id=#{attempt_id}"
+    assert log =~ "lifecycle_id=#{initial_lifecycle.lifecycle_id} generation=1"
+    assert log =~ "terminal_seen=false last_upstream_event_type=none last_upstream_event_class=none text_frame_count=0"
+    assert length(String.split(log, "upstream websocket request connection closed")) == 2
+    refute log =~ "synthetic-upstream-token"
 
     set_raw_websocket_peer_response_mode(peer, :terminal)
 
     assert {:ok, result} = UpstreamWebsocketSession.request(session, request)
-    assert_receive {:raw_upstream_websocket_connection, 2}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 2}, @message_detection_timeout_ms
 
     generation_two = %{initial_lifecycle | generation: 2}
     assert_connection_metadata(result, generation_two, false, true)
     assert raw_websocket_peer_connection_count(peer) == 2
+  end
+
+  # A compaction reports `response.compaction.compacting` before its closed
+  # item, so a drain or a cancelled task can find it in that phase; the close
+  # line then names the compaction family, not `response.unknown`.
+  test "request caller exit in a compaction's compacting phase names the compaction family in the close line" do
+    peer = start_raw_websocket_peer(response_mode: :hold_after_compacting)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = %{raw_websocket_request(peer.url, self()) | timeouts: @held_timeouts, request_id: Ecto.UUID.generate(), attempt_id: Ecto.UUID.generate()}
+    request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+    assert_receive {:raw_upstream_websocket_request, 1, 1}, @message_detection_timeout_ms
+
+    for type <- ~w(response.created response.in_progress response.output_item.added response.compaction.compacting) do
+      assert_receive {:upstream_websocket_frame, frame}, @detection_timeout_ms
+      assert %{"type" => ^type} = CodexPooler.JSON.decode!(frame)
+    end
+
+    {_lifecycle, log} =
+      with_info_log(fn ->
+        assert Task.shutdown(request_task, :brutal_kill) == nil
+        assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
+        lifecycle_state(session)
+      end)
+
+    assert log =~ "upstream websocket request connection closed reason_code=request_caller_down closed_by=pooler close_completed=true"
+    assert log =~ "terminal_seen=false last_upstream_event_type=response.compaction last_upstream_event_class=response_event text_frame_count=4"
+    refute log =~ "response.unknown"
+  end
+
+  test "a caller that exits after the response terminal keeps the upstream reusable without a cancellation close" do
+    peer = start_raw_websocket_peer()
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = %{raw_websocket_request(peer.url, self()) | timeouts: @held_timeouts}
+
+    {result, log} =
+      with_info_log(fn ->
+        caller = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+        caller_monitor = Process.monitor(caller.pid)
+        assert {:ok, %{terminal: "response.completed"}} = Task.await(caller, @message_detection_timeout_ms)
+        assert_receive {:DOWN, ^caller_monitor, :process, _pid, :normal}, @message_detection_timeout_ms
+        UpstreamWebsocketSession.request(session, request)
+      end)
+
+    assert {:ok, %{upstream_websocket_connection: %{generation: 1, reused: true}}} = result
+    assert raw_websocket_peer_connection_count(peer) == 1
+    refute log =~ "upstream websocket request connection closed"
   end
 
   test "request caller exit during websocket upgrade closes before payload send and reconnects" do
@@ -3129,15 +4940,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
-    request = %{
-      raw_websocket_request(peer.url, self())
-      | timeouts: %{connect_timeout_ms: 1_000, receive_timeout_ms: 5_000}
-    }
+    request = %{raw_websocket_request(peer.url, self()) | timeouts: @held_timeouts}
 
     initial_lifecycle = lifecycle_state(session)
     request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @message_detection_timeout_ms
     assert Task.shutdown(request_task, :brutal_kill) == nil
 
     assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
@@ -3151,8 +4959,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     set_raw_websocket_peer_upgrade_mode(peer, :valid)
 
     assert {:ok, result} = UpstreamWebsocketSession.request(session, request)
-    assert_receive {:raw_upstream_websocket_connection, 2}, 1_000
-    assert_receive {:upstream_websocket_frame, _frame}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 2}, @message_detection_timeout_ms
+    assert_receive {:upstream_websocket_frame, _frame}, @message_detection_timeout_ms
 
     generation_one = %{initial_lifecycle | generation: 1}
     assert_connection_metadata(result, generation_one, false, true)
@@ -3175,8 +4983,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_tls_client_hello, 1, bytes} when bytes > 0, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @message_detection_timeout_ms
+    assert_receive {:raw_upstream_tls_client_hello, 1, bytes} when bytes > 0, @message_detection_timeout_ms
     assert Task.shutdown(request_task, :brutal_kill) == nil
 
     assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
@@ -3212,14 +5020,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
               }
             }} = UpstreamWebsocketSession.request(session, request)
 
-    assert_receive {:raw_upstream_websocket_connection, 1}, 1_000
-    assert_receive {:raw_upstream_websocket_request, 1, 1}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 1}, @message_detection_timeout_ms
+    assert_receive {:raw_upstream_websocket_request, 1, 1}, @message_detection_timeout_ms
     assert :closed = wait_for_raw_websocket_connection_closed(1, 200)
 
     set_raw_websocket_peer_response_mode(peer, :terminal)
 
     assert {:ok, result} = UpstreamWebsocketSession.request(session, request)
-    assert_receive {:raw_upstream_websocket_connection, 2}, 1_000
+    assert_receive {:raw_upstream_websocket_connection, 2}, @message_detection_timeout_ms
 
     generation_two = %{initial_lifecycle | generation: 2}
     assert_connection_metadata(result, generation_two, false, true)
@@ -3228,50 +5036,53 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "does not treat response.created as upstream websocket terminal success" do
     parent = self()
+    release_ref = make_ref()
 
-    upstream =
-      start_upstream(
-        FakeUpstream.delayed_sse_stream(
-          [
-            %{
-              "type" => "response.created",
-              "response" => %{"id" => "resp_ws_created_only"}
-            },
-            %{
-              "type" => "response.completed",
-              "response" => %{"id" => "resp_ws_created_only"}
-            }
-          ],
-          done: false,
-          interval_ms: 250
-        )
+    frames =
+      Enum.map(
+        [
+          %{"type" => "response.created", "response" => %{"id" => "resp_ws_created_only"}},
+          %{"type" => "response.completed", "response" => %{"id" => "resp_ws_created_only"}}
+        ],
+        &CodexPooler.JSON.encode!/1
       )
+
+    # response.completed stays behind a frame barrier until the test has seen
+    # the turn still open after response.created; a 250 ms push interval let a
+    # stalled test find the turn already completed (findings#206 row 206-291).
+    upstream =
+      start_upstream(FakeUpstream.barrier_websocket_frames(frames, notify: parent, release_ref: release_ref))
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     request = %Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
       headers: [{"authorization", "Bearer synthetic-upstream-token"}],
       payload:
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "model" => "upstream-test-model",
           "input" => [%{"type" => "message", "role" => "user", "content" => "sample"}],
           "stream" => true
         }),
-      timeouts: @timeouts,
+      timeouts: @held_timeouts,
       writer: fn text -> send(parent, {:upstream_websocket_frame, text}) end,
       message_mapper: nil
     }
 
     request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
-    assert_receive {:upstream_websocket_frame, created_frame}, 1_000
-    assert %{"type" => "response.created"} = Jason.decode!(created_frame)
+    assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^release_ref}, @message_detection_timeout_ms
+    assert :ok = FakeUpstream.release_frame(upstream, release_ref)
+    assert_receive {:fake_upstream_frame_barrier, 1, _handler, ^release_ref}, @message_detection_timeout_ms
+    assert_receive {:upstream_websocket_frame, created_frame}, @message_detection_timeout_ms
+    assert %{"type" => "response.created"} = CodexPooler.JSON.decode!(created_frame)
     refute Task.yield(request_task, 50)
 
-    assert {:ok, %{terminal: "response.completed", status: 200}} = Task.await(request_task, 1_000)
-    assert_receive {:upstream_websocket_frame, completed_frame}, 1_000
-    assert %{"type" => "response.completed"} = Jason.decode!(completed_frame)
+    assert :ok = FakeUpstream.release_remaining_frames(upstream, release_ref)
+    assert {:ok, %{terminal: "response.completed", status: 200}} = Task.await(request_task, @message_detection_timeout_ms)
+    assert_receive {:upstream_websocket_frame, completed_frame}, @message_detection_timeout_ms
+    assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(completed_frame)
   end
 
   test "returns only bounded retained body while writing every upstream websocket frame" do
@@ -3314,10 +5125,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     request = %Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
       headers: [{"authorization", "Bearer synthetic-upstream-token"}],
       payload:
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "model" => "upstream-test-model",
           "input" => [%{"type" => "message", "role" => "user", "content" => "sample"}],
           "stream" => true
@@ -3333,11 +5145,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     written_frames =
       1..length(events)
       |> Enum.map(fn _index ->
-        assert_receive {:upstream_websocket_frame, frame}, 1_000
+        assert_receive {:upstream_websocket_frame, frame}, @message_detection_timeout_ms
         frame
       end)
 
-    assert Enum.map(written_frames, &Jason.decode!/1) == events
+    assert Enum.map(written_frames, &CodexPooler.JSON.decode!/1) == events
 
     full_body =
       written_frames
@@ -3353,15 +5165,15 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     response_id = "response-identity-early"
 
     frames = [
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.created",
         "response" => %{"id" => response_id}
       }),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.output_text.delta",
         "delta" => String.duplicate("x", 70_000)
       }),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"status" => "completed"}
       })
@@ -3369,6 +5181,92 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     assert {:ok, %{body: body, response_id: ^response_id}} = request_websocket_frames(frames)
     refute String.contains?(body, response_id)
+  end
+
+  @tag :collect_compaction
+  test "collects a compaction item that later frames push past the diagnostic retention bound" do
+    encrypted_content = "opaque-compaction-result"
+
+    item_frame =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_item.done",
+        "item" => %{"type" => "compaction", "encrypted_content" => encrypted_content}
+      })
+
+    # The compact result is authoritative for the collect delivery modes, so it
+    # must survive however many frames follow it. 40 * 2 KiB clears the 64 KiB
+    # diagnostic retention bound that used to evict the item above.
+    filler_frames =
+      for index <- 1..40 do
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.output_text.delta",
+          "sequence_number" => index,
+          "delta" => String.duplicate("x", 2_048)
+        })
+      end
+
+    terminal_frame =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.completed",
+        "response" => %{"id" => "resp_collect_past_retention", "status" => "completed"}
+      })
+
+    assert {:ok, %{body: body, terminal: "response.completed"}} =
+             request_websocket_frames(
+               [item_frame] ++ filler_frames ++ [terminal_frame],
+               writer: nil,
+               websocket_delivery_mode: :collect_full_history,
+               effective_serving_mode: "full",
+               payload: full_history_compaction_payload()
+             )
+
+    assert {:ok, %{compaction_item: %{"encrypted_content" => ^encrypted_content}}} =
+             CompactionResultCollector.collect_websocket_body(body)
+
+    assert byte_size(body) > 65_536
+  end
+
+  test "attributes a truncated retained body to its transport and route class" do
+    attach_stream_buffer_telemetry()
+
+    frames = [
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_item.done",
+        "item" => %{"type" => "compaction", "encrypted_content" => "opaque-compaction-result"}
+      }),
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_text.delta",
+        "delta" => String.duplicate("x", 70_000)
+      }),
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.completed",
+        "response" => %{"status" => "completed"}
+      })
+    ]
+
+    assert {:ok, _collected} =
+             request_websocket_frames(frames,
+               writer: nil,
+               websocket_delivery_mode: :collect_full_history,
+               effective_serving_mode: "full",
+               payload: full_history_compaction_payload()
+             )
+
+    assert_receive {[:codex_pooler, :gateway, :stream_buffer, :truncated], %{count: 1},
+                    %{
+                      buffer: "retained_body",
+                      transport: "websocket",
+                      route_class: "proxy_compact"
+                    }}
+
+    assert {:ok, _relayed} = request_websocket_frames(frames)
+
+    assert_receive {[:codex_pooler, :gateway, :stream_buffer, :truncated], %{count: 1},
+                    %{
+                      buffer: "retained_body",
+                      transport: "websocket",
+                      route_class: "proxy_websocket"
+                    }}
   end
 
   test "captures nested identities from each allowlisted typed lifecycle or success frame" do
@@ -3385,7 +5283,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
         frames =
           [
-            Jason.encode!(%{
+            CodexPooler.JSON.encode!(%{
               "type" => type,
               "response" => %{"id" => "  #{response_id}  ", "status" => "completed"}
             })
@@ -3401,7 +5299,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     response_id = "response-identity-done"
 
     frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.done",
         "response" => %{"id" => response_id, "status" => "completed"}
       })
@@ -3418,26 +5316,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       ~s({"type":"response.metadata","response_id":"metadata-response-id"}),
       ~s({"response_id":"typeless-response-id"}),
       ~s({"type":"response.created","response":{"id":"   "}}),
-      Jason.encode!(%{"type" => "response.created", "response" => %{"id" => 1}}),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{"type" => "response.created", "response" => %{"id" => 1}}),
+      CodexPooler.JSON.encode!(%{
         "type" => "response.created",
         "response" => %{"id" => String.duplicate("x", 1_025)}
       }),
       ~s({"type":"response.created","response":{"id":"unterminated"),
       ~s(["not-an-object"]),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.created",
         "response" => %{"id" => first_response_id}
       }),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.in_progress",
         "response" => %{"id" => first_response_id}
       }),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.queued",
         "response" => %{"id" => "response-identity-conflict"}
       }),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"status" => "completed"}
       })
@@ -3448,18 +5346,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "captures a typeless whole-response id but omits identities from failures" do
     typeless_id = "response-identity-typeless"
-    typeless_frame = Jason.encode!(%{"id" => "  #{typeless_id}  "})
+    typeless_frame = CodexPooler.JSON.encode!(%{"id" => "  #{typeless_id}  "})
 
     assert {:ok, %{response_id: ^typeless_id, terminal: "response.completed"}} =
              request_websocket_frames([typeless_frame])
 
     created =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.created",
         "response" => %{"id" => "response-identity-failure"}
       })
 
-    upstream = start_upstream(FakeUpstream.websocket_sse_then_close([Jason.decode!(created)]))
+    upstream =
+      start_upstream(FakeUpstream.websocket_sse_then_close([CodexPooler.JSON.decode!(created)]))
+
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
@@ -3480,11 +5380,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       ],
       fn {type, status} ->
         frames = [
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.created",
             "response" => %{"id" => "response-identity-semantic-#{status}"}
           }),
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => type,
             "response" => %{"status" => status}
           })
@@ -3501,18 +5401,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     response_id = "response-identity-raw"
 
     mapper = fn text ->
-      case Jason.decode!(text) do
+      case CodexPooler.JSON.decode!(text) do
         %{"type" => "response.created"} -> ~s({"type":"response.created"})
         _frame -> text
       end
     end
 
     frames = [
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.created",
         "response" => %{"id" => response_id}
       }),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"status" => "completed"}
       })
@@ -3526,7 +5426,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   test "completes without a response identity when no valid identity was captured" do
     frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"status" => "completed"}
       })
@@ -3553,6 +5453,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     parent = self()
 
     request = %Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
       headers: [{"authorization", "Bearer synthetic-upstream-token"}],
       payload: "{}",
@@ -3589,11 +5490,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   test "marked continuation forwards unchanged on a reused connection" do
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           websocket_success_without_id()
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1),
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1)
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -3610,6 +5511,43 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert [warmup_request, continuation_request] = FakeUpstream.requests(upstream)
     assert continuation_request.body == marked_request.payload
     assert warmup_request.websocket_connection_id == continuation_request.websocket_connection_id
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  # Only a Lite continuation on a context whose last completed response on the
+  # connection was served in Full is refused (findings#232 rows 232-210 and
+  # 232-273): an unknown mode, the same mode, or a Full continuation after Lite
+  # (a replay kept in Lite, then a Full turn) is sent.
+  for {previous_mode, continuation_mode, sent?} <- [{nil, "lite", true}, {"lite", "lite", true}, {"full", "full", true}, {"lite", "full", true}, {"full", "lite", false}] do
+    @tag :continuation_generation_boundary
+    test "marked continuation in #{continuation_mode} after a #{previous_mode || "mode-less"} response on a reused connection is #{if sent?, do: "sent", else: "refused"}" do
+      turns = if unquote(sent?), do: 2, else: 1
+
+      upstream =
+        start_upstream(
+          # provenance: synthetic_adversarial
+          FakeUpstream.strict_sequence(List.duplicate(strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1), turns))
+        )
+
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+      request = websocket_request(FakeUpstream.url(upstream))
+      assert {:ok, _first} = UpstreamWebsocketSession.request(session, %{request | effective_serving_mode: unquote(previous_mode)})
+      assert {:ok, result} = UpstreamWebsocketSession.request(session, %{request | connection_bound_continuation?: true, effective_serving_mode: unquote(continuation_mode)})
+
+      assert result.upstream_websocket_connection.reused
+      assert length(FakeUpstream.requests(upstream)) == turns
+
+      if unquote(sent?) do
+        refute Map.has_key?(result, :transport_failure)
+      else
+        assert result.transport_failure["reason"] == "previous_response_serving_mode_mismatch"
+        assert result.upstream_error_param == "previous_response_id"
+      end
+
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
   end
 
   @tag :collect_compaction
@@ -3622,7 +5560,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     request = %{
       request
       | payload:
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "previous_response_id" => "resp_old",
             "input" => [
@@ -3650,7 +5588,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     request = %{
       request
       | payload:
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "input" => [
               %{"type" => "message", "role" => "user", "content" => "synthetic"},
@@ -3671,24 +5609,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   @tag :collect_compaction
   test "collect compaction retains frames without a writer on a reused matching-mode connection" do
     item =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.output_item.done",
         "item" => %{"type" => "compaction", "encrypted_content" => "opaque-compact"}
       })
 
     terminal =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_collect_matching", "status" => "completed"}
       })
 
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           FakeUpstream.websocket_text_frames([item, terminal])
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1),
+          strict_websocket_turn(FakeUpstream.websocket_text_frames([item, terminal]),
+            websocket_connection_ordinal: 1
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -3714,17 +5654,81 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert [warmup_request, collect_request] = FakeUpstream.requests(upstream)
     assert warmup_request.websocket_connection_id == collect_request.websocket_connection_id
     assert collect_request.body == collect.payload
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  for {failure_mode, phase, source} <- [
+        {:transport_close, "receive", "mint_transport_error"},
+        {:peer_close, "upstream_close", "peer_close_frame"},
+        {:unexpected_binary, "unexpected_frame", "unexpected_binary_frame"}
+      ] do
+    @tag :compaction_connection_recovery
+    test "client-authored full-history retry reconnects after collected #{failure_mode}" do
+      peer = start_raw_websocket_peer()
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+      request = ordinary_request(raw_websocket_request(peer.url, self()))
+
+      assert {:ok, %{terminal: "response.completed"}} =
+               UpstreamWebsocketSession.request(session, request)
+
+      Agent.update(peer.state, &%{&1 | response_mode: unquote(failure_mode)})
+
+      payload = %{
+        "type" => "response.create",
+        "previous_response_id" => "resp_raw_ws_1_1",
+        "input" => [
+          %{"type" => "message", "role" => "user", "content" => "synthetic"},
+          %{"type" => "compaction_trigger"}
+        ]
+      }
+
+      collect = %{
+        request
+        | payload: CodexPooler.JSON.encode!(payload),
+          writer: nil,
+          websocket_delivery_mode: :collect_compaction
+      }
+
+      assert {:error, failure} = UpstreamWebsocketSession.request(session, collect)
+      assert failure.transport_failure["phase"] == unquote(phase)
+      assert failure.transport_failure["termination_source"] == unquote(source)
+      assert failure.transport_failure["terminal_seen"] == false
+      assert Agent.get(peer.state, & &1.connection_count) == 1
+      assert_receive {:raw_upstream_websocket_request, 1, 2}, @detection_timeout_ms
+
+      Agent.update(peer.state, &%{&1 | response_mode: :terminal})
+
+      retry = %{
+        collect
+        | payload: payload |> Map.delete("previous_response_id") |> CodexPooler.JSON.encode!(),
+          websocket_delivery_mode: :collect_full_history
+      }
+
+      assert {:ok, %{terminal: "response.completed"} = result} =
+               UpstreamWebsocketSession.request(session, retry)
+
+      refute result.upstream_websocket_connection.reused
+      refute result.upstream_websocket_connection.reconnected
+      assert Agent.get(peer.state, & &1.connection_count) == 2
+      assert lifecycle_state(session).generation == 2
+      assert_receive {:raw_upstream_websocket_request, 2, 1}, @detection_timeout_ms
+      refute_receive {:raw_upstream_websocket_request, 1, 3}
+      refute_receive {:raw_upstream_websocket_request, 2, 2}
+    end
   end
 
   @tag :collect_compaction
   test "collect compaction rejects fresh mode-mismatched and invalidated connections without send or reconnect" do
+    # Strict finite scenario: only the warmup reaches the upstream; every
+    # guarded collection must send nothing and open no connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           websocket_success_without_id()
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1)
+        ])
       )
 
     request = websocket_request(FakeUpstream.url(upstream))
@@ -3782,18 +5786,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     assert [_warmup_request] = FakeUpstream.requests(upstream)
     assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   @tag :collect_compaction
   test "collect compaction does not reconnect after a preterminal close" do
+    # Strict finite scenario: the collection rides the warmup connection and
+    # the preterminal close must not be followed by a reconnect send.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           FakeUpstream.websocket_sse_then_close([]),
-           websocket_success_without_id()
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1),
+          strict_websocket_turn(FakeUpstream.websocket_sse_then_close([]),
+            websocket_connection_ordinal: 1
+          )
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -3820,28 +5828,31 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert [_warmup_request, collect_request] = FakeUpstream.requests(upstream)
     assert collect_request.body == collect.payload
     assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   @tag :continuation_generation_boundary
-  test "marked continuation on a replacement connection writes one retry terminal and keeps it reusable" do
+  test "public marked continuation on a replacement key refuses before acquisition and leaves the producing connection intact" do
+    # Strict finite scenario: the guarded continuation sends nothing, and the
+    # later full request must open the replacement connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           websocket_success_without_id()
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1),
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 2)
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
-    warmup_request = websocket_request(FakeUpstream.url(upstream))
+    warmup_request = %{websocket_request(FakeUpstream.url(upstream)) | message_mapper: &StreamProtocol.normalize_public_openai_responses_json_message/1}
     replacement_request = %{warmup_request | url: warmup_request.url <> "?scope=replacement"}
 
     assert {:ok, _warmup} = UpstreamWebsocketSession.request(session, warmup_request)
 
-    assert_guard_terminal(
+    assert_public_guard_terminal(
       session,
       %{replacement_request | connection_bound_continuation?: true},
       :replacement_guard,
@@ -3849,35 +5860,39 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     )
 
     assert [_warmup] = FakeUpstream.requests(upstream)
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
 
     assert {:ok, later_result} =
              UpstreamWebsocketSession.request(session, replacement_request)
 
-    assert later_result.upstream_websocket_connection.reused
+    refute later_result.upstream_websocket_connection.reused
     assert [warmup, later_full_request] = FakeUpstream.requests(upstream)
     assert warmup.websocket_connection_id != later_full_request.websocket_connection_id
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   @tag :continuation_generation_boundary
-  test "marked continuation after invalidation writes one retry terminal and keeps reconnect reusable" do
+  test "repeated public marked continuations after invalidation refuse before acquisition until an unanchored request" do
+    # Strict finite scenario: the guarded continuation sends nothing after
+    # invalidation, and the later request must open the reconnect connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           websocket_success_without_id()
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1),
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 2)
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
     on_exit(fn -> UpstreamWebsocketSession.close(session) end)
 
-    request = websocket_request(FakeUpstream.url(upstream))
+    request = %{websocket_request(FakeUpstream.url(upstream)) | message_mapper: &StreamProtocol.normalize_public_openai_responses_json_message/1}
     assert {:ok, _warmup} = UpstreamWebsocketSession.request(session, request)
     assert :ok = UpstreamWebsocketSession.invalidate_connection(session)
 
-    assert_guard_terminal(
+    assert_public_guard_terminal(
       session,
       %{request | connection_bound_continuation?: true},
       :invalidation_guard,
@@ -3886,22 +5901,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
     assert [_warmup] = FakeUpstream.requests(upstream)
 
+    assert_public_guard_terminal(
+      session,
+      %{request | connection_bound_continuation?: true},
+      :second_invalidation_guard,
+      :reconnected
+    )
+
+    assert [_warmup] = FakeUpstream.requests(upstream)
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert {:ok, %{generation: nil}} = UpstreamWebsocketSession.live_connection(session)
+
     assert {:ok, later_result} = UpstreamWebsocketSession.request(session, request)
-    assert later_result.upstream_websocket_connection.reused
+    refute later_result.upstream_websocket_connection.reused
+    assert later_result.upstream_websocket_connection.reconnected
     assert length(FakeUpstream.requests(upstream)) == 2
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   @tag :continuation_generation_boundary
-  test "transparent reconnect never replays a marked continuation on the next generation" do
+  test "ambiguous marked continuation close requires a later explicit request" do
+    # Strict finite scenario: the marked continuation rides the warmup
+    # connection, its ambiguous close triggers no reconnect send, and only the
+    # later explicit request opens the replacement connection.
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_success_without_id(),
-           FakeUpstream.websocket_sse_then_close([]),
-           websocket_success_without_id()
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1),
+          strict_websocket_turn(FakeUpstream.websocket_sse_then_close([]),
+            websocket_connection_ordinal: 1
+          ),
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 2)
+        ])
       )
 
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -3910,48 +5943,92 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     request = websocket_request(FakeUpstream.url(upstream))
     assert {:ok, _warmup} = UpstreamWebsocketSession.request(session, request)
 
-    assert_guard_terminal(
-      session,
-      %{request | connection_bound_continuation?: true},
-      :transparent_reconnect_guard,
-      :reconnected
-    )
+    assert {:error, failure} =
+             UpstreamWebsocketSession.request(
+               session,
+               %{request | connection_bound_continuation?: true}
+             )
+
+    assert failure.reason == :upstream_websocket_closed_before_terminal
+    assert failure.transport_failure["upstream_committed"] == true
 
     assert [warmup, continuation] = FakeUpstream.requests(upstream)
     assert warmup.websocket_connection_id == continuation.websocket_connection_id
 
     assert {:ok, later_result} = UpstreamWebsocketSession.request(session, request)
-    assert later_result.upstream_websocket_connection.reused
+    refute later_result.upstream_websocket_connection.reconnected
 
     assert [_warmup, continuation, later_full_request] = FakeUpstream.requests(upstream)
     assert later_full_request.websocket_connection_id != continuation.websocket_connection_id
     assert FakeUpstream.websocket_connection_count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   @tag :continuation_generation_boundary
-  test "request_once writes one retry terminal without sending marked continuation bytes" do
+  test "native fresh continuation acquires a replacement without sending and reuses it for explicit full retry" do
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          strict_websocket_turn(websocket_success_without_id(), websocket_connection_ordinal: 1)
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    parent = self()
+
+    request = %{
+      websocket_request(FakeUpstream.url(upstream))
+      | native_codex_response_control: %TurnSnapshot{models_etag: "native-guard-etag"},
+        writer: fn frame -> send(parent, {:native_guard_frame, frame}) end
+    }
+
+    assert {:ok, result} = UpstreamWebsocketSession.request(session, %{request | connection_bound_continuation?: true})
+    assert result.upstream_error_code == "previous_response_not_found"
+    assert result.transport_failure == expected_guard_metadata(:fresh)
+    assert_receive {:native_guard_frame, metadata}, @message_detection_timeout_ms
+    assert %{"type" => "codex.response.metadata"} = CodexPooler.JSON.decode!(metadata)
+    terminal = native_retry_terminal()
+    assert_receive {:native_guard_frame, ^terminal}, @message_detection_timeout_ms
+    refute_received {:native_guard_frame, _extra_frame}
+    assert FakeUpstream.requests(upstream) == []
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert {:ok, %{generation: generation}} = UpstreamWebsocketSession.live_connection(session)
+    assert is_integer(generation)
+
+    assert {:ok, result} = UpstreamWebsocketSession.request(session, request)
+    assert result.upstream_websocket_connection.reused
+    assert [_full_retry] = FakeUpstream.requests(upstream)
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  @tag :continuation_generation_boundary
+  test "public request_once writes one refusal terminal without sending marked continuation bytes" do
     upstream = start_upstream(websocket_success_without_id())
     parent = self()
 
     request =
       FakeUpstream.url(upstream)
       |> websocket_request()
+      |> Map.put(:message_mapper, &StreamProtocol.normalize_public_openai_responses_json_message/1)
       |> Map.put(:connection_bound_continuation?, true)
       |> Map.put(:writer, fn frame -> send(parent, {:guard_frame, :request_once_guard, frame}) end)
 
-    assert_guard_result(
+    assert_public_guard_result(
       UpstreamWebsocketSession.request_once(request),
       :request_once_guard,
       :fresh
     )
 
-    # The guard aborts before any bytes are sent, so this is the one connection
-    # assertion in this file with no recorded request to serve as its barrier —
-    # every other one reads `requests/1` first, and a recorded request is proof
-    # the handler's `init/1` has already run.
+    # Synchronous admission refuses before acquisition, not merely before send.
     assert FakeUpstream.requests(upstream) == []
-    assert FakeUpstream.await_websocket_connection_count(upstream, 1) == 1
+    assert FakeUpstream.websocket_connection_count(upstream) == 0
   end
+
+  # What a request reports when the peer ends the connection under it: an orderly close, a reset or a broken pipe.
+  @peer_ended_connection_reasons [:closed, :econnreset, :epipe]
 
   @tag :fake_upstream_lifecycle_regression
   test "owner shutdown keeps FakeUpstream state alive through websocket initialization" do
@@ -3975,40 +6052,45 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         end
       end)
 
-    assert_receive {:fake_upstream_started, ^owner, upstream}, 1_000
+    # The owner is not linked to the test, so a failure before the stop below would leave the fake running.
+    on_exit(fn ->
+      if Process.alive?(owner), do: send(owner, :stop_fake_upstream_owner)
+    end)
+
+    assert_receive {:fake_upstream_started, ^owner, upstream}, @message_detection_timeout_ms
     supervisor_monitor = Process.monitor(upstream.supervisor)
 
     request_task =
       Task.async(fn ->
-        request = %{
-          websocket_request(FakeUpstream.url(upstream))
-          | connection_bound_continuation?: true
-        }
+        request = websocket_request(FakeUpstream.url(upstream))
 
         UpstreamWebsocketSession.request_once(request)
       end)
 
     assert_receive {:fake_upstream_websocket_barrier, :before_init, websocket_pid, ^release_ref},
-                   1_000
+                   @message_detection_timeout_ms
 
     send(owner, :stop_fake_upstream_owner)
-    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :shutdown}, 1_000
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :shutdown}, @message_detection_timeout_ms
     assert Process.alive?(upstream.pid)
+    FakeUpstream.set_mode(upstream, websocket_success_without_id())
     send(websocket_pid, {:fake_upstream_release_websocket, release_ref})
 
-    assert_receive {:fake_upstream_websocket_initialized, ^websocket_pid, ^release_ref}, 1_000
-    assert_receive {:DOWN, ^supervisor_monitor, :process, _, :shutdown}, 5_000
+    assert_receive {:fake_upstream_websocket_initialized, ^websocket_pid, ^release_ref}, @message_detection_timeout_ms
+    assert_receive {:DOWN, ^supervisor_monitor, :process, _, :shutdown}, @message_detection_timeout_ms
 
-    terminal = native_retry_terminal()
-
-    assert {:ok,
-            %{
-              body: "data: " <> ^terminal <> "\n\n",
-              terminal: "error",
-              status: 200,
-              upstream_error_code: "previous_response_not_found",
-              upstream_error_param: "previous_response_id"
-            }} = Task.await(request_task, 1_000)
+    # Nothing orders the request task against the fake's shutdown, so its outcome depends on how far it got: it was
+    # answered before the connection closed, or it decoded the close (a close frame in the same read as the upgrade
+    # response is decoded behind the 101 and fails the request before its payload is written), or its reads lagged
+    # behind the whole shutdown and the end of the connection reached it before a close frame it had read: before its
+    # send (the send found it closed) or after it (the receive saw it). A node shared with other suites produced the
+    # send-phase one (findings#303 row 303-7, Drone 1809).
+    case Task.await(request_task, @message_detection_timeout_ms) do
+      {:ok, %{terminal: "response.completed", status: 200}} -> :ok
+      {:error, %{reason: :upstream_websocket_closed_before_terminal}} -> :ok
+      {:error, %{reason: %Mint.TransportError{reason: reason}, transport_failure: %{"phase" => "send_payload", "termination_source" => "payload_send_error", "terminal_seen" => false, "text_frame_count" => 0}}} when reason in @peer_ended_connection_reasons -> :ok
+      {:error, %{reason: %Mint.TransportError{reason: reason}, transport_failure: %{"phase" => "receive", "termination_source" => "mint_transport_error", "terminal_seen" => false, "text_frame_count" => 0}}} when reason in @peer_ended_connection_reasons -> :ok
+    end
   end
 
   @tag :fake_upstream_lifecycle_regression
@@ -4029,7 +6111,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       if Process.alive?(owner), do: send(owner, :stop_fake_upstream_owner)
     end)
 
-    assert_receive {:fake_upstream_started, ^owner, upstream}, 1_000
+    assert_receive {:fake_upstream_started, ^owner, upstream}, @message_detection_timeout_ms
     server_monitor = Process.monitor(upstream.server)
     supervisor_monitor = Process.monitor(upstream.supervisor)
     state_monitor = Process.monitor(upstream.pid)
@@ -4037,55 +6119,73 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     capture_log(fn ->
       Supervisor.stop(upstream.server, :synthetic_failure)
 
-      assert_receive {:DOWN, ^server_monitor, :process, _, :synthetic_failure}, 1_000
-      assert_receive {:DOWN, ^supervisor_monitor, :process, _, :shutdown}, 1_000
-      assert_receive {:DOWN, ^state_monitor, :process, _, :shutdown}, 1_000
-      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :shutdown}, 1_000
+      assert_receive {:DOWN, ^server_monitor, :process, _, :synthetic_failure}, @message_detection_timeout_ms
+      assert_receive {:DOWN, ^supervisor_monitor, :process, _, :shutdown}, @message_detection_timeout_ms
+      assert_receive {:DOWN, ^state_monitor, :process, _, :shutdown}, @message_detection_timeout_ms
+      assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :shutdown}, @message_detection_timeout_ms
     end)
 
     assert {:error, %{body: "", reason: %Mint.TransportError{reason: :econnrefused}}} =
              UpstreamWebsocketSession.request_once(websocket_request(FakeUpstream.url(upstream)))
   end
 
-  defp assert_guard_terminal(session, request, label, connection_use) do
-    parent = self()
-    request = %{request | writer: fn frame -> send(parent, {:guard_frame, label, frame}) end}
-
-    assert_guard_result(UpstreamWebsocketSession.request(session, request), label, connection_use)
+  test "public owner repairs malformed failed envelopes before terminal classification" do
+    for response <- [:absent, nil, "scalar", ["list"]] do
+      terminal = %{"type" => "response.failed"}
+      terminal = if response == :absent, do: terminal, else: Map.put(terminal, "response", response)
+      upstream = start_upstream(FakeUpstream.strict_sequence([FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(terminal)])]))
+      {:ok, session} = UpstreamWebsocketSession.start_link([])
+      on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+      parent = self()
+      label = make_ref()
+      request = %{websocket_request(FakeUpstream.url(upstream)) | message_mapper: &StreamProtocol.normalize_public_openai_responses_json_message/1, writer: fn frame -> send(parent, {:malformed_failed_frame, label, frame}) end}
+      assert {:ok, %{terminal: "response.failed"}} = UpstreamWebsocketSession.request(session, request)
+      assert_receive {:malformed_failed_frame, ^label, frame}, @message_detection_timeout_ms
+      assert %{"type" => "response.failed", "response" => %{"status" => "failed", "error" => %{"code" => "upstream_error", "type" => "server_error"}}} = CodexPooler.JSON.decode!(frame)
+      refute_received {:malformed_failed_frame, ^label, _extra}
+      assert Process.alive?(session)
+      assert length(FakeUpstream.requests(upstream)) == 1
+      assert :ok = FakeUpstream.verify!(upstream)
+      IO.puts("MALFORMED_OWNER source_shape=#{if response == :absent, do: "absent", else: if(is_nil(response), do: "nil", else: if(is_binary(response), do: "scalar", else: "list"))} terminal=response.failed provider_requests=1 owner_alive=true")
+      assert :ok = UpstreamWebsocketSession.close(session)
+    end
   end
 
-  defp assert_guard_result(result, label, connection_use) do
-    terminal = native_retry_terminal()
+  defp assert_public_guard_terminal(session, request, label, connection_use) do
+    parent = self()
+    request = %{request | writer: fn frame -> send(parent, {:guard_frame, label, frame}) end}
+    assert_public_guard_result(UpstreamWebsocketSession.request(session, request), label, connection_use)
+  end
 
-    assert {:ok,
-            %{
-              body: "data: " <> ^terminal <> "\n\n",
-              terminal: "error",
-              status: 200,
-              headers: headers,
-              upstream_error_code: "previous_response_not_found",
-              upstream_error_param: "previous_response_id",
-              websocket_frame_headers: %{},
-              transport_failure: transport_failure,
-              upstream_websocket_connection: connection
-            }} = result
-
-    assert transport_failure ==
-             TransportFailureReason.continuation_generation_guard_metadata(connection_use)
-
-    assert connection.reused == false
+  defp assert_public_guard_result(result, label, connection_use) do
+    assert {:ok, %{terminal: "error", upstream_error_code: "previous_response_not_found", transport_failure: transport_failure, upstream_websocket_connection: connection}} = result
+    assert transport_failure == expected_guard_metadata(connection_use)
+    refute connection.reused
     assert connection.reconnected == (connection_use == :reconnected)
-
-    assert Enum.any?(headers, fn {name, value} ->
-             name == "sec-websocket-accept" and byte_size(value) > 0
-           end)
-
-    assert_receive {:guard_frame, ^label, ^terminal}, 1_000
+    assert_receive {:guard_frame, ^label, terminal}, @message_detection_timeout_ms
+    assert %{"type" => "error", "status" => 400, "error" => %{"type" => "invalid_request_error", "message" => "Invalid `previous_response_id`."} = error} = CodexPooler.JSON.decode!(terminal)
+    refute Map.has_key?(error, "code")
     refute_received {:guard_frame, ^label, _extra_terminal}
   end
 
+  for {connection_use, reason} <- [fresh: "previous_response_generation_mismatch", reconnected: "previous_response_generation_mismatch", reused: "previous_response_serving_mode_mismatch"] do
+    defp expected_guard_metadata(unquote(connection_use)) do
+      %{
+        "connection_use" => unquote(Atom.to_string(connection_use)),
+        "phase" => "send_payload",
+        "pre_visible_output" => true,
+        "reason" => unquote(reason),
+        "reason_class" => unquote(reason),
+        "termination_source" => "continuation_generation_guard",
+        "terminal_seen" => false,
+        "text_frame_count" => 0,
+        "upstream_committed" => false
+      }
+    end
+  end
+
   defp native_retry_terminal do
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "type" => "error",
       "status" => 400,
       "error" => %{
@@ -4111,7 +6211,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
             }} = result
 
     assert transport_failure ==
-             TransportFailureReason.continuation_generation_guard_metadata(connection_use)
+             expected_guard_metadata(connection_use)
 
     assert connection.reused == (connection_use == :reused)
     assert connection.reconnected == (connection_use == :reconnected)
@@ -4119,7 +6219,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   defp websocket_success_without_id do
     FakeUpstream.websocket_text_frames([
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"status" => "completed"}
       })
@@ -4128,6 +6228,36 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   defp websocket_success(response_id) do
     FakeUpstream.json_response(%{"id" => response_id, "object" => "response"})
+  end
+
+  defp strict_websocket_response(response_id, connection_ordinal) do
+    FakeUpstream.expect_request(
+      method: "WEBSOCKET",
+      path: "/backend-api/codex/responses",
+      websocket_connection_ordinal: connection_ordinal,
+      json: [valid: true, equals: %{"type" => "response.create"}],
+      respond:
+        FakeUpstream.websocket_text_frames([
+          CodexPooler.JSON.encode!(%{"id" => response_id, "object" => "response"})
+        ])
+    )
+  end
+
+  defp strict_websocket_turn(respond, expectations \\ []) do
+    FakeUpstream.expect_request(
+      [method: "WEBSOCKET", path: "/backend-api/codex/responses", json: [valid: true]]
+      |> Keyword.merge(expectations)
+      |> Keyword.put(:respond, respond)
+    )
+  end
+
+  defp strict_websocket_success(response_id, expectations \\ []) do
+    strict_websocket_turn(
+      FakeUpstream.websocket_text_frames([
+        CodexPooler.JSON.encode!(%{"id" => response_id, "object" => "response"})
+      ]),
+      expectations
+    )
   end
 
   defp request_websocket_frames(frames, request_opts \\ []) do
@@ -4150,14 +6280,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   defp maybe_append_terminal_frame(frames, _type) do
     frames ++
       [
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.completed",
           "response" => %{"status" => "completed"}
         })
       ]
   end
 
-  defp websocket_request(base_url) do
+  defp websocket_request(base_url, timeouts \\ @timeouts) do
     url =
       if String.ends_with?(base_url, "/backend-api/codex/responses") do
         base_url
@@ -4166,17 +6296,83 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       end
 
     %Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: url,
       headers: [],
       payload: "{}",
-      timeouts: @timeouts,
+      timeouts: timeouts,
       writer: fn _text -> :ok end,
       message_mapper: nil
     }
   end
 
+  defp attach_stream_buffer_telemetry do
+    handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:codex_pooler, :gateway, :stream_buffer, :truncated],
+      fn event, measurements, metadata, _config ->
+        send(parent, {event, measurements, metadata})
+      end,
+      :ok
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp full_history_compaction_payload do
+    CodexPooler.JSON.encode!(%{
+      "type" => "response.create",
+      "input" => [
+        %{"type" => "message", "role" => "user", "content" => "synthetic"},
+        %{"type" => "compaction_trigger"}
+      ]
+    })
+  end
+
+  defp generation_request(base_url, timeouts \\ @timeouts) do
+    %{
+      websocket_request(base_url, timeouts)
+      | payload: CodexPooler.JSON.encode!(%{"type" => "response.create"})
+    }
+  end
+
+  defp generation_request_counts(upstream) do
+    upstream
+    |> FakeUpstream.requests()
+    |> Enum.filter(&match?(%{"type" => "response.create"}, &1.json))
+    |> Enum.frequencies_by(& &1.websocket_connection_id)
+  end
+
+  defp connection_limit_terminal(:top_level) do
+    CodexPooler.JSON.encode!(%{
+      "type" => "error",
+      "status" => 400,
+      "code" => "websocket_connection_limit_reached"
+    })
+  end
+
+  defp connection_limit_terminal(:nested) do
+    CodexPooler.JSON.encode!(%{
+      "type" => "error",
+      "status" => 400,
+      "error" => %{"code" => "websocket_connection_limit_reached"}
+    })
+  end
+
+  defp websocket_connection_pid(upstream, connection_id) do
+    upstream.pid
+    |> :sys.get_state()
+    |> Map.fetch!(:websocket_pids_by_connection)
+    |> Map.fetch!(connection_id)
+  end
+
   defp metadata_event(frame) do
-    assert %{"type" => "codex.response.metadata", "headers" => headers} = Jason.decode!(frame)
+    assert %{"type" => "codex.response.metadata", "headers" => headers} =
+             CodexPooler.JSON.decode!(frame)
+
     headers
   end
 
@@ -4187,11 +6383,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   end
 
   defp ordinary_request(%Request{} = request) do
-    payload = request.payload |> Jason.decode!() |> Map.put_new("model", "upstream-test-model")
+    payload =
+      request.payload |> CodexPooler.JSON.decode!() |> Map.put_new("model", "upstream-test-model")
 
     %{
       request
-      | payload: Jason.encode!(payload),
+      | payload: CodexPooler.JSON.encode!(payload),
         request_id: Ecto.UUID.generate(),
         attempt_id: Ecto.UUID.generate(),
         effective_serving_mode: "full"
@@ -4244,9 +6441,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     ForwardedOwnerRequestHandoff.new(owner, witness)
   end
 
-  defp status_state(
-         {:status, _pid, {:module, :gen_server}, [_pdict, _running, _parent, _debug, status]}
-       ) do
+  defp status_state({:status, _pid, {:module, :gen_server}, [_pdict, _running, _parent, _debug, status]}) do
     status
     |> Keyword.get_values(:data)
     |> Enum.flat_map(& &1)
@@ -4256,9 +6451,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     end)
   end
 
-  defp status_logged_events(
-         {:status, _pid, {:module, :gen_server}, [_pdict, _running, _parent, _debug, status]}
-       ) do
+  defp status_logged_events({:status, _pid, {:module, :gen_server}, [_pdict, _running, _parent, _debug, status]}) do
     status
     |> Keyword.get_values(:data)
     |> Enum.flat_map(& &1)
@@ -4393,8 +6586,58 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     upstream
   end
 
-  defp with_short_keepalive(opts \\ []) do
-    original_env = Application.get_env(:codex_pooler, UpstreamWebsocketSession, [])
+  defp with_held_keepalive(opts) do
+    with_short_keepalive(Keyword.put_new(opts, :keepalive_interval_ms, @held_keepalive_interval_ms))
+  end
+
+  # Delivers the keepalive tick the session armed, as its timer would, and
+  # waits until the session handled it.
+  defp fire_keepalive!(session) do
+    assert %{keepalive_token: token} = :sys.get_state(session)
+    send(session, {:upstream_websocket_keepalive, token})
+    _state = :sys.get_state(session)
+    :ok
+  end
+
+  # The pong deadline armed by the last ping runs on the configured pong
+  # timeout; returns its token.
+  defp assert_pong_deadline_armed!(session, pong_timeout_ms) do
+    assert %{keepalive_pong_ref: ref, keepalive_pong_token: token} = :sys.get_state(session)
+    remaining_ms = Process.read_timer(ref)
+    assert is_integer(remaining_ms)
+    assert remaining_ms <= pong_timeout_ms and remaining_ms > pong_timeout_ms - @detection_timeout_ms
+    token
+  end
+
+  defp fire_pong_deadline!(session) do
+    assert %{keepalive_pong_token: token} = :sys.get_state(session)
+    send(session, {:upstream_websocket_pong_deadline, token})
+    :ok
+  end
+
+  defp await_pong_deadline_cleared!(session) do
+    deadline_ms = System.monotonic_time(:millisecond) + @detection_timeout_ms
+    await_pong_deadline_cleared!(session, deadline_ms)
+  end
+
+  defp await_pong_deadline_cleared!(session, deadline_ms) do
+    state = :sys.get_state(session)
+
+    cond do
+      not Map.has_key?(state, :keepalive_pong_ref) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline_ms ->
+        flunk("the matching pong never cleared the keepalive pong deadline")
+
+      true ->
+        Process.sleep(5)
+        await_pong_deadline_cleared!(session, deadline_ms)
+    end
+  end
+
+  defp with_short_keepalive(opts) do
+    original_env = CodexPooler.TestAppEnv.restore_on_exit(UpstreamWebsocketSession)
 
     settings =
       Keyword.merge(
@@ -4410,10 +6653,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       UpstreamWebsocketSession,
       Keyword.merge(original_env, settings)
     )
-
-    on_exit(fn ->
-      Application.put_env(:codex_pooler, UpstreamWebsocketSession, original_env)
-    end)
   end
 
   defp start_raw_websocket_peer(opts \\ []) do
@@ -4446,8 +6685,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       )
 
     peer = %{
-      url:
-        "#{Keyword.get(opts, :scheme, "http")}://127.0.0.1:#{port}/backend-api/codex/responses",
+      url: "#{Keyword.get(opts, :scheme, "http")}://127.0.0.1:#{port}/backend-api/codex/responses",
       state: state,
       supervisor: supervisor
     }
@@ -4469,12 +6707,48 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     name
   end
 
+  defp with_info_log(fun) do
+    previous_logger_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: previous_logger_level) end)
+
+    try do
+      with_log([level: :info], fun)
+    after
+      Logger.configure(level: previous_logger_level)
+    end
+  end
+
+  # The drain of a Close decoded behind a halting frame leaves exactly one
+  # bounded line naming the halt, the close code and the connection it retired;
+  # a Close read on its own goes through the idle path and names that cause
+  # (icoretech/codex-pooler-findings#225).
+  defp assert_coalesced_close_log(log, response_mode, halt, initial_lifecycle) do
+    if response_mode in [:terminal_then_coalesced_close, :retryable_first_then_coalesced_close] do
+      expected =
+        "upstream websocket coalesced close drained reason_code=peer_close_frame halt=#{halt} " <>
+          "close_code=1000 lifecycle_id=#{initial_lifecycle.lifecycle_id} generation=1"
+
+      assert log =~ expected
+      assert length(String.split(log, "coalesced close drained")) == 2
+      # The drain's own line reports this close; the between-requests line is
+      # for a Close read on its own (findings#206 row 206-356).
+      refute log =~ "closed between requests"
+      refute log =~ "synthetic-upstream-token"
+    else
+      assert log =~ "upstream websocket connection closed between requests reason_code=peer_close_frame closed_by=peer close_code=1000"
+      assert log =~ "lifecycle_id=#{initial_lifecycle.lifecycle_id} generation=1"
+      refute log =~ "coalesced close drained"
+    end
+  end
+
   defp raw_websocket_request(url, owner) do
     %Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: url,
       headers: [{"authorization", "Bearer synthetic-upstream-token"}],
       payload:
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "model" => "upstream-test-model",
           "input" => [%{"type" => "message", "role" => "user", "content" => "sample"}],
           "stream" => true
@@ -4634,7 +6908,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
         send(owner, {:raw_upstream_websocket_upgrade_fragment, connection_id, :terminal_queued})
         result
     after
-      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+      @raw_peer_release_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
     end
   end
 
@@ -4663,7 +6937,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
           "\r\n\r\n"
         ])
     after
-      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+      @raw_peer_release_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
     end
   end
 
@@ -4696,7 +6970,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       :release_raw_upstream_websocket_upgrade ->
         :gen_tcp.send(socket, "content-length: 0\r\n\r\n")
     after
-      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+      @raw_peer_release_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
     end
   end
 
@@ -4722,7 +6996,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
         result
     after
-      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+      @raw_peer_release_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
     end
   end
 
@@ -4931,21 +7205,159 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   defp send_raw_websocket_peer_response(state, socket, connection_id, request_count, owner) do
     case Agent.get(state, & &1.response_mode) do
+      :transport_close ->
+        send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
+        :ok = :gen_tcp.close(socket)
+
+      :peer_close ->
+        send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
+        :ok = :gen_tcp.send(socket, raw_websocket_server_close_frame(1000))
+
+      mode when mode in @raw_websocket_peer_terminal_then_control_modes ->
+        send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
+        response = %{"id" => "resp_raw_ws_#{connection_id}_#{request_count}"}
+
+        notify_delayed_peer_close(owner, mode)
+
+        send_raw_websocket_peer_terminal_then_control(
+          mode,
+          socket,
+          CodexPooler.JSON.encode!(response)
+        )
+
+      mode when mode in @raw_websocket_peer_retryable_first_then_control_modes ->
+        send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
+
+        response = %{
+          "type" => "response.failed",
+          "response" => %{
+            "id" => "resp_raw_ws_#{connection_id}_#{request_count}",
+            "status" => "failed",
+            "error" => %{"code" => "usage_limit_reached", "message" => "synthetic quota denial"}
+          }
+        }
+
+        notify_delayed_peer_close(owner, mode)
+        send_raw_websocket_peer_retryable_first_then_control(mode, socket, CodexPooler.JSON.encode!(response))
+
+      :unexpected_binary ->
+        send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
+        :ok = :gen_tcp.send(socket, <<0x82, 1, 0>>)
+
       :hold ->
         send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
         :ok
 
-      :hold_after_created ->
-        response = %{
-          "type" => "response.created",
-          "response" => %{"id" => "resp_raw_ws_#{connection_id}_#{request_count}"}
-        }
-
-        :gen_tcp.send(socket, raw_websocket_server_text_frame(Jason.encode!(response)))
+      mode when mode in [:hold_after_created, :hold_after_compacting] ->
+        send_raw_websocket_peer_held_frames(mode, socket, owner, connection_id, request_count)
 
       :terminal ->
+        send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
         response = %{"id" => "resp_raw_ws_#{connection_id}_#{request_count}"}
-        :gen_tcp.send(socket, raw_websocket_server_text_frame(Jason.encode!(response)))
+        :gen_tcp.send(socket, raw_websocket_server_text_frame(CodexPooler.JSON.encode!(response)))
+    end
+  end
+
+  # What a held peer writes before it stops answering: `response.created`
+  # alone, or the measured compaction stream up to its compacting phase, which
+  # also reports the request so a test can wait for it.
+  defp send_raw_websocket_peer_held_frames(:hold_after_created, socket, _owner, connection_id, request_count) do
+    response = %{
+      "type" => "response.created",
+      "response" => %{"id" => "resp_raw_ws_#{connection_id}_#{request_count}"}
+    }
+
+    :gen_tcp.send(socket, raw_websocket_server_text_frame(CodexPooler.JSON.encode!(response)))
+  end
+
+  defp send_raw_websocket_peer_held_frames(:hold_after_compacting, socket, owner, connection_id, request_count) do
+    send(owner, {:raw_upstream_websocket_request, connection_id, request_count})
+    frames = Enum.map(compacting_phase_events("resp_raw_ws_#{connection_id}_#{request_count}"), &raw_websocket_server_text_frame(CodexPooler.JSON.encode!(&1)))
+    :ok = :gen_tcp.send(socket, frames)
+  end
+
+  # The three arms of the coalesced-frame probe: what the peer writes after the
+  # terminal, and whether it shares the terminal's TCP segment
+  # (icoretech/codex-pooler-findings#251).
+  defp send_raw_websocket_peer_terminal_then_control(mode, socket, terminal) when mode in [:terminal_then_invalid_text, :terminal_then_invalid_text_then_close] do
+    trailing = if mode == :terminal_then_invalid_text_then_close, do: raw_websocket_server_close_frame(1000), else: <<>>
+    :ok = :gen_tcp.send(socket, [raw_websocket_server_text_frame(terminal), <<0x81, 1, 0xFF>>, trailing])
+  end
+
+  defp send_raw_websocket_peer_terminal_then_control(
+         :terminal_then_coalesced_close,
+         socket,
+         terminal
+       ) do
+    # One `send`: the terminal frame and the peer Close leave in the same TCP
+    # segment, so the session decodes both out of a single read and the Close
+    # sits behind the terminal in one batch.
+    :ok =
+      :gen_tcp.send(socket, [
+        raw_websocket_server_text_frame(terminal),
+        raw_websocket_server_close_frame(1000)
+      ])
+  end
+
+  defp send_raw_websocket_peer_terminal_then_control(
+         :terminal_then_coalesced_ping,
+         socket,
+         terminal
+       ) do
+    # A control frame behind the terminal that is not a Close: the Pong is owed
+    # and the connection stays reusable.
+    :ok =
+      :gen_tcp.send(socket, [
+        raw_websocket_server_text_frame(terminal),
+        raw_websocket_server_ping_frame("p2-ping-behind")
+      ])
+  end
+
+  defp send_raw_websocket_peer_terminal_then_control(
+         :terminal_then_delayed_close,
+         socket,
+         terminal
+       ) do
+    # The control arm: the same two frames, two reads. The session has always
+    # answered this one, through its idle path.
+    :ok = :gen_tcp.send(socket, raw_websocket_server_text_frame(terminal))
+    await_delayed_peer_close_release!()
+    :ok = :gen_tcp.send(socket, raw_websocket_server_close_frame(1000))
+  end
+
+  # The same three arms behind a retryable pre-visible first frame instead of a
+  # terminal (icoretech/codex-pooler-findings#203).
+  defp send_raw_websocket_peer_retryable_first_then_control(:retryable_first_then_coalesced_close, socket, frame) do
+    :ok = :gen_tcp.send(socket, [raw_websocket_server_text_frame(frame), raw_websocket_server_close_frame(1000)])
+  end
+
+  defp send_raw_websocket_peer_retryable_first_then_control(:retryable_first_then_coalesced_ping, socket, frame) do
+    :ok = :gen_tcp.send(socket, [raw_websocket_server_text_frame(frame), raw_websocket_server_ping_frame("p2-ping-behind")])
+  end
+
+  defp send_raw_websocket_peer_retryable_first_then_control(:retryable_first_then_delayed_close, socket, frame) do
+    :ok = :gen_tcp.send(socket, raw_websocket_server_text_frame(frame))
+    await_delayed_peer_close_release!()
+    :ok = :gen_tcp.send(socket, raw_websocket_server_close_frame(1000))
+  end
+
+  defp notify_delayed_peer_close(owner, mode) when mode in [:terminal_then_delayed_close, :retryable_first_then_delayed_close],
+    do: send(owner, {:raw_upstream_delayed_close, self()})
+
+  defp notify_delayed_peer_close(_owner, _mode), do: :ok
+
+  defp release_delayed_peer_close!(mode) when mode in [:terminal_then_delayed_close, :retryable_first_then_delayed_close] do
+    assert_receive {:raw_upstream_delayed_close, peer}, @message_detection_timeout_ms
+    send(peer, :release_delayed_peer_close)
+  end
+
+  defp release_delayed_peer_close!(_mode), do: :ok
+
+  defp await_delayed_peer_close_release! do
+    receive do
+      :release_delayed_peer_close -> :ok
+    after
+      @raw_peer_release_timeout_ms -> raise "delayed peer Close was never released"
     end
   end
 
@@ -4966,7 +7378,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   end
 
   defp raw_websocket_peer_recv_frame(socket) do
-    with {:ok, <<first, second>>} <- :gen_tcp.recv(socket, 2, 1_000),
+    with {:ok, <<first, second>>} <- :gen_tcp.recv(socket, 2, @raw_peer_idle_timeout_ms),
          opcode <- Bitwise.band(first, 0x0F),
          masked? <- Bitwise.band(second, 0x80) == 0x80,
          {:ok, payload_length} <-
@@ -5008,6 +7420,21 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   defp raw_websocket_peer_opcode(0xA), do: :pong
   defp raw_websocket_peer_opcode(_opcode), do: :unknown
 
+  # The provider's compaction stream as measured (gpt-6-luna) up to its
+  # compacting phase, with a synthetic ciphertext of the announcement's
+  # measured length (996 bytes); the closed item and the terminal never come.
+  defp compacting_phase_events(response_id) do
+    response = %{"id" => response_id, "status" => "in_progress", "output" => []}
+    announced = %{"type" => "compaction", "id" => nil, "encrypted_content" => "gAAAAA-announced-" <> String.duplicate("a", 979)}
+
+    [
+      %{"type" => "response.created", "response" => response},
+      %{"type" => "response.in_progress", "response" => response},
+      %{"type" => "response.output_item.added", "output_index" => 0, "item" => announced},
+      %{"type" => "response.compaction.compacting", "output_index" => 0}
+    ]
+  end
+
   defp raw_websocket_server_text_frame(payload) when byte_size(payload) < 126 do
     <<0x81, byte_size(payload), payload::binary>>
   end
@@ -5022,6 +7449,105 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   defp raw_websocket_server_pong_frame(payload) when byte_size(payload) < 126 do
     <<0x8A, byte_size(payload), payload::binary>>
+  end
+
+  defp raw_websocket_server_close_frame(code, reason) when is_integer(code) and byte_size(reason) <= 123 do
+    <<0x88, byte_size(reason) + 2, code::16, reason::binary>>
+  end
+
+  # Runs `close` against the raw peer's socket of the one established
+  # connection while the session is idle, and returns the info log captured
+  # until the session has closed that connection and handled every message.
+  defp close_idle_connection_from_peer!(peer, session, close, connection_id \\ 1) do
+    assert [server_socket] = Agent.get(peer.state, &MapSet.to_list(&1.client_sockets))
+
+    {:closed, log} =
+      with_info_log(fn ->
+        close.(server_socket)
+        closed = wait_for_raw_websocket_connection_closed(connection_id, @message_detection_timeout_ms)
+        _state = :sys.get_state(session)
+        closed
+      end)
+
+    log
+  end
+
+  defp start_subscribed_session!(subscriber \\ self()) do
+    {:ok, session} = UpstreamWebsocketSession.start_link(connection_close_subscriber: subscriber)
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    session
+  end
+
+  # A subscribed session whose first connection (generation 1) served one
+  # request of the raw peer; returns the session's initial lifecycle.
+  defp subscribed_session_after_one_request! do
+    peer = start_raw_websocket_peer()
+    session = start_subscribed_session!()
+    lifecycle = lifecycle_state(session)
+
+    assert {:ok, result} = UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+    assert_connection_metadata(result, %{lifecycle | generation: 1}, false, false)
+
+    {session, peer, lifecycle}
+  end
+
+  # The subscriber's one message for a close. Callers read it after a reply or
+  # a state read from the session, which the session sends after the signal.
+  defp assert_close_signal!(session, lifecycle, generation, cause, connection_requests) do
+    assert_received {:upstream_websocket_connection_closed, ^session, signal}
+
+    assert signal == %{
+             cause: cause,
+             lifecycle_id: lifecycle.lifecycle_id,
+             generation: generation,
+             connection_requests: connection_requests
+           }
+
+    refute_received {:upstream_websocket_connection_closed, _session, _signal}
+  end
+
+  # A close at the end of the connection's first exchange: `idle_ms` counts
+  # from that exchange's end, so it is a number no larger than the connection's
+  # age. Counted from the exchange before it, as it used to be, the first
+  # exchange's close read `idle_ms=none` (findings#270 row 270-55).
+  defp assert_exchange_end_idle_ms!(log) do
+    assert [_all, idle_ms, connection_age_ms] = Regex.run(~r/closed between requests .* idle_ms=(\d+) connection_age_ms=(\d+) /, log)
+    assert String.to_integer(idle_ms) <= String.to_integer(connection_age_ms)
+  end
+
+  defp assert_subscribed_disconnected!(session, expected_lifecycle) do
+    state = :sys.get_state(session)
+
+    assert lifecycle_from_state(state) == expected_lifecycle
+    assert Enum.sort(Map.keys(state)) == [:connection_close_subscriber, :generation, :lifecycle_id]
+    assert state.connection_close_subscriber == self()
+  end
+
+  defp assert_single_close_line!(log, expected) do
+    assert [_before, line_and_rest] = String.split(log, "upstream websocket connection closed between requests", parts: 2)
+    refute line_and_rest =~ "upstream websocket connection closed between requests"
+    [line | _rest] = String.split(line_and_rest, "\n", parts: 2)
+    lifecycle = Keyword.fetch!(expected, :lifecycle)
+
+    for key <- [:reason_code, :closed_by, :close_code, :close_reason, :transport_reason, :connection_requests, :pong_pending] do
+      assert line =~ " #{key}=#{Keyword.fetch!(expected, key)} "
+    end
+
+    case Keyword.fetch!(expected, :ping_age_ms) do
+      :integer -> assert line =~ ~r/ ping_age_ms=\d+ /
+      value -> assert line =~ " ping_age_ms=#{value} "
+    end
+
+    assert line =~ ~r/ idle_ms=\d+ connection_age_ms=\d+ /
+    assert line =~ " lifecycle_id=#{lifecycle.lifecycle_id} generation=#{lifecycle.generation}"
+  end
+
+  defp raw_websocket_server_close_frame(code) when is_integer(code) do
+    <<0x88, 2, code::16>>
+  end
+
+  defp raw_websocket_server_ping_frame(payload) when byte_size(payload) < 126 do
+    <<0x89, byte_size(payload), payload::binary>>
   end
 
   defp set_raw_websocket_peer_pong_mode(%{state: state}, mode) do
@@ -5057,6 +7583,54 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       {conn, accumulated}
     else
       receive_mint_upgrade_until_done(conn, ref, deadline, accumulated)
+    end
+  end
+
+  # A clock for the test-only `:upgrade_clock` timeout: every read asks the
+  # test for the time and waits for its answer.
+  defp answered_upgrade_clock(test_pid) do
+    fn ->
+      ref = make_ref()
+      send(test_pid, {:upgrade_clock_read, self(), ref})
+
+      receive do
+        {^ref, now_ms} -> now_ms
+      after
+        @raw_peer_release_timeout_ms -> exit(:upgrade_clock_read_unanswered)
+      end
+    end
+  end
+
+  defp answer_upgrade_clock(now_ms) do
+    assert_receive {:upgrade_clock_read, reader, ref}, @message_detection_timeout_ms
+    send(reader, {ref, now_ms})
+    reader
+  end
+
+  # The peer has written the bytes; nothing signals their delivery to the
+  # session, so poll the session's upstream socket: after the session re-armed
+  # it (`active: :once`) for the status line, it turns passive only when the
+  # port has handed the next bytes to the session as a message.
+  # (`Process.info(session, :messages)` did not list that message while the
+  # session waited in the clock read, though its receive took it.)
+  defp await_socket_data_delivered(session, deadline) do
+    delivered? =
+      Enum.any?(Port.list(), fn port ->
+        Port.info(port, :connected) == {:connected, session} and :inet.getopts(port, [:active]) == {:ok, [active: false]}
+      end)
+
+    cond do
+      delivered? ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        receive do
+        after
+          1 -> await_socket_data_delivered(session, deadline)
+        end
     end
   end
 
@@ -5105,20 +7679,179 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     end
   end
 
+  # A suspended process still counts its mailbox; `Process.info(pid, :messages)`
+  # can read empty for it.
+  defp assert_message_queue_eventually_nonempty(pid) do
+    deadline = System.monotonic_time(:millisecond) + @message_detection_timeout_ms
+    assert_message_queue_eventually_nonempty(pid, deadline)
+  end
+
+  defp assert_message_queue_eventually_nonempty(pid, deadline) do
+    {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+
+    cond do
+      queued > 0 ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected a queued message in #{inspect(pid)}")
+
+      true ->
+        Process.sleep(10)
+        assert_message_queue_eventually_nonempty(pid, deadline)
+    end
+  end
+
   defp wait_for_process_stop(pid) do
     if Process.alive?(pid) do
       ref = Process.monitor(pid)
 
+      # Callers assert the peer's tasks are gone right after this wait, so it
+      # is a detection budget (findings#206 row 206-298), not a grace period.
       receive do
         {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
       after
-        500 -> Process.demonitor(ref, [:flush])
+        @message_detection_timeout_ms -> Process.demonitor(ref, [:flush])
       end
     end
   end
 
   defp safe_tcp_close(socket) when is_port(socket), do: :gen_tcp.close(socket)
   defp safe_tcp_close(_socket), do: :ok
+
+  defp armed_direct_admission do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               System.system_time(:millisecond) + 30_000,
+               ordinary_receipt
+             )
+
+    %{session: session, peer: peer, binding: binding, lifecycle: lifecycle}
+  end
+
+  defp reserve_and_start_direct(session, phase, binding) do
+    assert {:ok, %Capability{} = capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               phase,
+               binding,
+               make_ref(),
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               System.system_time(:millisecond)
+             )
+
+    capability
+  end
+
+  # Runs a successful compact exchange and its confirmation, and returns the
+  # binding the final phase reserves against.
+  defp confirm_direct_compact(session, peer, binding, lifecycle) do
+    control_ref = make_ref()
+
+    assert {:ok, %Capability{} = capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               control_ref,
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               System.system_time(:millisecond)
+             )
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, %{
+               raw_websocket_request(peer.url, self())
+               | native_compaction_capability: capability,
+                 expected_connection_lifecycle: lifecycle
+             })
+
+    digest = :crypto.hash(:sha256, "synthetic-clear-reason-compaction-item")
+
+    confirmation = %Confirmation{
+      source_phase: :compact,
+      source_control_ref: control_ref,
+      binding: %{binding | compaction_item_digest: digest}
+    }
+
+    assert :ok =
+             UpstreamWebsocketSession.acknowledge_compact_finalization(
+               session,
+               {:success, digest, confirmation, System.system_time(:millisecond) + 30_000}
+             )
+
+    assert :pending_final = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    %{
+      binding
+      | window_digest: :crypto.hash(:sha256, "clear-reason-next-window"),
+        context_digest: :crypto.hash(:sha256, "clear-reason-next-context"),
+        window_number: binding.window_number + 1,
+        compaction_item_digest: digest
+    }
+  end
+
+  defp attach_direct_admission_clear_observer(lifecycle_id) do
+    handler_id = "direct-admission-clear-reason-#{System.unique_integer([:positive])}"
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :gateway, :native_compaction, :lifecycle],
+        &__MODULE__.forward_direct_admission_clear/4,
+        %{test: self(), lifecycle_id: lifecycle_id}
+      )
+  end
+
+  @doc false
+  # A clear of an admission that an earlier clear already removed carries no
+  # lifecycle id; the module is synchronous, so such a clear can only come from
+  # the session under test and is forwarded too.
+  def forward_direct_admission_clear(
+        _event,
+        _measurements,
+        %{operation: :clear, native_lifecycle_id: observed, topology: :direct} = observation,
+        %{test: test, lifecycle_id: lifecycle_id}
+      )
+      when observed in [lifecycle_id, nil],
+      do: send(test, {:direct_admission_clear, observation.reason})
+
+  def forward_direct_admission_clear(_event, _measurements, _observation, _config), do: :ok
+
+  defp drain_direct_admission_clear_reasons(reasons \\ []) do
+    receive do
+      {:direct_admission_clear, reason} -> drain_direct_admission_clear_reasons([reason | reasons])
+    after
+      0 -> Enum.reverse(reasons)
+    end
+  end
 
   defp attach_native_compaction_observer do
     handler_id = "direct-native-compaction-#{System.unique_integer([:positive])}"
@@ -5160,7 +7893,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     end)
   end
 
-  defp assert_stack_eventually_in(pid, module, function, arity, deadline_ms \\ 2_000) do
+  defp assert_stack_eventually_in(pid, module, function, arity, deadline_ms \\ @message_detection_timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + deadline_ms
 
     unless poll_stack_until(pid, module, function, arity, deadline) do

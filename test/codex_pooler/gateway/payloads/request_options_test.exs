@@ -9,6 +9,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions.Continuity
   alias CodexPooler.Gateway.Payloads.RequestOptions.OpenAICompatibility
   alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
+  alias CodexPooler.Gateway.Persistence.CodexSession
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
@@ -16,8 +18,134 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   alias CodexPooler.RouteClass
 
   @assignment_id "00000000-0000-0000-0000-000000000001"
+
+  test "invalid carried native compaction admission returns an error during accounting and cleanup" do
+    alias CodexPooler.Gateway.Payloads.RequestOptions.NativeCompactionAdmission, as: AdmissionContext
+    capability = native_compaction_capability()
+    options = RequestOptions.build(%{}, "/backend-api/codex/responses", %{})
+    admission = %AdmissionContext{capability: capability, owner: {:direct, self()}, expected_connection_lifecycle: %{lifecycle_id: Ecto.UUID.generate(), generation: 1}}
+    options = %{options | native_compaction_admission: admission}
+    assert {:error, :invalid_input} = RequestOptions.native_compaction_admission(options)
+    assert {:error, :invalid_input} = RequestOptions.mark_native_compaction_accounting_started(options, 0)
+    assert {:error, :invalid_input} = RequestOptions.cancel_native_compaction_reservation(options, 0)
+    assert {:error, :invalid_input} = RequestOptions.clear_native_compaction_admission(options)
+  end
+
+  test "portable history classification follows the current payload, moves compaction checkpoints and preserves opaque fences" do
+    endpoint = "/backend-api/codex/responses"
+    base = RequestOptions.build(%{}, endpoint, %{})
+
+    history = [
+      %{
+        "type" => "reasoning",
+        "encrypted_content" => "synthetic-encrypted-reasoning",
+        "summary" => []
+      },
+      %{
+        "type" => "function_call",
+        "call_id" => "call_example",
+        "name" => "example",
+        "arguments" => "{}"
+      },
+      %{
+        "type" => "function_call_output",
+        "call_id" => "call_example",
+        "output" => "synthetic result"
+      }
+    ]
+
+    options = RequestOptions.for_payload(base, endpoint, %{"input" => history})
+    assert options.payload_context.portable_full_history?
+
+    # The provider's compaction checkpoint moves with the history (findings#206
+    # row 206-357); the released client sends it with an id and its encrypted
+    # payload only.
+    checkpoint = %{"type" => "compaction", "id" => "cmp_synthetic", "encrypted_content" => "synthetic"}
+
+    for portable <- [[checkpoint | history], [Map.delete(checkpoint, "id") | history]] do
+      assert RequestOptions.for_payload(options, endpoint, %{"input" => portable}).payload_context.portable_full_history?
+      assert RequestOptions.retarget(options, endpoint, %{"input" => portable}).payload_context.portable_full_history?
+    end
+
+    for payload <- [
+          %{"input" => history, "previous_response_id" => "resp_opaque_anchor"},
+          %{"input" => [checkpoint | history], "previous_response_id" => "resp_opaque_anchor"},
+          %{"input" => [%{"type" => "item_reference", "id" => "msg_opaque"}]},
+          %{"input" => [checkpoint, %{"type" => "item_reference", "id" => "msg_opaque"}]},
+          %{"input" => [Map.put(checkpoint, "content", [%{"type" => "input_file", "file_id" => "file_opaque"}])]},
+          %{"input" => [%{"type" => "compaction_trigger"}]},
+          %{"input" => [%{"type" => "context_compaction", "encrypted_content" => "synthetic"}]},
+          %{"input" => [%{"type" => "input_file", "file_id" => "file_opaque"}]}
+        ] do
+      refute RequestOptions.for_payload(options, endpoint, payload).payload_context.portable_full_history?
+
+      refute RequestOptions.retarget(options, endpoint, payload).payload_context.portable_full_history?
+    end
+  end
+
+  test "recognized encrypted agent handoffs are portable without exempting nested ownership constraints" do
+    endpoint = "/backend-api/codex/responses"
+    base = RequestOptions.build(%{}, endpoint, %{})
+
+    for kind <- ["NEW_TASK", "MESSAGE"],
+        {author, recipient} <- [{"/root", "/root/sample"}, {"/root/sample", "/root"}, {"/root/sample", "/root/other"}, {"/morpheus", "/root/sample"}] do
+      handoff = %{
+        "type" => "agent_message",
+        "author" => author,
+        "recipient" => recipient,
+        "content" => [
+          %{"type" => "input_text", "text" => "Message Type: #{kind}\nTask name: #{recipient}\nSender: #{author}\nPayload:\n"},
+          %{"type" => "encrypted_content", "encrypted_content" => "synthetic-handoff"}
+        ]
+      }
+
+      [header, cipher] = handoff["content"]
+
+      for item <- [handoff, Map.put(handoff, "status", "completed")] do
+        payload = %{"input" => [item]}
+        assert RequestOptions.build(%{}, endpoint, payload).payload_context.portable_full_history?
+        assert RequestOptions.for_payload(base, endpoint, payload).payload_context.portable_full_history?
+        assert RequestOptions.retarget(base, endpoint, payload).payload_context.portable_full_history?
+      end
+
+      constraints = [
+        %{"type" => "item_reference", "id" => "msg_synthetic"},
+        %{"type" => "input_file", "file_id" => "file_synthetic"},
+        %{"type" => "compaction_trigger"},
+        %{"type" => "context_compaction", "encrypted_content" => "synthetic-bound"},
+        %{"type" => "unknown", "encrypted_content" => "synthetic-bound"}
+      ]
+
+      for constraint <- constraints,
+          item <- [
+            Map.put(handoff, "extra", constraint),
+            Map.put(handoff, "content", [Map.put(header, "extra", constraint), cipher]),
+            Map.put(handoff, "content", [header, Map.put(cipher, "extra", constraint)])
+          ] do
+        payload = %{"input" => [item]}
+        refute RequestOptions.for_payload(base, endpoint, payload).payload_context.portable_full_history?
+        refute RequestOptions.retarget(base, endpoint, payload).payload_context.portable_full_history?
+      end
+
+      for item <- [
+            Map.put(handoff, "file_id", "file_synthetic"),
+            Map.put(handoff, "encrypted_content", "synthetic-bound"),
+            Map.put(handoff, "author", "/unknown"),
+            Map.put(handoff, "content", [Map.put(header, "text", "unrecognized envelope"), cipher]),
+            Map.put(handoff, "content", [header, Map.put(cipher, "encrypted_content", " ")]),
+            Map.put(handoff, "content", [header, cipher, %{"type" => "input_text", "text" => "extra"}]),
+            cipher
+          ] do
+        refute RequestOptions.for_payload(base, endpoint, %{"input" => [item]}).payload_context.portable_full_history?
+      end
+
+      anchored = %{"input" => [handoff], "previous_response_id" => "resp_synthetic_anchor"}
+      refute RequestOptions.for_payload(base, endpoint, anchored).payload_context.portable_full_history?
+    end
+  end
+
   @identity_id "00000000-0000-0000-0000-000000000002"
-  @effective_model "gpt-5.4"
+  @effective_model "gpt-6-sol"
   @reset_probe_route_class "proxy_http"
 
   setup do
@@ -33,6 +161,52 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   end
 
   describe "boundary constructors" do
+    test "admits a redacted owner witness only through the typed programmatic helper" do
+      session_id = Ecto.UUID.generate()
+      lease_token = Ecto.UUID.generate()
+
+      assert {:ok, witness} =
+               OwnerWitness.new(%CodexSession{
+                 id: session_id,
+                 owner_lease_token: lease_token
+               })
+
+      assert inspect(witness) == "#OwnerWitness<redacted>"
+
+      options =
+        %{}
+        |> RequestOptions.build("/backend-api/codex/responses", %{})
+        |> RequestOptions.put_session_owner_witness(witness)
+
+      assert options.runtime.session_owner_witness == witness
+      refute inspect(options) =~ lease_token
+    end
+
+    test "rejects incomplete witnesses and ignores external witness injection" do
+      assert {:error, :invalid_owner_witness} = OwnerWitness.new(%CodexSession{})
+
+      assert {:error, :invalid_owner_witness} =
+               OwnerWitness.new(%CodexSession{
+                 id: Ecto.UUID.generate(),
+                 owner_lease_token: nil
+               })
+
+      injected = %{
+        session_id: Ecto.UUID.generate(),
+        owner_lease_token: Ecto.UUID.generate()
+      }
+
+      options =
+        RequestOptions.build(
+          %{"session_owner_witness" => injected, session_owner_witness: injected},
+          "/backend-api/codex/responses",
+          %{}
+        )
+
+      assert options.runtime.session_owner_witness == nil
+      assert options.extra == %{}
+    end
+
     @tag :compaction_state_baseline
     test "characterizes ordinary option transforms and existing result transport state" do
       payload = %{"model" => "example-model", "input" => [%{"type" => "message"}]}
@@ -196,11 +370,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
 
       cases = [
         {:ordinary, base},
-        {:bridge_only,
-         RequestOptions.put_payload_context(base, compaction_trigger_bridge?: true)},
+        {:bridge_only, RequestOptions.put_payload_context(base, compaction_trigger_bridge?: true)},
         {:websocket_only, RequestOptions.for_websocket(base, payload)},
-        {:collect_only,
-         RequestOptions.put_transport(base, websocket_delivery_mode: :collect_compaction)},
+        {:collect_only, RequestOptions.put_transport(base, websocket_delivery_mode: :collect_compaction)},
         {:full_history_websocket_collect,
          full_history_base
          |> RequestOptions.for_websocket(%{"input" => [%{"type" => "compaction_trigger"}]})
@@ -234,7 +406,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
         "input" => [%{"type" => "compaction_trigger"}],
         "client_metadata" => %{
           "x-codex-turn-metadata" =>
-            Jason.encode!(%{
+            CodexPooler.JSON.encode!(%{
               "compaction" => %{"implementation" => "responses_compaction_v2"}
             })
         }
@@ -293,7 +465,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.payload_context.compaction_projection_context == context
       assert options.extra == %{}
       assert inspect(context) == "#CompactionProjectionContext<redacted>"
-      assert {:error, %Protocol.UndefinedError{}} = Jason.encode(context)
+      assert {:error, %Protocol.UndefinedError{}} = CodexPooler.JSON.encode(context)
 
       assert {safe, finalized_options} =
                CompactionProjectionContext.finalize(options, compact)
@@ -408,7 +580,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
 
       assert RequestOptions.prompt_cache_controls_attempt_metadata(options) == %{}
       assert RequestOptions.openai_compatibility_metadata(options) == %{}
-      assert RequestOptions.payload_compression_request_metadata(options) == %{}
 
       updated =
         RequestOptions.put_runtime_context(options, prompt_cache_controls_downgraded: true)
@@ -418,7 +589,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
              }
 
       assert RequestOptions.openai_compatibility_metadata(updated) == %{}
-      assert RequestOptions.payload_compression_request_metadata(updated) == %{}
     end
 
     test "defaults normalized previous response state false and permits only typed internal updates" do
@@ -476,12 +646,59 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert RequestOptions.websocket_denial_correlation_id(options, persisted_request) ==
                request_claim_key
 
-      assert RequestOptions.websocket_denial_correlation_id(options, nil) == request_claim_key
+      # A refusal made before the claim never takes it (findings#206 row 206-429).
+      refute RequestOptions.websocket_denial_correlation_id(options, nil) == request_claim_key
 
       assert options.continuity.turn_claim_key == turn_claim_key
 
       invalid = RequestOptions.put_continuity(options, request_claim_key: "codex-request:invalid")
       assert invalid.continuity.request_claim_key == request_claim_key
+    end
+
+    test "normalizes every native durable claim domain with the same digest validation" do
+      digest = :crypto.hash(:sha256, "synthetic-native-claim")
+      encoded = Base.url_encode64(digest, padding: false)
+
+      for prefix <- ["codex-request:", "codex-resume:", "codex-kind:"] do
+        claim = prefix <> encoded
+
+        options =
+          RequestOptions.build(
+            %{transport: "websocket", request_claim_key: claim},
+            "/backend-api/codex/responses",
+            %{"model" => "example-model"}
+          )
+
+        assert options.continuity.request_claim_key == claim
+        assert RequestOptions.server_correlation_id(options) == claim
+
+        invalid = RequestOptions.put_continuity(options, request_claim_key: prefix <> "invalid")
+        assert invalid.continuity.request_claim_key == claim
+      end
+    end
+
+    test "rejects unknown prefixes and non-32-byte native claim digests" do
+      valid =
+        "codex-resume:" <>
+          (:crypto.hash(:sha256, "valid-resume-claim")
+           |> Base.url_encode64(padding: false))
+
+      options =
+        RequestOptions.build(
+          %{request_claim_key: valid},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      for invalid <- [
+            "codex-unknown:" <> String.duplicate("A", 43),
+            "codex-kind:" <> Base.url_encode64(:crypto.strong_rand_bytes(31), padding: false),
+            "codex-resume:" <> Base.url_encode64(:crypto.strong_rand_bytes(33), padding: false),
+            "codex-request:not-base64"
+          ] do
+        updated = RequestOptions.put_continuity(options, request_claim_key: invalid)
+        assert updated.continuity.request_claim_key == valid
+      end
     end
 
     test "websocket correlations fall back through turn claim and request id" do
@@ -976,9 +1193,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
           payload
         )
 
-      assert OpenAICompatibility.translated_responses_surface?(
-               public_responses.openai_compatibility
-             )
+      assert OpenAICompatibility.translated_responses_surface?(public_responses.openai_compatibility)
 
       assert OpenAICompatibility.translated_responses_surface?(public_chat.openai_compatibility)
       assert OpenAICompatibility.translated_responses_surface?(backend_chat.openai_compatibility)
@@ -987,17 +1202,11 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
 
       refute OpenAICompatibility.translated_responses_surface?(raw_backend.openai_compatibility)
 
-      refute OpenAICompatibility.translated_responses_surface?(
-               raw_backend_source.openai_compatibility
-             )
+      refute OpenAICompatibility.translated_responses_surface?(raw_backend_source.openai_compatibility)
 
-      refute OpenAICompatibility.translated_responses_surface?(
-               wrong_media_endpoint.openai_compatibility
-             )
+      refute OpenAICompatibility.translated_responses_surface?(wrong_media_endpoint.openai_compatibility)
 
-      refute OpenAICompatibility.translated_responses_surface?(
-               malformed_source.openai_compatibility
-             )
+      refute OpenAICompatibility.translated_responses_surface?(malformed_source.openai_compatibility)
 
       assert websocket.openai_compatibility.source_endpoint == "/v1/responses"
 
@@ -1167,7 +1376,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
         {@assignment_id, 123, @effective_model, @reset_probe_route_class},
         {@assignment_id, @identity_id, nil, @reset_probe_route_class},
         {@assignment_id, @identity_id, " ", @reset_probe_route_class},
-        {@assignment_id, @identity_id, " gpt-5.4", @reset_probe_route_class},
+        {@assignment_id, @identity_id, " gpt-6-sol", @reset_probe_route_class},
         {@assignment_id, @identity_id, 123, @reset_probe_route_class},
         {@assignment_id, @identity_id, @effective_model, nil},
         {@assignment_id, @identity_id, @effective_model, " "},
@@ -1202,12 +1411,10 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
                )
 
       changed_scopes = [
-        {:scope_mismatch, "00000000-0000-0000-0000-000000000003", @identity_id, @effective_model,
-         @reset_probe_route_class},
-        {:scope_mismatch, @assignment_id, "00000000-0000-0000-0000-000000000004",
-         @effective_model, @reset_probe_route_class},
-        {:scope_mismatch, @assignment_id, @identity_id, "gpt-5.4-mini", @reset_probe_route_class},
-        {:scope_mismatch, @assignment_id, @identity_id, "GPT-5.4", @reset_probe_route_class},
+        {:scope_mismatch, "00000000-0000-0000-0000-000000000003", @identity_id, @effective_model, @reset_probe_route_class},
+        {:scope_mismatch, @assignment_id, "00000000-0000-0000-0000-000000000004", @effective_model, @reset_probe_route_class},
+        {:scope_mismatch, @assignment_id, @identity_id, "gpt-6-luna", @reset_probe_route_class},
+        {:scope_mismatch, @assignment_id, @identity_id, "GPT-6-SOL", @reset_probe_route_class},
         {:scope_mismatch, @assignment_id, @identity_id, @effective_model, "proxy_stream"},
         {:invalid_scope, "", @identity_id, @effective_model, @reset_probe_route_class},
         {:invalid_scope, @assignment_id, " ", @effective_model, @reset_probe_route_class},
@@ -1645,7 +1852,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             websocket_writer: writer,
             upstream_websocket_session: self(),
             session_key: "session-key",
-            conversation_key: "conversation-key",
             owner_instance_id: "node-a",
             bridge_owner_lease_ttl_seconds: 120,
             reconnect_window_seconds: 30,
@@ -1668,7 +1874,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.transport.upstream_websocket_session == self()
       assert options.continuity.session_key == "session-key"
       assert options.continuity.session_header_source == nil
-      assert options.continuity.conversation_key == "conversation-key"
+      # No caller ever supplied a conversation key; the dead field is gone
+      # rather than persisted under a Pool-wide unique index (findings#255).
+      refute Map.has_key?(options.continuity, :conversation_key)
       assert options.continuity.owner_instance_id == "node-a"
       assert options.continuity.bridge_owner_lease_ttl_seconds == 120
       assert options.continuity.reconnect_window_seconds == 30
@@ -1685,176 +1893,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.runtime.interrupt_reason == "client_disconnected"
       assert options.timeout_config.receive_timeout_ms == 25_000
       assert options.extra == %{}
-    end
-
-    test "keeps safe payload compression metadata in the runtime context" do
-      sensitive_placeholder =
-        "placeholder raw candidate prompt with bearer example-token and call id example-call"
-
-      compression_metadata = %{
-        "enabled" => true,
-        "attempted" => true,
-        "status" => "compressed",
-        "reason" => nil,
-        "route_class" => "proxy_stream",
-        "transport" => "http",
-        "tokenizer" => "local:o200k_base",
-        "candidate_count" => 2,
-        "compressed_count" => 1,
-        "skipped_count" => 1,
-        "original_bytes" => 1000,
-        "compressed_bytes" => 400,
-        "original_tokens" => 500,
-        "compressed_tokens" => 200,
-        "strategies" => ["log_output", "diff"],
-        "elapsed_ms" => 4,
-        "raw_candidate" => sensitive_placeholder,
-        "call_id" => "call_sensitive_placeholder",
-        "json_path" => "$.input[0].output"
-      }
-
-      options =
-        RequestOptions.build(
-          %{payload_compression: compression_metadata},
-          "/backend-api/codex/responses",
-          %{"model" => "example-model"}
-        )
-
-      assert options.runtime.payload_compression == %{
-               "enabled" => true,
-               "attempted" => true,
-               "status" => "compressed",
-               "route_class" => "proxy_stream",
-               "transport" => "http",
-               "tokenizer" => "local:o200k_base",
-               "candidate_count" => 2,
-               "compressed_count" => 1,
-               "skipped_count" => 1,
-               "original_bytes" => 1000,
-               "compressed_bytes" => 400,
-               "saved_bytes" => 600,
-               "byte_savings_ratio" => 0.6,
-               "byte_savings_percent" => 60.0,
-               "compression_ratio" => 0.4,
-               "original_tokens" => 500,
-               "compressed_tokens" => 200,
-               "saved_tokens" => 300,
-               "token_savings_ratio" => 0.6,
-               "token_savings_percent" => 60.0,
-               "strategies" => ["log_output", "diff"],
-               "elapsed_ms" => 4
-             }
-
-      assert RequestOptions.payload_compression_request_metadata(options) == %{
-               "payload_compression" => options.runtime.payload_compression
-             }
-
-      metadata_text = inspect(options.runtime.payload_compression)
-      refute metadata_text =~ sensitive_placeholder
-      refute metadata_text =~ "call_sensitive_placeholder"
-      refute metadata_text =~ "$.input[0].output"
-      assert options.extra == %{}
-    end
-
-    test "allowlists payload compression strategy metadata" do
-      options =
-        RequestOptions.build(
-          %{
-            payload_compression: %{
-              "attempted" => true,
-              "status" => "compressed",
-              "strategies" => [
-                "log_output",
-                "call_probe_secret",
-                "json_document_lossless",
-                "json_array_lossless"
-              ],
-              "candidate_count" => 1
-            }
-          },
-          "/backend-api/codex/responses",
-          %{"model" => "example-model"}
-        )
-
-      assert options.runtime.payload_compression["strategies"] == [
-               "log_output",
-               "json_document_lossless",
-               "json_array_lossless"
-             ]
-
-      assert get_in(RequestOptions.payload_compression_attempt_metadata(options), [
-               "payload_compression",
-               "strategies"
-             ]) == ["log_output", "json_document_lossless", "json_array_lossless"]
-
-      refute inspect(options.runtime.payload_compression) =~ "call_probe_secret"
-    end
-
-    test "keeps tokenizer input limit metadata without raw skipped content" do
-      sensitive_placeholder = "placeholder skipped tokenizer input body"
-
-      options =
-        RequestOptions.build(
-          %{
-            payload_compression: %{
-              "attempted" => true,
-              "status" => "skipped",
-              "reason" => "tokenizer_input_limit",
-              "candidate_count" => 2,
-              "compressed_count" => 0,
-              "skipped_count" => 2,
-              "tokenizer_input_skipped_count" => 2,
-              "raw_candidate" => sensitive_placeholder
-            }
-          },
-          "/backend-api/codex/responses",
-          %{"model" => "example-model"}
-        )
-
-      assert options.runtime.payload_compression == %{
-               "attempted" => true,
-               "status" => "skipped",
-               "reason" => "tokenizer_input_limit",
-               "candidate_count" => 2,
-               "compressed_count" => 0,
-               "skipped_count" => 2,
-               "tokenizer_input_skipped_count" => 2
-             }
-
-      assert RequestOptions.payload_compression_request_metadata(options) == %{
-               "payload_compression" => options.runtime.payload_compression
-             }
-
-      refute inspect(options.runtime.payload_compression) =~ sensitive_placeholder
-    end
-
-    test "normalizes payload compression updates through put_runtime_context" do
-      options =
-        %{}
-        |> RequestOptions.build("/backend-api/codex/responses", %{"model" => "example-model"})
-        |> RequestOptions.put_runtime_context(
-          payload_compression: %{
-            attempted: true,
-            status: :no_change,
-            reason: :no_token_shrink,
-            original_bytes: 0,
-            compressed_bytes: 0,
-            original_tokens: 0,
-            compressed_tokens: 0
-          }
-        )
-
-      assert options.runtime.payload_compression == %{
-               "attempted" => true,
-               "status" => "no_change",
-               "reason" => "no_token_shrink",
-               "original_bytes" => 0,
-               "compressed_bytes" => 0,
-               "saved_bytes" => 0,
-               "original_tokens" => 0,
-               "compressed_tokens" => 0,
-               "saved_tokens" => 0
-             }
     end
 
     test "normalizes explicit interrupt reason without keeping legacy aliases in extra" do
@@ -2022,22 +2060,18 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.routing.prompt_cache_key == nil
     end
 
-    test "classifies request compression route surfaces without promoting public compact" do
+    test "classifies route surfaces without promoting public compact" do
       cases = [
         {"POST", "/backend-api/codex/responses", %{}, nil, "proxy_http", "http_json"},
-        {"POST", "/backend-api/codex/responses", %{"stream" => true}, nil, "proxy_stream",
-         "http_sse"},
+        {"POST", "/backend-api/codex/responses", %{"stream" => true}, nil, "proxy_stream", "http_sse"},
         {"POST", "/backend-api/codex/v1/responses", %{}, nil, "proxy_http", "http_json"},
         {"POST", "/backend-api/codex/v1/chat/completions", %{}, nil, "proxy_http", "http_json"},
         {"POST", "/v1/responses", %{}, nil, "proxy_http", "http_json"},
         {"POST", "/v1/chat/completions", %{}, nil, "proxy_http", "http_json"},
-        {"POST", "/backend-api/codex/responses/compact", %{}, nil, "proxy_compact",
-         "http_compact_json"},
-        {"POST", "/backend-api/codex/v1/responses/compact", %{}, nil, "proxy_compact",
-         "http_compact_json"},
+        {"POST", "/backend-api/codex/responses/compact", %{}, nil, "proxy_compact", "http_compact_json"},
+        {"POST", "/backend-api/codex/v1/responses/compact", %{}, nil, "proxy_compact", "http_compact_json"},
         {"GET", "/backend-api/codex/responses", %{}, "websocket", "proxy_websocket", "websocket"},
-        {"GET", "/backend-api/codex/v1/responses", %{}, "websocket", "proxy_websocket",
-         "websocket"},
+        {"GET", "/backend-api/codex/v1/responses", %{}, "websocket", "proxy_websocket", "websocket"},
         {"GET", "/v1/responses", %{}, "websocket", "proxy_websocket", "websocket"},
         {"POST", "/v1/responses/compact", %{}, nil, "proxy_http", "http_json"}
       ]
@@ -2080,7 +2114,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             collect_openai_response_stream: true,
             connect_timeout: 10,
             connect_timeout_ms: 11,
-            conversation_key: "conversation-key",
             defer_file_create_request: true,
             effective_model: "example-model",
             file_affinity_assignment_id: Ecto.UUID.generate(),
@@ -2472,6 +2505,63 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   end
 
   describe "section updaters" do
+    # findings#255: the marker names a turn state the Pooler issued for a
+    # websocket upgrade; a different turn state put later comes from the
+    # client's frame and must not inherit it.
+    test "keeps the issued turn state marker only while the issued value stands" do
+      issued =
+        %{}
+        |> RequestOptions.for_websocket()
+        |> RequestOptions.put_continuity(accepted_turn_state: "issued-turn-state", pooler_issued_turn_state?: true)
+
+      assert issued.continuity.pooler_issued_turn_state? == true
+
+      restated = RequestOptions.put_continuity(issued, accepted_turn_state: "issued-turn-state")
+      assert restated.continuity.pooler_issued_turn_state? == true
+
+      unrelated = RequestOptions.put_continuity(issued, previous_response_id: "resp_example")
+      assert unrelated.continuity.pooler_issued_turn_state? == true
+
+      replaced = RequestOptions.put_continuity(issued, accepted_turn_state: "client-turn-state")
+      assert replaced.continuity.accepted_turn_state == "client-turn-state"
+      assert replaced.continuity.pooler_issued_turn_state? == false
+
+      assert RequestOptions.for_websocket(%{accepted_turn_state: "client-turn-state"}).continuity.pooler_issued_turn_state? == false
+    end
+
+    # The socket drain budgets are transport knobs so tests can shorten the
+    # post-cleanup response task drains without changing production defaults;
+    # only positive integers are carried, anything else falls back to nil.
+    test "carries websocket response task drain budgets as positive integers" do
+      options =
+        RequestOptions.for_websocket(%{
+          websocket_response_task_drain_ms: 250,
+          websocket_owner_response_task_drain_ms: 750
+        })
+
+      assert options.transport.websocket_response_task_drain_ms == 250
+      assert options.transport.websocket_owner_response_task_drain_ms == 750
+
+      updated =
+        RequestOptions.put_transport(options,
+          websocket_response_task_drain_ms: 100,
+          websocket_owner_response_task_drain_ms: 0
+        )
+
+      assert updated.transport.websocket_response_task_drain_ms == 100
+      assert updated.transport.websocket_owner_response_task_drain_ms == 750
+
+      invalid =
+        RequestOptions.for_websocket(%{
+          websocket_response_task_drain_ms: "250",
+          websocket_owner_response_task_drain_ms: -1
+        })
+
+      assert invalid.transport.websocket_response_task_drain_ms == nil
+      assert invalid.transport.websocket_owner_response_task_drain_ms == nil
+      assert RequestOptions.for_websocket(%{}).transport.websocket_response_task_drain_ms == nil
+    end
+
     test "apply known keyword updates to typed sections" do
       writer = fn _frame -> :ok end
 
@@ -2509,7 +2599,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             session_header_source: "session-id",
             forwarded_headers: [{"x-codex-client", "fixture"}],
             finalize_retry_timeout_ms: 500,
-            payload_compression: %{"attempted" => true, "status" => "compressed"},
             websocket_owner_forwarding_enabled?: true,
             websocket_owner_downstream: %{pid: self()},
             websocket_owner_downstream_epoch: 3
@@ -2532,9 +2621,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
           forwarded_headers: [{"x-codex-client", :invalid}],
           finalize_retry_timeout_ms: -1
         )
-        |> RequestOptions.put_runtime_context(
-          payload_compression: %{"enabled" => true, "attempted" => false, "status" => "disabled"}
-        )
 
       assert updated.continuity.session_header_source == "session-id"
       assert updated.continuity.reconnect_window_seconds == nil
@@ -2542,11 +2628,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert updated.transport.websocket_owner.downstream_epoch == 3
       assert updated.file_bridge.forwarded_headers == [{"x-codex-client", "fixture"}]
       assert updated.file_bridge.finalize_retry_timeout_ms == 500
-
-      assert updated.runtime.payload_compression == %{
-               "attempted" => true,
-               "status" => "compressed"
-             }
     end
 
     test "optional normalizers still accept explicit valid replacements" do
@@ -2556,7 +2637,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             session_header_source: "session-id",
             forwarded_headers: [{"x-codex-client", "fixture"}],
             finalize_retry_timeout_ms: 500,
-            payload_compression: %{"attempted" => true, "status" => "compressed"},
             websocket_owner_forwarding_enabled?: true,
             websocket_owner_downstream_epoch: 3
           },
@@ -2575,9 +2655,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
           forwarded_headers: [{"user-agent", "codex_cli_rs/0.0.0"}],
           finalize_retry_timeout_ms: 0
         )
-        |> RequestOptions.put_runtime_context(
-          payload_compression: %{"attempted" => true, "status" => "no_change"}
-        )
 
       assert updated.continuity.session_header_source == "x-session-id"
 
@@ -2588,11 +2665,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert updated.transport.websocket_owner.downstream_epoch == 4
       assert updated.file_bridge.forwarded_headers == [{"user-agent", "codex_cli_rs/0.0.0"}]
       assert updated.file_bridge.finalize_retry_timeout_ms == 0
-
-      assert updated.runtime.payload_compression == %{
-               "attempted" => true,
-               "status" => "no_change"
-             }
     end
 
     test "reject unknown section fields" do
@@ -2625,6 +2697,42 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
 
       assert_raise KeyError, fn ->
         RequestOptions.put_file_bridge(options, unknown_field: true)
+      end
+    end
+  end
+
+  # findings#279 point 2, findings#270 row 270-261: the originator decides the
+  # Pool-exhausted answer only on a native Codex route.
+  describe "native_originator/1" do
+    test "carries the client's originator on a native route only" do
+      native = RequestOptions.build(%{originator: "Codex Desktop"}, "/backend-api/codex/responses", %{})
+      assert RequestOptions.native_originator(native) == "Codex Desktop"
+      assert RequestOptions.native_originator(RequestOptions.build(%{}, "/backend-api/codex/responses", %{})) == nil
+
+      public_socket = RequestOptions.put_openai_compatibility(native, public_openai_responses_stream: true)
+      translated = RequestOptions.mark_openai_compatibility_origin(native, "/v1/responses", "/backend-api/codex/responses")
+
+      for options <- [public_socket, translated, nil, %{}] do
+        assert RequestOptions.native_originator(options) == nil
+      end
+    end
+  end
+
+  # findings#270 row 270-249: only a refusal its owner answered proves a served
+  # compaction inconsistent with the admission; an owner that did not answer
+  # within its call budget, or is gone, leaves the compaction to its client.
+  describe "compact_confirmation_outcome/1" do
+    test "keeps an unanswered confirmation and an owner that is gone apart from a refusal" do
+      for reason <- [:owner_forward_timeout, :timeout, :owner_crashed] do
+        assert RequestOptions.compact_confirmation_outcome(reason) == :unknown
+      end
+
+      for reason <- [:owner_unavailable, :stale_owner, :owner_drained, :unavailable] do
+        assert RequestOptions.compact_confirmation_outcome(reason) == :not_applied
+      end
+
+      for reason <- NativeCompactionAdmission.refusal_reasons() ++ [:stale_downstream, :invalid_input, :missing_confirmation_provenance, :connection_closed, :owner_busy] do
+        assert RequestOptions.compact_confirmation_outcome(reason) == :refused
       end
     end
   end

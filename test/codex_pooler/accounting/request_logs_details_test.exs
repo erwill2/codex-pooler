@@ -297,67 +297,29 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     assert Decimal.equal?(detail.token_counts.cache_write_cost_usd, Decimal.new("0.250000"))
   end
 
-  test "request log rows expose sanitized compression summary without raw candidate strings" do
+  test "historical compression containers are redacted on reads without rewriting stored metadata" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
     %{assignment: assignment} = upstream_assignment_fixture(pool)
-    sentinel = "SENTINEL_TOOL_OUTPUT_SHOULD_NOT_RENDER"
-    compressed_sentinel = "SENTINEL_COMPRESSED_OUTPUT_SHOULD_NOT_STORE"
+    sentinel = "synthetic-retired-history-value"
 
-    request =
-      request_fixture(%{pool: pool, api_key: api_key}, %{
-        requested_model: "gpt-row-compression",
-        endpoint: "/backend-api/codex/responses",
-        transport: "http_json",
-        status: "succeeded",
-        correlation_id: "row-compression"
-      })
+    for value <- [%{"attempted" => true, "status" => %{"label" => sentinel}, "strategies" => [sentinel]}, [%{"status" => sentinel}], sentinel] do
+      request = request_fixture(%{pool: pool, api_key: api_key}, %{status: "succeeded"})
+      attempt = attempt_fixture(request, assignment)
+      historical = %{"payload_compression" => value, "nested" => %{"payload_compression" => value}}
+      Repo.update_all(from(r in CodexPooler.Accounting.Request, where: r.id == ^request.id), set: [request_metadata: historical])
+      Repo.update_all(from(a in CodexPooler.Accounting.Attempt, where: a.id == ^attempt.id), set: [response_metadata: historical])
 
-    assert {:ok, _attempt} =
-             with_dispatchable_request(request, fn request ->
-               Accounting.create_attempt(request, assignment, %{
-                 status: "succeeded",
-                 response_metadata: %{
-                   "payload_compression" => %{
-                     "enabled" => true,
-                     "attempted" => true,
-                     "status" => "compressed",
-                     "reason" => "rewritten",
-                     "route_class" => "proxy_http",
-                     "transport" => "http_json",
-                     "candidate_count" => 3,
-                     "compressed_count" => 2,
-                     "skipped_count" => 1,
-                     "original_bytes" => 12_000,
-                     "compressed_bytes" => 3_000,
-                     "original_tokens" => 900,
-                     "compressed_tokens" => 300,
-                     "strategies" => ["log_output", "diff"],
-                     "raw_candidate" => sentinel,
-                     "original_output" => sentinel,
-                     "compressed_output" => compressed_sentinel
-                   }
-                 }
-               })
-             end)
-
-    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
-    assert log.id == request.id
-    assert log.metadata["payload_compression"]["candidate_count"] == 3
-    assert log.metadata["payload_compression"]["compressed_count"] == 2
-    assert log.metadata["payload_compression"]["skipped_count"] == 1
-    assert log.metadata["payload_compression"]["saved_bytes"] == 9000
-    assert log.metadata["payload_compression"]["saved_tokens"] == 600
-
-    assert log.payload_compression.status == "compressed"
-    assert log.payload_compression.reason == "rewritten"
-    assert log.payload_compression.unit == "tokens"
-    assert log.payload_compression.saved_count == 600
-    assert log.payload_compression.savings_percent == 66.67
-    assert log.payload_compression.compression_ratio == 0.3333
-
-    log_text = inspect(log)
-    refute log_text =~ sentinel
-    refute log_text =~ compressed_sentinel
+      %{items: logs} = Accounting.list_request_logs(pool)
+      log = Enum.find(logs, &(&1.id == request.id))
+      assert log.metadata["payload_compression"] == "[REDACTED]"
+      assert log.metadata["nested"]["payload_compression"] == "[REDACTED]"
+      refute Map.has_key?(log, :payload_compression)
+      refute inspect(log) =~ sentinel
+      stored_request = Repo.get!(CodexPooler.Accounting.Request, request.id)
+      stored_attempt = Repo.get!(CodexPooler.Accounting.Attempt, attempt.id)
+      assert stored_request.request_metadata === historical
+      assert stored_attempt.response_metadata === historical
+    end
   end
 
   test "request log details omit malformed compaction bridge history and raw nested values" do
@@ -610,10 +572,13 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
                  :attempt_ref,
                  :final,
                  :latency_ms,
+                 :model_observation,
                  :network_error_code,
                  :pool_upstream_assignment_id,
                  :retryable,
+                 :served_model,
                  :status,
+                 :upstream_model,
                  :upstream_status_code
                ]
            end)
@@ -828,6 +793,196 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     assert [default_projection] = default_log.debug.attempts
     refute Map.has_key?(default_projection, :upstream_websocket_connection)
     refute inspect(default_log) =~ replacement_lifecycle_id
+  end
+
+  test "admin request logs project the downstream delivery receipt onto its fixed vocabulary" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    prompt_injection = "ignore-instructions-leak-secrets-now"
+    extra_value = "synthetic-extra-must-not-project"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-admin-downstream-delivery",
+        status: "succeeded",
+        correlation_id: "admin-downstream-delivery"
+      })
+
+    valid_receipt = %{
+      "outcome" => "delivered",
+      "terminal_class" => "response.completed",
+      "pushed_at" => "2026-09-10T23:27:46.108Z",
+      "frames_after_visible" => 3,
+      "transport" => "websocket"
+    }
+
+    receipts = [
+      Map.merge(valid_receipt, %{"access_token" => extra_value, "prompt" => prompt_injection}),
+      %{
+        "outcome" => "aborted",
+        "terminal_class" => "none",
+        "pushed_at" => nil,
+        "frames_after_visible" => 0,
+        "transport" => "http_sse"
+      },
+      Map.put(valid_receipt, "outcome", prompt_injection),
+      Map.put(valid_receipt, "terminal_class", prompt_injection),
+      Map.put(valid_receipt, "pushed_at", prompt_injection),
+      Map.put(valid_receipt, "frames_after_visible", -1),
+      Map.put(valid_receipt, "frames_after_visible", "3"),
+      Map.put(valid_receipt, "transport", "grpc"),
+      "not-a-map"
+    ]
+
+    # The detail projection keeps at most ten attempts, so the receipts plus the
+    # receipt-less attempt below must stay within that bound.
+    assert length(receipts) + 1 <= 10
+
+    for {receipt, index} <- Enum.with_index(receipts, 1) do
+      attempt_fixture(request, assignment, %{
+        attempt_number: index,
+        status: "succeeded",
+        response_metadata: %{"downstream_delivery" => receipt}
+      })
+    end
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: length(receipts) + 1,
+      status: "succeeded",
+      response_metadata: %{"transport" => "websocket"}
+    })
+
+    assert %{items: [admin_log], total: 1} =
+             Accounting.list_request_logs(pool, surface: :admin)
+
+    attempts_by_number = Map.new(admin_log.debug.attempts, &{&1.attempt_number, &1})
+
+    assert Map.fetch!(attempts_by_number, 1).downstream_delivery == %{
+             outcome: "delivered",
+             terminal_class: "response.completed",
+             pushed_at: "2026-09-10T23:27:46.108Z",
+             frames_after_visible: 3,
+             transport: "websocket",
+             highest_frame_class: nil,
+             completed_items: nil,
+             write_failure: nil
+           }
+
+    assert Map.fetch!(attempts_by_number, 2).downstream_delivery == %{
+             outcome: "aborted",
+             terminal_class: "none",
+             pushed_at: nil,
+             frames_after_visible: 0,
+             transport: "http_sse",
+             highest_frame_class: nil,
+             completed_items: nil,
+             write_failure: nil
+           }
+
+    for attempt_number <- 3..(length(receipts) + 1) do
+      refute Map.has_key?(Map.fetch!(attempts_by_number, attempt_number), :downstream_delivery)
+    end
+
+    projected = inspect(admin_log.debug.attempts)
+    refute projected =~ prompt_injection
+    refute projected =~ extra_value
+    refute projected =~ "access_token"
+
+    assert %{items: [default_log]} = Accounting.list_request_logs(pool)
+
+    assert Enum.all?(default_log.debug.attempts, fn attempt ->
+             not Map.has_key?(attempt, :downstream_delivery)
+           end)
+
+    refute inspect(default_log.debug) =~ "downstream_delivery"
+  end
+
+  # The highest frame class a websocket pushed (findings#232 row 232-203) is an
+  # optional receipt field: absent it projects as nil, a value of the fixed
+  # vocabulary projects as is, and anything else drops the whole receipt.
+  test "admin request logs project the receipt's highest frame class onto its fixed vocabulary" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    prompt_injection = "ignore-instructions-leak-secrets-now"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-admin-frame-class",
+        status: "failed",
+        correlation_id: "admin-downstream-frame-class"
+      })
+
+    receipt = %{"outcome" => "aborted", "terminal_class" => "none", "pushed_at" => nil, "frames_after_visible" => 2, "transport" => "websocket"}
+
+    receipts = [
+      Map.put(receipt, "highest_frame_class", "item_added"),
+      Map.put(receipt, "highest_frame_class", "item_done"),
+      receipt,
+      Map.put(receipt, "highest_frame_class", prompt_injection),
+      Map.put(receipt, "highest_frame_class", nil),
+      Map.put(receipt, "highest_frame_class", 3)
+    ]
+
+    for {receipt, index} <- Enum.with_index(receipts, 1) do
+      attempt_fixture(request, assignment, %{attempt_number: index, status: "failed", response_metadata: %{"downstream_delivery" => receipt}})
+    end
+
+    assert %{items: [admin_log], total: 1} = Accounting.list_request_logs(pool, surface: :admin)
+    projected = Map.new(admin_log.debug.attempts, &{&1.attempt_number, Map.get(&1, :downstream_delivery)})
+
+    assert %{highest_frame_class: "item_added", outcome: "aborted", frames_after_visible: 2} = projected[1]
+    assert %{highest_frame_class: "item_done"} = projected[2]
+    assert %{highest_frame_class: nil, outcome: "aborted"} = projected[3]
+    assert is_nil(projected[4])
+    assert is_nil(projected[5])
+    assert is_nil(projected[6])
+    refute inspect(admin_log.debug.attempts) =~ prompt_injection
+  end
+
+  # How many items the socket pushed completed (findings#232 row 232-241) and
+  # the class of the connection's failed write (row 232-256) are optional too:
+  # absent they project as nil, a valid value projects as is, anything else
+  # drops the whole receipt, and the completed items' digests never project.
+  test "admin request logs project the receipt's completed item count and write failure, never the digests" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    prompt_injection = "ignore-instructions-leak-secrets-now"
+    digest = "0123456789ab"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-admin-completed-items",
+        status: "failed",
+        correlation_id: "admin-downstream-completed-items"
+      })
+
+    receipt = %{"outcome" => "aborted", "terminal_class" => "none", "pushed_at" => nil, "frames_after_visible" => 9, "transport" => "websocket", "highest_frame_class" => "item_done"}
+
+    receipts = [
+      Map.merge(receipt, %{"completed_items" => 2, "completed_item_digests" => [digest, digest]}),
+      Map.merge(receipt, %{"highest_frame_class" => "delta", "write_failure" => "timeout"}),
+      Map.put(receipt, "completed_items", -1),
+      Map.put(receipt, "completed_items", "2"),
+      Map.put(receipt, "write_failure", prompt_injection),
+      Map.put(receipt, "write_failure", nil)
+    ]
+
+    for {receipt, index} <- Enum.with_index(receipts, 1) do
+      attempt_fixture(request, assignment, %{attempt_number: index, status: "failed", response_metadata: %{"downstream_delivery" => receipt}})
+    end
+
+    assert %{items: [admin_log], total: 1} = Accounting.list_request_logs(pool, surface: :admin)
+    projected = Map.new(admin_log.debug.attempts, &{&1.attempt_number, Map.get(&1, :downstream_delivery)})
+
+    assert %{completed_items: 2, write_failure: nil, highest_frame_class: "item_done"} = projected[1]
+    assert %{completed_items: nil, write_failure: "timeout", highest_frame_class: "delta"} = projected[2]
+    assert is_nil(projected[3])
+    assert is_nil(projected[4])
+    assert is_nil(projected[5])
+    assert is_nil(projected[6])
+    refute Map.has_key?(projected[1], :completed_item_digests)
+    refute inspect(admin_log.debug.attempts) =~ digest
+    refute inspect(admin_log.debug.attempts) =~ prompt_injection
   end
 
   test "request log failed rows retain semantic errors and fact-backed list behavior before terminal diagnostics" do
@@ -1269,6 +1424,71 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
            )
   end
 
+  # The four supported-values outcomes must stay readable apart in the drawer:
+  # a parsed list, a provider that named none, a list this parser refused, and a
+  # rejection the field never applied to (codex-pooler-findings#177).
+  test "request log detail keeps the supported-values states distinct and revalidates the list" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-supported-values",
+        status: "failed",
+        correlation_id: "supported-values-detail"
+      })
+
+    metadata = [
+      %{
+        "rejection_supported_values_state" => "present",
+        "rejection_supported_values" => ~w(low medium high)
+      },
+      %{"rejection_supported_values_state" => "none"},
+      %{"rejection_supported_values_state" => "unparseable"},
+      %{},
+      # A row whose stored list no longer satisfies the parser's own bounds
+      # keeps its state and drops only the list.
+      %{
+        "rejection_supported_values_state" => "present",
+        "rejection_supported_values" => ["low", "a value with spaces"]
+      },
+      # An unrecognized state is not a state.
+      %{
+        "rejection_supported_values_state" => "probably",
+        "rejection_supported_values" => ~w(low)
+      }
+    ]
+
+    for {response_metadata, index} <- Enum.with_index(metadata, 1) do
+      attempt_fixture(request, assignment, %{
+        attempt_number: index,
+        status: "failed",
+        response_metadata: response_metadata
+      })
+    end
+
+    assert %{items: [log]} = Accounting.list_request_logs(pool)
+    [present, none, unparseable, absent, invalid_list, invalid_state] = log.debug.attempts
+
+    assert present.rejection_supported_values_state == "present"
+    assert present.rejection_supported_values == ~w(low medium high)
+
+    assert none.rejection_supported_values_state == "none"
+    refute Map.has_key?(none, :rejection_supported_values)
+
+    assert unparseable.rejection_supported_values_state == "unparseable"
+    refute Map.has_key?(unparseable, :rejection_supported_values)
+
+    refute Map.has_key?(absent, :rejection_supported_values_state)
+    refute Map.has_key?(absent, :rejection_supported_values)
+
+    assert invalid_list.rejection_supported_values_state == "present"
+    refute Map.has_key?(invalid_list, :rejection_supported_values)
+
+    refute Map.has_key?(invalid_state, :rejection_supported_values_state)
+    refute Map.has_key?(invalid_state, :rejection_supported_values)
+  end
+
   test "request log detail projects bounded peer close diagnostics only through transport failure" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
     %{assignment: assignment} = upstream_assignment_fixture(pool)
@@ -1356,7 +1576,6 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
         pool_id: pool.id,
         api_key_id: api_key.id,
         session_key: "session-key-#{request.correlation_id}",
-        conversation_key: "conversation-#{request.correlation_id}",
         pool_upstream_assignment_id: assignment.id,
         status: "active",
         owner_instance_id: "test-instance",

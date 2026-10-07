@@ -15,7 +15,7 @@ defmodule Mix.Tasks.Dev.CodexCompactionSmokeFixture do
     with {:ok, action, options} <- CodexCompactionSmokeFixture.parse_args(args),
          result <- run_action(action, options) do
       case result do
-        {:ok, status} -> Mix.shell().info(Jason.encode!(status))
+        {:ok, status} -> Mix.shell().info(CodexPooler.JSON.encode!(status))
         {:error, message} -> Mix.raise(message)
       end
     else
@@ -25,6 +25,20 @@ defmodule Mix.Tasks.Dev.CodexCompactionSmokeFixture do
 
   defp run_action(:status, options), do: CodexCompactionSmokeFixture.status(options)
   defp run_action(:receipt, options), do: CodexCompactionSmokeFixture.receipt(options)
+
+  defp run_action(:cache_receipt, options) do
+    run_id = Keyword.fetch!(options, :run_id)
+
+    CodexCompactionSmokeFixture.with_isolated_config(run_id, fn _application_name ->
+      {:ok, _started} = Application.ensure_all_started(:codex_pooler)
+
+      try do
+        CodexCompactionSmokeFixture.cache_receipt(options)
+      after
+        Application.stop(:codex_pooler)
+      end
+    end)
+  end
 
   defp run_action(action, options) do
     run_id = Keyword.fetch!(options, :run_id)

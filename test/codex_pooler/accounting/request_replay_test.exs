@@ -12,6 +12,7 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
   }
 
   alias CodexPooler.Access
+  alias CodexPooler.Gateway.OperationalSettings
 
   alias CodexPooler.Gateway.Persistence.{
     BridgeOwnerLease,
@@ -23,6 +24,8 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
   alias CodexPooler.Gateway.Transports.Websocket.RemoteReconnectControlV2
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Jobs.RequestReplayCleanupWorker
+  alias CodexPooler.Platform.InstancePresence
+  alias CodexPooler.Platform.InstancePresence.Identity
   alias CodexPooler.Repo
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -80,36 +83,129 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
 
     _entitlement = insert_entitlement!(fixture, %{status: "armed"})
 
+    # A caller of the SAME tenant whose binding went stale is refused rather
+    # than served fresh work: that is the property this row exists for.
     for changed <- [
-          %{fixture.preflight | api_key_id: Ecto.UUID.generate()},
           %{fixture.preflight | api_key_runtime_epoch: 1},
-          %{fixture.preflight | pool_id: Ecto.UUID.generate()},
           %{fixture.preflight | model_id: Ecto.UUID.generate()},
           %{fixture.preflight | model_identifier: "gpt-other"}
         ] do
       assert {:error, :authorization_binding_mismatch} =
                RequestReplay.preflight_snapshot(changed)
     end
+
+    # Another tenant does not see the lifecycle at all. The lookup stopped
+    # scoping on the codex session -- a compacted thread's successor is in a
+    # different one (icoretech/codex-pooler-findings#250) -- and scopes on the
+    # request's pool and api key instead, so a foreign caller is answered
+    # `:none` and proceeds as its own fresh work rather than being told that
+    # someone else's turn is in flight.
+    for foreign <- [
+          %{fixture.preflight | api_key_id: Ecto.UUID.generate()},
+          %{fixture.preflight | pool_id: Ecto.UUID.generate()}
+        ] do
+      assert :none = RequestReplay.preflight_snapshot(foreign)
+    end
   end
 
-  test "preflight rejects stale request and attempt lifecycle behind an in-progress turn" do
+  test "preflight closes an orphaned generation-zero lifecycle behind an in-progress turn" do
+    # A terminal request whose turn was never completed, or not yet (its
+    # settlement writes the turn in a second transaction): the turn is written
+    # the way that settlement writes it, from the request's own outcome and
+    # error code, and the resend is judged against that predecessor
+    # (findings#206 row 206-609).
     terminal_request = replay_fixture()
+    completed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     terminal_request.request
     |> Ecto.Changeset.change(%{
       status: "failed",
       usage_status: "usage_unknown",
-      completed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
-      response_status_code: 499
+      completed_at: completed_at,
+      response_status_code: 499,
+      last_error_code: "client_disconnected"
     })
     |> Repo.update!()
 
-    assert {:error, :lifecycle_conflict} =
-             RequestReplay.preflight_snapshot(terminal_request.preflight)
+    assert :none = RequestReplay.preflight_snapshot(terminal_request.preflight)
 
+    assert %CodexTurn{
+             status: "interrupted",
+             error_code: "client_disconnected",
+             final_attempt_id: final_attempt_id,
+             completed_at: %DateTime{}
+           } = Repo.get!(CodexTurn, terminal_request.turn.id)
+
+    assert final_attempt_id == terminal_request.attempt.id
+
+    assert %{
+             status: "failed",
+             last_error_code: "client_disconnected",
+             completed_at: ^completed_at
+           } =
+             Repo.reload!(terminal_request.request)
+
+    assert :none = RequestReplay.preflight_snapshot(terminal_request.preflight)
+
+    # A provider failure keeps its own code on a failed turn.
+    provider_failed = replay_fixture()
+
+    provider_failed.request
+    |> Ecto.Changeset.change(%{status: "failed", usage_status: "usage_unknown", completed_at: completed_at, response_status_code: 200, last_error_code: "server_error"})
+    |> Repo.update!()
+
+    assert :none = RequestReplay.preflight_snapshot(provider_failed.preflight)
+    assert %CodexTurn{status: "failed", error_code: "server_error"} = Repo.get!(CodexTurn, provider_failed.turn.id)
+
+    # A succeeded request keeps a succeeded turn.
+    succeeded_request = replay_fixture()
+
+    succeeded_request.request
+    |> Ecto.Changeset.change(%{
+      status: "succeeded",
+      usage_status: "usage_known",
+      completed_at: completed_at,
+      response_status_code: 200
+    })
+    |> Repo.update!()
+
+    assert :none = RequestReplay.preflight_snapshot(succeeded_request.preflight)
+
+    assert %CodexTurn{status: "succeeded", error_code: nil} =
+             Repo.get!(CodexTurn, succeeded_request.turn.id)
+
+    # A finished non-retryable attempt behind an open request has no live
+    # work either: request and turn close together.
     terminal_attempt = replay_fixture()
 
     terminal_attempt.attempt
+    |> Ecto.Changeset.change(%{
+      status: "failed",
+      completed_at: completed_at,
+      usage_status: "usage_unknown"
+    })
+    |> Repo.update!()
+
+    assert :none = RequestReplay.preflight_snapshot(terminal_attempt.preflight)
+
+    assert %{
+             status: "failed",
+             usage_status: "usage_unknown",
+             response_status_code: 500,
+             last_error_code: "orphaned_turn_closed",
+             completed_at: %DateTime{}
+           } = Repo.reload!(terminal_attempt.request)
+
+    assert %CodexTurn{status: "failed", error_code: "orphaned_turn_closed"} =
+             Repo.get!(CodexTurn, terminal_attempt.turn.id)
+
+    assert Repo.reload!(terminal_attempt.attempt).status == "failed"
+  end
+
+  test "preflight settles an orphaned request reservation exactly once" do
+    fixture = replay_fixture(reservation?: true)
+
+    fixture.attempt
     |> Ecto.Changeset.change(%{
       status: "failed",
       completed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
@@ -117,9 +213,43 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     })
     |> Repo.update!()
 
-    assert {:error, :lifecycle_conflict} =
-             RequestReplay.preflight_snapshot(terminal_attempt.preflight)
+    terminal_attempt = Repo.reload!(fixture.attempt)
+    assert :none = RequestReplay.preflight_snapshot(fixture.preflight)
+    assert Repo.reload!(fixture.attempt) == terminal_attempt
+    assert terminal_ledger_count(fixture.request.id, "settlement") == 1
+    assert terminal_ledger_count(fixture.request.id, "release") == 1
+    assert :none = RequestReplay.preflight_snapshot(fixture.preflight)
+    assert terminal_ledger_count(fixture.request.id, "settlement") == 1
+    assert terminal_ledger_count(fixture.request.id, "release") == 1
+  end
 
+  test "preflight defers a proven ended visible execution to the claim transaction without settling it" do
+    fixture = replay_fixture(reservation?: true)
+    now = InstancePresence.database_now()
+    owner = Identity.new("replaced-#{System.unique_integer([:positive])}@example", "old-boot")
+    successor = Identity.new(owner.node_name, "new-boot")
+    {:ok, _} = InstancePresence.record_heartbeat(owner, DateTime.add(now, -180, :second))
+    {:ok, _} = InstancePresence.record_heartbeat()
+
+    fixture.attempt
+    |> Ecto.Changeset.change(owner_instance_id: owner.node_name, owner_instance_boot_id: owner.boot_id, owner_execution_id: Ecto.UUID.generate(), owner_process_id: "<0.123.0>")
+    |> Repo.update!()
+
+    fixture.turn |> Ecto.Changeset.change(first_visible_output_at: now) |> Repo.update!()
+    input = fixture.preflight |> Map.put(:codex_session_id, Ecto.UUID.generate()) |> Map.put(:allow_execution_recovery?, true)
+
+    assert {:error, :lifecycle_conflict} = RequestReplay.preflight_snapshot(input)
+    {:ok, _} = InstancePresence.record_heartbeat(successor, now)
+    assert :recoverable_generation_zero = RequestReplay.preflight_snapshot(input)
+    assert_untouched(fixture)
+    assert terminal_ledger_count(fixture.request.id, "settlement") == 0
+    assert terminal_ledger_count(fixture.request.id, "release") == 0
+    assert {:error, :lifecycle_conflict} = RequestReplay.preflight_snapshot(Map.delete(input, :allow_execution_recovery?))
+    assert {:error, :authorization_binding_mismatch} = RequestReplay.preflight_snapshot(%{input | api_key_runtime_epoch: input.api_key_runtime_epoch + 1})
+  end
+
+  test "preflight keeps live, retryable, pre-attempt, and visible lifecycles as conflicts" do
+    # An in-progress attempt with stale usage is still live work.
     stale_usage = replay_fixture()
 
     stale_usage.attempt
@@ -128,6 +258,50 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
 
     assert {:error, :lifecycle_conflict} =
              RequestReplay.preflight_snapshot(stale_usage.preflight)
+
+    assert_untouched(stale_usage)
+
+    # A retryable failure is a retry gap, not an orphan.
+    retryable = replay_fixture()
+
+    retryable.attempt
+    |> Ecto.Changeset.change(%{
+      status: "retryable_failed",
+      retryable: true,
+      completed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+      usage_status: "usage_unknown"
+    })
+    |> Repo.update!()
+
+    assert {:error, :lifecycle_conflict} = RequestReplay.preflight_snapshot(retryable.preflight)
+    assert_untouched(retryable)
+
+    # No attempt yet: the reservation is between admission and dispatch.
+    pre_attempt = replay_fixture()
+    Repo.delete!(pre_attempt.attempt)
+
+    assert {:error, :lifecycle_conflict} =
+             RequestReplay.preflight_snapshot(pre_attempt.preflight)
+
+    assert Repo.get!(CodexTurn, pre_attempt.turn.id).status == "in_progress"
+    assert Repo.reload!(pre_attempt.request).status == "in_progress"
+
+    # Visible output with a live attempt is a concurrent duplicate.
+    visible = replay_fixture()
+
+    visible.turn
+    |> Ecto.Changeset.change(%{
+      first_visible_output_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    })
+    |> Repo.update!()
+
+    assert {:error, :lifecycle_conflict} = RequestReplay.preflight_snapshot(visible.preflight)
+    assert_untouched(visible)
+  end
+
+  defp assert_untouched(fixture) do
+    assert Repo.get!(CodexTurn, fixture.turn.id).status == "in_progress"
+    assert Repo.reload!(fixture.request).status == "in_progress"
   end
 
   test "active preflight rejects generation zero when a globally newer generation-one attempt exists" do
@@ -150,15 +324,81 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
              RequestReplay.preflight_snapshot(fixture.preflight)
   end
 
+  # findings#319 row 1: a resend of a running generation-zero request that
+  # differs from it only by the turn metadata the client fills late carries the
+  # request's stored witness among its alternates. Only then, and only after
+  # the semantic and authorization checks passed, does the active snapshot name
+  # the stored witness for the socket to rebind the frame to.
+  test "active preflight names the stored witness only when one of the resend's alternates is it" do
+    fixture = replay_fixture()
+    stored = <<3::256>>
+    other = <<7::256>>
+    fixture.request |> Ecto.Changeset.change(%{native_client_retry_digest: stored}) |> Repo.update!()
+    before_counts = counts()
+
+    assert {:active_generation_zero, rebound} = RequestReplay.preflight_snapshot(Map.put(fixture.preflight, :replay_claim_alternates, [other, stored]))
+    assert rebound.matched_replay_claim_digest == stored
+    assert rebound.request_id == fixture.request.id
+
+    # The resend already carries the request's claim: nothing to rebind.
+    assert {:active_generation_zero, exact} = RequestReplay.preflight_snapshot(Map.put(%{fixture.preflight | replay_claim_digest: stored}, :replay_claim_alternates, [stored]))
+    refute Map.has_key?(exact, :matched_replay_claim_digest)
+
+    # A different request, or a resend without alternates, keeps its own claim.
+    for unmatched <- [Map.put(fixture.preflight, :replay_claim_alternates, [other]), fixture.preflight] do
+      assert {:active_generation_zero, snapshot} = RequestReplay.preflight_snapshot(unmatched)
+      refute Map.has_key?(snapshot, :matched_replay_claim_digest)
+    end
+
+    # The rebind is never reached before the turn's own checks pass.
+    with_stored = Map.put(fixture.preflight, :replay_claim_alternates, [stored])
+    assert RequestReplay.preflight_snapshot(%{with_stored | semantic_turn_digest: <<9::256>>}) == :none
+    assert {:error, :authorization_binding_mismatch} = RequestReplay.preflight_snapshot(%{with_stored | api_key_runtime_epoch: 1})
+    assert counts() == before_counts
+  end
+
+  # findings#323: an anchored request's stored witness is the anchor-free
+  # digest of its items, and its reservation records the claim it runs under.
+  # The anchor-free resend that carries the witness among its alternates is
+  # named that claim; a row recorded without it (by the previous release, or
+  # with a shape the sanitizer would drop) falls back to the witness.
+  test "active preflight names an anchored request's recorded claim when the resend's alternates hold its witness" do
+    fixture = replay_fixture()
+    witness = <<3::256>>
+    claim = <<4::256>>
+    other = <<7::256>>
+    recorded = %{"version" => 1, "digest" => Base.url_encode64(claim, padding: false)}
+    metadata = Map.put(fixture.request.request_metadata || %{}, "native_replay_claim", recorded)
+    fixture.request |> Ecto.Changeset.change(%{native_client_retry_digest: witness, request_metadata: metadata}) |> Repo.update!()
+    before_counts = counts()
+
+    assert {:active_generation_zero, rebound} = RequestReplay.preflight_snapshot(Map.put(fixture.preflight, :replay_claim_alternates, [other, witness]))
+    assert rebound.matched_replay_claim_digest == claim
+
+    # The resend is the anchored frame itself, or a different request: nothing
+    # to rebind.
+    for unmatched <- [Map.put(%{fixture.preflight | replay_claim_digest: claim}, :replay_claim_alternates, [witness]), Map.put(fixture.preflight, :replay_claim_alternates, [other, claim]), fixture.preflight] do
+      assert {:active_generation_zero, snapshot} = RequestReplay.preflight_snapshot(unmatched)
+      refute Map.has_key?(snapshot, :matched_replay_claim_digest)
+    end
+
+    for unusable <- [nil, %{"version" => 2, "digest" => recorded["digest"]}, Map.put(recorded, "extra", true), %{"version" => 1, "digest" => "invalid"}] do
+      metadata = if unusable, do: Map.put(metadata, "native_replay_claim", unusable), else: Map.delete(metadata, "native_replay_claim")
+      fixture.request |> Repo.reload!() |> Ecto.Changeset.change(%{request_metadata: metadata}) |> Repo.update!()
+      assert {:active_generation_zero, fallback} = RequestReplay.preflight_snapshot(Map.put(fixture.preflight, :replay_claim_alternates, [witness]))
+      assert fallback.matched_replay_claim_digest == witness
+    end
+
+    assert counts() == before_counts
+  end
+
   test "armed preflight rejects expired and incoherent durable lifecycle" do
     expired = replay_fixture()
 
     _entitlement =
       insert_entitlement!(expired, %{
-        armed_at:
-          DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:microsecond),
-        expires_at:
-          DateTime.utc_now() |> DateTime.add(-30, :second) |> DateTime.truncate(:microsecond)
+        armed_at: DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:microsecond),
+        expires_at: DateTime.utc_now() |> DateTime.add(-30, :second) |> DateTime.truncate(:microsecond)
       })
 
     assert {:error, :lifecycle_conflict} =
@@ -369,6 +609,44 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
   end
 
   @tag :replay_lifecycle
+  test "consume refuses an eligible attempt whose upstream references were detached" do
+    fixture = replay_fixture(owner?: true, reservation?: true)
+    assert {:ok, armed} = RequestReplay.arm(arm_input(fixture))
+
+    fixture.attempt
+    |> Ecto.Changeset.change(%{upstream_identity_id: nil, pool_upstream_assignment_id: nil})
+    |> Repo.update!()
+
+    assert {:error, :ineligible} =
+             RequestReplay.consume(consume_input(fixture, armed, :crypto.strong_rand_bytes(32)))
+
+    assert Repo.aggregate(Attempt, :count) == 1
+    assert Repo.aggregate(LedgerEntry, :count) == 1
+    assert Repo.get!(RequestReplayEntitlement, armed.entitlement_id).status == "armed"
+  end
+
+  @tag :replay_lifecycle
+  test "arm refuses an attempt whose upstream references were detached" do
+    fixture = replay_fixture(owner?: true, reservation?: true)
+    fixture.attempt |> Ecto.Changeset.change(%{upstream_identity_id: nil, pool_upstream_assignment_id: nil}) |> Repo.update!()
+
+    assert {:error, :ineligible} = RequestReplay.arm(arm_input(fixture))
+    assert Repo.aggregate(RequestReplayEntitlement, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 1
+  end
+
+  @tag :replay_lifecycle
+  test "dispatch refuses a consumed attempt whose upstream references were detached" do
+    fixture = replay_fixture(owner?: true, reservation?: true)
+    assert {:ok, armed} = RequestReplay.arm(arm_input(fixture))
+    assert {:ok, consumed} = RequestReplay.consume(consume_input(fixture, armed, :crypto.strong_rand_bytes(32)))
+    consumed.attempt |> Ecto.Changeset.change(%{upstream_identity_id: nil, pool_upstream_assignment_id: nil}) |> Repo.update!()
+
+    assert {:error, :ineligible} = RequestReplay.dispatch_lifecycle(consumed.consume_binding)
+    assert Repo.aggregate(Attempt, :count) == 2
+  end
+
+  @tag :replay_lifecycle
   test "consume persists each valid owner reserve timeout unchanged" do
     for reserve_timeout_ms <- [1_000, 23_417, 60_000] do
       fixture = replay_fixture(owner?: true, reservation?: true)
@@ -526,8 +804,7 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
 
     cancelled_consumer_monitor = Process.monitor(cancelled_consumer)
 
-    assert_receive {:request_replay_owner_reserve_redeemed, ^cancelled_consumer,
-                    ^cancelled_barrier_ref}
+    assert_receive {:request_replay_owner_reserve_redeemed, ^cancelled_consumer, ^cancelled_barrier_ref}
 
     %{suspended_replay: cancelled_redeemed} = :sys.get_state(cancelled_owner)
     consume_monitor = cancelled_redeemed.consume_monitor
@@ -835,9 +1112,7 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     {consumed_owner, consumed_arm} = start_suspended_replay_owner(consumed_fixture)
 
     assert {:ok, consumed} =
-             RequestReplay.consume(
-               suspended_consume_input(consumed_fixture, consumed_owner, consumed_arm)
-             )
+             RequestReplay.consume(suspended_consume_input(consumed_fixture, consumed_owner, consumed_arm))
 
     stop_replay_owner(consumed_fixture.session.id)
 
@@ -853,25 +1128,28 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
   @tag :replay_api_key_delete
   @tag :replay_race
   @tag :replay_lock_order
-  test "API key deletion closes armed replay before cascading its graph" do
+  test "API key deletion closes armed replay and preserves its accounting history" do
     fixture = replay_fixture(owner?: true, reservation?: true)
     assert {:ok, _armed} = RequestReplay.arm(arm_input(fixture))
 
     assert {:ok, deleted} = Access.delete_api_key(fixture.scope, fixture.api_key)
     assert deleted.id == fixture.api_key.id
     assert Repo.get(CodexPooler.Access.APIKey, fixture.api_key.id) == nil
-    assert Repo.get(CodexPooler.Accounting.Request, fixture.request.id) == nil
+
+    assert %{api_key_id: nil, status: "failed"} =
+             Repo.get!(CodexPooler.Accounting.Request, fixture.request.id)
+
     assert Repo.get_by(RequestReplayEntitlement, request_id: fixture.request.id) == nil
 
     assert Repo.aggregate(
              from(row in Attempt, where: row.request_id == ^fixture.request.id),
              :count
-           ) == 0
+           ) == 1
 
     assert Repo.aggregate(
              from(row in LedgerEntry, where: row.request_id == ^fixture.request.id),
              :count
-           ) == 0
+           ) == 3
   end
 
   @tag :replay_api_key_delete
@@ -923,12 +1201,12 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     assert consume_error in [:ineligible, :owner_unavailable]
     assert {:error, :ineligible} = RequestReplay.arm(arm_input(delete_first))
     assert Repo.get(CodexPooler.Access.APIKey, delete_first.api_key.id) == nil
-    assert Repo.get(CodexPooler.Accounting.Request, delete_first.request.id) == nil
+    assert %{api_key_id: nil} = Repo.get!(CodexPooler.Accounting.Request, delete_first.request.id)
 
     assert Repo.aggregate(
              from(row in Attempt, where: row.request_id == ^delete_first.request.id),
              :count
-           ) == 0
+           ) == 1
 
     Application.delete_env(:codex_pooler, :request_replay_consume_test_barrier)
 
@@ -964,7 +1242,10 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     assert {:ok, _deleted} = Task.await(consume_first_delete, 15_000)
     assert {:error, :ineligible} = RequestReplay.dispatch_lifecycle(consumed.consume_binding)
     assert Repo.get(CodexPooler.Access.APIKey, consume_first.api_key.id) == nil
-    assert Repo.get(CodexPooler.Accounting.Request, consume_first.request.id) == nil
+
+    assert %{api_key_id: nil} =
+             Repo.get!(CodexPooler.Accounting.Request, consume_first.request.id)
+
     assert Repo.get_by(RequestReplayEntitlement, request_id: consume_first.request.id) == nil
   end
 
@@ -1099,6 +1380,28 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     assert request_attempt_count(fixture.request.id) == 1
   end
 
+  # findings#270 row 270-258: the owner touches a started replay at every
+  # renewal of its lease, so the window outlasts the lease whatever the
+  # operator sets; the shipped settings keep the idle timeout's 30 minutes.
+  @tag :replay_liveness
+  test "a started replay's liveness window outlasts its owner's lease when the lease TTL is raised above the idle timeout" do
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
+    base = Keyword.get(previous, :settings, %OperationalSettings{})
+    raised = %{base | bridge_owner_lease_ttl_seconds: 120, bridge_owner_lease_renewal_seconds: 15, websocket_owner_idle_timeout_ms: 60_000}
+    Application.put_env(:codex_pooler, OperationalSettings, Keyword.put(previous, :settings, raised))
+
+    assert {started, touched} = start_and_touch_replay!()
+    assert DateTime.diff(started.abandon_at, started.started_at, :millisecond) >= (120 + 15) * 1_000
+    assert DateTime.diff(touched.abandon_at, touched.last_liveness_at, :millisecond) >= (120 + 15) * 1_000
+  end
+
+  @tag :replay_liveness
+  test "the shipped settings keep a started replay's thirty-minute liveness window" do
+    assert {started, touched} = start_and_touch_replay!()
+    assert DateTime.diff(started.abandon_at, started.started_at, :millisecond) == 1_800_000
+    assert DateTime.diff(touched.abandon_at, touched.last_liveness_at, :millisecond) == 1_800_000
+  end
+
   @tag :replay_cleanup
   @tag :replay_liveness
   test "consumed replay abandonment settles N+1 once and current touch postpones cleanup" do
@@ -1117,9 +1420,7 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
     assert {:ok, abandoned_arm} = RequestReplay.arm(arm_input(abandoned))
 
     assert {:ok, abandoned_consume} =
-             RequestReplay.consume(
-               consume_input(abandoned, abandoned_arm, :crypto.strong_rand_bytes(32))
-             )
+             RequestReplay.consume(consume_input(abandoned, abandoned_arm, :crypto.strong_rand_bytes(32)))
 
     assert {:ok, _closed} = RequestReplay.compensate_no_send(abandoned_consume.consume_binding)
     assert {:ok, :noop} = RequestReplay.close(abandoned.request.id, :owner_unavailable)
@@ -1814,5 +2115,14 @@ defmodule CodexPooler.Accounting.RequestReplayTest do
       assert terminal_ledger_count(fixture.request.id, "settlement") == 1
       assert terminal_ledger_count(fixture.request.id, "release") == 1
     end
+  end
+
+  defp start_and_touch_replay! do
+    fixture = replay_fixture(owner?: true, reservation?: true)
+    assert {:ok, armed} = RequestReplay.arm(arm_input(fixture))
+    assert {:ok, consumed} = RequestReplay.consume(consume_input(fixture, armed, :crypto.strong_rand_bytes(32)))
+    assert {:ok, started} = RequestReplay.mark_started(consumed.consume_binding)
+    assert {:ok, touched} = RequestReplay.touch_liveness(consumed.consume_binding)
+    {started, touched}
   end
 end

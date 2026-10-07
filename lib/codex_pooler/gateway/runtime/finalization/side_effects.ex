@@ -1,12 +1,17 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
   @moduledoc false
 
+  require Logger
+
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
   alias CodexPooler.Gateway.Routing.RouteLifecycle, as: RoutingRouteLifecycle
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
+  alias CodexPooler.Gateway.Runtime.Finalization.UsageLimitRefusal
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
+  alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
   alias CodexPooler.Jobs
   alias CodexPooler.Jobs.UpstreamEnqueue
   alias CodexPooler.Upstreams.SavedResets.ProbeLease
@@ -30,12 +35,67 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
     if stale_replay_generation?(context) do
       :ok
     else
-      callbacks.register_continuity.(
-        with_assignment(request_options, context.assignment),
-        payload,
-        body
+      record_continuity_result(
+        fn ->
+          callbacks.register_continuity.(
+            with_assignment(request_options, context.assignment),
+            payload,
+            body
+          )
+        end,
+        context
       )
     end
+  end
+
+  defp record_continuity_result(callback, context) when is_function(callback, 0) do
+    callback.()
+    |> consume_continuity_result(context)
+  rescue
+    exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
+      log_continuity_failure(context, continuity_exception_code(exception))
+  end
+
+  defp consume_continuity_result(:ok, _context), do: :ok
+  defp consume_continuity_result({:ok, _value}, _context), do: :ok
+
+  defp consume_continuity_result(result, context),
+    do: log_continuity_failure(context, continuity_failure_code(result))
+
+  # The line names the failure with a bounded code, never the raw result: a
+  # fixed rollback reason (`stale_owner`, `owner_unavailable`,
+  # `continuity_deadlock`, ...) renders as itself through the websocket
+  # diagnostic sanitizer, anything else as a fixed class (findings#225, row
+  # 225-96: the production line gave no way to tell why it failed).
+  defp continuity_failure_code({:error, reason}) do
+    case DiagnosticTaxonomy.reason_code(reason) do
+      code when is_binary(code) -> code
+      nil -> "unclassified_error"
+    end
+  end
+
+  defp continuity_failure_code(_result), do: "unexpected_result"
+
+  defp continuity_exception_code(%DBConnection.ConnectionError{}), do: "database_connection_error"
+  defp continuity_exception_code(%Ecto.QueryError{}), do: "query_error"
+  defp continuity_exception_code(%Postgrex.Error{}), do: "database_error"
+
+  defp log_continuity_failure(%SelectedCandidateContext{} = context, reason_code) do
+    Logger.warning(
+      "gateway continuity registration failed " <>
+        "pool_upstream_assignment_id=#{context.assignment.id} " <>
+        "reason_code=#{reason_code}",
+      continuity_registration_metadata(context)
+    )
+
+    :ok
+  end
+
+  defp continuity_registration_metadata(%SelectedCandidateContext{} = context) do
+    [
+      request_id: context.reserved.request.id,
+      pool_upstream_assignment_id: context.assignment.id
+    ]
   end
 
   @spec before_finalize_success(SelectedCandidateContext.t(), RequestOptions.t() | map()) :: :ok
@@ -56,8 +116,14 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
   end
 
   @spec observe_http_response(SelectedCandidateContext.t(), Req.Response.t(), binary()) :: :ok
-  def observe_http_response(%SelectedCandidateContext{identity: identity}, response, body) do
-    RateLimitObserver.record_headers(identity, response)
+  def observe_http_response(
+        %SelectedCandidateContext{identity: identity} = context,
+        response,
+        body
+      ) do
+    # A usage-limit `429` records its windows as the provider's denial, the
+    # refusal code read from its drained body (findings#206 row 206-594).
+    RateLimitObserver.record_headers(identity, response, context.model.upstream_model_id, UsageLimitRefusal.denial_code(response))
     RateLimitObserver.record_error(identity, body)
     :ok
   end
@@ -69,12 +135,12 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
           map() | nil
         ) :: :ok
   def observe_stream_response(
-        %SelectedCandidateContext{identity: identity},
+        %SelectedCandidateContext{identity: identity} = context,
         response,
         body,
         state
       ) do
-    RateLimitObserver.record_headers(identity, response)
+    RateLimitObserver.record_headers(identity, response, context.model.upstream_model_id)
 
     rate_limit_state =
       if is_map(state) do
@@ -90,19 +156,32 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
   end
 
   @spec observe_websocket_response(SelectedCandidateContext.t(), map()) :: :ok
-  def observe_websocket_response(%SelectedCandidateContext{identity: identity}, response) do
+  def observe_websocket_response(
+        %SelectedCandidateContext{identity: identity} = context,
+        response
+      ) do
     RateLimitObserver.record_websocket_upgrade_headers(
       identity,
-      websocket_upgrade_headers(response)
+      websocket_upgrade_headers(response),
+      context.model.upstream_model_id
     )
 
     RateLimitObserver.record_websocket_frame_headers(
       identity,
-      Map.get(response, :websocket_frame_headers, %{})
+      Map.get(response, :websocket_frame_headers, %{}),
+      context.model.upstream_model_id,
+      websocket_denial_code(response)
     )
 
     :ok
   end
+
+  defp websocket_denial_code(%{terminal: terminal, upstream_error_code: code})
+       when terminal in ["response.failed", "response.incomplete", "error"],
+       do: code
+
+  defp websocket_denial_code(%{reason: {:quota_exhausted_first_event, %{code: code}}}), do: code
+  defp websocket_denial_code(_response), do: nil
 
   defp websocket_upgrade_headers(%{reason: {:websocket_upgrade_failed, status, headers}})
        when is_integer(status) and is_list(headers),
@@ -141,32 +220,22 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
   defp maybe_confirm_reset_probe(_context, _request_options), do: :ok
 
   defp maybe_confirm_bound_reset_probe(%SelectedCandidateContext{} = context, probe) do
-    if ResetProbe.bound?(probe) and
-         ResetProbe.matches?(
-           probe,
-           context.assignment.id,
-           context.identity.id,
-           effective_model(context),
-           context.route_class
-         ) do
-      redemption = (context.identity.metadata || %{})["saved_reset_redemption"] || %{}
+    if ProviderCreditsAdmission.confirms_probe?(context.provider_credits_admission, context, probe) do
+      admitted = context.provider_credits_admission.context
 
       safe_confirm_reset_probe(
         context.identity.id,
-        redemption["generation"],
-        redemption["attempt_id"],
-        probe
+        admitted.redemption_generation,
+        admitted.redemption_attempt_id,
+        %ProbeLease.VerifiedConfirmation{credential_epoch: admitted.credential_epoch, probe: probe, upstream_model: admitted.upstream_model, serving_mode: admitted.serving_mode, transport: admitted.transport}
       )
     else
       :ok
     end
   end
 
-  defp effective_model(%SelectedCandidateContext{} = context),
-    do: context.request_options.routing.effective_model || context.model.exposed_model_id
-
-  defp safe_confirm_reset_probe(identity_id, generation, attempt_id, %ResetProbe{} = probe) do
-    ProbeLease.confirm_upstream(identity_id, generation, attempt_id, probe)
+  defp safe_confirm_reset_probe(identity_id, generation, attempt_id, %ProbeLease.VerifiedConfirmation{} = confirmation) do
+    ProbeLease.confirm_upstream(identity_id, generation, attempt_id, confirmation)
     :ok
   rescue
     exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->

@@ -6,18 +6,18 @@ head:
     attrs:
       type: application/ld+json
     content: |
-      {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can I use the official OpenAI SDK with Codex Pooler?","acceptedAnswer":{"@type":"Answer","text":"Yes, for selected SDK routes. Set the SDK base_url or baseURL to https://codex-pooler.example.com/v1, use a Pool API key as the bearer credential, and keep requests on supported route shapes such as responses, chat completions, models, usage, files, audio transcription, and image generation or edits."}},{"@type":"Question","name":"Should Codex backend clients use /v1?","acceptedAnswer":{"@type":"Answer","text":"No. Codex backend-compatible clients should use /backend-api/codex. The /v1 surface is for selected OpenAI SDK-compatible clients and translates supported requests into Codex-compatible work."}},{"@type":"Question","name":"Does /v1 support OpenAI Realtime?","acceptedAnswer":{"@type":"Answer","text":"No. /v1/realtime and OpenAI Realtime SDK websocket or session routes are unsupported. GET /v1/responses is narrow Responses websocket compatibility only, not OpenAI Realtime support."}},{"@type":"Question","name":"Does /v1/responses/compact work?","acceptedAnswer":{"@type":"Answer","text":"No. POST /v1/responses/compact returns a deterministic unsupported_endpoint error. Explicit compaction is supported on normal /v1/responses requests when a client appends exactly one final compaction_trigger after visible input."}},{"@type":"Question","name":"Can I use the same key for /v1 and /mcp?","acceptedAnswer":{"@type":"Answer","text":"No. /v1 uses Pool API keys for runtime work. /mcp uses operator-owned MCP bearer tokens for metadata-only lookup. Keep those credentials separate in client configuration and storage."}}]}
+      {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can I use the official OpenAI SDK with Codex Pooler?","acceptedAnswer":{"@type":"Answer","text":"Yes, for selected SDK routes. Set the SDK base_url or baseURL to https://codex-pooler.example.com/v1, use a Pool API key as the bearer credential, and keep requests on supported route shapes such as responses, chat completions, models, usage, files, audio transcription, and image generation or edits."}},{"@type":"Question","name":"Should Codex backend clients use /v1?","acceptedAnswer":{"@type":"Answer","text":"No. Codex backend-compatible clients should use /backend-api/codex. The /v1 surface is for selected OpenAI SDK-compatible clients and translates supported requests into Codex-compatible work. A Codex client pointed at /v1 also behaves differently from one on the backend alias in two ways: Codex's own post-turn compaction is a bare compaction_trigger, and /v1 refuses it with 400 invalid_request because visible input is required before the trigger, so only a mid-turn compaction reaches the provider through /v1; and when the provider refuses a connection-bound compaction with its usage limit, /v1 answers the 429 of the account that holds the conversation's anchor, which is the documented /v1 contract for SDK clients, and Codex stops, while the backend alias answers 503 pinned_continuation_unavailable when another account can serve and Codex then falls back to a compaction served by another account."}},{"@type":"Question","name":"Does /v1 support OpenAI Realtime?","acceptedAnswer":{"@type":"Answer","text":"No. /v1/realtime and OpenAI Realtime SDK websocket or session routes are unsupported. GET /v1/responses is narrow Responses websocket compatibility only, not OpenAI Realtime support."}},{"@type":"Question","name":"Do the OpenAI Agents helpers work with Codex Pooler?","acceptedAnswer":{"@type":"Answer","text":"No. The beta Agents API under /v1/agents and /v1/vaults is unsupported, so the OpenAI Node client.beta.agents helpers, such as sessions.stream, functionTool, typed final results, environment file preparation and artifact download, receive a 404 with the error code unsupported_endpoint. Use POST /v1/responses with function tools instead; a tool result goes back as a function_call_output item in the next request."}},{"@type":"Question","name":"Does /v1/responses/compact work?","acceptedAnswer":{"@type":"Answer","text":"No. POST /v1/responses/compact returns a deterministic unsupported_endpoint error. Explicit compaction is supported on normal /v1/responses requests when a client appends exactly one final compaction_trigger after visible input."}},{"@type":"Question","name":"Can I use the same key for /v1 and /mcp?","acceptedAnswer":{"@type":"Answer","text":"No. /v1 uses Pool API keys for runtime work. /mcp uses operator-owned MCP bearer tokens for metadata-only lookup. Keep those credentials separate in client configuration and storage."}}]}
 ---
 
-Codex Pooler provides narrow OpenAI-compatible `/v1` support for selected SDK routes. It translates supported requests into Codex-compatible work, then sends them through the same Pool routing, limit checks, account selection, and accounting path used by Codex backend clients.
+Use Codex Pooler in your own applications with the OpenAI Python and Node SDKs or the Vercel AI SDK. This guide covers the supported ways to generate text, use tools, work with images and transcribe audio with a Pool API key, along with examples you can adapt to your application.
 
-It doesn't provide full OpenAI API parity.
+![Codex Pooler OpenAI-compatible SDK integrations](/codex-pooler-sdks.webp)
 
 For a short citable summary, see [OpenAI-compatible Codex gateway](/discovery/openai-compatible-codex-gateway/).
 
 ## What OpenAI-Compatible Means Here
 
-OpenAI-compatible means selected SDK request shapes can use a `/v1` base URL and a Pool API key. Codex Pooler still routes the request through Codex account Pools, not through a separate OpenAI engine. Unsupported OpenAI API areas remain unsupported, including embeddings, batches, fine-tuning, moderation, response retrieve/cancel/delete, image variations, OpenAI Responses remote MCP tool definitions, and OpenAI Realtime SDK routes.
+OpenAI-compatible means selected SDK request shapes can use a `/v1` base URL and a Pool API key. Codex Pooler still routes the request through Codex account Pools, not through a separate OpenAI engine. Unsupported OpenAI API areas remain unsupported, including embeddings, batches, fine-tuning, moderation, response retrieve/cancel/delete, image variations, the beta Agents API, OpenAI Responses remote MCP tool definitions, and OpenAI Realtime SDK routes.
 
 ## Base URL and authentication
 
@@ -33,6 +33,22 @@ Bearer <pool-api-key>
 
 For local setup, use `http://localhost:4000/v1`.
 
+Set the key in the terminal used to run the SDK examples:
+
+**macOS / Linux / WSL**
+
+```bash
+export CODEX_POOLER_API_KEY="<pool-api-key>"
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:CODEX_POOLER_API_KEY = "<pool-api-key>"
+```
+
+These commands apply to the current terminal. If the application runs as a service, configure the same variable in that service's environment. The Python, JavaScript and TypeScript examples below use the same code on all supported operating systems.
+
 ## Service tier compatibility
 
 Use `service_tier: "priority"` for priority processing. `fast` is an accepted
@@ -41,11 +57,15 @@ configuration. On `/v1`, Codex Pooler translates supported OpenAI request and
 response shapes while preserving any projected provider `service_tier` value in
 its literal provider vocabulary. Codex backend relay routes under
 `/backend-api/codex` preserve provider bytes, frames, and service-tier
-vocabulary unchanged.
+vocabulary unchanged. The ChatGPT Codex backend reports
+`service_tier: "default"` on completed responses even when the request asked
+for `priority`, and Codex Pooler relays that value as reported.
 
-`ultrafast` is a separate tier, not an alias for `fast` or `priority`. Use
-`service_tier: "ultrafast"` only with direct `/v1/responses` requests when the
-selected model metadata advertises it:
+`ultrafast` is a separate tier, not an alias for `fast` or `priority`. Native
+Codex Responses and `/v1/responses` can use `service_tier: "ultrafast"` when
+the selected account's model metadata advertises it. A Pool with mixed
+capabilities routes the request only to matching accounts; a Pro plan label
+alone does not grant access:
 
 ```python
 response = client.responses.create(
@@ -60,19 +80,27 @@ JSON, SSE, and narrow Responses WebSocket requests preserve a returned
 Provider availability, access, and price control whether the tier can be used;
 model metadata advertisement is not an entitlement or price promise.
 
+The Codex model catalog can expose a compatible account's richer tier list
+when that list includes every available tier and keeps the same default.
+Incompatible context or tool capabilities are not combined. When no account
+advertises every choice, the catalog keeps its existing selection. An anchored
+continuation stays on its original account; changing tier cannot transfer its
+upstream context to another account.
+
 ## Tool-specific setup pages
 
 Use the dedicated setup pages when configuring an agent or editor that has its own provider shape:
 
 - [Aider](/clients/aider/)
-- [Continue](/clients/continue/)
 - [Cline](/clients/cline/)
+- [Continue](/clients/continue/)
+- [DeepSeek Harness](/clients/deepseek-harness/)
 - [Goose](/clients/goose/)
 - [Hermes Agent](/clients/hermes/)
-- [Kilo](/clients/kilo/)
+- [Kilo Code](/clients/kilo-code/)
 - [OpenCode](/clients/opencode/)
 - [OpenClaw](/clients/openclaw/)
-- [OpenHands](/clients/openhands/)
+- [OpenHands Agent Canvas](/clients/openhands/)
 - [OMP](/clients/omp/)
 - [Pi](/clients/pi/)
 - [Trae](/clients/trae/)
@@ -91,7 +119,7 @@ client = OpenAI(
 )
 
 response = client.responses.create(
-    model="gpt-5.6-terra",
+    model="gpt-6.1-sol",
     input="Write a short setup confirmation.",
 )
 
@@ -109,7 +137,7 @@ const client = new OpenAI({
 });
 
 const response = await client.responses.create({
-  model: "gpt-5.6-terra",
+  model: "gpt-6.1-sol",
   input: "Write a short setup confirmation.",
 });
 
@@ -128,7 +156,7 @@ const pooler = createOpenAI({
 });
 
 const { text } = await generateText({
-  model: pooler.responses("gpt-5.6-terra"),
+  model: pooler.responses("gpt-6.1-sol"),
   providerOptions: {
     openai: {
       promptCacheOptions: { mode: "explicit", ttl: "30m" },
@@ -152,7 +180,7 @@ console.log(text);
 Codex Pooler accepts these OpenAI cache controls as public input. For
 account-backed requests, it adapts the explicit controls automatically before
 upstream dispatch while preserving `prompt_cache_key` independently from Pool
-routing affinity. GPT-5.6 model ids are passed through to the Pool catalog and
+routing affinity. GPT-6 model ids are passed through to the Pool catalog and
 assignment policy; naming one here does not guarantee that every Pool has an
 eligible account for that model.
 
@@ -163,7 +191,7 @@ on every generation that participates in the tool loop:
 
 ```ts
 const result = await generateText({
-  model: pooler.responses("gpt-5.6-terra"),
+  model: pooler.responses("gpt-6.1-sol"),
   providerOptions: {
     openai: { store: false },
   },
@@ -180,12 +208,15 @@ complete stateless replay path. Independently, Codex Pooler forces upstream
 This is narrow, closed-world compatibility, not general OpenAI programmatic-tool
 or Responses parity. Supported shapes are `program` and `program_output`,
 caller-enabled `function_call` and `function_call_output`, the type-only
-`programmatic_tool_calling` tool and tool choice, plus `allowed_callers` and
-map-only `output_schema`. Reference-only and ordinary stored-response
-continuations are not supported. Codex Pooler does not locally persist raw
-program code, results, schemas, or identifiers. A request accepted by the
-gateway can still be rejected when its selected upstream model or account lacks
-the required capability.
+`programmatic_tool_calling` tool, plus `allowed_callers` and map-only
+`output_schema`. The upstream accepts the `programmatic_tool_calling` tool only
+in Lite serving mode: in Full serving mode Codex Pooler rejects the declaration
+before dispatch with `400 invalid_request` on `tools`. A `tool_choice` naming
+it is rejected in both modes with `400 invalid_request` on `tool_choice`.
+Reference-only and ordinary stored-response continuations are not supported.
+Codex Pooler does not locally persist raw program code, results, schemas, or
+identifiers. A request accepted by the gateway can still be rejected when its
+selected upstream model or account lacks the required capability.
 
 Responses `function_call_output` replay has two closed forms over HTTP and the
 narrow Responses websocket bridge. A paired item requires a nonblank `call_id`;
@@ -195,6 +226,29 @@ named standalone item requires a nonblank `name` and an `output` field, permits
 `null`, or a nonblank string. Blank or non-string values and standalone `result`
 reject before dispatch. Classification and debug summaries remain metadata-only.
 This does not expand general Responses parity or prove provider-live acceptance.
+
+### Multi-agent mailbox history replay
+
+A Codex multi-agent (v2) history contains `agent_message` items: a message one
+agent delivered to another, such as a subagent's answer handed back to its lead
+or the lead's task handed to a subagent. A gateway that relays that history to
+`POST /v1/responses` sends them in `input`. Codex Pooler accepts the two forms
+Codex serializes and forwards them unchanged, in Full and Lite serving mode
+alike, as part of a stateless replay:
+
+- A plaintext item with `author`, `recipient` and a nonempty `content` list of
+  `input_text` parts, plus an optional `id` and an optional
+  `internal_chat_message_metadata_passthrough` object.
+- A sealed task handoff whose `content` is exactly one `input_text` envelope
+  followed by one nonblank `encrypted_content` part. The envelope reads
+  `Message Type: NEW_TASK` or `Message Type: MESSAGE`, names the recipient as the
+  task name and the author as the sender, and both are `/root` or `/morpheus`
+  agent paths. The encrypted part is opaque to Codex Pooler and never persisted.
+
+Any other shape, every other encrypted `agent_message` included, is rejected
+before dispatch with `400 invalid_request` on `input` instead of being filtered
+out of the history. Plaintext and sealed items keep the position the client sent
+them in.
 
 ### Hosted shell history replay
 
@@ -232,7 +286,46 @@ accepts only ordered `url_citation` annotations with exactly `type`,
 explicit empty annotation lists, and omission exactly. Malformed or unsupported
 annotation shapes are rejected before dispatch rather than filtered.
 
-`GET /v1/models` may include `context_length` for clients that probe OpenAI-compatible model lists, such as Hermes. The official OpenAI SDK request APIs and Vercel AI SDK generation APIs do not expose Codex model-catalog context controls. Use their output-budget fields only when your application needs one: `max_output_tokens` in OpenAI Responses, `max_completion_tokens` in Chat Completions, and `maxOutputTokens` at the Vercel AI SDK layer. Codex Pooler's public `/v1/responses` rejects `context_management`, and direct `POST /v1/responses/compact` remains unsupported. Explicit compaction is available on the normal `/v1/responses` route.
+Assistant-history replay may also carry the Codex Responses message `phase`:
+`commentary`, `partial_answer` (stable answer text that may be followed by more
+output or tools) or `final_answer`. Codex Pooler forwards an accepted phase
+unchanged. Any other phase value, and a `phase` on a message that is not an
+assistant message, is rejected before dispatch with `400 invalid_request`.
+
+`GET /v1/models` may include `context_length` for clients that probe OpenAI-compatible model lists, such as Hermes. That probe is an ordinary authenticated request: a client that issues it without the Pool API key is refused like any other route, and a client that caches the refusal will keep using whatever context window it bundles for the model instead. Configure the context window explicitly wherever the client allows it. The official OpenAI SDK request APIs and Vercel AI SDK generation APIs do not expose Codex model-catalog context controls. Their output-budget fields are `max_output_tokens` in OpenAI Responses, `max_completion_tokens` in Chat Completions, and `maxOutputTokens` at the Vercel AI SDK layer; availability at the SDK layer does not establish upstream support or a hard generation limit. Codex Pooler's public `/v1/responses` rejects `context_management`, and direct `POST /v1/responses/compact` remains unsupported. Explicit compaction is available on the normal `/v1/responses` route.
+
+### Continuing with `previous_response_id`
+
+A nonblank `previous_response_id` is accepted only for a tool-output continuation. If the input has no tool-result shape, Codex Pooler returns `400 invalid_request` with `param: previous_response_id` before checking the upstream connection. This validation rule applies to HTTP and the Responses websocket.
+
+Codex Pooler forces `store: false` upstream, and the upstream provider resolves `previous_response_id` only on the websocket connection that produced the response. Over HTTP it rejects the parameter, and on any other websocket connection, a new one included, it rejects the anchor. On `/v1/responses` an anchored request therefore reaches the earlier context in two cases: on the Responses websocket route, or as a `stream: true` HTTP request on a deployment with websocket owner forwarding (see the [websocket replica caveat](/deployment/helm/#websocket-replica-caveat)) when every request of the chain, the first one included, sends the same session header, such as `session-id`. Codex Pooler then sends those requests over its session's upstream websocket.
+
+After input validation, an unavailable producing connection returns `400 previous_response_not_found`. Codex Pooler rejects locally detectable failures before dispatch and maps the provider’s matching stale-anchor refusal to the same error:
+
+```json
+{
+  "error": {
+    "type": "invalid_request_error",
+    "code": "previous_response_not_found",
+    "param": "previous_response_id",
+    "message": "Previous response not found on this request's upstream connection: ..."
+  }
+}
+```
+
+This covers a non-streaming request, every HTTP request on a deployment without owner forwarding, and a streaming request whose session has no upstream connection that produced the anchor, such as a chain without a session header or a session whose connection was closed. The message states the requirement above. When you receive this error, send the complete input again without `previous_response_id`; clients that recognize the `previous_response_not_found` code as a stale chain do this on their own.
+
+### Output budgets and local usage
+
+Codex Pooler checks token policy against admission estimates. The output reservation floor is 512 tokens, or 2,048 when context is opaque; higher accepted request or policy values can increase the estimate. Continuation references and other opaque input prevent a complete input count from the visible payload. These are local accounting estimates in both Full and Lite serving modes, not provider hard bounds. The selected upstream may refuse `max_output_tokens`; forwarding a field or switching serving modes does not guarantee output enforcement. Actual measured usage is recorded without clipping, so a single response can exceed its reservation or remaining token budget. There is no absolute per-response spend cap.
+
+`GET /v1/usage` separates measured reporting from local enforcement. Existing `total_tokens` and priced cost totals remain measured-usage reporting; a price snapshot produces an estimate, not an invoice or a provider-confirmed charge. `budget_usage.daily` and `budget_usage.weekly` each expose `known_total_tokens`, `provisional_total_tokens`, `pending_total_tokens`, `effective_total_tokens`, and `admission_count`. Daily means midnight UTC onward; weekly means the trailing seven days. These components cover only the authenticated key across models and routes, never other keys.
+
+Effective pressure is known plus provisional plus pending. Attempted work with unknown terminal usage keeps its original estimate provisionally until a known correction or expiry of the original terminal window. A correction replaces that estimate once at the original terminal time. Pre-attempt failures and requests the Pooler refuses before anything is sent upstream create no provisional consumption; pending reservations remain pressure across a window boundary. RPM counts each admitted reservation once, without refunds or movement on correction.
+
+The local `limits` list describes active default-policy thresholds; it is not a model-override simulator. A matching active model override replaces the default binding for admission, including its blank fields, while comparing its thresholds with whole-key pressure. Provider quota windows remain separate in `upstream_limits`; Codex-compatible usage endpoints retain their upstream quota authority when available. See [API key limits](/operators/api-keys/#limits) for policy and concurrency configuration.
+
+An optional key-wide `max_active_requests` limit spans the fleet and all models and routes. A trusted local saturation denial is `429 api_key_concurrency_limit_exceeded`, typed `rate_limit_error`, with HTTP `Retry-After: 1`. Back off before retrying; the interval does not promise availability. Native and narrow public Responses websockets receive the equivalent turn error and can retry on the same connection when a slot becomes available. A provider error that happens to use the same code is not trusted as a local concurrency denial and does not acquire its retry header or type. Authentication `401` and policy-budget `403` remain distinct.
 
 ### Request an explicit compaction turn
 
@@ -251,7 +344,7 @@ const pooler = createOpenAI({
 });
 
 const result = await generateText({
-  model: pooler.responses("gpt-5.6-terra"),
+  model: pooler.responses("gpt-6.1-sol"),
   providerOptions: {
     openai: {
       store: false,
@@ -268,7 +361,7 @@ const compaction = result.content.find(
 
 The serialized request must contain visible input followed by exactly one final `{"type":"compaction_trigger"}` item. Non-terminal, duplicate, trigger-only, hidden-only, or otherwise malformed placement returns an OpenAI-shaped `400 invalid_request` on `input` before upstream dispatch.
 
-Successful non-streaming HTTP returns a completed Responses JSON object containing the normalized compaction item. Public SSE emits `response.output_item.done`, then `response.completed`, then `[DONE]`. Narrow Responses websocket completion emits the same two Responses events without the HTTP `[DONE]` sentinel. Direct `POST /v1/responses/compact` remains unsupported.
+Successful non-streaming HTTP returns a completed Responses JSON object containing the normalized compaction item. Public SSE follows the Responses streaming grammar the official SDK stream helpers expect: `response.created` with an empty output, `response.output_item.added` and `response.output_item.done` for the compaction item at `output_index` 0, then `response.completed` and `[DONE]`. Narrow Responses websocket completion emits the same four Responses events without the HTTP `[DONE]` sentinel. Direct `POST /v1/responses/compact` remains unsupported.
 
 If upstream compact output is malformed JSON or does not contain nonblank encrypted compaction content, Codex Pooler returns a sanitized `502 invalid_compaction_response`. Other provider failures follow the public error rules documented below.
 
@@ -276,7 +369,7 @@ If upstream compact output is malformed JSON or does not contain nonblank encryp
 
 When a compaction turn returns an encrypted `type: "compaction"` output item, submit that item unchanged at the start of the next `POST /v1/responses` input, followed by the new user input. Start a new chain by omitting `previous_response_id`; the compact response envelope id is not a replay anchor.
 
-The stable public replay fields are `type`, a nonblank opaque `encrypted_content` string, and optional `id`. The `id` key may be absent, a string, or explicitly `null`, and its presence is preserved. JSON, SSE, and narrow Responses websocket surfaces return the same normalized item. Native-only metadata and unknown fields are removed from output; unknown replay fields or malformed values are rejected before upstream dispatch. Treat `encrypted_content` as opaque and do not log or persist it in application telemetry.
+The stable public replay fields are `type`, a nonblank opaque `encrypted_content` string, and a string `id`. When the upstream item carries no usable id, Codex Pooler returns a derived `cmp_` id and removes that derived id again when the item is replayed, so the upstream receives the item as it produced it; a provider id is forwarded unchanged. JSON, SSE, and narrow Responses websocket surfaces return the same normalized item. Native-only metadata and unknown fields are removed from output; unknown replay fields or malformed values are rejected before upstream dispatch. Treat `encrypted_content` as opaque and do not log or persist it in application telemetry.
 
 ## Supported or translated route support
 
@@ -296,26 +389,100 @@ The OpenAI-compatible `/v1` surface supports or translates selected routes only:
 
 The `/v1` surface is compatibility over Codex routing, not a separate OpenAI engine. Supported requests still require a Pool API key and a Pool with eligible upstream capacity for the requested model.
 
+### Request metadata
+
+`POST /v1/responses`, the Responses websocket and `POST /v1/chat/completions`
+accept `metadata` as the OpenAI API defines it: `null`, or an object of at most
+16 properties whose names have at most 64 characters and whose values are
+strings of at most 512 characters. A malformed value is rejected before
+dispatch on `metadata`, with the OpenAI API's error code: `invalid_type`,
+`object_above_max_properties`, `property_name_above_max_length` or
+`string_above_max_length`. An accepted value is not forwarded, because the
+upstream rejects the parameter, and it is neither stored nor echoed in the
+response.
+
+### Chat Completions request compatibility
+
+`POST /v1/chat/completions` accepts normal `messages` requests. It also accepts
+Responses-shaped `input` with `reasoning`, `text`, and `include` when `messages`
+is absent or empty. Combining these fallback fields with nonempty `messages`
+returns `invalid_request`, except that a string `reasoning` value is accepted
+as an alias for Chat's `reasoning_effort`. The alias follows the same validation
+and API-key reasoning policy. If both effort fields are present, their normalized
+values must match; conflicting values return `invalid_request`. A Responses
+`reasoning` object remains invalid alongside nonempty `messages`.
+
+Both shapes return Chat Completions JSON or SSE. `stream_options.include_usage`
+controls the terminal streamed usage chunk and is not forwarded upstream.
+Successful function or custom-tool turns return `finish_reason: "tool_calls"`,
+including streams whose terminal event omits the output list.
+
+Streamed function arguments and custom-tool input can be completed from the
+upstream's final argument, item, or completed-response snapshot. Pooler appends
+only the missing suffix when the tool identity and already-delivered bytes
+agree. Conflicting snapshots end the stream with a sanitized error rather than
+reporting a successful tool call.
+
+Chat function tools keep Chat's non-strict default: omitted or null `strict`
+is forwarded as `strict: false`. Explicit `strict: true` remains strict.
+Direct Responses requests and Responses-shaped fallback requests retain their
+own strict-mode defaults.
+
+For ordinary Chat `messages`, text fields larger than 10 MiB are divided into
+smaller UTF-8 content parts before dispatch, preserving all text and its order.
+This includes message history and textual tool outputs. Oversized combined
+system/developer instructions keep their normalized content in one leading
+developer message with multiple parts. Nothing is truncated or summarized.
+Request-size and model context limits still apply; opaque fields such as tool
+arguments and encoded media are not split. Direct Responses and `input`
+fallback requests retain their existing representation.
+
+Replayed Chat tool-call identifiers longer than 64 UTF-8 bytes are mapped to
+stable, bounded identifiers before dispatch. The matching call and result use
+the same identifier, including across repeated history requests. Short
+identifiers, tool names, arguments and outputs stay unchanged. If a mapped
+identifier would collide with another identifier in the request, Pooler rejects
+the request instead of merging distinct calls. Direct Responses and `input`
+fallback requests keep their original identifiers.
+
+The optional `user` field accepts a string or null and is discarded before
+dispatch. It does not establish ownership, permissions, or routing identity.
+
+A `tool` message may carry `image_url` parts next to its text, as Hermes sends a
+screenshot tool result when it talks Chat Completions. Codex Pooler forwards them
+as images of the tool output, with `image_url.detail` handled like a user image.
+A `file` part in a `tool` message returns `invalid_request`.
+
 ### Image generation and edits
 
-Use `gpt-image-2` for current image examples. It is the [latest GPT Image model](https://developers.openai.com/api/docs/models/gpt-image-2); older supported identifiers remain available for compatibility. Media identifiers do not have to appear in the Pool's model catalog for these translated routes to work.
+Use `gpt-image-2.5-flare` for current image examples, or select `gpt-image-2.5-sunburst` explicitly. Both [Flare](https://developers.openai.com/api/docs/models/gpt-image-2.5-flare) and [Sunburst](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst) are accepted; `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`, and `gpt-image-1-mini` remain available for compatibility. Media identifiers do not have to appear in the Pool's model catalog for these translated routes to work.
 
 ```js
 const image = await client.images.generate({
-  model: "gpt-image-2",
+  model: "gpt-image-2.5-flare",
   prompt: "A simple watercolor landscape",
   size: "1024x1024",
   quality: "medium",
 });
 ```
 
-The translated Images routes accept `size` values `auto`, `1024x1024`, `1024x1536` and `1536x1024`, with one image per request. This is a Codex-backed subset; it does not expose every resolution or option offered by the OpenAI Images API.
+For GPT Image 2.5, the translated Images routes accept `auto` or custom `WIDTHxHEIGHT` sizes: both edges must be multiples of 16, neither may exceed 3840 pixels, the aspect ratio must stay between 1:3 and 3:1, and the total area must be between 655,360 and 8,294,400 pixels. Resolutions above `2560x1440` are experimental upstream. Quality accepts `auto`, `low`, `medium`, `high`, `xhigh`, and `max`. Older models retain the three standard sizes plus `auto`, with quality up to `high`. Requests still produce one image. The dated identifiers `gpt-image-2.5-flare-2026-09-08` and `gpt-image-2.5-sunburst-2026-09-08` use the same adapter options as their aliases.
 
-Standard `gpt-image-2` generation and edit requests use the native Codex image service. Uploaded edit images are forwarded transiently as image data URLs. The provider determines the returned image dimensions; a requested size does not guarantee exact output dimensions.
+Standard `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst`, and `gpt-image-2` generation and edit requests use the native Codex image service. Uploaded edit images are forwarded transiently as image data URLs. Accepted `size` and `quality` values are forwarded unchanged. The backend accepts these options but has returned `quality: low` and `1254x1254` even when higher quality and custom dimensions were requested. Acceptance does not establish output adherence; inspect the returned `size` and `quality` fields and decoded image dimensions rather than treating request values as measured output. The native Codex service is distinct from the public OpenAI Images API.
 
-Requests using `mask` or `input_fidelity`, and older image model identifiers, retain the Responses image-tool translation. These options are not silently dropped or sent to the native image service. Their availability depends on the selected provider host actually producing image output; a completed text response alone is an image-generation failure.
+Edits with `mask` use a Full Responses host and explicitly request the image generation tool. Codex Pooler chooses an eligible Full host without changing Pool serving-mode overrides. If no eligible Full host is available under the configured model and serving policy, the request fails before upstream dispatch or accounting reservation with `400 unsupported_parameter` and `param: "mask"`. Unmasked GPT Image 2/2.5 edits remain on the native image route.
+
+A mask identifies editable regions through transparent pixels while opaque pixels indicate areas to preserve. Supply a mask with the same dimensions and format as the source image, and describe the intended edit clearly in the prompt. Image editing is generative: inspect the output rather than assuming exact pixel preservation. Codex Pooler forwards the original mask as `input_image_mask`; it does not invert alpha, append it as an ordinary reference image, or rewrite the prompt.
+
+`input_fidelity` is accepted only for `gpt-image-1` and `gpt-image-1.5`. Omit it for `gpt-image-2`, which [always processes image inputs at high fidelity](https://developers.openai.com/api/docs/guides/image-generation#image-input-fidelity), and for `gpt-image-1-mini`, which does not support the option. Codex Pooler also rejects configurable `input_fidelity` for both GPT Image 2.5 models; this is an adapter limitation, not a claim about their public OpenAI API capabilities. Unsupported model/option combinations are rejected before dispatch.
+
+The bundled pricing catalog includes standard and batch text/image token rates for both GPT Image 2.5 models. These separate modality prices are validated but are not converted into generic token pricing snapshots. Native Images requests retain reported aggregate token usage when available, but do not borrow the routing host's language-model rates; without supported image pricing, dollar cost remains unavailable rather than zero. Batch prices in the catalog do not enable the unsupported `/v1/batches` API.
+
+Image responses contain base64 image data. `response_format` may be omitted or set to `b64_json`; `url` and other values are rejected. The optional `user` hint accepts a string or null and is discarded before dispatch; it does not establish ownership or routing identity. Unsupported options, including image streaming and output compression, are rejected rather than silently ignored.
 
 ### Audio transcriptions
+
+The Pool's `Allow Audio Transcription` setting must be enabled (the default). Disabling it rejects transcription requests with `403 audio_transcription_disabled` before the upload is parsed or sent upstream.
 
 Audio support covers speech-to-text transcription. Text-to-speech (`POST /v1/audio/speech`), audio translation (`POST /v1/audio/translations`), and
 Realtime voice sessions are not supported. Use a provider that supports those
@@ -324,6 +491,10 @@ endpoints when a client needs spoken output or live voice conversations.
 `POST /v1/audio/transcriptions` accepts `gpt-transcribe` as a caller alias. The
 gateway uses the fixed canonical backend identity `gpt-4o-transcribe`. The alias
 is not a model-list entry or a model-discovery guarantee.
+
+The transcription adapter accepts `file`, `model`, an optional string `prompt`, decoded `keywords` and `languages` arrays, and `response_format: "json"` or `"text"`. Omitting the format returns JSON. With `"text"`, Pooler returns the backend transcript as an unquoted UTF-8 string with `Content-Type: text/plain; charset=utf-8`; whitespace and line breaks are preserved, and errors still use the JSON error envelope.
+
+Subtitle formats `srt` and `vtt`, `verbose_json`, and `diarized_json` are unsupported. The Codex transcription backend returns text without timed segments or speaker annotations, so Pooler does not generate subtitle timestamps or infer them from the audio length. A model or format accepted by the OpenAI SDK is not automatically available through this backend. Scalar `language` and `temperature` are also rejected. Use the explicitly supported `languages` array only when its backend language hints fit your client; it is not an automatic translation of the OpenAI `language` parameter.
 
 ```js
 import fs from "node:fs";
@@ -370,11 +541,23 @@ omitted. Nonempty lists retain caller order and duplicate entries. Responses omi
 language-detection fields. This documents the accepted request shape only, not
 transcription quality, model discovery, or general Audio API coverage.
 
-A successful transcription response must contain a string `text` field. An empty string is valid for silence; missing or invalid text and error objects are reported as upstream failures rather than successful transcriptions.
+A successful upstream transcription response must contain a string `text` field. Pooler validates this JSON before returning the requested JSON or plain-text format. An empty string is valid for silence; missing or invalid text and error objects are reported as upstream failures rather than successful transcriptions.
 
-`POST /v1/responses` lifts system and developer input-message text into top-level `instructions` before dispatching to Codex-compatible work. Streaming `/v1/responses` and `/v1/chat/completions` return early upstream terminal errors as the first public SSE event or data chunk, without synthetic assistant/success prefixes. Non-streaming failures remain OpenAI-shaped JSON errors.
+`POST /v1/responses` lifts system and developer input-message text into top-level `instructions` before dispatching to Codex-compatible work. When the provider supplies only a failed, incomplete, or error terminal, the public SSE adapter adds a `response.created` lifecycle prefix so SDK accumulators can initialize; this prefix does not imply success. Chat Completions streams still return early upstream errors without a synthetic assistant prefix. Non-streaming failures remain OpenAI-shaped JSON errors.
+
+Relayed validation errors name a client input index only when its original position remains known. If coercion removed or expanded items, the public parameter uses `input[]` rather than an incorrect index. Tool-output image `detail` is validated for both list outputs and object outputs containing a `content` list.
+
+### Responses stream behavior
 
 Streaming `/v1/responses` clients must also handle a terminal `type: "error"` SSE event whose flat fields and nested `error` object both carry the sanitized `server_error` code.
+
+The final `response.completed` or `response.incomplete` event carries the response output, as in the OpenAI Responses stream. When the upstream ends a stream with an empty output, Codex Pooler lists in that terminal the items the stream already delivered in `response.output_item.done` events, in `output_index` order and with their ids. SDK stream helpers that read the final response from the terminal event, such as `responses.stream().finalResponse()` in the OpenAI Node SDK, therefore return the streamed output and its `output_text`. A terminal that already lists its output is relayed unchanged. This applies to `POST /v1/responses` SSE and the narrow Responses websocket in both serving modes; the Codex backend routes relay the upstream terminal as sent.
+
+On public Responses SSE and narrow Responses websockets, an announced function or custom-tool call needs a real `response.output_item.done` with matching source identity and output index before the response can succeed. Argument or input completion alone isn't enough, and a final response snapshot can't complete an already announced tool. Missing completion or invalid correlation produces one sanitized `server_error` terminal instead of success. That done event completes the call only with `status: "completed"` or no status: `incomplete`, `in_progress`, `failed` or any other value leaves the call unfinished, so a `response.completed` that follows becomes the same `server_error` terminal, while a provider `response.incomplete` keeps its own outcome. The status only says whether the model finished writing the call. A tool that your client fails or cancels, such as a Codex dynamic tool interrupted before its host replied, belongs in the `function_call_output` or `custom_tool_call_output` of the next request, which Pooler forwards like any other tool result. Already delivered deltas remain delivered; Pooler doesn't invent a tool completion or replay the request after visible output.
+
+A valid terminal-only response that never announced a tool retains its existing snapshot normalization, including accepted omitted item IDs or statuses. Provider failed and ordinary incomplete outcomes remain non-success outcomes. Accounting settles observed provider usage once even when an attempted success is rejected, and the rejected response creates no successful continuation alias.
+
+An anchored continuation must still reach the upstream websocket connection that produced its response. A prior successful alias can remain stored after that connection generation is retired, but it can't authorize a fresh connection: Pooler refuses the continuation before acquiring that connection or sending upstream. A new unanchored turn can recover on the same downstream websocket with fresh upstream state.
 
 Streaming `/v1/chat/completions` clients must separately handle a terminal `data: {"error":{...}}` chunk with nested `server_error` fields and no top-level `type`; no `[DONE]` chunk follows that terminal.
 
@@ -397,6 +580,142 @@ not promise cross-ID concurrency or fairness. `previous_response_id` controls
 conversation lineage independently. REST `POST /v1/responses`, native backend
 WebSockets, Chat, compact, and batches do not accept this field.
 
+### Error types on errors Codex Pooler authors
+
+Errors that Codex Pooler itself authors carry an `error.type` that agrees with
+the HTTP status about whether the failure is worth retrying. The same
+classification applies to HTTP error bodies on `/v1/*` and
+`/backend-api/codex/*` and to error frames on `GET /v1/responses`, so one code
+has one type on every surface.
+
+- `server_error`: the failure is on the server side, including failures raised
+  while the server hands a turn between connections. The same request can
+  succeed on a retry.
+- `rate_limit_error`: the request was throttled with HTTP `429`. Retry after
+  backing off.
+- `usage_limit_reached`: HTTP `429` when every upstream account is exhausted
+  until a known reset (see below). Retry after the reset it names. The same
+  `quota_exhausted` code on a retryable `503` keeps `server_error`.
+- `invalid_request_error`: the client must change the request before retrying,
+  or the connection was superseded by its own newer replacement. Codex Desktop
+  also gets it for an exhausted Pool (see below).
+
+No released client branches on `error.type` for retries. openai-node,
+openai-python and the Vercel AI SDK retry on the HTTP status (`408`, `409`,
+`429`, `5xx`) and on connection errors, and the first two honour an
+`x-should-retry` response header that overrides the status in both directions.
+Codex's HTTP client retries `5xx` and transport errors, not `429`, with a
+default budget of four retries on a 200 ms doubling backoff; its sampling loop
+then retries any retryable turn error, including an unexpected status such as
+`403` or `409` and a stream-level rate limit, up to five more times from its own
+error variant, surfacing each as a stream disconnect and falling back from
+websocket to HTTPS once that budget is spent. A `400` response or frame and a
+`429` status end the turn at once, so a Pooler policy denial that no resend can
+pass (`model_not_allowed`, a per-request token cap) answers `400`. None of that
+reads the type. Keep that behaviour and use the type and `error.code` for diagnosis,
+treating `error.code` as an open string as described below; on the
+`GET /v1/responses` frame surface there is no HTTP status, and the type is what
+a reader sees. The status and the type never disagree: a `5xx` response or frame
+is never typed `invalid_request_error`. Errors relayed from the Codex backend
+follow the rules in the next section.
+
+Policy denials that Codex Pooler authors (`api_key_missing`,
+`api_key_disabled`, `api_key_policy_malformed`, `model_not_allowed`,
+`image_generation_disabled`) keep their
+own code and message on `/v1/*`, exactly as on `/backend-api/codex/*`; they are
+never rewritten to `server_error` or `upstream request failed`, because no
+upstream was involved.
+
+### When every upstream account is exhausted
+
+When every account that can serve the requested model is excluded because its
+quota is exhausted, and Codex Pooler knows when each of them resets, the
+request is answered before any upstream work with the same terminal shape the
+Codex backend uses for an exhausted account, on every route and transport:
+
+- HTTP status `429` (and `"status": 429` on a websocket error frame);
+- `error.type` `usage_limit_reached`, `error.code` `quota_exhausted` and Codex
+  Pooler's own message, also on `/v1/*`;
+- `resets_at` (Unix seconds) and `resets_in_seconds` for the earliest reset
+  among those accounts;
+- a `Retry-After` header with the same number of seconds (in the websocket
+  error frame's `headers`), plus `x-should-retry: false` on HTTP when the wait
+  is longer than 60 seconds.
+
+The Codex client ends the turn and names the reset time; the OpenAI SDKs do not
+retry it.
+
+On the Codex backend routes, those accounts include the ones Codex Pooler keeps
+out of a request because they advertise the model with a different catalog
+shape (a field that changes how the model runs, such as its context window;
+descriptions, defaults and the model's place in the model picker do not count).
+Before refusing, Codex Pooler checks them once with the same quota rules,
+reading any quota older than the freshness window again first, and moves the
+request to one of them that has quota. When none has, the earliest reset covers
+them too. A compaction that has to stay on the WebSocket connection it runs on,
+a request that session continuity hard-pins to its account (for example one
+anchored on `previous_response_id`) and a request tied to the account that holds
+its file are the exceptions: they stay with their account and are not moved.
+
+Codex Desktop is the exception on the Codex backend Responses routes
+(`/backend-api/codex/responses` over HTTP and websocket,
+`/backend-api/codex/responses/compact`, and their `/backend-api/codex/v1/`
+aliases). It answers `usage_limit_reached` with its own usage-limit screen,
+built from the ChatGPT account it is signed in with, so it never shows the
+Pool's reset. A request whose `originator` header is `Codex Desktop` therefore
+gets the same refusal as HTTP `400` (`"status": 400` on the websocket error
+frame, which then has no `headers`), with `error.type`
+`invalid_request_error`, `error.code` `invalid_prompt`, `resets_at`,
+`resets_in_seconds`, and the reset written into the message, for example:
+
+`The Pool's usage limit is reached. Try again at 01:28 UTC (in about 1 h 24 min).`
+
+Over HTTP it carries `x-should-retry: false` and no `Retry-After`. Codex
+Desktop shows that message as it is and ends the turn. The code is chosen for
+how Codex Desktop displays the refusal, not because anything is wrong with the
+prompt. `/v1/*` and every other client keep the `429`.
+
+The time is advice rather than a promise: an automatically redeemed
+saved reset can bring an account back sooner. When the reset of any of those
+accounts is unknown (missing or stale quota evidence), or an account was taken
+out by an open circuit rather than by quota, the answer stays a retryable `503`
+(`quota_evidence_unavailable` or `quota_exhausted`) with no reset fields. When
+an open circuit took an account out, that `503` (and the `no_eligible_backend`
+`503` when open circuits took out every account) carries a `Retry-After` of the
+seconds until the earliest of those circuits lets a request through again,
+between 1 and 60, in the websocket error frame's `headers` too, and never
+`x-should-retry: false`, because the request can succeed then. The same
+applies when a circuit opens between routing and dispatch, and to file
+uploads. When
+at least one account is still eligible, the request is routed to it as usual,
+and a provider usage-limit refusal that arrives before any output moves the
+same request to another eligible account. That includes an account Codex
+Pooler kept out of the request because it advertises the model with a
+different catalog shape: when the last account of the chosen shape refuses
+with a usage limit, the request moves to such an account once.
+
+On the native websocket, an ordinary continuation can be bound to one account even while another compatible account has capacity. If its account returns a usage limit before output, Codex Pooler checks capacity before that connection binding. A healthy sibling or an unknown return time produces a retryable `503 pinned_continuation_unavailable`, without an account reset, so the client can reconnect and resend its full history. Codex Pooler never sends the old response anchor to a different connection. A native websocket compaction that can run only on its connection gets the same answer for the same refusal; the Codex client then retries it and finally sends it over HTTPS, which can move to another account. When every compatible account is exhausted, both get the Pool's usage limit described below. Public `/v1` answers differently: a `GET /v1/responses` websocket compaction that can run only on the connection holding its anchor, and that the provider refuses with its usage limit, gets the usage limit of the account that holds the anchor even while another account could serve a new request. The answer is an `error` event with `"status": 429`, `usage_limit_reached`, `quota_exhausted`, `resets_at` and `resets_in_seconds` for that account's reset, and `headers.retry-after`.
+
+When no compatible account is left and the Codex backend's
+usage-limit refusal names the account's reset, that refusal gets the same
+answer: `429`, `usage_limit_reached`, `quota_exhausted` and Codex Pooler's
+message, and `resets_at` and `resets_in_seconds` for the soonest of the
+backend's reset and the resets of the other accounts, which must all be
+exhausted with a known reset (otherwise the refusal stays retryable),
+`Retry-After`, and `x-should-retry: false` when the wait is longer than 60
+seconds (Codex Desktop gets the `400` described above). The backend's own
+message and other fields are not relayed. Over the `GET /v1/responses`
+websocket the same refusal is the `error` event with
+`"status": 429`, those fields and `headers.retry-after`. A streaming
+`/v1/responses` request that Codex Pooler carries over the backend's
+websocket gets the same HTTP answer, or moves to another eligible account,
+when the refusal arrives before any output. A usage-limit
+refusal that names no reset still ahead, or one answered while another
+account's return is not known, keeps the redacted `429` `rate_limit_error`
+described below in both serving modes, with `Retry-After` (and, over the
+websocket, an `error` event with `headers.retry-after`) when an account that
+an open circuit took out bounds the wait.
+
 ### Relayed terminal errors
 
 When the Codex backend returns a genuine terminal error, Codex Pooler preserves its trimmed `error.code` only when
@@ -404,7 +723,12 @@ the value is at most 80 bytes and matches `^[A-Za-z0-9_.-]+$`. Other code values
 A surviving code may be a Codex-backend value that is not part of the OpenAI platform `ResponseError` enum.
 
 Upstream error messages are replaced with `upstream request failed`, and upstream error types are replaced with
-`server_error`. Clients must therefore treat `error.code` as an open string: handle the values they understand and
+`server_error`, except that an upstream refusal answered with a `4xx` status other than `401`, `403`, `404` and
+`429` (for example `400` or `422`) is typed `invalid_request_error`, the class its status names, and an upstream
+`429` is typed `rate_limit_error`, on HTTP and in the `response.failed` event a `/v1/responses` websocket receives
+for it. SDKs retry a `429` on the status alone, so the type changes what a reader sees, not whether the request is
+retried.
+Clients must therefore treat `error.code` as an open string: handle the values they understand and
 keep an unknown-code fallback rather than validating against the platform enum.
 
 Public relays construct each `response.failed` envelope from a named-field projection. Unknown event, response,
@@ -426,6 +750,39 @@ fixed safe fallback when it is blank. The error never includes a provider
 exact code, fixed accounting text, and bounded facts. Every other provider error
 continues to use the generic redaction above.
 
+A second narrow exception covers upstream parameter validation. When upstream
+rejects a `POST /v1/responses` or `POST /v1/chat/completions` request before
+any stream starts with HTTP `400`, type `invalid_request_error`, and one of the
+codes `unsupported_value`, `invalid_value`, `unsupported_parameter`,
+`missing_required_parameter`, `invalid_type`, `string_above_max_length`,
+`unknown_parameter` (a request key upstream does not know, for example a hosted
+tool key it does not accept), or `invalid_parameter` (a field the selected
+model does not support), streaming and non-streaming clients receive a `400`
+JSON error with type `invalid_request_error`, that code, a bounded `param` field
+path or `null`, and a message written by Codex Pooler from the code and param,
+for example
+`upstream rejected parameter reasoning.effort (unsupported_value); supported values: low, medium, high`.
+SDKs expose these as `BadRequestError` with `code` and `param`. The provider
+message is never forwarded; for `unsupported_value` and `invalid_value` the
+message may list up to 12 supported values when upstream reports them as simple
+identifiers, never the rejected value. Chat Completions requests receive the
+Chat field they sent where Codex Pooler renamed it, for example
+`reasoning_effort`, `max_tokens`, `verbosity`, or `response_format`, and the
+message names that same Chat field; other paths name the upstream Responses
+field. Other statuses, types, and codes keep
+the generic redaction.
+
+The same refusals reach the `GET /v1/responses` websocket as its `error` event
+with the same error object, and a streaming `POST /v1/responses` request that
+Codex Pooler carries over the backend's websocket gets it as the same `400`. The
+backend's websocket sends them without a code and without a `param`, with the
+HTTP message as text, so Codex Pooler reads the code and the field path from that
+text: the event carries the `code` and `param` the HTTP answer of the same fault
+carries, except that an `Invalid value` refusal names no field in the frame and
+has a `null` `param`, and that the websocket leaves an `input[N]` index out (`input[].content`).
+A text it does not read keeps the generic redaction. See
+[upstream parameter validation rejections](/reference/runtime-routes/#upstream-parameter-validation-rejections).
+
 Schema-strict clients that enforce the platform enum cannot accept every relayed Codex-backend code. In
 `openai-python`, leave `_strict_response_validation` at its default `false` when using this compatibility surface.
 
@@ -439,9 +796,8 @@ In Full serving mode, direct `POST /v1/responses` and narrow Responses websocket
 `response.create` accept an `allowed_tools` choice only when every member is
 backed by a direct top-level declaration. Named `function` and `custom` members
 must match the declared kind and name. The only type-only built-ins are
-`programmatic_tool_calling`, `web_search_preview`, `web_search`, and
-`image_generation`, each declared at the top level. Caller order and repeated
-members are preserved.
+`web_search` and `image_generation`, each declared at the top level. Caller
+order and repeated members are preserved.
 
 This is a narrow declaration-backed contract, not broad OpenAI tool parity. It
 doesn't cover Chat, backend Responses, namespaces, additional tools, deferred
@@ -467,13 +823,105 @@ forwarding of this accepted shape only. Web search availability and any
 allow-list or block-list enforcement can vary by selected upstream model and
 account.
 
-## Request compression behavior
+### Web search tool options
 
-Per-Pool request compression can apply to `POST /v1/responses`, `POST /v1/chat/completions`, and narrow Responses websocket `response.create` traffic. It is transparent to SDK clients and does not require a client flag. Operators enable it with the Pool setting `request_compression_enabled`.
+`web_search` accepts the keys the upstream accepts and Codex serializes:
+`external_web_access`, `indexed_web_access`, `filters`, `user_location`,
+`search_context_size` and `search_content_types`. Every other key is rejected
+before dispatch with `400 invalid_request` on `tools`, because the upstream
+refuses it as an unknown parameter in both Full and Lite serving mode.
 
-The feature is request-side only. Codex Pooler may compress upstream-bound Responses tool-output payloads before dispatch, but it does not store raw outputs, does not store upstream response bodies, and does not implement CCR/retrieval. Public `/v1/responses/compact` remains unsupported.
+- `indexed_web_access` is a boolean and requires `external_web_access: true`.
+  `index_gated_web_access`, an older Codex spelling of this field, is rejected:
+  the upstream refuses it, and Codex Pooler does not rewrite it.
+- `user_location` is an object that requires `type` (only `approximate`) and
+  may add nonblank string `country`, `region`, `city` and `timezone` fields.
+- `search_context_size` is `low`, `medium` or `high`.
+- `search_content_types` is a nonempty list of `text` and `image`.
 
-If compression is enabled but savings do not appear, check the request log's `payload_compression` status and reason. The UI prefers saved token count and token savings percent when local token counts are available, then falls back to saved bytes and byte savings percent.
+Accepted values are forwarded unchanged. As with domain filters, Codex Pooler
+guarantees local validation and forwarding of this shape only; availability and
+enforcement can vary by selected upstream model and account.
+
+`web_search_preview` is rejected before dispatch with `400 invalid_request` on
+`tools` in both serving modes, because the upstream refuses it. Declare
+`web_search` instead; Codex Pooler does not rewrite one into the other.
+
+### Hosted web search history replay
+
+A `web_search_call` item is what a Full-served model returns after it ran the
+hosted `web_search` tool. A client that sends `response.output` back as the
+history of its next stateless request sends it in `input`, and Codex Pooler
+forwards it unchanged, in the position the client sent it, in Full and Lite
+serving mode alike. It admits the item the way upstream validates it:
+
+- The keys are `type`, `id`, `status`, `action` and an optional
+  `internal_chat_message_metadata_passthrough` object. `id` and `status` are
+  nonblank strings when present.
+- `action.type` is `search` (`query`, `queries` and `sources`, a list of
+  `{"type": "url", "url": ...}` objects that upstream returns when the request
+  lists `web_search_call.action.sources` in `include`), `open_page` (`url`) or
+  `find_in_page` (`url`, `pattern`). A key that belongs to another action type
+  is rejected.
+- A `null` is rejected for every field except the passthrough object.
+- An item the public stream named `web_search_call` or `web_search_call_<n>`,
+  because upstream sent it without an id, is replayed without that id.
+
+Any other shape is rejected before dispatch with `400 invalid_request` on
+`input`. Neither the search query nor the sources are persisted in request
+metadata, logs or operator views.
+
+### Tool search with deferred tools
+
+`POST /v1/responses` and the Responses websocket accept the upstream's
+`tool_search` tool, which loads function tools declared with
+`defer_loading: true` only when the model searches for them. A `tool_search`
+entry accepts `type`, `execution` (`server` or `client`), `description` and
+`parameters`. Any other key, or another `execution` value, is rejected before
+dispatch with `400 invalid_request` on `tools`. A client-executed search
+(`execution: "client"`) describes itself with `description` and `parameters`.
+Accepted entries are forwarded unchanged.
+
+The upstream decides how `tool_search` and deferred tools pair. In Full serving
+mode it rejects a deferred function without a `tool_search` tool, a
+`tool_search` without a deferred tool, and a client-executed search without a
+description, and Codex Pooler returns that rejection with the upstream's
+parameter path. Codex Pooler does not apply these rules itself.
+
+In Full serving mode a server-executed search returns a `tool_search_call` item
+(the searched `paths` in `arguments`), a `tool_search_output` item (the loaded
+`tools`) and then the `function_call` for the loaded function, which carries a
+`namespace`. Codex Pooler relays these items in JSON, SSE and websocket
+responses. A client-executed search returns the `tool_search_call`, and the
+client answers it with a `tool_search_output` of its own.
+
+In Lite serving mode the tools travel in the leading `additional_tools` item.
+The upstream still validates `tool_search` there but performs no search: the
+model sees deferred functions directly and calls them without `tool_search_call`
+or `tool_search_output` items.
+
+A client that sends `response.output` back as the history of its next
+stateless request can include these items in `input`, in either serving mode.
+Codex Pooler admits them the way upstream validates them:
+
+- `tool_search_call` takes `type` and `arguments` (an object), and
+  `tool_search_output` takes `type` and `tools` (a list). Both may add `id`,
+  `call_id`, `execution` and `status`, and no other key.
+- `id`, `call_id` and `status` may be `null`. `execution` is `server` or
+  `client`, and `status` is `in_progress`, `completed` or `incomplete`.
+- A remote MCP tool among a `tool_search_output` item's `tools` is rejected, as
+  everywhere in `/v1/responses`.
+
+Any other shape is rejected before dispatch with `400 invalid_request` on
+`input`. Upstream checks the item ids it issued, and its rejection of another id
+is returned with the item's path. Neither `tool_search` nor a deferred tool can
+be a member of an `allowed_tools` choice.
+
+## Tool-output preservation
+
+Accepted tool-output text on `POST /v1/responses`, `POST /v1/chat/completions` and the supported Responses websocket route reaches the upstream without gateway minification or summarization. Protocol adapters may change the surrounding request or split text into ordered parts; the output text itself is preserved. Full/Lite tool handling and strict-schema normalization remain in effect.
+
+There is no Pool compression switch or savings display. Raw outputs are not stored. Public `/v1/responses/compact` remains unsupported, while provider and client compaction keep their separate contracts.
 
 ## Routed but unsupported boundaries
 
@@ -491,17 +939,29 @@ These `/v1` routes are unsupported and may return deterministic OpenAI-shaped un
 - `GET /v1/responses/:response_id`
 - `POST /v1/responses/:response_id/cancel`
 - `DELETE /v1/responses/:response_id`
+- `/v1/agents` and every path below it, for every method: the beta Agents API
+- `/v1/vaults` and every path below it, for every method: the credential vaults of the beta Agents API
 - `/v1/realtime` and OpenAI Realtime SDK websocket or session routes
 
 `GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. OpenAI Realtime SDK websocket and session routes are not supported.
 
-Within `POST /v1/responses`, OpenAI Responses remote MCP tool definitions are unsupported. A top-level `tools` entry with `type: "mcp"`, or an `input` item with `type: "additional_tools"` whose `tools` list contains `type: "mcp"`, is rejected before upstream dispatch with an OpenAI-shaped `invalid_request` error.
+Within `POST /v1/responses`, OpenAI Responses remote MCP tool definitions are unsupported. A top-level `tools` entry with `type: "mcp"`, or an `input` item with `type: "additional_tools"` or `type: "tool_search_output"` whose `tools` list contains `type: "mcp"`, is rejected before upstream dispatch with an OpenAI-shaped `invalid_request` error.
+
+### Beta Agents API
+
+Every method and every path under `/v1/agents` and `/v1/vaults` answers `404` with the OpenAI-shaped error code `unsupported_endpoint` and the message `Unsupported OpenAI /v1 endpoint: the beta Agents API is not supported`. The answer follows the Pool API key and `/v1` compatibility checks and comes before the request body is read, so nothing is dispatched upstream, reserved or recorded. The Codex backend behind Codex Pooler serves no Agents route, so there is nothing to relay, and Codex Pooler does not run tools itself.
+
+The OpenAI Node SDK helpers under `client.beta.agents` call those routes and do not work against a Codex Pooler base URL: `sessions.create` and `sessions.stream` with their `toolHandlers` and `functionTool` results (sent as `agent.session.input.tool_result` events), typed final results such as `finalResult()` with `zodAgentTextFormat`, `environments.files.prepare` and `upload`, and `artifacts.forResult(...).download`. `environments.files.prepare` first uploads each file with `POST /v1/files`. That upload is an ordinary Files upload, but no Agents environment can use it through Codex Pooler.
+
+To use tools through Codex Pooler, send `POST /v1/responses`. A function definition with the `type`, `name`, `description` and `parameters` that an Agents tool carries is an ordinary Responses function tool in Full and Lite serving modes, and the tool result goes back in the next request as a `function_call_output` item. The SDK's `client.responses` helpers send those requests.
 
 ## MCP stays separate
 
 The operator MCP endpoint is rooted at `/mcp`, not under `/v1`. It uses operator-owned MCP bearer tokens and returns metadata only.
 
 The root `/mcp` endpoint is not a `/v1/responses` remote MCP bridge and is not invoked by Responses `tools[type=mcp]` definitions.
+
+Request-log and audit-log tools accept offsets from 0 through 10,000. Refine the filters to inspect more distant history. Their `totalExact` field distinguishes an exact total from a bounded lower estimate; `nextOffset` becomes null at the traversal cap. Audit outcomes are `success` or `failure`. Clients that cache tool schemas should refresh the tool list after upgrading.
 
 ```text
 MCP URL:
@@ -521,11 +981,18 @@ Yes, for selected SDK routes. Set the SDK `base_url` or `baseURL` to `https://co
 
 ### Should Codex backend clients use `/v1`?
 
-No. Codex backend-compatible clients should use `/backend-api/codex`. The `/v1` surface is for selected OpenAI SDK-compatible clients and translates supported requests into Codex-compatible work.
+No. Codex backend-compatible clients should use `/backend-api/codex`. The `/v1` surface is for selected OpenAI SDK-compatible clients and translates supported requests into Codex-compatible work. A Codex client pointed at `/v1` also behaves differently from one on the backend alias in two ways:
+
+- Codex's own post-turn compaction is a bare `compaction_trigger`, and `/v1` refuses it with `400 invalid_request` because visible input is required before the trigger. Only a mid-turn compaction reaches the provider through `/v1`.
+- When the provider refuses a connection-bound compaction with its usage limit, `/v1` answers `429 usage_limit_reached` with the reset of the account that holds the conversation's anchor, even while another account could serve a new request, because an SDK client does not rebuild the compaction without its anchor, and Codex stops. The backend alias answers `503 pinned_continuation_unavailable` when another account can serve, and Codex then falls back to a compaction served by another account.
 
 ### Does `/v1` support OpenAI Realtime?
 
 No. `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are unsupported. `GET /v1/responses` is narrow Responses websocket compatibility only, not OpenAI Realtime support.
+
+### Do the OpenAI Agents helpers work with Codex Pooler?
+
+No. The beta Agents API under `/v1/agents` and `/v1/vaults` is unsupported, so the OpenAI Node `client.beta.agents` helpers, such as `sessions.stream`, `functionTool`, typed final results, environment file preparation and artifact download, receive a `404` with the error code `unsupported_endpoint`. Use `POST /v1/responses` with function tools instead; a tool result goes back as a `function_call_output` item in the next request.
 
 ### Does `/v1/responses/compact` work?
 

@@ -15,17 +15,18 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, BridgeSessionAlias, CodexSession}
   alias CodexPooler.Gateway.Transports.Admission
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
   alias CodexPooler.Gateway.Websocket, as: Gateway
-  alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPoolerWeb.CodexResponsesSocket
+  alias CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport
 
-  @websocket_frame_timeout 1_000
-  @supported_compression_model "gpt-4o"
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+  @preservation_model "gpt-4o"
 
   defmodule StaleOwnerAttachmentNodeClient do
     @moduledoc false
@@ -103,65 +104,11 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       do: {:error, %{body: "", reason: "raw detach sentinel"}}
   end
 
-  test "owner forwarding keeps the rolling RPC argument shapes" do
-    downstream = %{
-      pid: self(),
-      correlation_id: "owner-rpc-contract",
-      epoch: 1
-    }
-
-    assert WebsocketOwnerForwarder.remote_attach_args("session-contract", downstream, []) == [
-             "session-contract",
-             downstream
-           ]
-
-    assert WebsocketOwnerForwarder.remote_attach_args("session-contract", downstream,
-             reject_if_busy: true
-           ) == ["session-contract", downstream, [reject_if_busy: true]]
-
-    assert function_exported?(WebsocketOwnerForwarder, :remote_attach_downstream, 2)
-    assert function_exported?(WebsocketOwnerForwarder, :remote_attach_downstream, 3)
-    assert function_exported?(WebsocketOwnerForwarder, :remote_submit_request, 4)
-    assert function_exported?(WebsocketOwnerForwarder, :remote_reconnect_control_v1, 1)
-
-    semantic_turn_key = :crypto.hash(:sha256, "opaque-turn")
-    control_ref = make_ref()
-
-    assert %{
-             version: 1,
-             action: :preflight,
-             codex_session_id: "session-contract",
-             downstream: ^downstream,
-             semantic_turn_key: ^semantic_turn_key,
-             control_ref: ^control_ref
-           } =
-             WebsocketOwnerForwarder.reconnect_control(
-               :preflight,
-               "session-contract",
-               downstream,
-               semantic_turn_key,
-               control_ref
-             )
-
-    assert Map.keys(
-             WebsocketOwnerForwarder.reconnect_control(
-               :preflight,
-               "session-contract",
-               Map.put(downstream, :active_turn_reconnect?, true),
-               semantic_turn_key,
-               control_ref
-             ).downstream
-           )
-           |> Enum.sort() == [:correlation_id, :epoch, :pid]
-  end
-
   test "socket-only execution tags outer websocket admission rejection as local completion" do
     previous_settings = Application.get_env(:codex_pooler, OperationalSettings)
     Admission.reset_for_test()
 
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: websocket_saturation_settings()
-    )
+    Application.put_env(:codex_pooler, OperationalSettings, settings: websocket_saturation_settings())
 
     on_exit(fn ->
       Admission.reset_for_test()
@@ -178,51 +125,47 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     opts = RequestOptions.for_websocket(%{request_id: "rejected-websocket-admission"})
 
     payload =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => "gpt-example",
         "input" => []
       })
 
-    assert {:socket_response_result, :local_complete,
-            {:error, %{code: "server_is_overloaded", accounting_disposition: :zero_work}}} =
+    assert {:socket_response_result, :local_complete, {:error, %{code: "server_is_overloaded", accounting_disposition: :zero_work}}} =
              Gateway.run_websocket_response_for_socket(%{}, payload, opts, fn _frame -> :ok end)
 
-    assert {:socket_response_result, :local_complete,
-            {:error, %{code: "invalid_request", message: "websocket message must be valid JSON"}}} =
+    assert {:socket_response_result, :local_complete, {:error, %{code: "invalid_request", message: "websocket message must be valid JSON"}}} =
              Gateway.run_websocket_response_for_socket(%{}, "{invalid", opts, fn _frame -> :ok end)
 
     malformed_model =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => 123,
         "input" => []
       })
 
-    assert {:socket_response_result, :local_complete,
-            {:error, %{code: "invalid_request", param: "model"}}} =
+    assert {:socket_response_result, :local_complete, {:error, %{code: "invalid_request", param: "model"}}} =
              Gateway.run_websocket_response_for_socket(%{}, malformed_model, opts, fn _frame ->
                :ok
              end)
 
     malformed_schema =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => "gpt-example",
         "input" => "not-an-array"
       })
 
-    assert {:socket_response_result, :local_complete,
-            {:error, %{code: "invalid_request", param: "input"}}} =
+    assert {:socket_response_result, :local_complete, {:error, %{code: "invalid_request", param: "input"}}} =
              Gateway.run_websocket_response_for_socket(%{}, malformed_schema, opts, fn _frame ->
                :ok
              end)
 
-    prewarm = Jason.encode!(%{"generate" => false, "model" => "gpt-example"})
+    prewarm = CodexPooler.JSON.encode!(%{"generate" => false, "model" => "gpt-example"})
 
     assert {:socket_response_result, :local_complete, :ok} =
              Gateway.run_websocket_response_for_socket(%{}, prewarm, opts, fn frame ->
-               send(self(), {:prewarm_frame, Jason.decode!(frame)})
+               send(self(), {:prewarm_frame, CodexPooler.JSON.decode!(frame)})
              end)
 
     assert_receive {:prewarm_frame, %{"type" => "response.created"}}
@@ -264,7 +207,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     writer = fn frame -> send(self(), {:prepared_native_frame, frame}) end
 
     assert {:ok, prepared} =
-             Gateway.prepare_websocket_response(Jason.encode!(payload), opts, writer)
+             Gateway.prepare_websocket_response(CodexPooler.JSON.encode!(payload), opts, writer)
 
     assert prepared.variant == :native_response_create
     refute inspect(prepared) =~ turn_id
@@ -273,7 +216,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
     assert :ok = Gateway.run_prepared_websocket_response(auth, prepared, writer)
     frame = receive_prepared_provider_frame!()
-    assert %{"id" => "resp_prepared_native"} = Jason.decode!(frame)
+    assert %{"id" => "resp_prepared_native"} = CodexPooler.JSON.decode!(frame)
     refute_received :request_options_built
     assert FakeUpstream.count(upstream) == 1
 
@@ -281,7 +224,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     assert request.status == "succeeded"
   end
 
-  test "socket-only execution keeps a previous-release remote owner behind its completion barrier" do
+  test "socket-only execution refuses a remote success without final admission" do
     upstream = start_upstream(FakeUpstream.json_response(%{"id" => "unused_remote_result"}))
     setup = gateway_setup(upstream)
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
@@ -310,7 +253,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       )
 
     payload =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => setup.model.exposed_model_id,
         "input" => [%{"type" => "message", "role" => "user", "content" => "synthetic"}],
@@ -318,13 +261,13 @@ defmodule CodexPooler.Gateway.WebsocketTest do
         "generate" => true
       })
 
-    assert {:socket_response_result, :owner_completion_pending, :ok} =
+    assert {:socket_response_result, _disposition, {:error, %{code: "owner_unavailable"}}} =
              Gateway.run_websocket_response_for_socket(auth, payload, opts, fn _frame -> :ok end)
 
     assert_receive {:websocket_owner_harness_node_call,
                     %{
                       node: ^remote_node,
-                      function: :remote_submit_request_v1,
+                      function: :remote_submit_request_v8,
                       arity: 3,
                       mode: {:return, :ok}
                     }}
@@ -334,19 +277,11 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
   describe "retarget_websocket_owner_runtime/4" do
     setup do
-      previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+      CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
       Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
 
-      on_exit(fn ->
-        cleanup_local_owner_sessions()
-
-        case previous do
-          nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-          value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-        end
-      end)
-
       key = active_api_key_fixture()
+      BackendCodexWebsocketOwnerForwardingSupport.stop_pool_owners_on_exit(key.pool)
       {:ok, auth} = Access.authenticate_authorization_header(key.authorization)
 
       %{api_key: key.api_key, auth: auth}
@@ -572,7 +507,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       {:ok, runtime} = owner_runtime(auth, "owner-runtime-refusal")
       owner_pid = owner_pid!(runtime.codex_session.id)
       owner_state_before = :sys.get_state(owner_pid)
-      owner_session_ids = local_owner_session_ids()
+      owner_pids = local_owner_pids(auth)
       previous_response_id = previous_response_id("guessed-alias-sentinel")
       request_id = "guessed-alias-request"
 
@@ -596,7 +531,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       assert_runtime_unchanged!(runtime, returned_runtime)
       assert :sys.get_state(owner_pid) == owner_state_before
       assert {:ok, ^owner_pid} = WebsocketOwnerSession.lookup(runtime.codex_session.id)
-      assert local_owner_session_ids() == owner_session_ids
+      assert local_owner_pids(auth) == owner_pids
     end
 
     test "treats expired aliases as cache misses without starting the expired target owner", %{
@@ -610,9 +545,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
       previous_response_id = previous_response_id("expired")
 
-      register_previous_response_alias!(target_session, api_key, previous_response_id,
-        expires_at: DateTime.add(DateTime.utc_now(), -1, :second)
-      )
+      register_previous_response_alias!(target_session, api_key, previous_response_id, expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
 
       assert_alias_miss_keeps_runtime!(auth, runtime, previous_response_id, target_session.id)
     end
@@ -804,33 +737,33 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     end
   end
 
-  describe "websocket response.create request compression" do
-    test "disabled pool sends the original backend websocket tool output with safe metadata" do
+  describe "websocket response.create tool-output preservation" do
+    test "the gateway sends the original backend websocket tool output with safe metadata" do
       upstream =
         start_upstream(
           FakeUpstream.json_response(%{
-            "id" => "resp_ws_compression_disabled",
+            "id" => "resp_ws_preservation",
             "object" => "response",
             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
           })
         )
 
-      setup = gateway_setup(upstream, supported_compression_model_opts())
+      setup = gateway_setup(upstream, preservation_model_opts())
       {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
       {:ok, session} = Gateway.start_codex_session(auth, accepted_turn_state: "ws-disabled")
       omitted_sentinel = "backend websocket disabled omitted marker"
-      original_output = compression_log_fixture(omitted_sentinel)
+      original_output = preservation_log_fixture(omitted_sentinel)
 
       assert :ok =
                execute_websocket_response(
                  auth,
                  backend_tool_output_payload(setup, original_output, "call_ws_disabled"),
-                 websocket_request_options(session, "ws-compression-disabled"),
+                 websocket_request_options(session, "ws-preservation"),
                  fn frame -> send(self(), {:websocket_frame, frame}) end
                )
 
       frame = receive_provider_websocket_frame!()
-      assert %{"id" => "resp_ws_compression_disabled"} = Jason.decode!(frame)
+      assert %{"id" => "resp_ws_preservation"} = CodexPooler.JSON.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
@@ -844,25 +777,10 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
       assert [attempt] = attempt_rows(request)
 
-      assert %{
-               "enabled" => false,
-               "attempted" => true,
-               "status" => "disabled",
-               "reason" => "pool_disabled",
-               "route_class" => "proxy_websocket",
-               "transport" => "websocket",
-               "candidate_count" => 0,
-               "compressed_count" => 0,
-               "skipped_count" => 0
-             } = attempt.response_metadata["payload_compression"]
-
-      refute_payload_compression_leak!(
-        attempt.response_metadata["payload_compression"],
-        [omitted_sentinel, "call_ws_disabled"]
-      )
+      refute Map.has_key?(attempt.response_metadata, "payload_compression")
     end
 
-    test "enabled pool skips lossy backend websocket shell output before upstream send" do
+    test "the gateway preserves backend websocket shell output before upstream send" do
       upstream =
         start_upstream(
           FakeUpstream.json_response(%{
@@ -872,12 +790,11 @@ defmodule CodexPooler.Gateway.WebsocketTest do
           })
         )
 
-      setup = gateway_setup(upstream, supported_compression_model_opts())
-      enable_request_compression!(setup.pool)
+      setup = gateway_setup(upstream, preservation_model_opts())
       {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
       {:ok, session} = Gateway.start_codex_session(auth, accepted_turn_state: "ws-backend")
       omitted_sentinel = "backend websocket skipped omitted marker"
-      original_output = compression_log_fixture(omitted_sentinel)
+      original_output = preservation_log_fixture(omitted_sentinel)
 
       assert :ok =
                execute_websocket_response(
@@ -888,7 +805,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
                )
 
       frame = receive_provider_websocket_frame!()
-      assert %{"id" => "resp_ws_backend_skipped"} = Jason.decode!(frame)
+      assert %{"id" => "resp_ws_backend_skipped"} = CodexPooler.JSON.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
@@ -900,38 +817,27 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       assert request.status == "succeeded"
 
       assert [attempt] = attempt_rows(request)
-
-      assert_lossy_shell_skipped_metadata!(
-        attempt.response_metadata["payload_compression"],
-        "proxy_websocket",
-        "websocket"
-      )
-
-      refute_payload_compression_leak!(
-        attempt.response_metadata["payload_compression"],
-        [omitted_sentinel, "call_ws_backend"]
-      )
+      refute Map.has_key?(attempt.response_metadata, "payload_compression")
     end
 
-    test "enabled pool compresses embedded JSON in eligible backend websocket function output" do
+    test "the gateway preserves embedded JSON in backend websocket function output" do
       upstream =
         start_upstream(
           FakeUpstream.json_response(%{
-            "id" => "resp_ws_embedded_json_compressed",
+            "id" => "resp_ws_embedded_json_preserved",
             "object" => "response",
             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
           })
         )
 
-      setup = gateway_setup(upstream, supported_compression_model_opts())
-      enable_request_compression!(setup.pool)
+      setup = gateway_setup(upstream, preservation_model_opts())
       {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
       {:ok, session} = Gateway.start_codex_session(auth, accepted_turn_state: "ws-embedded-json")
       prefix = "synthetic websocket report begins\n"
       suffix = "\nsynthetic websocket report ends"
 
       original_json =
-        Jason.encode!(%{"rows" => Enum.map(1..24, &%{"id" => &1, "active" => true})},
+        CodexPooler.JSON.encode!(%{"rows" => Enum.map(1..24, &%{"id" => &1, "active" => true})},
           pretty: true
         )
 
@@ -942,34 +848,35 @@ defmodule CodexPooler.Gateway.WebsocketTest do
                execute_websocket_response(
                  auth,
                  backend_function_tool_output_payload(setup, original_output, call_id),
-                 websocket_request_options(session, "ws-embedded-json-compressed"),
+                 websocket_request_options(session, "ws-embedded-json-preserved"),
                  fn frame -> send(self(), {:websocket_frame, frame}) end
                )
 
       frame = receive_provider_websocket_frame!()
-      assert %{"id" => "resp_ws_embedded_json_compressed"} = Jason.decode!(frame)
+      assert %{"id" => "resp_ws_embedded_json_preserved"} = CodexPooler.JSON.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
       assert captured.path == "/backend-api/codex/responses"
 
-      compressed_output =
+      forwarded_output =
         captured.json["input"]
         |> Enum.find(&(&1["type"] == "function_call_output"))
         |> Map.fetch!("output")
 
-      assert String.starts_with?(compressed_output, prefix)
-      assert String.ends_with?(compressed_output, suffix)
+      assert String.starts_with?(forwarded_output, prefix)
+      assert String.ends_with?(forwarded_output, suffix)
 
-      compressed_json =
+      forwarded_json =
         binary_part(
-          compressed_output,
+          forwarded_output,
           byte_size(prefix),
-          byte_size(compressed_output) - byte_size(prefix) - byte_size(suffix)
+          byte_size(forwarded_output) - byte_size(prefix) - byte_size(suffix)
         )
 
-      assert Jason.decode!(compressed_json) == Jason.decode!(original_json)
-      assert byte_size(compressed_json) < byte_size(original_json)
+      assert CodexPooler.JSON.decode!(forwarded_json) == CodexPooler.JSON.decode!(original_json)
+      assert forwarded_output == original_output
+      assert forwarded_json == original_json
 
       assert [request] = request_rows(setup.pool.id)
       assert request.transport == "websocket"
@@ -977,50 +884,35 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
       assert [attempt] = attempt_rows(request)
 
-      assert %{
-               "enabled" => true,
-               "attempted" => true,
-               "status" => "compressed",
-               "route_class" => "proxy_websocket",
-               "transport" => "websocket",
-               "candidate_count" => 1,
-               "compressed_count" => 1,
-               "skipped_count" => 0,
-               "strategies" => strategies
-             } = metadata = attempt.response_metadata["payload_compression"]
-
-      assert "embedded_json_lossless" in strategies
-      assert metadata["original_tokens"] > metadata["compressed_tokens"]
-      refute_payload_compression_leak!(metadata, [call_id])
+      refute Map.has_key?(attempt.response_metadata, "payload_compression")
     end
 
-    test "enabled pool preserves output-only public websocket tool output before upstream send" do
+    test "the gateway preserves output-only public websocket tool output before upstream send" do
       upstream =
         start_upstream(
           FakeUpstream.json_response(%{
-            "id" => "resp_ws_public_compressed",
+            "id" => "resp_ws_public_preserved",
             "object" => "response",
             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
           })
         )
 
-      setup = gateway_setup(upstream, supported_compression_model_opts())
-      enable_request_compression!(setup.pool)
+      setup = gateway_setup(upstream, preservation_model_opts())
       {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
       {:ok, session} = Gateway.start_codex_session(auth, accepted_turn_state: "ws-public")
-      omitted_sentinel = "public websocket compressed omitted marker"
-      original_output = compression_log_fixture(omitted_sentinel)
+      omitted_sentinel = "public websocket retained marker"
+      original_output = preservation_log_fixture(omitted_sentinel)
 
       assert :ok =
                execute_websocket_response(
                  auth,
                  public_tool_output_payload(setup, original_output, "call_ws_public"),
-                 public_websocket_request_options(session, "ws-public-compressed"),
+                 public_websocket_request_options(session, "ws-public-preserved"),
                  fn frame -> send(self(), {:websocket_frame, frame}) end
                )
 
-      assert_receive {:websocket_frame, frame}, @websocket_frame_timeout
-      assert %{"id" => "resp_ws_public_compressed"} = Jason.decode!(frame)
+      assert_receive {:websocket_frame, frame}, @detection_timeout_ms
+      assert %{"id" => "resp_ws_public_preserved"} = CodexPooler.JSON.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
@@ -1043,23 +935,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
       assert [attempt] = attempt_rows(request)
 
-      assert %{
-               "enabled" => true,
-               "attempted" => true,
-               "status" => "skipped",
-               "reason" => "protected_tool_outputs",
-               "route_class" => "proxy_websocket",
-               "transport" => "websocket",
-               "candidate_count" => 0,
-               "compressed_count" => 0,
-               "skipped_count" => 0,
-               "protected_tool_output_skipped_count" => 1
-             } = attempt.response_metadata["payload_compression"]
-
-      refute_payload_compression_leak!(
-        attempt.response_metadata["payload_compression"],
-        [omitted_sentinel, "call_ws_public"]
-      )
+      refute Map.has_key?(attempt.response_metadata, "payload_compression")
     end
   end
 
@@ -1080,7 +956,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   end
 
   defp assert_alias_miss_keeps_runtime!(auth, runtime, previous_response_id, target_session_id) do
-    owner_session_ids = local_owner_session_ids()
+    owner_pids = local_owner_pids(auth)
 
     assert {:ok, returned_runtime} =
              Gateway.retarget_websocket_owner_runtime(auth, runtime, %{
@@ -1089,7 +965,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
              })
 
     assert_runtime_unchanged!(runtime, returned_runtime)
-    assert local_owner_session_ids() == owner_session_ids
+    assert local_owner_pids(auth) == owner_pids
     assert_owner_not_started!(target_session_id)
   end
 
@@ -1123,6 +999,8 @@ defmodule CodexPooler.Gateway.WebsocketTest do
 
   defp with_info_log(fun) when is_function(fun, 0) do
     previous_level = Logger.level()
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> Logger.configure(level: previous_level) end)
     Logger.configure(level: :info)
 
     try do
@@ -1136,9 +1014,11 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(codex_session_id)
   end
 
-  defp local_owner_session_ids do
-    WebsocketOwnerSession.Registry
-    |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
+  # This test's Pool only: an owner another test left in the application registry must not decide
+  # whether this one started an owner (findings#206 row 206-387).
+  defp local_owner_pids(auth) do
+    auth.pool
+    |> BackendCodexWebsocketOwnerForwardingSupport.pool_owner_pids()
     |> Enum.sort()
   end
 
@@ -1171,24 +1051,6 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   defp owner_pid!(codex_session_id) do
     assert {:ok, owner_pid} = WebsocketOwnerSession.lookup(codex_session_id)
     owner_pid
-  end
-
-  defp cleanup_local_owner_sessions do
-    capture_log(fn ->
-      WebsocketOwnerSession.Registry
-      |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-      |> Enum.each(fn codex_session_id ->
-        try do
-          with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
-            _result = GenServer.stop(owner_pid, :shutdown, 1_000)
-          end
-        catch
-          :exit, _reason -> :ok
-        end
-      end)
-    end)
-
-    :ok
   end
 
   defp execute_websocket_response(
@@ -1249,7 +1111,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       "stream" => true,
       "generate" => true
     }
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp backend_function_tool_output_payload(setup, output, call_id) do
@@ -1272,7 +1134,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       "stream" => true,
       "generate" => true
     }
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp public_tool_output_payload(setup, output, tool_call_id) do
@@ -1289,7 +1151,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       "stream" => true,
       "generate" => true
     }
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp assert_websocket_lossy_output_skipped!(captured, original_output) do
@@ -1303,7 +1165,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   end
 
   defp receive_provider_websocket_frame! do
-    assert_receive {:websocket_frame, frame}, @websocket_frame_timeout
+    assert_receive {:websocket_frame, frame}, @detection_timeout_ms
 
     if StreamProtocol.internal_control_event?(frame) do
       receive_provider_websocket_frame!()
@@ -1313,7 +1175,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   end
 
   defp receive_prepared_provider_frame! do
-    assert_receive {:prepared_native_frame, frame}, @websocket_frame_timeout
+    assert_receive {:prepared_native_frame, frame}, @detection_timeout_ms
 
     if StreamProtocol.internal_control_event?(frame) do
       receive_prepared_provider_frame!()
@@ -1322,47 +1184,12 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     end
   end
 
-  defp assert_lossy_shell_skipped_metadata!(metadata, route_class, transport) do
-    assert %{
-             "enabled" => true,
-             "attempted" => true,
-             "status" => "skipped",
-             "reason" => "lossy_unrecoverable_tool_output",
-             "route_class" => ^route_class,
-             "transport" => ^transport,
-             "candidate_count" => 1,
-             "compressed_count" => 0,
-             "skipped_count" => 1,
-             "lossy_unrecoverable_tool_output_skipped_count" => 1,
-             "original_bytes" => original_bytes,
-             "compressed_bytes" => compressed_bytes
-           } = metadata
-
-    assert original_bytes == compressed_bytes
-    refute Map.has_key?(metadata, "strategies")
-    refute Map.has_key?(metadata, "original_tokens")
-    refute Map.has_key?(metadata, "compressed_tokens")
-    refute Map.has_key?(metadata, "saved_tokens")
-    refute Map.has_key?(metadata, "token_savings_ratio")
-    refute Map.has_key?(metadata, "token_savings_percent")
-  end
-
-  defp supported_compression_model_opts do
+  defp preservation_model_opts do
     [
-      exposed_model_id: @supported_compression_model,
-      upstream_model_id: @supported_compression_model,
-      pricing_ref: @supported_compression_model
+      exposed_model_id: @preservation_model,
+      upstream_model_id: @preservation_model,
+      pricing_ref: @preservation_model
     ]
-  end
-
-  defp refute_payload_compression_leak!(metadata, forbidden_values) when is_map(metadata) do
-    metadata_text = inspect(metadata)
-
-    for value <- forbidden_values do
-      if String.contains?(metadata_text, value) do
-        flunk("payload compression metadata leaked forbidden websocket request content")
-      end
-    end
   end
 
   defp captured_output_fingerprint(captured) do
@@ -1381,22 +1208,10 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   end
 
   defp attempt_rows(%Request{} = request) do
-    Repo.all(
-      from(a in Attempt, where: a.request_id == ^request.id, order_by: [asc: a.attempt_number])
-    )
+    Repo.all(from(a in Attempt, where: a.request_id == ^request.id, order_by: [asc: a.attempt_number]))
   end
 
-  defp enable_request_compression!(pool) do
-    pool
-    |> Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{
-      request_compression_enabled: true,
-      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    })
-    |> Repo.update!()
-  end
-
-  defp compression_log_fixture(omitted_sentinel) do
+  defp preservation_log_fixture(omitted_sentinel) do
     middle =
       1..96
       |> Enum.map(fn

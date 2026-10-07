@@ -18,12 +18,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   alias __MODULE__.UsageAuthentication
   alias CodexPooler.Accounting.ClientRetry.OriginalWitness
   alias CodexPooler.Gateway.Payloads.CompactionTrigger
+  alias CodexPooler.Gateway.Payloads.ContinuityPayload
   alias CodexPooler.Gateway.Persistence.CodexSession
-  alias CodexPooler.Gateway.RequestCompression.Metadata, as: RequestCompressionMetadata
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
   alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerAdmissionControlV1
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
+  alias CodexPooler.RouteClass
 
   @enforce_keys [
     :request_metadata,
@@ -104,7 +106,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :compaction_projection_context,
     :compaction_result_mode,
     :compaction_result_transport,
-    :conversation_key,
     :connect_timeout,
     :connect_timeout_ms,
     :bridge_owner_lease_ttl_seconds,
@@ -128,12 +129,12 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :model_serving_mode_configured,
     :model_serving_mode_source,
     :native_image_request?,
+    :masked_image_request?,
     :now,
     :openai_source_endpoint,
     :openai_translated_endpoint,
     :openai_chat_payload,
     :owner_instance_id,
-    :payload_compression,
     :pool_timeout,
     :pool_timeout_ms,
     :reasoning_effort_snapshot,
@@ -170,6 +171,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :session_header,
     :session_header_source,
     :session_key,
+    :session_owner_witness,
+    :tenant_scope,
     :timeout,
     :transport,
     :upload_bytes,
@@ -195,6 +198,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     "prompt_cache_controls_downgraded",
     "prompt_cache_key",
     "request_method",
+    "session_owner_witness",
+    "tenant_scope",
     "transport",
     "websocket_delivery_mode"
   ]
@@ -263,7 +268,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   @spec for_payload(t(), String.t(), map()) :: t()
   def for_payload(%__MODULE__{} = options, endpoint, payload) when is_map(payload) do
-    %{options | request_metadata: request_metadata(options, endpoint, payload)}
+    %{
+      options
+      | request_metadata: request_metadata(options, endpoint, payload),
+        payload_context: %{
+          options.payload_context
+          | portable_full_history?: portable_full_history?(payload)
+        }
+    }
   end
 
   @spec retarget(t(), String.t(), map()) :: t()
@@ -271,8 +283,12 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{
       options
       | request_metadata: request_metadata(options, endpoint, payload),
+        payload_context: %{
+          options.payload_context
+          | portable_full_history?: portable_full_history?(payload)
+        },
         transport: retargeted_transport(options.transport, endpoint, payload),
-        routing: Routing.update(options.routing, prompt_cache_key: nil)
+        routing: Routing.update(options.routing, prompt_cache_key: nil, prompt_cache_key_state: :route_excluded)
     }
   end
 
@@ -328,19 +344,12 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       ),
       do: websocket_request_correlation_id(options)
 
-  def websocket_denial_correlation_id(
-        %__MODULE__{
-          transport: %{transport: "websocket"},
-          continuity: %{
-            request_claim_key: request_claim_key,
-            turn_claim_key: turn_claim_key
-          }
-        },
-        nil
-      )
-      when is_binary(request_claim_key) and request_claim_key != turn_claim_key,
-      do: request_claim_key
-
+  # A refusal recorded without a turn claim was made before the request was
+  # claimed, so it never takes a durable claim: the same request resent once
+  # the refusal's cause is gone would meet it and get `409 duplicate_turn` for
+  # good. It takes the socket's handshake request id, or a fresh id when none
+  # is present. Reservation.record_denied_request/3 retries a duplicate id
+  # under a fresh UUID (findings#206 rows 206-361 and 206-429).
   def websocket_denial_correlation_id(
         %__MODULE__{
           request_metadata: %{request_id: request_id},
@@ -350,6 +359,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       )
       when is_binary(request_id),
       do: request_id
+
+  def websocket_denial_correlation_id(%__MODULE__{transport: %{transport: "websocket"}}, nil),
+    do: Ecto.UUID.generate()
 
   def websocket_denial_correlation_id(%__MODULE__{} = options, nil),
     do: websocket_request_correlation_id(options)
@@ -367,10 +379,13 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     end
   end
 
+  # `unwrap/1` revalidates the carried admission and answers
+  # `{:error, :invalid_input}` when it no longer holds; every caller must treat
+  # that as no usable admission, never as `:none` (findings#225).
   @spec native_compaction_admission(t()) ::
-          {:ok, CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability.t(),
-           NativeCompactionAdmissionContext.owner(), NativeCompactionAdmissionContext.lifecycle()}
+          {:ok, CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability.t(), NativeCompactionAdmissionContext.owner(), NativeCompactionAdmissionContext.lifecycle()}
           | :none
+          | {:error, :invalid_input}
   def native_compaction_admission(%__MODULE__{
         native_compaction_admission: %NativeCompactionAdmissionContext{} = admission
       }),
@@ -386,6 +401,24 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       ),
       do: %{options | first_compact_collection: provenance}
 
+  # How a step of a compaction's confirmation ended when its owner did not
+  # confirm it: `:unknown` when the owner did not answer within its call budget
+  # (`owner_forward_timeout`, or `timeout` from the connection's session with
+  # owner forwarding off) or the call to it failed in transit (`owner_crashed`),
+  # so it may still apply the step once it answers; `:not_applied` when the
+  # owner is gone (exited, drained, replaced, or its lease is no longer this
+  # socket's) and never will; `:refused` when it answered with a refusal of
+  # the admission's own (`binding_mismatch`, `stale_downstream`,
+  # `invalid_transition`, ...). Only a refusal proves the compaction
+  # inconsistent with the owner's admission (findings#270 row 270-249).
+  @unanswered_confirmation_reasons [:owner_forward_timeout, :timeout, :owner_crashed]
+  @gone_owner_confirmation_reasons [:owner_unavailable, :stale_owner, :owner_drained, :unavailable]
+
+  @spec compact_confirmation_outcome(term()) :: :unknown | :not_applied | :refused
+  def compact_confirmation_outcome(reason) when reason in @unanswered_confirmation_reasons, do: :unknown
+  def compact_confirmation_outcome(reason) when reason in @gone_owner_confirmation_reasons, do: :not_applied
+  def compact_confirmation_outcome(_reason), do: :refused
+
   @spec acknowledge_native_compact_finalization(
           t(),
           <<_::256>>,
@@ -399,7 +432,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
         expires_at_ms
       ) do
     with {:ok, source_phase, control_ref, owner} <- compact_confirmation_source(options),
-         :ok <- record_first_compact_collection_if_needed(options, owner) do
+         :ok <- recorded_unless_refused(record_first_compact_collection_if_needed(options, owner)) do
       confirmation = %NativeCompactionAdmission.Confirmation{
         source_phase: source_phase,
         source_control_ref: control_ref,
@@ -409,6 +442,19 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       acknowledge_compact_owner(owner, digest, confirmation, expires_at_ms)
     end
   end
+
+  # A first full-history compaction's collection the owner did not confirm is
+  # still followed by its acknowledgement. The owner handles its calls in
+  # order, so one that applies the collection late applies the acknowledgement
+  # right after it and arms the final, instead of keeping a
+  # `collected_unconfirmed` admission that no acknowledgement follows; one
+  # that is gone answers the acknowledgement the same way. A refusal ends the
+  # confirmation there (findings#270 row 270-249).
+  defp recorded_unless_refused({:error, reason} = refused) do
+    if compact_confirmation_outcome(reason) == :refused, do: refused, else: :ok
+  end
+
+  defp recorded_unless_refused(:ok), do: :ok
 
   defp record_first_compact_collection_if_needed(
          %__MODULE__{
@@ -467,14 +513,16 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp compact_confirmation_source(
          %__MODULE__{
-           first_compact_collection:
-             %NativeCompactionAdmission.FirstCompactCollection{} = provenance
+           first_compact_collection: %NativeCompactionAdmission.FirstCompactCollection{} = provenance
          } = options
        ) do
     {:ok, :first_full_history_compact, provenance.control_ref, first_compact_owner(options)}
   end
 
-  defp compact_confirmation_source(%__MODULE__{}), do: {:error, :owner_unavailable}
+  # A request with neither provenance never reaches the owner: nothing it
+  # could confirm was reserved or collected, so it is refused as such, never
+  # as an owner that is gone.
+  defp compact_confirmation_source(%__MODULE__{}), do: {:error, :missing_confirmation_provenance}
 
   defp first_compact_owner(%__MODULE__{
          transport: %{upstream_websocket_session: owner, websocket_owner: %{enabled?: false}}
@@ -604,6 +652,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
       :none ->
         :ok
+
+      {:error, :invalid_input} = error ->
+        error
     end
   end
 
@@ -616,6 +667,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
       :none ->
         :ok
+
+      {:error, :invalid_input} = error ->
+        error
     end
   end
 
@@ -638,6 +692,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
       :none ->
         :ok
+
+      {:error, :invalid_input} = error ->
+        error
     end
   end
 
@@ -699,6 +756,22 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     end
   end
 
+  @doc """
+  The client's own `originator` header on a native Codex route, which decides
+  how the Pool-exhausted refusal reads to that client
+  (`Contracts.native_usage_limit_answer/2`, findings#279 point 2); `nil` on a
+  public `/v1` route or a route translated from one, whose answers never
+  depend on it.
+  """
+  @spec native_originator(t() | term()) :: String.t() | nil
+  def native_originator(%__MODULE__{
+        openai_compatibility: %OpenAICompatibility{public_openai_responses_stream: false, source_endpoint: nil},
+        request_metadata: %RequestMetadata{originator: originator}
+      }),
+      do: originator
+
+  def native_originator(_options), do: nil
+
   @spec client_request_metadata(t()) :: map()
   def client_request_metadata(%__MODULE__{} = options) do
     case safe_client_request_id(options.request_metadata.client_request_id) do
@@ -748,6 +821,16 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{options | transport: Transport.update(options.transport, updates)}
   end
 
+  @doc """
+  Whether the upstream request streams. A websocket turn always streams
+  upstream whatever its `stream` flag; any other transport follows the flag.
+  """
+  @spec upstream_streaming?(t(), map()) :: boolean()
+  def upstream_streaming?(%__MODULE__{transport: %{transport: "websocket"}}, _payload), do: true
+
+  def upstream_streaming?(%__MODULE__{}, payload) when is_map(payload),
+    do: RouteClass.streaming?(payload)
+
   @spec connection_bound_compaction?(t()) :: boolean()
   def connection_bound_compaction?(%__MODULE__{
         payload_context: %{
@@ -778,6 +861,11 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{options | runtime: RuntimeContext.update(options.runtime, updates)}
   end
 
+  @spec put_session_owner_witness(t(), OwnerWitness.t()) :: t()
+  def put_session_owner_witness(%__MODULE__{} = options, %OwnerWitness{} = witness) do
+    %{options | runtime: %{options.runtime | session_owner_witness: witness}}
+  end
+
   @spec put_native_client_retry_witness(t(), OriginalWitness.t()) :: t()
   def put_native_client_retry_witness(%__MODULE__{} = options, %OriginalWitness{} = witness),
     do: %{options | native_client_retry_witness: witness}
@@ -792,6 +880,28 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   end
 
   def capture_api_key_runtime_epoch(%__MODULE__{} = options, _auth), do: options
+
+  @doc """
+  Captures the trusted Pool and API key ids of the authenticated runtime
+  principal. They scope the provider `session-id` synthesized for public `/v1`
+  prompt-cache keys, so the ids only ever come from the authenticated auth
+  context and never from controller opts, params, headers, or the body. An
+  auth context without both ids clears the scope, which suppresses the header.
+  """
+  @spec capture_tenant_scope(t(), CodexPooler.Access.auth_context()) :: t()
+  def capture_tenant_scope(
+        %__MODULE__{runtime: %RuntimeContext{} = runtime} = options,
+        %{pool: %{id: pool_id}, api_key: %{id: api_key_id}}
+      )
+      when is_binary(pool_id) and byte_size(pool_id) > 0 and is_binary(api_key_id) and
+             byte_size(api_key_id) > 0 do
+    %{options | runtime: %{runtime | tenant_scope: %{pool_id: pool_id, api_key_id: api_key_id}}}
+  end
+
+  def capture_tenant_scope(%__MODULE__{runtime: %RuntimeContext{} = runtime} = options, _auth),
+    do: %{options | runtime: %{runtime | tenant_scope: nil}}
+
+  def capture_tenant_scope(%__MODULE__{} = options, _auth), do: options
 
   @spec put_payload_context(t(), keyword()) :: t()
   def put_payload_context(%__MODULE__{} = options, updates) when is_list(updates) do
@@ -826,20 +936,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     OpenAICompatibility.metadata(compatibility)
   end
 
-  @spec payload_compression_attempt_metadata(t() | map() | term()) :: map()
-  def payload_compression_attempt_metadata(%__MODULE__{
-        runtime: %{payload_compression: metadata}
-      }),
-      do: payload_compression_metadata_envelope(metadata)
-
-  def payload_compression_attempt_metadata(%{runtime: %{payload_compression: metadata}}),
-    do: payload_compression_metadata_envelope(metadata)
-
-  def payload_compression_attempt_metadata(%{payload_compression: metadata}),
-    do: payload_compression_metadata_envelope(metadata)
-
-  def payload_compression_attempt_metadata(_opts), do: %{}
-
   @spec reasoning_effort_attempt_metadata(t() | map() | term()) :: map()
   def reasoning_effort_attempt_metadata(%__MODULE__{
         runtime: %{reasoning_effort_snapshot: snapshot}
@@ -872,9 +968,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   def prompt_cache_controls_attempt_metadata(_opts), do: %{}
 
-  @spec payload_compression_request_metadata(t() | map() | term()) :: map()
-  def payload_compression_request_metadata(opts), do: payload_compression_attempt_metadata(opts)
-
   @spec route_class(t()) :: String.t() | nil
   def route_class(%__MODULE__{transport: %{route_class: route_class}})
       when is_binary(route_class),
@@ -890,7 +983,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   @spec json_request_bytes(term()) :: non_neg_integer() | nil
   def json_request_bytes(payload) when is_map(payload) do
-    case Jason.encode(payload) do
+    case CodexPooler.JSON.encode(payload) do
       {:ok, encoded} -> byte_size(encoded)
       {:error, _reason} -> nil
     end
@@ -913,6 +1006,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       idempotency_key: Map.get(opts, :idempotency_key),
       client_ip: Map.get(opts, :client_ip),
       user_agent: Map.get(opts, :user_agent),
+      originator: Map.get(opts, :originator),
       request_bytes: Map.get(opts, :request_bytes) || json_request_bytes(payload),
       upload_bytes: Map.get(opts, :upload_bytes),
       request_content_type: Map.get(opts, :request_content_type)
@@ -924,17 +1018,19 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   end
 
   defp routing(opts, endpoint, payload) do
+    {prompt_cache_key, prompt_cache_key_state} = prompt_cache_key(opts, endpoint, payload)
+
     %Routing{
       requested_model: Map.get(opts, :requested_model),
       effective_model: Map.get(opts, :effective_model),
       api_key_policy: Map.get(opts, :api_key_policy),
       file_affinity_assignment_id: Map.get(opts, :file_affinity_assignment_id),
-      prompt_cache_key: prompt_cache_key(opts, endpoint, payload),
+      prompt_cache_key: prompt_cache_key,
+      prompt_cache_key_state: prompt_cache_key_state,
       quota_decision: Map.get(opts, :quota_decision),
       reset_probe: reset_probe(Map.get(opts, :reset_probe)),
       reasoning_effort_decision: Map.get(opts, :reasoning_effort_decision),
-      supports_reasoning_summary_parameter?:
-        Map.get(opts, :supports_reasoning_summary_parameter?, true) != false,
+      supports_reasoning_summary_parameter?: Map.get(opts, :supports_reasoning_summary_parameter?, true) != false,
       routing_attempt_metadata: Map.get(opts, :routing_attempt_metadata),
       routing_circuit_state: Map.get(opts, :routing_circuit_state),
       model_serving_mode_configured: Map.get(opts, :model_serving_mode_configured),
@@ -966,14 +1062,70 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp payload_context(opts, payload) do
     PayloadContext.build(opts, CompactionTrigger.compaction_input_mode(payload))
+    |> Map.put(:portable_full_history?, portable_full_history?(payload))
+  end
+
+  # A full history is portable when another account can serve it. Measured
+  # directly against the provider, another account reads a `compaction`
+  # checkpoint (findings#320) but drops a `reasoning` item's
+  # `encrypted_content` without an error (findings#318): a move keeps the
+  # compacted context and costs the model only its earlier reasoning. A request
+  # that must keep that reasoning is pinned after reservation
+  # (`Runtime.Dispatch.ContentFilterRetryPin`).
+  defp portable_full_history?(%{"input" => input} = payload) do
+    CompactionTrigger.compaction_input_mode(payload) == :full_history and
+      (is_binary(input) or is_list(input)) and not upstream_bound_input?(input)
+  end
+
+  defp portable_full_history?(_payload), do: false
+
+  # The provider's `compaction` checkpoint is portable: another account reads it.
+  # A direct probe counted the same input tokens for a checkpoint on the
+  # producing and on another account, and the other account recalled a fact
+  # planted only in it (findings#320); production served the same checkpoint on
+  # two accounts of one Pool, over the released client's HTTPS fallback, after
+  # the websocket had pinned it to the exhausted one (findings#206 row
+  # 206-357). Only what it wraps besides its own encrypted payload can still
+  # bind it.
+  defp upstream_bound_input?(%{"type" => "compaction"} = item),
+    do: item |> Map.drop(["type", "id", "encrypted_content"]) |> Map.values() |> upstream_bound_input?()
+
+  # Recognized agent handoffs travel with full history across accounts, just
+  # as they do on the client's HTTP fallback. Exempt only the known cipher;
+  # extra fields on the envelope or either content part retain their fences.
+  defp upstream_bound_input?(%{"type" => "agent_message"} = item) do
+    if ContinuityPayload.v2_encrypted_handoff?(item) do
+      [header, cipher] = item["content"]
+      upstream_bound_fields?(Map.put(item, "content", [header, Map.delete(cipher, "encrypted_content")]))
+    else
+      upstream_bound_fields?(item)
+    end
+  end
+
+  defp upstream_bound_input?(%{} = item) do
+    upstream_bound_fields?(item)
+  end
+
+  defp upstream_bound_input?(items) when is_list(items),
+    do: Enum.any?(items, &upstream_bound_input?/1)
+
+  defp upstream_bound_input?(_value), do: false
+
+  # A `reasoning` item's `encrypted_content` binds nothing: another account
+  # accepts the item and drops it (input tokens as without it, and the model
+  # reasons again; findings#318), so a move loses that reasoning but never
+  # fails the request. Any other encrypted content stays bound.
+  defp upstream_bound_fields?(item) do
+    Map.get(item, "type") in ["item_reference", "compaction_trigger"] or
+      Map.has_key?(item, "file_id") or
+      (Map.has_key?(item, "encrypted_content") and Map.get(item, "type") != "reasoning") or
+      Enum.any?(Map.values(item), &upstream_bound_input?/1)
   end
 
   defp usage_authentication(opts) do
     %UsageAuthentication{
-      authorization_header:
-        Map.get(opts, :authorization_header) || Map.get(opts, "authorization_header"),
-      chatgpt_account_id:
-        Map.get(opts, :chatgpt_account_id) || Map.get(opts, "chatgpt_account_id")
+      authorization_header: Map.get(opts, :authorization_header) || Map.get(opts, "authorization_header"),
+      chatgpt_account_id: Map.get(opts, :chatgpt_account_id) || Map.get(opts, "chatgpt_account_id")
     }
   end
 
@@ -1009,11 +1161,18 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp safe_client_request_id(_value), do: nil
 
+  # The routing copy is the key's digest or nil; the state keeps why it is nil,
+  # so a key the client sent is never reported as absent (findings#255 rows
+  # 255-80 and 255-81): a route outside `@prompt_cache_key_routes` (compact,
+  # file, GET, websocket) and every retarget take no seed whatever the body
+  # carries. Only the state crosses into metadata, never the key.
   defp prompt_cache_key(opts, endpoint, payload) do
     if prompt_cache_key_route?(opts, endpoint, payload) do
       payload
       |> Map.get("prompt_cache_key")
       |> normalized_prompt_cache_key()
+    else
+      {nil, :route_excluded}
     end
   end
 
@@ -1034,30 +1193,29 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   defp post_request?(method) when is_binary(method), do: String.upcase(method) == "POST"
   defp post_request?(_method), do: false
 
+  defp normalized_prompt_cache_key(nil), do: {nil, :absent}
+
   defp normalized_prompt_cache_key(value) when is_binary(value) do
     canonical = String.trim(value)
 
     cond do
       canonical == "" ->
-        nil
+        {nil, :blank}
 
       byte_size(canonical) > @prompt_cache_key_max_bytes ->
-        nil
+        {nil, :oversized}
 
       true ->
-        :crypto.hash(:sha256, canonical)
-        |> Base.encode16(case: :lower)
+        {:crypto.hash(:sha256, canonical) |> Base.encode16(case: :lower), :present}
     end
   end
 
-  defp normalized_prompt_cache_key(_value), do: nil
+  defp normalized_prompt_cache_key(_value), do: {nil, :invalid}
 
   defp reasoning_effort_metadata_envelope(snapshot) when is_map(snapshot) do
     snapshot =
       snapshot
-      |> Map.take(
-        ~w(policy_mode configured_effort requested_effort applied_effort effective_effort source rewrite)
-      )
+      |> Map.take(~w(policy_mode configured_effort requested_effort applied_effort effective_effort source rewrite))
       |> Enum.reject(fn {_key, value} ->
         is_nil(value) or (is_binary(value) and String.trim(value) == "")
       end)
@@ -1067,7 +1225,4 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   end
 
   defp reasoning_effort_metadata_envelope(_snapshot), do: %{}
-
-  defp payload_compression_metadata_envelope(metadata),
-    do: RequestCompressionMetadata.request_envelope(metadata)
 end

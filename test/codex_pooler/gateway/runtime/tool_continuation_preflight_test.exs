@@ -36,7 +36,7 @@ defmodule CodexPooler.Gateway.Runtime.ToolContinuationPreflightTest do
       "type" => "response.create",
       "model" => setup.model.exposed_model_id,
       "input" => [%{"role" => "user", "content" => "synthetic"}],
-      "client_metadata" => %{"x-codex-turn-metadata" => Jason.encode!(metadata)}
+      "client_metadata" => %{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(metadata)}
     }
 
     continuation =
@@ -151,7 +151,7 @@ defmodule CodexPooler.Gateway.Runtime.ToolContinuationPreflightTest do
                ClientRetry.preflight_snapshot(session, setup.api_key, setup.model, input)
              end)
 
-    assert {:ok, {:error, :unsafe_completed_output}} =
+    assert {:ok, {:ok, %{client_retry_predecessor_request_id: exact_predecessor}}} =
              Repo.transaction(fn ->
                ClientRetry.preflight_snapshot(session, setup.api_key, setup.model, %{
                  input
@@ -162,14 +162,16 @@ defmodule CodexPooler.Gateway.Runtime.ToolContinuationPreflightTest do
     assert {:ok, %{intent: :fresh, lifecycle: nil}} =
              Service.prepare_replay_intent(setup.auth, next)
 
-    assert {:error, %{code: "duplicate_turn"}} = Service.prepare_replay_intent(setup.auth, first)
+    assert {:ok, %{intent: :fresh, lifecycle: %{client_retry_predecessor_request_id: ^exact_predecessor}}} = Service.prepare_replay_intent(setup.auth, first)
 
     forged_options =
       RequestOptions.put_continuity(first.request_options,
         request_claim_key: next.request_options.continuity.request_claim_key
       )
 
-    assert {:error, %{code: "invalid_request"}} =
+    # A forged claim key breaks the frame's own signature, which is a gateway
+    # invariant breach rather than a client request error (findings #168).
+    assert {:error, %{status: 500, code: "server_error"}} =
              Service.prepare_replay_intent(setup.auth, %{first | request_options: forged_options})
 
     assert Repo.aggregate(RequestClientRetryLink, :count) == 0
@@ -198,12 +200,10 @@ defmodule CodexPooler.Gateway.Runtime.ToolContinuationPreflightTest do
         "/backend-api/codex/responses",
         payload
       )
-      |> RequestOptions.put_runtime_context(
-        api_key_runtime_epoch: setup.api_key.runtime_revocation_epoch
-      )
+      |> RequestOptions.put_runtime_context(api_key_runtime_epoch: setup.api_key.runtime_revocation_epoch)
 
     {:ok, prepared} =
-      WebsocketCodec.prepare_frame(Jason.encode!(payload), options, fn _ -> :ok end)
+      WebsocketCodec.prepare_frame(CodexPooler.JSON.encode!(payload), options, fn _ -> :ok end)
 
     prepared
   end

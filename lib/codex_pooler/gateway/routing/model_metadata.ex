@@ -3,15 +3,10 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   Codex-compatible model metadata and capability helpers for gateway routing.
   """
 
-  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.MetadataProjection
-  alias CodexPooler.Catalog
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.ReasoningEffort
 
-  @short_context_price_bucket "short_context"
-  @long_context_price_bucket "long_context"
-  @short_context_advertised_window 128_000
   @atom_metadata_keys Map.new(
                         ~w[
                           audio
@@ -37,149 +32,8 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
   @type metadata :: map()
   @type metadata_input :: Model.t() | metadata()
-  @type pricing_buckets :: Catalog.pricing_bucket_map()
   @type context_window_overrides :: %{optional(String.t()) => pos_integer()}
   @type effective_model_serving_mode :: String.t() | nil
-
-  @spec codex_model_payload(Model.t(), pricing_buckets()) :: map()
-  def codex_model_payload(%Model{} = model, pricing_buckets),
-    do: codex_model_payload(model, pricing_buckets, nil)
-
-  @spec codex_model_payload(Model.t(), pricing_buckets(), MetadataProjection.t() | nil) :: map()
-  def codex_model_payload(%Model{} = model, pricing_buckets, reasoning_projection) do
-    settings = OperationalSettings.current()
-
-    codex_model_payload(
-      model,
-      pricing_buckets,
-      reasoning_projection,
-      settings.model_context_window_overrides
-    )
-  end
-
-  @spec codex_model_payload(
-          Model.t(),
-          pricing_buckets(),
-          MetadataProjection.t() | nil,
-          context_window_overrides()
-        ) :: map()
-  def codex_model_payload(
-        %Model{} = model,
-        pricing_buckets,
-        reasoning_projection,
-        context_window_overrides
-      )
-      when is_map(context_window_overrides) do
-    metadata =
-      model
-      |> metadata()
-      |> apply_context_window_policy(model, pricing_buckets, context_window_overrides)
-
-    model
-    |> base_codex_model_payload(metadata, reasoning_projection)
-    |> maybe_put_reasoning_summary_capabilities(metadata)
-    |> maybe_put_comp_hash(metadata)
-  end
-
-  @spec codex_model_payload(
-          Model.t(),
-          pricing_buckets(),
-          MetadataProjection.t() | nil,
-          context_window_overrides(),
-          effective_model_serving_mode()
-        ) :: map()
-  def codex_model_payload(
-        %Model{} = model,
-        pricing_buckets,
-        reasoning_projection,
-        context_window_overrides,
-        effective_model_serving_mode
-      )
-      when is_map(context_window_overrides) do
-    model
-    |> codex_model_payload(pricing_buckets, reasoning_projection, context_window_overrides)
-    |> Map.put("use_responses_lite", effective_model_serving_mode == "lite")
-  end
-
-  defp base_codex_model_payload(model, metadata, reasoning_projection) do
-    %{
-      "slug" => model.exposed_model_id,
-      "display_name" => model.display_name,
-      "description" => metadata["description"] || model.display_name,
-      "default_reasoning_level" =>
-        projected_default_reasoning_level(reasoning_projection, model, metadata),
-      "supported_reasoning_levels" =>
-        projected_reasoning_levels(reasoning_projection, model, metadata),
-      "shell_type" => "shell_command",
-      "visibility" => "list",
-      "priority" => int_metadata(metadata, "priority", 0),
-      "additional_speed_tiers" => list_metadata(metadata, "additional_speed_tiers"),
-      "service_tiers" => list_metadata(metadata, "service_tiers"),
-      "available_in_plans" => list_metadata(metadata, "available_in_plans"),
-      "default_service_tier" => string_metadata(metadata, "default_service_tier"),
-      "minimal_client_version" => json_metadata(metadata, "minimal_client_version"),
-      "availability_nux" => nil,
-      "upgrade" => nil,
-      "base_instructions" => metadata["base_instructions"] || "",
-      "default_reasoning_summary" => metadata["default_reasoning_summary"] || "auto",
-      "support_verbosity" => bool_metadata(metadata, "support_verbosity"),
-      "default_verbosity" => metadata["default_verbosity"],
-      "apply_patch_tool_type" => metadata["apply_patch_tool_type"],
-      "web_search_tool_type" => metadata["web_search_tool_type"] || "text",
-      "truncation_policy" =>
-        metadata["truncation_policy"] ||
-          %{
-            "mode" => "bytes",
-            "limit" => int_metadata(metadata, "truncation_limit", 10_000)
-          },
-      "supports_parallel_tool_calls" => model.supports_tools,
-      "supports_image_detail_original" => supports_image_detail_original?(metadata),
-      "model_messages" => map_metadata(metadata, "model_messages"),
-      "include_skills_usage_instructions" =>
-        bool_metadata(metadata, "include_skills_usage_instructions"),
-      "prefer_websockets" => bool_metadata(metadata, "prefer_websockets"),
-      "reasoning_summary_format" => string_metadata(metadata, "reasoning_summary_format"),
-      "context_window" => metadata["context_window"],
-      "max_context_window" => metadata["max_context_window"],
-      "auto_compact_token_limit" => metadata["auto_compact_token_limit"],
-      "effective_context_window_percent" =>
-        int_metadata(metadata, "effective_context_window_percent", 95),
-      "experimental_supported_tools" => list_metadata(metadata, "experimental_supported_tools"),
-      "input_modalities" => input_modalities(metadata),
-      "supports_search_tool" => bool_metadata(metadata, "supports_search_tool"),
-      "tool_mode" => tool_mode_metadata(metadata),
-      "upstream_model_id" => model.upstream_model_id,
-      "exposed_model_id" => model.exposed_model_id,
-      "status" => model.status,
-      "supported_in_api" => model.supports_responses,
-      "supports_responses" => model.supports_responses,
-      "supports_streaming" => model.supports_streaming,
-      "supports_tools" => model.supports_tools,
-      "supports_reasoning" => model.supports_reasoning,
-      "use_responses_lite" => bool_metadata(metadata, "use_responses_lite")
-    }
-  end
-
-  defp maybe_put_reasoning_summary_capabilities(payload, metadata) do
-    payload =
-      if supports_reasoning_summary_parameter?(metadata) do
-        payload
-      else
-        Map.put(payload, "supports_reasoning_summary_parameter", false)
-      end
-
-    case literal_boolean_metadata(metadata, "supports_reasoning_summaries") do
-      value when is_boolean(value) -> Map.put(payload, "supports_reasoning_summaries", value)
-      nil -> payload
-    end
-  end
-
-  defp maybe_put_comp_hash(payload, metadata) do
-    case optional_string_metadata(metadata, "comp_hash") do
-      nil -> payload
-      comp_hash -> Map.put(payload, "comp_hash", comp_hash)
-    end
-  end
 
   @spec supports_reasoning_summary_parameter?(metadata_input()) :: boolean()
   def supports_reasoning_summary_parameter?(%Model{} = model) do
@@ -218,22 +72,6 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
   def assignment_source?(%Model{}, _assignment_id), do: false
 
-  defp projected_default_reasoning_level(
-         %MetadataProjection{default_effort: default_effort},
-         _model,
-         _metadata
-       ),
-       do: default_effort
-
-  defp projected_default_reasoning_level(nil, model, metadata),
-    do: default_reasoning_level(model, metadata)
-
-  defp projected_reasoning_levels(%MetadataProjection{levels: levels}, _model, _metadata),
-    do: levels
-
-  defp projected_reasoning_levels(nil, model, metadata),
-    do: supported_reasoning_levels(model, metadata)
-
   @spec default_reasoning_level(Model.t(), metadata()) :: String.t() | nil
   def default_reasoning_level(%Model{supports_reasoning: true}, metadata) do
     string_metadata(metadata, "default_reasoning_level") ||
@@ -258,6 +96,62 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
   def supported_reasoning_levels(%Model{}, _metadata), do: []
 
+  @spec catalog_reasoning_levels(Model.t()) :: [String.t()]
+  def catalog_reasoning_levels(%Model{} = model) do
+    model
+    |> metadata()
+    |> reasoning_level_values()
+  end
+
+  @doc """
+  Reasoning levels of the assignment actually selected for dispatch.
+
+  `catalog_reasoning_levels/1` reads the Pool-wide union, which is right before
+  routing (admission, `/models`) but wrong for an upstream rewrite: a `ultra`
+  request must be rewritten to the highest level *this* assignment's model
+  advertises, not to a level another assignment in the Pool contributed
+  (findings#221). Without a selected assignment, or for an assignment with no
+  source metadata, the union is the only answer.
+  """
+  @spec selected_reasoning_levels(Model.t(), Ecto.UUID.t() | nil) :: [String.t()]
+  def selected_reasoning_levels(%Model{} = model, nil), do: catalog_reasoning_levels(model)
+
+  def selected_reasoning_levels(%Model{} = model, assignment_id) when is_binary(assignment_id) do
+    # A preserved source whose sync failed is stored as `%{}`, which is truthy
+    # and would otherwise yield no levels at all; the union is the answer then.
+    case model |> selected_assignment_metadata(assignment_id) |> reasoning_level_values() do
+      [] -> catalog_reasoning_levels(model)
+      levels -> levels
+    end
+  end
+
+  @doc """
+  Reasoning levels one metadata map advertises, canonicalized and de-duplicated.
+
+  Reads a raw metadata map rather than a `Model`, so a per-assignment source
+  from `source_assignment_models` can be asked what *it* advertises rather than
+  what the Pool-wide union does.
+  """
+  @spec metadata_reasoning_levels(term()) :: [String.t()]
+  def metadata_reasoning_levels(metadata) when is_map(metadata),
+    do: reasoning_level_values(metadata)
+
+  def metadata_reasoning_levels(_metadata), do: []
+
+  @doc """
+  The description each reasoning level of one metadata map gives, as
+  `{effort, description}` pairs in the map's own order. A level named by a
+  bare string, or whose `description` is not a nonblank string, gives none.
+  """
+  @spec metadata_reasoning_level_descriptions(term()) :: [{String.t(), String.t()}]
+  def metadata_reasoning_level_descriptions(metadata) when is_map(metadata) do
+    metadata
+    |> metadata_values(["supported_reasoning_levels", "reasoning_efforts"])
+    |> Enum.flat_map(&reasoning_level_description/1)
+  end
+
+  def metadata_reasoning_level_descriptions(_metadata), do: []
+
   @spec reasoning_levels_and_default(Model.t()) :: {[String.t()], String.t() | nil}
   def reasoning_levels_and_default(%Model{} = model) do
     metadata = metadata(model)
@@ -274,8 +168,7 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   def reasoning_level_maps_and_default(%Model{} = model) do
     metadata = metadata(model)
 
-    {effective_reasoning_level_maps(model, metadata),
-     canonical_default_reasoning_level(model, metadata)}
+    {effective_reasoning_level_maps(model, metadata), canonical_default_reasoning_level(model, metadata)}
   end
 
   defp canonical_default_reasoning_level(%Model{} = model, metadata) do
@@ -353,6 +246,20 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   defp reasoning_level_value(value) when is_binary(value), do: clean_reasoning_level(value)
   defp reasoning_level_value(_value), do: nil
 
+  defp reasoning_level_description(%{"effort" => effort, "description" => description}) when is_binary(effort) and is_binary(description),
+    do: level_description(clean_reasoning_level(effort), description)
+
+  defp reasoning_level_description(%{effort: effort, description: description}) when is_binary(effort) and is_binary(description),
+    do: level_description(clean_reasoning_level(effort), description)
+
+  defp reasoning_level_description(_level), do: []
+
+  defp level_description(nil, _description), do: []
+
+  defp level_description(effort, description) do
+    if String.trim(description) == "", do: [], else: [{effort, description}]
+  end
+
   defp clean_reasoning_level(value) do
     case String.trim(value) do
       "" -> nil
@@ -373,49 +280,6 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
     case Map.get(metadata, key) do
       value when is_binary(value) -> value
       _value -> nil
-    end
-  end
-
-  @spec optional_string_metadata(metadata(), String.t()) :: String.t() | nil
-  defp optional_string_metadata(metadata, key) do
-    case Map.get(metadata, key) do
-      value when is_binary(value) ->
-        case String.trim(value) do
-          "" -> nil
-          trimmed -> trimmed
-        end
-
-      _value ->
-        nil
-    end
-  end
-
-  @spec tool_mode_metadata(metadata()) :: String.t() | nil
-  defp tool_mode_metadata(metadata) do
-    case string_metadata(metadata, "tool_mode") do
-      value when value in ["direct", "code_mode", "code_mode_only"] -> value
-      _value -> nil
-    end
-  end
-
-  @spec map_metadata(metadata(), String.t()) :: metadata() | nil
-  defp map_metadata(metadata, key) do
-    case Map.get(metadata, key) do
-      %{} = map -> map
-      _value -> nil
-    end
-  end
-
-  @spec json_metadata(metadata(), String.t()) :: term() | nil
-  defp json_metadata(metadata, key) do
-    case Map.get(metadata, key) do
-      value
-      when is_binary(value) or is_boolean(value) or is_number(value) or is_list(value) or
-             is_map(value) or is_nil(value) ->
-        value
-
-      _value ->
-        nil
     end
   end
 
@@ -451,14 +315,6 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
       true ->
         ["text"]
-    end
-  end
-
-  @spec supports_image_detail_original?(metadata()) :: boolean()
-  def supports_image_detail_original?(metadata) do
-    case metadata_value(metadata, "supports_image_detail_original") do
-      value when is_boolean(value) -> value
-      _value -> supports_image_input?(metadata)
     end
   end
 
@@ -575,15 +431,14 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
     end
   end
 
-  @spec apply_context_window_policy(metadata(), Model.t(), pricing_buckets()) :: metadata()
-  def apply_context_window_policy(metadata, %Model{} = model, pricing_buckets)
+  @spec apply_context_window_policy(metadata(), Model.t()) :: metadata()
+  def apply_context_window_policy(metadata, %Model{} = model)
       when is_map(metadata) do
     settings = OperationalSettings.current()
 
     apply_context_window_policy(
       metadata,
       model,
-      pricing_buckets,
       settings.model_context_window_overrides
     )
   end
@@ -591,13 +446,11 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   @spec apply_context_window_policy(
           metadata(),
           Model.t(),
-          pricing_buckets(),
           context_window_overrides()
         ) :: metadata()
   def apply_context_window_policy(
         metadata,
         %Model{} = model,
-        pricing_buckets,
         context_window_overrides
       )
       when is_map(metadata) and is_map(context_window_overrides) do
@@ -607,7 +460,7 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
           put_context_window(metadata, context_window)
 
         _value ->
-          maybe_apply_pricing_context_window(metadata, model, pricing_buckets)
+          metadata
       end
 
     put_default_effective_context_window_percent(metadata)
@@ -662,51 +515,10 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
   defp normalize_modalities(values) do
     values
+    |> Enum.filter(&(is_binary(&1) or (is_atom(&1) and &1 not in [nil, true, false])))
     |> Enum.map(fn value -> value |> to_string() |> String.trim() end)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
-  end
-
-  defp maybe_apply_pricing_context_window(metadata, %Model{} = model, pricing_buckets) do
-    case Catalog.pricing_buckets_for_model(model, pricing_buckets) do
-      [] ->
-        metadata
-
-      buckets ->
-        cond do
-          @long_context_price_bucket in buckets ->
-            maybe_promote_long_context_window(metadata)
-
-          @short_context_price_bucket in buckets ->
-            maybe_cap_short_context_window(metadata)
-
-          true ->
-            metadata
-        end
-    end
-  end
-
-  defp maybe_promote_long_context_window(metadata) do
-    with context_window when is_integer(context_window) <- metadata["context_window"],
-         max_context_window
-         when is_integer(max_context_window) and
-                max_context_window > context_window <-
-           metadata["max_context_window"] do
-      put_context_window(metadata, max_context_window)
-    else
-      _value -> metadata
-    end
-  end
-
-  defp maybe_cap_short_context_window(metadata) do
-    case metadata["context_window"] do
-      context_window
-      when is_integer(context_window) and context_window > @short_context_advertised_window ->
-        put_context_window(metadata, @short_context_advertised_window)
-
-      _value ->
-        metadata
-    end
   end
 
   defp put_context_window(metadata, context_window) do
@@ -764,13 +576,6 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       value = metadata_value(metadata, key)
       value in [true, "true", "supported", "enabled"]
     end)
-  end
-
-  defp literal_boolean_metadata(metadata, key) do
-    case metadata_value(metadata, key) do
-      value when is_boolean(value) -> value
-      _value -> nil
-    end
   end
 
   defp metadata_value(%{} = metadata, key) do

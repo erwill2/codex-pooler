@@ -56,8 +56,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.QuotaConvergenceVerifier do
         {:error, error("no_accepted_selector", "no unambiguous selector was accepted")}
 
       candidates ->
-        {:error,
-         error("ambiguous_selector", "multiple selectors were accepted", length(candidates))}
+        {:error, error("ambiguous_selector", "multiple selectors were accepted", length(candidates))}
     end
   end
 
@@ -75,9 +74,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.QuotaConvergenceVerifier do
     Enum.flat_map(assignments, fn {assignment, identity} ->
       observed_at = now()
 
-      case UsageProbe.fetch_from_identity(identity, assignment, observed_at,
-             receive_timeout: 30_000
-           ) do
+      case UsageProbe.fetch_from_identity(identity, assignment, observed_at, receive_timeout: 30_000) do
         {:ok, %UsageProbe.Result{} = probe} -> candidates_from_probe(assignment, identity, probe)
         _unavailable -> []
       end
@@ -256,7 +253,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.QuotaConvergenceVerifier do
 
   defp equivalent_pair?(provider, persisted) do
     decimal_equal?(field(provider, :used_percent), field(persisted, :used_percent)) and
-      iso8601(field(provider, :reset_at)) == iso8601(field(persisted, :reset_at))
+      DateTime.compare(field(provider, :reset_at), field(persisted, :reset_at)) == :eq
   end
 
   defp valid_observation?(window) do

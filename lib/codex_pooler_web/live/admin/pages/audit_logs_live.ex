@@ -5,8 +5,10 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.LogPagination
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.DateTimeDisplay
+  alias CodexPoolerWeb.DateTimeInput
 
   import CodexPoolerWeb.Admin.AuditLogsComponents,
     only: [audit_event_drawer: 1, audit_log_filters: 1, audit_prose_ledger: 1]
@@ -21,6 +23,13 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   # Unclamped it exceeds int64, raises inside handle_params, and the
   # reconnecting client retries the same URL.
   @max_page 10_000
+
+  # How far past the current page the total is counted. `audit_events` has no
+  # retention, so an exact total of the all-Pools view reads the whole audit
+  # history on every load (findings#206 row 206-414). Past this many events the
+  # pager says "10000+": the operator still sees that more match and can page
+  # on, and never a wrong number.
+  @count_window 10_000
 
   @impl true
   def mount(_params, _session, socket) do
@@ -37,9 +46,9 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
        filter_values: %{},
        filter_errors: [],
        pool_filter_options: [],
-       datetime_preferences:
-         DateTimeDisplay.preferences_for_user(socket.assigns.current_scope.user)
-     )}
+       datetime_preferences: DateTimeDisplay.preferences_for_user(socket.assigns.current_scope.user)
+     )
+     |> NotificationCenterHooks.follow_viewer_visibility()}
   end
 
   @impl true
@@ -94,6 +103,22 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
     {:noreply, assign(socket, selected_audit_event: nil)}
   end
 
+  # A role change or a Pool granted or revoked changes which Pools and which
+  # instance events this page may show. It re-reads them at once with the Pool
+  # filter options, and an open event the viewer can no longer see closes
+  # (findings#206 row 206-410). A Pool filter the viewer lost leaves the address
+  # bar too, so the URL names the list the page shows instead of a filter error
+  # the operator did not cause (206-431).
+  @impl true
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    filtered_pool = socket.assigns.selected_pool
+
+    {:noreply,
+     socket
+     |> load_audit_logs(socket.assigns.current_params)
+     |> drop_lost_pool_filter(filtered_pool)}
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -102,6 +127,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
       current_scope={@current_scope}
       active_nav={:audit_logs}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <div id="audit-event-details-drawer-root" class="drawer drawer-end">
         <input
@@ -124,6 +150,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
               filter_values={@filter_values}
               filter_errors={@filter_errors}
               pool_filter_options={@pool_filter_options}
+              timezone={@datetime_preferences.timezone}
             />
 
             <.audit_prose_ledger
@@ -148,7 +175,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   defp load_audit_logs(socket, params) do
     pools = Pools.list_log_filter_pools(socket.assigns.current_scope)
     {selected_pool, pool_error} = select_pool(pools, params["pool_id"])
-    {filters, form_values, filter_errors} = parse_filters(params, selected_pool)
+    {filters, form_values, filter_errors} = parse_filters(params, selected_pool, socket.assigns.datetime_preferences.timezone)
     filter_errors = Enum.reject([pool_error | filter_errors], &is_nil/1)
     offset = page_offset(params)
     cursor = snapshot_at(params)
@@ -161,8 +188,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
       audit_logs: audit_logs,
       current_params: params,
       audit_log_pin_at: cursor || newest_cursor(audit_logs),
-      selected_audit_event:
-        selected_audit_event(socket.assigns.selected_audit_event, audit_logs.items),
+      selected_audit_event: selected_audit_event(socket.assigns.selected_audit_event, audit_logs.items),
       filter_form: to_form(form_values, as: :filters, errors: form_errors(filter_errors)),
       filter_values: form_values,
       filter_errors: filter_errors,
@@ -172,14 +198,15 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   end
 
   defp audit_events(_socket, selected_pool, filters, offset) when not is_nil(selected_pool) do
-    Audit.list_events(selected_pool, limit: @page_size, offset: offset, filters: filters)
+    Audit.list_events(selected_pool, limit: @page_size, offset: offset, filters: filters, count_limit: offset + @count_window)
   end
 
   defp audit_events(socket, _selected_pool, filters, offset) do
     Audit.list_events_for_scope(socket.assigns.current_scope,
       limit: @page_size,
       offset: offset,
-      filters: filters
+      filters: filters,
+      count_limit: offset + @count_window
     )
   end
 
@@ -217,6 +244,14 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
         socket
     end
   end
+
+  # The page selected a Pool before the re-read and none after it, so the Pool
+  # the URL names is one the viewer lost. It leaves the URL like a filter
+  # change: the other filters stay and the window starts over on page one.
+  defp drop_lost_pool_filter(%{assigns: %{selected_pool: nil}} = socket, %{id: _pool_id}),
+    do: patch_window(socket, Map.delete(socket.assigns.current_params, "pool_id"), 1, nil)
+
+  defp drop_lost_pool_filter(socket, _filtered_pool), do: socket
 
   defp patch_window(socket, params, page, cursor) do
     push_patch(socket, to: ~p"/admin/audit-logs?#{window_params(params, page, cursor)}")
@@ -275,7 +310,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
     end
   end
 
-  defp parse_filters(params, selected_pool) do
+  defp parse_filters(params, selected_pool, timezone) do
     form_values = %{
       "pool_id" => (selected_pool && selected_pool.id) || string_param(params, "pool_id") || "",
       "outcome" => string_param(params, "outcome"),
@@ -311,8 +346,8 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
         "Action filter is not supported"
       )
 
-    {date_from, date_from_error} = parse_date(form_values["date_from"], :date_from)
-    {date_to, date_to_error} = parse_date(form_values["date_to"], :date_to)
+    {date_from, date_from_error} = parse_date(form_values["date_from"], :date_from, timezone)
+    {date_to, date_to_error} = parse_date(form_values["date_to"], :date_to, timezone)
 
     filters =
       [
@@ -365,24 +400,27 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
     end
   end
 
-  defp parse_date(nil, _field), do: {nil, nil}
+  defp parse_date(nil, _field, _timezone), do: {nil, nil}
 
-  defp parse_date(value, field) do
-    case Date.from_iso8601(value) do
-      {:ok, date} ->
-        {date_boundary(date, field), nil}
+  defp parse_date(value, field, timezone) do
+    case DateTimeInput.date_boundary(value, field, timezone) do
+      {:ok, datetime} ->
+        {datetime, nil}
+
+      {:error, :gap} ->
+        {nil, %{field: field, message: "#{date_label(field)} does not exist in the selected timezone"}}
+
+      {:error, :unknown_timezone} ->
+        {nil, %{field: field, message: "#{date_label(field)} timezone is unavailable; update your timezone in Settings"}}
 
       {:error, _reason} ->
         {nil, %{field: field, message: "#{date_label(field)} must be a valid date"}}
     end
   end
 
-  defp date_boundary(date, :date_to), do: DateTime.new!(date, ~T[23:59:59.999999], "Etc/UTC")
-  defp date_boundary(date, _field), do: DateTime.new!(date, ~T[00:00:00], "Etc/UTC")
-
   defp form_errors(errors), do: Enum.map(errors, &{&1.field, {&1.message, []}})
 
-  defp empty_audit_logs, do: %{items: [], total: 0, limit: @page_size, offset: 0}
+  defp empty_audit_logs, do: %{items: [], total: 0, total_exact?: true, limit: @page_size, offset: 0}
 
   defp selected_audit_event(nil, _events), do: nil
 
@@ -395,5 +433,6 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   defp string_param(params, key), do: params |> Map.get(key) |> blank_to_nil()
   defp blank_to_nil(value), do: if(blank?(value), do: nil, else: String.trim(to_string(value)))
   defp blank?(nil), do: true
-  defp blank?(value), do: String.trim(to_string(value)) == ""
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: true
 end

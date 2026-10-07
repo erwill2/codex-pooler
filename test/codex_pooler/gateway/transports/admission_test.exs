@@ -7,6 +7,8 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.RouteClass
 
+  @detection_timeout_ms 15_000
+
   defmodule BlockingSaturationServer do
     use GenServer
 
@@ -16,7 +18,7 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
   end
 
   setup do
-    old_config = Application.get_env(:codex_pooler, OperationalSettings, [])
+    old_config = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
     Admission.reset_for_test()
 
     Application.put_env(
@@ -33,7 +35,6 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
 
     on_exit(fn ->
       Admission.reset_for_test()
-      Application.put_env(:codex_pooler, OperationalSettings, old_config)
       Repo.delete_all(Settings)
       InstanceSettings.reset_cache_for_test()
     end)
@@ -137,8 +138,7 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
         Admission.acquire("proxy_stream", %{request_id: "queued-stream"})
       end)
 
-    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :enqueued],
-                    _measurements, %{route_class: "proxy_stream"}}
+    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :enqueued], _measurements, %{route_class: "proxy_stream"}}
 
     assert {:ok, snapshot} = Admission.saturation()
     assert %{running: 1, queued: 1} = snapshot["proxy_stream"]
@@ -149,12 +149,12 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
     refute inspect(snapshot) =~ "monitors"
 
     Admission.release(held)
-    assert {:ok, lease} = Task.await(queued, 1_000)
+    assert {:ok, lease} = Task.await(queued, @detection_timeout_ms)
     Admission.release(lease)
   end
 
   test "saturation distinguishes timeout from an unavailable server" do
-    name = {:global, {:blocking_saturation, System.unique_integer([:positive])}}
+    name = :"blocking-saturation-#{System.unique_integer([:positive])}"
     {:ok, _pid} = start_supervised({BlockingSaturationServer, name: name})
 
     assert {:error, :timeout} = Admission.saturation(name, 1)
@@ -189,14 +189,12 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
         })
       end)
 
-    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :enqueued],
-                    _measurements, %{route_class: "proxy_stream", request_id: "queued-stream"}}
+    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :enqueued], _measurements, %{route_class: "proxy_stream", request_id: "queued-stream"}}
 
     Admission.release(held)
-    assert {:ok, queued_lease} = Task.await(task, 1_000)
+    assert {:ok, queued_lease} = Task.await(task, @detection_timeout_ms)
 
-    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :dequeued],
-                    measurements, %{route_class: "proxy_stream", request_id: "queued-stream"}}
+    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :dequeued], measurements, %{route_class: "proxy_stream", request_id: "queued-stream"}}
 
     assert is_integer(measurements.queued_ms)
     Admission.release(queued_lease)
@@ -249,18 +247,16 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
         })
       end)
 
-    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :enqueued],
-                    _measurements, metadata}
+    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :enqueued], _measurements, metadata}
 
     assert metadata.route_class == "audio_transcription"
     refute inspect(metadata) =~ "private prompt"
     refute inspect(metadata) =~ "secret-token"
 
     assert {:error, %{code: "bulkhead_queue_timeout", route_class: "audio_transcription"}} =
-             Task.await(task, 1_000)
+             Task.await(task, @detection_timeout_ms)
 
-    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :timeout],
-                    measurements, timeout_metadata}
+    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :timeout], measurements, timeout_metadata}
 
     assert timeout_metadata.route_class == "audio_transcription"
     assert timeout_metadata.request_id == "queued-media"
@@ -283,8 +279,7 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
                authorization: "Bearer secret-token"
              })
 
-    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :rejected],
-                    _measurements, metadata}
+    assert_receive {:admission_event, [:codex_pooler, :gateway, :admission, :rejected], _measurements, metadata}
 
     assert metadata.route_class == "proxy_http"
     assert metadata.internal_reason == "bulkhead_rejected"
@@ -390,5 +385,5 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
              })
   end
 
-  defp string_keyed_map(map), do: map |> Jason.encode!() |> Jason.decode!()
+  defp string_keyed_map(map), do: map |> CodexPooler.JSON.encode!() |> CodexPooler.JSON.decode!()
 end

@@ -2,7 +2,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   use CodexPoolerWeb.ConnCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
+  import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport, only: [stop_pool_owners!: 1]
 
   alias CodexPooler.Access
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
@@ -16,7 +18,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   alias CodexPooler.Gateway.Runtime.Service
   alias CodexPooler.Gateway.Transports.Admission
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Gateway.Websocket.Adapter
   alias CodexPooler.NativeCompactionTraceTestExport
@@ -26,6 +27,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
   @turn_state_param "client_metadata.x-codex-turn-state"
   @detection_timeout_ms 15_000
+  @stale_native_content "stale-native-content-must-not-succeed"
   @remote_compaction_v2_fixture_path Path.expand(
                                        "../../../fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_request.json",
                                        __DIR__
@@ -40,6 +42,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   for topology <- [:direct, :forwarded], flip? <- [false, true] do
     @tag :queued_lite_compaction
     @tag capture_log: true
+    @tag slow: "drives real queued compaction through current serving-mode admission and owner delivery barriers"
     test "#{topology} queued Lite compact #{if flip?, do: "rejects a current mode flip", else: "uses unresolved owner mode"}" do
       queued_lite_compaction_case(unquote(topology), unquote(flip?))
     end
@@ -66,23 +69,50 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     item = incremental_compaction_item("queued-lite")
 
+    # Strict finite scenario: the seed turn is always the first send; the queued
+    # Lite compact is the only other send when it is admitted, and a rejected
+    # mode flip must send nothing at all.
+    seed_expectation =
+      FakeUpstream.expect_request(
+        method: "WEBSOCKET",
+        websocket_connection_ordinal: 1,
+        json: [
+          valid: true,
+          equals: %{"type" => "response.create"},
+          forbidden: ["previous_response_id"]
+        ],
+        respond: websocket_completed_frames("resp_queued_lite_seed")
+      )
+
+    compact_expectation =
+      FakeUpstream.expect_request(
+        method: "WEBSOCKET",
+        json: [
+          valid: true,
+          equals: %{
+            "type" => "response.create",
+            "previous_response_id" => "resp_queued_lite_seed",
+            "input.0.type" => "function_call_output"
+          }
+        ],
+        respond:
+          FakeUpstream.websocket_text_frames([
+            CodexPooler.JSON.encode!(%{"type" => "response.output_item.done", "item" => item}),
+            CodexPooler.JSON.encode!(%{
+              "type" => "response.completed",
+              "response" => %{
+                "id" => "resp_queued_lite_compact",
+                "status" => "completed",
+                "output" => [item]
+              }
+            })
+          ])
+      )
+
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_completed_response("resp_queued_lite_seed"),
-           FakeUpstream.websocket_text_frames([
-             Jason.encode!(%{"type" => "response.output_item.done", "item" => item}),
-             Jason.encode!(%{
-               "type" => "response.completed",
-               "response" => %{
-                 "id" => "resp_queued_lite_compact",
-                 "status" => "completed",
-                 "output" => [item]
-               }
-             })
-           ])
-         ]}
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([seed_expectation] ++ if(flip?, do: [], else: [compact_expectation]))
       )
 
     setup = gateway_setup(upstream, compact?: true)
@@ -117,7 +147,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       assert {:push, {:text, _created}, state} = receive_queued_lite_message(state)
       assert {:push, {:text, terminal}, state} = receive_queued_lite_message(state)
       Process.put(:queued_lite_socket_state, state)
-      assert %{"type" => "response.completed"} = Jason.decode!(terminal)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(terminal)
       assert MapSet.size(state.tasks) == 1
 
       assert is_nil(Adapter.response_options(state, true, nil).routing.model_serving_mode)
@@ -152,7 +182,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
       compact =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_queued_lite_seed",
@@ -174,22 +204,22 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       assert Process.delete(:queued_lite_reserved) == flip?
 
       if flip? do
-        assert %{"type" => "error"} = Jason.decode!(first)
+        assert %{"type" => "error"} = CodexPooler.JSON.decode!(first)
         assert FakeUpstream.count(upstream) == 1
         assert Repo.aggregate(Request, :count) == before_requests
         assert Repo.aggregate(Attempt, :count) == before_attempts
       else
-        assert %{"type" => "response.output_item.done", "item" => ^item} = Jason.decode!(first)
+        assert %{"type" => "response.output_item.done", "item" => ^item} =
+                 CodexPooler.JSON.decode!(first)
+
         assert {:push, {:text, done}, next} = receive_queued_lite_message(next)
         Process.put(:queued_lite_socket_state, next)
-        assert %{"type" => "response.completed"} = Jason.decode!(done)
+        assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(done)
         assert FakeUpstream.count(upstream) == 2
         assert Repo.aggregate(Attempt, :count) == before_attempts + 1
 
         compact_row =
-          Repo.one!(
-            from r in Request, where: r.endpoint == "/backend-api/codex/responses/compact"
-          )
+          Repo.one!(from r in Request, where: r.endpoint == "/backend-api/codex/responses/compact")
 
         assert compact_row.request_metadata["routing"]["model_serving_mode"] == "lite"
       end
@@ -198,10 +228,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                complete_queued_lite_socket(Process.get(:queued_lite_socket_state))
 
       Process.put(:queued_lite_socket_state, done_state)
+      assert :ok = FakeUpstream.verify!(upstream)
     after
       final_state = Process.delete(:queued_lite_socket_state)
       CodexResponsesSocket.terminate(:closed, final_state)
-      if topology == :forwarded, do: cleanup_trace_owner_sessions()
+      if topology == :forwarded, do: stop_pool_owners!(setup.pool)
     end
   end
 
@@ -230,30 +261,68 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     end
   end
 
-  test "forwarded final validates the submitted compaction item instead of the stored digest" do
+  for topology <- [:direct, :forwarded] do
+    test "#{topology} final validates the submitted compaction item instead of the stored digest" do
+      assert_final_compaction_item_binding(unquote(topology))
+    end
+  end
+
+  defp assert_final_compaction_item_binding(topology) do
     enable_owner_forwarding_for_trace!()
+
+    Application.put_env(
+      :codex_pooler,
+      :websocket_owner_forwarding_enabled,
+      topology == :forwarded
+    )
+
     turn = "final-digest-check"
     context = "00000000-0000-4000-8000-000000000991"
     item = incremental_compaction_item("final-digest-check")
 
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_completed_response("resp_final_digest_anchor"),
-           FakeUpstream.websocket_text_frames([
-             Jason.encode!(%{"type" => "response.output_item.done", "item" => item}),
-             Jason.encode!(%{
-               "type" => "response.completed",
-               "response" => %{
-                 "id" => "resp_final_digest_compact",
-                 "status" => "completed",
-                 "output" => [item]
-               }
-             })
-           ]),
-           websocket_completed_response("resp_forbidden_final")
-         ]}
+        # Strict finite scenario: the anchor and the compact are the only sends;
+        # the final with a mismatching compaction item must never reach upstream.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond: websocket_completed_frames("resp_final_digest_anchor")
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => "resp_final_digest_anchor",
+                "input.0.type" => "function_call_output"
+              }
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "type" => "response.output_item.done",
+                  "item" => item
+                }),
+                CodexPooler.JSON.encode!(%{
+                  "type" => "response.completed",
+                  "response" => %{
+                    "id" => "resp_final_digest_compact",
+                    "status" => "completed",
+                    "output" => [item]
+                  }
+                })
+              ])
+          )
+        ])
       )
 
     setup = gateway_setup(upstream, compact?: true)
@@ -280,7 +349,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {conn, websocket, _} = public_websocket_receive_text!(conn, websocket, ref)
 
       compact =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_final_digest_anchor",
@@ -300,12 +369,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       metadata =
         native_turn_metadata(turn, "00000000-0000-4000-8000-000000000992", :turn)
-        |> Jason.decode!()
+        |> CodexPooler.JSON.decode!()
         |> Map.merge(%{"window_id" => "final-window", "window_number" => 2})
-        |> Jason.encode!()
+        |> CodexPooler.JSON.encode!()
 
       final =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{item | "encrypted_content" => "different-synthetic"}],
@@ -315,8 +384,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, final)
       {_conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
-      assert %{"type" => "error"} = Jason.decode!(frame)
+
+      assert %{
+               "type" => "error",
+               "status" => 409,
+               "error" => %{"code" => "invalid_runtime_admission"}
+             } = CodexPooler.JSON.decode!(frame)
+
       assert FakeUpstream.count(upstream) == 2
+      assert :ok = FakeUpstream.verify!(upstream)
     after
       Mint.HTTP.close(conn)
     end
@@ -330,22 +406,56 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_completed_response("resp_final_digest_anchor"),
-           FakeUpstream.websocket_text_frames([
-             Jason.encode!(%{"type" => "response.output_item.done", "item" => item}),
-             Jason.encode!(%{
-               "type" => "response.completed",
-               "response" => %{
-                 "id" => "resp_final_digest_compact",
-                 "status" => "completed",
-                 "output" => [item]
-               }
-             })
-           ]),
-           websocket_completed_response("resp_forbidden_final")
-         ]}
+        # Strict finite scenario: the anchor, the compact, and the final that
+        # opens with the compaction item are the only sends; the prewarm in
+        # between must not reach upstream.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond: websocket_completed_frames("resp_final_digest_anchor")
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => "resp_final_digest_anchor",
+                "input.0.type" => "function_call_output"
+              }
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "type" => "response.output_item.done",
+                  "item" => item
+                }),
+                CodexPooler.JSON.encode!(%{
+                  "type" => "response.completed",
+                  "response" => %{
+                    "id" => "resp_final_digest_compact",
+                    "status" => "completed",
+                    "output" => [item]
+                  }
+                })
+              ])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create", "input.0.type" => "compaction"}
+            ],
+            respond: websocket_completed_frames("resp_final_after_prewarm")
+          )
+        ])
       )
 
     setup = gateway_setup(upstream, compact?: true)
@@ -372,7 +482,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {conn, websocket, _} = public_websocket_receive_text!(conn, websocket, ref)
 
       compact =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_final_digest_anchor",
@@ -391,30 +501,30 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {conn, websocket, _} = public_websocket_receive_text!(conn, websocket, ref)
 
       prewarm =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "generate" => false,
           "input" => [],
           "client_metadata" => %{
-            "x-codex-turn-metadata" => Jason.encode!(%{"request_kind" => "prewarm"})
+            "x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"request_kind" => "prewarm"})
           }
         })
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, prewarm)
       {conn, websocket, _prewarm_created} = public_websocket_receive_text!(conn, websocket, ref)
       {conn, websocket, prewarm_completed} = public_websocket_receive_text!(conn, websocket, ref)
-      assert %{"type" => "response.completed"} = Jason.decode!(prewarm_completed)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(prewarm_completed)
       assert FakeUpstream.count(upstream) == 2
 
       metadata =
         native_turn_metadata(turn, "00000000-0000-4000-8000-000000000992", :turn)
-        |> Jason.decode!()
+        |> CodexPooler.JSON.decode!()
         |> Map.merge(%{"window_id" => "final-window", "window_number" => 2})
-        |> Jason.encode!()
+        |> CodexPooler.JSON.encode!()
 
       final =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{item | "encrypted_content" => "synthetic-incremental-final-digest-check"}],
@@ -424,15 +534,17 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, final)
       {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
-      assert %{"type" => "response.created"} = Jason.decode!(frame)
+      assert %{"type" => "response.created"} = CodexPooler.JSON.decode!(frame)
       {_conn, _websocket, terminal} = public_websocket_receive_text!(conn, websocket, ref)
-      assert %{"type" => "response.completed"} = Jason.decode!(terminal)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(terminal)
       assert FakeUpstream.count(upstream) == 3
+      assert :ok = FakeUpstream.verify!(upstream)
     after
       Mint.HTTP.close(conn)
     end
   end
 
+  @tag slow: "captures and flushes full BEAM trace events through a real owner compaction socket lifecycle"
   test "full trace records a real socket owner compact lifecycle without injected events" do
     assert_real_trace_fixture_has_no_manual_emits!()
     enable_owner_forwarding_for_trace!()
@@ -441,21 +553,38 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     turn_id = "trace-real-turn"
     context_window_id = "00000000-0000-4000-8000-000000000591"
     compact_item = incremental_compaction_item("trace-real-success")
-    compact_release_ref = make_ref()
     response_id = fixture["provider_response_id"]
 
     upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_completed_response(response_id),
-           delayed_incremental_compaction_response(
-             compact_item,
-             "resp_trace_real_compact",
-             self(),
-             compact_release_ref
-           )
-         ]}
+        # Strict finite scenario: the lineage turn and the anchored incremental
+        # compact are the only sends, both on the owner's single connection.
+        # provenance: observed test/fixtures/codex/rust-v0.153.3-* request contract; reply frames synthetic
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond: websocket_completed_frames(response_id)
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => response_id,
+                "input.0.type" => "function_call_output"
+              }
+            ],
+            respond: incremental_compaction_frames(compact_item, "resp_trace_real_compact")
+          )
+        ])
       )
 
     setup = gateway_setup(upstream, compact?: true)
@@ -503,7 +632,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         public_websocket_receive_text!(conn, websocket, ref)
 
       assert %{"type" => "response.completed", "response" => %{"id" => ^response_id}} =
-               Jason.decode!(lineage_terminal)
+               CodexPooler.JSON.decode!(lineage_terminal)
 
       compact_payload =
         source_frame
@@ -512,22 +641,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, compact_payload)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_terminal, compact_upstream_pid,
-                      ^compact_release_ref},
-                     @detection_timeout_ms
-
-      send(compact_upstream_pid, {:fake_upstream_release_timeout, compact_release_ref})
-
       {conn, websocket, done_frame} = public_websocket_receive_text!(conn, websocket, ref)
       {conn, _websocket, completed_frame} = public_websocket_receive_text!(conn, websocket, ref)
 
       assert %{"type" => "response.output_item.done", "item" => ^compact_item} =
-               Jason.decode!(done_frame)
+               CodexPooler.JSON.decode!(done_frame)
 
       assert %{
                "type" => "response.completed",
                "response" => %{"status" => "completed", "output" => [^compact_item]}
-             } = Jason.decode!(completed_frame)
+             } = CodexPooler.JSON.decode!(completed_frame)
 
       assert FakeUpstream.websocket_connection_count(upstream) == 1
       assert [ordinary_request, compact_request] = FakeUpstream.requests(upstream)
@@ -537,9 +660,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       assert ordinary_request.websocket_connection_id ==
                compact_request.websocket_connection_id
 
+      assert :ok = FakeUpstream.verify!(upstream)
+
       {:ok, _conn} = Mint.HTTP.close(conn)
       await_trace_event!("cleanup_finished")
-      cleanup_trace_owner_sessions()
+      stop_pool_owners!(setup.pool)
       assert :ok = NativeCompactionTrace.flush()
       status = NativeCompactionTrace.status()
       assert status["preset"] == "f3_happy"
@@ -603,7 +728,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       )
 
     invalid_payload =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => setup.model.exposed_model_id,
         "input" => [],
@@ -613,13 +738,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     try do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, invalid_payload)
       {conn, _websocket, error_frame} = public_websocket_receive_text!(conn, websocket, ref)
-      assert %{"status" => 400, "error" => %{"param" => param}} = Jason.decode!(error_frame)
+
+      assert %{"status" => 400, "error" => %{"param" => param}} =
+               CodexPooler.JSON.decode!(error_frame)
+
       assert param =~ "x-codex-turn-metadata"
       assert FakeUpstream.count(upstream) == 0
 
       {:ok, _conn} = Mint.HTTP.close(conn)
       await_trace_event!("cleanup_finished")
-      cleanup_trace_owner_sessions()
+      stop_pool_owners!(setup.pool)
       assert :ok = NativeCompactionTrace.flush()
       assert :ok = NativeCompactionTrace.stop_scope()
 
@@ -645,33 +773,51 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   for {path, transport, optional_metadata} <- [
         {"/backend-api/codex/responses", :sse, :valid},
         {"/backend-api/codex/v1/responses", :sse, :malformed}
-      ] do
+      ],
+      mode <- ["full", "lite"],
+      metadata_encoding <- if(transport == :sse, do: [:json, :object], else: [:json]) do
     if transport == :sse do
       @tag :codex_remote_compaction_v2
     end
 
-    test "#{path} completes #{transport} native compaction and reuses the downstream socket" do
+    @tag :strict_fake_upstream
+    test "#{path} completes #{mode} #{transport} native compaction with #{metadata_encoding} metadata and reuses the downstream socket" do
       path = unquote(path)
       transport = unquote(transport)
       optional_metadata = unquote(optional_metadata)
+      mode = unquote(mode)
       admission_events = attach_admission_telemetry()
 
       fixture = native_compaction_fixture(transport, optional_metadata)
 
       upstream =
         start_upstream(
-          {:sequence,
-           [
-             fixture.upstream_mode,
-             FakeUpstream.json_response(%{
-               "id" => fixture.follow_up_response_id,
-               "object" => "response",
-               "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
-             })
-           ]}
+          # provenance: synthetic_adversarial
+          FakeUpstream.strict_sequence([
+            strict_compaction_response(fixture.upstream_mode, transport, mode),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              path: "/backend-api/codex/responses",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond:
+                FakeUpstream.websocket_text_frames([
+                  CodexPooler.JSON.encode!(%{
+                    "id" => fixture.follow_up_response_id,
+                    "object" => "response",
+                    "usage" => %{
+                      "input_tokens" => 2,
+                      "output_tokens" => 1,
+                      "total_tokens" => 3
+                    }
+                  })
+                ])
+            )
+          ])
         )
 
       setup = gateway_setup(upstream, compact?: true)
+      put_model_serving_mode!(setup, mode)
       port = start_public_endpoint!()
       upgrade_turn_state = "upgrade-#{fixture.case_id}"
       frame_turn_state = "frame-#{fixture.case_id}"
@@ -680,20 +826,48 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         public_websocket_connect!(port, setup, upgrade_turn_state, path)
 
       try do
-        payload = compact_payload(setup, frame_turn_state, transport)
-        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
-        {conn, websocket, done_frame} = public_websocket_receive_text!(conn, websocket, ref)
+        payload =
+          setup
+          |> compact_payload(frame_turn_state, transport)
+          |> encode_compaction_metadata(unquote(metadata_encoding))
 
-        {conn, websocket, completed_frame} = public_websocket_receive_text!(conn, websocket, ref)
+        previous_logger_level = Logger.level()
+        Logger.configure(level: :info)
+        on_exit(fn -> Logger.configure(level: previous_logger_level) end)
+
+        {{conn, websocket, done_frame, completed_frame}, egress_log} =
+          with_log([level: :info], fn ->
+            {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+            {conn, websocket, done_frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+            {conn, websocket, completed_frame} =
+              public_websocket_receive_text!(conn, websocket, ref)
+
+            {conn, websocket, done_frame, completed_frame}
+          end)
+
+        assert egress_log =~ "compact final egress decision"
+
+        assert egress_log =~ "discriminator_class=#{compact_discriminator_class(transport)}"
+
+        assert egress_log =~ "serving_mode=#{mode}"
+
+        assert egress_log =~
+                 "lite_marker_present=#{compact_lite_marker_present?(transport, mode)}"
+
+        assert egress_log =~ "lite_marker_matches=true"
+        assert egress_log =~ "input_mode=full_history"
+        assert egress_log =~ "transport=#{compact_expected(transport, :transport)}"
+        assert Enum.count(String.split(egress_log, "compact final egress decision")) == 2
 
         item = fixture.expected_item
 
-        assert Jason.decode!(done_frame) == %{
+        assert CodexPooler.JSON.decode!(done_frame) == %{
                  "type" => "response.output_item.done",
                  "item" => item
                }
 
-        assert Jason.decode!(completed_frame) == %{
+        assert CodexPooler.JSON.decode!(completed_frame) == %{
                  "type" => "response.completed",
                  "response" => %{
                    "id" => fixture.response_id,
@@ -726,21 +900,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         assert compact_request.json["model"] == setup.model.upstream_model_id
         assert List.last(compact_request.json["input"]) == %{"type" => "compaction_trigger"}
 
-        assert Enum.map(compact_request.json["input"], & &1["type"]) == [
-                 "message",
-                 "compaction_trigger"
-               ]
+        assert Enum.map(compact_request.json["input"], & &1["type"]) ==
+                 compact_input_types(mode)
 
         assert_compact_transport_payload(compact_request.json, transport)
 
-        refute Map.has_key?(compact_request.json, "type")
         refute Map.has_key?(compact_request.json, "generate")
-        refute Map.has_key?(compact_request.json, "client_metadata")
+
+        assert_compact_transport_envelope(compact_request.json, transport, mode, frame_turn_state)
 
         assert_compact_turn_state_header(compact_request.headers, transport, frame_turn_state)
 
         assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
         assert request.endpoint == "/backend-api/codex/responses/compact"
+        assert egress_log =~ "request_id=#{request.id}"
 
         assert request.transport ==
                  compact_expected(transport, :transport)
@@ -750,7 +923,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
         assert request.request_metadata["compaction_bridge"] == %{
                  "applied" => true,
-                 "result_transport" => Atom.to_string(transport)
+                 "result_transport" => "sse"
                }
 
         assert get_in(request.request_metadata, ["reservation_snapshot_inputs", "route_class"]) ==
@@ -795,13 +968,31 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
           frame_turn_state
         ])
 
-        follow_up_payload = ordinary_payload(setup)
+        # The first ordinary turn after the compaction is the admission's final
+        # frame. A released client names it with turn metadata like any turn,
+        # in the same encoding it used for the compact frame.
+        follow_up_turn_id = "turn_native_follow_up_#{fixture.case_id}"
+
+        follow_up_payload =
+          setup
+          |> ordinary_payload(%{
+            "client_metadata" => %{
+              "x-codex-turn-metadata" =>
+                native_turn_metadata(
+                  follow_up_turn_id,
+                  "00000000-0000-4000-8000-000000000786",
+                  :turn
+                )
+            }
+          })
+          |> encode_compaction_metadata(unquote(metadata_encoding))
+
         {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, follow_up_payload)
 
         {_conn, _websocket, follow_up_frame} =
           public_websocket_receive_text!(conn, websocket, ref)
 
-        assert %{"id" => follow_up_response_id} = Jason.decode!(follow_up_frame)
+        assert %{"id" => follow_up_response_id} = CodexPooler.JSON.decode!(follow_up_frame)
         assert follow_up_response_id == fixture.follow_up_response_id
 
         assert [^compact_request, ordinary_request] = FakeUpstream.requests(upstream)
@@ -821,12 +1012,24 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         assert ordinary_log.endpoint == "/backend-api/codex/responses"
         assert ordinary_log.transport == "websocket"
         assert ordinary_log.request_metadata["codex_session_id"] == session_id
+
+        # The final frame after a native compaction stores its own retry witness.
+        # Production images up to `afe8dfd9` stored none for this exact turn on
+        # released Desktop clients (findings#225); the witness is what lets the
+        # released client's identical resend be judged instead of refused as
+        # `missing_witness`.
+        assert ordinary_log.native_client_retry_version == 1
+        assert byte_size(ordinary_log.native_client_retry_digest) == 32
+        assert is_integer(ordinary_log.native_client_retry_auth_epoch)
+
+        assert :ok = FakeUpstream.verify!(upstream)
       after
         Mint.HTTP.close(conn)
       end
     end
   end
 
+  @tag slow: "runs all measured incremental compaction scenarios through real socket lineage and accounting"
   test "source-derived incremental compaction stays on the response lineage assignment and reuses the socket" do
     :ok = NativeCompactionAuthorizationObserver.arm()
     on_exit(fn -> NativeCompactionAuthorizationObserver.disarm() end)
@@ -876,21 +1079,50 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         })
 
       compact_item = incremental_compaction_item("success-#{scenario_name}")
-      compact_release_ref = make_ref()
+      compact_first_input_type = source_frame["input"] |> List.first() |> Map.fetch!("type")
 
       assignment_a_upstream =
         start_upstream(
-          {:sequence,
-           [
-             websocket_completed_response(fixture["provider_response_id"]),
-             delayed_incremental_compaction_response(
-               compact_item,
-               "resp_compact_#{scenario_name}",
-               self(),
-               compact_release_ref
-             ),
-             ordinary_response("resp_follow_up_#{scenario_name}")
-           ]}
+          # Strict finite scenario: the lineage turn, the anchored incremental
+          # compact, and the full follow-up are the only sends on assignment A,
+          # all on its single connection; the compact keeps the lineage anchor
+          # and the follow-up drops it.
+          # provenance: observed test/fixtures/codex/rust-v0.153.3-* request contract; reply frames synthetic
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              websocket_connection_ordinal: 1,
+              json: [
+                valid: true,
+                equals: %{"type" => "response.create"},
+                forbidden: ["previous_response_id"]
+              ],
+              respond: websocket_completed_frames(fixture["provider_response_id"])
+            ),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              websocket_connection_ordinal: 1,
+              json: [
+                valid: true,
+                equals: %{
+                  "type" => "response.create",
+                  "previous_response_id" => fixture["provider_response_id"],
+                  "input.0.type" => compact_first_input_type
+                }
+              ],
+              respond: incremental_compaction_frames(compact_item, "resp_compact_#{scenario_name}")
+            ),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              websocket_connection_ordinal: 1,
+              json: [
+                valid: true,
+                equals: %{"type" => "response.create"},
+                forbidden: ["previous_response_id"]
+              ],
+              respond: ordinary_response_frames("resp_follow_up_#{scenario_name}")
+            )
+          ])
         )
 
       assignment_b_upstream =
@@ -923,11 +1155,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         {conn, websocket, lineage_terminal_frame} =
           public_websocket_receive_text!(conn, websocket, ref)
 
-        assert %{"response" => %{"id" => response_id}} = Jason.decode!(lineage_frame)
+        assert %{"response" => %{"id" => response_id}} = CodexPooler.JSON.decode!(lineage_frame)
         assert response_id == fixture["provider_response_id"]
 
         assert %{"type" => "response.completed", "response" => %{"id" => ^response_id}} =
-                 Jason.decode!(lineage_terminal_frame)
+                 CodexPooler.JSON.decode!(lineage_terminal_frame)
 
         setup = activate_assignment_b(setup)
 
@@ -942,16 +1174,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
         {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, compact_payload)
 
-        assert_receive {:fake_upstream_timeout_barrier, :before_terminal, compact_upstream_pid,
-                        ^compact_release_ref},
-                       @detection_timeout_ms
-
-        send(compact_upstream_pid, {:fake_upstream_release_timeout, compact_release_ref})
-
         {conn, websocket, done_frame} = public_websocket_receive_text!(conn, websocket, ref)
         {conn, websocket, completed_frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-        assert Jason.decode!(done_frame) == %{
+        assert CodexPooler.JSON.decode!(done_frame) == %{
                  "type" => "response.output_item.done",
                  "item" => compact_item
                }
@@ -959,7 +1185,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         assert %{
                  "type" => "response.completed",
                  "response" => %{"status" => "completed", "output" => [^compact_item]}
-               } = Jason.decode!(completed_frame)
+               } = CodexPooler.JSON.decode!(completed_frame)
 
         authorization_counts = NativeCompactionAuthorizationObserver.captures()["counts"]
 
@@ -1012,7 +1238,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                } =
                  source_frame
                  |> get_in(["client_metadata", "x-codex-turn-metadata"])
-                 |> Jason.decode!()
+                 |> CodexPooler.JSON.decode!()
 
         assert FakeUpstream.count(assignment_b_upstream) == 0
 
@@ -1112,7 +1338,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         {_conn, _websocket, follow_up_frame} =
           public_websocket_receive_text!(conn, websocket, ref)
 
-        assert %{"id" => "resp_follow_up_" <> ^scenario_name} = Jason.decode!(follow_up_frame)
+        assert %{"id" => "resp_follow_up_" <> ^scenario_name} =
+                 CodexPooler.JSON.decode!(follow_up_frame)
 
         assert [^lineage_request, ^compact_request, follow_up_request] =
                  FakeUpstream.requests(assignment_a_upstream)
@@ -1125,15 +1352,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         refute Map.has_key?(follow_up_request.json, "previous_response_id")
         assert FakeUpstream.websocket_connection_count(assignment_a_upstream) == 1
         assert FakeUpstream.count(assignment_b_upstream) == 0
+        assert :ok = FakeUpstream.verify!(assignment_a_upstream)
       after
-        receive do
-          {:fake_upstream_timeout_barrier, :before_terminal, compact_upstream_pid,
-           ^compact_release_ref} ->
-            send(compact_upstream_pid, {:fake_upstream_release_timeout, compact_release_ref})
-        after
-          0 -> :ok
-        end
-
         Mint.HTTP.close(conn)
       end
     end
@@ -1161,12 +1381,45 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     assignment_a_upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_completed_response(fixture["provider_response_id"]),
-           websocket_provider_failure(provider_error),
-           ordinary_response("resp_after_compact_provider_400")
-         ]}
+        # Strict finite scenario: the lineage turn, the rejected pinned compact,
+        # and the full follow-up are the only sends on assignment A, all on its
+        # single connection; the rejection is never retried anywhere.
+        # provenance: observed rust-v0.153.3 fixture contract and findings #116 compact response.failed; codes synthetic
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond: websocket_completed_frames(fixture["provider_response_id"])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => fixture["provider_response_id"],
+                "input.0.type" => "function_call_output"
+              }
+            ],
+            respond: websocket_provider_failure_frames(provider_error)
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond: ordinary_response_frames("resp_after_compact_provider_400")
+          )
+        ])
       )
 
     assignment_b_upstream =
@@ -1187,11 +1440,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {conn, websocket, lineage_terminal_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"response" => %{"id" => response_id}} = Jason.decode!(lineage_frame)
+      assert %{"response" => %{"id" => response_id}} = CodexPooler.JSON.decode!(lineage_frame)
       assert response_id == fixture["provider_response_id"]
 
       assert %{"type" => "response.completed", "response" => %{"id" => ^response_id}} =
-               Jason.decode!(lineage_terminal_frame)
+               CodexPooler.JSON.decode!(lineage_terminal_frame)
 
       setup = activate_assignment_b(setup)
       source_frame = Map.put(source_frame, "previous_response_id", response_id)
@@ -1208,7 +1461,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                  "type" => "invalid_request_error",
                  "param" => "input"
                }
-             } = Jason.decode!(error_frame)
+             } = CodexPooler.JSON.decode!(error_frame)
 
       refute error_frame =~ provider_message
       assert [lineage_request, compact_request] = FakeUpstream.requests(assignment_a_upstream)
@@ -1257,7 +1510,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {_conn, _websocket, follow_up_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"id" => "resp_after_compact_provider_400"} = Jason.decode!(follow_up_frame)
+      assert %{"id" => "resp_after_compact_provider_400"} =
+               CodexPooler.JSON.decode!(follow_up_frame)
 
       assert [^lineage_request, ^compact_request, follow_up_request] =
                FakeUpstream.requests(assignment_a_upstream)
@@ -1266,6 +1520,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       refute Map.has_key?(follow_up_request.json, "previous_response_id")
       assert FakeUpstream.websocket_connection_count(assignment_a_upstream) == 1
       assert FakeUpstream.count(assignment_b_upstream) == 0
+      assert :ok = FakeUpstream.verify!(assignment_a_upstream)
     after
       Mint.HTTP.close(conn)
     end
@@ -1292,11 +1547,33 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     assignment_a_upstream =
       start_upstream(
-        {:sequence,
-         [
-           websocket_completed_response(fixture["provider_response_id"]),
-           websocket_provider_failure(provider_error)
-         ]}
+        # Strict finite scenario: the lineage turn and the rejected pinned
+        # compact are the only sends; the rejection is never retried anywhere.
+        # provenance: observed rust-v0.153.3 fixture request contract; misalignment rejection frames synthetic
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond: websocket_completed_frames(fixture["provider_response_id"])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => fixture["provider_response_id"],
+                "input.0.type" => "function_call_output"
+              }
+            ],
+            respond: websocket_provider_failure_frames(provider_error)
+          )
+        ])
       )
 
     assignment_b_upstream =
@@ -1319,11 +1596,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {conn, websocket, lineage_terminal_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"response" => %{"id" => response_id}} = Jason.decode!(lineage_frame)
+      assert %{"response" => %{"id" => response_id}} = CodexPooler.JSON.decode!(lineage_frame)
       assert response_id == fixture["provider_response_id"]
 
       assert %{"type" => "response.completed", "response" => %{"id" => ^response_id}} =
-               Jason.decode!(lineage_terminal_frame)
+               CodexPooler.JSON.decode!(lineage_terminal_frame)
 
       setup = activate_assignment_b(setup)
       source_frame = Map.put(source_frame, "previous_response_id", response_id)
@@ -1341,7 +1618,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                  "param" => "input",
                  "message" => "upstream rejected the compact request"
                }
-             } = Jason.decode!(error_frame)
+             } = CodexPooler.JSON.decode!(error_frame)
 
       refute error_frame =~ provider_message
       assert FakeUpstream.count(assignment_b_upstream) == 0
@@ -1369,6 +1646,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       refute inspect({compact_log.request_metadata, compact_attempt.response_metadata}) =~
                provider_message
+
+      assert :ok = FakeUpstream.verify!(assignment_a_upstream)
     after
       Mint.HTTP.close(conn)
     end
@@ -1398,11 +1677,33 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       assignment_a_upstream =
         start_upstream(
-          {:sequence,
-           [
-             websocket_completed_response(fixture["provider_response_id"]),
-             websocket_provider_failure(provider_error)
-           ]}
+          # Strict finite scenario: the lineage turn and the rejected pinned
+          # compact are the only sends; the rejection is never retried anywhere.
+          # provenance: observed rust-v0.153.3 fixture contract and findings #116 compact response.failed; codes synthetic
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              websocket_connection_ordinal: 1,
+              json: [
+                valid: true,
+                equals: %{"type" => "response.create"},
+                forbidden: ["previous_response_id"]
+              ],
+              respond: websocket_completed_frames(fixture["provider_response_id"])
+            ),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              json: [
+                valid: true,
+                equals: %{
+                  "type" => "response.create",
+                  "previous_response_id" => fixture["provider_response_id"],
+                  "input.0.type" => "function_call_output"
+                }
+              ],
+              respond: websocket_provider_failure_frames(provider_error)
+            )
+          ])
         )
 
       assignment_b_upstream =
@@ -1427,11 +1728,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         {conn, websocket, lineage_terminal_frame} =
           public_websocket_receive_text!(conn, websocket, ref)
 
-        assert %{"response" => %{"id" => response_id}} = Jason.decode!(lineage_frame)
+        assert %{"response" => %{"id" => response_id}} = CodexPooler.JSON.decode!(lineage_frame)
         assert response_id == fixture["provider_response_id"]
 
         assert %{"type" => "response.completed", "response" => %{"id" => ^response_id}} =
-                 Jason.decode!(lineage_terminal_frame)
+                 CodexPooler.JSON.decode!(lineage_terminal_frame)
 
         setup = activate_assignment_b(setup)
         source_frame = Map.put(source_frame, "previous_response_id", response_id)
@@ -1455,7 +1756,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                    "type" => "invalid_request_error",
                    "param" => "previous_response_id"
                  }
-               } = Jason.decode!(error_frame)
+               } = CodexPooler.JSON.decode!(error_frame)
 
         refute error_frame =~ provider_message
         assert [lineage_request, compact_request] = FakeUpstream.requests(assignment_a_upstream)
@@ -1500,6 +1801,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         assert compact_turn.final_attempt_id == compact_attempt.id
 
         refute inspect({compact_log, compact_attempt, compact_turn}) =~ provider_message
+        assert :ok = FakeUpstream.verify!(assignment_a_upstream)
       after
         Mint.HTTP.close(conn)
       end
@@ -1518,30 +1820,48 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     release_ref = make_ref()
 
+    lineage_frames =
+      Enum.map(
+        [
+          %{
+            "type" => "response.created",
+            "response" => %{"id" => fixture["provider_response_id"]}
+          },
+          %{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => fixture["provider_response_id"],
+              "status" => "completed",
+              "output" => []
+            }
+          }
+        ],
+        &CodexPooler.JSON.encode!/1
+      )
+
+    # Strict finite scenario: the lineage turn is the only send on assignment A.
+    # It is held frame by frame so the pinned assignment can be disabled between
+    # response.created and response.completed on the same connection; the denied
+    # compact must never reach either assignment.
     assignment_a_upstream =
       start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.delayed_terminal_sse_stream(
-             [
-               %{
-                 "type" => "response.created",
-                 "response" => %{"id" => fixture["provider_response_id"]}
-               }
-             ],
-             %{
-               "type" => "response.completed",
-               "response" => %{
-                 "id" => fixture["provider_response_id"],
-                 "status" => "completed",
-                 "output" => []
-               }
-             },
-             notify: self(),
-             release_ref: release_ref
-           ),
-           ordinary_response(fixture["provider_response_id"])
-         ]}
+        # provenance: observed test/fixtures/codex/rust-v0.153.3-* request contract; reply frames synthetic
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond:
+              FakeUpstream.barrier_websocket_frames(lineage_frames,
+                notify: self(),
+                release_ref: release_ref
+              )
+          )
+        ])
       )
 
     assignment_b_upstream = start_upstream(ordinary_response("resp_full_request_on_assignment_b"))
@@ -1556,12 +1876,17 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     try do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, lineage_payload)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid,
-                      ^release_ref},
-                     1_000
+      # Deliver response.created, then hold before response.completed.
+      assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^release_ref},
+                     @detection_timeout_ms
+
+      assert :ok = FakeUpstream.release_frame(assignment_a_upstream, release_ref)
+
+      assert_receive {:fake_upstream_frame_barrier, 1, _handler, ^release_ref},
+                     @detection_timeout_ms
 
       {conn, websocket, lineage_frame} = public_websocket_receive_text!(conn, websocket, ref)
-      assert %{"response" => %{"id" => response_id}} = Jason.decode!(lineage_frame)
+      assert %{"response" => %{"id" => response_id}} = CodexPooler.JSON.decode!(lineage_frame)
       assert response_id == fixture["provider_response_id"]
 
       setup = activate_assignment_b(setup)
@@ -1586,20 +1911,25 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                :count
              ) == 0
 
-      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+      assert :ok = FakeUpstream.release_remaining_frames(assignment_a_upstream, release_ref)
+
+      # Consume the trailing barrier before the public receive helper, which
+      # drains and drops non-Mint messages from this mailbox while it waits.
+      assert_receive {:fake_upstream_frame_barrier, 2, _handler, ^release_ref},
+                     @detection_timeout_ms
 
       {conn, websocket, lineage_terminal_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"type" => "response.completed"} = Jason.decode!(lineage_terminal_frame)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(lineage_terminal_frame)
 
       {_conn, _websocket, error_frame} = public_websocket_receive_text!(conn, websocket, ref)
 
       assert %{
                "type" => "error",
-               "status" => 503,
-               "error" => %{"code" => "pinned_continuation_unavailable"}
-             } = Jason.decode!(error_frame)
+               "status" => 400,
+               "error" => %{"code" => "previous_response_not_found"}
+             } = CodexPooler.JSON.decode!(error_frame)
 
       assert [_lineage_request] = FakeUpstream.requests(assignment_a_upstream)
       assert FakeUpstream.count(assignment_b_upstream) == 0
@@ -1614,29 +1944,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         )
 
       assert denied_request.endpoint == "/backend-api/codex/responses/compact"
-      assert denied_request.status == "rejected"
-      assert denied_request.last_error_code == "pinned_continuation_unavailable"
+      assert denied_request.status == "failed"
+      assert denied_request.last_error_code == "stream_incomplete"
       assert denied_request.retry_count == 0
 
       assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^denied_request.id), :count) ==
-               0
-
-      assert settlement_count(denied_request.id) == 0
-
-      assert Repo.aggregate(
-               from(t in CodexTurn, where: t.request_id == ^denied_request.id),
-               :count
-             ) == 0
+               1
 
       assert FakeUpstream.requests(assignment_b_upstream) == []
+      assert :ok = FakeUpstream.verify!(assignment_a_upstream)
     after
-      receive do
-        {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref} ->
-          send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
-      after
-        0 -> :ok
-      end
-
+      # A failure before the release above would otherwise leave the lineage
+      # frames held; releasing an already-finished reply is a no-op.
+      _ = FakeUpstream.release_remaining_frames(assignment_a_upstream, release_ref)
       Mint.HTTP.close(conn)
     end
   end
@@ -1669,7 +1989,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
              )
 
     assert_receive {:frame, frame}, @detection_timeout_ms
-    assert %{"id" => "resp_ordinary_permissive_turn_state"} = Jason.decode!(frame)
+    assert %{"id" => "resp_ordinary_permissive_turn_state"} = CodexPooler.JSON.decode!(frame)
     assert FakeUpstream.count(upstream) == 1
   end
 
@@ -1710,7 +2030,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                )
 
       assert {:push, {:text, frame}, state} = receive_socket_message(state)
-      assert %{"id" => "resp_after_invalid_bridge_turn_state"} = Jason.decode!(frame)
+      assert %{"id" => "resp_after_invalid_bridge_turn_state"} = CodexPooler.JSON.decode!(frame)
       assert {:ok, _state} = receive_socket_done(state)
       assert FakeUpstream.count(upstream) == 1
     after
@@ -1749,8 +2069,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
             CodexResponsesSocket.init(%{
               auth: auth,
               opts: %{
-                request_id:
-                  "owner-invalid-bridge-turn-state-target-#{System.unique_integer([:positive])}",
+                request_id: "owner-invalid-bridge-turn-state-target-#{System.unique_integer([:positive])}",
                 accepted_turn_state: turn_state,
                 client_ip: "127.0.0.1"
               }
@@ -1784,12 +2103,161 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                )
 
       assert {:push, {:text, frame}, state} = receive_socket_message(state)
-      assert %{"id" => "resp_owner_after_invalid_bridge_turn_state"} = Jason.decode!(frame)
+
+      assert %{"id" => "resp_owner_after_invalid_bridge_turn_state"} =
+               CodexPooler.JSON.decode!(frame)
+
       assert {:ok, _state} = receive_socket_completion(state)
       assert FakeUpstream.count(upstream) == 1
     after
       CodexResponsesSocket.terminate(:closed, state)
     end
+  end
+
+  test "unmarked native bridge collects HTTP SSE and forwards one validated frame turn state" do
+    upstream =
+      start_upstream(
+        FakeUpstream.compaction_stream(%{
+          "id" => "resp_native_buffered_compaction",
+          "output" => [
+            %{
+              "type" => "compaction",
+              "encrypted_content" => "synthetic-native-buffered-encrypted"
+            }
+          ],
+          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+        })
+      )
+
+    setup = gateway_setup(upstream, compact?: true)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      direct_socket(auth, "native-buffered-success",
+        accepted_turn_state: "upgrade-turn-state",
+        forwarded_headers: [
+          {"X-Codex-Turn-State", "stale-one"},
+          {"x-codex-turn-state", "stale-two"}
+        ]
+      )
+
+    try do
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in(
+                 {compact_payload(setup, "  frame-turn-state  "), [opcode: :text]},
+                 state
+               )
+
+      assert {:push, {:text, done_frame}, state} = receive_socket_message(state)
+      assert {:push, {:text, completed_frame}, state} = receive_socket_message(state)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert %{"type" => "response.output_item.done", "item" => item} =
+               CodexPooler.JSON.decode!(done_frame)
+
+      assert %{
+               "type" => "response.completed",
+               "response" => %{"output" => [^item]}
+             } = CodexPooler.JSON.decode!(completed_frame)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.method == "POST"
+      assert captured.path == "/backend-api/codex/responses"
+
+      assert Enum.filter(captured.headers, fn {name, _value} ->
+               String.downcase(name) == "x-codex-turn-state"
+             end) == [{"x-codex-turn-state", "frame-turn-state"}]
+
+      assert [request] = Repo.all(Request)
+      assert request.status == "succeeded"
+
+      assert [attempt] =
+               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^request.id))
+
+      assert attempt.status == "succeeded"
+      assert settlement_count(request.id) == 1
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "non-streamed native compact bodies fail before success settlement" do
+    cases = [
+      {FakeUpstream.malformed_json("{malformed-native-compact", 200), "upstream compact response was not valid JSON", "invalid_json"},
+      {FakeUpstream.json_response(%{"id" => "resp_missing_native_compact_content"}), "upstream compact response did not include encrypted compaction content", "missing_encrypted_content"},
+      {buffered_native_compaction_response("resp_empty_native_compact_content", "", :output), "upstream compact response did not include encrypted compaction content", "missing_encrypted_content"},
+      {buffered_native_compaction_response(
+         "resp_blank_native_compact_content",
+         " \t\r\n",
+         :top_level
+       ), "upstream compact response did not include encrypted compaction content", "missing_encrypted_content"}
+    ]
+
+    for {mode, _legacy_message, _legacy_reason} <- cases do
+      upstream = start_upstream(mode)
+      setup = gateway_setup(upstream, compact?: true)
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+      {:ok, session} = Websocket.start_codex_session(auth, %{})
+
+      assert {:error, error} =
+               Service.execute_websocket_response(
+                 auth,
+                 compact_payload(setup, nil),
+                 RequestOptions.for_websocket(%{codex_session: session}),
+                 fn frame -> send(self(), {:unexpected_frame, frame}) end
+               )
+
+      assert error.status == 502
+      assert error.code == "invalid_compaction_response"
+      assert error.message == "upstream compact stream was invalid"
+      refute_received {:unexpected_frame, _frame}
+
+      assert [request] =
+               Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
+
+      assert request.status == "failed"
+      assert request.last_error_code == "invalid_compaction_response"
+      assert request.retry_count == 0
+
+      assert [attempt] =
+               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^request.id))
+
+      assert attempt.status == "failed"
+      assert attempt.network_error_code == "invalid_compaction_response"
+      assert attempt.response_metadata["compaction_invalid_reason"] == "missing_terminal"
+      refute attempt.retryable
+
+      assert [turn] =
+               Repo.all(
+                 from(turn in CodexTurn,
+                   where: turn.codex_session_id == ^session.id and turn.request_id == ^request.id
+                 )
+               )
+
+      assert turn.status == "failed"
+      assert turn.error_code == "invalid_compaction_response"
+      assert turn.final_attempt_id == attempt.id
+      assert settlement_count(request.id) == 1
+      refute inspect({request, attempt, turn}) =~ @stale_native_content
+    end
+  end
+
+  defp buffered_native_compaction_response(response_id, encrypted_content, :output) do
+    FakeUpstream.json_response(%{
+      "id" => response_id,
+      "output" => [
+        %{"type" => "compaction", "encrypted_content" => encrypted_content},
+        %{"type" => "compaction_summary", "encrypted_content" => @stale_native_content}
+      ],
+      "compaction_summary" => %{"encrypted_content" => @stale_native_content}
+    })
+  end
+
+  defp buffered_native_compaction_response(response_id, encrypted_content, :top_level) do
+    FakeUpstream.json_response(%{
+      "id" => response_id,
+      "compaction_summary" => %{"encrypted_content" => encrypted_content}
+    })
   end
 
   test "native compact saturation emits one error, releases admission, and keeps the socket reusable" do
@@ -1831,7 +2299,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
       {conn, websocket, error_frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert Jason.decode!(error_frame) == %{
+      assert CodexPooler.JSON.decode!(error_frame) == %{
                "type" => "error",
                "status" => 503,
                "error" => %{
@@ -1856,7 +2324,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {_conn, _websocket, follow_up_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"id" => "resp_after_native_compact_saturation"} = Jason.decode!(follow_up_frame)
+      assert %{"id" => "resp_after_native_compact_saturation"} =
+               CodexPooler.JSON.decode!(follow_up_frame)
+
       assert FakeUpstream.count(upstream) == 1
 
       assert [request] = Repo.all(Request)
@@ -1891,8 +2361,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     try do
       {conn, websocket} =
-        Enum.reduce(malformed_compact_payloads(setup), {conn, websocket}, fn payload,
-                                                                             {conn, websocket} ->
+        Enum.reduce(malformed_compact_payloads(setup), {conn, websocket}, fn payload, {conn, websocket} ->
           {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
           {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
@@ -1900,7 +2369,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                    "type" => "error",
                    "status" => 400,
                    "error" => %{"code" => "invalid_request", "param" => "input"}
-                 } = Jason.decode!(frame)
+                 } = CodexPooler.JSON.decode!(frame)
 
           assert_no_invalid_turn_state_side_effects(upstream)
           {conn, websocket}
@@ -1912,7 +2381,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       {_conn, _websocket, follow_up_frame} =
         public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"id" => "resp_after_malformed_native_compact"} = Jason.decode!(follow_up_frame)
+      assert %{"id" => "resp_after_malformed_native_compact"} =
+               CodexPooler.JSON.decode!(follow_up_frame)
+
       assert FakeUpstream.count(upstream) == 1
     after
       Mint.HTTP.close(conn)
@@ -1928,6 +2399,44 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
           Map.new(extra_opts)
         )
     })
+  end
+
+  defp put_model_serving_mode!(setup, mode) when mode in ["full", "lite"] do
+    %{user: user} = CodexPooler.AccountsFixtures.bootstrap_owner_fixture()
+    scope = Scope.for_user(user, ["instance_owner"])
+    {:ok, snapshot} = CodexPooler.Pools.model_serving_modes_snapshot(scope, setup.pool)
+
+    assert {:ok, _changed} =
+             CodexPooler.Pools.update_model_serving_modes(
+               scope,
+               setup.pool,
+               [%{exposed_model_id: setup.model.exposed_model_id, mode: mode}],
+               snapshot.revision
+             )
+  end
+
+  defp compact_input_types("full"), do: ["message", "compaction_trigger"]
+  defp compact_input_types("lite"), do: ["additional_tools", "message", "compaction_trigger"]
+
+  defp compact_discriminator_class(:sse), do: "response_create"
+  defp compact_discriminator_class(:buffered), do: "missing"
+
+  defp compact_lite_marker_present?(:sse, "lite"), do: true
+  defp compact_lite_marker_present?(_transport, _mode), do: false
+
+  defp assert_compact_transport_envelope(payload, :sse, mode, frame_turn_state) do
+    assert payload["client_metadata"]["x-codex-turn-state"] == frame_turn_state
+    assert payload["type"] == "response.create"
+
+    assert get_in(payload, [
+             "client_metadata",
+             "ws_request_header_x_openai_internal_codex_responses_lite"
+           ]) == if(mode == "lite", do: "true")
+  end
+
+  defp assert_compact_transport_envelope(payload, :buffered, _mode, frame_turn_state) do
+    refute Map.has_key?(payload, "type")
+    assert payload["client_metadata"] == %{"x-codex-turn-state" => frame_turn_state}
   end
 
   defp compact_expected(:sse, key),
@@ -1946,6 +2455,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   defp assert_compact_turn_state_header(headers, :sse, _frame_turn_state),
     do: assert(header_values(headers, "x-codex-turn-state") == [])
 
+  defp encode_compaction_metadata(payload, :json), do: payload
+
+  defp encode_compaction_metadata(payload, :object) do
+    payload
+    |> CodexPooler.JSON.decode!()
+    |> update_in(["client_metadata", "x-codex-turn-metadata"], &CodexPooler.JSON.decode!/1)
+    |> CodexPooler.JSON.encode!()
+  end
+
   defp compact_payload(setup, turn_state, transport \\ :buffered) do
     client_metadata =
       if is_nil(turn_state), do: %{}, else: %{"x-codex-turn-state" => turn_state}
@@ -1958,7 +2476,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         client_metadata
       end
 
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "type" => "response.create",
       "model" => setup.model.exposed_model_id,
       "input" => [
@@ -1976,7 +2494,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     |> Map.put("model", setup.model.exposed_model_id)
     |> Map.put("generate", true)
     |> Map.put("request_id", request_id)
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp canonical_incremental_pair(setup, source_frame, turn_id) do
@@ -2000,7 +2518,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   end
 
   defp native_turn_metadata(turn_id, context_window_id, :turn) do
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "turn_id" => turn_id,
       "window_id" => "window-#{turn_id}",
       "context_window_id" => context_window_id,
@@ -2010,7 +2528,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   end
 
   defp native_turn_metadata(turn_id, context_window_id, :compaction) do
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "turn_id" => turn_id,
       "window_id" => "window-#{turn_id}",
       "context_window_id" => context_window_id,
@@ -2029,7 +2547,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   defp incremental_compaction_fixture! do
     @incremental_compaction_fixture_path
     |> File.read!()
-    |> Jason.decode!()
+    |> CodexPooler.JSON.decode!()
     |> Map.fetch!("contract")
   end
 
@@ -2040,20 +2558,55 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     }
   end
 
-  defp delayed_incremental_compaction_response(item, response_id, notify, release_ref) do
-    FakeUpstream.delayed_terminal_sse_stream(
-      [%{"type" => "response.output_item.done", "item" => item}],
-      %{
+  defp incremental_compaction_frames(item, response_id) do
+    FakeUpstream.websocket_text_frames([
+      CodexPooler.JSON.encode!(%{"type" => "response.output_item.done", "item" => item}),
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{
           "id" => response_id,
           "status" => "completed",
           "output" => [item]
         }
-      },
-      notify: notify,
-      release_ref: release_ref
-    )
+      })
+    ])
+  end
+
+  defp ordinary_response_frames(response_id) do
+    FakeUpstream.websocket_text_frames([
+      CodexPooler.JSON.encode!(%{
+        "id" => response_id,
+        "object" => "response",
+        "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+      })
+    ])
+  end
+
+  defp websocket_completed_frames(response_id) do
+    FakeUpstream.websocket_text_frames([
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.created",
+        "response" => %{"id" => response_id, "status" => "in_progress"}
+      }),
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.completed",
+        "response" => %{
+          "id" => response_id,
+          "status" => "completed",
+          "output" => [],
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+        }
+      })
+    ])
+  end
+
+  defp websocket_provider_failure_frames(provider_error) do
+    FakeUpstream.websocket_text_frames([
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.failed",
+        "response" => %{"status" => "failed", "error" => provider_error}
+      })
+    ])
   end
 
   defp ordinary_response(response_id) do
@@ -2062,42 +2615,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       "object" => "response",
       "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
     })
-  end
-
-  defp websocket_completed_response(response_id) do
-    FakeUpstream.sse_stream([
-      {"response.created",
-       %{
-         "type" => "response.created",
-         "response" => %{"id" => response_id, "status" => "in_progress"}
-       }},
-      {"response.completed",
-       %{
-         "type" => "response.completed",
-         "response" => %{
-           "id" => response_id,
-           "status" => "completed",
-           "output" => [],
-           "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
-         }
-       }}
-    ])
-  end
-
-  defp websocket_provider_failure(provider_error) do
-    FakeUpstream.sse_stream(
-      [
-        {"response.failed",
-         %{
-           "type" => "response.failed",
-           "response" => %{
-             "status" => "failed",
-             "error" => provider_error
-           }
-         }}
-      ],
-      done: false
-    )
   end
 
   defp two_assignment_setup_with_b_disabled(setup_upstream, assignment_b_upstream) do
@@ -2134,7 +2651,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   defp remote_compaction_v2_client_metadata do
     @remote_compaction_v2_fixture_path
     |> File.read!()
-    |> Jason.decode!()
+    |> CodexPooler.JSON.decode!()
     |> get_in(["request", "client_metadata"])
   end
 
@@ -2147,7 +2664,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       "generate" => true
     }
     |> Map.merge(extra)
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp invalid_turn_states do
@@ -2184,7 +2701,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
           [visible, trigger, visible],
           [visible, trigger, trigger]
         ] do
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.create",
         "model" => setup.model.exposed_model_id,
         "input" => input,
@@ -2201,7 +2718,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                "code" => "invalid_request",
                "param" => @turn_state_param
              }
-           } = Jason.decode!(frame)
+           } = CodexPooler.JSON.decode!(frame)
 
     refute frame =~ "wrong-type"
     refute frame =~ "control"
@@ -2256,17 +2773,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     upstream_mode =
       case transport do
         :buffered ->
-          FakeUpstream.json_response(response)
+          FakeUpstream.compaction_stream(response)
 
         :sse ->
-          FakeUpstream.sse_stream([
-            {"response.output_item.done",
-             %{"type" => "response.output_item.done", "item" => source_item}},
-            {"response.completed",
-             %{
-               "type" => "response.completed",
-               "response" => Map.put(response, "status", "completed")
-             }}
+          FakeUpstream.websocket_text_frames([
+            CodexPooler.JSON.encode!(%{
+              "type" => "response.output_item.done",
+              "item" => source_item
+            }),
+            CodexPooler.JSON.encode!(%{
+              "type" => "response.completed",
+              "response" => Map.put(response, "status", "completed")
+            })
           ])
       end
 
@@ -2281,6 +2799,37 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
       turn_id: turn_id,
       upstream_mode: upstream_mode
     }
+  end
+
+  defp strict_compaction_response(mode, :buffered, _serving_mode) do
+    FakeUpstream.expect_request(
+      method: "POST",
+      path: "/backend-api/codex/responses",
+      json: [valid: true, required: ["model", "input"], forbidden: ["type"]],
+      respond: mode
+    )
+  end
+
+  defp strict_compaction_response(mode, :sse, serving_mode) do
+    FakeUpstream.expect_request(
+      method: "WEBSOCKET",
+      path: "/backend-api/codex/responses",
+      websocket_connection_ordinal: 1,
+      json: [
+        valid: true,
+        required: ["model", "input", "type"],
+        equals:
+          %{"type" => "response.create"}
+          |> maybe_expect_lite_marker(serving_mode)
+      ],
+      respond: mode
+    )
+  end
+
+  defp maybe_expect_lite_marker(expected, "full"), do: expected
+
+  defp maybe_expect_lite_marker(expected, "lite") do
+    Map.put(expected, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite", "true")
   end
 
   defp trace_root(label) do
@@ -2319,44 +2868,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   end
 
   defp enable_owner_forwarding_for_trace! do
-    previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
-
-    on_exit(fn ->
-      cleanup_trace_owner_sessions()
-
-      case previous do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
-    end)
-
-    :ok
-  end
-
-  defp cleanup_trace_owner_sessions do
-    WebsocketOwnerSession.Registry
-    |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-    |> Enum.each(fn codex_session_id ->
-      case WebsocketOwnerSession.lookup(codex_session_id) do
-        {:ok, owner_pid} ->
-          monitor = Process.monitor(owner_pid)
-
-          try do
-            GenServer.stop(owner_pid, :shutdown, @detection_timeout_ms)
-          catch
-            :exit, {:noproc, _details} -> :ok
-          end
-
-          assert_receive {:DOWN, ^monitor, :process, ^owner_pid, _reason},
-                         @detection_timeout_ms
-
-        {:error, :owner_unavailable} ->
-          :ok
-      end
-
-      assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(codex_session_id)
-    end)
 
     :ok
   end
@@ -2445,6 +2958,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     assert Enum.frequencies(route_classes) == Enum.frequencies(expected_route_classes)
   end
 
+  defp assert_compact_transport_payload(payload, :buffered) do
+    assert payload["stream"] == true
+  end
+
   defp assert_compact_transport_payload(payload, :sse) do
     assert payload["stream"] == true
   end
@@ -2452,9 +2969,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   defp configure_compact_saturation do
     old_config = Application.get_env(:codex_pooler, OperationalSettings)
 
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: compact_saturation_settings()
-    )
+    Application.put_env(:codex_pooler, OperationalSettings, settings: compact_saturation_settings())
 
     on_exit(fn ->
       if old_config do

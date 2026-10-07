@@ -8,6 +8,9 @@ defmodule CodexPoolerWeb.V1.ImagesHostSelectionTest do
 
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
+  alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Repo
 
   test "native image carrier prefers listed catalog host while preserving wire image model", %{
@@ -35,13 +38,10 @@ defmodule CodexPoolerWeb.V1.ImagesHostSelectionTest do
   end
 
   for {label, first, second} <- [
-        {"listed before hidden", %{"visibility" => "hide", "priority" => 0},
-         %{"visibility" => "list", "priority" => 20}},
+        {"listed before hidden", %{"visibility" => "hide", "priority" => 0}, %{"visibility" => "list", "priority" => 20}},
         {"listed before unspecified", %{}, %{"visibility" => "list"}},
-        {"catalog priority before identifier", %{"visibility" => "list", "priority" => 20},
-         %{"visibility" => "list", "priority" => 1}},
-        {"integer priority before malformed priority",
-         %{"visibility" => "list", "priority" => "0"}, %{"visibility" => "list", "priority" => 1}}
+        {"catalog priority before identifier", %{"visibility" => "list", "priority" => 20}, %{"visibility" => "list", "priority" => 1}},
+        {"integer priority before malformed priority", %{"visibility" => "list", "priority" => "0"}, %{"visibility" => "list", "priority" => 1}}
       ] do
     @first first
     @second second
@@ -80,11 +80,193 @@ defmodule CodexPoolerWeb.V1.ImagesHostSelectionTest do
     assert_image_host(conn, setup, upstream, hidden)
   end
 
+  test "masked edits skip preferred Lite hosts for a Full host", %{conn: conn} do
+    upstream = start_upstream(image_stream())
+    setup = gateway_setup(upstream)
+
+    host(setup, "a-lite", %{"visibility" => "list", "priority" => 0, "use_responses_lite" => true})
+
+    full = host(setup, "z-full", %{"visibility" => "hide", "use_responses_lite" => false})
+    Repo.delete!(setup.model)
+
+    assert_mask_host(conn, setup, upstream, full)
+  end
+
+  test "masked edits accept a Full-only catalog", %{conn: conn} do
+    upstream = start_upstream(image_stream())
+    setup = gateway_setup(upstream)
+    full = host(setup, "full-host", %{"use_responses_lite" => false})
+    Repo.delete!(setup.model)
+    assert_mask_host(conn, setup, upstream, full)
+  end
+
+  test "masked edits fail before dispatch when all hosts are Lite", %{conn: conn} do
+    upstream = start_upstream(image_stream())
+    setup = gateway_setup(upstream)
+    host(setup, "lite-host", %{"use_responses_lite" => true})
+    Repo.delete!(setup.model)
+    assert_mask_rejected(conn, setup, upstream)
+  end
+
+  test "masked edits respect a persisted Lite override on an exact image model", %{conn: conn} do
+    upstream = start_upstream(image_stream())
+    setup = gateway_setup(upstream)
+    exact = host(setup, "gpt-image-1", %{"use_responses_lite" => false})
+    host(setup, "other-full", %{"use_responses_lite" => false})
+    Repo.delete!(setup.model)
+    serving_override(setup, exact, "lite")
+    assert_mask_rejected(conn, setup, upstream)
+  end
+
+  for state <- [:retired, :absent] do
+    @catalog_state state
+    test "masked edits retain exact Lite override when image model is #{@catalog_state}", %{
+      conn: conn
+    } do
+      upstream = start_upstream(image_stream())
+      setup = gateway_setup(upstream)
+      exact = host(setup, "gpt-image-1", %{"use_responses_lite" => false})
+      host(setup, "other-full", %{"use_responses_lite" => false})
+      Repo.delete!(setup.model)
+      serving_override(setup, exact, "lite")
+
+      case @catalog_state do
+        :retired -> exact |> Ecto.Changeset.change(status: "retired") |> Repo.update!()
+        :absent -> Repo.delete!(exact)
+      end
+
+      assert_mask_rejected(conn, setup, upstream)
+    end
+  end
+
+  test "masked edits honor a persisted Full override on a Lite catalog host", %{conn: conn} do
+    upstream = start_upstream(image_stream())
+    setup = gateway_setup(upstream)
+    full = host(setup, "catalog-lite", %{"use_responses_lite" => true})
+    Repo.delete!(setup.model)
+    serving_override(setup, full, "full")
+    assert_mask_host(conn, setup, upstream, full)
+  end
+
+  test "masked fallback rechecks requested Lite override after host hydration" do
+    upstream = start_upstream(image_stream())
+    setup = gateway_setup(upstream)
+    full = host(setup, "full-host", %{"use_responses_lite" => false})
+    Repo.delete!(setup.model)
+
+    {:ok, auth_context} =
+      CodexPooler.Access.authenticate_authorization_header(setup.authorization)
+
+    hydration =
+      CandidateEligibility.hydrate_model_visibility(setup.pool)
+
+    context =
+      Map.merge(hydration, %{
+        visible_model: full,
+        candidate_snapshots: hydration.candidates_by_model_id[full.id]
+      })
+
+    serving_override(setup, %{exposed_model_id: "gpt-image-1"}, "lite")
+
+    payload = %{
+      "model" => "gpt-image-1",
+      "input" => [%{"role" => "user", "content" => "synthetic"}]
+    }
+
+    options =
+      RequestOptions.build(
+        [
+          masked_image_request?: true,
+          collect_openai_image_stream: true,
+          requested_model: "gpt-image-1",
+          effective_model: "gpt-image-1"
+        ],
+        "/backend-api/codex/responses",
+        payload
+      )
+
+    {:ok, policy} = CodexPooler.Access.normalize_api_key_policy(auth_context.api_key)
+
+    options =
+      RequestOptions.put_routing(options, api_key_policy: policy)
+
+    assert {:error, %{status: 400, code: "unsupported_parameter", param: "mask"}} =
+             PreDispatch.prepare(
+               auth_context,
+               "/backend-api/codex/responses",
+               payload,
+               options,
+               full,
+               context
+             )
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  defp serving_override(setup, model, mode) do
+    timestamp = DateTime.utc_now()
+
+    Repo.insert!(%CodexPooler.Pools.ModelServingOverride{
+      pool_id: setup.pool.id,
+      exposed_model_id: model.exposed_model_id,
+      mode: mode,
+      created_at: timestamp,
+      updated_at: timestamp
+    })
+  end
+
+  defp mask_request(conn, setup) do
+    image = %Plug.Upload{
+      path: write_mask_fixture(),
+      filename: "image.png",
+      content_type: "image/png"
+    }
+
+    conn
+    |> auth(setup)
+    |> post("/v1/images/edits", %{
+      "model" => "gpt-image-1",
+      "prompt" => "synthetic edit",
+      "image" => image,
+      "mask" => image
+    })
+  end
+
+  defp write_mask_fixture do
+    path = Path.join(System.tmp_dir!(), "mask-host-#{System.unique_integer([:positive])}.png")
+    File.write!(path, <<137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3>>)
+    on_exit(fn -> File.rm(path) end)
+    path
+  end
+
+  defp assert_mask_host(conn, setup, upstream, expected) do
+    assert %{"data" => [_]} = conn |> mask_request(setup) |> json_response(200)
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["model"] == expected.upstream_model_id
+    assert [request] = Repo.all(Request)
+    assert request.model_id == expected.id
+    assert [attempt] = Repo.all(Attempt)
+    assert attempt.upstream_model_id == expected.upstream_model_id
+  end
+
+  defp assert_mask_rejected(conn, setup, upstream) do
+    assert %{"error" => %{"code" => "unsupported_parameter", "param" => "mask"}} =
+             conn |> mask_request(setup) |> json_response(400)
+
+    assert FakeUpstream.requests(upstream) == []
+    assert Repo.all(Attempt) == []
+    assert Repo.all(Request) == []
+  end
+
   defp host(setup, identifier, attributes) do
     source =
       setup.model.metadata["source_assignment_models"][setup.assignment.id]
       |> Map.drop(["visibility", "priority"])
       |> Map.merge(attributes)
+      |> Map.put("input_modalities", ["text", "image"])
       |> Map.put("slug", identifier)
       |> Map.put("upstream_model_id", "provider-#{identifier}")
 
@@ -101,25 +283,24 @@ defmodule CodexPoolerWeb.V1.ImagesHostSelectionTest do
 
   defp assert_image_host(conn, setup, upstream, expected) do
     setup.api_key
-    |> Ecto.Changeset.change(allowed_model_identifiers: ["gpt-image-2"])
+    |> Ecto.Changeset.change(allowed_model_identifiers: ["gpt-image-1"])
     |> Repo.update!()
 
     result =
       conn
       |> auth(setup)
       |> post("/v1/images/generations", %{
-        "model" => "gpt-image-2",
-        "prompt" => "synthetic image",
-        "input_fidelity" => "high"
+        "model" => "gpt-image-1",
+        "prompt" => "synthetic image"
       })
 
     assert %{"data" => [%{"b64_json" => "c3ludGhldGlj"}]} = json_response(result, 200)
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.json["model"] == expected.upstream_model_id
-    assert [%{"model" => "gpt-image-2", "type" => "image_generation"}] = captured.json["tools"]
+    assert [%{"model" => "gpt-image-1", "type" => "image_generation"}] = captured.json["tools"]
     assert [request] = Repo.all(Request)
     assert request.model_id == expected.id
-    assert request.request_metadata["effective_model"] == "gpt-image-2"
+    assert request.request_metadata["effective_model"] == "gpt-image-1"
     assert [attempt] = Repo.all(Attempt)
     assert attempt.upstream_model_id == expected.upstream_model_id
   end
@@ -134,6 +315,6 @@ defmodule CodexPoolerWeb.V1.ImagesHostSelectionTest do
       }
     }
 
-    {:sse, ["event: response.completed\ndata: #{Jason.encode!(payload)}\n\n"]}
+    {:sse, ["event: response.completed\ndata: #{CodexPooler.JSON.encode!(payload)}\n\n"]}
   end
 end

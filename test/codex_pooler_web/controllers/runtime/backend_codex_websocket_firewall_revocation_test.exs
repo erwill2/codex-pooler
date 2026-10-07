@@ -9,9 +9,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.{Cache, Settings}
+  alias CodexPooler.PeerRegistry
   alias CodexPooler.Repo
 
-  @websocket_frame_timeout 1_000
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
   @large_websocket_frame_timeout 5_000
   @websocket_transport_barrier_payload "codex-pooler-test-barrier"
   @model_serving_websocket_routes [
@@ -51,7 +55,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
       assert_cache_applied!(allowed_settings.lock_version)
 
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => native_text_input("allowed firewall update"),
@@ -62,7 +66,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {_conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"type" => "response.completed"} = Jason.decode!(frame)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(frame)
       assert FakeUpstream.count(upstream) == 1
     after
       Mint.HTTP.close(conn)
@@ -133,7 +137,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
 
     try do
       first_payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => native_text_input("admitted turn"),
@@ -142,10 +146,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
         })
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, first_payload)
-      assert_receive {:fake_upstream_chunk_barrier, 0, upstream_pid, ^release_ref}, 1_000
+      assert_receive {:fake_upstream_chunk_barrier, 0, upstream_pid, ^release_ref}, @detection_timeout_ms
 
       queued_payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [
@@ -177,7 +181,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
             assert_public_websocket_queue_length!(server, 0)
 
             new_payload =
-              Jason.encode!(%{
+              CodexPooler.JSON.encode!(%{
                 "type" => "response.create",
                 "model" => setup.model.exposed_model_id,
                 "input" => native_text_input("new work after revocation"),
@@ -199,7 +203,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
         receive_public_websocket_frames_until_close!(conn, websocket, ref)
 
       assert [{:text, final_frame}, {:close, 1008, "client IP is no longer allowed"}] = frames
-      assert %{"type" => "response.completed"} = Jason.decode!(final_frame)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(final_frame)
       assert FakeUpstream.count(upstream) == 1
 
       assert Repo.aggregate(
@@ -247,7 +251,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
 
     try do
       assert_receive {:DOWN, ^peer_monitor, :process, peer_pid, _reason},
-                     @websocket_frame_timeout
+                     @detection_timeout_ms
 
       assert peer_pid == peer.pid
       refute peer.node in Node.list(:connected)
@@ -292,7 +296,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
 
       assert :ok = :erpc.call(peer.node, Cache, :broadcast_update, [denied_version_2])
 
-      assert_receive {Cache, {:applied, 2}}, @websocket_frame_timeout
+      assert_receive {Cache, {:applied, 2}}, @detection_timeout_ms
       assert InstanceSettings.current().lock_version == 2
 
       {_conn, _websocket, code, reason} =
@@ -369,7 +373,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
       {Cache, {:applied, ^expected_version}} -> :ok
       {Cache, {:applied, _other_version}} -> assert_cache_applied!(expected_version)
     after
-      @websocket_frame_timeout ->
+      @detection_timeout_ms ->
         flunk("timed out waiting for instance settings cache version #{expected_version}")
     end
   end
@@ -438,7 +442,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
       :peer.stop(peer_pid)
 
       assert_receive {:DOWN, ^peer_monitor, :process, ^peer_pid, _reason},
-                     @websocket_frame_timeout
+                     @detection_timeout_ms
     end
 
     refute peer_node in Node.list(:connected)
@@ -564,6 +568,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
       false ->
         ensure_epmd_started!()
         previous_partition_guard = Application.fetch_env(:kernel, :prevent_overlapping_partitions)
+        # Also on_exit: the ExUnit timeout kills the test before its peer cleanup is registered.
+        on_exit(fn -> restore_partition_guard(previous_partition_guard) end)
 
         distribution = %{
           node_started?: true,
@@ -593,6 +599,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
 
       {:error, _reason} ->
         assert {_output, 0} = System.cmd("epmd", ["-daemon"])
+        PeerRegistry.assert_epmd_ready!()
         true
     end
   end
@@ -607,48 +614,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
 
   defp restore_partition_guard(:unchanged), do: :ok
 
+  # epmd drops a name only once it processes the closed registration socket, which trails the
+  # peer's `:DOWN`; `PeerRegistry` bounds that wait and names its detection budget on timeout.
   defp assert_epmd_names_released!(nodes) do
-    expected_names =
-      nodes
-      |> Enum.reject(&is_nil/1)
-      |> Enum.map(fn node ->
-        node
-        |> Atom.to_string()
-        |> String.split("@", parts: 2)
-        |> hd()
-      end)
-      |> MapSet.new()
-
-    await_epmd_names_released!(expected_names, System.monotonic_time(:millisecond) + 1_000)
-  end
-
-  defp await_epmd_names_released!(expected_names, deadline) do
-    registered_names =
-      case :erl_epmd.names() do
-        {:ok, names} ->
-          names
-          |> Enum.map(fn {name, _port} -> List.to_string(name) end)
-          |> MapSet.new()
-
-        {:error, _reason} ->
-          MapSet.new()
-      end
-
-    remaining_names = MapSet.intersection(expected_names, registered_names)
-
-    cond do
-      MapSet.size(remaining_names) == 0 ->
-        :ok
-
-      System.monotonic_time(:millisecond) < deadline ->
-        receive do
-        after
-          10 -> await_epmd_names_released!(expected_names, deadline)
-        end
-
-      true ->
-        flunk("EPMD still registers acquired nodes: #{inspect(remaining_names)}")
-    end
+    nodes
+    |> Enum.reject(&is_nil/1)
+    |> Enum.each(fn node ->
+      [name | _host] = node |> Atom.to_string() |> String.split("@", parts: 2)
+      PeerRegistry.assert_peer_absent!(String.to_atom(name))
+    end)
   end
 
   defp broadcast_peer_source do
@@ -679,8 +653,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
                   {:ok, websocket, decoded} = Mint.WebSocket.decode(websocket, data)
                   decoded = Enum.reject(decoded, &metadata_control_frame?/1)
 
-                  {websocket, frames ++ decoded,
-                   closed? or Enum.any?(decoded, &match?({:close, _, _}, &1))}
+                  {websocket, frames ++ decoded, closed? or Enum.any?(decoded, &match?({:close, _, _}, &1))}
 
                 _response, acc ->
                   acc
@@ -708,7 +681,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketFirewallRevocationTest do
     do: metadata_control_frame?(frame)
 
   defp metadata_control_frame?(frame) when is_binary(frame) do
-    match?({:ok, %{"type" => "codex.response.metadata"}}, Jason.decode(frame))
+    match?({:ok, %{"type" => "codex.response.metadata"}}, CodexPooler.JSON.decode(frame))
   end
 
   defp metadata_control_frame?(_frame), do: false

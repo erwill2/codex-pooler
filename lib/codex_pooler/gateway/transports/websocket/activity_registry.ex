@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
   alias __MODULE__.{Drain, Entry}
   alias CodexPooler.Gateway.Websocket.DirectCleanup
+  alias CodexPooler.Platform.ExecutionRegistry
 
   @spec begin_direct_cleanup(DirectCleanup.t()) :: :ok | {:error, :cancelled}
   def begin_direct_cleanup(context),
@@ -33,6 +34,24 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
   @spec handoff_direct_cleanup(DirectCleanup.t()) :: :ok
   def handoff_direct_cleanup(context),
     do: GenServer.call(context.registry, {:direct_handoff, context})
+
+  @doc """
+  The direct task marks the span it spends blocked on its upstream request,
+  the one point where stopping it touches no database work in flight
+  (`stop_direct_upstream_wait/1`). Leaving the span after a stop was granted
+  answers `{:error, :stopped}`: the task must then exit without settling.
+  """
+  @spec enter_direct_upstream_wait(DirectCleanup.t()) :: :ok | {:error, :stopped}
+  def enter_direct_upstream_wait(context),
+    do: GenServer.call(context.registry, {:direct_upstream_wait, context, true})
+
+  @spec leave_direct_upstream_wait(DirectCleanup.t()) :: :ok | {:error, :stopped}
+  def leave_direct_upstream_wait(context),
+    do: GenServer.call(context.registry, {:direct_upstream_wait, context, false})
+
+  @spec stop_direct_upstream_wait(DirectCleanup.t()) :: :stop | :busy
+  def stop_direct_upstream_wait(context),
+    do: GenServer.call(context.registry, {:direct_stop_upstream_wait, context})
 
   @type activity_kind :: Entry.kind()
   @type outcome :: :completed | :aborted | :failed
@@ -106,10 +125,28 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
     GenServer.call(server(opts), {:complete_drain, epoch})
   end
 
-  @spec cancel(token(), :owner_drained, keyword()) :: :ok
+  @doc """
+  Cancels an admitted activity for a drain. An activity whose terminal the
+  socket already pushed (`mark_terminal_delivered/2`) is left alone and
+  answered `:terminal_delivered`, unless `force: true`: the drain's cut once
+  the task had its time to settle.
+  """
+  @spec cancel(token(), :owner_drained, keyword()) :: :ok | :terminal_delivered
   def cancel(token, :owner_drained = reason, opts \\ []) when is_reference(token) do
-    GenServer.call(server(opts), {:cancel, token, reason})
+    GenServer.call(server(opts), {:cancel, token, reason, Keyword.get(opts, :force, false)})
   end
+
+  @doc """
+  The socket is pushing the terminal of the turn `pid` runs (findings#287):
+  from now on the client holds the turn's outcome and only its settlement is
+  left, so a drain's `cancel/3` leaves that activity to settle
+  (`ActivityDrain`); cancelling it had recorded a turn the client completed as
+  `owner_drained` and put an error frame after its terminal. An unknown `pid`
+  is a no-op.
+  """
+  @spec mark_terminal_delivered(pid(), keyword()) :: :ok
+  def mark_terminal_delivered(pid, opts \\ []) when is_pid(pid),
+    do: GenServer.call(server(opts), {:mark_terminal_delivered, pid})
 
   @spec status(token(), keyword()) ::
           {:active, :registered | :admitted | :cancelling}
@@ -156,19 +193,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
         receipt = if cleanup.receipt, do: Map.put_new(cleanup.receipt, :cancel_reason, reason)
         cleanup = Map.put_new(cleanup, :cancel_reason, reason)
 
-        {:reply, :ok,
-         put_in(state.activities[token].direct_cleanup, %{cleanup | receipt: receipt})}
+        {:reply, :ok, put_in(state.activities[token].direct_cleanup, %{cleanup | receipt: receipt})}
 
       _ ->
         {:reply, :ok, state}
     end
   end
 
+  def handle_call({:direct_upstream_wait, context, waiting?}, {caller, _}, state) do
+    case direct_entry(state, context.task) do
+      {_token, %{direct_cleanup: %{context: ^context, upstream_stop?: true}}} when caller == context.task ->
+        {:reply, {:error, :stopped}, state}
+
+      {token, %{direct_cleanup: %{context: ^context} = cleanup}} when caller == context.task ->
+        {:reply, :ok, put_in(state.activities[token].direct_cleanup, Map.put(cleanup, :upstream_wait?, waiting?))}
+
+      _ ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call({:direct_stop_upstream_wait, context}, _from, state) do
+    case direct_entry(state, context.task) do
+      {token, %{direct_cleanup: %{context: ^context, upstream_wait?: true} = cleanup}} ->
+        {:reply, :stop, put_in(state.activities[token].direct_cleanup, Map.put(cleanup, :upstream_stop?, true))}
+
+      _ ->
+        {:reply, :busy, state}
+    end
+  end
+
   def handle_call({:direct_cancel_pending, context}, _from, state) do
     case direct_entry(state, context.task) do
       {token, %{direct_cleanup: %{context: ^context, pending?: true}} = entry} ->
-        {:reply, :pending,
-         put_in(state.activities[token], Map.put(entry, :direct_cancelled?, true))}
+        {:reply, :pending, put_in(state.activities[token], Map.put(entry, :direct_cancelled?, true))}
 
       _ ->
         {:reply, :not_pending, state}
@@ -199,8 +257,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
         send(context.parent, {:direct_request_cleanup, context.task, context.ref, receipt})
 
-        {:reply, :ok,
-         put_in(state.activities[token].direct_cleanup, %{cleanup | receipt: receipt})}
+        {:reply, :ok, put_in(state.activities[token].direct_cleanup, %{cleanup | receipt: receipt})}
 
       _ ->
         {:reply, :ok, state}
@@ -219,8 +276,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
              do: {:error, :cancelled},
              else: :ok
 
-        {:reply, result,
-         put_in(state.activities[token].direct_cleanup, %{cleanup | pending?: false, waiters: []})}
+        {:reply, result, put_in(state.activities[token].direct_cleanup, %{cleanup | pending?: false, waiters: []})}
 
       _ ->
         {:reply, {:error, :cancelled}, state}
@@ -237,8 +293,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
          })}
 
       {token, %{direct_cleanup: %{context: ^context} = cleanup}} ->
-        {:reply, direct_receipt(cleanup),
-         put_in(state.activities[token].direct_cleanup, Map.put(cleanup, :consumed?, true))}
+        {:reply, direct_receipt(cleanup), put_in(state.activities[token].direct_cleanup, Map.put(cleanup, :consumed?, true))}
 
       {token, %{direct_ref: ref, direct_parent: parent} = entry}
       when entry.pid == context.task and ref == context.ref and parent == context.parent ->
@@ -249,8 +304,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
           %{context: ^context} = completed ->
             Process.demonitor(completed.monitor, [:flush])
 
-            {:reply, {:ok, completed.receipt},
-             %{state | finished_direct: Map.delete(state.finished_direct, context.ref)}}
+            {:reply, {:ok, completed.receipt}, %{state | finished_direct: Map.delete(state.finished_direct, context.ref)}}
 
           _ ->
             {:reply, :none, state}
@@ -370,9 +424,23 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ActivityRegistry do
 
   def handle_call({:complete_drain, _epoch}, _from, state), do: {:reply, :ok, state}
 
-  def handle_call({:cancel, token, reason}, _from, state) do
+  def handle_call({:mark_terminal_delivered, pid}, _from, state) do
+    activities =
+      Map.new(state.activities, fn
+        {token, %{pid: ^pid} = entry} -> {token, Map.put(entry, :terminal_delivered?, true)}
+        other -> other
+      end)
+
+    {:reply, :ok, %{state | activities: activities}}
+  end
+
+  def handle_call({:cancel, token, reason, force?}, _from, state) do
     case Map.get(state.activities, token) do
+      %{terminal_delivered?: true, status: status} when status in [:registered, :admitted] and not force? ->
+        {:reply, :terminal_delivered, state}
+
       %{status: status} = entry when status in [:registered, :admitted] ->
+        _marked = ExecutionRegistry.mark_interruption(entry.pid, "owner_drained")
         {cancel_pid, entry} = Entry.cancel(entry, reason)
         send(cancel_pid, {:websocket_activity_cancel, token, reason})
         activities = Map.put(state.activities, token, entry)

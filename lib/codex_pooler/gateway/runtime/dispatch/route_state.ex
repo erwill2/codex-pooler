@@ -94,8 +94,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
       when is_list(candidates) do
     %__MODULE__{
       visible_model: visible_model,
-      visible_model_context:
-        Map.get(attrs, :visible_model_context, %{visible_model: visible_model}),
+      visible_model_context: Map.get(attrs, :visible_model_context, %{visible_model: visible_model}),
       visible_models: Map.get(attrs, :visible_models, [visible_model]),
       effective_model_serving_modes: Map.get(attrs, :effective_model_serving_modes, %{}),
       candidate_snapshots: Map.get(attrs, :candidate_snapshots, candidates),
@@ -151,6 +150,72 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
       when is_map(snapshot_inputs),
       do: %{route_state | reservation_snapshot_inputs: snapshot_inputs}
 
+  @doc """
+  Records the candidates route filtering dropped (circuit, quota, workspace
+  denial, reasoning preference), next to the kept `candidates`: together they
+  are the Pool a relayed provider usage limit speaks for (findings#206 row
+  206-545). Nothing is recorded when filtering dropped none.
+  """
+  @spec put_route_filter_dropped(t(), [candidate()]) :: t()
+  def put_route_filter_dropped(%__MODULE__{} = route_state, []), do: route_state
+
+  def put_route_filter_dropped(%__MODULE__{} = route_state, dropped) when is_list(dropped),
+    do: %{route_state | extensions: Map.put(route_state.extensions, :route_filter_dropped, dropped)}
+
+  @doc """
+  The kept and dropped candidates of the last route filtering, and the
+  candidates partition selection held back: the Pool a relayed provider usage
+  limit speaks for (rows 206-545, 206-586).
+  """
+  @spec route_filter_candidates(t() | term()) :: [candidate()]
+  def route_filter_candidates(%__MODULE__{candidates: candidates, extensions: extensions}) when is_list(candidates),
+    do: candidates ++ Map.get(extensions, :route_filter_dropped, []) ++ Map.get(extensions, :partition_fallback, []) ++ Map.get(extensions, :attempted_capacity_candidates, [])
+
+  def route_filter_candidates(_route_state), do: []
+
+  @doc "Runtime-compatible Pool capacity before connection pinning, for quota advice only."
+  @spec put_usage_limit_capacity(t(), [candidate()]) :: t()
+  def put_usage_limit_capacity(%__MODULE__{} = route_state, candidates) when is_list(candidates),
+    do: %{route_state | extensions: Map.put(route_state.extensions, :usage_limit_capacity, candidates)}
+
+  @spec usage_limit_capacity(t()) :: [candidate()]
+  def usage_limit_capacity(%__MODULE__{extensions: extensions} = route_state),
+    do: Map.get(extensions, :usage_limit_capacity, route_filter_candidates(route_state))
+
+  @doc """
+  Records the runtime-compatible candidates canonical partition selection held
+  back from a native turn (valid sources outside the selected partition, after
+  the file-affinity, compact and session-pin filters). A pre-output usage-limit
+  refusal of the selected partition's last candidate may move the turn to them
+  once (findings#206 row 206-586).
+  """
+  @spec put_partition_fallback(t(), [candidate()]) :: t()
+  def put_partition_fallback(%__MODULE__{} = route_state, []), do: route_state
+
+  def put_partition_fallback(%__MODULE__{} = route_state, candidates) when is_list(candidates),
+    do: %{route_state | extensions: Map.put(route_state.extensions, :partition_fallback, candidates)}
+
+  @spec partition_fallback(t() | term()) :: [candidate()]
+  def partition_fallback(%__MODULE__{extensions: %{partition_fallback: candidates}}) when is_list(candidates), do: candidates
+  def partition_fallback(_route_state), do: []
+
+  @doc """
+  The route state of the one partition fallback hop: the held-back candidates
+  become the candidates and the capacity, with quota and circuit snapshots
+  read now, and the fallback is spent.
+  """
+  @spec take_partition_fallback(t(), auth(), Model.t(), RequestOptions.t()) :: t()
+  def take_partition_fallback(%__MODULE__{} = route_state, auth, %Model{} = model, %RequestOptions{} = request_options) do
+    fallback = partition_fallback(route_state)
+
+    extensions = route_state.extensions |> Map.delete(:partition_fallback) |> Map.delete(:route_filter_dropped)
+
+    %{route_state | extensions: extensions, quota_snapshots: %{}}
+    |> put_saved_reset_auto_capacity(fallback)
+    |> put_candidates(fallback)
+    |> preload_routing_snapshots(auth, model, request_options)
+  end
+
   @spec put_quota_snapshots(t(), quota_snapshots()) :: t()
   def put_quota_snapshots(%__MODULE__{} = route_state, snapshots) when is_map(snapshots) do
     validate_quota_snapshots!(snapshots)
@@ -183,9 +248,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
 
     route_state
     |> maybe_load_quota_snapshot(routing_candidates)
-    |> put_circuit_snapshots(
-      CircuitState.eligibility_snapshots(auth, model, routing_candidates, route_class)
-    )
+    |> put_circuit_snapshots(CircuitState.eligibility_snapshots(auth, model, routing_candidates, route_class))
   end
 
   # Canonical partition selection loads a snapshot over the wider pre-filter
@@ -238,7 +301,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   @spec quota_snapshot_for_identity(t(), UpstreamIdentity.t() | Ecto.UUID.t()) ::
           RoutingQuotaSnapshot.t()
   def quota_snapshot_for_identity(%__MODULE__{} = route_state, %UpstreamIdentity{id: identity_id}),
-      do: quota_snapshot_for_identity!(route_state, identity_id)
+    do: quota_snapshot_for_identity!(route_state, identity_id)
 
   def quota_snapshot_for_identity(%__MODULE__{} = route_state, identity_id)
       when is_binary(identity_id),
@@ -289,8 +352,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   defp validate_quota_snapshots!(snapshots) do
     valid_entries? =
       Enum.all?(snapshots, fn
-        {identity_id,
-         %RoutingQuotaSnapshot{upstream_identity_id: snapshot_identity_id, as_of: %DateTime{}}}
+        {identity_id, %RoutingQuotaSnapshot{upstream_identity_id: snapshot_identity_id, as_of: %DateTime{}}}
         when identity_id == snapshot_identity_id ->
           true
 

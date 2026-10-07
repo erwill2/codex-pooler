@@ -1,14 +1,22 @@
 defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
   @moduledoc """
   Run-scoped local fixture for released Codex same-turn automatic compaction.
+
+  `serving-override --mode full|lite|auto` writes or clears the run model's
+  Pool serving override through the product write path
+  (`Pools.update_model_serving_modes/4`, owner scope, snapshot revision), the
+  same path the operator Pools page uses, and journals the written row id so
+  `release` drops exactly that row. `auto` removes the override.
   """
 
   import Ecto.Query
 
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Dev.CodexCompactionSmokeFixture.{Journal, Provisioner}
+  alias CodexPooler.Dev.LocalTarget
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
   alias CodexPooler.Pools.{ModelServingOverride, Pool}
   alias CodexPooler.Repo
@@ -25,8 +33,10 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
            strict: [
              run_id: :string,
              upstream_base_url: :string,
+             serving_mode: :string,
              upstream_frame_count: :integer,
-             duplicate_error_count: :integer
+             duplicate_error_count: :integer,
+             mode: :string
            ]
          ) do
       {options, ["acquire"], []} ->
@@ -41,9 +51,14 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
       {options, ["receipt"], []} ->
         validate_args(:receipt, options)
 
+      {options, ["cache-receipt"], []} ->
+        validate_args(:cache_receipt, options)
+
+      {options, ["serving-override"], []} ->
+        validate_args(:serving_override, options)
+
       _invalid ->
-        {:error,
-         "use acquire --run-id RUN_ID --upstream-base-url ORIGIN, status/release --run-id RUN_ID, or receipt --run-id RUN_ID --upstream-frame-count N --duplicate-error-count N"}
+        {:error, "use acquire --run-id RUN_ID --upstream-base-url ORIGIN [--serving-mode full|lite], status/release --run-id RUN_ID, receipt --run-id RUN_ID --upstream-frame-count N --duplicate-error-count N, cache-receipt --run-id RUN_ID, or serving-override --run-id RUN_ID --mode full|lite|auto"}
     end
   end
 
@@ -88,6 +103,46 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
       end
     end
   end
+
+  @doc """
+  Writes (`full`, `lite`) or clears (`auto`) the Pool serving override of the
+  run model through `Pools.update_model_serving_modes/4` and journals the
+  written row id, so `release/1` drops exactly that row.
+  """
+  @spec serving_override(options()) :: {:ok, map()} | {:error, String.t()}
+  def serving_override(options) do
+    with :ok <- validate_environment(options),
+         {:ok, run_id} <- fetch_run_id(options),
+         {:ok, mode} <- fetch_override_mode(options),
+         {:ok, journal} <- read_ready_journal(options, run_id) do
+      paths = paths(options, run_id)
+
+      {:ok, override_id} =
+        Repo.transaction(fn ->
+          override_id = Provisioner.set_serving_override!(journal, mode)
+          :ok = journal_serving_override(paths, journal, mode, override_id)
+          override_id
+        end)
+
+      {:ok,
+       %{
+         status: "ready",
+         run_id: run_id,
+         model: Provisioner.model(),
+         serving_mode: mode,
+         serving_override_id: override_id
+       }}
+    end
+  rescue
+    _exception -> {:error, "fixture serving override failed"}
+  end
+
+  # Keep the last exact ownership id when clearing. A rejected COMMIT
+  # restores that row, and release already tolerates a committed delete.
+  defp journal_serving_override(_paths, _journal, "auto", _override_id), do: :ok
+
+  defp journal_serving_override(paths, journal, _mode, override_id),
+    do: Journal.write_journal(paths, Journal.put_serving_override(journal, override_id))
 
   @spec receipt(options()) :: {:ok, map()} | {:error, String.t()}
   def receipt(options) do
@@ -134,12 +189,153 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
          turn_sequences: Enum.map(turns, &elem(&1, 2)),
          upstream_frame_count: Keyword.fetch!(options, :upstream_frame_count),
          duplicate_error_count: Keyword.fetch!(options, :duplicate_error_count),
-         logical_turn_fingerprints:
-           turns |> Enum.map(&elem(&1, 1)) |> Enum.uniq() |> Enum.map(&fingerprint/1),
+         logical_turn_fingerprints: turns |> Enum.map(&elem(&1, 1)) |> Enum.uniq() |> Enum.map(&fingerprint/1),
          request_fingerprints: Enum.map(correlations, &fingerprint/1)
        }}
     end
   end
+
+  @doc """
+  Metadata-only per-request cache-fidelity projection for the websocket to
+  client-authored HTTP SSE fallback certification (issue 371 / findings 116 T12).
+
+  This is additive to `receipt/1` and intentionally reports the per-generation
+  transport, usage status, and NULL-preserving ledger token facts the exact
+  client cache-metadata receipt binds. It never persists new production
+  metadata: `provider_cached_field_present` / `parser_cached_field_present`
+  are derived by the harness receipt, not here. Cached input tokens stay
+  three-valued (NULL when the provider omitted the field, 0 when present and
+  zero) exactly as the ledger records them.
+  """
+  @spec cache_receipt(options()) :: {:ok, map()} | {:error, String.t()}
+  def cache_receipt(options) do
+    with :ok <- validate_environment(options),
+         {:ok, run_id} <- fetch_run_id(options),
+         {:ok, journal} <- read_ready_journal(options, run_id) do
+      pool_id = journal["pool_id"]
+
+      generations =
+        Repo.all(
+          from request in Request,
+            left_join: turn in CodexTurn,
+            on: turn.request_id == request.id,
+            where: request.pool_id == ^pool_id,
+            order_by: [asc: request.admitted_at],
+            select: %{
+              request_id: request.id,
+              requested_model: request.requested_model,
+              transport: request.transport,
+              status: request.status,
+              usage_status: request.usage_status,
+              codex_session_id: turn.codex_session_id,
+              turn_sequence: turn.turn_sequence
+            }
+        )
+        |> Enum.map(&cache_receipt_generation/1)
+
+      {:ok,
+       %{
+         status: "closed",
+         fidelity_scope: "metadata_fidelity_websocket_to_http_sse_fallback",
+         provider_cache_allocation_claimed: false,
+         generation_count: length(generations),
+         generations: generations
+       }}
+    end
+  end
+
+  defp cache_receipt_generation(row) do
+    settlement = latest_settlement(row.request_id)
+    attempt = latest_attempt(row.request_id)
+
+    %{
+      transport: row.transport,
+      status: row.status,
+      usage_status: row.usage_status,
+      turn_sequence: row.turn_sequence,
+      requested_model: row.requested_model,
+      codex_session_fingerprint: fingerprint(row.codex_session_id),
+      usage_observation_classification: usage_observation_classification(attempt)
+    }
+    |> Map.merge(attempt_receipt_fields(attempt))
+    |> Map.merge(settlement_receipt_fields(settlement))
+  end
+
+  defp latest_settlement(request_id) do
+    Repo.one(
+      from entry in LedgerEntry,
+        where: entry.request_id == ^request_id and entry.entry_kind == "settlement",
+        order_by: [desc: entry.id],
+        limit: 1,
+        select: %{
+          input_tokens: entry.input_tokens,
+          cached_input_tokens: entry.cached_input_tokens,
+          output_tokens: entry.output_tokens,
+          total_tokens: entry.total_tokens,
+          usage_status: entry.usage_status
+        }
+    )
+  end
+
+  defp latest_attempt(request_id) do
+    Repo.one(
+      from attempt in Attempt,
+        where: attempt.request_id == ^request_id,
+        order_by: [desc: attempt.attempt_number],
+        limit: 1,
+        select: %{
+          transport: attempt.transport,
+          status: attempt.status,
+          usage_status: attempt.usage_status,
+          pool_upstream_assignment_id: attempt.pool_upstream_assignment_id,
+          upstream_model_id: attempt.upstream_model_id,
+          response_metadata: attempt.response_metadata
+        }
+    )
+  end
+
+  defp attempt_receipt_fields(nil), do: %{upstream_model: nil, attempt_transport: nil, attempt_status: nil, pool_upstream_assignment_id: nil}
+
+  defp attempt_receipt_fields(attempt) do
+    %{
+      upstream_model: attempt.upstream_model_id,
+      attempt_transport: attempt.transport,
+      attempt_status: attempt.status,
+      pool_upstream_assignment_id: fingerprint(attempt.pool_upstream_assignment_id)
+    }
+  end
+
+  # NULL-preserving: a nil token count means the provider omitted the field
+  # entirely, 0 means it was present and zero. Never coalesce one into the other.
+  defp settlement_receipt_fields(nil) do
+    %{
+      ledger_input_tokens: nil,
+      ledger_cached_input_tokens: nil,
+      ledger_cached_input_tokens_present: false,
+      ledger_output_tokens: nil,
+      ledger_total_tokens: nil,
+      settlement_present: false
+    }
+  end
+
+  defp settlement_receipt_fields(settlement) do
+    %{
+      ledger_input_tokens: settlement.input_tokens,
+      ledger_cached_input_tokens: settlement.cached_input_tokens,
+      ledger_cached_input_tokens_present: not is_nil(settlement.cached_input_tokens),
+      ledger_output_tokens: settlement.output_tokens,
+      ledger_total_tokens: settlement.total_tokens,
+      settlement_present: true
+    }
+  end
+
+  defp usage_observation_classification(nil), do: nil
+
+  defp usage_observation_classification(%{response_metadata: metadata}) when is_map(metadata) do
+    get_in(metadata, ["usage_observation", "classification"])
+  end
+
+  defp usage_observation_classification(_attempt), do: nil
 
   @spec with_isolated_config(String.t(), (String.t() -> result)) :: result when result: var
   def with_isolated_config(run_id, function) when is_function(function, 1) do
@@ -184,7 +380,8 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
 
     provisioned =
       Provisioner.provision!(run_id, origin, journal, persist_journal,
-        interrupt_after: Keyword.get(options, :interrupt_after)
+        interrupt_after: Keyword.get(options, :interrupt_after),
+        serving_mode: Keyword.get(options, :serving_mode)
       )
 
     journal = Map.put(provisioned.journal, "state", "prepared")
@@ -213,6 +410,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
   end
 
   defp cleanup(paths, journal) do
+    close_run_replays(journal)
     Provisioner.cleanup!(journal)
     cancel_pending_reconciliation(journal)
     require_postconditions(journal)
@@ -222,6 +420,19 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
   rescue
     _exception -> {:error, "fixture cleanup incomplete; metadata journal retained"}
   end
+
+  # A pre-visible replay the released client never redeemed leaves its armed
+  # entitlement and `in_progress` turn behind, and the isolated runtime runs no
+  # Oban to expire it (findings#232, row 232-101). Close the run key's open
+  # entitlements through the lifecycle an API key deletion uses, which settles
+  # the request, turn and reservation, before the postconditions check them.
+  defp close_run_replays(%{"api_key_id" => api_key_id}) when is_binary(api_key_id) do
+    api_key_id
+    |> Accounting.request_replay_ids_for_api_key()
+    |> Enum.each(fn request_id -> {:ok, _closed_or_noop} = Accounting.close_request_replay(request_id, :deleted) end)
+  end
+
+  defp close_run_replays(_journal), do: :ok
 
   defp cancel_pending_reconciliation(%{
          "pool_id" => pool_id,
@@ -316,10 +527,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
   defp identity_secret_active?(nil), do: false
 
   defp identity_secret_active?(identity_id),
-    do:
-      Repo.exists?(
-        from secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity_id
-      )
+    do: Repo.exists?(from secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity_id)
 
   defp serving_override_active?(nil), do: false
 
@@ -375,9 +583,32 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
   end
 
   defp exact_option_keys(:acquire, options) do
-    if Enum.sort(Keyword.keys(options)) == [:run_id, :upstream_base_url],
+    keys = Enum.sort(Keyword.keys(options))
+    serving_mode = Keyword.get(options, :serving_mode)
+
+    cond do
+      keys not in [[:run_id, :upstream_base_url], [:run_id, :serving_mode, :upstream_base_url]] ->
+        {:error, "acquire requires exact options"}
+
+      not is_nil(serving_mode) and serving_mode not in ["full", "lite"] ->
+        {:error, "serving mode must be full or lite"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp exact_option_keys(:cache_receipt, options) do
+    if Keyword.keys(options) == [:run_id],
       do: :ok,
-      else: {:error, "acquire requires exact options"}
+      else: {:error, "cache-receipt accepts only --run-id"}
+  end
+
+  defp exact_option_keys(:serving_override, options) do
+    if Enum.sort(Keyword.keys(options)) == [:mode, :run_id] and
+         match?({:ok, _mode}, fetch_override_mode(options)),
+       do: :ok,
+       else: {:error, "serving-override requires --run-id and --mode full|lite|auto"}
   end
 
   defp exact_option_keys(:receipt, options) do
@@ -412,6 +643,13 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
     end
   end
 
+  defp fetch_override_mode(options) do
+    case Keyword.get(options, :mode) do
+      mode when mode in ["full", "lite", "auto"] -> {:ok, mode}
+      _other -> {:error, "serving override mode must be full, lite, or auto"}
+    end
+  end
+
   defp fingerprint(value) when is_binary(value) do
     :sha256
     |> :crypto.hash(value)
@@ -433,16 +671,12 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture do
     end
   end
 
+  # Loopback for the managed listener, or an in-cluster service origin that a
+  # local replica's pods can reach; public hosts stay refused.
   defp fetch_origin(options) do
-    value = Keyword.get(options, :upstream_base_url)
-    uri = if is_binary(value), do: URI.parse(value), else: %URI{}
-
-    if uri.scheme == "http" and uri.host in ["127.0.0.1", "localhost", "::1"] and
-         is_integer(uri.port) and uri.path in [nil, "", "/"] and is_nil(uri.query) and
-         is_nil(uri.fragment) and is_nil(uri.userinfo) do
-      {:ok, String.trim_trailing(value, "/")}
-    else
-      {:error, "upstream base URL must be an origin-only loopback HTTP URL"}
+    case Keyword.get(options, :upstream_base_url) do
+      value when is_binary(value) -> LocalTarget.upstream_base_url(value, value)
+      _missing -> {:error, "--upstream-base-url is required"}
     end
   end
 

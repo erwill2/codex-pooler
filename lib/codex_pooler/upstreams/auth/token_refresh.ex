@@ -92,6 +92,12 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          stale_after_ms,
          expected_credential_epoch
        ) do
+    # A cold cache loads settings in its own process. Resolve that policy before
+    # holding a database connection so its checkout cannot wait on this transaction.
+    proactive_refresh_enabled? =
+      trigger_kind != "scheduled" or
+        CodexPooler.InstanceSettings.current().gateway.upstream_token_refresh_proactive_enabled
+
     Repo.transaction(fn ->
       identity.id
       |> lock_upstream_identity_with_timestamp()
@@ -99,7 +105,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
         trigger_kind,
         receive_timeout_ms,
         stale_after_ms,
-        expected_credential_epoch
+        expected_credential_epoch,
+        proactive_refresh_enabled?
       )
     end)
     |> case do
@@ -122,7 +129,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          _trigger_kind,
          _receive_timeout_ms,
          _stale_after_ms,
-         _expected_credential_epoch
+         _expected_credential_epoch,
+         _proactive_refresh_enabled?
        )
        when status in @token_refresh_terminal_statuses do
     token_refresh_result(:noop, locked, retryable?: false, reason: "account is #{status}")
@@ -133,7 +141,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          _trigger_kind,
          _receive_timeout_ms,
          _stale_after_ms,
-         _expected_credential_epoch
+         _expected_credential_epoch,
+         _proactive_refresh_enabled?
        )
        when status not in @token_refresh_candidate_statuses do
     token_refresh_result(:noop, locked, retryable?: false, reason: "account is #{status}")
@@ -144,7 +153,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          trigger_kind,
          receive_timeout_ms,
          stale_after_ms,
-         expected_credential_epoch
+         expected_credential_epoch,
+         proactive_refresh_enabled?
        ) do
     case CredentialFencing.validate_current_credential_epoch(locked) do
       {:ok, credential_epoch} ->
@@ -157,7 +167,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
             receive_timeout_ms,
             stale_after_ms,
             timestamp,
-            credential_epoch
+            credential_epoch,
+            proactive_refresh_enabled?
           )
         end
 
@@ -171,11 +182,10 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          _trigger_kind,
          _receive_timeout_ms,
          _stale_after_ms,
-         _expected_credential_epoch
+         _expected_credential_epoch,
+         _proactive_refresh_enabled?
        ) do
-    Repo.rollback(
-      lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")
-    )
+    Repo.rollback(lifecycle_error(:upstream_identity_not_found, "upstream identity was not found"))
   end
 
   # A caller carrying an expected credential epoch observed its auth failure
@@ -207,6 +217,30 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
 
   defp begin_refreshable_identity(
          %UpstreamIdentity{} = locked,
+         trigger_kind,
+         receive_timeout_ms,
+         stale_after_ms,
+         timestamp,
+         credential_epoch,
+         proactive_refresh_enabled?
+       ) do
+    if trigger_kind == "scheduled" and locked.status == @active and
+         not proactive_refresh_enabled? do
+      token_refresh_result(:noop, locked, retryable?: false, reason: "proactive refresh disabled")
+    else
+      begin_enabled_refresh(
+        locked,
+        trigger_kind,
+        receive_timeout_ms,
+        stale_after_ms,
+        timestamp,
+        credential_epoch
+      )
+    end
+  end
+
+  defp begin_enabled_refresh(
+         locked,
          trigger_kind,
          receive_timeout_ms,
          stale_after_ms,
@@ -246,6 +280,7 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
         timestamp,
         credential_epoch
       )
+      |> Map.put(:proactive?, trigger_kind == "scheduled" and locked.status == @active)
 
     case Secrets.decrypt_active_secret(locked, "refresh_token") do
       {:ok, refresh_token} ->
@@ -287,11 +322,11 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
       {:error, %{code: :codex_refresh_token_revoked}} ->
         {:reauth_required, "refresh_token_revoked"}
 
-      {:error, %{code: code}} ->
-        {:transient_error, to_string(code)}
+      {:error, %{code: code} = error} ->
+        {:transient_error, to_string(code), Map.get(error, :retry_after_seconds)}
 
       {:error, _reason} ->
-        {:transient_error, "provider refresh request failed"}
+        {:transient_error, "provider refresh request failed", nil}
     end
   end
 
@@ -397,9 +432,7 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
   end
 
   defp finalize_token_refresh_from_lock(nil, _refresh_result, _trigger_kind, _attempt) do
-    Repo.rollback(
-      lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")
-    )
+    Repo.rollback(lifecycle_error(:upstream_identity_not_found, "upstream identity was not found"))
   end
 
   defp do_finalize_token_refresh(
@@ -414,7 +447,7 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
 
     with :ok <- require_current_access_token(expiry),
          {:ok, replacement_metadata, credential_epoch} <-
-           CredentialFencing.prepare_replacement_metadata(identity),
+           CredentialFencing.prepare_refresh_metadata(identity),
          {:ok, _secret} <-
            Secrets.store_encrypted_secret(identity, %{
              secret_kind: "access_token",
@@ -472,19 +505,37 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
   end
 
   defp do_finalize_token_refresh(
-         {:transient_error, code},
+         {:transient_error, code, retry_after_seconds},
          %UpstreamIdentity{} = identity,
          trigger_kind,
          attempt
        ) do
-    finalize_refresh_failure(identity, trigger_kind, attempt, code, now())
+    identity
+    |> finalize_refresh_failure(trigger_kind, attempt, code, now())
+    |> put_retry_after(retry_after_seconds)
   end
 
+  # The provider's own interval travels with the result so the worker can wait
+  # exactly that long instead of guessing. It is a hint, not a state change:
+  # nothing about the failure classification depends on it.
+  defp put_retry_after(%{} = result, seconds) when is_integer(seconds) and seconds > 0,
+    do: Map.put(result, :retry_after_seconds, seconds)
+
+  defp put_retry_after(result, _seconds), do: result
+
   defp finalize_refresh_failure(identity, trigger_kind, attempt, code, timestamp) do
+    expiry =
+      identity.metadata
+      |> TokenRefreshMetadata.project_access_token_expiry()
+      |> AccessTokenExpiry.evaluate(timestamp)
+
+    preserve_active? = attempt.proactive? and expiry.state == :known
+    status = if preserve_active?, do: @active, else: @refresh_failed
+
     failed_identity =
       identity
       |> UpstreamIdentity.changeset(%{
-        status: @refresh_failed,
+        status: status,
         updated_at: timestamp,
         metadata:
           put_token_refresh_metadata(
@@ -497,7 +548,9 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
       })
       |> Repo.update!()
 
-    token_refresh_result(:refresh_failed, failed_identity,
+    token_refresh_result(
+      if(preserve_active?, do: :active, else: :refresh_failed),
+      failed_identity,
       retryable?: true,
       reason: token_refresh_message(code)
     )

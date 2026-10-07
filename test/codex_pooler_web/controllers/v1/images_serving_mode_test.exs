@@ -35,7 +35,7 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
       assert captured.json["stream"] == true
       assert [tool] = image_tools(captured.json, @mode)
       assert tool["type"] == "image_generation"
-      assert tool["model"] == "gpt-image-2"
+      assert tool["model"] == "gpt-image-1"
       assert tool["quality"] == "medium"
 
       if @operation == "edits" do
@@ -51,8 +51,8 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
 
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
       assert request.status == "succeeded"
-      assert request.request_metadata["requested_model"] == "gpt-image-2"
-      assert request.request_metadata["effective_model"] == "gpt-image-2"
+      assert request.request_metadata["requested_model"] == "gpt-image-1"
+      assert request.request_metadata["effective_model"] == "gpt-image-1"
       assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
       assert attempt.status == "succeeded"
 
@@ -193,14 +193,140 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
-  defp setup_host(upstream, mode) do
+  for mode <- ["full", "lite"],
+      {model, options, fidelity} <-
+        Enum.map(
+          ~w(gpt-image-1 gpt-image-1.5 gpt-image-1-mini gpt-image-2 gpt-image-2.5-flare gpt-image-2.5-sunburst),
+          &{&1, :mask, nil}
+        ) ++
+          for(
+            model <- ~w(gpt-image-2 gpt-image-2.5-flare gpt-image-2.5-sunburst gpt-image-1-mini),
+            options <- [:fidelity, :both],
+            fidelity <- ["low", "high"],
+            do: {model, options, fidelity}
+          ) ++
+          for(
+            model <- ["gpt-image-1", "gpt-image-1.5"],
+            fidelity <- ["low", "high"],
+            do: {model, :fidelity, fidelity}
+          ) do
+    @mode mode
+    @options options
+    @image_model model
+    @fidelity fidelity
+    test "#{@image_model} edit with #{@options} #{@fidelity} obeys #{@mode} fidelity policy", %{
+      conn: conn
+    } do
+      source = png(255, 0, 0)
+      mask = png(0, 255, 0)
+      upstream = start_upstream(image_stream(Base.encode64(png(0, 0, 255))))
+      setup = setup_host(upstream, @mode, @image_model)
+      fields = [{"model", @image_model}, {"prompt", "synthetic image"}, {"quality", "high"}]
+
+      fields =
+        if @options in [:fidelity, :both],
+          do: fields ++ [{"input_fidelity", @fidelity}],
+          else: fields
+
+      parts =
+        for {key, value} <- fields,
+            do: "--edit-options\r\nContent-Disposition: form-data; name=\"#{key}\"\r\n\r\n#{value}\r\n"
+
+      uploads =
+        if @options in [:mask, :both],
+          do: [{"image", source}, {"mask", mask}],
+          else: [{"image", source}]
+
+      files =
+        for {key, bytes} <- uploads,
+            do: [
+              "--edit-options\r\nContent-Disposition: form-data; name=\"#{key}\"; filename=\"sample.png\"\r\nContent-Type: image/png\r\n\r\n",
+              bytes,
+              "\r\n"
+            ]
+
+      if @options == :mask do
+        unauthenticated =
+          conn
+          |> recycle()
+          |> put_req_header("content-type", "multipart/form-data; boundary=edit-options")
+          |> post("/v1/images/edits", IO.iodata_to_binary([parts, files, "--edit-options--\r\n"]))
+
+        assert response(unauthenticated, 401)
+      end
+
+      response =
+        conn
+        |> auth(setup)
+        |> put_req_header("content-type", "multipart/form-data; boundary=edit-options")
+        |> post("/v1/images/edits", IO.iodata_to_binary([parts, files, "--edit-options--\r\n"]))
+
+      if @image_model in ~w(gpt-image-2 gpt-image-2.5-flare gpt-image-2.5-sunburst gpt-image-1-mini) and
+           @options != :mask do
+        assert %{"error" => %{"param" => "input_fidelity", "type" => "invalid_request_error"}} =
+                 json_response(response, 400)
+
+        assert FakeUpstream.count(upstream) == 0
+        assert Repo.aggregate(Request, :count) == 0
+        assert Repo.aggregate(Attempt, :count) == 0
+        assert Repo.aggregate(LedgerEntry, :count) == 0
+      else
+        if @mode == "lite" and @options in [:mask, :both] do
+          assert %{"error" => %{"code" => "unsupported_parameter", "param" => "mask"}} =
+                   json_response(response, 400)
+
+          assert FakeUpstream.count(upstream) == 0
+          assert Repo.aggregate(Request, :count) == 0
+          assert Repo.aggregate(Attempt, :count) == 0
+          assert Repo.aggregate(LedgerEntry, :count) == 0
+        else
+          assert %{"data" => [_]} = json_response(response, 200)
+          assert [captured] = FakeUpstream.requests(upstream)
+          assert captured.path == "/backend-api/codex/responses"
+          assert [tool] = image_tools(captured.json, @mode)
+          assert tool["model"] == @image_model
+          assert tool["quality"] == "high"
+          assert Map.has_key?(tool, "input_fidelity") == @options in [:fidelity, :both]
+          if @options in [:fidelity, :both], do: assert(tool["input_fidelity"] == @fidelity)
+          assert Map.has_key?(tool, "input_image_mask") == @options in [:mask, :both]
+
+          if @options in [:mask, :both] do
+            assert captured.json["tool_choice"] == %{"type" => "image_generation"}
+
+            assert %{"image_url" => "data:image/png;base64," <> encoded} =
+                     tool["input_image_mask"]
+
+            assert Base.decode64!(encoded) == mask
+          end
+
+          content = captured.json["input"] |> Enum.flat_map(&Map.get(&1, "content", []))
+
+          assert [
+                   %{"type" => "input_text", "text" => "synthetic image"},
+                   %{"type" => "input_image", "image_url" => "data:image/png;base64," <> encoded}
+                 ] = content
+
+          assert Base.decode64!(encoded) == source
+          assert [request] = Repo.all(Request)
+          assert request.status == "succeeded"
+          assert request.request_metadata["effective_model"] == @image_model
+          assert [attempt] = Repo.all(Attempt)
+          assert attempt.response_metadata["routing"]["model_serving_mode"] == @mode
+          assert_usage_settled_once(request, attempt)
+        end
+      end
+    end
+  end
+
+  defp setup_host(upstream, mode, image_model \\ "gpt-image-1") do
     setup = gateway_setup(upstream)
 
     setup.model
     |> Ecto.Changeset.change(
       metadata:
-        put_in(
-          setup.model.metadata,
+        setup.model.metadata
+        |> Map.put("input_modalities", ["text", "image"])
+        |> put_in(
           ["source_assignment_models", setup.assignment.id, "input_modalities"],
           ["text", "image"]
         )
@@ -208,7 +334,7 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
     |> Repo.update!()
 
     setup.api_key
-    |> Ecto.Changeset.change(allowed_model_identifiers: ["gpt-image-2"])
+    |> Ecto.Changeset.change(allowed_model_identifiers: [image_model])
     |> Repo.update!()
 
     timestamp = DateTime.utc_now()
@@ -226,10 +352,9 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
 
   defp image_request(conn, "generations", _source) do
     post(conn, "/v1/images/generations", %{
-      "model" => "gpt-image-2",
+      "model" => "gpt-image-1",
       "prompt" => "synthetic image",
-      "quality" => "medium",
-      "input_fidelity" => "high"
+      "quality" => "medium"
     })
   end
 
@@ -242,7 +367,7 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
   defp multipart(boundary, source) do
     fields =
       for {key, value} <- [
-            {"model", "gpt-image-2"},
+            {"model", "gpt-image-1"},
             {"prompt", "synthetic image"},
             {"quality", "medium"},
             {"input_fidelity", "high"}
@@ -318,8 +443,7 @@ defmodule CodexPoolerWeb.V1.ImagesServingModeTest do
     do: <<byte_size(data)::32, type::binary, data::binary, :erlang.crc32(type <> data)::32>>
 
   defp assert_png(<<137, 80, 78, 71, 13, 10, 26, 10, chunks::binary>>) do
-    <<13::32, "IHDR", header::binary-size(13), header_crc::32, size::32, "IDAT",
-      data::binary-size(size), data_crc::32, 0::32, "IEND", end_crc::32>> = chunks
+    <<13::32, "IHDR", header::binary-size(13), header_crc::32, size::32, "IDAT", data::binary-size(size), data_crc::32, 0::32, "IEND", end_crc::32>> = chunks
 
     assert header == <<1::32, 1::32, 8, 2, 0, 0, 0>>
     assert header_crc == :erlang.crc32("IHDR" <> header)

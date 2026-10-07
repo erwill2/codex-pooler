@@ -16,8 +16,11 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRequestCallbacksTest do
 
   test "maps every discriminator to the exact current mapper output" do
     messages = [
-      Jason.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_example"}}),
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.completed",
+        "response" => %{"id" => "resp_example"}
+      }),
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "response" => %{"error" => %{"code" => "server_error"}}
       })
@@ -138,10 +141,8 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRequestCallbacksTest do
 
     snapshots = [
       {:timeouts, Map.put(attrs.timeouts, :unexpected_callback, function)},
-      {:reset_probe,
-       Map.put(%ResetProbe{token: Ecto.UUID.generate()}, :unexpected_callback, function)},
-      {:native_codex_response_control,
-       Map.put(%TurnSnapshot{models_etag: "etag"}, :unexpected_callback, function)}
+      {:reset_probe, Map.put(%ResetProbe{token: Ecto.UUID.generate()}, :unexpected_callback, function)},
+      {:native_codex_response_control, Map.put(%TurnSnapshot{models_etag: "etag"}, :unexpected_callback, function)}
     ]
 
     assert Enum.map(snapshots, fn {field, snapshot} ->
@@ -152,8 +153,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRequestCallbacksTest do
              [
                {:error, {:invalid_owner_request, {:invalid_field, :timeouts}}},
                {:error, {:invalid_owner_request, {:invalid_field, :reset_probe}}},
-               {:error,
-                {:invalid_owner_request, {:invalid_field, :native_codex_response_control}}}
+               {:error, {:invalid_owner_request, {:invalid_field, :native_codex_response_control}}}
              ]
   end
 
@@ -170,10 +170,17 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRequestCallbacksTest do
         nil
       )
 
+    # Restoring the captured state, not a hardcoded `false`. No config sets this key, so it is
+    # absent here, and the runtime reads it through `get_env/3` with a `false` default that
+    # applies only to an absent key; writing `false` back leaves it present and pins the value
+    # for the rest of the partition instead of restoring absence.
+    previous =
+      Application.fetch_env(:codex_pooler, :multi_agent_round_product_observation_enabled)
+
     Application.put_env(:codex_pooler, :multi_agent_round_product_observation_enabled, true)
 
     on_exit(fn ->
-      Application.put_env(:codex_pooler, :multi_agent_round_product_observation_enabled, false)
+      restore_product_observation_gate(previous)
       :telemetry.detach(handler_id)
     end)
 
@@ -188,12 +195,12 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRequestCallbacksTest do
     assert {:ok, request} = WebsocketRequestCallbacks.materialize(envelope, writer)
 
     frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{"id" => "resp_abcdefghijklmnop"}
       })
 
-    assert request.frame_observer.(frame, Jason.decode!(frame)) == :ok
+    assert request.frame_observer.(frame, CodexPooler.JSON.decode!(frame)) == :ok
     assert request.writer.(frame, :terminal) == :writer_result
     assert_receive {:written, ^frame, :terminal}
 
@@ -267,4 +274,10 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRequestCallbacksTest do
 
     capability
   end
+
+  defp restore_product_observation_gate({:ok, value}),
+    do: Application.put_env(:codex_pooler, :multi_agent_round_product_observation_enabled, value)
+
+  defp restore_product_observation_gate(:error),
+    do: Application.delete_env(:codex_pooler, :multi_agent_round_product_observation_enabled)
 end

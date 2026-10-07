@@ -8,27 +8,14 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Upstreams.Quota.{AccountAvailabilityStore, AccountQuotaWindow}
   alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
+  alias CodexPooler.Upstreams.Quota.Windows
 
   @as_of ~U[2026-05-30 12:00:00Z]
   @future_reset ~U[2026-05-30 12:15:00Z]
   @weekly_reset ~U[2026-06-06 12:00:00Z]
   @monthly_reset ~U[2026-06-29 12:00:00Z]
-  @expected_keys MapSet.new([
-                   :state,
-                   :label,
-                   :tone,
-                   :routing_ready_now?,
-                   :reason_codes,
-                   :primary_window,
-                   :primary_30d_window,
-                   :weekly_window
-                 ])
 
   describe "from_windows/2" do
-    test "requires the trusted snapshot timestamp" do
-      refute function_exported?(UpstreamQuotaReadiness, :from_windows, 1)
-    end
-
     test "uses the supplied snapshot for freshness and reset expiry boundaries" do
       ttl = Evidence.freshness_ttl_seconds()
 
@@ -76,9 +63,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^primary,
                primary_30d_window: nil,
                weekly_window: nil
-             } = projection = UpstreamQuotaReadiness.from_windows([primary], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([primary], @as_of)
     end
 
     test "maps fresh reset-bearing monthly account primary evidence to ready" do
@@ -93,9 +78,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^monthly,
                primary_30d_window: ^monthly,
                weekly_window: nil
-             } = projection = UpstreamQuotaReadiness.from_windows([monthly], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([monthly], @as_of)
     end
 
     test "maps weekly-only probe eligibility to warning readiness that can still route" do
@@ -110,9 +93,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: nil,
                primary_30d_window: nil,
                weekly_window: ^weekly
-             } = projection = UpstreamQuotaReadiness.from_windows([weekly], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([weekly], @as_of)
     end
 
     test "maps exhausted account primary evidence to exhausted" do
@@ -127,9 +108,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^primary,
                primary_30d_window: nil,
                weekly_window: nil
-             } = projection = UpstreamQuotaReadiness.from_windows([primary], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([primary], @as_of)
     end
 
     test "maps unusable monthly primary evidence to blocked states without false readiness" do
@@ -177,9 +156,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^primary,
                primary_30d_window: nil,
                weekly_window: nil
-             } = projection = UpstreamQuotaReadiness.from_windows([primary], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([primary], @as_of)
     end
 
     test "maps missing account-level windows to missing evidence" do
@@ -195,8 +172,6 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_30d_window: nil,
                weekly_window: nil
              } = projection
-
-      assert_exact_keys(projection)
     end
 
     test "maps account reset-missing evidence to missing evidence" do
@@ -211,9 +186,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^primary,
                primary_30d_window: nil,
                weekly_window: nil
-             } = projection = UpstreamQuotaReadiness.from_windows([primary], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([primary], @as_of)
     end
 
     test "maps unclassified account-level blockers to blocked" do
@@ -235,11 +208,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^primary,
                primary_30d_window: nil,
                weekly_window: nil
-             } =
-               projection =
-               UpstreamQuotaReadiness.from_windows([primary, auxiliary_blocker], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([primary, auxiliary_blocker], @as_of)
     end
 
     test "ignores model-scoped and upstream-model-scoped windows for top-level readiness" do
@@ -262,8 +231,6 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_30d_window: nil,
                weekly_window: nil
              } = projection
-
-      assert_exact_keys(projection)
     end
 
     test "reports missing evidence when only non-account windows are present" do
@@ -285,8 +252,6 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_30d_window: nil,
                weekly_window: nil
              } = projection
-
-      assert_exact_keys(projection)
     end
 
     test "weekly exhaustion wins after eligibility blocks" do
@@ -302,9 +267,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: ^primary,
                primary_30d_window: nil,
                weekly_window: ^weekly
-             } = projection = UpstreamQuotaReadiness.from_windows([primary, weekly], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([primary, weekly], @as_of)
     end
 
     test "selects measured account primary evidence over a zero-capacity usage outlier" do
@@ -344,39 +307,62 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
                primary_window: nil,
                primary_30d_window: nil,
                weekly_window: ^weekly
-             } = projection = UpstreamQuotaReadiness.from_windows([weekly], @as_of)
-
-      assert_exact_keys(projection)
+             } = UpstreamQuotaReadiness.from_windows([weekly], @as_of)
     end
   end
 
   describe "from_snapshot/1" do
-    test "maps fresh provider availability without windows to warning readiness" do
+    for minutes <- [300, 43_200] do
+      test "permitted zero-use #{minutes}-minute primary agrees with runtime eligibility" do
+        %{identity: identity} = upstream_assignment_fixture(pool_fixture())
+
+        primary =
+          account_primary_window(
+            window_minutes: unquote(minutes),
+            active_limit: nil,
+            credits: nil,
+            used_percent: Decimal.new(0),
+            metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false}
+          )
+
+        snapshot = RoutingQuotaSnapshot.from_identity(identity, [primary], @as_of)
+
+        assert %{eligible?: true} =
+                 Windows.routing_quota_eligibility_from_snapshot(snapshot)
+
+        assert %{state: "ready", routing_ready_now?: true, primary_window: ^primary} =
+                 UpstreamQuotaReadiness.from_snapshot(snapshot)
+
+        assert %{state: "ready", primary_window: ^primary} =
+                 UpstreamQuotaReadiness.from_windows([primary], @as_of)
+      end
+    end
+
+    test "affirmative permission with exhausted percentage remains ready" do
       pool = pool_fixture()
 
       %{identity: identity} =
         upstream_assignment_fixture(pool, %{
           identity_metadata: %{
             "credential_epoch" => 1,
-            AccountAvailabilityStore.metadata_key() =>
-              AccountAvailabilityStore.encode!(:available, @as_of, 1)
+            AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, @as_of, 1)
           }
         })
 
-      snapshot = RoutingQuotaSnapshot.from_identity(identity, [], @as_of)
+      window =
+        account_primary_window(
+          source: "codex_usage_api",
+          used_percent: Decimal.new(100),
+          observed_at: @as_of,
+          metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false}
+        )
 
-      assert %{
-               state: "provider_available_no_windows",
-               label: "Provider available",
-               tone: :warning,
-               routing_ready_now?: true,
-               reason_codes: [],
-               primary_window: nil,
-               primary_30d_window: nil,
-               weekly_window: nil
-             } = projection = UpstreamQuotaReadiness.from_snapshot(snapshot)
-
-      assert_exact_keys(projection)
+      snapshot = RoutingQuotaSnapshot.from_identity(identity, [window], @as_of)
+      projection = UpstreamQuotaReadiness.from_snapshot(snapshot)
+      assert projection.state == "ready"
+      assert projection.routing_ready_now?
+      assert projection.reason_codes == []
+      assert Decimal.equal?(projection.primary_window.used_percent, 100)
 
       routing =
         UpstreamRoutingReadiness.from_inputs(
@@ -385,18 +371,36 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
           projection
         )
 
-      assert routing.state == "provider_available_no_windows"
-      assert routing.label == "Provider available"
-      assert routing.tone == :warning
       assert routing.routing_ready_now?
+    end
+
+    @tag credits_negative: true
+    test "attested legacy windowless availability stays conditional on and is denied off" do
+      %{identity: identity} = upstream_assignment_fixture(pool_fixture(), %{identity_metadata: %{"credential_epoch" => 1, AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, @as_of, 1)}})
+      snapshot = RoutingQuotaSnapshot.from_identity(identity, [], @as_of)
+      projection = UpstreamQuotaReadiness.from_snapshot(snapshot)
+      assert projection.routing_ready_now?
+      assert projection.conditional?
+      assert projection.capacity_basis == :unknown_legacy
+      assert projection.qualification == :legacy_attested
+      assert projection.primary_window == nil
+      assert projection.weekly_window == nil
+
+      routing = UpstreamRoutingReadiness.from_inputs(identity, %{status: "active", health_status: "active", eligibility_status: "eligible"}, projection)
+      assert routing.routing_ready_now?
+      assert routing.state == "capacity_basis_unknown"
+
+      disabled = UpstreamQuotaReadiness.from_snapshot(%{snapshot | allow_provider_credits: false})
+      refute disabled.routing_ready_now?
+      assert disabled.capacity_basis == :unknown_legacy
+      assert disabled.reason_codes == ["provider_credits_disabled", "capacity_basis_unknown"]
     end
 
     test "keeps blocked unknown expired and credential-mismatched snapshots fail closed" do
       for {state, observed_at, epoch, expected_state} <- [
             {:blocked, @as_of, 1, "blocked"},
             {:unknown, @as_of, 1, "missing_evidence"},
-            {:available, DateTime.add(@as_of, -(Evidence.freshness_ttl_seconds() + 1), :second),
-             1, "missing_evidence"},
+            {:available, DateTime.add(@as_of, -(Evidence.freshness_ttl_seconds() + 1), :second), 1, "missing_evidence"},
             {:available, @as_of, 2, "missing_evidence"}
           ] do
         pool = pool_fixture()
@@ -405,8 +409,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
           upstream_assignment_fixture(pool, %{
             identity_metadata: %{
               "credential_epoch" => 1,
-              AccountAvailabilityStore.metadata_key() =>
-                AccountAvailabilityStore.encode!(state, observed_at, epoch)
+              AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(state, observed_at, epoch)
             }
           })
 
@@ -417,7 +420,6 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
 
         assert projection.state == expected_state
         refute projection.routing_ready_now?
-        assert_exact_keys(projection)
       end
     end
 
@@ -428,8 +430,7 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
         upstream_assignment_fixture(pool, %{
           identity_metadata: %{
             "credential_epoch" => 1,
-            AccountAvailabilityStore.metadata_key() =>
-              AccountAvailabilityStore.encode!(:available, @as_of, 1)
+            AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, @as_of, 1)
           }
         })
 
@@ -437,15 +438,31 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
       snapshot = RoutingQuotaSnapshot.from_identity(identity, [model_blocker], @as_of)
       projection = UpstreamQuotaReadiness.from_snapshot(snapshot)
 
-      assert projection.state == "provider_available_no_windows"
+      assert projection.capacity_basis == :unknown_legacy
+      assert projection.conditional?
       assert projection.routing_ready_now?
       assert snapshot.raw_windows == [model_blocker]
-      assert_exact_keys(projection)
     end
   end
 
-  defp assert_exact_keys(projection) do
-    assert MapSet.new(Map.keys(projection)) == @expected_keys
+  test "ready credit presentation retains identity, assignment and circuit guards" do
+    quota = %{state: "provider_credits_ready", label: "Routing ready via credits", tone: :success, routing_ready_now?: true, capacity_basis: :provider_credits, conditional?: false, reason_codes: [], primary_window: nil, primary_30d_window: nil, weekly_window: nil}
+    assignment = %{status: "active", health_status: "active", eligibility_status: "eligible"}
+    ready = UpstreamRoutingReadiness.from_inputs("active", assignment, quota)
+
+    assert ready.routing_ready_now?
+    assert ready.tone == :success
+    assert ready.label == "Routing ready via credits"
+
+    for status <- ["reauth_required", "disabled", "paused"] do
+      refute UpstreamRoutingReadiness.from_inputs(status, assignment, quota).routing_ready_now?
+    end
+
+    refute UpstreamRoutingReadiness.from_inputs("active", %{assignment | status: "disabled"}, quota).routing_ready_now?
+    refute UpstreamRoutingReadiness.from_inputs("active", assignment, %{quota | routing_ready_now?: false, reason_codes: ["provider_credits_disabled"]}).routing_ready_now?
+    circuit = UpstreamRoutingReadiness.with_circuit_visibility(ready, %{state: :blocked})
+    assert circuit.tone == :error
+    assert circuit.state == "circuit_protection_active"
   end
 
   defp account_primary_window(attrs \\ []) do

@@ -2,8 +2,17 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
   use ExUnit.Case, async: true
 
   alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
+
   alias CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
+
+  @no_model %{"version" => 1, "coverage" => "full", "terminal_status" => nil, "terminal_model" => nil, "first_conflicting_model" => nil, "conflict" => nil}
+  @completed_no_model %{@no_model | "terminal_status" => "completed"}
+
+  defp assert_observation(usage, expected) do
+    assert Map.fetch!(usage, :model_observation) == expected
+    Map.delete(usage, :model_observation)
+  end
 
   @known_usage %{
     status: "usage_known",
@@ -16,14 +25,83 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
     service_tier: "priority"
   }
 
+  @tag slow: "exhaustively checks every byte split across newline and ignored-field variants"
+  test "ignored fields and capped event labels preserve records across every transport split" do
+    ignored_value = ~s({"usage":{"input_tokens":999},"type":"response.failed"})
+    capped_label = String.pad_trailing(" response.completed", 80)
+
+    for newline <- ["\n", "\r", "\r\n"],
+        ignored_field <- [":", "id:", "retry:", "unknown:"] do
+      stream =
+        ignored_field <>
+          ignored_value <>
+          "\nevent:" <>
+          capped_label <>
+          "ignored suffix\n" <>
+          "data: " <>
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.in_progress",
+            "usage" => usage(16, 5, 21),
+            "service_tier" => "priority"
+          }) <>
+          "\n\n" <>
+          usage_event("response.in_progress", usage(1, 1, 2), "flex")
+
+      stream = String.replace(stream, "\n", newline)
+      expected = StreamUsageObserver.observe(StreamUsageObserver.new(), stream)
+      assert assert_observation(StreamUsageObserver.usage(expected), @completed_no_model) == @known_usage
+      assert expected.previous_terminal?
+      assert StreamUsageObserver.diagnostics(expected).candidate_count == 1
+
+      for split_at <- 0..byte_size(stream) do
+        <<first::binary-size(^split_at), second::binary>> = stream
+
+        actual =
+          StreamUsageObserver.new()
+          |> StreamUsageObserver.observe(first)
+          |> StreamUsageObserver.observe(second)
+
+        assert actual == expected
+      end
+    end
+  end
+
+  test "unterminated ignored fields and capped event labels retain only bounded context" do
+    for prefix <- [":", "id:", "event:" <> String.duplicate("x", 80)] do
+      state = StreamUsageObserver.observe(StreamUsageObserver.new(), prefix)
+      expected = %{state | cr?: false}
+
+      for chunk <- ["", "tail", String.duplicate("x", 65_536)] do
+        assert StreamUsageObserver.observe(state, chunk) == expected
+      end
+    end
+  end
+
+  test "ignored lines and exhausted event prefixes have a span scanning reduction budget" do
+    padding = String.duplicate("x", 1_048_576)
+    terminal = usage_event("response.completed", usage(16, 5, 21), "priority")
+
+    for prefix <- [":", "id:", "event:"], chunk_size <- [1_024, 4_096, 16_384, 65_536] do
+      stream = prefix <> padding <> "\r\n\r\n" <> terminal
+      chunks = chunk_bytes(stream, chunk_size)
+      initial = StreamUsageObserver.new()
+      {:reductions, before_count} = Process.info(self(), :reductions)
+      state = Enum.reduce(chunks, initial, &StreamUsageObserver.observe(&2, &1))
+      {:reductions, after_count} = Process.info(self(), :reductions)
+
+      assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
+
+      assert after_count - before_count < 200_000,
+             "#{prefix} at #{chunk_size} bytes used #{after_count - before_count} reductions"
+    end
+  end
+
   test "exact candidate object budget is independent of chunk placement" do
-    base = Jason.encode!(Map.put(usage(16, 5, 21), "padding", ""))
+    base = CodexPooler.JSON.encode!(Map.put(usage(16, 5, 21), "padding", ""))
 
     for size <- [16_383, 16_384, 16_385] do
       object =
-        Jason.encode!(
-          Map.put(usage(16, 5, 21), "padding", String.duplicate("x", size - byte_size(base)))
-        )
+        CodexPooler.JSON.encode!(Map.put(usage(16, 5, 21), "padding", String.duplicate("x", size - byte_size(base))))
 
       prefix =
         ~s(event: response.completed\ndata: {"type":"response.completed","service_tier":"priority","usage":)
@@ -40,7 +118,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         state = StreamUsageObserver.observe(StreamUsageObserver.new(), first)
         assert StreamUsageObserver.candidate_bytes(state) <= 16_384
         state = StreamUsageObserver.observe(state, second)
-        assert StreamUsageObserver.usage(state) == @known_usage == size <= 16_384
+
+        if size <= 16_384 do
+          assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
+        else
+          assert StreamUsageObserver.usage(state) == nil
+        end
       end
     end
   end
@@ -52,7 +135,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
       "event: response." <> oversized <> "\ndata: {}",
       ~s(data: {"type":") <> oversized <> ~s(","service_tier":") <> oversized <> ~s("}),
       ~s(data: {"type":"response.completed","service_tier":") <>
-        oversized <> ~s(","usage":) <> Jason.encode!(usage(16, 5, 21)) <> "}"
+        oversized <> ~s(","usage":) <> CodexPooler.JSON.encode!(usage(16, 5, 21)) <> "}"
     ]
 
     for frame <- frames do
@@ -75,14 +158,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
   end
 
   test "data-only SSE boundaries reset tier and recover incomplete usage at every split" do
-    for newline <- ["\n", "\r\n", "\r"], prior_usage <- ["null}", ~s({"input_tokens":)] do
+    for newline <- ["\n", "\r\n", "\r"], {prior_usage, coverage} <- [{"null}", "full"}, {~s({"input_tokens":), "partial"}] do
       prior =
         ~s(data: {"type":"response.created","service_tier":"flex","usage":) <>
           prior_usage <> "\n\n"
 
       terminal =
         ~s(data: {"type":"response.completed","usage":) <>
-          Jason.encode!(usage(16, 5, 21)) <> ~s(,"service_tier":"priority"}\n\n)
+          CodexPooler.JSON.encode!(usage(16, 5, 21)) <> ~s(,"service_tier":"priority"}\n\n)
 
       stream = String.replace(prior <> terminal, "\n", newline)
 
@@ -94,7 +177,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
           |> StreamUsageObserver.observe(first)
           |> StreamUsageObserver.observe(second)
 
-        assert StreamUsageObserver.usage(state) == @known_usage
+        assert assert_observation(StreamUsageObserver.usage(state), %{@completed_no_model | "coverage" => coverage}) == @known_usage
       end
     end
   end
@@ -110,7 +193,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
       |> StreamUsageObserver.observe(first)
       |> StreamUsageObserver.observe(completion <> later)
 
-    assert StreamUsageObserver.usage(state) == @known_usage
+    assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
     assert :binary.referenced_byte_size(state.marker_suffix) <= 64
   end
 
@@ -120,7 +203,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
     for invalid <- [nil, false, 3, "absent", []] do
       prior = usage_event("response.created", invalid, "flex")
       state = StreamUsageObserver.observe(StreamUsageObserver.new(), prior <> terminal)
-      assert StreamUsageObserver.usage(state) == @known_usage
+      assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
     end
   end
 
@@ -139,7 +222,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
           |> StreamUsageObserver.observe(first)
           |> StreamUsageObserver.observe(second)
 
-        assert StreamUsageObserver.usage(state) == @known_usage,
+        assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage,
                "usage lost for split #{split_at}, newline bytes #{byte_size(newline)}"
 
         assert StreamUsageObserver.diagnostics(state).candidate_count == 3
@@ -175,7 +258,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         |> StreamUsageObserver.observe(first)
         |> StreamUsageObserver.observe(second)
 
-      assert StreamUsageObserver.usage(state) == @known_usage
+      assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
     end
   end
 
@@ -228,7 +311,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
           |> StreamUsageObserver.observe(first)
           |> StreamUsageObserver.observe(second)
 
-        assert StreamUsageObserver.usage(state) == @known_usage
+        assert assert_observation(StreamUsageObserver.usage(state), %{@completed_no_model | "coverage" => "partial"}) == @known_usage
         assert StreamUsageObserver.diagnostics(state).classification == "known"
       end
     end
@@ -253,7 +336,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
             usage_event("response.in_progress", usage(1, 1, 2), "flex")
           )
 
-        assert StreamUsageObserver.usage(state) == @known_usage
+        assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
       end
     end
   end
@@ -274,7 +357,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         usage_event("response.completed", measured, "priority")
       )
 
-    assert StreamUsageObserver.usage(state) == %{
+    assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == %{
              @known_usage
              | cached_input_tokens: 4,
                reasoning_tokens: 2
@@ -304,12 +387,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
     retained = RetainedBody.read(retained)
     assert byte_size(retained) == RetainedBody.max_bytes()
 
-    assert ResponseUsage.from_sse(retained) == %{
+    assert assert_observation(ResponseUsage.from_sse(retained), @no_model) == %{
              status: "usage_unknown",
              source: "sse_usage_missing"
            }
 
-    assert StreamUsageObserver.usage(state) == @known_usage
+    assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
   end
 
   test "recovers usage and service tier markers split at every byte boundary" do
@@ -332,7 +415,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         |> StreamUsageObserver.observe(first)
         |> StreamUsageObserver.observe(second)
 
-      assert StreamUsageObserver.usage(state) == @known_usage
+      assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
     end
   end
 
@@ -348,7 +431,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         |> StreamUsageObserver.observe(first)
         |> StreamUsageObserver.observe(second)
 
-      assert StreamUsageObserver.usage(state) == @known_usage
+      assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == @known_usage
     end
   end
 
@@ -363,7 +446,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         })
       )
 
-    assert StreamUsageObserver.usage(state) == %{@known_usage | service_tier: nil}
+    assert assert_observation(StreamUsageObserver.usage(state), @completed_no_model) == %{@known_usage | service_tier: nil}
   end
 
   test "keeps candidate context bounded and abandons oversized usage objects" do
@@ -405,7 +488,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         "\n\n" <> usage_event("response.completed", usage(16, 5, 21), "priority")
       )
 
-    assert StreamUsageObserver.usage(state) == @known_usage
+    assert assert_observation(StreamUsageObserver.usage(state), %{@completed_no_model | "coverage" => "partial"}) == @known_usage
     assert StreamUsageObserver.candidate_bytes(state) == 0
   end
 
@@ -425,7 +508,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
         |> StreamUsageObserver.observe(first)
         |> StreamUsageObserver.observe(second)
 
-      assert StreamUsageObserver.usage(state) == @known_usage
+      assert assert_observation(StreamUsageObserver.usage(state), %{@completed_no_model | "coverage" => "partial"}) == @known_usage
       assert StreamUsageObserver.candidate_bytes(state) == 0
     end
   end
@@ -441,7 +524,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
       |> StreamUsageObserver.observe(terminal)
       |> StreamUsageObserver.observe(later)
 
-    assert StreamUsageObserver.usage(state) == @known_usage
+    assert assert_observation(StreamUsageObserver.usage(state), %{@no_model | "terminal_status" => "incomplete"}) == @known_usage
   end
 
   test "latest valid nonterminal wins while malformed and missing usage cannot erase it" do
@@ -464,7 +547,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
       |> StreamUsageObserver.observe(malformed)
       |> StreamUsageObserver.observe(missing)
 
-    assert StreamUsageObserver.usage(state) == @known_usage
+    assert assert_observation(StreamUsageObserver.usage(state), @no_model) == @known_usage
   end
 
   test "preserves all response usage precedence paths" do
@@ -481,8 +564,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
     assert StreamUsageObserver.resolve(empty, fallback).status == "usage_unknown"
     assert StreamUsageObserver.resolve(nil, fallback) == fallback
     assert StreamUsageObserver.resolve(progress_state, fallback).total_tokens == 5
-    assert StreamUsageObserver.resolve(terminal_state, fallback) == @known_usage
-    assert StreamUsageObserver.resolve(later_state, fallback) == @known_usage
+    assert assert_observation(StreamUsageObserver.resolve(terminal_state, fallback), @completed_no_model) == @known_usage
+    assert assert_observation(StreamUsageObserver.resolve(later_state, fallback), @completed_no_model) == @known_usage
   end
 
   test "reset clears failed-candidate usage and parser context" do
@@ -542,15 +625,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
 
   defp terminal_event_with_usage_before_tail(usage, tail) do
     payload =
-      ~s({"type":"response.completed","response":{"service_tier":#{Jason.encode!(usage.service_tier)},"usage":) <>
-        Jason.encode!(%{
+      ~s({"type":"response.completed","response":{"service_tier":#{CodexPooler.JSON.encode!(usage.service_tier)},"usage":) <>
+        CodexPooler.JSON.encode!(%{
           "input_tokens" => usage.input_tokens,
           "cached_input_tokens" => usage.cached_input_tokens,
           "output_tokens" => usage.output_tokens,
           "reasoning_tokens" => usage.reasoning_tokens,
           "total_tokens" => usage.total_tokens
         }) <>
-        ~s(,"output":#{Jason.encode!(tail)}}})
+        ~s(,"output":#{CodexPooler.JSON.encode!(tail)}}})
 
     "event: response.completed\ndata: " <> payload <> "\n\n"
   end
@@ -558,16 +641,127 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
   defp terminal_event_with_tier_after_usage(usage) do
     payload =
       ~s({"type":"response.completed","response":{"usage":) <>
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "input_tokens" => usage.input_tokens,
           "cached_input_tokens" => usage.cached_input_tokens,
           "output_tokens" => usage.output_tokens,
           "reasoning_tokens" => usage.reasoning_tokens,
           "total_tokens" => usage.total_tokens
         }) <>
-        ~s(,"service_tier":#{Jason.encode!(usage.service_tier)}}})
+        ~s(,"service_tier":#{CodexPooler.JSON.encode!(usage.service_tier)}}})
 
     "event: response.completed\ndata: " <> payload <> "\n\n"
+  end
+
+  describe "served model" do
+    test "the first response object's model is kept through the terminal event" do
+      stream =
+        sse_event("response.created", %{
+          "type" => "response.created",
+          "response" => %{"id" => "resp_1", "model" => "gpt-6-luna", "status" => "in_progress"}
+        }) <>
+          sse_event("response.in_progress", %{
+            "type" => "response.in_progress",
+            "response" => %{"id" => "resp_1", "model" => "gpt-6-luna"}
+          }) <>
+          sse_event("response.completed", %{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => "resp_1",
+              "model" => "gpt-6-astra",
+              "service_tier" => "priority",
+              "usage" => usage(16, 5, 21)
+            }
+          })
+
+      expected = StreamUsageObserver.observe(StreamUsageObserver.new(), stream)
+      assert StreamUsageObserver.served_model(expected) == "gpt-6-luna"
+      assert assert_observation(StreamUsageObserver.usage(expected), %{@completed_no_model | "conflict" => true, "first_conflicting_model" => "gpt-6-astra", "terminal_model" => "gpt-6-astra"}) == Map.put(@known_usage, :served_model, "gpt-6-luna")
+      assert StreamUsageObserver.result(expected).served_model == "gpt-6-luna"
+
+      for split_at <- 0..byte_size(stream) do
+        <<first::binary-size(^split_at), second::binary>> = stream
+
+        actual =
+          StreamUsageObserver.new()
+          |> StreamUsageObserver.observe(first)
+          |> StreamUsageObserver.observe(second)
+
+        assert actual == expected
+      end
+    end
+
+    test "a stream that ends before its terminal event still names the served model" do
+      stream =
+        sse_event("response.created", %{
+          "type" => "response.created",
+          "response" => %{"id" => "resp_1", "model" => "gpt-6-luna"}
+        })
+
+      state = StreamUsageObserver.observe(StreamUsageObserver.new(), stream)
+
+      assert %{status: "usage_unknown", source: "sse_usage_missing", served_model: "gpt-6-luna"} =
+               StreamUsageObserver.result(state)
+    end
+
+    test "a terminal event that declares no model records none" do
+      state =
+        StreamUsageObserver.observe(
+          StreamUsageObserver.new(),
+          usage_event("response.completed", usage(16, 5, 21), "priority")
+        )
+
+      assert StreamUsageObserver.served_model(state) == nil
+      refute Map.has_key?(StreamUsageObserver.usage(state), :served_model)
+      refute Map.has_key?(StreamUsageObserver.result(state), :served_model)
+    end
+
+    test "a root model stands in only when no response object declares one" do
+      chat_shape =
+        sse_event("chunk", %{
+          "model" => "gpt-6-luna",
+          "usage" => usage(16, 5, 21),
+          "service_tier" => "priority"
+        })
+
+      state = StreamUsageObserver.observe(StreamUsageObserver.new(), chat_shape)
+      assert StreamUsageObserver.served_model(state) == "gpt-6-luna"
+
+      both =
+        sse_event("response.created", %{
+          "type" => "response.created",
+          "model" => "root-model",
+          "response" => %{"id" => "resp_1", "model" => "gpt-6-luna"}
+        })
+
+      state = StreamUsageObserver.observe(StreamUsageObserver.new(), both)
+      assert StreamUsageObserver.served_model(state) == "gpt-6-luna"
+    end
+
+    test "model keys nested in output items are not declarations" do
+      stream =
+        sse_event("response.output_item.done", %{
+          "type" => "response.output_item.done",
+          "item" => %{"type" => "image_generation_call", "model" => "gpt-image-1"},
+          "response" => %{"output" => [%{"model" => "nested"}]}
+        }) <>
+          usage_event("response.completed", usage(16, 5, 21), "priority")
+
+      state = StreamUsageObserver.observe(StreamUsageObserver.new(), stream)
+      assert StreamUsageObserver.served_model(state) == nil
+    end
+
+    test "a declared model that is not a plain identifier is fingerprinted" do
+      stream =
+        sse_event("response.created", %{
+          "type" => "response.created",
+          "response" => %{"id" => "resp_1", "model" => "gpt 5.6 luna"}
+        })
+
+      state = StreamUsageObserver.observe(StreamUsageObserver.new(), stream)
+      assert "sha256_" <> digest = StreamUsageObserver.served_model(state)
+      assert String.length(digest) == 12
+    end
   end
 
   defp usage_event(type, usage, service_tier) do
@@ -588,11 +782,20 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserverTest do
   end
 
   defp sse_event(event, payload) do
-    "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
+    "event: " <> event <> "\n" <> "data: " <> CodexPooler.JSON.encode!(payload) <> "\n\n"
   end
 
   defp marker_offset(event, marker) do
     {offset, _length} = :binary.match(event, marker)
     offset
+  end
+
+  defp chunk_bytes(<<>>, _size), do: []
+
+  defp chunk_bytes(data, size) when byte_size(data) <= size, do: [data]
+
+  defp chunk_bytes(data, size) do
+    <<chunk::binary-size(^size), rest::binary>> = data
+    [chunk | chunk_bytes(rest, size)]
   end
 end

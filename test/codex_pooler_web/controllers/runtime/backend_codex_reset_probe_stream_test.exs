@@ -11,8 +11,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.ProviderCreditsFixtures
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
 
   defmodule ClosedChunkAdapter do
     def chunk(_payload, _chunk), do: {:error, :closed}
@@ -93,17 +98,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
     release_ref = make_ref()
 
     fixture =
-      reset_probe_fixture(
-        FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref)
-      )
+      reset_probe_fixture(FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref))
 
     {conn, logs} =
       with_log([level: :warning], fn ->
         conn = post_reset_probe(conn, fixture.setup)
 
-        assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid,
-                        ^release_ref},
-                       1_000
+        assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                       @detection_timeout_ms
 
         send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
         conn
@@ -128,8 +130,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
   end
 
   for {label, stage, mode_kind, expected_error} <- [
-        {"silent stream after headers", :after_sse_headers, :after_headers,
-         "stream_idle_timeout"},
+        {"silent stream after headers", :after_sse_headers, :after_headers, "stream_idle_timeout"},
         {"partial stream", :mid_stream, :mid_stream, "stream_idle_timeout"}
       ] do
     test "#{label} timeout leaves the guarded SSE reset probe claimed", %{conn: conn} do
@@ -142,7 +143,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
       conn = post_reset_probe(conn, fixture.setup)
 
       assert_receive {:fake_upstream_timeout_barrier, unquote(stage), upstream_pid, ^release_ref},
-                     1_000
+                     @detection_timeout_ms
 
       send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
       assert conn.status == 200
@@ -162,8 +163,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
     fixture =
       reset_probe_fixture(
         FakeUpstream.abrupt_close_mid_stream([
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "partial"}}
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "partial"}}
         ])
       )
 
@@ -183,8 +183,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
     fixture =
       reset_probe_fixture(
         FakeUpstream.sse_stream([
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "visible"}}
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "visible"}}
         ])
       )
 
@@ -229,8 +228,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
       reset_probe_fixture(
         FakeUpstream.delayed_terminal_sse_stream(
           [
-            {"response.output_text.delta",
-             %{"type" => "response.output_text.delta", "delta" => "partial"}}
+            {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "partial"}}
           ],
           completed_event("resp_reset_probe_late_terminal"),
           notify: self(),
@@ -241,7 +239,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
     task = Task.async(fn -> post_reset_probe(conn, fixture.setup) end)
 
     assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
-                   1_000
+                   @detection_timeout_ms
 
     expire_reset_probe!(fixture.identity)
     send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
@@ -264,9 +262,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
         {:path_json,
          %{
            "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
-           "/api/codex/usage" =>
-             {200,
-              %{"plan_type" => "pro", "rate_limit_reset_credits" => %{"available_count" => 0}}}
+           "/api/codex/usage" => {200, %{"plan_type" => "pro", "rate_limit_reset_credits" => %{"available_count" => 0}, "credits" => %{"balance" => 0, "has_credits" => false, "unlimited" => false}, "spend_control" => %{"reached" => false}}}
          }}
       )
 
@@ -291,6 +287,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
       |> enable_saved_reset_auto_redeem!()
 
     prime_weekly_exhausted_quota!(identity)
+    ProviderCreditsFixtures.persist_usage!(Repo.reload!(identity), ProviderCreditsFixtures.usage_payload(:weekly_credit_only, credits: :none), DateTime.utc_now())
 
     %{
       setup: %{setup | identity: identity, model: model},
@@ -418,7 +415,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
   end
 
   defp setup_runtime_timeout(timeout_ms) do
-    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -427,8 +424,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeStreamTest do
       |> Keyword.put(:settings, %OperationalSettings{upstream_receive_timeout_ms: timeout_ms})
       |> Keyword.put(:use_instance_settings?, false)
     )
-
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
   end
 
   defp expire_reset_probe!(%UpstreamIdentity{} = identity) do

@@ -9,10 +9,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Callbac
     :upstream_sender,
     :upstream_closer,
     :upstream_invalidator,
+    :connection_reader,
     :downstream_sender,
     :monotonic_now_ms,
     :replay_suspender,
-    :replay_status_reader
+    :replay_status_reader,
+    :replay_retirer
   ]
   defstruct @enforce_keys
 
@@ -21,9 +23,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Callbac
                               WebsocketOwnerSession.request_result()),
           upstream_closer: (pid() -> :ok),
           upstream_invalidator: (pid() -> :ok | {:error, atom()}),
+          connection_reader: (pid() -> {:ok, %{lifecycle_id: Ecto.UUID.t(), generation: pos_integer() | nil}} | {:error, atom()}),
           downstream_sender: (pid(), tuple() -> :ok | {:error, atom()}),
           monotonic_now_ms: (-> integer()),
           replay_suspender: (RequestReplay.arm_input() -> {:ok, map()} | {:error, term()}),
-          replay_status_reader: (map() -> term())
+          replay_status_reader: (map() -> term()),
+          replay_retirer: (map() -> {:ok, :closed | :noop} | {:error, term()})
         }
 end

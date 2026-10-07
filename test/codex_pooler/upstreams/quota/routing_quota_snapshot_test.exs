@@ -6,6 +6,7 @@ defmodule CodexPooler.Upstreams.Quota.RoutingQuotaSnapshotTest do
   alias CodexPooler.Quotas.AccountAvailability
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Quota.CapacityFactsStore
   alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
@@ -127,6 +128,40 @@ defmodule CodexPooler.Upstreams.Quota.RoutingQuotaSnapshotTest do
              RoutingQuotaSnapshot.load_by_identity_ids([identity.id], @as_of)[identity.id]
   end
 
+  test "one joined generation keeps persisted opt-out, exact facts and epoch coherent" do
+    facts = %CodexPooler.Quotas.CapacityFacts{observed_at: @as_of, included_permission: :exhausted, credit_permission: :available, denial_category: :included_limit, balance: "0.125", has_credits: true, unlimited: false}
+    metadata = CapacityFactsStore.transition(%{"credential_epoch" => 3}, facts, 3)
+    identity = upstream_identity_fixture(metadata: metadata)
+    identity = Repo.update!(Ecto.Changeset.change(identity, allow_provider_credits: false))
+
+    snapshot = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], @as_of)[identity.id]
+    refute snapshot.allow_provider_credits
+    assert snapshot.capacity_facts.balance == "0.125"
+    assert snapshot.capacity_facts.credential_epoch == snapshot.credential_epoch
+    Repo.update!(Ecto.Changeset.change(identity, metadata: Map.put(metadata, "credential_epoch", 4)))
+    current = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], @as_of)[identity.id]
+    refute CapacityFactsStore.fresh?(current.capacity_facts, current.credential_epoch, @as_of)
+    refute current.allow_provider_credits
+  end
+
+  @tag credits_negative: true
+  test "present malformed capacity metadata never appears as unreported legacy authority" do
+    for malformed <- [nil, %{"version" => 2}, "invalid"] do
+      identity = upstream_identity_fixture(metadata: %{"quota_capacity_facts" => malformed, "quota_capacity_blocker" => malformed})
+      snapshot = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], @as_of)[identity.id]
+      assert snapshot.capacity_facts == nil
+      assert snapshot.capacity_blockers == []
+      assert snapshot.capacity_blockers_overflowed?
+      assert snapshot.capacity_facts_reported?
+      assert snapshot.capacity_blocker_reported?
+    end
+
+    identity = upstream_identity_fixture(metadata: %{})
+    snapshot = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], @as_of)[identity.id]
+    refute snapshot.capacity_facts_reported?
+    refute snapshot.capacity_blocker_reported?
+  end
+
   defp identity_with_availability!(state, epoch) do
     identity = upstream_identity_fixture(metadata: %{"credential_epoch" => epoch})
 
@@ -167,6 +202,9 @@ defmodule CodexPooler.Upstreams.Quota.RoutingQuotaSnapshotTest do
 
   defp capture_queries(fun) do
     handler_id = {__MODULE__, self(), System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

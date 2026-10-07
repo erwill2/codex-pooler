@@ -9,13 +9,22 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Dev.CodexCompactionSmokeFixture.Journal
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, BridgeSessionAlias, CodexSession}
-  alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.{ModelServingOverride, Pool}
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Quota.Windows
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
 
-  @model "gpt-5.5"
+  @model "gpt-6-sol"
+
+  # The served catalog entry is this source map verbatim, so it carries every
+  # field the released Codex client's `ModelInfo`
+  # (codex-rs/protocol/src/openai_models.rs) decodes without a serde default, reasoning levels as
+  # `{effort, description}` presets, and the instructions the catalog decoder
+  # requires (`base_instructions` or `model_messages.instructions_template`).
+  # One undecodable entry makes Codex discard the whole catalog and keep its
+  # bundled one.
+  @base_instructions "You are Codex, a coding agent. Synthetic instructions of the Codex Pooler compaction smoke fixture."
 
   @type provisioned :: %{
           pool: Pool.t(),
@@ -30,6 +39,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
   def provision!(run_id, upstream_base_url, journal, persist_journal, options \\ []) do
     scope = owner_scope!()
     interrupt_after = Keyword.get(options, :interrupt_after)
+    serving_mode = serving_mode(Keyword.get(options, :serving_mode))
 
     {:ok, provisioned} =
       Repo.transact(fn ->
@@ -48,7 +58,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
 
         maybe_interrupt!(interrupt_after, :assignment)
 
-        model = create_model!(pool, assignment)
+        model = create_model!(pool, assignment, serving_mode)
         journal = journal |> Journal.put_resource(:model, model.id) |> persist_journal.()
         create_quota_windows!(identity, model)
         maybe_interrupt!(interrupt_after, :model)
@@ -72,11 +82,30 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
     provisioned
   end
 
+  @doc """
+  Writes (`full`, `lite`) or clears (`auto`) the run model's serving override
+  through the product write path and returns the written row id, or `nil` once
+  cleared.
+  """
+  @spec set_serving_override!(map(), String.t()) :: String.t() | nil
+  def set_serving_override!(%{"pool_id" => pool_id}, mode)
+      when is_binary(pool_id) and mode in ["full", "lite", "auto"] do
+    scope = owner_scope!()
+    {:ok, %{overrides: overrides}} = update_serving_mode(scope, pool_id, @model, mode)
+
+    case {mode, Enum.find(overrides, &(&1.exposed_model_id == @model))} do
+      {"auto", nil} -> nil
+      {mode, %ModelServingOverride{id: id, mode: mode}} when mode != "auto" -> id
+      _unexpected -> raise "serving override was not written as requested"
+    end
+  end
+
   @spec cleanup!(map()) :: :ok
   def cleanup!(journal) do
     scope = owner_scope!()
     pool_id = journal["pool_id"]
 
+    drop_serving_override(scope, pool_id, Map.get(journal, "serving_override_id"))
     revoke_key(scope, Map.get(journal, "api_key_id"))
     retire_model(journal["model_id"])
     delete_assignment(pool_id, journal["assignment_id"])
@@ -88,6 +117,11 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
 
   @spec model() :: String.t()
   def model, do: @model
+
+  @spec serving_mode(term()) :: :full | :lite
+  def serving_mode(value) when value in [:full, "full"], do: :full
+  def serving_mode(value) when value in [:lite, "lite"], do: :lite
+  def serving_mode(nil), do: :lite
 
   defp owner_scope! do
     Accounts.list_operators()
@@ -145,8 +179,9 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
     assignment
   end
 
-  defp create_model!(pool, assignment) do
+  defp create_model!(pool, assignment, serving_mode) do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    use_responses_lite = serving_mode == :lite
 
     %Model{}
     |> Model.changeset(%{
@@ -167,6 +202,16 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
         "source_assignment_models" => %{
           assignment.id => %{
             "slug" => @model,
+            "display_name" => "GPT Smoke",
+            "description" => "Codex compaction smoke fixture model",
+            "shell_type" => "shell_command",
+            "visibility" => "list",
+            "supported_in_api" => true,
+            "priority" => 0,
+            "support_verbosity" => false,
+            "truncation_policy" => %{"mode" => "bytes", "limit" => 10_000},
+            "experimental_supported_tools" => [],
+            "base_instructions" => @base_instructions,
             "supports_responses" => true,
             "supports_streaming" => true,
             "supports_tools" => true,
@@ -178,10 +223,18 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
               "tools" => true,
               "reasoning" => true
             },
-            "use_responses_lite" => true,
+            "use_responses_lite" => use_responses_lite,
             "input_modalities" => ["text", "image"],
             "supports_image_detail_original" => true,
-            "supported_reasoning_levels" => ["low"],
+            # The tiers the provider's catalog declares for this model, as the
+            # upstream sync stores them. The released client sends its bundled
+            # default tier (`priority` for gpt-6-sol) when nothing configures
+            # one, and the runtime filter refuses a non-default tier the
+            # assignment does not declare (`503 no_compatible_backend`).
+            "service_tiers" => [%{"id" => "priority", "name" => "Fast", "description" => "1.5x speed"}],
+            "default_service_tier" => nil,
+            "additional_speed_tiers" => ["fast"],
+            "supported_reasoning_levels" => [%{"effort" => "low", "description" => "Low reasoning effort"}],
             "default_reasoning_level" => "low",
             "context_window" => 128_000,
             "auto_compact_token_limit" => 200
@@ -237,6 +290,31 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
     {:ok, _windows} = Windows.upsert_quota_windows(identity, windows)
   end
 
+  defp update_serving_mode(scope, pool_id, model, mode) do
+    {:ok, %{revision: revision}} = Pools.model_serving_modes_snapshot(scope, pool_id)
+    Pools.update_model_serving_modes(scope, pool_id, [%{exposed_model_id: model, mode: mode}], revision)
+  end
+
+  # Drops exactly the journalled row, through the product, and only while it
+  # still belongs to the run Pool. Any other override row is left in place, so
+  # the release postcondition reports it instead of hiding it.
+  defp drop_serving_override(_scope, _pool_id, nil), do: :ok
+
+  defp drop_serving_override(scope, pool_id, override_id) do
+    case Repo.get(ModelServingOverride, override_id) do
+      nil ->
+        :ok
+
+      %ModelServingOverride{pool_id: ^pool_id, exposed_model_id: model} ->
+        {:ok, %{overrides: overrides}} = update_serving_mode(scope, pool_id, model, "auto")
+        if Enum.any?(overrides, &(&1.id == override_id)), do: raise("serving override was not dropped")
+        :ok
+
+      %ModelServingOverride{} ->
+        raise "journalled serving override is not run-owned"
+    end
+  end
+
   defp revoke_key(_scope, nil), do: :ok
 
   defp revoke_key(scope, key_id) do
@@ -285,9 +363,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
   defp disable_identity(nil), do: :ok
 
   defp disable_identity(identity_id) do
-    Repo.delete_all(
-      from secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity_id
-    )
+    Repo.delete_all(from secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity_id)
 
     case Repo.get(UpstreamIdentity, identity_id) do
       nil ->
@@ -305,9 +381,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixture.Provisioner do
 
   defp expire_continuity(pool_id) do
     session_ids =
-      Repo.all(
-        from session in CodexSession, where: session.pool_id == ^pool_id, select: session.id
-      )
+      Repo.all(from session in CodexSession, where: session.pool_id == ^pool_id, select: session.id)
 
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 

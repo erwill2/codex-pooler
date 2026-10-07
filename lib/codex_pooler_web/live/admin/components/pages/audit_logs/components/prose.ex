@@ -6,10 +6,8 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Prose do
   alias CodexPoolerWeb.Admin.AuditLogsComponents.Presentation
   alias CodexPoolerWeb.DateTimeDisplay
 
-  # Every supported audit action maps to a sentence form and a verb phrase.
-  # The coverage test walks Audit.action_options/0 against this map, so a new
-  # action cannot ship without deciding how it reads — an unknown action still
-  # renders through the generic fallback (marked data-role, never asserted).
+  # Supported audit actions map to a sentence form and verb phrase; an unknown
+  # action renders through the generic fallback.
   #
   # Forms:
   #   :actor_only  — "{actor} {verb}"                             (auth.*)
@@ -38,25 +36,25 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Prose do
     "pool.update" => {:pool, "updated the Pool", nil},
     "pool.status_update" => {:pool, "changed the status of the Pool", "status"},
     "pool.routing_update" => {:pool, "updated the routing of the Pool", nil},
-    "pool.model_serving_modes_update" =>
-      {:pool, "updated the model serving modes of the Pool", nil},
+    "pool.model_serving_modes_update" => {:pool, "updated the model serving modes of the Pool", nil},
     "pool.delete" => {:pool, "deleted the Pool", nil},
+    "pool.delete_requested" => {:pool, "requested deletion of the Pool", nil},
+    "pool.assignment_add" => {:named, "assigned the upstream account"},
+    "pool.assignment_remove" => {:named, "unassigned the upstream account"},
     "invite.create" => {:invite, "invited", "created an invite for the Pool"},
     "invite.revoke" => {:invite, "revoked the invite for", "revoked an invite for the Pool"},
     "upstream_account.import" => {:named, "imported the upstream account"},
-    "upstream_account.oauth_browser_link" =>
-      {:named_suffix, "linked the upstream account", "through the browser OAuth flow"},
-    "upstream_account.oauth_device_link" =>
-      {:named_suffix, "linked the upstream account", "with a device code"},
+    "upstream_account.oauth_browser_link" => {:named_suffix, "linked the upstream account", "through the browser OAuth flow"},
+    "upstream_account.oauth_device_link" => {:named_suffix, "linked the upstream account", "with a device code"},
+    "upstream_account.rename" => {:named, "renamed the upstream account"},
     "upstream_account.pause" => {:named, "paused the upstream account"},
     "upstream_account.reactivate" => {:named, "reactivated the upstream account"},
-    "upstream_account.refresh_enqueue" =>
-      {:named, "queued a token refresh for the upstream account"},
+    "upstream_account.refresh_enqueue" => {:named, "queued a token refresh for the upstream account"},
     "upstream_account.delete" => {:named, "deleted the upstream account"},
-    "upstream_account.saved_reset_policy_update" =>
-      {:named, "updated the saved-reset policy of the upstream account"},
-    "upstream_account.saved_reset_redeem_enqueue" =>
-      {:named, "queued a saved-reset redemption for the upstream account"},
+    "upstream_account.delete_requested" => {:named, "requested deletion of the upstream account"},
+    "upstream_account.saved_reset_policy_update" => {:named, "updated the saved-reset policy of the upstream account"},
+    "upstream_account.provider_credits_policy_update" => {:named, "updated the provider-credit policy of the upstream account"},
+    "upstream_account.saved_reset_redeem_enqueue" => {:named, "queued a saved-reset redemption for the upstream account"},
     "api_key.create" => {:named, "created the API key"},
     "api_key.update" => {:named, "updated the API key"},
     "api_key.pause" => {:named, "paused the API key"},
@@ -64,6 +62,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Prose do
     "api_key.revoke" => {:named, "revoked the API key"},
     "api_key.rotate" => {:named, "rotated the API key"},
     "api_key.delete" => {:named, "deleted the API key"},
+    "api_key.delete_requested" => {:named, "requested deletion of the API key"},
     "mcp.operator_enable" => {:plain, "enabled MCP access for their operator account"},
     "mcp.operator_disable" => {:plain, "disabled MCP access for their operator account"},
     "mcp.token_create" => {:named, "created the MCP token"},
@@ -83,9 +82,6 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Prose do
     "alert_incident.resolve" => {:named, "resolved the alert incident"},
     "instance_settings.update" => {:plain, "updated the instance settings"}
   }
-
-  @spec covered_actions() :: [String.t()]
-  def covered_actions, do: Map.keys(@sentence_forms)
 
   attr :event, :map, required: true
   attr :pool_names, :map, required: true

@@ -42,13 +42,11 @@ RUNBOOK.md
 /.sisyphus/
 /.desloppify/
 /.elixir_ls/
+/.expert/
 /.impeccable/
 /.omo/
 /.omp/
 .codegraphignore
-/references/*
-!/references/.gitkeep
-!/references/README.md
 
 # Local app-private runtime file payloads.
 /var/codex_pooler/files/
@@ -82,7 +80,8 @@ __pycache__/
 .desloppify/
 scorecard.png
 .omo/
-output/imagegen/
+output/
+outputs/
 .claude/
 graphify-out/
 .planning/

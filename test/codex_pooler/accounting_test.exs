@@ -780,7 +780,10 @@ defmodule CodexPooler.AccountingTest do
                Accounting.recover_stale_reservations(now)
     end
 
-    test "terminalizes stale websocket turn claims without releasing their identity" do
+    # The recovered row keeps its history and gives its claim up: nothing
+    # reached the provider, so its claim protects nothing, and kept it fenced
+    # every resend of the request for good (findings#206 row 206-421).
+    test "terminalizes stale websocket turn claims and releases their claim" do
       setup = accounting_setup()
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       stale_admitted_at = DateTime.add(now, -7, :hour)
@@ -806,12 +809,12 @@ defmodule CodexPooler.AccountingTest do
                response_status_code: 499,
                last_error_code: "stale_websocket_turn_claim_recovered",
                completed_at: ^now,
-               correlation_id: ^turn_id
+               request_metadata: %{"released_turn_claim" => ^turn_id}
              } = Repo.reload!(claimed_request)
 
       assert Accounting.list_ledger_entries_for_request(claimed_request.id) == []
 
-      assert {:error, %{code: :duplicate_request}} =
+      assert {:ok, %{request: %{correlation_id: ^turn_id}}} =
                Accounting.claim_websocket_turn(setup.auth, setup.model, %{
                  endpoint: "/backend-api/codex/responses",
                  correlation_id: turn_id
@@ -884,6 +887,53 @@ defmodule CodexPooler.AccountingTest do
                  rollup_date: rollup_date,
                  dimension_kind: "pool"
                )
+    end
+
+    # A refusal recorded without a turn claim under a correlation id that is
+    # already recorded (the websocket handshake request id an earlier refusal
+    # of the same socket took, or a claim another row holds) is its own row
+    # under a fresh correlation id; the earlier row keeps the correlation
+    # (findings#206 row 206-361).
+    test "an unclaimed denial whose correlation id is taken records its own row and leaves the holder alone" do
+      setup = accounting_setup()
+
+      assert {:ok, %{request: first}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: "socket-handshake-request-id",
+                 transport: "websocket",
+                 last_error_code: "pinned_continuation_unavailable"
+               })
+
+      assert {:ok, %{request: second}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: "socket-handshake-request-id",
+                 transport: "websocket",
+                 last_error_code: "pinned_continuation_unavailable"
+               })
+
+      assert first.correlation_id == "socket-handshake-request-id"
+      refute second.id == first.id
+      assert {:ok, _uuid} = Ecto.UUID.cast(second.correlation_id)
+      assert second.status == "rejected"
+      assert second.last_error_code == "pinned_continuation_unavailable"
+
+      assert {:ok, %{request: claim}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: "held-turn-claim"
+               })
+
+      assert {:ok, %{request: refused}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: claim.correlation_id,
+                 transport: "websocket"
+               })
+
+      refute refused.id == claim.id
+      assert {:ok, _uuid} = Ecto.UUID.cast(refused.correlation_id)
+      assert Repo.reload!(claim) == claim
+
+      assert Repo.aggregate(from(request in CodexPooler.Accounting.Request, where: request.pool_id == ^setup.pool.id), :count, :id) == 4
     end
 
     test "settles stale dispatched reservations from reserved estimate when usage is unknown" do
@@ -1407,9 +1457,7 @@ defmodule CodexPooler.AccountingTest do
                0
 
       identity_row =
-        rollup_row(actual_rows, "upstream_identity",
-          upstream_identity_id: fixture.primary.identity.id
-        )
+        rollup_row(actual_rows, "upstream_identity", upstream_identity_id: fixture.primary.identity.id)
 
       assert identity_row.pool_id == fixture.secondary.pool.id
       assert identity_row.request_count == 2
@@ -1509,6 +1557,9 @@ defmodule CodexPooler.AccountingTest do
   defp count_repo_commands(fun) do
     parent = self()
     handler_id = "accounting-test-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

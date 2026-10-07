@@ -14,6 +14,10 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
   describe "record_complete_events/2" do
     test "records a whole event payload without exposing streaming state" do
       identity = %UpstreamIdentity{id: Ecto.UUID.generate()}
@@ -33,7 +37,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
                RateLimitObserver.record_complete_events(
                  identity,
                  "event: codex.rate_limits\n" <>
-                   "data: #{Jason.encode!(codex_rate_limits_payload(42, reset_at))}\n\n"
+                   "data: #{CodexPooler.JSON.encode!(codex_rate_limits_payload(42, reset_at))}\n\n"
                )
 
       assert window = wait_for_rate_limit_event_window(identity, "primary")
@@ -57,7 +61,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
                RateLimitObserver.record_complete_events(
                  identity,
                  "event: codex.rate_limits\n" <>
-                   "data: #{Jason.encode!(codex_rate_limits_payload(42, reset_at))}\n\n"
+                   "data: #{CodexPooler.JSON.encode!(codex_rate_limits_payload(42, reset_at))}\n\n"
                )
 
       assert window = wait_for_rate_limit_event_window(identity, "primary")
@@ -76,7 +80,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
                RateLimitObserver.record_complete_events(
                  identity,
                  "event: response.failed\n" <>
-                   "data: #{Jason.encode!(usage_limit_terminal_payload())}\n\n"
+                   "data: #{CodexPooler.JSON.encode!(usage_limit_terminal_payload())}\n\n"
                )
 
       wait_for_rate_limit_event_tasks()
@@ -94,7 +98,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
           assert :ok =
                    RateLimitObserver.record_complete_events(
                      identity,
-                     Jason.encode!(%{
+                     CodexPooler.JSON.encode!(%{
                        "type" => "response.output_text.delta",
                        "delta" => "sample"
                      })
@@ -150,7 +154,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
                RateLimitObserver.record_events(
                  identity,
                  "event: response.output_text.delta\n" <>
-                   "data: #{Jason.encode!(%{"type" => "response.output_text.delta"})}\n\n" <>
+                   "data: #{CodexPooler.JSON.encode!(%{"type" => "response.output_text.delta"})}\n\n" <>
                    "event: codex.rate_limits\n",
                  RateLimitObserver.event_state()
                )
@@ -162,7 +166,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
 
       event =
         "event: codex.rate_limits\n" <>
-          "data: #{Jason.encode!(codex_rate_limits_payload(42, reset_at))}\n\n"
+          "data: #{CodexPooler.JSON.encode!(codex_rate_limits_payload(42, reset_at))}\n\n"
 
       {marker_offset, marker_size} = :binary.match(event, "codex.rate_limits")
 
@@ -186,7 +190,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
 
       event =
         "event: codex.rate_limits\r\n" <>
-          "data: #{Jason.encode!(codex_rate_limits_payload(43, reset_at))}\r\n\r\n"
+          "data: #{CodexPooler.JSON.encode!(codex_rate_limits_payload(43, reset_at))}\r\n\r\n"
 
       {split_at, _length} = :binary.match(event, "\r\n")
       split_at = split_at + 1
@@ -207,7 +211,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
 
       event =
         "event: codex.rate_limits\r" <>
-          "data: #{Jason.encode!(codex_rate_limits_payload(44, reset_at))}\r\r"
+          "data: #{CodexPooler.JSON.encode!(codex_rate_limits_payload(44, reset_at))}\r\r"
 
       assert {:ok, state} =
                RateLimitObserver.record_events(identity, event, RateLimitObserver.event_state())
@@ -331,9 +335,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       assert [window] =
                fixture.identity
                |> QuotaWindows.list_quota_windows()
-               |> Enum.filter(
-                 &(&1.source == "codex_rate_limit_event" and &1.window_kind == "primary")
-               )
+               |> Enum.filter(&(&1.source == "codex_rate_limit_event" and &1.window_kind == "primary"))
 
       assert Decimal.equal?(window.used_percent, Decimal.new("68.0"))
       assert %DateTime{} = Repo.reload!(current.entitlement).closed_at
@@ -363,7 +365,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
          fn identity ->
            RateLimitObserver.record_error(
              identity,
-             Jason.encode!(usable_account_rate_limit_error())
+             CodexPooler.JSON.encode!(usable_account_rate_limit_error())
            )
          end},
         {"runtime_event",
@@ -386,9 +388,8 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
 
         assert :ok = observe.(identity)
 
-        assert_receive {^handler_id, %{count: 1},
-                        %{source: ^source, outcome: "confirmed_by_quota"}},
-                       1_000
+        assert_receive {^handler_id, %{count: 1}, %{source: ^source, outcome: "confirmed_by_quota"}},
+                       @detection_timeout_ms
 
         redemption = persisted_redemption(identity)
         assert redemption["convergence_source"] == source
@@ -544,7 +545,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       assert :ok =
                RateLimitObserver.record_error(
                  stale_identity,
-                 Jason.encode!(exhausted_account_rate_limit_error())
+                 CodexPooler.JSON.encode!(exhausted_account_rate_limit_error())
                )
 
       assert redemption_phase(stale_identity) == "reblocked"
@@ -565,7 +566,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
 
           RateLimitObserver.record_error(
             stale_identity,
-            Jason.encode!(%{
+            CodexPooler.JSON.encode!(%{
               "limit_id" => "codex_future_family",
               "window_kind" => "secondary",
               "window_minutes" => "10080",
@@ -612,7 +613,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
           assert :ok =
                    RateLimitObserver.record_error(
                      identity,
-                     Jason.encode!(%{
+                     CodexPooler.JSON.encode!(%{
                        "limit_id" => "codex_future_family",
                        "window_kind" => "secondary",
                        "window_minutes" => "10080",
@@ -694,7 +695,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       end
 
     for _index <- 1..count do
-      assert_receive {:rate_limit_event_task_blocked, _pid}, 1_000
+      assert_receive {:rate_limit_event_task_blocked, _pid}, @detection_timeout_ms
     end
 
     blocker_pids
@@ -982,7 +983,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
   end
 
   defp wait_for_rate_limit_event_window(identity, window_kind, deadline \\ nil) do
-    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+    deadline = deadline || System.monotonic_time(:millisecond) + @detection_timeout_ms
 
     identity
     |> QuotaWindows.list_quota_windows()
@@ -1004,7 +1005,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
   end
 
   defp wait_for_rate_limit_event_tasks(deadline \\ nil) do
-    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+    deadline = deadline || System.monotonic_time(:millisecond) + @detection_timeout_ms
 
     case Task.Supervisor.children(CodexPooler.RateLimitEventSupervisor) do
       [] ->
@@ -1025,6 +1026,9 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
   defp collect_repo_query_events(fun) when is_function(fun, 0) do
     parent = self()
     handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -1070,6 +1074,9 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
     parent = self()
     handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -1093,7 +1100,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       task_pid = await_identity_quota_write(handler_id, identity_id)
       await_task_commit(handler_id, task_pid)
       monitor_ref = Process.monitor(task_pid)
-      assert_receive {:DOWN, ^monitor_ref, :process, ^task_pid, :normal}, 1_000
+      assert_receive {:DOWN, ^monitor_ref, :process, ^task_pid, :normal}, @detection_timeout_ms
       result
     after
       :telemetry.detach(handler_id)
@@ -1116,7 +1123,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       {^handler_id, _pid, _source, _query, _params} ->
         await_identity_quota_write(handler_id, identity_id)
     after
-      1_000 -> flunk("expected async codex.rate_limits quota write for fixture identity")
+      @detection_timeout_ms -> flunk("expected async codex.rate_limits quota write for fixture identity")
     end
   end
 
@@ -1132,7 +1139,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       {^handler_id, _other_pid, _source, _query, _params} ->
         await_task_commit(handler_id, task_pid)
     after
-      1_000 -> flunk("expected async codex.rate_limits Repo COMMIT")
+      @detection_timeout_ms -> flunk("expected async codex.rate_limits Repo COMMIT")
     end
   end
 

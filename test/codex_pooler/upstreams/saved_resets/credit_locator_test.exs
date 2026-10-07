@@ -36,8 +36,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CreditLocatorTest do
             {"ChatGPT_api", @consume_url, @account_scope},
             {"chatgpt_api", @consume_url <> "/", @account_scope},
             {"chatgpt_api", String.replace(@consume_url, "consume", "Consume"), @account_scope},
-            {"chatgpt_api", String.replace(@consume_url, "rate-limit", "rate%2Dlimit"),
-             @account_scope},
+            {"chatgpt_api", String.replace(@consume_url, "rate-limit", "rate%2Dlimit"), @account_scope},
             {"chatgpt_api", @consume_url, String.upcase(@account_scope)},
             {"chatgpt_api", @consume_url, ""}
           ] do
@@ -85,9 +84,9 @@ defmodule CodexPooler.Upstreams.SavedResets.CreditLocatorTest do
 
       tampered =
         locator
-        |> Jason.decode!()
+        |> CodexPooler.JSON.decode!()
         |> put_in(["aad", "endpoint_family"], "codex_api")
-        |> Jason.encode!()
+        |> CodexPooler.JSON.encode!()
 
       assert {:error, %{code: :saved_reset_credit_locator_invalid}} =
                CreditLocator.open(tampered, binding)

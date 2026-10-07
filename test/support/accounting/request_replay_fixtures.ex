@@ -16,7 +16,8 @@ defmodule CodexPooler.RequestReplayFixtures do
   alias CodexPooler.Repo
 
   def replay_fixture(opts \\ []) do
-    %{user: owner} = bootstrap_owner_fixture()
+    # A committed caller passes the owner it committed and registered for removal.
+    owner = Keyword.get_lazy(opts, :owner, fn -> bootstrap_owner_fixture().user end)
     scope = Scope.for_user(owner, ["instance_owner"])
     pool = pool_fixture(%{created_by_user_id: owner.id})
 
@@ -60,7 +61,8 @@ defmodule CodexPooler.RequestReplayFixtures do
         status: "in_progress",
         completed_at: nil,
         upstream_status_code: nil,
-        usage_status: "usage_pending"
+        usage_status: "usage_pending",
+        response_metadata: replay_preparation_metadata()
       })
 
     attempt = attempt |> Ecto.Changeset.change(%{model_id: model.id}) |> Repo.update!()
@@ -111,7 +113,25 @@ defmodule CodexPooler.RequestReplayFixtures do
       scope: scope,
       semantic_digest: semantic_digest,
       session: session,
+      physical_upstream?: Keyword.get(opts, :physical_upstream?, false),
       turn: turn
+    }
+  end
+
+  def replay_preparation_metadata do
+    %{
+      "native_replay_preparation" => %{
+        "version" => 1,
+        "configured_mode" => "full",
+        "effective_mode" => "full",
+        "source" => "override",
+        "reasoning_mode" => "unrestricted",
+        "configured_effort" => nil,
+        "requested_effort" => nil,
+        "applied_effort" => nil,
+        "supports_reasoning_summary" => true,
+        "request_compression_enabled" => false
+      }
     }
   end
 
@@ -308,16 +328,20 @@ defmodule CodexPooler.RequestReplayFixtures do
   def install_reserved_replay_owner(fixture, armed, token, timeout_ms) do
     stop_replay_owner(fixture.session.id)
 
+    upstream_opts = if Map.get(fixture, :physical_upstream?, false), do: [], else: [upstream: replay_owner_upstream()]
+
     {:ok, owner} =
       WebsocketOwnerSession.start_owner(
-        codex_session_id: fixture.session.id,
-        owner_lease_token: fixture.owner_lease_token,
-        owner_instance_id: fixture.session.owner_instance_id,
-        owner_renewal_ms: 60_000,
-        handoff_absolute_timeout_ms: 60_000,
-        monotonic_now_ms: fn -> 10_000 end,
-        upstream: replay_owner_upstream(),
-        persistence: replay_owner_persistence()
+        upstream_opts ++
+          [
+            codex_session_id: fixture.session.id,
+            owner_lease_token: fixture.owner_lease_token,
+            owner_instance_id: fixture.session.owner_instance_id,
+            owner_renewal_ms: 60_000,
+            handoff_absolute_timeout_ms: 60_000,
+            monotonic_now_ms: fn -> 10_000 end,
+            persistence: replay_owner_persistence()
+          ]
       )
 
     downstream = %{pid: self(), epoch: 2, correlation_id: "request-replay-reserve"}

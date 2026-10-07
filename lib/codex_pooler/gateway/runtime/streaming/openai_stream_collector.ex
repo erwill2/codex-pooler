@@ -5,13 +5,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
 
   alias CodexPooler.Gateway.OpenAICompatibility.{ImageObservation, Images, Responses}
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Runtime.Finalization.{Metadata, ResponseUsage}
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
+  alias CodexPooler.Gateway.Runtime.Streaming.ModelDeclarationObserver
+  alias CodexPooler.Gateway.Runtime.Streaming.StreamTiming
   alias CodexPooler.Gateway.Runtime.Streaming.StreamUsageObserver
+  alias CodexPooler.Gateway.Runtime.Streaming.VisibleOutputMark
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamRelay
 
@@ -20,7 +22,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
   def collect_response(response, %SelectedCandidateContext{} = context, finalization_callbacks) do
     collect_stream(response, context, finalization_callbacks, fn body ->
       with {:ok, response_body} <- Responses.response_from_sse(body, context.request_options) do
-        {:ok, %{status: 200, headers: json_headers(), raw_body: Jason.encode!(response_body)}}
+        {:ok,
+         %{
+           status: 200,
+           headers: json_headers(),
+           raw_body: CodexPooler.JSON.encode!(response_body)
+         }}
       end
     end)
   end
@@ -69,15 +76,20 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
          finalization_callbacks,
          parser
        ) do
-    state = %{
-      chunks: [],
-      rate_limit: RateLimitObserver.event_state(),
-      usage_observer: StreamUsageObserver.new()
-    }
+    state =
+      StreamTiming.init_state(
+        %{
+          chunks: [],
+          rate_limit: RateLimitObserver.event_state(),
+          usage_observer: StreamUsageObserver.new()
+        },
+        response
+      )
 
     response_context = %ResponseContext{context: context, response: response}
 
     case StreamRelay.run(state, response, %{
+           buffer_telemetry_opts: [request_options: context.request_options],
            finalize_success: fn body, state ->
              Finalization.finalize_stream_success(
                body,
@@ -89,9 +101,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
            finalize_failure: fn body, reason, state ->
              with {:ok, finalized} <-
                     Finalization.finalize_stream_failure(body, reason, response_context, state) do
-               case Map.fetch(state, :collection_error) do
-                 {:ok, error} -> {:error, error}
-                 :error -> {:ok, finalized}
+               case {reason, Map.fetch(state, :collection_error)} do
+                 {{:chunk, :visible_output_unavailable}, _collection} -> {:error, %{status: 500, code: "gateway_accounting_failed", message: "Visible output authorization unavailable"}}
+                 {_reason, {:ok, error}} -> {:error, error}
+                 {_reason, :error} -> {:ok, finalized}
                end
              end
            end,
@@ -100,24 +113,24 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
            end,
            first_event_retry: first_event_retry_handler(response_context),
            write_chunk: fn state, data ->
+             state = StreamTiming.observe_chunk(state, data)
+
              {:ok, rate_limit_state} =
                RateLimitObserver.collect_events(data, rate_limit_state(state))
 
-             state =
-               maybe_mark_visible_stream_output(
-                 state,
-                 context.reserved.request,
-                 context.attempt,
-                 data
-               )
+             case maybe_mark_visible_stream_output(state, context.reserved.request, context.attempt, data) do
+               {:ok, state} ->
+                 {:ok,
+                  %{
+                    state
+                    | chunks: [data | state.chunks],
+                      rate_limit: rate_limit_state,
+                      usage_observer: StreamUsageObserver.observe(state.usage_observer, data)
+                  }}
 
-             {:ok,
-              %{
-                state
-                | chunks: [data | state.chunks],
-                  rate_limit: rate_limit_state,
-                  usage_observer: StreamUsageObserver.observe(state.usage_observer, data)
-              }}
+               {:error, reason} ->
+                 {:error, reason}
+             end
            end,
            write_keepalive: fn state -> {:ok, state} end,
            keepalive_interval_ms: 0
@@ -143,17 +156,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
         {:ok, Map.put(state, :collected_response, response), ""}
 
       {:error, error} ->
-        {:failure, Map.put(state, :collection_error, error), "",
-         {:collected_response_invalid, error.status, error.code}}
+        {:failure, Map.put(state, :collection_error, error), "", {:collected_response_invalid, error.status, error.code}}
     end
   end
 
   defp put_json_usage(state, body, upstream_response) do
     if Metadata.json_content?(upstream_response) do
       usage =
-        case Jason.decode(body) do
-          {:ok, decoded} -> ResponseUsage.from_stream_event(decoded)
-          {:error, _reason} -> %{status: "usage_unknown", source: "json_decode_failed"}
+        case CodexPooler.JSON.decode(body) do
+          {:ok, decoded} -> ModelDeclarationObserver.put_usage(ResponseUsage.from_stream_event(decoded), ModelDeclarationObserver.json(decoded))
+          {:error, _reason} -> ResponseUsage.from_json(body)
         end
 
       state |> Map.delete(:usage_observer) |> Map.put(:response_usage, usage)
@@ -181,16 +193,17 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
          _attempt,
          _data
        ),
-       do: state
+       do: {:ok, state}
 
   defp maybe_mark_visible_stream_output(state, request, attempt, data) do
     if StreamProtocol.stream_data_visible?(data) do
-      case SessionContinuity.mark_codex_turn_visible(request, attempt) do
-        :ok -> Map.put(state, :visible_output_marked?, true)
-        {:error, :stale_generation} -> state
+      case VisibleOutputMark.mark(request, attempt) do
+        :ok -> {:ok, Map.put(state, :visible_output_marked?, true)}
+        {:error, :stale_generation} -> {:ok, state}
+        {:error, reason} -> {:error, reason}
       end
     else
-      state
+      {:ok, state}
     end
   end
 

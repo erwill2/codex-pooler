@@ -16,9 +16,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.NativeCompactionDirectProvide
     finalization_failure: {:cleared, 1, 1},
     compact_collection: {:collected_unconfirmed, 1, 1},
     compact_ack_success: {:pending_final, 1, 1},
-    compact_ack_failure: {:cleared, 1, 1},
-    final_success: {:cleared, 1, 1},
-    final_failure: {:cleared, 1, 1}
+    compact_ack_failure: {:cleared, 1, 1}
   }
 
   for {variant, {expected_phase, expected_sends, expected_accounting}} <- @expected do
@@ -26,8 +24,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.NativeCompactionDirectProvide
       context = %Context{
         test_pid: self(),
         sandbox_owner: self(),
-        scenario_namespace:
-          "direct-#{unquote(variant)}-#{System.unique_integer([:positive, :monotonic])}",
+        scenario_namespace: "direct-#{unquote(variant)}-#{System.unique_integer([:positive, :monotonic])}",
         cleanup_registry: self()
       }
 

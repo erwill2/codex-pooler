@@ -6,17 +6,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: ResetFormatting
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection
   alias CodexPoolerWeb.Admin.UpstreamFilterForm
   alias CodexPoolerWeb.Admin.UpstreamOAuthDialogComponents
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ProviderCreditsComponents
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents
   alias CodexPoolerWeb.RelativeTime
   alias Phoenix.HTML.Form
 
-  @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
-  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
-  @saved_reset_docs_url "https://docs.codex-pooler.com/operators/upstreams/#saved-resets"
+  @oauth_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#openai-oauth-upstream-linking"
+  @upstream_actions_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
+  @saved_reset_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#saved-resets"
 
   attr :pools, :list, required: true
   attr :can_manage_pools?, :boolean, required: true
@@ -43,6 +45,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :delete_account_form, :any, required: true
   attr :editing_saved_reset_policy, :map, default: nil
   attr :saved_reset_policy_form, :any, required: true
+  attr :editing_provider_credits_policy, :map, default: nil
+  attr :provider_credits_policy_form, :any, default: nil
   attr :confirming_saved_reset_redemption, :map, default: nil
   attr :account_panel_views, :map, required: true
   attr :upstream_accounts, :list, required: true
@@ -51,7 +55,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   def upstreams_page(assigns) do
     ~H"""
-    <section id="admin-upstreams-live" class="grid min-w-0 gap-6">
+    <section id="admin-upstreams-live" phx-hook="SavedResetConnection" class="grid min-w-0 gap-6">
+      <AdminComponents.saved_reset_connection_notice id="saved-reset-connection-list" in_flight={Enum.any?(@upstream_accounts, &saved_reset_open?/1)} />
       <AdminComponents.page_header
         id="upstream-account-page-header"
         title="Upstreams"
@@ -100,6 +105,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
         datetime_preferences={@datetime_preferences}
       />
+      <.provider_credits_policy_dialog account={@editing_provider_credits_policy} form={@provider_credits_policy_form} />
 
       <section id="upstream-account-surface" class="grid min-w-0 gap-4">
         <.upstream_filter_form
@@ -221,7 +227,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         <summary
           data-role="status-filter-trigger"
           aria-label="Status"
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.status_filter_icon option={@selected} />
           <span class="truncate">{@selected.label}</span>
@@ -404,7 +410,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               <select
                 id="oauth_link_pool_id"
                 name={@oauth_link_form[:pool_id].name}
-                class="select select-bordered w-full"
+                class="select w-full"
               >
                 <option value="" selected={oauth_pool_selected?(@oauth_link_form, "")}>
                   Select Pool
@@ -571,8 +577,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <p class="text-sm font-semibold uppercase tracking-wide text-error">Upstream account</p>
           <h2 class="mt-1 text-2xl font-bold text-base-content">Delete {@account.label}?</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            It stops serving traffic immediately and leaves every routing surface with it.
-            This cannot be undone.
+            This permanently removes the account, credentials, quotas, Pool assignments, and account-specific statistics from the database.
+            Shared request accounting remains without an account association. This cannot be undone.
           </p>
         </div>
         <.form
@@ -627,6 +633,43 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   attr :account, :map, default: nil
   attr :form, :any, default: nil
+
+  def provider_credits_policy_dialog(assigns) do
+    ~H"""
+    <dialog :if={@account && @form} id="provider-credits-policy-dialog" class="modal modal-bottom overflow-x-hidden sm:modal-middle" aria-labelledby="provider-credits-policy-dialog-title" aria-modal="true" phx-window-keydown="cancel_provider_credits_policy" phx-key="escape" phx-remove={JS.pop_focus()} open>
+      <.focus_wrap id="provider-credits-policy-dialog-panel" class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl" phx-mounted={JS.focus(to: "#provider-credits-enabled")}>
+        <div class="border-b border-base-300 px-5 py-4">
+          <p class="text-xs font-semibold uppercase tracking-wide text-primary">Upstream account</p>
+          <h2 id="provider-credits-policy-dialog-title" class="mt-1 text-xl font-bold text-base-content">Provider credits</h2>
+          <p class="mt-1 text-xs leading-5 text-base-content/60">Balance and admission policy for every Pool using this upstream.</p>
+        </div>
+        <div class="grid gap-4 p-5">
+          <ProviderCreditsComponents.provider_credits_policy_form form={@form} />
+          <details :if={Map.has_key?(@account, :provider_credits_summary)} id="provider-credits-observation-details" class="group border-t border-base-300 pt-4" data-preserve-open>
+            <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold text-base-content transition-colors hover:bg-base-200/50 [&::-webkit-details-marker]:hidden">
+              Balance and availability <.icon name="hero-chevron-right" class="size-4 text-base-content/50 transition-transform group-open:rotate-90" />
+            </summary>
+            <div class="pt-4">
+              <ProviderCreditsComponents.provider_credits_details summary={@account.provider_credits_summary} />
+            </div>
+          </details>
+        </div>
+        <AdminComponents.dialog_footer id="provider-credits-policy-dialog-footer">
+          <:actions>
+            <AdminComponents.action_button id="provider-credits-policy-cancel" label="Cancel" variant={:ghost} phx-click="cancel_provider_credits_policy" />
+            <AdminComponents.action_button id="provider-credits-save" label="Save policy" icon="hero-check" type="submit" form="provider-credits-policy-form" variant={:primary} phx-disable-with="Saving…" />
+          </:actions>
+        </AdminComponents.dialog_footer>
+      </.focus_wrap>
+      <form method="dialog" class="modal-backdrop">
+        <button id="provider-credits-policy-backdrop" type="button" phx-click="cancel_provider_credits_policy">close</button>
+      </form>
+    </dialog>
+    """
+  end
+
+  attr :account, :map, default: nil
+  attr :form, :any, default: nil
   attr :confirming_saved_reset_redemption, :map, default: nil
   attr :datetime_preferences, :map, required: true
 
@@ -657,8 +700,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           </p>
         </div>
 
+        <AdminComponents.saved_reset_connection_notice id="saved-reset-connection-bank" class="border-b border-base-300 px-5 py-3" in_flight={saved_reset_open?(@account)} />
         <.form
           id="saved-reset-policy-form"
+          data-saved-reset-form
+          data-saved-reset-identity={@account.identity.id}
           for={@form}
           phx-change="validate_saved_reset_policy"
           phx-submit="save_saved_reset_policy"
@@ -731,6 +777,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                   }
                   id="saved-reset-redemption-action"
                   data-role="saved-reset-redemption-action"
+                  data-saved-reset-action="open-redemption"
+                  data-server-disabled={to_string(!@account.saved_reset_redemption_action.available?)}
                   type="button"
                   class="btn btn-secondary btn-sm gap-2"
                   phx-click="open_saved_reset_redemption_confirmation"
@@ -743,7 +791,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 </button>
               </span>
             </div>
-            <div
+            <AdminComponents.saved_reset_confirmation
               :if={
                 confirming_saved_reset_redemption?(
                   @confirming_saved_reset_redemption,
@@ -751,37 +799,25 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 )
               }
               id="saved-reset-redemption-confirmation"
-              data-role="saved-reset-redemption-confirmation"
-              class="flex flex-wrap items-center justify-between gap-2 rounded-box border border-warning/30 bg-warning/10 px-3 py-2"
-            >
-              <p class="text-xs leading-5 text-base-content/75">
-                Queue one account-level recovery attempt? Account state is checked again before a job runs.
-              </p>
-              <span class="flex items-center gap-2">
-                <button
-                  id="saved-reset-redemption-confirm"
-                  type="button"
-                  class="btn btn-primary btn-sm gap-2"
-                  phx-click="redeem_saved_reset"
-                  phx-value-id={@account.identity.id}
-                >
-                  <.icon name="hero-check" class="size-4" />
-                  <span>Queue redemption</span>
-                </button>
-                <button
-                  id="saved-reset-redemption-cancel"
-                  type="button"
-                  class="btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"
-                  phx-click="cancel_saved_reset_redemption"
-                >
-                  <span>Keep resets in bank</span>
-                </button>
-              </span>
-            </div>
+              identity_id={@account.identity.id}
+              surface={:bank}
+              confirm_id="saved-reset-redemption-confirm"
+              cancel_id="saved-reset-redemption-cancel"
+              disabled={!@account.saved_reset_redemption_action.available?}
+            />
+            <AdminComponents.saved_reset_operation
+              identity_id={@account.identity.id}
+              surface={:bank}
+              operation={@account.saved_reset_operation}
+              refreshing={Map.get(@account, :saved_reset_status_refreshing?, false)}
+            />
+            <%!-- A status hold is already explained by the receipt above; the
+            line names the account or bank reason the receipt cannot. --%>
             <p
               :if={
                 !@account.saved_reset_redemption_action.available? &&
-                  @account.saved_reset_redemption_action.reason
+                  @account.saved_reset_redemption_action.reason &&
+                  is_nil(SavedResetProjection.status_hold(@account.saved_reset_operation))
               }
               id="saved-reset-redemption-unavailable-reason"
               class="text-xs leading-5 text-base-content/55"
@@ -815,6 +851,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               <SavedResetComponents.saved_reset_expiration_table
                 id="saved-reset-expiration"
                 saved_resets={@account.saved_resets}
+                calendar_path={~p"/admin/upstreams/#{@account.identity.id}/saved-reset-expirations.ics"}
                 datetime_preferences={@datetime_preferences}
                 empty_label="No expiration dates reported for the available saved resets yet."
               />
@@ -849,12 +886,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <:actions>
             <AdminComponents.action_button
               id="saved-reset-policy-cancel"
-              label="Cancel"
+              label="Close"
               variant={:ghost}
               phx-click="cancel_saved_reset_policy"
             />
             <AdminComponents.action_button
               id="saved-reset-policy-submit"
+              data-saved-reset-action="save-policy"
+              data-server-disabled="false"
               icon="hero-check"
               label="Save policy"
               type="submit"
@@ -899,6 +938,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   defp confirming_saved_reset_redemption?(%{identity_id: identity_id}, identity_id), do: true
   defp confirming_saved_reset_redemption?(_confirmation, _identity_id), do: false
+
+  defp saved_reset_open?(account), do: match?(%{saved_reset_operation: %{open?: true}}, account)
 
   defp saved_reset_redemption_title(%{available?: true}), do: "Queue manual redemption"
 

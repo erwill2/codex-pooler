@@ -230,8 +230,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
       upstream_assignment_fixture(pool, %{
         identity_metadata: %{
           "credential_epoch" => 1,
-          AccountAvailabilityStore.metadata_key() =>
-            AccountAvailabilityStore.encode!(:available, as_of, 1)
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
         }
       })
 
@@ -289,8 +288,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
         chatgpt_account_id: "acct-quota-windowless",
         identity_metadata: %{
           "credential_epoch" => 1,
-          AccountAvailabilityStore.metadata_key() =>
-            AccountAvailabilityStore.encode!(:available, as_of, 1)
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
         }
       })
 
@@ -324,8 +322,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
         chatgpt_account_id: "acct-quota-windowless-model-detail",
         identity_metadata: %{
           "credential_epoch" => 1,
-          AccountAvailabilityStore.metadata_key() =>
-            AccountAvailabilityStore.encode!(:available, as_of, 1)
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
         }
       })
 
@@ -573,14 +570,10 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     reset_at = DateTime.add(observed_at, 3_600, :second)
 
     controls = [
-      {"D8 exhausted credits", "acct-quota-d8",
-       %{active_limit: nil, credits: 3817, used_percent: Decimal.new("100")}},
-      {"D12 capacity credits", "acct-quota-d12",
-       %{active_limit: 601, credits: 601, used_percent: Decimal.new("0")}},
-      {"Unknown used credits", "acct-quota-unknown-used",
-       %{active_limit: nil, credits: 1701, used_percent: nil}},
-      {"Zero exhausted credits", "acct-quota-zero",
-       %{active_limit: nil, credits: 0, used_percent: Decimal.new("100")}}
+      {"D8 exhausted credits", "acct-quota-d8", %{active_limit: nil, credits: 3817, used_percent: Decimal.new("100")}},
+      {"D12 capacity credits", "acct-quota-d12", %{active_limit: 601, credits: 601, used_percent: Decimal.new("0")}},
+      {"Unknown used credits", "acct-quota-unknown-used", %{active_limit: nil, credits: 1701, used_percent: nil}},
+      {"Zero exhausted credits", "acct-quota-zero", %{active_limit: nil, credits: 0, used_percent: Decimal.new("100")}}
     ]
 
     for {account_label, chatgpt_account_id, attrs} <- controls do
@@ -817,7 +810,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
     structured = result["structuredContent"]
-    serialized_structured = Jason.encode!(structured)
+    serialized_structured = CodexPooler.JSON.encode!(structured)
 
     for forbidden <- [raw_metadata, provider_payload, raw_evidence, auth_json] do
       refute serialized_structured =~ forbidden
@@ -918,7 +911,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
     structured = result["structuredContent"]
-    serialized_structured = Jason.encode!(structured)
+    serialized_structured = CodexPooler.JSON.encode!(structured)
 
     for forbidden <- [
           raw_email,
@@ -1192,7 +1185,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert [item] = result["structuredContent"]["items"]
     assert item["id"] == visible_identity.id
     refute text =~ "Invisible quota account"
-    refute Jason.encode!(result["structuredContent"]) =~ invisible_identity.id
+    refute CodexPooler.JSON.encode!(result["structuredContent"]) =~ invisible_identity.id
 
     assert {:ok, get_result} =
              ToolDispatch.call(
@@ -1311,7 +1304,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
              "count" => 1
            }
 
-    refute Jason.encode!(filtered_result["structuredContent"]) =~ identity.id
+    refute CodexPooler.JSON.encode!(filtered_result["structuredContent"]) =~ identity.id
     assert :ok = Redaction.assert_mcp_output_safe!(filtered_result)
   end
 
@@ -1501,6 +1494,32 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert window.upstream_model == nil
     assert window.remaining_value == 25
     assert window.active_limit == 50
+  end
+
+  @tag credits_negative: true
+  test "quota policy changes effective admission without rewriting observed quota DTOs", %{scope: scope, auth: auth} do
+    pool = pool_fixture()
+    %{identity: identity} = upstream_assignment_fixture(pool, %{identity_metadata: %{"credential_epoch" => 1}})
+    now = DateTime.utc_now()
+    identity = CodexPooler.ProviderCreditsFixtures.persist_usage!(identity, CodexPooler.ProviderCreditsFixtures.usage_payload(:weekly_credit_only, now: now), now)
+    before = ReadModel.account_summary(identity)
+    assert before.capacity_decision.reason_codes == []
+    assert before.capacity_decision.routing_usable
+    assert before.capacity_decision.qualification == "provider_attested"
+    assert before.capacity_decision.scope == "account"
+    assert {:ok, _} = CodexPooler.Upstreams.update_provider_credits_policy_for_scope(scope, identity.id, %{allow_provider_credits: false})
+    after_policy = ReadModel.account_summary(Repo.reload!(identity))
+    assert after_policy.quota_windows == before.quota_windows
+    assert after_policy.allow_provider_credits == false
+    assert after_policy.capacity_decision.reason_codes == ["provider_credits_disabled"]
+    assert {:ok, result} = ToolDispatch.call("codex_pooler_get_upstream_quota", %{"selector" => identity.id}, %{auth: auth})
+    assert result["structuredContent"]["item"]["capacity_decision"]["scope"] == "account"
+    assert result["structuredContent"]["item"]["quota_windows"] |> hd() |> Map.fetch!("credits") == 25
+    assert [%{"text" => text}] = result["content"]
+    assert text =~ "provider credits policy disabled"
+    assert text =~ "account scope (request permission and billing source not guaranteed)"
+    assert text =~ "provider_credits_disabled"
+    refute text =~ "quota_capacity_facts"
   end
 
   defp assert_dto_keys(window) do

@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
 
   alias CodexPooler.{Accounts, Catalog, Dev, InstanceSettings, MCP, Pools}
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.SystemPageComponents
   alias CodexPoolerWeb.Admin.SystemSettingsForm
   alias CodexPoolerWeb.DateTimeDisplay
@@ -62,9 +63,13 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
              socket.assigns[:user_session_id]
            )
        )
-       |> assign_forms()}
+       |> assign_forms()
+       |> NotificationCenterHooks.follow_viewer_visibility()}
     else
-      {:ok, assign(socket, page_title: "System", owner_authorized?: false)}
+      {:ok,
+       socket
+       |> assign(page_title: "System", owner_authorized?: false)
+       |> NotificationCenterHooks.follow_viewer_visibility()}
     end
   end
 
@@ -163,8 +168,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
         {:ok, %{code: :smtp_test_email_sent}} ->
           %{
             tone: :success,
-            message:
-              "Test email sent to #{operator_email_for_status(socket.assigns.current_scope)}"
+            message: "Test email sent to #{operator_email_for_status(socket.assigns.current_scope)}"
           }
 
         {:error, %Ecto.Changeset{} = changeset} ->
@@ -297,6 +301,22 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     end
   end
 
+  # Instance settings belong to owners. A viewer who lost or gained the owner
+  # role reloads the page, which mounts it again with the role it has now: a
+  # demoted owner's settings forms go, a promoted admin's appear. Any other
+  # change of the viewer's Pools leaves an owner's open forms alone (findings#206
+  # row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    if Pools.owner?(socket.assigns.current_scope) == socket.assigns.owner_authorized? do
+      {:noreply, socket}
+    else
+      {:noreply, push_navigate(socket, to: system_path(socket.assigns[:selected_tab]))}
+    end
+  end
+
+  defp system_path(tab) when is_binary(tab), do: ~p"/admin/system?#{%{tab: tab}}"
+  defp system_path(_tab), do: ~p"/admin/system"
+
   @impl true
   def render(assigns) do
     assigns =
@@ -312,6 +332,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
       current_scope={@current_scope}
       active_nav={:system}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-system-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
@@ -507,8 +528,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
   defp sample_data_import_status(result) do
     %{
       tone: :success,
-      message:
-        "Sample data imported: #{length(result.pools)} pools, #{length(result.api_keys)} API keys, #{length(result.upstream_identities)} upstream accounts, #{length(result.assignments)} assignments, #{length(result.models)} models, #{length(result.quota_windows)} quota windows, #{length(result.request_logs)} request logs, #{length(result.invites)} invites, #{length(result.audit_events)} audit events, and #{length(result.jobs)} jobs."
+      message: "Sample data imported: #{length(result.pools)} pools, #{length(result.api_keys)} API keys, #{length(result.upstream_identities)} upstream accounts, #{length(result.assignments)} assignments, #{length(result.models)} models, #{length(result.quota_windows)} quota windows, #{length(result.request_logs)} request logs, #{length(result.invites)} invites, #{length(result.audit_events)} audit events, and #{length(result.jobs)} jobs."
     }
   end
 

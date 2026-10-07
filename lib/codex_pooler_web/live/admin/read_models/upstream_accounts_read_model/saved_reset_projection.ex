@@ -2,21 +2,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
   @moduledoc false
 
   alias CodexPooler.Upstreams.SavedResets
+  alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting
   alias CodexPoolerWeb.DateTimeDisplay
-
-  # Human-readable phase labels for operators. Deliberately omits any token,
-  # idempotency key, or raw provider detail.
-  @lifecycle_labels %{
-    "consuming" => "Redeeming",
-    "consumed_pending_probe" => "Reset consumed — confirming",
-    "confirmed_by_upstream" => "Reset confirmed by probe",
-    "confirmed_by_quota" => "Reset confirmed by quota",
-    "reblocked" => "Reset consumed — awaiting usable quota",
-    "expired" => "Reset confirmation expired",
-    "consume_not_applied" => "Reset was not applied"
-  }
 
   @type action :: %{
           required(:available?) => boolean(),
@@ -51,12 +40,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
           required(:reset_lifecycle) => reset_lifecycle() | nil
         }
   @type auto_redemption_cause :: %{required(:label) => String.t()}
-  @type reset_lifecycle :: %{
-          required(:phase) => String.t(),
-          required(:label) => String.t(),
-          required(:consumed_at) => String.t() | nil,
-          required(:deadline_at) => String.t() | nil
-        }
+  # Only the recognized phase: `redemption_action/1` names the claim's blocker from it. The receipt
+  # (`SavedResetOperationProjection`) owns every operator-facing lifecycle fact.
+  @type reset_lifecycle :: %{required(:phase) => String.t()}
 
   @spec snapshot(UpstreamIdentity.t() | map() | nil, DateTimeDisplay.preferences()) :: snapshot()
   def snapshot(identity, datetime_preferences) do
@@ -71,7 +57,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
       next_expires_label: next_expires_label(snapshot, datetime_preferences),
       next_expires_title: next_expires_title(snapshot, datetime_preferences),
       last_auto_redemption_cause: last_auto_redemption_cause(snapshot.last_redemption),
-      reset_lifecycle: reset_lifecycle(snapshot.last_redemption, datetime_preferences)
+      reset_lifecycle: reset_lifecycle(snapshot.last_redemption)
     })
   end
 
@@ -79,7 +65,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
          "trigger_kind" => "gateway_auto",
          "trigger_detail" => "exhausted"
        }),
-       do: %{label: "Request · weekly exhausted"}
+       do: %{label: "Request · long-window quota exhausted"}
 
   defp last_auto_redemption_cause(%{
          "trigger_kind" => "gateway_auto",
@@ -91,7 +77,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
          "trigger_kind" => "scheduled_expiry_rescue",
          "trigger_detail" => "exhausted"
        }),
-       do: %{label: "Scheduled · weekly exhausted"}
+       do: %{label: "Scheduled · long-window quota exhausted"}
 
   defp last_auto_redemption_cause(%{
          "trigger_kind" => "scheduled_expiry_rescue",
@@ -107,22 +93,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
 
   defp last_auto_redemption_cause(_redemption), do: nil
 
-  defp reset_lifecycle(%{"phase" => phase} = redemption, datetime_preferences)
-       when is_map_key(@lifecycle_labels, phase) do
-    %{
-      phase: phase,
-      label: Map.fetch!(@lifecycle_labels, phase),
-      consumed_at: format_lifecycle_datetime(redemption["consumed_at"], datetime_preferences),
-      deadline_at: format_lifecycle_datetime(redemption["deadline_at"], datetime_preferences)
-    }
-  end
-
-  defp reset_lifecycle(_redemption, _datetime_preferences), do: nil
-
-  defp format_lifecycle_datetime(value, datetime_preferences) do
-    case Formatting.parse_datetime(value) do
-      %DateTime{} = datetime -> DateTimeDisplay.format_datetime(datetime, datetime_preferences)
-      nil -> nil
+  defp reset_lifecycle(redemption) do
+    case RedemptionLifecycle.phase(redemption) do
+      phase when is_binary(phase) -> %{phase: phase}
+      _legacy_or_unknown -> nil
     end
   end
 
@@ -148,8 +122,33 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
   @spec policy(map()) :: SavedResets.auto_policy_projection()
   def policy(identity), do: SavedResets.auto_policy(identity)
 
+  @doc """
+  Whether a manual redemption can be offered: the account and bank checks, then the recorded status
+  (`status_hold/1`), each with the reason the controls show.
+  """
   @spec redemption_action(map()) :: action()
   def redemption_action(account) do
+    existing_action = domain_redemption_action(account)
+
+    case existing_action.available? && status_hold(Map.get(account, :saved_reset_operation)) do
+      reason when is_binary(reason) -> action(false, reason)
+      _available_or_refused -> existing_action
+    end
+  end
+
+  @doc """
+  Why the recorded saved-reset status holds back another manual redemption, or `nil`: an accepted
+  request, a request status that could not be read, a reset still in progress, or an outcome that is
+  not established yet. The operator reviews that status instead of submitting again.
+  """
+  @spec status_hold(map() | nil) :: String.t() | nil
+  def status_hold(%{request: %{state: state}}) when state in [:queued, :processing], do: "saved reset request is already accepted"
+  def status_hold(%{request: %{state: :unavailable}}), do: "saved reset request status is unavailable"
+  def status_hold(%{active?: true}), do: "the last saved reset is still in progress"
+  def status_hold(%{unresolved?: true}), do: "the last saved reset is unresolved; another redemption waits until it resolves"
+  def status_hold(_operation), do: nil
+
+  defp domain_redemption_action(account) do
     cond do
       account.identity.status == "deleted" ->
         action(false, "deleted accounts cannot redeem saved resets")
@@ -163,19 +162,39 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
       account.assignments == [] ->
         action(false, "saved reset redemption requires a Pool assignment")
 
-      account.saved_resets.reported? == false ->
+      true ->
+        bank_redemption_action(account.saved_resets)
+    end
+  end
+
+  defp bank_redemption_action(saved_resets) do
+    cond do
+      saved_resets.reported? == false ->
         action(false, "saved reset count is not reported")
 
-      account.saved_resets.available? == false ->
+      saved_resets.available? == false ->
         action(false, "no saved resets are available")
 
-      account.saved_resets.in_progress? == true ->
+      saved_resets.in_progress? == true ->
         action(false, "saved reset redemption is already in progress")
+
+      Map.get(saved_resets, :redemption_blocked?) == true ->
+        action(false, blocked_redemption_reason(get_in(saved_resets, [:reset_lifecycle, :phase])))
 
       true ->
         action(true, nil)
     end
   end
+
+  # The claim refuses these records too, so offering the action would only
+  # queue a request that stops before reaching the provider.
+  defp blocked_redemption_reason("reblocked"),
+    do: "the last saved reset was applied and quota is still blocked; another redemption waits until a usage report shows quota recovered"
+
+  defp blocked_redemption_reason("expired"),
+    do: "the last saved reset was not confirmed in time; another redemption waits until a usage report shows quota recovered"
+
+  defp blocked_redemption_reason(_phase), do: "the last saved reset is unresolved; another redemption waits until it resolves"
 
   defp next_expires_label(%{next_expires_at: expires_at}, datetime_preferences) do
     case Formatting.parse_datetime(expires_at) do

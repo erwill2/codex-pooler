@@ -2,21 +2,23 @@ defmodule CodexPooler.Gateway.Transports.OrdinarySuccessTestSeed do
   @moduledoc false
   import ExUnit.Assertions
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Transports.OwnerAccountingSeed
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession, as: Upstream
-  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession, as: Owner
 
   def boundary(original) do
     {:ok, server} =
       FakeUpstream.start_link(
         FakeUpstream.websocket_text_frames([
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{"id" => "resp_seed_authority", "status" => "completed"}
           })
         ])
       )
 
-    {:ok, store} = Agent.start_link(fn -> %{} end)
+    # Not linked: the exit of the test process would stop it while the `on_exit`
+    # below stops it too, and an owner's teardown still reads it before then.
+    {:ok, store} = Agent.start(fn -> %{} end)
 
     boundary = %{
       start: fn ->
@@ -60,9 +62,10 @@ defmodule CodexPooler.Gateway.Transports.OrdinarySuccessTestSeed do
 
   def request(owner, downstream, binding, url) do
     request = %Upstream.Request{
+      provider_credits_context: CodexPooler.ProviderCreditsDispatchSupport.context!(),
       url: url <> "/backend-api/codex/responses",
       headers: [],
-      payload: Jason.encode!(%{"model" => "ordinary-authority-seed", "input" => []}),
+      payload: CodexPooler.JSON.encode!(%{"model" => "ordinary-authority-seed", "input" => []}),
       request_id: Ecto.UUID.generate(),
       attempt_id: Ecto.UUID.generate(),
       effective_serving_mode: "full",
@@ -71,7 +74,9 @@ defmodule CodexPooler.Gateway.Transports.OrdinarySuccessTestSeed do
       message_mapper: & &1
     }
 
-    assert {:ok, result} = Owner.submit_request(owner, downstream, request)
+    assert {:ok, result} =
+             OwnerAccountingSeed.submit(owner, downstream, request)
+
     receipt = result.ordinary_success_result
 
     binding = %{

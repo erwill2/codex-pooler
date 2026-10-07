@@ -88,6 +88,9 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP do
     resolve_x_real_ip(conn, peer_ip)
   end
 
+  defp resolve_forwarded(_conn, peer_ip, _source, _depth, _trusted_rules),
+    do: error(peer_ip, :forwarded_depth_unsatisfied, 0)
+
   defp resolve_x_real_ip(conn, peer_ip) do
     case Plug.Conn.get_req_header(conn, "x-real-ip") do
       [] ->
@@ -235,8 +238,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP do
   end
 
   defp scan_entry_from_right(
-         {_value, _index, _content_start, _content_end, _content_bytes, _pending_ows,
-          @max_entry_scan_bytes},
+         {_value, _index, _content_start, _content_end, _content_bytes, _pending_ows, @max_entry_scan_bytes},
          _rest,
          _split_on_comma?
        ) do
@@ -266,8 +268,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP do
     cond do
       ows?(byte) ->
         scan_entry_from_right(
-          {value, index - 1, content_start, content_end, content_bytes,
-           if(is_nil(content_start), do: 0, else: pending_ows + 1), scanned_bytes + 1},
+          {value, index - 1, content_start, content_end, content_bytes, if(is_nil(content_start), do: 0, else: pending_ows + 1), scanned_bytes + 1},
           rest,
           split_on_comma?
         )
@@ -277,8 +278,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP do
 
       true ->
         scan_entry_from_right(
-          {value, index - 1, index, content_end || index, content_bytes + pending_ows + 1, 0,
-           scanned_bytes + 1},
+          {value, index - 1, index, content_end || index, content_bytes + pending_ows + 1, 0, scanned_bytes + 1},
           rest,
           split_on_comma?
         )

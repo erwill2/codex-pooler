@@ -1,0 +1,181 @@
+---
+title: Kilo Code on Codex Pooler
+sidebar:
+  label: Kilo Code
+description: Configure Kilo Code CLI with Codex Pooler's narrow OpenAI-compatible /v1 chat-completions surface and a Pool API key.
+---
+
+Kilo Code is an open-source coding agent for exploring projects, writing code and completing development tasks. This guide connects its CLI to Codex Pooler, giving your terminal sessions access to your Pool's models while Kilo handles the work in your project.
+
+![Codex Pooler Kilo Code integration](/codex-pooler-kilo.webp)
+
+## Before you start
+
+- Install [Kilo Code CLI](https://kilo.ai/docs/code-with-ai/platforms/cli) using the official instructions for your operating system.
+- Have a Codex Pooler URL reachable from the client.
+- Create a [Pool API key](/getting-started/quick-start/) and choose a model available to that Pool.
+
+<a id="install"></a>
+
+<a id="provider-shape"></a>
+
+## Configure the connection
+
+Use the commands for the terminal that starts the client. Environment-variable assignments below apply to that terminal; desktop apps and services need the variables in their own launch environment.
+
+### Config file paths
+
+| OS | Default config file |
+| --- | --- |
+| macOS | `~/.config/kilo/kilo.jsonc` |
+| Linux | `~/.config/kilo/kilo.jsonc` |
+| Windows | `%USERPROFILE%\.config\kilo\kilo.jsonc` |
+
+If you set `XDG_CONFIG_HOME` or a client-specific config override, use that location instead.
+
+These are the default locations. On Windows, paste the `%USERPROFILE%`, `%APPDATA%` or `%LOCALAPPDATA%` path into File Explorer's address bar. For a client installed inside WSL, use the Linux paths and commands inside WSL. Keep any custom configuration folder or profile you already use.
+
+Set the Pool API key in the shell that starts the client:
+
+**macOS / Linux / WSL**
+
+```bash
+export CODEX_POOLER_API_KEY="<pool-api-key>"
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:CODEX_POOLER_API_KEY = "<pool-api-key>"
+```
+
+For a deployed instance, add these settings to `kilo.jsonc` at the path for your system:
+
+```jsonc title="kilo.jsonc" frame="code"
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "model": "codex-pooler/gpt-6.1-sol",
+  "enabled_providers": ["codex-pooler"],
+  "provider": {
+    "codex-pooler": {
+      "options": {
+        "apiKey": "{env:CODEX_POOLER_API_KEY}",
+        "baseURL": "https://codex-pooler.example.com/v1"
+      },
+      "models": {
+        "gpt-6-luna": {
+          "name": "GPT-6 Luna via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 828400,
+            "input": 828400,
+            "output": 64000
+          }
+        },
+        "gpt-6.1-sol": {
+          "name": "GPT-6.1 Sol via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 828400,
+            "input": 828400,
+            "output": 64000
+          }
+        },
+        "gpt-6-astra": {
+          "name": "GPT-6 Astra via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 828400,
+            "input": 828400,
+            "output": 64000
+          }
+        }
+      }
+    }
+  },
+  "compaction": {
+    "reserved": 41420,
+    "threshold_percent": 95
+  }
+}
+```
+
+For local setup, change `baseURL` to `http://localhost:4000/v1`.
+
+`{env:CODEX_POOLER_API_KEY}` keeps the Pool API key outside the config file. Define only model ids your assigned Pool can serve. If you add Kilo Code permissions, use the object form such as `"permission": {"bash": "allow"}`; do not set `"permission": "ask"`, which is not a valid Kilo Code config shape.
+
+## Choose a model
+
+Set the top-level `model` to `codex-pooler/` followed by a model ID available to your Pool.
+
+Kilo Code uses OpenCode-style `limit.{context,input,output}` fields but includes reasoning tokens in overflow accounting and supports `compaction.threshold_percent` for preflight compaction. The `828400` values above are long-profile examples for models whose selected Pool catalog source reports an 872000-token raw ceiling. Provider accounts can temporarily report different ceilings for the same model; a selected 272000-token profile exposes `258400` instead. Use each model's `/v1/models.context_length` for `limit.context` and `limit.input`, not the raw ceiling. For the long-profile example, `compaction.reserved: 41420` and `threshold_percent: 95` make both safety checks meet at 786980 tokens. `limit.input` is the local pre-compaction boundary, not a simultaneous input-plus-output envelope.
+
+For GPT-5 OpenAI-compatible models, Kilo Code suppresses the outgoing max-token request field to avoid incompatible `max_tokens`, so `limit.output` is still important for local context math and UI even when it is not forwarded.
+
+<a id="connection-check"></a>
+
+## Verify the connection
+
+Run a tool-using prompt from an isolated directory:
+
+**macOS / Linux / WSL**
+
+```bash
+validation_dir="$(mktemp -d)"
+cd "$validation_dir"
+
+kilo run \
+  --model codex-pooler/gpt-6.1-sol \
+  --pure \
+  --auto \
+  --format json \
+  --dir "$PWD" \
+  'Use your tools to create kilo-ok.txt containing exactly: kilo ok. After the file exists, reply with exactly: kilo ok'
+```
+
+**Windows PowerShell**
+
+```powershell
+$validationDir = Join-Path ([System.IO.Path]::GetTempPath()) ("kilo-check-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $validationDir | Out-Null
+Set-Location $validationDir
+
+kilo run --model codex-pooler/gpt-6.1-sol --pure --auto --format json --dir "$validationDir" 'Use your tools to create kilo-ok.txt containing exactly: kilo ok. After the file exists, reply with exactly: kilo ok'
+```
+
+`--pure` keeps external plugins out of the check. `--auto` is only for trusted isolated automation, because it lets Kilo Code approve tool permissions automatically.
+
+Confirm that `kilo-ok.txt` contains the expected text. In Codex Pooler's request logs, match the request time, API key, model, and final status to your test. A reply alone does not confirm that the client used your Pooler instance.
+
+## Compatibility notes
+
+### Route shape
+
+Kilo Code is a chat-completions client. It sends model requests to `POST /v1/chat/completions`, and Codex Pooler translates supported chat-completions requests into Codex Responses work internally. Do not point Kilo Code at `/backend-api/codex`, `/v1/responses`, or `/v1/chat/completions` as the configured base URL.
+
+### MCP boundary
+
+Kilo Code model requests use Codex Pooler's narrow OpenAI-compatible `/v1` support for selected SDK routes. Codex Pooler doesn't provide full OpenAI API parity.
+
+Codex Pooler model use does not require MCP. If you need operator metadata from `/mcp`, use a separate MCP-capable host and authenticate it with an operator-owned MCP token, not the Pool API key.

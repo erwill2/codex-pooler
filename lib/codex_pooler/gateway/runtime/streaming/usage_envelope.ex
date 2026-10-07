@@ -1,10 +1,13 @@
 defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
   @moduledoc false
 
+  alias CodexPooler.Accounting.Metadata
   alias CodexPooler.Gateway.Runtime.Streaming.{UsageJsonToken, UsageProjection}
 
   @context_bytes 80
   @encoded_context_bytes @context_bytes * 6 + 2
+  @model_context_bytes 16_384
+  @string_boundary ~r/[\x00-\x1f"\\\x80-\xff]/
 
   @type frame :: %{
           kind: :object | :array,
@@ -25,8 +28,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
           response_tier: binary() | nil,
           root_type: binary() | nil,
           response_type: binary() | nil,
+          root_model: binary() | nil,
+          response_model: binary() | nil,
           tier: binary() | nil,
           type: binary() | nil,
+          model: binary() | nil,
+          root_id: binary() | nil,
+          response_id: binary() | nil,
+          model_coverage_complete?: boolean(),
           error: :malformed | :limit | :null | nil,
           usage_error: :malformed | :limit | :null | nil,
           done?: boolean(),
@@ -44,8 +53,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
             response_tier: nil,
             root_type: nil,
             response_type: nil,
+            root_model: nil,
+            response_model: nil,
             tier: nil,
             type: nil,
+            model: nil,
+            root_id: nil,
+            response_id: nil,
+            model_coverage_complete?: true,
             error: nil,
             usage_error: nil,
             done?: false,
@@ -59,7 +74,23 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
   def feed(state, ""), do: state
   def feed(%{error: error} = state, _data) when error != nil, do: state
 
-  def feed(state, <<byte, rest::binary>> = data) do
+  def feed(%{lexer: :string, capture: nil, projection: nil} = state, data) do
+    if key_phase?(state) do
+      feed_byte(state, data)
+    else
+      # Only plain ASCII can be skipped: escapes, controls and every UTF-8
+      # byte still pass through the incremental validating lexer.
+      case Regex.run(@string_boundary, data, return: :index) do
+        nil -> state
+        [{0, _length}] -> feed_byte(state, data)
+        [{offset, _length}] -> feed(state, binary_part(data, offset, byte_size(data) - offset))
+      end
+    end
+  end
+
+  def feed(state, data), do: feed_byte(state, data)
+
+  defp feed_byte(state, <<byte, rest::binary>> = data) do
     case UsageJsonToken.step(state.lexer, byte) do
       :error -> fail(state, :malformed)
       {:again, token} -> state |> Map.put(:lexer, :idle) |> advance(token) |> feed(data)
@@ -99,7 +130,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
              ["type"],
              ["response", "type"],
              ["service_tier"],
-             ["response", "service_tier"]
+             ["response", "service_tier"],
+             ["model"],
+             ["response", "model"],
+             ["id"],
+             ["response", "id"]
            ] ->
         %{state | capture: ""}
 
@@ -118,15 +153,27 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
         tier: nil,
         response_tier: nil,
         response_type: nil,
-        type: state.root_type
+        response_model: nil,
+        response_id: nil,
+        type: state.root_type,
+        model: state.root_model
     }
 
   defp reset_response(state),
-    do: %{state | response_tier: nil, response_type: nil, type: state.root_type}
+    do: %{
+      state
+      | response_tier: nil,
+        response_type: nil,
+        response_model: nil,
+        response_id: nil,
+        type: state.root_type,
+        model: state.root_model
+    }
 
   defp capture(state, byte) do
     key = capture_key(state, byte)
-    captured = append_bounded(state.capture, byte, @encoded_context_bytes)
+    limit = if value_path(state) in [["model"], ["response", "model"], ["id"], ["response", "id"]], do: @model_context_bytes, else: @encoded_context_bytes
+    captured = append_bounded(state.capture, byte, limit)
     state = %{state | key: key, capture: captured}
 
     case state.projection do
@@ -141,7 +188,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
     do: %{state | usage_error: error, projection: nil, usage: nil}
 
   defp project(state, {:done, json, _rest}) do
-    case Jason.decode(json) do
+    case CodexPooler.JSON.decode(json) do
       {:ok, usage} -> %{state | projection: nil, usage: usage}
       _invalid -> fail(state, :malformed)
     end
@@ -155,7 +202,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
   defp advance(%{stack: [frame | tail]} = state, :string)
        when frame.kind == :object and frame.phase in [:first, :key] do
     key =
-      case state.key && Jason.decode(state.key) do
+      case state.key && CodexPooler.JSON.decode(state.key) do
         {:ok, key} -> key
         _other -> nil
       end
@@ -236,7 +283,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
 
   defp value_path(_state), do: nil
 
-  defp tracked_key(frame, key) when key in ["usage", "response", "type", "service_tier"] do
+  defp tracked_key(frame, key)
+       when key in ["usage", "response", "type", "service_tier", "model", "id"] do
     if frame.path in [[], ["response"]] do
       if key in frame.seen,
         do: %{frame | key: nil},
@@ -260,14 +308,23 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
   end
 
   defp store_context(state, path) do
+    model_context? = path in [["model"], ["response", "model"], ["id"], ["response", "id"]]
+
     value =
-      case state.capture && Jason.decode(state.capture) do
-        {:ok, value} when is_binary(value) and byte_size(value) <= @context_bytes -> value
-        _other -> nil
+      case state.capture && CodexPooler.JSON.decode(state.capture) do
+        {:ok, value} when is_binary(value) ->
+          if model_context?, do: Metadata.bounded_model_identifier(value), else: bounded_context(value)
+
+        _other ->
+          nil
       end
 
+    state = if model_context? and is_nil(state.capture), do: %{state | model_coverage_complete?: false}, else: state
     put_context(state, path, value)
   end
+
+  defp bounded_context(value) when byte_size(value) <= @context_bytes, do: value
+  defp bounded_context(_value), do: nil
 
   defp put_context(state, ["type"], value),
     do: %{state | type: value || state.response_type, root_type: value}
@@ -280,6 +337,17 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.UsageEnvelope do
 
   defp put_context(state, ["response", "service_tier"], value),
     do: %{state | response_tier: tier(value), tier: owned_tier(state, :response, tier(value))}
+
+  # The response object's own `model` names what was served; a root `model`
+  # only stands in when no response object declares one.
+  defp put_context(state, ["model"], value),
+    do: %{state | root_model: value, model: state.response_model || value}
+
+  defp put_context(state, ["response", "model"], value),
+    do: %{state | response_model: value, model: value || state.root_model}
+
+  defp put_context(state, ["id"], value), do: %{state | root_id: value}
+  defp put_context(state, ["response", "id"], value), do: %{state | response_id: value}
 
   defp put_context(state, _path, _value), do: state
 

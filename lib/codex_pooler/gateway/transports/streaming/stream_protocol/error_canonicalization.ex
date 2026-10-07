@@ -1,12 +1,14 @@
 defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonicalization do
   @moduledoc false
 
+  alias CodexPooler.Gateway.ErrorClassification
   alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
 
   @synthetic_public_openai_responses_failure_message "upstream request failed: stream interrupted before terminal response event"
+  @provider_previous_response_refusal_status 400
 
   @type event_summary :: EventSummary.t()
 
@@ -29,21 +31,34 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
   @spec normalize_block(binary(), binary()) :: iodata()
   def normalize_block(block, separator \\ "\n\n") do
     {event_type, decoded} = SSEParser.stream_block_event(block)
-
-    if codex_responses_error_needs_canonical_response?(event_type, decoded) do
-      encode_codex_responses_error_sse(decoded)
-    else
-      [block, separator]
-    end
+    {wire, _changed} = normalize_decoded_block(block, separator, event_type, decoded, false)
+    wire
   end
 
   @spec normalize_private_native_misalignment_block(binary(), binary()) :: iodata()
   def normalize_private_native_misalignment_block(block, separator \\ "\n\n") do
     {event_type, decoded} = SSEParser.stream_block_event(block)
+    {wire, _changed} = normalize_decoded_block(block, separator, event_type, decoded, true)
+    wire
+  end
 
-    case private_native_misalignment(event_type, decoded) do
-      nil -> normalize_block(block, separator)
-      misalignment -> encode_private_native_misalignment_sse(decoded, misalignment)
+  @doc false
+  @spec normalize_decoded_block(binary(), binary(), String.t() | nil, map(), boolean()) ::
+          {iodata(), map() | nil}
+  def normalize_decoded_block(block, separator, event_type, decoded, private_details?) do
+    misalignment = if private_details?, do: private_native_misalignment(event_type, decoded)
+
+    cond do
+      not is_nil(misalignment) ->
+        event = private_native_misalignment_event(decoded, misalignment)
+        {encode_error_event_sse(event), event}
+
+      codex_responses_error_needs_canonical_response?(event_type, decoded) ->
+        event = canonical_codex_responses_error_event(decoded)
+        {encode_error_event_sse(event), event}
+
+      true ->
+        {[block, separator], nil}
     end
   end
 
@@ -82,7 +97,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
     [
       "event: error\n",
       "data: ",
-      Jason.encode!(event),
+      CodexPooler.JSON.encode!(event),
       "\n\n"
     ]
     |> IO.iodata_to_binary()
@@ -90,7 +105,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
 
   @spec canonicalize_codex_responses_json_message(binary()) :: binary()
   def canonicalize_codex_responses_json_message(data) when is_binary(data) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok, %{} = decoded} ->
         {canonical, _decoded} = canonicalize_codex_responses_json_message(data, decoded)
         canonical
@@ -108,13 +123,18 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
 
   @spec canonicalize_native_codex_responses_json_message(binary()) :: binary()
   def canonicalize_native_codex_responses_json_message(data) when is_binary(data) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok,
        %{
          "type" => "error",
          "error" => %{"code" => "previous_response_not_found"}
        }} ->
-        Jason.encode!(native_previous_response_not_found_event())
+        CodexPooler.JSON.encode!(native_previous_response_not_found_event())
+
+      {:ok, %{} = decoded} ->
+        if provider_previous_response_refusal?(decoded),
+          do: CodexPooler.JSON.encode!(provider_previous_response_miss_event()),
+          else: canonicalize_codex_responses_json_message(data)
 
       _other ->
         canonicalize_codex_responses_json_message(data)
@@ -130,11 +150,51 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
         "error" => %{"code" => "previous_response_not_found"}
       } ->
         canonical = native_previous_response_not_found_event()
-        {Jason.encode!(canonical), canonical}
+        {CodexPooler.JSON.encode!(canonical), canonical}
 
       _other ->
-        canonicalize_codex_responses_json_message(data, decoded)
+        if provider_previous_response_refusal?(decoded) do
+          canonical = provider_previous_response_miss_event()
+          {CodexPooler.JSON.encode!(canonical), canonical}
+        else
+          canonicalize_codex_responses_json_message(data, decoded)
+        end
     end
+  end
+
+  # The Codex backend refuses an anchor the websocket connection cannot resolve
+  # (a connection that did not produce the response) with a codeless wrapped
+  # 400 whose message is exactly `ErrorCodes.invalid_previous_response_id_message/0`
+  # (findings#232 row 232-277, live probe 2026-09-23). It is given the
+  # `previous_response_not_found` code the Pooler's own connection-bound guard
+  # sends (row 232-278): the refusal's meaning, the released client's
+  # designated signal to resend the full request (rust-v0.156.1
+  # `responses_websocket.rs`) and the stale-chain code other native clients
+  # recover on. Before, it became the canonical `response.failed`
+  # `stream_incomplete`, a generic retryable stream error. The provider's fixed
+  # message is kept on this first pass, which the upstream websocket session
+  # applies and the attempt settles on, so the attempt records the provider's
+  # message class and not a code the provider never sent
+  # (`Finalization.Websocket.provider_rejection_metadata/2`). The native socket
+  # applies this canonicalization again to every frame it pushes, where the
+  # coded frame becomes the guard's own retry event.
+  defp provider_previous_response_refusal?(%{"type" => "error", "error" => %{"type" => "invalid_request_error", "message" => message} = error} = decoded) do
+    message == ErrorCodes.invalid_previous_response_id_message() and is_nil(Map.get(error, "code")) and
+      Map.get(decoded, "status") == @provider_previous_response_refusal_status
+  end
+
+  defp provider_previous_response_refusal?(_decoded), do: false
+
+  defp provider_previous_response_miss_event do
+    %{
+      "type" => "error",
+      "status" => @provider_previous_response_refusal_status,
+      "error" => %{
+        "type" => "invalid_request_error",
+        "code" => "previous_response_not_found",
+        "message" => ErrorCodes.invalid_previous_response_id_message()
+      }
+    }
   end
 
   @spec terminal_error_code(binary(), String.t() | nil) :: String.t()
@@ -201,39 +261,39 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
     |> EventSummary.incomplete_failure?()
   end
 
-  defp encode_codex_responses_error_sse(decoded) do
-    [
-      "event: response.failed\n",
-      "data: ",
-      Jason.encode!(canonical_codex_responses_error_event(decoded)),
-      "\n\n"
-    ]
-  end
-
   defp canonicalize_codex_responses_json_decoded_message(decoded, data) do
     cond do
       EventSummary.typeless_detail_error?(decoded) ->
         canonical = EventSummary.canonical_typeless_detail_error_event()
-        {Jason.encode!(canonical), canonical}
+        {CodexPooler.JSON.encode!(canonical), canonical}
 
       codex_responses_error_needs_canonical_response?(
         ErrorCodes.decoded_string(decoded, "type"),
         decoded
       ) ->
         canonical = canonical_codex_responses_error_event(decoded)
-        {Jason.encode!(canonical), canonical}
+        {CodexPooler.JSON.encode!(canonical), canonical}
 
       true ->
         {data, decoded}
     end
   end
 
+  # findings#191: a Codex Pooler-authored envelope that named its own type could
+  # not follow the classification either surface applies, so it is derived from
+  # the same status this event already declares.
+  @native_previous_response_not_found_status 400
+
   defp native_previous_response_not_found_event do
     %{
       "type" => "error",
-      "status" => 400,
+      "status" => @native_previous_response_not_found_status,
       "error" => %{
-        "type" => "invalid_request_error",
+        "type" =>
+          ErrorClassification.error_type(
+            "previous_response_not_found",
+            @native_previous_response_not_found_status
+          ),
         "code" => "previous_response_not_found",
         "message" => ErrorCodes.previous_response_not_found_message()
       }
@@ -293,16 +353,17 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
 
   defp private_native_misalignment(_event_type, _decoded), do: nil
 
-  defp encode_private_native_misalignment_sse(decoded, misalignment) do
+  defp private_native_misalignment_event(decoded, misalignment) do
     event = canonical_codex_responses_error_event(decoded)
     error = Map.put(event["response"]["error"], "misalignment", misalignment)
 
-    event =
-      event
-      |> Map.put("error", error)
-      |> put_in(["response", "error"], error)
+    event
+    |> Map.put("error", error)
+    |> put_in(["response", "error"], error)
+  end
 
-    ["event: response.failed\n", "data: ", Jason.encode!(event), "\n\n"]
+  defp encode_error_event_sse(event) do
+    ["event: response.failed\n", "data: ", CodexPooler.JSON.encode!(event), "\n\n"]
   end
 
   defp canonical_codex_responses_error_response(decoded, error) do

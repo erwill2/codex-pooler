@@ -16,6 +16,7 @@ defmodule CodexPoolerWeb.WebsocketConnectionLoggerTest do
     owner_instance_id
     phase
     proxy_instance_id
+    rejection_stage
     reconnect_disposition
     reason_class
     reason_code
@@ -405,9 +406,7 @@ defmodule CodexPoolerWeb.WebsocketConnectionLoggerTest do
       assert :info == WebsocketConnectionLogger.failed_native_websocket_turn_level(:owner_drained)
 
       assert :warning ==
-               WebsocketConnectionLogger.failed_native_websocket_turn_level(
-                 "upstream_request_failed"
-               )
+               WebsocketConnectionLogger.failed_native_websocket_turn_level("upstream_request_failed")
 
       warning_log =
         capture_log([level: :warning], fn ->
@@ -423,6 +422,63 @@ defmodule CodexPoolerWeb.WebsocketConnectionLoggerTest do
   end
 
   describe "reconnect lifecycle events" do
+    test "emits a bounded replay rejection with the owning stage and reason" do
+      log =
+        capture_lifecycle_log(fn ->
+          assert :ok =
+                   WebsocketConnectionLogger.log_replay_rejection(
+                     reconnect_metadata("TASK8_PRIVATE_REJECTION_SENTINEL"),
+                     :owner_preflight,
+                     "malformed provider reason"
+                   )
+        end)
+
+      line =
+        assert_lifecycle_line!(
+          log,
+          WebsocketConnectionLogger.replay_rejection_message(),
+          ~w(codex_session_id reason_class reason_code rejection_stage request_id)
+        )
+
+      assert line =~ "rejection_stage=owner_preflight"
+      assert line =~ "reason_code=sha256_"
+      refute line =~ "public_code="
+      refute log =~ "malformed provider reason"
+    end
+
+    test "names the code the client received next to the owner's reason, bounded like the reason" do
+      log =
+        capture_lifecycle_log(fn ->
+          assert :ok =
+                   WebsocketConnectionLogger.log_replay_rejection(
+                     reconnect_metadata("PUBLIC_CODE_PRIVATE_SENTINEL"),
+                     :replay_preflight,
+                     :owner_unavailable,
+                     "duplicate_turn"
+                   )
+
+          assert :ok =
+                   WebsocketConnectionLogger.log_replay_rejection(
+                     reconnect_metadata("PUBLIC_CODE_PRIVATE_SENTINEL"),
+                     :replay_preflight,
+                     :owner_busy,
+                     "malformed public code sentinel"
+                   )
+        end)
+
+      [first, second] =
+        log
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&(&1 =~ WebsocketConnectionLogger.replay_rejection_message()))
+
+      assert first =~ "rejection_stage=replay_preflight"
+      assert first =~ "reason_code=owner_unavailable"
+      assert first =~ "public_code=duplicate_turn"
+      assert second =~ "public_code=sha256_"
+      refute log =~ "malformed public code sentinel"
+      refute log =~ "PUBLIC_CODE_PRIVATE_SENTINEL"
+    end
+
     test "emits every fixed reconnect disposition with safe correlators only" do
       sentinel = "TASK2_PRIVATE_RECONNECT_SENTINEL"
 
@@ -534,6 +590,65 @@ defmodule CodexPoolerWeb.WebsocketConnectionLoggerTest do
 
       assert log == ""
       refute log =~ sentinel
+    end
+  end
+
+  # findings#270: a native socket closing itself after its upstream connection
+  # closed between requests, or naming why it stays open.
+  describe "upstream close events" do
+    test "logs the downstream close with the fixed fields in order and nothing else" do
+      lifecycle_id = Ecto.UUID.generate()
+      sentinel = "UPSTREAM_CLOSE_PRIVATE_SENTINEL"
+
+      log =
+        capture_lifecycle_log(fn ->
+          assert :ok =
+                   WebsocketConnectionLogger.log_downstream_closed_after_upstream_close(%{
+                     reason_code: :pong_deadline,
+                     skip_reason: :busy,
+                     lifecycle_id: lifecycle_id,
+                     generation: 4,
+                     forwarding: :off,
+                     codex_session_id: "session-upstream-close",
+                     prompt: sentinel
+                   })
+        end)
+
+      assert log == "websocket downstream closed after upstream connection close reason_code=pong_deadline lifecycle_id=#{lifecycle_id} generation=4 forwarding=off codex_session_id=session-upstream-close\n"
+    end
+
+    test "logs why the downstream stays open, for every fixed skip reason" do
+      for skip_reason <- WebsocketConnectionLogger.upstream_close_skip_reasons() do
+        log =
+          capture_lifecycle_log(fn ->
+            assert :ok =
+                     WebsocketConnectionLogger.log_downstream_kept_open_after_upstream_close(%{
+                       reason_code: :peer_close_frame,
+                       skip_reason: skip_reason,
+                       lifecycle_id: "lifecycle-kept-open",
+                       generation: 1,
+                       forwarding: :on,
+                       codex_session_id: "session-kept-open"
+                     })
+          end)
+
+        assert log == "websocket downstream kept open after upstream connection close reason_code=peer_close_frame skip_reason=#{skip_reason} lifecycle_id=lifecycle-kept-open generation=1 forwarding=on codex_session_id=session-kept-open\n"
+      end
+    end
+
+    test "logs nothing for a cause or skip reason outside the vocabularies, and drops malformed fields" do
+      log =
+        capture_lifecycle_log(fn ->
+          metadata = %{reason_code: :peer_close_frame, skip_reason: :busy, lifecycle_id: "lifecycle-malformed", generation: 2, forwarding: :off}
+
+          assert :ok = WebsocketConnectionLogger.log_downstream_closed_after_upstream_close(%{metadata | reason_code: :request_key_changed})
+          assert :ok = WebsocketConnectionLogger.log_downstream_closed_after_upstream_close(%{metadata | reason_code: "peer_close_frame"})
+          assert :ok = WebsocketConnectionLogger.log_downstream_kept_open_after_upstream_close(%{metadata | skip_reason: :unbounded_private_reason})
+          assert :ok = WebsocketConnectionLogger.log_downstream_kept_open_after_upstream_close(%{metadata | reason_code: :request_key_changed})
+          assert :ok = WebsocketConnectionLogger.log_downstream_closed_after_upstream_close(%{metadata | generation: 0, forwarding: :sideways, lifecycle_id: "Bearer synthetic-private"})
+        end)
+
+      assert log == "websocket downstream closed after upstream connection close reason_code=peer_close_frame lifecycle_id=redacted\n"
     end
   end
 

@@ -8,7 +8,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
   @type state :: %{
           required(:max_seen) => integer() | nil,
           required(:terminal_latched?) => boolean(),
-          required(:overflow_latched?) => boolean()
+          required(:overflow_latched?) => boolean(),
+          optional(atom()) => term()
         }
 
   @type normalized ::
@@ -79,6 +80,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
   def max_safe_integer, do: @max_safe_integer
 
   defp normalize_public_success(event_type, decoded) do
+    decoded = if is_binary(event_type) and event_type != "" and is_nil(Map.get(decoded, "type")), do: Map.put(decoded, "type", event_type), else: decoded
+
     case StreamProtocol.terminal_outcome(event_type, decoded) do
       {:ok, %{kind: :completed, data_type: nil}} ->
         completed_response_without_wrapper(decoded)

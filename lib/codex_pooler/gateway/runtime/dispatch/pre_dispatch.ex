@@ -4,6 +4,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Access
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts, as: GatewayContracts
+  alias CodexPooler.Gateway.Denials
+  alias CodexPooler.Gateway.Metadata.CanonicalModelSource
+  alias CodexPooler.Gateway.Metadata.CatalogRepresentation
   alias CodexPooler.Gateway.Metadata.CodexCatalog
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.InputShape
@@ -18,6 +21,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Gateway.Runtime.Dispatch.WebsocketBridge
   alias CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame.ValidationClaim
   alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Pools
@@ -25,6 +29,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Pools.ModelServingOverride
   alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.RouteClass
+  alias CodexPooler.ServiceTier
 
   @type candidate :: CandidateEligibility.FilterInput.candidate()
   @type visible_model_context :: CandidateEligibility.visible_model_context()
@@ -130,9 +135,25 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              visible_models,
              request_options
            ),
+         :ok <- ensure_mask_serving_mode(request_options),
          :ok <- validate_payload_once(payload, request_options, validation_authority),
          {:ok, candidate_snapshots} <-
            CandidateEligibility.routable_candidates(visible_model_context, model),
+         {:ok, candidates} <-
+           CandidateEligibility.filter_runtime_compatible_candidates(
+             CandidateEligibility.FilterInput.new(%{
+               auth: auth,
+               model: model,
+               endpoint: endpoint,
+               payload: payload,
+               has_input_image?: has_input_image?,
+               request_options: request_options,
+               candidates: candidate_snapshots
+             })
+           ),
+         {:ok, request_options} <-
+           SessionContinuity.attach_codex_session(auth, payload, request_options),
+         request_options = WebsocketBridge.plan(request_options, payload),
          quota_snapshots =
            RouteState.load_quota_snapshots(
              quota_snapshot_candidates(
@@ -146,7 +167,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
            put_selected_partition_assignment_ids(
              visible_model_context,
              model,
-             quota_snapshots
+             quota_snapshots,
+             request_options
            ),
          request_options =
            put_canonical_partition_metadata(request_options, visible_model_context),
@@ -162,24 +184,11 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              routing_settings: PoolRouting.routing_settings_with_defaults(auth.pool)
            })
            |> maybe_put_codex_models_etag(endpoint, request_options),
-         {:ok, candidates} <-
-           CandidateEligibility.filter_runtime_compatible_candidates(
-             CandidateEligibility.FilterInput.new(%{
-               auth: auth,
-               model: model,
-               endpoint: endpoint,
-               payload: payload,
-               has_input_image?: has_input_image?,
-               request_options: request_options,
-               candidates: candidate_snapshots
-             })
-           ),
          route_state = RouteState.put_saved_reset_auto_cohort(route_state, candidates),
-         {:ok, request_options} <-
-           SessionContinuity.attach_codex_session(auth, payload, request_options),
          canonical_filter_input_candidates = candidates,
          allowed_canonical_assignment_ids =
-           allowed_canonical_assignment_ids(visible_model_context, request_options),
+           allowed_canonical_assignment_ids(visible_model_context, request_options, model, payload, candidates),
+         request_options = put_tier_variant_counts(request_options, visible_model_context, allowed_canonical_assignment_ids),
          {:ok, candidates} <-
            CandidateEligibility.filter_allowed_canonical_candidates(
              candidates,
@@ -198,10 +207,15 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              request_options,
              model
            ) do
+      {partition_fallback, held_back_skip_reason} = partition_fallback(canonical_filter_input_candidates, candidates, visible_model_context, endpoint, request_options, model)
+      request_options = put_held_back_skip_reason(request_options, held_back_skip_reason)
+
       route_state =
         route_state
+        |> RouteState.put_usage_limit_capacity(usage_limit_capacity(canonical_filter_input_candidates, visible_model_context.valid_canonical_assignment_ids, endpoint, request_options))
         |> RouteState.put_saved_reset_auto_capacity(request_compatible_capacity)
         |> RouteState.put_candidates(candidates)
+        |> RouteState.put_partition_fallback(partition_fallback)
         |> RouteState.preload_routing_snapshots(auth, model, request_options)
         |> RouteState.put_reservation_snapshot_inputs(
           AccountingReservation.reservation_snapshot_inputs(
@@ -333,7 +347,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   defp put_selected_partition_assignment_ids(
          visible_model_context,
          %Model{} = model,
-         quota_snapshots
+         quota_snapshots,
+         request_options
        ) do
     candidates_by_model_id = Map.get(visible_model_context, :candidates_by_model_id, %{})
 
@@ -344,7 +359,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
           PartitionRoutability.routable_assignment_ids_by_model_id(
             [model],
             candidates_by_model_id,
-            quota_snapshots
+            quota_snapshots,
+            request_options
           )
         end
       )
@@ -384,7 +400,16 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
       "filtered_count" => max(valid_count - selected_count, 0),
       "routable_selection" => partition.routable_selection?
     }
+    |> put_routable_counts(partition.routable_counts)
   end
+
+  # Bounded integers from the selection's own quota classification, so a
+  # refusal that names only the selected seats also says whether selection
+  # read any held-back seat as routable.
+  defp put_routable_counts(summary, %{selected: selected, held_back: held_back}),
+    do: Map.merge(summary, %{"selected_routable_count" => selected, "held_back_routable_count" => held_back})
+
+  defp put_routable_counts(summary, _counts), do: summary
 
   # Only the surfaces that are actually capped to one partition carry the
   # evidence. The translated Responses surface starts from every valid canonical
@@ -422,14 +447,117 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
 
   defp allowed_canonical_assignment_ids(
          visible_model_context,
-         %RequestOptions{openai_compatibility: compatibility}
+         %RequestOptions{openai_compatibility: compatibility} = request_options,
+         model,
+         payload,
+         compatible_candidates
        ) do
-    if OpenAICompatibility.translated_responses_surface?(compatibility) do
-      visible_model_context.valid_canonical_assignment_ids
-    else
-      visible_model_context.selected_partition_assignment_ids
+    selected_ids = visible_model_context.selected_partition_assignment_ids
+
+    cond do
+      OpenAICompatibility.translated_responses_surface?(compatibility) ->
+        visible_model_context.valid_canonical_assignment_ids
+
+      explicit_service_tier?(payload, request_options) ->
+        selected_ids ++ service_tier_variant_ids(model, selected_ids, compatible_candidates)
+
+      true ->
+        selected_ids
     end
   end
+
+  defp put_tier_variant_counts(request_options, visible_model_context, allowed_ids) do
+    case request_options.routing.canonical_partition do
+      %{} = summary ->
+        count = allowed_ids |> Enum.uniq() |> length()
+        valid_count = length(visible_model_context.valid_canonical_assignment_ids)
+        RequestOptions.put_routing(request_options, canonical_partition: Map.merge(summary, %{"selected_count" => count, "filtered_count" => max(valid_count - count, 0)}))
+
+      nil ->
+        request_options
+    end
+  end
+
+  defp explicit_service_tier?(payload, request_options) do
+    policy = request_options.routing.api_key_policy || %{}
+    tier = Map.get(policy, :enforced_service_tier) || Map.get(payload, "service_tier")
+    ServiceTier.canonicalize(tier) not in [nil, "auto", "default"]
+  end
+
+  # Runtime compatibility has already required each account's own exact tier
+  # advertisement. A tier-only variant can satisfy an explicit request without
+  # widening the catalog's context, tool or transport capability family.
+  defp service_tier_variant_ids(model, selected_ids, compatible_candidates) do
+    sources = Map.get(model.metadata || %{}, "source_assignment_models", %{})
+    selected = Enum.map(selected_ids, &Map.get(sources, &1))
+
+    for {assignment, _identity} <- compatible_candidates,
+        Enum.any?(selected, &CanonicalModelSource.same_service_tier_family?(&1, Map.get(sources, assignment.id))),
+        do: assignment.id
+  end
+
+  # Advice describes runtime-compatible Pool capacity before the connection pin.
+  # This cohort is never used to dispatch an anchored request on another socket.
+  defp usage_limit_capacity(candidates, valid_ids, endpoint, request_options) do
+    candidates = Enum.filter(candidates, fn {assignment, _identity} -> assignment.id in valid_ids end)
+
+    with {:ok, candidates} <- SessionContinuity.filter_file_affinity(candidates, request_options),
+         {:ok, candidates} <- CandidateEligibility.maybe_filter_compact(endpoint, candidates) do
+      candidates
+    else
+      _unavailable -> []
+    end
+  end
+
+  # The runtime-compatible candidates with a valid canonical source that the
+  # selected partition held back, passed through the same file-affinity,
+  # compact and session-pin filters as the kept ones, so a hard pin or a file
+  # affinity leaves none (findings#206 row 206-586), with the reason when
+  # valid held-back seats exist and none can ever take a fallback for this
+  # request. A connection-bound compaction runs only on the upstream
+  # connection that holds it and never moves; its held-back candidates stay
+  # recorded because a relayed usage limit's Pool advice still counts them
+  # (row 206-545). Translated surfaces already route over every valid source
+  # and keep none.
+  defp partition_fallback(input_candidates, kept_candidates, visible_model_context, endpoint, request_options, model) do
+    kept_ids = MapSet.new(kept_candidates, fn {assignment, _identity} -> assignment.id end)
+    outside_ids = visible_model_context.valid_canonical_assignment_ids |> MapSet.new() |> MapSet.difference(kept_ids)
+    held_back = Enum.filter(input_candidates, fn {assignment, _identity} -> MapSet.member?(outside_ids, assignment.id) end)
+
+    cond do
+      MapSet.size(outside_ids) == 0 or OpenAICompatibility.translated_responses_surface?(request_options.openai_compatibility) ->
+        {[], nil}
+
+      held_back == [] ->
+        {[], :runtime_incompatible}
+
+      RequestOptions.connection_bound_compaction?(request_options) ->
+        {held_back |> continuity_held_back(endpoint, request_options, model) |> elem(0), :connection_bound_compaction}
+
+      true ->
+        continuity_held_back(held_back, endpoint, request_options, model)
+    end
+  end
+
+  defp continuity_held_back(held_back, endpoint, request_options, model) do
+    with {:file_affinity, {:ok, [_ | _] = held_back}} <- {:file_affinity, SessionContinuity.filter_file_affinity(held_back, request_options)},
+         {:compact_unsupported, {:ok, [_ | _] = held_back}} <- {:compact_unsupported, CandidateEligibility.maybe_filter_compact(endpoint, held_back)},
+         {:hard_pin, {:ok, [_ | _] = held_back}} <- {:hard_pin, SessionContinuity.apply_codex_session_assignment(held_back, request_options, model)} do
+      {held_back, nil}
+    else
+      {reason, _none} -> {[], reason}
+    end
+  end
+
+  # Bounded fixed vocabulary on the summary of a capped surface, so a request
+  # row says why its held-back seats could not take the selected partition's
+  # place: `runtime_incompatible`, `connection_bound_compaction`,
+  # `file_affinity`, `compact_unsupported` or `hard_pin`
+  # (`PartitionFallback.before_dispatch/3` adds `non_quota_refusal`).
+  defp put_held_back_skip_reason(%RequestOptions{routing: %{canonical_partition: %{} = summary}} = request_options, reason) when is_atom(reason) and not is_nil(reason),
+    do: RequestOptions.put_routing(request_options, canonical_partition: Map.put(summary, "held_back_skip_reason", Atom.to_string(reason)))
+
+  defp put_held_back_skip_reason(%RequestOptions{} = request_options, _reason), do: request_options
 
   defp finish_canonical_filtering(
          candidates,
@@ -523,7 +651,6 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
 
       visible_models = policy_visible_models(route_state.visible_models, policy)
 
-      pricing_buckets = CodexPooler.Catalog.pricing_buckets_by_identifier(visible_models)
       context_window_overrides = OperationalSettings.current().model_context_window_overrides
 
       candidates_by_model_id =
@@ -534,16 +661,19 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
           visible_models,
           candidates_by_model_id,
           policy,
-          pricing_buckets,
           context_window_overrides,
           route_state.effective_model_serving_modes,
           routable_assignment_ids_by_model_id: fn ->
             PartitionRoutability.routable_assignment_ids_by_model_id(
               visible_models,
               candidates_by_model_id,
-              route_state.quota_snapshots
+              route_state.quota_snapshots,
+              request_options
             )
-          end
+          end,
+          # Same representation the client's own catalog fetch selected, or
+          # the turn's x-models-etag would never match it (refetch per turn).
+          representation: CatalogRepresentation.for_request(request_options)
         )
 
       RouteState.put_codex_models_etag(route_state, etag)
@@ -583,6 +713,22 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
 
   defp policy_visible_models(models, nil) when is_list(models), do: visible_models(models)
 
+  defp ensure_mask_serving_mode(%RequestOptions{
+         payload_context: %{masked_image_request?: true},
+         routing: %{model_serving_mode: mode}
+       })
+       when mode != "full" do
+    {:error,
+     error(
+       400,
+       "unsupported_parameter",
+       "mask requires an eligible Full Responses backend",
+       "mask"
+     )}
+  end
+
+  defp ensure_mask_serving_mode(%RequestOptions{}), do: :ok
+
   defp resolve_model_serving_modes(
          auth,
          %Model{} = effective_model,
@@ -598,6 +744,49 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
       |> then(&Pools.model_serving_modes_by_pool_ids([&1]))
       |> Map.get(auth.pool.id, %{})
 
+    with :ok <- validate_requested_mask_override(request_options, overrides) do
+      resolve_available_model_serving_modes(
+        policy_visible_models,
+        overrides,
+        effective_model,
+        visible_model_context,
+        request_options
+      )
+    end
+  end
+
+  defp validate_requested_mask_override(
+         %RequestOptions{
+           payload_context: %{masked_image_request?: true},
+           routing: %{effective_model: requested}
+         },
+         overrides
+       )
+       when is_binary(requested) do
+    case Map.get(overrides, ModelServingOverride.canonical_exposed_model_id(requested)) do
+      %ModelServingOverride{mode: "lite"} ->
+        {:error,
+         error(
+           400,
+           "unsupported_parameter",
+           "mask requires an eligible Full Responses backend",
+           "mask"
+         )}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp validate_requested_mask_override(_options, _overrides), do: :ok
+
+  defp resolve_available_model_serving_modes(
+         policy_visible_models,
+         overrides,
+         effective_model,
+         visible_model_context,
+         request_options
+       ) do
     resolutions =
       Map.new(policy_visible_models, fn model ->
         resolution =
@@ -661,8 +850,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
 
         case resolution do
           {:ok, resolution} ->
-            {:ok, RequestOptions.put_model_serving_mode(request_options, resolution),
-             effective_modes}
+            {:ok, RequestOptions.put_model_serving_mode(request_options, resolution), effective_modes}
 
           :no_runtime_model ->
             CandidateEligibility.routable_candidates(visible_model_context, effective_model)
@@ -716,6 +904,14 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   end
 
   defp resolve_reasoning_effort(auth, model, payload, request_options) do
+    if ReasoningEffort.invalid_native_budget?(payload, request_options) do
+      {:error, error(400, "invalid_request", "reasoning effort budget must be an unsigned 64-bit integer", ReasoningEffort.parameter(request_options))}
+    else
+      resolve_valid_reasoning_effort(auth, model, payload, request_options)
+    end
+  end
+
+  defp resolve_valid_reasoning_effort(auth, model, payload, request_options) do
     requested_effort = ReasoningEffort.extract(payload, request_options)
 
     {model_efforts, model_default} =
@@ -782,29 +978,28 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
     end
   end
 
-  defp ensure_model_supports(%Model{} = model, _endpoint, payload, _opts, has_input_image?) do
+  defp ensure_model_supports(%Model{} = model, _endpoint, payload, opts, has_input_image?) do
     cond do
       not model.supports_responses ->
-        {:error,
-         error(400, "unsupported_model_capability", "model does not support responses", "model")}
+        {:error, error(400, "unsupported_model_capability", "model does not support responses", "model")}
 
-      RouteClass.streaming?(payload) and not model.supports_streaming ->
-        {:error,
-         error(400, "unsupported_model_capability", "model does not support streaming", "stream")}
+      RequestOptions.upstream_streaming?(opts, payload) and not model.supports_streaming ->
+        {:error, error(400, "unsupported_model_capability", "model does not support streaming", "stream")}
 
       has_input_image? and
         ModelMetadata.has_capability_evidence?(model) and
           not ModelMetadata.supports_image_input?(ModelMetadata.metadata(model)) ->
-        {:error,
-         error(400, "unsupported_model_capability", "model does not support image input", "input")}
+        {:error, error(400, "unsupported_model_capability", "model does not support image input", "input")}
 
       true ->
         :ok
     end
   end
 
-  defp policy_error(:model_not_allowed),
-    do: error(403, "model_not_allowed", "api key is not allowed to use this model", nil)
+  # Pooler-authored: the reason's one status and message, marked by the
+  # shared constructor, so this path cannot answer a condition differently
+  # from `Denials.log_policy/1` (findings#221).
+  defp policy_error(reason) when is_atom(reason), do: Denials.policy_denial_error(reason)
 
   defp error(status, code, message, param),
     do: %{status: status, code: code, message: message, param: param}

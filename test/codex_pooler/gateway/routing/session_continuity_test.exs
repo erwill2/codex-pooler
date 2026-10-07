@@ -7,15 +7,57 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Files.FileRecord
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession, CodexTurn}
+
+  alias CodexPooler.Gateway.Persistence.{
+    BridgeOwnerLease,
+    BridgeSessionAlias,
+    CodexSession,
+    CodexTurn
+  }
+
+  alias CodexPooler.Gateway.Routing.BridgeRing
+  alias CodexPooler.Gateway.Routing.RoutePlanInput
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
+  alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
 
   @endpoint "/backend-api/codex/responses"
 
+  test "HTTP session start classifies only PostgreSQL shutdown availability failures" do
+    for code <- [:admin_shutdown, :crash_shutdown, :cannot_connect_now] do
+      assert SessionContinuity.http_session_database_unavailable?(%Postgrex.Error{
+               postgres: %{code: code}
+             })
+    end
+
+    refute SessionContinuity.http_session_database_unavailable?(%Postgrex.Error{
+             postgres: %{code: :unique_violation}
+           })
+
+    refute SessionContinuity.http_session_database_unavailable?(%Postgrex.Error{})
+  end
+
   describe "attach_file_affinity/4" do
+    test "existing session file conflict uses the database clock" do
+      setup = active_pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      {:ok, auth} = Access.authenticate_authorization_header(api_key.authorization)
+      file_id = "file-clock-conflict"
+      insert_response_file!(setup, api_key.api_key, file_id)
+      payload = %{"input" => [%{"type" => "input_file", "file_id" => file_id}]}
+      options = RequestOptions.build(%{session_header: "file-clock-session", session_header_source: "x-codex-window-id"}, @endpoint, payload)
+      {:ok, session} = CodexPooler.Gateway.Persistence.SessionContinuity.start_codex_session(auth, options)
+      other = active_upstream_assignment_fixture(setup.pool)
+      Repo.update!(Ecto.Changeset.change(session, pool_upstream_assignment_id: other.assignment.id))
+      handler = {__MODULE__, make_ref()}
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok = :telemetry.attach(handler, [:codex_pooler, :repo, :query], &__MODULE__.capture_clock_query/4, self())
+      assert {:error, %{code: "file_assignment_conflict"}} = SessionContinuity.attach_file_affinity(auth, @endpoint, payload, options)
+      assert_received :database_clock_sampled
+    end
+
     test "collects nested mixed-key file ids once while preserving one assignment" do
       setup = active_pinned_assignment_setup()
       api_key = active_api_key_fixture(setup.pool)
@@ -50,6 +92,54 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                )
 
       assert attached.routing.file_affinity_assignment_id == setup.pinned.assignment.id
+    end
+
+    test "pins an input_image file_id the Pool bridged to the assignment that holds it" do
+      setup = active_pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      {:ok, auth} = Access.authenticate_authorization_header(api_key.authorization)
+      file_id = "file-image-#{System.unique_integer([:positive])}"
+
+      insert_response_file!(setup, api_key.api_key, file_id)
+
+      for part <- [
+            %{"type" => "input_image", "file_id" => file_id, "detail" => "high"},
+            %{"type" => "function_call_output", "call_id" => "call_image", "output" => [%{"type" => "input_image", "file_id" => file_id}]}
+          ] do
+        payload = %{"input" => [%{"type" => "message", "role" => "user", "content" => [part]}]}
+        request_options = RequestOptions.build(%{}, @endpoint, payload)
+
+        assert {:ok, attached} = SessionContinuity.attach_file_affinity(auth, @endpoint, payload, request_options)
+        assert attached.routing.file_affinity_assignment_id == setup.pinned.assignment.id
+      end
+    end
+
+    test "leaves an input_image file_id the Pool never bridged unpinned" do
+      setup = active_pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      other_key = active_api_key_fixture(setup.pool)
+      {:ok, auth} = Access.authenticate_authorization_header(api_key.authorization)
+      foreign_file_id = "file-image-other-key-#{System.unique_integer([:positive])}"
+
+      insert_response_file!(setup, other_key.api_key, foreign_file_id)
+
+      payload = %{
+        "input" => [
+          %{
+            "type" => "message",
+            "role" => "user",
+            "content" => [
+              %{"type" => "input_image", "file_id" => "file-image-unknown-#{System.unique_integer([:positive])}"},
+              %{"type" => "input_image", "file_id" => foreign_file_id}
+            ]
+          }
+        ]
+      }
+
+      request_options = RequestOptions.build(%{}, @endpoint, payload)
+
+      assert {:ok, attached} = SessionContinuity.attach_file_affinity(auth, @endpoint, payload, request_options)
+      assert attached.routing.file_affinity_assignment_id == nil
     end
 
     test "resolves session aliases once in candidate priority order" do
@@ -216,9 +306,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
 
     test "returns pinned unavailable recovery for generic reauth_required state" do
       setup =
-        pinned_assignment_setup(
-          identity_metadata: %{"token_refresh" => %{"status" => "reauth_required"}}
-        )
+        pinned_assignment_setup(identity_metadata: %{"token_refresh" => %{"status" => "reauth_required"}})
 
       session = codex_session_fixture(setup, setup.pinned.assignment)
       opts = request_options_with_session(session)
@@ -342,9 +430,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
-        pin_reason: "previous_response_id"
-      )
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable", pin_reason: "previous_response_id")
     end
 
     test "soft-pins proxy stream continuations with bare accepted turn state" do
@@ -369,7 +455,43 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert other_candidate == setup.other_candidate
     end
 
-    test "hard-pins accepted turn state backed by a live upstream websocket session" do
+    test "portable full history keeps live direct and forwarded websocket assignments soft" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      for transport <- [
+            [upstream_websocket_session: self()],
+            [
+              websocket_owner_forwarding_enabled?: true,
+              websocket_owner_session: session,
+              websocket_owner_lease_token: "lease-token",
+              websocket_owner_downstream: %{pid: self(), correlation_id: "safe-correlation"}
+            ]
+          ] do
+        opts =
+          session
+          |> streaming_request_options_with_session()
+          |> RequestOptions.put_transport(transport)
+          |> RequestOptions.for_payload("/backend-api/codex/responses", %{
+            "input" => [%{"role" => "user", "content" => "synthetic complete history"}]
+          })
+
+        assert {:ok, [candidate]} =
+                 SessionContinuity.filter_codex_session_assignment(
+                   [setup.other_candidate],
+                   opts,
+                   model
+                 )
+
+        assert candidate == setup.other_candidate
+        assert is_nil(SessionContinuity.hard_pin_metadata(opts, model))
+      end
+    end
+
+    test "hard-pins opaque input backed by a live upstream websocket session" do
       setup = active_pinned_assignment_setup()
       session = codex_session_fixture(setup, setup.pinned.assignment)
 
@@ -378,6 +500,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
         |> streaming_request_options_with_session()
         |> RequestOptions.put_continuity(accepted_turn_state: "turn_live_websocket")
         |> RequestOptions.put_transport(upstream_websocket_session: self())
+        |> RequestOptions.for_payload("/backend-api/codex/responses", %{
+          "input" => [%{"type" => "item_reference", "id" => "msg_opaque_anchor"}]
+        })
 
       model =
         model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
@@ -389,12 +514,10 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
-        pin_reason: "live_upstream_websocket"
-      )
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable", pin_reason: "live_upstream_websocket")
     end
 
-    test "hard-pins accepted turn state backed by upstream websocket owner forwarding" do
+    test "hard-pins opaque input backed by upstream websocket owner forwarding" do
       setup = active_pinned_assignment_setup()
       session = codex_session_fixture(setup, setup.pinned.assignment)
 
@@ -408,6 +531,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
           websocket_owner_lease_token: "lease-token",
           websocket_owner_downstream: %{pid: self(), correlation_id: "safe-correlation"}
         )
+        |> RequestOptions.for_payload("/backend-api/codex/responses", %{
+          "input" => [%{"type" => "item_reference", "id" => "msg_opaque_anchor"}]
+        })
 
       model =
         model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
@@ -419,9 +545,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
-        pin_reason: "live_upstream_websocket"
-      )
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable", pin_reason: "live_upstream_websocket")
     end
 
     test "keeps a first-turn owner-forwarded websocket soft until its session is assigned" do
@@ -531,9 +655,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
-        pin_reason: "file_affinity"
-      )
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable", pin_reason: "file_affinity")
     end
 
     test "soft-pins proxy stream sessions after a same-model successful turn" do
@@ -566,7 +688,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       model =
         model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
 
-      succeeded_codex_turn_fixture(setup, session, api_key.api_key, "gpt-5.4-mini")
+      succeeded_codex_turn_fixture(setup, session, api_key.api_key, "gpt-6-luna")
 
       assert {:ok, [other_candidate]} =
                SessionContinuity.filter_codex_session_assignment(
@@ -576,6 +698,223 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                )
 
       assert other_candidate == setup.other_candidate
+    end
+  end
+
+  describe "recreated session assignment preference" do
+    test "soft-prefers the previous assignment of a lease-expiry recreation" do
+      setup = active_pinned_assignment_setup()
+      session = recreated_session_fixture(setup, setup.pinned.assignment)
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert SessionContinuity.hard_pin_metadata(opts, model) == nil
+
+      assert {:ok, filtered} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate, setup.pinned_candidate],
+                 opts,
+                 model
+               )
+
+      assert candidate_assignment_ids(filtered) == [
+               setup.pinned.assignment.id,
+               setup.other.assignment.id
+             ]
+    end
+
+    test "falls through to ordinary ordering when the previous assignment is absent" do
+      setup = active_pinned_assignment_setup()
+      session = recreated_session_fixture(setup, setup.pinned.assignment)
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:ok, [other_candidate]} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert other_candidate == setup.other_candidate
+    end
+
+    test "a hard pin outranks the recreation preference" do
+      setup = active_pinned_assignment_setup()
+      session = recreated_session_fixture(setup, setup.pinned.assignment)
+
+      opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_continuity(previous_response_id: "resp_recreation_#{System.unique_integer([:positive])}")
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert SessionContinuity.hard_pin_metadata(opts, model) == %{
+               "pin_mode" => "hard",
+               "pin_reason" => "previous_response_id"
+             }
+
+      assert {:ok, filtered} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate, setup.pinned_candidate],
+                 opts,
+                 model
+               )
+
+      assert candidate_assignment_ids(filtered) == [
+               setup.other.assignment.id,
+               setup.pinned.assignment.id
+             ]
+    end
+
+    test "a session that was never recreated keeps ordinary ordering" do
+      setup = active_pinned_assignment_setup()
+
+      session =
+        setup
+        |> codex_session_fixture(setup.pinned.assignment)
+        |> Ecto.Changeset.change(pool_upstream_assignment_id: nil)
+        |> Repo.update!()
+
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:ok, filtered} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate, setup.pinned_candidate],
+                 opts,
+                 model
+               )
+
+      assert candidate_assignment_ids(filtered) == [
+               setup.other.assignment.id,
+               setup.pinned.assignment.id
+             ]
+    end
+
+    test "an ineligible previous assignment is excluded before the preference can order it" do
+      setup = pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      {:ok, auth} = Access.authenticate_authorization_header(api_key.authorization)
+      session = recreated_session_fixture(setup, setup.pinned.assignment, api_key.api_key)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      payload = %{
+        "model" => model.exposed_model_id,
+        "input" => native_text_input("hello"),
+        "stream" => true
+      }
+
+      opts =
+        %{api_key_policy: auth.api_key}
+        |> RequestOptions.build(@endpoint, payload)
+        |> RequestOptions.put_continuity(codex_session: session)
+
+      assert {:ok, %{candidates: candidates}} =
+               PreDispatch.prepare(auth, @endpoint, payload, opts, model)
+
+      assert candidate_assignment_ids(candidates) == [setup.other.assignment.id]
+    end
+  end
+
+  describe "lease-expiry recreation preference, end to end" do
+    # Drives the real path instead of a hand-built struct: PreDispatch attaches
+    # the session through persistence `start_codex_session/2`, which recreates
+    # it because the previous session's owner lease expired, and the preference
+    # has to survive every link from that transaction to candidate ordering.
+    # The preference is only proven by moving an assignment the ring would
+    # otherwise rank last. Asserting that the ring's own first choice comes
+    # first passes whether or not the preference reached routing at all, which
+    # is exactly how this went unnoticed in production.
+    test "the previous assignment moves to the front of ordinary ordering" do
+      context = recreation_context()
+      ordinary_ids = ordinary_candidate_order(context)
+      preferred_id = List.last(ordinary_ids)
+
+      expired = expired_assigned_session!(context, preferred_id, context.session_header)
+
+      assert {:ok, %{request_options: options, candidates: candidates}} =
+               prepare_session_turn(context, context.session_header)
+
+      replacement = options.continuity.codex_session
+
+      refute replacement.id == expired.id
+      assert is_nil(replacement.pool_upstream_assignment_id)
+      assert replacement.recreated_from_assignment_id == preferred_id
+
+      assert candidate_assignment_ids(candidates) ==
+               [preferred_id | List.delete(ordinary_ids, preferred_id)]
+    end
+
+    # Pre-dispatch ordering is not the decision: `BridgeRing.plan_route/1`
+    # re-sorts the whole shortlist afterwards. Both assignments are driven
+    # through a real recreation against one fixed ring seed, so the ring's own
+    # order is the same in both runs and exactly one of them contradicts it.
+    # A single run would pass whenever the ring already favoured the preferred
+    # assignment, which is how this went unnoticed in production.
+    test "the ring selects the previous assignment over its own ordering" do
+      context = recreation_context()
+      pin_ring_seed!(context)
+      route_plan_input = fixed_ring_seed()
+
+      outcomes =
+        Enum.map(context.assignment_ids, fn assignment_id ->
+          session_header = "window-#{System.unique_integer([:positive])}"
+          expired = expired_assigned_session!(context, assignment_id, session_header)
+
+          assert {:ok, %{request_options: options, candidates: candidates}} =
+                   prepare_session_turn(context, session_header)
+
+          replacement = options.continuity.codex_session
+
+          refute replacement.id == expired.id
+          assert replacement.recreated_from_assignment_id == assignment_id
+
+          %{
+            expected: assignment_id,
+            preferred: selected_assignment_id(context, route_plan_input, options, candidates),
+            baseline:
+              selected_assignment_id(
+                context,
+                route_plan_input,
+                without_recreation_preference(options),
+                candidates
+              )
+          }
+        end)
+
+      assert Enum.map(outcomes, & &1.preferred) == Enum.map(outcomes, & &1.expected)
+      assert Enum.any?(outcomes, &(&1.baseline != &1.expected))
+    end
+
+    test "an expired session with no assignment leaves ordinary ordering alone" do
+      context = recreation_context()
+      ordinary_ids = ordinary_candidate_order(context)
+
+      assert {:ok, %{request_options: first_options}} =
+               prepare_session_turn(context, context.session_header)
+
+      expired = first_options.continuity.codex_session
+      expire_owner_lease!(expired.id)
+
+      assert {:ok, %{request_options: options, candidates: candidates}} =
+               prepare_session_turn(context, context.session_header)
+
+      replacement = options.continuity.codex_session
+
+      refute replacement.id == expired.id
+      assert is_nil(replacement.recreated_from_assignment_id)
+      assert candidate_assignment_ids(candidates) == ordinary_ids
     end
   end
 
@@ -768,6 +1107,16 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
     |> Repo.insert!()
   end
 
+  # A session recreated after owner-lease expiry: no assignment of its own, and
+  # the closed session's assignment carried only on the struct.
+  defp recreated_session_fixture(setup, %PoolUpstreamAssignment{} = previous, api_key \\ nil) do
+    setup
+    |> codex_session_fixture(previous, api_key)
+    |> Ecto.Changeset.change(pool_upstream_assignment_id: nil)
+    |> Repo.update!()
+    |> Map.put(:recreated_from_assignment_id, previous.id)
+  end
+
   defp native_text_input(text) do
     [
       %{
@@ -781,7 +1130,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
   defp request_options_with_session(%CodexSession{} = session) do
     %{}
     |> RequestOptions.build(@endpoint, %{
-      "model" => "gpt-5.5",
+      "model" => "gpt-6-sol",
       "input" => native_text_input("hello")
     })
     |> RequestOptions.put_continuity(codex_session: session)
@@ -790,7 +1139,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
   defp streaming_request_options_with_session(%CodexSession{} = session) do
     %{}
     |> RequestOptions.build(@endpoint, %{
-      "model" => "gpt-5.5",
+      "model" => "gpt-6-sol",
       "input" => native_text_input("hello"),
       "stream" => true
     })
@@ -822,6 +1171,150 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       updated_at: now
     }
     |> Repo.insert!()
+  end
+
+  defp streaming_payload(model) do
+    %{
+      "model" => model.exposed_model_id,
+      "input" => native_text_input("hello"),
+      "stream" => true
+    }
+  end
+
+  # The shape a sessioned native HTTP turn arrives in: a session header and its
+  # source, exactly as `GatewayControllerHelpers.request_opts/1` builds them.
+  defp http_session_request_options(auth, payload, session_header) do
+    RequestOptions.build(
+      %{
+        api_key_policy: auth.api_key,
+        session_header: session_header,
+        session_header_source: "x-codex-window-id"
+      },
+      @endpoint,
+      payload
+    )
+  end
+
+  defp recreation_context do
+    setup = active_pinned_assignment_setup()
+    api_key = active_api_key_fixture(setup.pool)
+    {:ok, auth} = Access.authenticate_authorization_header(api_key.authorization)
+
+    model =
+      model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+    %{
+      auth: auth,
+      pool: setup.pool,
+      model: model,
+      assignment_ids: [setup.pinned.assignment.id, setup.other.assignment.id],
+      payload: streaming_payload(model),
+      session_header: "window-#{System.unique_integer([:positive])}"
+    }
+  end
+
+  # Sticky session affinity would seed the ring from the replacement session id,
+  # which is new on every recreation. Seeding from a fixed correlation id
+  # instead keeps the ring's own order identical across runs, so the preference
+  # is the only thing that can move the selection.
+  defp pin_ring_seed!(context) do
+    context.pool
+    |> Pools.ensure_routing_settings()
+    |> Ecto.Changeset.change(%{
+      routing_strategy: "bridge_ring",
+      bridge_ring_size: length(context.assignment_ids),
+      sticky_websocket_sessions: false,
+      sticky_http_sessions: false,
+      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    })
+    |> Repo.update!()
+  end
+
+  defp fixed_ring_seed do
+    %RoutePlanInput{
+      request_id: nil,
+      correlation_id: "ring-seed-#{System.unique_integer([:positive])}"
+    }
+  end
+
+  defp selected_assignment_id(context, %RoutePlanInput{} = route_plan_input, options, candidates) do
+    BridgeRing.plan_route(%{
+      auth: context.auth,
+      model: context.model,
+      candidates: candidates,
+      route_plan_input: route_plan_input,
+      request_options: options
+    }).selected_assignment_id
+  end
+
+  defp without_recreation_preference(options) do
+    RequestOptions.put_continuity(options,
+      codex_session: %{options.continuity.codex_session | recreated_from_assignment_id: nil}
+    )
+  end
+
+  # The ring's ordering for this pool, measured on a key that has no history,
+  # so the recreation assertions compare against the real baseline instead of a
+  # hardcoded order.
+  defp ordinary_candidate_order(context) do
+    assert {:ok, %{request_options: options, candidates: candidates}} =
+             prepare_session_turn(context, "baseline-#{System.unique_integer([:positive])}")
+
+    assert is_nil(options.continuity.codex_session.recreated_from_assignment_id)
+
+    ids = candidate_assignment_ids(candidates)
+    assert length(ids) == 2
+    ids
+  end
+
+  defp prepare_session_turn(context, session_header) do
+    PreDispatch.prepare(
+      context.auth,
+      @endpoint,
+      context.payload,
+      http_session_request_options(context.auth, context.payload, session_header),
+      context.model
+    )
+  end
+
+  # A session that held `assignment_id` and whose owner lease has since expired:
+  # the state a lease-expiry recreation replaces.
+  defp expired_assigned_session!(context, assignment_id, session_header) do
+    assert {:ok, %{request_options: options}} = prepare_session_turn(context, session_header)
+
+    session = options.continuity.codex_session
+
+    bind_session_assignment!(session, assignment_id)
+    expire_owner_lease!(session.id)
+
+    session
+  end
+
+  defp bind_session_assignment!(%CodexSession{} = session, assignment_id)
+       when is_binary(assignment_id) do
+    session
+    |> Ecto.Changeset.change(%{pool_upstream_assignment_id: assignment_id})
+    |> Repo.update!()
+  end
+
+  defp expire_owner_lease!(session_id) do
+    expired_at =
+      DateTime.utc_now() |> DateTime.add(-1, :second) |> DateTime.truncate(:microsecond)
+
+    CodexSession
+    |> Repo.get!(session_id)
+    |> Ecto.Changeset.change(%{
+      owner_lease_expires_at: expired_at,
+      last_heartbeat_at: expired_at,
+      updated_at: expired_at
+    })
+    |> Repo.update!()
+
+    BridgeOwnerLease
+    |> where([lease], lease.codex_session_id == ^session_id)
+    |> Repo.update_all(set: [expires_at: expired_at, updated_at: expired_at])
+
+    :ok
   end
 
   defp candidate_assignment_ids(candidates) do
@@ -871,6 +1364,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
     parent = self()
     handler_id = {__MODULE__, :query_count, System.unique_integer([:positive, :monotonic])}
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -917,15 +1413,14 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
   end
 
   defp model_for_assignments(pool, assignment_ids) do
-    exposed_model_id = "gpt-5.5-#{System.unique_integer([:positive])}"
+    exposed_model_id = "gpt-6-sol-#{System.unique_integer([:positive])}"
 
     model_fixture(pool, %{
       exposed_model_id: exposed_model_id,
       source_assignment_count: length(assignment_ids),
       metadata: %{
         "source_assignment_ids" => assignment_ids,
-        "source_assignment_models" =>
-          Map.new(assignment_ids, &{&1, %{"slug" => exposed_model_id}})
+        "source_assignment_models" => Map.new(assignment_ids, &{&1, %{"slug" => exposed_model_id}})
       }
     })
   end
@@ -949,5 +1444,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
              "pool_upstream_assignment_id" => setup.pinned.assignment.id,
              "upstream_identity_id" => setup.pinned.identity.id
            }
+  end
+
+  def capture_clock_query(_event, _measurements, metadata, parent) do
+    if self() == parent and metadata.query == "SELECT clock_timestamp()", do: send(parent, :database_clock_sampled)
   end
 end

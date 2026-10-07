@@ -1,0 +1,2261 @@
+defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocket.ContinuationTest do
+  use CodexPoolerWeb.ConnCase, async: false
+
+  import Ecto.Query
+  import ExUnit.CaptureLog
+
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport
+  import CodexPoolerWeb.Runtime.BackendCodexWebsocketSupport
+
+  alias CodexPooler.Access
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.OperationalSettings
+
+  alias CodexPooler.Gateway.Persistence.{
+    BridgeDemotion,
+    CodexSession,
+    CodexTurn,
+    RoutingCircuitState
+  }
+
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
+  alias CodexPooler.Repo
+  alias CodexPoolerWeb.CodexResponsesSocket
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  @tag :websocket_previous_response_bridge
+  test "websocket continuity turns preserve client supplied previous_response_id for upstream context" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_bridge",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-previous-bridge",
+          accepted_turn_state: "stable-ws-previous-bridge",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_bridge"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      second_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "second"}],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_bridge"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_bridge"} = CodexPooler.JSON.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.method == "WEBSOCKET"
+      assert second_request.method == "WEBSOCKET"
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert first_request.json["type"] == "response.create"
+      assert second_request.json["type"] == "response.create"
+      assert first_request.json["generate"] == true
+      assert second_request.json["generate"] == true
+      refute Map.has_key?(first_request.json, "previous_response_id")
+      assert second_request.json["previous_response_id"] == "resp_ws_bridge"
+
+      assert second_request.json["input"] == [
+               %{"type" => "message", "role" => "user", "content" => "second"}
+             ]
+
+      assert [first_log, second_log] =
+               Repo.all(
+                 from request in Request,
+                   where: request.pool_id == ^setup.pool.id,
+                   order_by: [asc: request.admitted_at]
+               )
+
+      assert first_log.status == "succeeded"
+      assert second_log.status == "succeeded"
+      assert first_log.response_status_code == 200
+      assert second_log.response_status_code == 200
+
+      assert [first_turn, second_turn] =
+               Repo.all(
+                 from turn in CodexTurn,
+                   where: turn.codex_session_id == ^state.codex_session.id,
+                   order_by: [asc: turn.turn_sequence]
+               )
+
+      assert first_turn.status == "succeeded"
+      assert second_turn.status == "succeeded"
+      assert second_turn.turn_sequence == 2
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  @tag :websocket_persistent_upstream_session
+  test "downstream websocket keeps one upstream websocket session across continuation turns" do
+    previous_env =
+      Application.get_env(
+        :codex_pooler,
+        UpstreamWebsocketSession,
+        []
+      )
+
+    Application.put_env(:codex_pooler, UpstreamWebsocketSession,
+      keepalive_interval_ms: 20,
+      keepalive_pong_timeout_ms: 1_000
+    )
+
+    on_exit(fn ->
+      Application.put_env(
+        :codex_pooler,
+        UpstreamWebsocketSession,
+        previous_env
+      )
+    end)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_persistent",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    FakeUpstream.notify_websocket_controls(upstream, self())
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-persistent-connection",
+          accepted_turn_state: "stable-ws-persistent-connection",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_persistent"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+      assert_receive {:fake_upstream_websocket_control, :ping, 1}, @detection_timeout_ms
+
+      processed_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.processed",
+          "response_id" => "resp_ws_persistent"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({processed_payload, [opcode: :text]}, state)
+
+      assert {:ok, state} = receive_socket_done(state)
+
+      second_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_sample",
+              "output" => "sample output"
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_persistent"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_persistent"} = CodexPooler.JSON.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, processed_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.method == "WEBSOCKET"
+      assert processed_request.method == "WEBSOCKET"
+      assert second_request.method == "WEBSOCKET"
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert processed_request.websocket_connection_id == first_request.websocket_connection_id
+      refute Map.has_key?(first_request.json, "previous_response_id")
+
+      assert processed_request.json == %{
+               "response_id" => "resp_ws_persistent",
+               "type" => "response.processed"
+             }
+
+      assert second_request.json["previous_response_id"] == "resp_ws_persistent"
+
+      assert second_request.json["input"] == [
+               %{
+                 "call_id" => "call_sample",
+                 "output" => "sample output",
+                 "type" => "function_call_output"
+               }
+             ]
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  # The fake upstream closes a websocket that has read no client data for this
+  # long, as Bandit does after its default 60 s read timeout: the peer idle
+  # timeout that killed the held proxy turn of the smoke proxy-drain lane
+  # (icoretech/codex-pooler-findings#206 row 206-142).
+  @upstream_idle_timeout_ms 150
+  # Detection budget for the settlement the test only observes.
+  @settlement_detection_timeout_ms 15_000
+
+  # Owner forwarding off runs the turn through `request_once/1` in the response
+  # task; on, through the owner's upstream session process (the lane's
+  # topology).
+  for forwarding? <- [false, true] do
+    @tag :websocket_in_flight_keepalive
+    @tag slow: "the provider must stay silent past a real peer idle timeout twice on a public socket"
+    test "a silent in-flight turn keeps its upstream websocket past the peer's idle timeout and completes once (owner forwarding #{forwarding?})" do
+      CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+      Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, unquote(forwarding?))
+      CodexPooler.TestAppEnv.restore_on_exit(UpstreamWebsocketSession)
+
+      Application.put_env(:codex_pooler, UpstreamWebsocketSession,
+        keepalive_interval_ms: 25,
+        keepalive_pong_timeout_ms: 5_000
+      )
+
+      # The provider stays silent for two idle periods after the submission, so
+      # the turn outlives the peer's idle timeout twice before its terminal. A
+      # single silent span keeps frame processing out of the measured window.
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          FakeUpstream.delayed_sse_stream(
+            [
+              {"response.completed",
+               %{
+                 "type" => "response.completed",
+                 "response" => %{
+                   "id" => "resp_in_flight_keepalive",
+                   "status" => "completed",
+                   "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                 }
+               }}
+            ],
+            interval_ms: 2 * @upstream_idle_timeout_ms
+          ),
+          thousand_island_options: [read_timeout: @upstream_idle_timeout_ms]
+        )
+
+      on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+      setup = gateway_setup(upstream)
+      assert :ok = CodexPooler.Events.subscribe_pool(setup.pool)
+      port = start_public_endpoint!()
+      turn_state = "ws-in-flight-keepalive-#{System.unique_integer([:positive])}"
+      {conn, websocket, ref} = public_websocket_connect!(port, setup, turn_state)
+
+      try do
+        payload =
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => native_text_input("in-flight keepalive"),
+            "stream" => true,
+            "generate" => true
+          })
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+        {conn, _websocket, completed} = public_websocket_receive_text!(conn, websocket, ref)
+
+        assert %{"type" => "response.completed", "response" => %{"id" => "resp_in_flight_keepalive"}} =
+                 CodexPooler.JSON.decode!(completed)
+
+        assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}},
+                       @settlement_detection_timeout_ms
+
+        assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+        assert request.transport == "websocket"
+        assert request.status == "succeeded"
+        assert request.retry_count == 0
+        assert [%Attempt{status: "succeeded", transport: "websocket"}] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+        # One submission only, on the connection the fake pinged while the
+        # provider stayed silent. The fake records a Ping before it pushes the
+        # later terminal from the same handler, so the record is read from its
+        # state; the public socket receive helper may consume mailbox notices.
+        assert [upstream_request] = FakeUpstream.requests(upstream)
+        assert upstream_request.method == "WEBSOCKET"
+        connection_id = upstream_request.websocket_connection_id
+
+        assert Enum.any?(
+                 FakeUpstream.websocket_control_frames(upstream),
+                 &match?(%{opcode: :ping, websocket_connection_id: ^connection_id}, &1)
+               )
+
+        conn
+      after
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
+
+  @tag :continuation_generation_boundary
+  test "native continuation guard blocks replacement send and accepts the explicit full retry" do
+    previous_response_id = "resp_generation_boundary_sentinel"
+    prompt_sentinel = "generation boundary prompt sentinel"
+    call_id_sentinel = "call_generation_boundary_sentinel"
+    output_sentinel = "generation boundary tool output sentinel"
+
+    upstream =
+      start_upstream(
+        # Strict finite scenario: the guarded continuation never reaches the
+        # upstream, so only the anchor (connection 1) and the explicit full
+        # retry (replacement connection 2, no previous response) are sent.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create", "input.0.type" => "message"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => previous_response_id,
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                })
+              ])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 2,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create", "input.0.type" => "message"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_generation_boundary_full_retry",
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 8, "output_tokens" => 5, "total_tokens" => 13}
+                })
+              ])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_generation_boundary_fallback_should_not_run",
+          "object" => "response"
+        })
+      )
+
+    fallback =
+      gateway_upstream(
+        setup.pool,
+        fallback_upstream,
+        "upstream-token-generation-boundary-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-generation-boundary",
+          accepted_turn_state: "stable-ws-generation-boundary",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    codex_session =
+      state.codex_session
+      |> Ecto.Changeset.change(%{pool_upstream_assignment_id: setup.assignment.id})
+      |> Repo.update!()
+
+    state = %{state | codex_session: codex_session}
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{"type" => "message", "role" => "user", "content" => prompt_sentinel}
+          ],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state, 10_000)
+      assert %{"id" => ^previous_response_id} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state, 10_000)
+
+      assert :ok =
+               UpstreamWebsocketSession.invalidate_connection(state.upstream_websocket_session)
+
+      continuation_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => call_id_sentinel,
+              "output" => output_sentinel
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => previous_response_id
+        })
+
+      continuation_logs =
+        capture_log(fn ->
+          assert {:ok, next_state} =
+                   CodexResponsesSocket.handle_in(
+                     {continuation_payload, [opcode: :text]},
+                     state
+                   )
+
+          assert {:push, {:text, retry_frame}, next_state} =
+                   receive_socket_push(next_state, 10_000)
+
+          assert CodexPooler.JSON.decode!(retry_frame) == native_previous_response_retry_event()
+          assert {:ok, next_state} = receive_socket_done(next_state, 10_000)
+          send(self(), {:generation_boundary_state, next_state})
+        end)
+
+      assert_received {:generation_boundary_state, state}
+      refute_received {:codex_response_chunk, _task_pid, _extra_terminal}
+      assert [first_upstream_request] = FakeUpstream.requests(upstream)
+      assert FakeUpstream.websocket_connection_count(upstream) == 2
+
+      full_retry_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{"type" => "message", "role" => "user", "content" => prompt_sentinel},
+            %{
+              "type" => "function_call_output",
+              "call_id" => call_id_sentinel,
+              "output" => output_sentinel
+            }
+          ],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({full_retry_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, full_retry_frame}, state} = receive_socket_push(state, 10_000)
+
+      assert %{"id" => "resp_generation_boundary_full_retry"} =
+               CodexPooler.JSON.decode!(full_retry_frame)
+
+      assert {:ok, _state} = receive_socket_done(state, 10_000)
+
+      assert [^first_upstream_request, full_retry_upstream_request] =
+               FakeUpstream.requests(upstream)
+
+      refute Map.has_key?(first_upstream_request.json, "previous_response_id")
+      refute Map.has_key?(full_retry_upstream_request.json, "previous_response_id")
+
+      refute first_upstream_request.websocket_connection_id ==
+               full_retry_upstream_request.websocket_connection_id
+
+      assert FakeUpstream.websocket_connection_count(upstream) == 2
+      assert FakeUpstream.requests(fallback_upstream) == []
+
+      assert [first_request, failed_request, full_retry_request] =
+               Repo.all(
+                 from(request in Request,
+                   where: request.pool_id == ^setup.pool.id,
+                   order_by: [asc: request.admitted_at]
+                 )
+               )
+
+      assert first_request.status == "succeeded"
+      assert full_retry_request.status == "succeeded"
+      assert failed_request.status == "failed"
+      assert failed_request.response_status_code == 200
+      assert failed_request.retry_count == 0
+      assert failed_request.last_error_code == "stream_incomplete"
+      refute get_in(failed_request.request_metadata, ["routing", "demotion_reason"])
+
+      assert [failed_attempt] =
+               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^failed_request.id))
+
+      assert failed_attempt.attempt_number == 1
+      assert failed_attempt.pool_upstream_assignment_id == setup.assignment.id
+      assert failed_attempt.status == "failed"
+      assert failed_attempt.retryable == false
+      assert failed_attempt.network_error_code == "stream_incomplete"
+
+      assert failed_attempt.response_metadata["upstream_error_code"] ==
+               "previous_response_not_found"
+
+      assert failed_attempt.response_metadata["masked_error_code"] == "stream_incomplete"
+      assert failed_attempt.response_metadata["upstream_error_param"] == "previous_response_id"
+
+      assert failed_attempt.response_metadata["transport_failure"] == %{
+               "connection_use" => "reconnected",
+               "phase" => "send_payload",
+               "pre_visible_output" => true,
+               "reason" => "previous_response_generation_mismatch",
+               "reason_class" => "previous_response_generation_mismatch",
+               "termination_source" => "continuation_generation_guard",
+               "terminal_seen" => false,
+               "text_frame_count" => 0,
+               "upstream_committed" => false
+             }
+
+      assert %{
+               "generation" => 2,
+               "reconnected" => true,
+               "reused" => false
+             } = failed_attempt.response_metadata["upstream_websocket_connection"]
+
+      assert [full_retry_attempt] =
+               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^full_retry_request.id))
+
+      assert %{
+               "generation" => 2,
+               "reconnected" => false,
+               "reused" => true
+             } = full_retry_attempt.response_metadata["upstream_websocket_connection"]
+
+      assert [failed_turn] =
+               Repo.all(
+                 from(turn in CodexTurn,
+                   where:
+                     turn.codex_session_id == ^state.codex_session.id and
+                       turn.request_id == ^failed_request.id
+                 )
+               )
+
+      assert failed_turn.status == "failed"
+      assert failed_turn.error_code == "stream_incomplete"
+      assert failed_turn.final_attempt_id == failed_attempt.id
+
+      assert [failed_settlement] =
+               Repo.all(
+                 from(entry in LedgerEntry,
+                   where:
+                     entry.request_id == ^failed_request.id and
+                       entry.entry_kind == "settlement"
+                 )
+               )
+
+      assert failed_settlement.attempt_id == failed_attempt.id
+      # Refused before it was sent: no usage applies, and the reservation
+      # estimate is not kept as the settlement's tokens.
+      assert failed_settlement.usage_status == "not_applicable"
+      assert failed_settlement.total_tokens == nil
+      assert failed_settlement.details["estimated_from_reserve"] == false
+
+      assert Repo.aggregate(
+               from(attempt in Attempt, where: attempt.request_id == ^failed_request.id),
+               :count
+             ) == 1
+
+      assert Repo.aggregate(
+               from(turn in CodexTurn, where: turn.request_id == ^failed_request.id),
+               :count
+             ) == 1
+
+      assert Repo.aggregate(
+               from(entry in LedgerEntry,
+                 where:
+                   entry.request_id == ^failed_request.id and
+                     entry.entry_kind == "settlement"
+               ),
+               :count
+             ) == 1
+
+      assert Repo.get!(CodexSession, state.codex_session.id).pool_upstream_assignment_id ==
+               setup.assignment.id
+
+      assert Repo.all(from(demotion in BridgeDemotion)) == []
+      assert Repo.all(from(circuit in RoutingCircuitState)) == []
+
+      persisted_metadata =
+        inspect({
+          Enum.map([first_request, failed_request, full_retry_request], & &1.request_metadata),
+          [failed_attempt.response_metadata, full_retry_attempt.response_metadata],
+          failed_turn,
+          failed_settlement.details
+        })
+
+      for private_sentinel <- [
+            previous_response_id,
+            prompt_sentinel,
+            call_id_sentinel,
+            output_sentinel,
+            continuation_payload,
+            setup.authorization,
+            "upstream-token-generation-boundary-fallback"
+          ] do
+        refute persisted_metadata =~ private_sentinel
+        refute continuation_logs =~ private_sentinel
+      end
+
+      assert :ok = FakeUpstream.verify!(upstream)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "persistent upstream websocket does not reconnect after a partial response body" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_partial_close",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-partial-close-no-reconnect",
+          accepted_turn_state: "stable-ws-partial-close-no-reconnect",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_partial_close"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      FakeUpstream.set_mode(
+        upstream,
+        FakeUpstream.websocket_sse_then_close(
+          [
+            {"response.output_text.delta",
+             %{
+               "type" => "response.output_text.delta",
+               "response_id" => "resp_ws_partial_close",
+               "output_index" => 0,
+               "content_index" => 0,
+               "delta" => "partial"
+             }}
+          ],
+          reason: "fake upstream closed after partial frame"
+        )
+      )
+
+      second_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "second"}],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_partial_close"
+        })
+
+      {error_frame, logs} =
+        capture_native_turn_warning(fn ->
+          assert {:ok, state} =
+                   CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+          assert {:push, {:text, partial_frame}, state} = receive_socket_push(state)
+
+          assert %{"type" => "response.output_text.delta", "delta" => "partial"} =
+                   CodexPooler.JSON.decode!(partial_frame)
+
+          assert {:push, {:text, error_frame}, _state} = receive_socket_done(state)
+          error_frame
+        end)
+
+      assert_native_turn_warnings(logs, 1)
+      assert logs =~ "request_id=ws-partial-close-no-reconnect"
+      assert logs =~ "error_code=upstream_request_failed"
+      assert logs =~ "reason_code=upstream_request_failed"
+      assert logs =~ "visible_output=after_visible_output"
+      refute logs =~ "phase=receive"
+      refute logs =~ "fake upstream closed after partial frame"
+      refute logs =~ "resp_ws_partial_close"
+
+      assert %{"type" => "error", "error" => %{"code" => "upstream_request_failed"}} =
+               CodexPooler.JSON.decode!(error_frame)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert second_request.json["previous_response_id"] == "resp_ws_partial_close"
+
+      assert [first_log, second_log] =
+               Repo.all(
+                 from(r in Request,
+                   where: r.pool_id == ^setup.pool.id,
+                   order_by: [asc: r.admitted_at]
+                 )
+               )
+
+      assert first_log.status == "succeeded"
+      assert second_log.status == "failed"
+      assert second_log.transport == "websocket"
+      assert second_log.last_error_code == "upstream_stream_error"
+
+      assert [second_attempt] =
+               Repo.all(from(a in Attempt, where: a.request_id == ^second_log.id))
+
+      assert second_attempt.status == "failed"
+
+      assert second_attempt.response_metadata["transport_failure"] == %{
+               "connection_age_bucket" => "under_1m",
+               "connection_idle_bucket" => "under_5s",
+               "connection_request_bucket" => "requests_2_5",
+               "connection_use" => "reused",
+               "last_upstream_event_class" => "response_event",
+               "last_upstream_event_type" => "response.output_text",
+               "peer_close_code" => 1001,
+               "peer_close_reason_bytes" => 40,
+               "peer_close_reason_present" => true,
+               "phase" => "upstream_close",
+               "pre_visible_output" => false,
+               "reason" => "upstream_websocket_closed_before_terminal",
+               "reason_class" => "upstream_websocket_closed_before_terminal",
+               "terminal_candidate_seen" => false,
+               "terminal_seen" => false,
+               "termination_source" => "peer_close_frame",
+               "text_frame_count" => 1,
+               "transport_signal" => "tcp_data",
+               "upstream_committed" => true,
+               "websocket_buffer_bucket" => "empty",
+               "websocket_fragment_open" => false
+             }
+
+      metadata_text = inspect(second_attempt.response_metadata)
+      refute metadata_text =~ "partial"
+      refute metadata_text =~ "fake upstream closed after partial frame"
+      refute metadata_text =~ setup.authorization
+      refute metadata_text =~ setup.raw_key
+      refute metadata_text =~ "Bearer "
+      refute metadata_text =~ "upstream-token"
+
+      assert [demotion] = Repo.all(from(d in BridgeDemotion))
+      assert demotion.pool_upstream_assignment_id == setup.assignment.id
+      assert demotion.reason_code == "upstream_stream_error"
+
+      assert [circuit] =
+               Repo.all(from(c in RoutingCircuitState, where: c.route_class == "proxy_websocket"))
+
+      assert circuit.pool_upstream_assignment_id == setup.assignment.id
+      assert circuit.reason_code == "upstream_stream_error"
+      assert circuit.failure_count == 1
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "concurrent downstream websocket frames queue behind the active upstream turn" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.barrier_sse_stream(
+          [
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_ws_parallel",
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+               }
+             }}
+          ],
+          barrier_after: 0,
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-concurrent-frames",
+          accepted_turn_state: "stable-ws-concurrent-frames",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "main turn"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, first_upstream_pid, ^release_ref}, @detection_timeout_ms
+
+      second_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "sidecar turn"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      send(first_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, second_upstream_pid, ^release_ref}, @detection_timeout_ms
+      send(second_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(second_frame)
+      assert {:ok, state} = receive_socket_done(state)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "tool output websocket continuations wait for the active upstream turn" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.barrier_sse_stream(
+          [
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_ws_ordered_tool",
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+               }
+             }}
+          ],
+          barrier_after: 0,
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-ordered-tool-continuation",
+          accepted_turn_state: "stable-ws-ordered-tool-continuation",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "main turn"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, first_upstream_pid, ^release_ref}, @detection_timeout_ms
+
+      second_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_ordered_tool",
+              "output" => "sample output"
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_ordered_tool"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      refute_receive {:fake_upstream_chunk_barrier, 0, _second_upstream_pid, ^release_ref}, 100
+
+      send(first_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, second_upstream_pid, ^release_ref}, @detection_timeout_ms
+      send(second_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert second_request.json["previous_response_id"] == "resp_ws_ordered_tool"
+
+      assert [%{"type" => "function_call_output", "call_id" => "call_ordered_tool"}] =
+               second_request.json["input"]
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "direct websocket preserves schema-bound output and unbound output bytes" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_schema_bound_preservation",
+          "object" => "response",
+          "status" => "completed"
+        })
+      )
+
+    setup =
+      gateway_setup(upstream,
+        exposed_model_id: "gpt-4o",
+        upstream_model_id: "gpt-4o",
+        pricing_ref: "gpt-4o"
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-schema-bound-preservation",
+          accepted_turn_state: "stable-ws-schema-bound-preservation",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    schema_bound_output =
+      CodexPooler.JSON.encode!(%{"rows" => Enum.to_list(1..160)}, pretty: true)
+
+    unbound_output = CodexPooler.JSON.encode!(%{"rows" => Enum.to_list(161..320)}, pretty: true)
+
+    assert byte_size(schema_bound_output) > 512
+    assert byte_size(unbound_output) > 512
+
+    payload =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.create",
+        "model" => setup.model.exposed_model_id,
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "schema_bound_direct_fixture",
+            "output_schema" => %{"type" => "object"}
+          },
+          %{"type" => "function", "name" => "unbound_direct_fixture"}
+        ],
+        "input" => [
+          %{
+            "type" => "function_call",
+            "call_id" => "call_direct_schema_bound",
+            "name" => "schema_bound_direct_fixture",
+            "arguments" => "{}"
+          },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_direct_unbound",
+            "name" => "unbound_direct_fixture",
+            "arguments" => "{}"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_direct_schema_bound",
+            "output" => schema_bound_output
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_direct_unbound",
+            "output" => unbound_output
+          }
+        ],
+        "stream" => true,
+        "generate" => true
+      })
+
+    try do
+      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+      assert {:push, {:text, frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_schema_bound_preservation"} = CodexPooler.JSON.decode!(frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+
+      schema_bound_item =
+        Enum.find(captured.json["input"], fn item ->
+          item["type"] == "function_call_output" and
+            item["call_id"] == "call_direct_schema_bound"
+        end)
+
+      unbound_item =
+        Enum.find(captured.json["input"], fn item ->
+          item["type"] == "function_call_output" and item["call_id"] == "call_direct_unbound"
+        end)
+
+      assert schema_bound_item["output"] == schema_bound_output
+
+      assert CodexPooler.JSON.decode!(schema_bound_item["output"]) ==
+               CodexPooler.JSON.decode!(schema_bound_output)
+
+      assert unbound_item["output"] == unbound_output
+
+      assert CodexPooler.JSON.decode!(unbound_item["output"]) ==
+               CodexPooler.JSON.decode!(unbound_output)
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      refute Map.has_key?(attempt.response_metadata, "payload_compression")
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "downstream websocket does not inject last response id when continuation omits previous_response_id" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_auto_previous",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-no-auto-previous-response-id",
+          accepted_turn_state: "stable-ws-no-auto-previous-response-id",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_auto_previous"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      second_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "follow-up"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_auto_previous"} = CodexPooler.JSON.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      refute Map.has_key?(first_request.json, "previous_response_id")
+      refute Map.has_key?(second_request.json, "previous_response_id")
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  # The anchor opens the provider-held context with the Lite prefix; the
+  # anchored continuation continues it and carries the client's input alone,
+  # as the released client's own Lite anchored deltas do (findings#232 row
+  # 232-184: the prefix used to be repeated on every anchored turn).
+  test "websocket Full-to-Lite tool continuations keep previous_response_id without repeating the tools prefix" do
+    upstream =
+      start_upstream(
+        # Strict finite scenario: the anchor carries no previous response and
+        # the Lite continuation keeps it behind the tools prefix on the same
+        # physical connection.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create", "input.0.type" => "additional_tools", "input.1.role" => "developer"},
+              forbidden: ["previous_response_id", "tools", "instructions"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_tool_origin",
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+                })
+              ])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => "resp_ws_tool_origin",
+                "input.0.type" => "function_call_output"
+              },
+              forbidden: ["tools", "instructions"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_tool_continuation",
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                })
+              ])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    scope = model_serving_scope()
+    revision = set_model_serving_mode!(scope, setup, "full")
+    _revision = set_model_serving_mode!(scope, setup, "lite", revision)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    tool_output = "sample output"
+    tool_call_id = "call_sample"
+    previous_response_id = "resp_ws_tool_origin"
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-tool-continuation",
+          accepted_turn_state: "stable-ws-tool-continuation",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      tools = [
+        %{
+          "type" => "function",
+          "name" => "sample_lookup",
+          "parameters" => %{
+            "type" => "object",
+            "properties" => %{},
+            "required" => []
+          }
+        }
+      ]
+
+      anchor_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "instructions" => "synthetic base instructions",
+          "tools" => tools,
+          "input" => native_text_input("anchor"),
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({anchor_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, anchor_frame}, state} = receive_socket_push(state)
+      assert %{"id" => ^previous_response_id} = CodexPooler.JSON.decode!(anchor_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      continuation_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => tool_call_id,
+              "output" => tool_output
+            }
+          ],
+          "instructions" => "synthetic base instructions",
+          "tools" => tools,
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => previous_response_id
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({continuation_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_tool_continuation"} = CodexPooler.JSON.decode!(frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [anchor_request, captured] = FakeUpstream.requests(upstream)
+      assert anchor_request.websocket_connection_id == captured.websocket_connection_id
+      assert captured.method == "WEBSOCKET"
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["previous_response_id"] == previous_response_id
+      assert captured.json["type"] == "response.create"
+      assert captured.json["generate"] == true
+
+      assert [tools_prefix, instructions_message | _anchor_input] = anchor_request.json["input"]
+      assert tools_prefix["type"] == "additional_tools"
+      assert tools_prefix["role"] == "developer"
+      assert [%{"name" => "sample_lookup"}] = tools_prefix["tools"]
+      assert %{"type" => "message", "role" => "developer"} = instructions_message
+
+      assert [captured_tool_output] = captured.json["input"]
+
+      assert captured_tool_output == %{
+               "type" => "function_call_output",
+               "call_id" => tool_call_id,
+               "output" => tool_output
+             }
+
+      assert [_anchor_request, request] =
+               Repo.all(
+                 from(request in Request,
+                   where: request.pool_id == ^setup.pool.id,
+                   order_by: [asc: request.admitted_at]
+                 )
+               )
+
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+      assert request.response_status_code == 200
+      assert request.usage_status == "usage_known"
+      assert request.request_metadata["codex_session_id"] == state.codex_session.id
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.transport == "websocket"
+      assert attempt.status == "succeeded"
+      assert attempt.upstream_status_code == 200
+
+      assert [_anchor_turn, turn] =
+               Repo.all(
+                 from(turn in CodexTurn,
+                   where: turn.codex_session_id == ^state.codex_session.id,
+                   order_by: [asc: turn.turn_sequence]
+                 )
+               )
+
+      assert turn.request_id == request.id
+      assert turn.status == "succeeded"
+      assert turn.transport_kind == "websocket"
+      assert turn.completed_at
+      assert turn.final_attempt_id == attempt.id
+
+      session = Repo.get!(CodexSession, state.codex_session.id)
+      assert session.status == "active"
+      assert session.pool_upstream_assignment_id == setup.assignment.id
+
+      persistence_text =
+        inspect({request.request_metadata, attempt.response_metadata, session, turn})
+
+      refute persistence_text =~ setup.authorization
+      refute persistence_text =~ previous_response_id
+      refute persistence_text =~ tool_call_id
+      refute persistence_text =~ tool_output
+      refute persistence_text =~ "upstream-token"
+      assert :ok = FakeUpstream.verify!(upstream)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  # A Lite-shaped client (the released client on a Lite catalog entry) puts its
+  # own manifest and instructions message at the head of the request that opens
+  # the context and sends neither on an anchored delta. The Pooler used to
+  # append an empty `additional_tools` manifest to every such delta
+  # (findings#232 row 232-184).
+  test "websocket anchored Lite-shaped deltas reach the upstream without an injected empty manifest" do
+    manifest = %{"type" => "additional_tools", "id" => "at_sample", "role" => "developer", "tools" => [%{"type" => "function", "name" => "sample_lookup", "parameters" => %{"type" => "object", "properties" => %{}}}]}
+    next_message = hd(native_text_input("next"))
+
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create", "input.0.id" => "at_sample"}, forbidden: ["previous_response_id"]],
+            respond: FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"id" => "resp_ws_lite_anchor", "object" => "response", "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}})])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create", "previous_response_id" => "resp_ws_lite_anchor", "input.0.type" => "message"}],
+            respond: FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"id" => "resp_ws_lite_delta", "object" => "response", "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}})])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    _revision = set_model_serving_mode!(model_serving_scope(), setup, "lite")
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{auth: auth, opts: %{request_id: "ws-lite-shaped-delta", accepted_turn_state: "stable-ws-lite-shaped-delta", client_ip: "127.0.0.1"}})
+
+    try do
+      frames = [
+        %{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "", "input" => [manifest | native_text_input("anchor")], "stream" => true, "generate" => true},
+        %{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "", "input" => [next_message], "previous_response_id" => "resp_ws_lite_anchor", "stream" => true, "generate" => true}
+      ]
+
+      _state =
+        Enum.reduce(frames, state, fn frame, state ->
+          assert {:ok, state} = CodexResponsesSocket.handle_in({CodexPooler.JSON.encode!(frame), [opcode: :text]}, state)
+          assert {:push, {:text, _frame}, state} = receive_socket_push(state)
+          assert {:ok, state} = receive_socket_done(state)
+          state
+        end)
+
+      assert [anchor_request, delta_request] = FakeUpstream.requests(upstream)
+      assert anchor_request.websocket_connection_id == delta_request.websocket_connection_id
+      assert [^manifest | _anchor_input] = anchor_request.json["input"]
+      assert Enum.count(anchor_request.json["input"], &(&1["type"] == "additional_tools")) == 1
+      assert delta_request.json["previous_response_id"] == "resp_ws_lite_anchor"
+      assert delta_request.json["input"] == [next_message]
+      assert :ok = FakeUpstream.verify!(upstream)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  # A Lite anchored request sends no tool manifest or instructions message,
+  # because the context it continues already holds those of the request that
+  # opened it (findings#232 row 232-184). A context opened under Full holds
+  # neither, so once the Pool flips the model to Lite mid-session the anchored
+  # delta of a Full-shaped client would reach the provider with no tools and no
+  # base instructions (row 232-210). The connection refuses that anchor before
+  # sending, like an anchor on a replaced connection, and the client's full
+  # retry opens a Lite context with the prefix on the same connection.
+  # Owner forwarding off sends from the response task's own upstream session;
+  # on, from the owner's, which receives the request through the owner contract.
+  for forwarding? <- [false, true] do
+    test "websocket anchored delta after a Full-to-Lite flip is refused and the full retry carries the Lite prefix (owner forwarding #{forwarding?})" do
+      CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+      Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, unquote(forwarding?))
+
+      tools = [%{"type" => "function", "name" => "sample_lookup", "parameters" => %{"type" => "object", "properties" => %{}, "required" => []}}]
+      first_input = native_text_input("anchor")
+      tool_output = %{"type" => "function_call_output", "call_id" => "call_flip_sample", "output" => "sample output"}
+
+      upstream =
+        start_upstream(
+          # Strict finite scenario: the Full anchor and the Lite full retry share
+          # connection 1; the anchored Lite delta between them never reaches the
+          # upstream.
+          # provenance: synthetic_adversarial
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              path: "/backend-api/codex/responses",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.create", "tools.0.name" => "sample_lookup", "input.0.type" => "message"}, forbidden: ["previous_response_id"]],
+              respond: FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"id" => "resp_ws_flip_anchor", "object" => "response", "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}})])
+            ),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              path: "/backend-api/codex/responses",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.create", "input.0.type" => "additional_tools", "input.1.role" => "developer"}, forbidden: ["previous_response_id", "tools", "instructions"]],
+              respond: FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"id" => "resp_ws_flip_retry", "object" => "response", "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}})])
+            )
+          ])
+        )
+
+      setup = gateway_setup(upstream)
+      scope = model_serving_scope()
+      revision = set_model_serving_mode!(scope, setup, "full")
+      assert :ok = CodexPooler.Events.subscribe_pool(setup.pool)
+      port = start_public_endpoint!()
+      {conn, websocket, ref} = public_websocket_connect!(port, setup, "ws-serving-mode-flip-#{System.unique_integer([:positive])}")
+      frame = fn input, extra -> CodexPooler.JSON.encode!(Map.merge(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "synthetic base instructions", "tools" => tools, "input" => input, "stream" => true, "generate" => true}, extra)) end
+
+      try do
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, frame.(first_input, %{}))
+        {conn, websocket, anchor_frame} = public_websocket_receive_text!(conn, websocket, ref)
+        assert %{"id" => "resp_ws_flip_anchor"} = CodexPooler.JSON.decode!(anchor_frame)
+        assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @settlement_detection_timeout_ms
+
+        _revision = set_model_serving_mode!(scope, setup, "lite", revision)
+
+        {{conn, websocket}, delta_logs} =
+          with_log(fn ->
+            {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, frame.([tool_output], %{"previous_response_id" => "resp_ws_flip_anchor"}))
+            {conn, websocket, refusal_frame} = public_websocket_receive_text!(conn, websocket, ref)
+            assert CodexPooler.JSON.decode!(refusal_frame) == native_previous_response_retry_event()
+            assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "failed"}}}, @settlement_detection_timeout_ms
+            {conn, websocket}
+          end)
+
+        assert [_anchor_request] = FakeUpstream.requests(upstream)
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, frame.(first_input ++ [tool_output], %{}))
+        {conn, _websocket, retry_frame} = public_websocket_receive_text!(conn, websocket, ref)
+        assert %{"id" => "resp_ws_flip_retry"} = CodexPooler.JSON.decode!(retry_frame)
+        assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @settlement_detection_timeout_ms
+
+        assert [anchor_request, retry_request] = FakeUpstream.requests(upstream)
+        assert anchor_request.websocket_connection_id == retry_request.websocket_connection_id
+        assert FakeUpstream.websocket_connection_count(upstream) == 1
+        assert [%{"type" => "additional_tools", "tools" => [%{"name" => "sample_lookup"}]}, %{"type" => "message", "role" => "developer"} | retry_input] = retry_request.json["input"]
+        assert retry_input == first_input ++ [tool_output]
+
+        assert [anchor, refused, retry] = Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id, order_by: [asc: request.admitted_at]))
+        assert Enum.map([anchor, refused, retry], & &1.request_metadata["routing"]["model_serving_mode"]) == ["full", "lite", "lite"]
+        assert refused.status == "failed"
+        assert [refused_attempt] = Repo.all(from(attempt in Attempt, where: attempt.request_id == ^refused.id))
+        assert refused_attempt.response_metadata["upstream_error_code"] == "previous_response_not_found"
+
+        assert refused_attempt.response_metadata["transport_failure"] == %{
+                 "connection_use" => "reused",
+                 "phase" => "send_payload",
+                 "pre_visible_output" => true,
+                 "reason" => "previous_response_serving_mode_mismatch",
+                 "reason_class" => "previous_response_serving_mode_mismatch",
+                 "termination_source" => "continuation_generation_guard",
+                 "terminal_seen" => false,
+                 "text_frame_count" => 0,
+                 "upstream_committed" => false
+               }
+
+        assert Repo.all(from(demotion in BridgeDemotion)) == []
+        assert Repo.all(from(circuit in RoutingCircuitState)) == []
+        refute inspect({refused.request_metadata, refused_attempt.response_metadata}) =~ "resp_ws_flip_anchor"
+        refute delta_logs =~ "resp_ws_flip_anchor"
+        assert :ok = FakeUpstream.verify!(upstream)
+        conn
+      after
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
+
+  # The reverse flip is sent: a Full anchored request carries its tools and
+  # instructions at top level, so nothing is missing whatever the Lite context
+  # holds (a replay kept in Lite may be followed by a Full turn on its
+  # connection, findings#232 row 232-273).
+  test "websocket anchored Full delta after a Lite-to-Full flip is sent on the same connection" do
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+    tools = [%{"type" => "function", "name" => "sample_lookup", "parameters" => %{"type" => "object", "properties" => %{}, "required" => []}}]
+    tool_output = %{"type" => "function_call_output", "call_id" => "call_reverse_flip_sample", "output" => "sample output"}
+
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create", "input.0.type" => "additional_tools"}, forbidden: ["previous_response_id", "tools"]],
+            respond: FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"id" => "resp_ws_reverse_flip_anchor", "object" => "response", "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}})])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [valid: true, equals: %{"type" => "response.create", "previous_response_id" => "resp_ws_reverse_flip_anchor", "tools.0.name" => "sample_lookup", "input.0.type" => "function_call_output"}],
+            respond: FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"id" => "resp_ws_reverse_flip_delta", "object" => "response", "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}})])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    scope = model_serving_scope()
+    revision = set_model_serving_mode!(scope, setup, "lite")
+    assert :ok = CodexPooler.Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    {conn, websocket, ref} = public_websocket_connect!(port, setup, "ws-reverse-flip-#{System.unique_integer([:positive])}")
+    frame = fn input, extra -> CodexPooler.JSON.encode!(Map.merge(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "instructions" => "synthetic base instructions", "tools" => tools, "input" => input, "stream" => true, "generate" => true}, extra)) end
+
+    try do
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, frame.(native_text_input("anchor"), %{}))
+      {conn, websocket, anchor_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      assert %{"id" => "resp_ws_reverse_flip_anchor"} = CodexPooler.JSON.decode!(anchor_frame)
+      assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @settlement_detection_timeout_ms
+
+      _revision = set_model_serving_mode!(scope, setup, "full", revision)
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, frame.([tool_output], %{"previous_response_id" => "resp_ws_reverse_flip_anchor"}))
+      {conn, _websocket, delta_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      assert %{"id" => "resp_ws_reverse_flip_delta"} = CodexPooler.JSON.decode!(delta_frame)
+      assert_receive {CodexPooler.Events, %{reason: "request_finalized", payload: %{"status" => "succeeded"}}}, @settlement_detection_timeout_ms
+
+      assert [anchor_request, delta_request] = FakeUpstream.requests(upstream)
+      assert anchor_request.websocket_connection_id == delta_request.websocket_connection_id
+      assert delta_request.json["input"] == [tool_output]
+      assert Enum.map(Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id, order_by: [asc: request.admitted_at])), &{&1.status, &1.request_metadata["routing"]["model_serving_mode"]}) == [{"succeeded", "lite"}, {"succeeded", "full"}]
+      assert :ok = FakeUpstream.verify!(upstream)
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "websocket custom tool output continuations keep previous_response_id for upstream context" do
+    upstream =
+      start_upstream(
+        # Strict finite scenario: the custom tool continuation must carry the
+        # anchor response id on the same physical connection.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_custom_tool_origin",
+                  "object" => "response"
+                })
+              ])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => "resp_ws_custom_tool_origin",
+                "input.0.type" => "custom_tool_call_output"
+              }
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_custom_tool_continuation",
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                })
+              ])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-custom-tool-continuation",
+          accepted_turn_state: "stable-ws-custom-tool",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in(
+                 {anchor_payload(setup.model.exposed_model_id), [opcode: :text]},
+                 state
+               )
+
+      assert {:push, {:text, anchor_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_custom_tool_origin"} = CodexPooler.JSON.decode!(anchor_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      continuation_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "custom_tool_call_output",
+              "call_id" => "call_sample",
+              "name" => "sample_tool",
+              "output" => "sample output"
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_custom_tool_origin"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({continuation_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_custom_tool_continuation"} = CodexPooler.JSON.decode!(frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [anchor_request, captured] = FakeUpstream.requests(upstream)
+      assert anchor_request.websocket_connection_id == captured.websocket_connection_id
+      assert captured.json["previous_response_id"] == "resp_ws_custom_tool_origin"
+      assert captured.json["type"] == "response.create"
+      assert captured.json["generate"] == true
+      assert :ok = FakeUpstream.verify!(upstream)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "future tool output continuations keep previous_response_id by shape" do
+    upstream =
+      start_upstream(
+        # Strict finite scenario: the anchor carries no previous response and
+        # the continuation must keep it on the same physical connection.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_future_tool_origin",
+                  "object" => "response"
+                })
+              ])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => "resp_ws_future_tool_origin",
+                "input.0.type" => "future_tool_call_output"
+              }
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_future_tool_continuation",
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                })
+              ])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-future-tool-continuation",
+          accepted_turn_state: "stable-ws-future-tool",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in(
+                 {anchor_payload(setup.model.exposed_model_id), [opcode: :text]},
+                 state
+               )
+
+      assert {:push, {:text, anchor_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_future_tool_origin"} = CodexPooler.JSON.decode!(anchor_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      continuation_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "future_tool_call_output",
+              "call_id" => "future_call_sample",
+              "output" => "future sample output"
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_future_tool_origin"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({continuation_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_future_tool_continuation"} = CodexPooler.JSON.decode!(frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [anchor_request, captured] = FakeUpstream.requests(upstream)
+      assert anchor_request.websocket_connection_id == captured.websocket_connection_id
+      assert captured.json["previous_response_id"] == "resp_ws_future_tool_origin"
+
+      assert captured.json["input"] |> List.first() |> Map.fetch!("type") ==
+               "future_tool_call_output"
+
+      assert :ok = FakeUpstream.verify!(upstream)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  # The anchor is kept by semantic tool-result shape (AGENTS invariant), but
+  # the provider resolves it only on the websocket connection that produced
+  # the response and refuses the parameter over HTTP (findings#232 rows
+  # 232-275 and 232-276); FakeUpstream answers the same way. The client gets
+  # the refusal naming the parameter instead of a delta served without its
+  # context.
+  test "HTTP custom tool output continuations keep previous_response_id and relay its HTTP refusal", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_http_custom_tool_never_served"}))
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "type" => "custom_tool_call_output",
+            "call_id" => "call_sample",
+            "name" => "sample_tool",
+            "output" => "sample output"
+          }
+        ],
+        "previous_response_id" => "resp_http_custom_tool_origin"
+      })
+
+    assert %{"error" => %{"code" => "unsupported_parameter", "param" => "previous_response_id"}} = json_response(conn, 400)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["previous_response_id"] == "resp_http_custom_tool_origin"
+    assert [%{"type" => "custom_tool_call_output", "call_id" => "call_sample"}] = captured.json["input"]
+    refute Map.has_key?(captured.json, "type")
+  end
+
+  test "gateway debug mode logs safe continuation decisions and stores request metadata" do
+    previous_env = Application.get_env(:codex_pooler, OperationalSettings)
+
+    Application.put_env(:codex_pooler, OperationalSettings, settings: %OperationalSettings{gateway_debug?: true})
+
+    on_exit(fn ->
+      if previous_env,
+        do: Application.put_env(:codex_pooler, OperationalSettings, previous_env),
+        else: Application.delete_env(:codex_pooler, OperationalSettings)
+    end)
+
+    upstream =
+      start_upstream(
+        # Strict finite scenario: the debug-logged continuation must still
+        # preserve the anchor response id on the same physical connection.
+        # provenance: synthetic_adversarial
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{"type" => "response.create"},
+              forbidden: ["previous_response_id"]
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_debug_tool_origin",
+                  "object" => "response"
+                })
+              ])
+          ),
+          FakeUpstream.expect_request(
+            method: "WEBSOCKET",
+            path: "/backend-api/codex/responses",
+            websocket_connection_ordinal: 1,
+            json: [
+              valid: true,
+              equals: %{
+                "type" => "response.create",
+                "previous_response_id" => "resp_ws_debug_tool_origin",
+                "input.0.type" => "custom_tool_call_output"
+              }
+            ],
+            respond:
+              FakeUpstream.websocket_text_frames([
+                CodexPooler.JSON.encode!(%{
+                  "id" => "resp_ws_debug_tool_continuation",
+                  "object" => "response",
+                  "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                })
+              ])
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-debug-tool-continuation",
+          accepted_turn_state: "stable-ws-debug-tool",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    assert {:ok, state} =
+             CodexResponsesSocket.handle_in(
+               {anchor_payload(setup.model.exposed_model_id), [opcode: :text]},
+               state
+             )
+
+    assert {:push, {:text, anchor_frame}, state} = receive_socket_push(state)
+    assert %{"id" => "resp_ws_debug_tool_origin"} = CodexPooler.JSON.decode!(anchor_frame)
+    assert {:ok, state} = receive_socket_done(state)
+
+    continuation_payload =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.create",
+        "model" => setup.model.exposed_model_id,
+        "metadata" => %{"debug_note" => "metadata value must stay hidden"},
+        "input" => [
+          %{
+            "type" => "custom_tool_call_output",
+            "call_id" => "call_debug_sample",
+            "output" => "debug output must stay hidden"
+          }
+        ],
+        "stream" => true,
+        "generate" => true,
+        "previous_response_id" => "resp_ws_debug_tool_origin"
+      })
+
+    try do
+      previous_logger_level = Logger.level()
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> Logger.configure(level: previous_logger_level) end)
+
+      log =
+        try do
+          Logger.configure(level: :info)
+
+          ExUnit.CaptureLog.capture_log([level: :info], fn ->
+            assert {:ok, next_state} =
+                     CodexResponsesSocket.handle_in(
+                       {continuation_payload, [opcode: :text]},
+                       state
+                     )
+
+            assert {:push, {:text, frame}, next_state} = receive_socket_push(next_state)
+            assert %{"id" => "resp_ws_debug_tool_continuation"} = CodexPooler.JSON.decode!(frame)
+            assert {:ok, _state} = receive_socket_done(next_state)
+          end)
+        after
+          Logger.configure(level: previous_logger_level)
+        end
+
+      assert log =~ "codex_pooler gateway_debug payload"
+      assert log =~ "previous_response_id_action=preserved"
+      assert log =~ "previous_response_id_clear_preview=resp_ws_debug_too"
+      assert log =~ "client_json_bytes="
+      assert log =~ "client_approx_tokens="
+      assert log =~ "upstream_json_bytes="
+      assert log =~ "upstream_approx_tokens="
+      assert log =~ "client_entry_count=1"
+      assert log =~ "client_chat_entry_count=0"
+      assert log =~ "client_string_bytes="
+      assert log =~ "custom_tool_call_output"
+      refute log =~ "debug output must stay hidden"
+      refute log =~ "metadata value must stay hidden"
+      refute log =~ "resp_ws_debug_tool_origin"
+      refute log =~ "call_debug_sample"
+
+      assert [_anchor_request, request] =
+               Repo.all(
+                 from(request in Request,
+                   where:
+                     request.endpoint == "/backend-api/codex/responses" and
+                       request.transport == "websocket",
+                   order_by: [asc: request.admitted_at]
+                 )
+               )
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      debug = attempt.response_metadata["gateway_debug"]
+      refute Map.has_key?(debug, "previous_response_id")
+      refute Map.has_key?(debug, "previous_response_id_clear_preview")
+      assert debug["previous_response_id_summary"]["action"] == "preserved"
+      assert debug["previous_response_id_summary"]["preview"] =~ ~r/\A[0-9a-f]{16}\z/
+      assert debug["items"]["tool_result_types"] == ["custom_tool_call_output"]
+      assert debug["shape"]["client"]["json"]["bytes"] > 0
+      assert debug["shape"]["client"]["json"]["approx_tokens"] > 0
+      assert debug["shape"]["client"]["json"]["strategy"] == "json_bytes_div_4_ceil"
+
+      assert debug["shape"]["client"]["top_level_keys"] == [
+               "generate",
+               "input",
+               "metadata",
+               "model",
+               "previous_response_id",
+               "stream",
+               "type"
+             ]
+
+      assert debug["shape"]["client"]["entries"]["count"] == 1
+
+      assert debug["shape"]["client"]["entries"]["item_types"] == %{
+               "custom_tool_call_output" => 1
+             }
+
+      assert debug["shape"]["client"]["entries"]["tool_result_count"] == 1
+      assert debug["shape"]["client"]["chat_entries"]["kind"] == "absent"
+      assert debug["shape"]["client"]["string_stats"]["string_bytes"] > 0
+      assert debug["shape"]["client"]["string_stats"]["max_string_bytes"] > 0
+      assert debug["shape"]["client"]["flags"]["stream"] == true
+      assert debug["shape"]["client"]["flags"]["generate"] == true
+      assert debug["shape"]["client"]["flags"]["has_previous_response_id"] == true
+      assert debug["shape"]["upstream"]["json"]["bytes"] > 0
+      assert debug["shape"]["upstream"]["flags"]["has_instructions"] == true
+
+      metadata_text = inspect(debug)
+      refute metadata_text =~ "debug output must stay hidden"
+      refute metadata_text =~ "metadata value must stay hidden"
+      refute metadata_text =~ "resp_ws_debug_too"
+      refute metadata_text =~ "call_debug_sample"
+      assert :ok = FakeUpstream.verify!(upstream)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "HTTP Full-to-Lite ordinary continuation drops previous_response_id after the tools prefix",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.reject_json_field(
+          "previous_response_id",
+          %{
+            "id" => "resp_http_bridge",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          %{"error" => %{"code" => "invalid_previous_response_id"}}
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    scope = model_serving_scope()
+    revision = set_model_serving_mode!(scope, setup, "full")
+    _revision = set_model_serving_mode!(scope, setup, "lite", revision)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("hello"),
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "sample_lookup",
+            "parameters" => %{
+              "type" => "object",
+              "properties" => %{},
+              "required" => []
+            }
+          }
+        ],
+        "previous_response_id" => "resp_http_previous"
+      })
+
+    assert %{"id" => "resp_http_bridge"} = json_response(conn, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+    refute Map.has_key?(captured.json, "previous_response_id")
+    assert [%{"type" => "additional_tools"} | _input] = captured.json["input"]
+  end
+
+  # The call bound `UpstreamWebsocketSession.send_request_frame/2` used to
+  # carry (findings#206 row 206-322).
+  @former_frame_call_bound_ms 1_000
+
+  # The session serves one call at a time and holds a turn's call until the turn
+  # settles. On a direct socket a response.processed whose call reaches the
+  # session behind a fresh turn's request waits for that turn; the test holds
+  # the session with :sys.suspend/1 to stand for that turn. The fixed one-second
+  # call bound answered the client 502 upstream_websocket_forward_failed and
+  # recorded nothing, while the queued frame still reached the provider once
+  # the session was free.
+  @tag :websocket_persistent_upstream_session
+  @tag slow: "the acknowledgement must outlive the former fixed one-second send_request_frame call bound, which has no injectable clock"
+  test "a response.processed queued behind a busy upstream session is forwarded once and acknowledged" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_busy_session",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-busy-session-processed",
+          accepted_turn_state: "stable-ws-busy-session-processed",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} = CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_busy_session"} = CodexPooler.JSON.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      session = state.upstream_websocket_session
+      assert is_pid(session)
+      ledger_entries_before = Repo.aggregate(LedgerEntry, :count)
+
+      processed_payload =
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.processed",
+          "response_id" => "resp_ws_busy_session"
+        })
+
+      :ok = :sys.suspend(session)
+
+      state =
+        try do
+          tasks_before = Map.get(state, :tasks, MapSet.new())
+          assert {:ok, state} = CodexResponsesSocket.handle_in({processed_payload, [opcode: :text]}, state)
+          assert [task] = state |> Map.get(:tasks, MapSet.new()) |> MapSet.difference(tasks_before) |> MapSet.to_list()
+          await_frame_call_queued!(task, session)
+
+          refute_receive {:codex_response_done, ^task, _result}, @former_frame_call_bound_ms + 200
+          state
+        after
+          :ok = :sys.resume(session)
+        end
+
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [turn_request, processed_request] = FakeUpstream.requests(upstream)
+      assert processed_request.websocket_connection_id == turn_request.websocket_connection_id
+      assert processed_request.json == %{"response_id" => "resp_ws_busy_session", "type" => "response.processed"}
+
+      assert [ack] = Repo.all(from(request in Request, where: fragment("?->>'response_processed' = 'true'", request.request_metadata)))
+      assert %Request{status: "succeeded", response_status_code: 200, last_error_code: nil} = ack
+      assert Repo.aggregate(LedgerEntry, :count) == ledger_entries_before
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  defp await_frame_call_queued!(task, session) do
+    deadline = System.monotonic_time(:millisecond) + @detection_timeout_ms
+    await_frame_call_queued!(task, session, deadline)
+  end
+
+  defp await_frame_call_queued!(task, session, deadline) do
+    {:current_stacktrace, stack} = Process.info(task, :current_stacktrace)
+    {:message_queue_len, queued} = Process.info(session, :message_queue_len)
+
+    cond do
+      queued > 0 and Enum.any?(stack, &match?({UpstreamWebsocketSession, :send_request_frame, 2, _location}, &1)) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("the response.processed call never reached the suspended upstream session")
+
+      true ->
+        Process.sleep(10)
+        await_frame_call_queued!(task, session, deadline)
+    end
+  end
+
+  defp anchor_payload(model_id) do
+    CodexPooler.JSON.encode!(%{
+      "type" => "response.create",
+      "model" => model_id,
+      "input" => native_text_input("anchor"),
+      "stream" => true,
+      "generate" => true
+    })
+  end
+end

@@ -1,7 +1,7 @@
 defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
   use CodexPooler.DataCase, async: false
 
-  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Accounting.{Attempt, Request, RequestLogFact}
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Dev.UpstreamAccountBundle
@@ -16,6 +16,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
   import CodexPooler.PoolerFixtures
 
   @password "synthetic-bundle-password-12345"
+  @detection_timeout_ms 15_000
 
   test "round trips an encrypted active account through trusted token linking" do
     source_pool = pool_fixture()
@@ -33,13 +34,13 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     refute bundle =~ source.refresh_token
 
     assert {:ok, import_receipt} =
-             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, refresh_tokens: :import)
 
     assert import_receipt.imported == 1
     assert import_receipt.dry_run == false
 
     assert {:ok, %{imported: 1}} =
-             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, refresh_tokens: :import)
 
     assert length(Upstreams.list_active_pool_assignments(target_pool)) == 1
 
@@ -58,6 +59,41 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     refute inspect(import_receipt) =~ source.access_token
     refute inspect(import_receipt) =~ source.refresh_token
     refute inspect(import_receipt) =~ source.identity.account_email
+  end
+
+  test "auto-publishing bundle import rejects a caller-owned transaction before work" do
+    source_pool = pool_fixture()
+    source = account_fixture(source_pool)
+    target_pool = pool_fixture()
+    scope = owner_scope()
+
+    assert {:ok, bundle, _receipt} =
+             UpstreamAccountBundle.export_bundle(source_pool, @password)
+
+    before = persistence_counts()
+    observer = start_event_observer(target_pool.id)
+
+    assert {:error, :intentional_rollback} =
+             Repo.transaction(fn ->
+               assert {:error, %{code: :bundle_import_failed}} =
+                        UpstreamAccountBundle.import_bundle(
+                          bundle,
+                          target_pool,
+                          scope,
+                          @password
+                        )
+
+               assert persistence_counts() == before
+               assert Upstreams.list_active_pool_assignments(target_pool) == []
+               assert event_snapshot(observer) == []
+               Repo.rollback(:intentional_rollback)
+             end)
+
+    assert persistence_counts() == before
+    assert Upstreams.list_active_pool_assignments(target_pool) == []
+    assert event_snapshot(observer) == []
+    refute inspect(before) =~ source.access_token
+    refute inspect(before) =~ source.refresh_token
   end
 
   test "rejects a wrong password, tampering, legacy, unversioned, and unsupported bundles before writes" do
@@ -80,57 +116,57 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
 
     tampered =
       bundle
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> Map.update!("ciphertext", fn ciphertext ->
         <<first, rest::binary>> = Base.decode64!(ciphertext)
         Base.encode64(<<Bitwise.bxor(first, 1), rest::binary>>)
       end)
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
 
     assert {:error, %{code: :bundle_decryption_failed}} =
              UpstreamAccountBundle.import_bundle(tampered, target_pool, scope, @password)
 
     unsupported =
       bundle
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> Map.put("version", 999)
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
 
     assert {:error, %{code: :bundle_unsupported_version}} =
              UpstreamAccountBundle.import_bundle(unsupported, target_pool, scope, @password)
 
     legacy =
       bundle
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> Map.put("version", 1)
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
 
     assert {:error, %{code: :bundle_unsupported_version}} =
              UpstreamAccountBundle.import_bundle(legacy, target_pool, scope, @password)
 
     unversioned =
       bundle
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> Map.delete("version")
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
 
     assert {:error, %{code: :bundle_malformed}} =
              UpstreamAccountBundle.import_bundle(unversioned, target_pool, scope, @password)
 
     downgraded_kdf =
       bundle
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> update_in(["kdf", "t_cost"], &(&1 - 1))
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
 
     assert {:error, %{code: :bundle_unsupported_kdf}} =
              UpstreamAccountBundle.import_bundle(downgraded_kdf, target_pool, scope, @password)
 
     injected_header =
       bundle
-      |> Jason.decode!()
+      |> CodexPooler.JSON.decode!()
       |> Map.put("owner_email", "prompt-injection@example.com")
-      |> Jason.encode!()
+      |> CodexPooler.JSON.encode!()
 
     assert {:error, injected_error} =
              UpstreamAccountBundle.import_bundle(injected_header, target_pool, scope, @password)
@@ -158,13 +194,11 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     assert receipt.skipped_missing_refresh_token == 1
 
     assert {:ok, %{imported: 1}} =
-             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, refresh_tokens: :import)
 
     assert Upstreams.get_upstream_identity_by_chatgpt_account(skipped.identity.chatgpt_account_id)
 
-    assert Upstreams.get_upstream_identity_by_chatgpt_account(
-             imported.identity.chatgpt_account_id
-           )
+    assert Upstreams.get_upstream_identity_by_chatgpt_account(imported.identity.chatgpt_account_id)
   end
 
   test "dry runs full validation without writes" do
@@ -176,12 +210,73 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
 
     assert {:ok, %{dry_run: true, valid: 1, imported: 0}} =
-             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password,
-               dry_run: true
-             )
+             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, dry_run: true)
 
     assert Upstreams.list_active_pool_assignments(target_pool) == []
     refute inspect(bundle) =~ source.identity.account_email
+  end
+
+  test "empty real and dry-run imports are query-free successes" do
+    source_pool = pool_fixture()
+    target_pool = pool_fixture()
+    scope = owner_scope()
+
+    assert {:ok, bundle, %{exported: 0}} =
+             UpstreamAccountBundle.export_bundle(source_pool, @password)
+
+    for dry_run? <- [false, true] do
+      handler = {__MODULE__, :empty_bundle_query, dry_run?, System.unique_integer([:positive])}
+
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:codex_pooler, :repo, :query],
+          fn _event, _measurements, metadata, test_pid ->
+            if metadata[:repo] == Repo, do: send(test_pid, :bundle_repo_query)
+          end,
+          self()
+        )
+
+      try do
+        assert {:ok, %{account_count: 0, valid: 0, imported: 0, dry_run: ^dry_run?}} =
+                 UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, dry_run: dry_run?)
+
+        refute_received :bundle_repo_query
+      after
+        :telemetry.detach(handler)
+      end
+    end
+
+    assert Upstreams.list_active_pool_assignments(target_pool) == []
+  end
+
+  test "malformed persisted credential epochs collapse to the bundle phase error in normal and dry-run paths" do
+    source_pool = pool_fixture()
+    source = account_fixture(source_pool)
+    scope = owner_scope()
+
+    assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
+
+    source.identity
+    |> Ecto.Changeset.change(metadata: %{"credential_epoch" => "malformed"})
+    |> Repo.update!()
+
+    for dry_run? <- [false, true] do
+      target_pool = pool_fixture()
+      before = persistence_counts()
+
+      assert {:error, %{code: :bundle_import_failed} = error} =
+               UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, dry_run: dry_run?)
+
+      assert persistence_counts() == before
+      assert Upstreams.list_active_pool_assignments(target_pool) == []
+      refute inspect(error) =~ source.access_token
+      refute inspect(error) =~ source.refresh_token
+      refute inspect(error) =~ source.identity.account_email
+    end
   end
 
   test "round trip preserves an explicitly unclassified credential without authorizing it" do
@@ -275,6 +370,181 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     refute inspect(error) =~ second.access_token
   end
 
+  test "canonical preparation conflicts use the same opaque phase error in normal and dry-run imports" do
+    source_pool = pool_fixture()
+    first = account_fixture(source_pool)
+    second = account_fixture(source_pool)
+    scope = owner_scope()
+
+    assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
+
+    delete_export_source!(first)
+    delete_export_source!(second)
+    create_subject_bound_conflict!(second)
+
+    for dry_run? <- [false, true] do
+      target_pool = pool_fixture()
+      before = persistence_counts()
+
+      assert {:error, %{code: :bundle_import_failed} = error} =
+               UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, dry_run: dry_run?)
+
+      assert persistence_counts() == before
+      assert Upstreams.list_active_pool_assignments(target_pool) == []
+      refute inspect(error) =~ first.access_token
+      refute inspect(error) =~ second.access_token
+      refute inspect(error) =~ second.identity.account_email
+    end
+  end
+
+  test "scoped PostgreSQL failure after the first assignment maps to a sanitized bundle error and rolls back" do
+    source_pool = pool_fixture()
+    first = account_fixture(source_pool)
+    second = account_fixture(source_pool)
+    target_pool = pool_fixture()
+    unrelated = active_upstream_assignment_fixture(target_pool)
+    scope = owner_scope()
+    observer = start_event_observer(target_pool.id)
+
+    assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
+    before = persistence_counts()
+    assert event_snapshot(observer) == []
+    fault = install_second_assignment_failure!(second.identity.id, :postgres)
+    on_exit(fn -> remove_assignment_failure!(fault) end)
+
+    try do
+      assert {:error, %{code: :bundle_import_failed} = error} =
+               UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+
+      assert fault_counter(fault) == 1
+      assert persistence_counts() == before
+      assert Repo.get!(UpstreamIdentity, unrelated.identity.id).status == "active"
+      assert Repo.get!(PoolUpstreamAssignment, unrelated.assignment.id).status == "active"
+      assert Upstreams.list_active_pool_assignments(target_pool) == [unrelated.assignment]
+      assert event_snapshot(observer) == []
+
+      for forbidden <- [
+            first.access_token,
+            first.refresh_token,
+            second.access_token,
+            second.refresh_token,
+            second.identity.account_email,
+            second.identity.id,
+            "synthetic bundle persistence failure"
+          ] do
+        refute inspect(error) =~ forbidden
+      end
+    after
+      remove_assignment_failure!(fault)
+      assert_fault_removed!(fault)
+    end
+  end
+
+  test "scoped Ecto constraint failure after the first assignment maps to a sanitized bundle error and rolls back" do
+    source_pool = pool_fixture()
+    first = account_fixture(source_pool)
+    second = account_fixture(source_pool)
+    target_pool = pool_fixture()
+    unrelated = active_upstream_assignment_fixture(target_pool)
+    scope = owner_scope()
+    observer = start_event_observer(target_pool.id)
+
+    assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
+    before = persistence_counts()
+    assert event_snapshot(observer) == []
+    fault = install_second_assignment_failure!(second.identity.id, :constraint)
+    on_exit(fn -> remove_assignment_failure!(fault) end)
+
+    try do
+      assert {:error, %{code: :bundle_import_failed} = error} =
+               UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+
+      assert fault_counter(fault) == 1
+      assert persistence_counts() == before
+      assert Repo.get!(UpstreamIdentity, unrelated.identity.id).status == "active"
+      assert Repo.get!(PoolUpstreamAssignment, unrelated.assignment.id).status == "active"
+      assert Upstreams.list_active_pool_assignments(target_pool) == [unrelated.assignment]
+      assert event_snapshot(observer) == []
+
+      for forbidden <- [
+            first.access_token,
+            first.refresh_token,
+            second.access_token,
+            second.refresh_token,
+            second.identity.account_email,
+            second.identity.id,
+            fault.constraint
+          ] do
+        refute inspect(error) =~ forbidden
+      end
+    after
+      remove_assignment_failure!(fault)
+      assert_fault_removed!(fault)
+    end
+  end
+
+  test "the scoped later assignment constraint is converted to Ecto.ConstraintError by the installed Ecto boundary" do
+    source_pool = pool_fixture()
+    first = account_fixture(source_pool)
+    second = account_fixture(source_pool)
+    target_pool = pool_fixture()
+    fault = install_second_assignment_failure!(second.identity.id, :constraint)
+    on_exit(fn -> remove_assignment_failure!(fault) end)
+
+    try do
+      assert {:error, :intentional_rollback} =
+               Repo.transaction(fn ->
+                 assert {:ok, _assignment} =
+                          Repo.insert(assignment_changeset(target_pool, first.identity.id))
+
+                 assert_raise Ecto.ConstraintError, fn ->
+                   Repo.insert!(assignment_changeset(target_pool, second.identity.id))
+                 end
+
+                 Repo.rollback(:intentional_rollback)
+               end)
+
+      assert fault_counter(fault) == 1
+      assert Upstreams.list_active_pool_assignments(target_pool) == []
+    after
+      remove_assignment_failure!(fault)
+      assert_fault_removed!(fault)
+    end
+  end
+
+  test "an unexpected persistence collaborator exception after the second write propagates without publication" do
+    source_pool = pool_fixture()
+    _first = account_fixture(source_pool)
+    second = account_fixture(source_pool)
+    target_pool = pool_fixture()
+    unrelated = active_upstream_assignment_fixture(target_pool)
+    scope = owner_scope()
+    observer = start_event_observer(target_pool.id)
+
+    assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
+    before = persistence_counts()
+    assert event_snapshot(observer) == []
+
+    fault = install_second_assignment_failure!(second.identity.id, :delete_after_insert)
+    on_exit(fn -> remove_assignment_failure!(fault) end)
+
+    try do
+      assert_raise Ecto.NoResultsError, fn ->
+        UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+      end
+
+      assert fault_counter(fault) == 1
+      assert persistence_counts() == before
+      assert Repo.get!(UpstreamIdentity, unrelated.identity.id).status == "active"
+      assert Repo.get!(PoolUpstreamAssignment, unrelated.assignment.id).status == "active"
+      assert Upstreams.list_active_pool_assignments(target_pool) == [unrelated.assignment]
+      assert event_snapshot(observer) == []
+    after
+      remove_assignment_failure!(fault)
+      assert_fault_removed!(fault)
+    end
+  end
+
   test "normal and dry-run imports enqueue no provider-capable job and create no request" do
     source_pool = pool_fixture()
     _source = account_fixture(source_pool)
@@ -291,9 +561,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
              UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
 
     assert {:ok, %{imported: 0, dry_run: true}} =
-             UpstreamAccountBundle.import_bundle(bundle, dry_run_pool, scope, @password,
-               dry_run: true
-             )
+             UpstreamAccountBundle.import_bundle(bundle, dry_run_pool, scope, @password, dry_run: true)
 
     assert Repo.aggregate(Oban.Job, :count) == before_jobs
     assert Repo.aggregate(Request, :count) == before_requests
@@ -310,7 +578,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     assert {:ok, bundle, _receipt} = UpstreamAccountBundle.export_bundle(source_pool, @password)
 
     assert {:ok, %{imported: 1}} =
-             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, refresh_tokens: :import)
 
     imported =
       Upstreams.get_upstream_identity_by_chatgpt_account(source.identity.chatgpt_account_id)
@@ -326,7 +594,8 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
                missing_refresh,
                pool_fixture(),
                scope,
-               @password
+               @password,
+               refresh_tokens: :import
              )
   end
 
@@ -352,7 +621,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
              UpstreamAccountBundle.export_bundle(source_pool, @password)
 
     assert {:ok, %{imported: 4}} =
-             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password)
+             UpstreamAccountBundle.import_bundle(bundle, target_pool, scope, @password, refresh_tokens: :import)
 
     assert %{state: :known, deadline: ^future} =
              known_future.identity
@@ -484,6 +753,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     assert persistence_counts() == before
   end
 
+  @tag slow: "exercises real encryption and storage rejection across credential provenance variants"
   test "encrypted v2 import rejects missing, forged, and malformed credential provenance before writes" do
     source_pool = pool_fixture()
     _source = account_fixture(source_pool)
@@ -517,12 +787,9 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
 
   test "strict CLI parsers reject duplicate and contradictory destructive options" do
     duplicate_cases = [
-      {&UpstreamAccountBundle.parse_export_args/1,
-       ["--pool", "one", "--pool", "two", "--out", "bundle.bin"]},
-      {&UpstreamAccountBundle.parse_export_args/1,
-       ["--pool", "one", "--out", "a.bin", "--out", "b.bin"]},
-      {&UpstreamAccountBundle.parse_import_args/1,
-       ["bundle.bin", "--pool", "one", "--pool", "two"]},
+      {&UpstreamAccountBundle.parse_export_args/1, ["--pool", "one", "--pool", "two", "--out", "bundle.bin"]},
+      {&UpstreamAccountBundle.parse_export_args/1, ["--pool", "one", "--out", "a.bin", "--out", "b.bin"]},
+      {&UpstreamAccountBundle.parse_import_args/1, ["bundle.bin", "--pool", "one", "--pool", "two"]},
       {&UpstreamAccountBundle.parse_import_args/1,
        [
          "bundle.bin",
@@ -533,10 +800,8 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
          "--owner-email",
          "b@example.com"
        ]},
-      {&UpstreamAccountBundle.parse_import_args/1,
-       ["bundle.bin", "--pool", "one", "--dry-run", "--dry-run"]},
-      {&UpstreamAccountBundle.parse_import_args/1,
-       ["bundle.bin", "--pool", "one", "--dry-run", "--no-dry-run"]}
+      {&UpstreamAccountBundle.parse_import_args/1, ["bundle.bin", "--pool", "one", "--dry-run", "--dry-run"]},
+      {&UpstreamAccountBundle.parse_import_args/1, ["bundle.bin", "--pool", "one", "--dry-run", "--no-dry-run"]}
     ]
 
     for {parser, args} <- duplicate_cases do
@@ -699,14 +964,48 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     identity =
       fixture.identity
       |> Ecto.Changeset.change()
-      |> UpstreamIdentity.put_credential_provenance(
-        Keyword.get(opts, :credential_provenance, :codex_chatgpt)
-      )
+      |> UpstreamIdentity.put_credential_provenance(Keyword.get(opts, :credential_provenance, :codex_chatgpt))
       |> Repo.update!()
 
     fixture
     |> Map.put(:identity, identity)
     |> Map.merge(%{access_token: access_token, refresh_token: refresh_token})
+  end
+
+  defp start_event_observer(pool_id) do
+    parent = self()
+
+    observer =
+      spawn_link(fn ->
+        :ok = Events.subscribe_pool(pool_id, "upstreams")
+        send(parent, {:event_observer_ready, self()})
+        observe_events([])
+      end)
+
+    assert_receive {:event_observer_ready, ^observer}, @detection_timeout_ms
+    on_exit(fn -> send(observer, :stop) end)
+    observer
+  end
+
+  defp observe_events(events) do
+    receive do
+      {Events, event} ->
+        observe_events([event | events])
+
+      {:snapshot, caller, ref} ->
+        send(caller, {ref, Enum.reverse(events)})
+        observe_events(events)
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp event_snapshot(observer) do
+    ref = make_ref()
+    send(observer, {:snapshot, self(), ref})
+    assert_receive {^ref, events}, @detection_timeout_ms
+    events
   end
 
   defp trusted_expiry_metadata(%DateTime{} = deadline) do
@@ -746,9 +1045,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
   defp delete_export_source!(source) do
     Repo.delete!(Repo.reload!(source.assignment))
 
-    Repo.delete_all(
-      from secret in EncryptedSecret, where: secret.upstream_identity_id == ^source.identity.id
-    )
+    Repo.delete_all(from secret in EncryptedSecret, where: secret.upstream_identity_id == ^source.identity.id)
 
     Repo.delete!(Repo.reload!(source.identity))
   end
@@ -767,13 +1064,119 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     |> Repo.update!()
   end
 
+  defp install_second_assignment_failure!(identity_id, family)
+       when family in [:postgres, :constraint, :counter_only, :delete_after_insert] do
+    unique = System.unique_integer([:positive, :monotonic])
+    sequence = "bundle_assignment_failure_sequence_#{unique}"
+    function = "bundle_assignment_failure_function_#{unique}"
+    trigger = "bundle_assignment_failure_trigger_#{unique}"
+    constraint = "bundle_assignment_failure_constraint_#{unique}"
+
+    raise_statement =
+      case family do
+        :postgres ->
+          "RAISE EXCEPTION 'synthetic bundle persistence failure' USING ERRCODE = '23505';"
+
+        :constraint ->
+          "RAISE EXCEPTION 'synthetic bundle constraint failure' USING ERRCODE = '23505', CONSTRAINT = '#{constraint}';"
+
+        :counter_only ->
+          ""
+
+        :delete_after_insert ->
+          "DELETE FROM pool_upstream_assignments WHERE id = NEW.id;"
+      end
+
+    trigger_timing = if family == :delete_after_insert, do: "AFTER", else: "BEFORE"
+
+    Repo.query!("CREATE SEQUENCE #{sequence} START 1")
+
+    Repo.query!("""
+    CREATE FUNCTION #{function}() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.upstream_identity_id = '#{identity_id}'::uuid THEN
+        PERFORM nextval('#{sequence}');
+        #{raise_statement}
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER #{trigger}
+    #{trigger_timing} INSERT ON pool_upstream_assignments
+    FOR EACH ROW EXECUTE FUNCTION #{function}()
+    """)
+
+    %{constraint: constraint, function: function, sequence: sequence, trigger: trigger}
+  end
+
+  defp fault_counter(fault) do
+    %{rows: [[last_value, true]]} =
+      Repo.query!("SELECT last_value, is_called FROM #{fault.sequence}")
+
+    last_value
+  end
+
+  defp remove_assignment_failure!(fault) do
+    Repo.query!("DROP TRIGGER IF EXISTS #{fault.trigger} ON pool_upstream_assignments")
+    Repo.query!("DROP FUNCTION IF EXISTS #{fault.function}()")
+    Repo.query!("DROP SEQUENCE IF EXISTS #{fault.sequence}")
+  end
+
+  defp assert_fault_removed!(fault) do
+    assert %{rows: [[0]]} =
+             Repo.query!(
+               "SELECT count(*) FROM pg_trigger WHERE tgname = $1",
+               [fault.trigger]
+             )
+
+    assert %{rows: [[0]]} =
+             Repo.query!(
+               "SELECT count(*) FROM pg_proc WHERE proname = $1",
+               [fault.function]
+             )
+
+    assert %{rows: [[0]]} =
+             Repo.query!(
+               "SELECT count(*) FROM pg_class WHERE relkind = 'S' AND relname = $1",
+               [fault.sequence]
+             )
+  end
+
+  defp assignment_changeset(pool, identity_id) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    PoolUpstreamAssignment.changeset(%PoolUpstreamAssignment{}, %{
+      pool_id: pool.id,
+      upstream_identity_id: identity_id,
+      assignment_label: "Synthetic constraint assignment",
+      status: "active",
+      health_status: "active",
+      eligibility_status: "eligible",
+      created_at: now,
+      updated_at: now,
+      metadata: %{}
+    })
+  end
+
   defp persistence_counts do
     %{
       identities: Repo.aggregate(UpstreamIdentity, :count),
-      secrets: Repo.aggregate(EncryptedSecret, :count),
+      active_secrets: Repo.aggregate(from(secret in EncryptedSecret, where: secret.status == "active"), :count),
+      superseded_secrets:
+        Repo.aggregate(
+          from(secret in EncryptedSecret, where: secret.status == "superseded"),
+          :count
+        ),
+      total_secrets: Repo.aggregate(EncryptedSecret, :count),
       assignments: Repo.aggregate(PoolUpstreamAssignment, :count),
       audits: Repo.aggregate(AuditEvent, :count),
-      jobs: Repo.aggregate(Oban.Job, :count)
+      jobs: Repo.aggregate(Oban.Job, :count),
+      requests: Repo.aggregate(Request, :count),
+      attempts: Repo.aggregate(Attempt, :count),
+      request_log_facts: Repo.aggregate(RequestLogFact, :count)
     }
   end
 
@@ -795,7 +1198,7 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
   end
 
   defp reseal_first_account(bundle, mutation) do
-    header = Jason.decode!(bundle)
+    header = CodexPooler.JSON.decode!(bundle)
     kdf = header["kdf"]
     salt = Base.decode64!(kdf["salt"])
     nonce = Base.decode64!(header["nonce"])
@@ -806,15 +1209,15 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
     plaintext =
       :crypto.crypto_one_time_aead(:aes_256_gcm, key, nonce, ciphertext, aad, tag, false)
 
-    %{"accounts" => [account]} = payload = Jason.decode!(plaintext)
-    encoded = Jason.encode!(%{payload | "accounts" => [mutation.(account)]})
+    %{"accounts" => [account]} = payload = CodexPooler.JSON.decode!(plaintext)
+    encoded = CodexPooler.JSON.encode!(%{payload | "accounts" => [mutation.(account)]})
 
     {ciphertext, tag} =
       :crypto.crypto_one_time_aead(:aes_256_gcm, key, nonce, encoded, aad, true)
 
     header
     |> Map.put("ciphertext", Base.encode64(tag <> ciphertext))
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp bundle_key(salt, kdf) do
@@ -837,13 +1240,13 @@ defmodule CodexPooler.Dev.UpstreamAccountBundleTest do
       map
       |> Enum.sort_by(fn {key, _value} -> key end)
       |> Enum.map_join(",", fn {key, value} ->
-        [Jason.encode!(key), ":", canonical_json(value)]
+        [CodexPooler.JSON.encode!(key), ":", canonical_json(value)]
       end),
       "}"
     ]
   end
 
-  defp canonical_json(value), do: Jason.encode!(value)
+  defp canonical_json(value), do: CodexPooler.JSON.encode!(value)
 
   defp private_tmp_dir! do
     path =

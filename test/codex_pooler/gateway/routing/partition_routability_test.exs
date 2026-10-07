@@ -49,7 +49,8 @@ defmodule CodexPooler.Gateway.Routing.PartitionRoutabilityTest do
       count_repo_commands(fn ->
         PartitionRoutability.routable_assignment_ids_by_model_id(
           [routable_model, exhausted_model],
-          candidates_by_model_id
+          candidates_by_model_id,
+          %{}
         )
       end)
 
@@ -67,6 +68,9 @@ defmodule CodexPooler.Gateway.Routing.PartitionRoutabilityTest do
   defp count_repo_commands(fun) do
     parent = self()
     handler_id = "partition-routability-test-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

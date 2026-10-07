@@ -4,6 +4,76 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.PublicResponseTest do
   alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
 
+  describe "Pooler-authored policy denials on /v1" do
+    # The exemption is keyed on the `pooler_policy` marker `Denials.log_policy/1`
+    # sets by construction, never on the wire code (findings#221).
+    test "Pooler-authored policy denials are not redacted, the same codes without the marker are" do
+      for code <- PublicResponse.unredacted_policy_denial_codes(),
+          status <- [401, 403, 429] do
+        refute PublicResponse.redacted_gateway_error?(%{
+                 status: status,
+                 code: code,
+                 message: "own",
+                 pooler_policy: true
+               })
+
+        refute PublicResponse.redacted_gateway_error?(%{
+                 status: status,
+                 code: String.to_atom(code),
+                 message: "own",
+                 pooler_policy: true
+               })
+
+        # An upstream-derived error that happens to carry one of the four
+        # codes carries no marker and stays redacted: privacy by construction,
+        # not by the accident of today's provider vocabulary.
+        assert PublicResponse.redacted_gateway_error?(%{
+                 status: status,
+                 code: code,
+                 message: "provider prose that must not leak"
+               })
+      end
+
+      # A string-keyed marker, the only shape a decoded provider or client body
+      # could carry, is not the marker.
+      assert PublicResponse.redacted_gateway_error?(%{
+               "pooler_policy" => true,
+               status: 403,
+               code: "model_not_allowed",
+               message: "provider prose that must not leak"
+             })
+
+      # Quota denials share the 503 status and the redaction with upstream failures.
+      assert PublicResponse.redacted_gateway_error?(%{
+               status: 503,
+               code: "quota_exhausted",
+               message: "upstream quota is exhausted until its reset time"
+             })
+
+      # An upstream-derived 401/403/429 never carries one of the four codes and
+      # stays redacted whatever its message says.
+      for {status, code} <- [
+            {403, "upstream_status"},
+            {401, "upstream_unauthorized"},
+            {429, "upstream_rate_limited"},
+            {403, "provider_specific_code"}
+          ] do
+        assert PublicResponse.redacted_gateway_error?(%{
+                 status: status,
+                 code: code,
+                 message: "provider prose that must not leak"
+               })
+      end
+
+      matrix = CodexPooler.CompatibilityMatrix.fixture!(:v1_supported_surface)
+
+      assert PublicResponse.unredacted_policy_denial_codes() ==
+               matrix.public_error_redaction.pooler_policy_denials_unredacted
+
+      assert matrix.public_error_redaction.pooler_policy_denial_marker == "pooler_policy"
+    end
+  end
+
   describe "generic error redaction" do
     test "preserves decoded-map projections across existing error classes" do
       generic_error = %{
@@ -14,11 +84,37 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.PublicResponseTest do
         "sibling" => "private_sibling"
       }
 
-      for status <- [400, 401, 403, 429, 500] do
+      for status <- [401, 403, 404, 500] do
         assert PublicResponse.normalize_error(generic_error, status: status) == %{
                  "code" => "provider_code",
                  "message" => "upstream request failed",
                  "type" => "server_error"
+               }
+      end
+
+      # A redacted 429 is the classifier's throttle class, OpenAI's
+      # `rate_limit_error`, not the retryable server class (findings#254 row
+      # 254-72); the SDKs retry it on the status alone.
+      assert PublicResponse.normalize_error(generic_error, status: 429) == %{
+               "code" => "provider_code",
+               "message" => "upstream request failed",
+               "type" => "rate_limit_error"
+             }
+
+      # Only that rendered throttle keeps its type on a second terminal
+      # normalization (findings#254 row 254-82).
+      assert PublicResponse.redacted_throttle_error?(PublicResponse.normalize_error(generic_error, status: 429))
+      refute PublicResponse.redacted_throttle_error?(PublicResponse.normalize_error(generic_error, status: 500))
+      refute PublicResponse.redacted_throttle_error?(%{generic_error | "type" => "rate_limit_error"})
+
+      # A refused 4xx outside the gateway failure statuses is the client's
+      # error class, whatever type the provider wrote (findings#254 row
+      # 254-51).
+      for status <- [400, 409, 422] do
+        assert PublicResponse.normalize_error(generic_error, status: status) == %{
+                 "code" => "provider_code",
+                 "message" => "upstream request failed",
+                 "type" => "invalid_request_error"
                }
       end
 
@@ -28,7 +124,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.PublicResponseTest do
              ) == %{
                "code" => "provider_code",
                "message" => "upstream request failed",
-               "type" => "server_error"
+               "type" => "invalid_request_error"
              }
 
       assert PublicResponse.normalize_error(
@@ -86,11 +182,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.PublicResponseTest do
                "upstream_status" => 404
              }
 
-      body = Jason.encode!(%{"error" => upstream_error})
+      body = CodexPooler.JSON.encode!(%{"error" => upstream_error})
 
-      assert PublicResponse.normalize_raw_body(404, body, &Function.identity/1,
-               input_file_upstream_404?: true
-             ) ==
+      assert PublicResponse.normalize_raw_body(404, body, &Function.identity/1, input_file_upstream_404?: true) ==
                {:ok,
                 %{
                   "error" => %{
@@ -101,7 +195,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.PublicResponseTest do
                   }
                 }}
 
-      encoded = Jason.encode!(PublicResponse.normalize_error(upstream_error, opts))
+      encoded = CodexPooler.JSON.encode!(PublicResponse.normalize_error(upstream_error, opts))
       refute encoded =~ "private upstream input-file limitation"
       refute encoded =~ "input[0].content[1].file_id"
       refute encoded =~ "private request body"
@@ -145,7 +239,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.PublicResponseTest do
   describe "misalignment policy violation" do
     test "projects direct HTTP error bodies through the same narrow shape" do
       body =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "error" => %{
             "code" => MisalignmentPolicyViolation.code(),
             "message" => "policy blocked this request",

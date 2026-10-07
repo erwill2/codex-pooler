@@ -7,11 +7,18 @@ defmodule CodexPooler.InstanceSettings.Cache do
 
   require Logger
 
+  alias CodexPooler.Gateway.{OperationalSettings, OwnerRenewalSchedule}
   alias CodexPooler.InstanceSettings.Settings
+  alias Ecto.Adapters.SQL
   alias Phoenix.PubSub
 
   @pubsub CodexPooler.PubSub
   @topic "instance_settings"
+  # Worker and scheduler VMs are not BEAM-clustered in the supported topology, so a
+  # PubSub broadcast never reaches them; every role shares Postgres, so a committed
+  # NOTIFY on this channel invalidates each role's cache right after an update.
+  @postgres_channel "codex_pooler_instance_settings"
+  @notifications CodexPooler.Events.PostgresNotifications
   @applied_topic "instance_settings:applied"
   @message_tag __MODULE__
   @cache_key {__MODULE__, :current}
@@ -54,6 +61,24 @@ defmodule CodexPooler.InstanceSettings.Cache do
     end
   end
 
+  @spec postgres_channel() :: String.t()
+  def postgres_channel, do: @postgres_channel
+
+  # PostgreSQL delivers a NOTIFY only when its transaction commits, so a caller
+  # inside an enclosing transaction invalidates the other roles after the commit
+  # and a rollback invalidates nothing.
+  @spec notify_update(Settings.t()) :: :ok | {:error, term()}
+  def notify_update(%Settings{lock_version: lock_version}) when is_integer(lock_version) do
+    case SQL.query(CodexPooler.Repo, "SELECT pg_notify($1, $2)", [@postgres_channel, Integer.to_string(lock_version)]) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> notify_failed(reason)
+    end
+  rescue
+    exception -> notify_failed(exception)
+  catch
+    :exit, reason -> notify_failed(reason)
+  end
+
   @spec subscribe() :: :ok | {:error, term()}
   def subscribe, do: PubSub.subscribe(@pubsub, @topic)
 
@@ -76,6 +101,7 @@ defmodule CodexPooler.InstanceSettings.Cache do
     state =
       opts
       |> new_state()
+      |> listen_postgres()
       |> schedule_reconciliation()
 
     {:ok, state, {:continue, :recover}}
@@ -130,15 +156,20 @@ defmodule CodexPooler.InstanceSettings.Cache do
   @impl true
   def handle_info({@message_tag, {:updated, lock_version}}, state)
       when is_integer(lock_version) do
-    state =
-      state
-      |> cancel_retry()
-      |> Map.put(:retry_attempt, 0)
-      |> Map.put(:desired_lock_version, lock_version)
-
-    {_settings, state} = reload(state)
-    {:noreply, state}
+    {:noreply, reload_for_update(state, lock_version)}
   end
+
+  # The notification is only a hint: the cache always reloads the authoritative
+  # row, so an unparseable payload still triggers the reload.
+  def handle_info({:notification, _pid, listen_ref, @postgres_channel, payload}, %{postgres_listen: %{ref: listen_ref}} = state) do
+    case Integer.parse(payload) do
+      {lock_version, ""} -> {:noreply, reload_for_update(state, lock_version)}
+      _invalid -> {:noreply, reload_for_update(state, state.desired_lock_version)}
+    end
+  end
+
+  def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, %{postgres_listen: %{monitor_ref: monitor_ref}} = state),
+    do: {:noreply, %{state | postgres_listen: nil}}
 
   def handle_info(
         {@message_tag, {:retry, generation}},
@@ -157,7 +188,7 @@ defmodule CodexPooler.InstanceSettings.Cache do
         %{reconciliation_timer: %{generation: generation}} = state
       ) do
     state = %{state | reconciliation_timer: nil}
-    {:noreply, reconcile(state)}
+    {:noreply, state |> ensure_postgres_listen() |> reconcile()}
   end
 
   def handle_info({@message_tag, {:reconcile, _stale_generation}}, state),
@@ -169,6 +200,46 @@ defmodule CodexPooler.InstanceSettings.Cache do
   def terminate(_reason, state) do
     _ = cancel_timers(state)
     :ok
+  end
+
+  defp reload_for_update(state, lock_version) do
+    state =
+      state
+      |> cancel_retry()
+      |> Map.put(:retry_attempt, 0)
+      |> Map.put(:desired_lock_version, lock_version)
+
+    {_settings, state} = reload(state)
+    state
+  end
+
+  # A missing notification listener (a VM started without it, or one that
+  # restarted) leaves the reconciliation poll as the fallback; each
+  # reconciliation tick retries the LISTEN.
+  defp listen_postgres(state) do
+    with pid when is_pid(pid) <- Process.whereis(@notifications),
+         {:ok, listen_ref} <- listen(pid) do
+      %{state | postgres_listen: %{ref: listen_ref, monitor_ref: Process.monitor(pid)}}
+    else
+      _unavailable -> state
+    end
+  end
+
+  defp ensure_postgres_listen(%{postgres_listen: nil} = state), do: listen_postgres(state)
+  defp ensure_postgres_listen(state), do: state
+
+  defp listen(pid) do
+    case Postgrex.Notifications.listen(pid, @postgres_channel) do
+      {:ok, listen_ref} -> {:ok, listen_ref}
+      {:eventually, listen_ref} -> {:ok, listen_ref}
+    end
+  catch
+    :exit, _reason -> :error
+  end
+
+  defp notify_failed(reason) do
+    Logger.warning(fn -> "instance settings postgres notify failed exception=#{reason_label(reason)}" end)
+    {:error, reason}
   end
 
   defp load_current do
@@ -185,7 +256,7 @@ defmodule CodexPooler.InstanceSettings.Cache do
       _missing_or_stale -> :persistent_term.erase(@cache_key)
     end
 
-    new_state([], state.retry_generation, state.reconciliation_generation)
+    [] |> new_state(state.retry_generation, state.reconciliation_generation) |> Map.put(:postgres_listen, state.postgres_listen)
   end
 
   defp reload(state) do
@@ -197,6 +268,8 @@ defmodule CodexPooler.InstanceSettings.Cache do
 
   defp publish_success(state, %Settings{} = settings) do
     settings = settings |> Settings.mark_loaded(:database) |> clear_virtual_secrets()
+    log_clamped_owner_lease_ttl(state.cached, settings)
+    log_clamped_owner_lease_renewal(state.cached, settings)
     :persistent_term.put(@cache_key, {@cache_version, settings})
 
     :ok =
@@ -324,12 +397,11 @@ defmodule CodexPooler.InstanceSettings.Cache do
       retry_generation: retry_generation,
       reconciliation_timer: nil,
       reconciliation_generation: reconciliation_generation,
-      retry_initial_interval_ms:
-        Keyword.get(config, :retry_initial_interval_ms, @retry_initial_interval_ms),
+      retry_initial_interval_ms: Keyword.get(config, :retry_initial_interval_ms, @retry_initial_interval_ms),
       retry_max_interval_ms: Keyword.get(config, :retry_max_interval_ms, @retry_max_interval_ms),
-      reconciliation_interval_ms:
-        Keyword.get(config, :reconciliation_interval_ms, @reconciliation_interval_ms),
-      timer_module: Keyword.get(config, :timer_module, Process)
+      reconciliation_interval_ms: Keyword.get(config, :reconciliation_interval_ms, @reconciliation_interval_ms),
+      timer_module: Keyword.get(config, :timer_module, Process),
+      postgres_listen: nil
     }
   end
 
@@ -422,6 +494,46 @@ defmodule CodexPooler.InstanceSettings.Cache do
   end
 
   defp cancel_timers(state), do: state |> cancel_retry() |> cancel_reconciliation()
+
+  # A stored owner lease ttl below the validated minimum predates the minimum;
+  # `OperationalSettings` raises it at read time. Say so once per node for each
+  # stored value, not on every reconciliation reload.
+  defp log_clamped_owner_lease_ttl(previous, %Settings{} = settings) do
+    stored = stored_owner_lease_ttl(settings)
+    minimum = OwnerRenewalSchedule.minimum_lease_ttl_seconds()
+
+    if is_integer(stored) and stored < minimum and stored != stored_owner_lease_ttl(previous) do
+      Logger.warning(fn ->
+        "instance setting clamped at read setting=bridge_owner_lease_ttl_seconds stored=#{stored} effective=#{minimum}"
+      end)
+    end
+
+    :ok
+  end
+
+  defp stored_owner_lease_ttl(%Settings{gateway: %{bridge_owner_lease_ttl_seconds: ttl}}), do: ttl
+  defp stored_owner_lease_ttl(_settings), do: nil
+
+  # A stored renewal interval above a third of the effective ttl is lowered at
+  # read time by `OperationalSettings`; say so once per node for each stored
+  # (renewal, ttl) pair, not on every reconciliation reload.
+  defp log_clamped_owner_lease_renewal(previous, %Settings{gateway: gateway} = settings) do
+    stored = stored_owner_lease_renewal(settings)
+    effective = OperationalSettings.effective_owner_lease_renewal_seconds(gateway)
+
+    if is_integer(stored) and stored > effective and stored_owner_lease_pair(settings) != stored_owner_lease_pair(previous) do
+      Logger.warning(fn ->
+        "instance setting clamped at read setting=bridge_owner_lease_renewal_seconds stored=#{stored} effective=#{effective}"
+      end)
+    end
+
+    :ok
+  end
+
+  defp stored_owner_lease_renewal(%Settings{gateway: %{bridge_owner_lease_renewal_seconds: renewal}}), do: renewal
+  defp stored_owner_lease_renewal(_settings), do: nil
+
+  defp stored_owner_lease_pair(settings), do: {stored_owner_lease_renewal(settings), stored_owner_lease_ttl(settings)}
 
   defp log_db_failure(reason, warm_cache?) do
     Logger.warning(fn ->

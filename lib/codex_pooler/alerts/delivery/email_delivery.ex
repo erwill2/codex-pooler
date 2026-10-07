@@ -10,6 +10,7 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
   }
 
   alias CodexPooler.Alerts.Delivery.AttemptLifecycle
+  alias CodexPooler.Alerts.StatusVocabulary.AssignmentState
   alias CodexPooler.Mailer
   alias CodexPooler.Mailer.Config, as: MailerConfig
   alias CodexPooler.Repo
@@ -54,6 +55,7 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
     route_class_scope
     routing_usable
     source
+    state_counts
     status
     target_state
     threshold_used_percent
@@ -113,7 +115,12 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
       incident
       |> alert_email(channel)
       |> Mailer.deliver()
-      |> record_delivery_result(incident, channel, attempt_number, timestamp)
+      |> record_delivery_result(
+        incident,
+        channel,
+        attempt_number,
+        {timestamp, Keyword.get(opts, :retry_attempt, attempt_number)}
+      )
     else
       {:discard, code, message} ->
         AttemptLifecycle.record_discarded_attempt(
@@ -202,7 +209,13 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
       else: {:failure, "alert_email_mailer_unconfigured", "email delivery is not configured"}
   end
 
-  defp record_delivery_result({:ok, _receipt}, incident, channel, attempt_number, timestamp) do
+  defp record_delivery_result(
+         {:ok, _receipt},
+         incident,
+         channel,
+         attempt_number,
+         {timestamp, _retry_attempt}
+       ) do
     AttemptLifecycle.insert_sent_attempt(
       incident,
       channel,
@@ -212,12 +225,18 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
     )
   end
 
-  defp record_delivery_result({:error, reason}, incident, channel, attempt_number, timestamp) do
+  defp record_delivery_result(
+         {:error, reason},
+         incident,
+         channel,
+         attempt_number,
+         {timestamp, retry_attempt}
+       ) do
     sanitized = MailerConfig.sanitize_delivery_error(reason)
     code = sanitized.code |> Atom.to_string()
 
     retryable =
-      retryable_failure_code?(code) and attempt_number < AlertDeliveryAttempt.fixed_max_attempts()
+      retryable_failure_code?(code) and retry_attempt < AlertDeliveryAttempt.fixed_max_attempts()
 
     AttemptLifecycle.record_failed_attempt(
       incident.id,
@@ -227,7 +246,7 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
       @delivery_adapter,
       code,
       sanitized.message,
-      next_retry_at: next_retry_at(timestamp, attempt_number, retryable),
+      next_retry_at: next_retry_at(timestamp, retry_attempt, retryable),
       retryable: retryable,
       response_metadata: base_metadata(incident, channel)
     )
@@ -329,6 +348,12 @@ defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
       RouteClass.all()
     )
   end
+
+  # Per-assignment state counts from the evaluation, bounded to the alert
+  # state vocabulary, so an incident caused by, for example, an unserved model
+  # says so instead of only `model_membership_resolved=false`.
+  defp safe_summary_value("state_counts", _value, evidence),
+    do: AssignmentState.describe(Map.get(evidence, "state_counts") || Map.get(evidence, :state_counts))
 
   defp safe_summary_value("circuit_blocked_reasons", _value, evidence) do
     bounded_safe_list(

@@ -19,6 +19,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Forwar
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Websocket
+  alias CodexPooler.ProviderCreditsDispatchSupport
   alias CodexPooler.Repo
 
   @detection_timeout_ms 15_000
@@ -150,8 +151,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Forwar
     assert %{active_turn: nil, native_compaction_admission: nil} = await_cleared(fixture.owner)
     send(delayed_pid, {:websocket_owner_harness_release_delayed, release_ref})
 
-    assert_receive {:websocket_owner_harness_delayed_result, ^release_ref,
-                    {:error, :stale_downstream}},
+    assert_receive {:websocket_owner_harness_delayed_result, ^release_ref, {:error, :stale_downstream}},
                    @detection_timeout_ms
 
     assert {:ok, _status} = WebsocketOwnerSession.owner_status(fixture.owner)
@@ -181,7 +181,8 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Forwar
   defp execute(:owner_drain, context, _accounting) do
     fixture = start_accounted_owner(context, :owner_drain)
     owner_monitor = Process.monitor(fixture.owner)
-    assert :ok = WebsocketOwnerSession.drain_owner(fixture.owner)
+    # The accounted turn the owner relayed has settled (findings#287).
+    assert {:ok, :settled} = WebsocketOwnerSession.drain_owner(fixture.owner)
     assert_down(owner_monitor, fixture.owner)
     observe_retired(fixture)
   end
@@ -225,9 +226,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Forwar
 
   defp execute(:stale_lease, context, _accounting) do
     fixture =
-      start_reserved_owner(context, :stale_lease,
-        persistence: WebsocketOwnerNodeHarness.fake_persistence_boundary()
-      )
+      start_reserved_owner(context, :stale_lease, persistence: WebsocketOwnerNodeHarness.fake_persistence_boundary())
 
     owner_monitor = Process.monitor(fixture.owner)
 
@@ -473,11 +472,12 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Forwar
     %UpstreamWebsocketSession.Request{
       url: "https://example.com/backend-api/codex/responses",
       headers: [],
-      payload: Jason.encode!(%{"type" => "response.create", "turn_id" => turn_id}),
+      payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "turn_id" => turn_id}),
       timeouts: %{},
       writer: fn _frame -> :ok end,
       message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1
     }
+    |> ProviderCreditsDispatchSupport.wire_request!()
   end
 
   defp observe_survivor(fixture) do
@@ -564,8 +564,7 @@ defmodule CodexPooler.Gateway.Transports.NativeCompactionFailureScenarios.Forwar
     do: await_state(owner, &(is_nil(&1.active_turn) and is_nil(&1.native_compaction_admission)))
 
   defp await_handoff_cleared(owner),
-    do:
-      await_state(owner, &(is_nil(&1.pending_handoff) and is_nil(&1.native_compaction_admission)))
+    do: await_state(owner, &(is_nil(&1.pending_handoff) and is_nil(&1.native_compaction_admission)))
 
   defp await_downstream_cleared(owner),
     do: await_state(owner, &(is_nil(&1.downstream) and is_nil(&1.native_compaction_admission)))

@@ -29,10 +29,8 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
          reason: {:proxy, {:unexpected_status, 503}},
          source: %Mint.HTTPError{module: Mint.HTTP1, reason: {:proxy, {:unexpected_status, 503}}}
        }, "Finch.HTTPError", "proxy_unexpected_status_503"},
-      {%Mint.TransportError{reason: {:bad_alpn_protocol, "h3"}}, "Mint.TransportError",
-       "bad_alpn_protocol"},
-      {%Mint.HTTPError{module: Mint.HTTP1, reason: {:proxy, :tunnel_timeout}}, "Mint.HTTPError",
-       "proxy_tunnel_timeout"}
+      {%Mint.TransportError{reason: {:bad_alpn_protocol, "h3"}}, "Mint.TransportError", "bad_alpn_protocol"},
+      {%Mint.HTTPError{module: Mint.HTTP1, reason: {:proxy, :tunnel_timeout}}, "Mint.HTTPError", "proxy_tunnel_timeout"}
     ]
 
     for {exception, exception_name, reason} <- cases do
@@ -92,6 +90,20 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
            }
   end
 
+  test "permits candidate retry only for failures proven before submission" do
+    for reason <- [:econnrefused, :ehostunreach, :enetunreach, :nxdomain] do
+      error = TransportFailureReason.upstream_transport_error(reason, %{phase: :request})
+      assert TransportFailureReason.retry_safe_before_submission?(error)
+    end
+
+    for reason <- [:closed, :timeout, :econnreset] do
+      error = TransportFailureReason.upstream_transport_error(reason, %{phase: :request})
+      refute TransportFailureReason.retry_safe_before_submission?(error)
+    end
+
+    refute TransportFailureReason.retry_safe_before_submission?(%{})
+  end
+
   test "preserves websocket receive timeout phase metadata" do
     metadata =
       TransportFailureReason.transport_failure_metadata(
@@ -148,6 +160,35 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
                })
              ) == expected
     end
+  end
+
+  test "builds the serving-mode guard diagnostic only for a reused connection" do
+    expected = %{
+      "connection_use" => "reused",
+      "phase" => "send_payload",
+      "pre_visible_output" => true,
+      "reason" => "previous_response_serving_mode_mismatch",
+      "reason_class" => "previous_response_serving_mode_mismatch",
+      "termination_source" => "continuation_generation_guard",
+      "terminal_seen" => false,
+      "text_frame_count" => 0,
+      "upstream_committed" => false
+    }
+
+    for connection_use <- [:reused, "reused"] do
+      assert TransportFailureReason.continuation_generation_guard_metadata(:previous_response_serving_mode_mismatch, connection_use) == expected
+
+      assert TransportFailureReason.transport_failure_metadata(:previous_response_serving_mode_mismatch, %{connection_use: connection_use, previous_response_id: "raw-response-id-sentinel"}) == expected
+    end
+
+    assert TransportFailureReason.sanitize_transport_failure_metadata(Map.put(expected, "previous_response_id", "raw-response-id-sentinel")) == expected
+
+    for connection_use <- [:fresh, :reconnected, "future", nil] do
+      assert TransportFailureReason.continuation_generation_guard_metadata(:previous_response_serving_mode_mismatch, connection_use) == %{}
+      assert TransportFailureReason.sanitize_transport_failure_metadata(%{expected | "connection_use" => connection_use}) == %{}
+    end
+
+    assert TransportFailureReason.sanitize_transport_failure_metadata(%{expected | "reason_class" => "previous_response_generation_mismatch"}) == %{}
   end
 
   test "rejects malformed continuation generation guard diagnostics" do

@@ -9,7 +9,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
   alias CodexPoolerWeb.RelativeTime
   alias Phoenix.LiveView.JS
 
-  @invite_docs_url "https://docs.codex-pooler.com/operators/invites/#active-invite-actions"
+  @invite_docs_url "https://www.codex-pooler.com/docs/operators/invites/#active-invite-actions"
 
   attr :id, :string, required: true
   attr :label, :string, required: true
@@ -43,7 +43,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
         <summary
           data-role={"#{@role}-trigger"}
           aria-label={@label}
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name={@selected.icon} class={["size-4 shrink-0", option_icon_class(@selected)]} />
           <span class="truncate">{@selected.label}</span>

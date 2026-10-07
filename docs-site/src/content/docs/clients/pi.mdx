@@ -1,39 +1,83 @@
 ---
-title: Pi
+title: Pi on Codex Pooler
+sidebar:
+  label: Pi
 description: Configure Pi coding agent with Codex Pooler's narrow OpenAI-compatible /v1 Responses surface, Pi models/settings file locations, and a Pool API key.
 ---
 
-Pi should use Codex Pooler through a custom provider in `~/.pi/agent/models.json`. Point that provider at the narrow OpenAI-compatible `/v1` surface, keep the Pool API key in the environment, and choose `openai-responses` so Pi sends agent turns through the Responses route.
+Pi is an extensible coding agent that works in your terminal. Use it to explore a project, edit files and run commands, with extensions and settings to adapt the workflow. Connect it to Codex Pooler to make your Pool's models available in Pi's model picker and coding sessions.
 
-## Config file path
+![Codex Pooler Pi integration](/codex-pooler-pi.webp)
 
-Pi docs use home-relative paths for global config and project-local `.pi` paths for overrides:
+## Before you start
 
-| Path | Scope |
-| --- | --- |
-| `~/.pi/agent/models.json` | Global custom providers and models |
-| `~/.pi/agent/settings.json` | Global defaults, UI behavior, resource paths, and project trust fallback |
-| `~/.pi/agent/trust.json` | Saved project trust decisions |
-| `~/.pi/agent/sessions/` | Saved sessions |
-| `.pi/settings.json` | Project settings that override and merge with global settings |
+- Install [Pi](https://pi.dev/docs/latest/quickstart) using the official instructions for your operating system.
+- Have a Codex Pooler URL reachable from the client.
+- Create a [Pool API key](/getting-started/quick-start/) and choose a model available to that Pool.
 
-On Windows, use the same home-relative paths under the user profile, for example `%USERPROFILE%\.pi\agent\models.json` and `%USERPROFILE%\.pi\agent\settings.json`.
+<a id="install"></a>
 
-## Install
+## Configure the connection
 
-Use the current npm package:
+Use the commands for the terminal that starts the client. Environment-variable assignments below apply to that terminal; desktop apps and services need the variables in their own launch environment.
+
+Set the Pool API key in the shell that starts the client:
+
+**macOS / Linux / WSL**
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+export CODEX_POOLER_API_KEY="<pool-api-key>"
 ```
 
-`--ignore-scripts` matches Pi's published install guidance and keeps dependency lifecycle scripts disabled during install.
+**Windows PowerShell**
 
-## Provider shape
+```powershell
+$env:CODEX_POOLER_API_KEY = "<pool-api-key>"
+```
+
+### Config file path
+
+**Global providers and models**
+
+| OS | Default config file |
+| --- | --- |
+| macOS | `~/.pi/agent/models.json` |
+| Linux | `~/.pi/agent/models.json` |
+| Windows | `%USERPROFILE%\.pi\agent\models.json` |
+
+**Global defaults and preferences**
+
+| OS | Default config file |
+| --- | --- |
+| macOS | `~/.pi/agent/settings.json` |
+| Linux | `~/.pi/agent/settings.json` |
+| Windows | `%USERPROFILE%\.pi\agent\settings.json` |
+
+**Saved project trust decisions**
+
+| OS | Default config file |
+| --- | --- |
+| macOS | `~/.pi/agent/trust.json` |
+| Linux | `~/.pi/agent/trust.json` |
+| Windows | `%USERPROFILE%\.pi\agent\trust.json` |
+
+**Saved sessions**
+
+| OS | Default config folder |
+| --- | --- |
+| macOS | `~/.pi/agent/sessions/` |
+| Linux | `~/.pi/agent/sessions/` |
+| Windows | `%USERPROFILE%\.pi\agent\sessions\` |
+
+These are the default locations. On Windows, paste the `%USERPROFILE%`, `%APPDATA%` or `%LOCALAPPDATA%` path into File Explorer's address bar. For a client installed inside WSL, use the Linux paths and commands inside WSL. Keep any custom configuration folder or profile you already use.
+
+Project overrides belong in `.pi/settings.json` inside the project on every platform. If you set `PI_CODING_AGENT_DIR`, use that folder for the global files instead.
+
+### Provider shape
 
 For a deployed instance, add:
 
-```json
+```json title="models.json" frame="code"
 {
   "providers": {
     "codex-pooler": {
@@ -44,8 +88,8 @@ For a deployed instance, add:
       "authHeader": true,
       "models": [
         {
-          "id": "gpt-5.6-luna",
-          "name": "GPT-5.6 Luna via Codex Pooler",
+          "id": "gpt-6-luna",
+          "name": "GPT-6 Luna via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
@@ -55,8 +99,8 @@ For a deployed instance, add:
           "maxTokens": 128000
         },
         {
-          "id": "gpt-5.6-terra",
-          "name": "GPT-5.6 Terra via Codex Pooler",
+          "id": "gpt-6.1-sol",
+          "name": "GPT-6.1 Sol via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
@@ -66,8 +110,8 @@ For a deployed instance, add:
           "maxTokens": 128000
         },
         {
-          "id": "gpt-5.6-sol",
-          "name": "GPT-5.6 Sol via Codex Pooler",
+          "id": "gpt-6-astra",
+          "name": "GPT-6 Astra via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
@@ -86,23 +130,25 @@ For local setup, change `baseUrl` to `http://localhost:4000/v1`.
 
 `authHeader: true` makes Pi send the Pool API key as `Authorization: Bearer ...`. Define only model ids your assigned Pool can serve.
 
+## Choose a model
+
 Current Pi source still requires `thinkingLevelMap.xhigh` for Pi to expose `xhigh` for this custom model. Without it, Pi clamps `--thinking xhigh` and `defaultThinkingLevel: "xhigh"` down to `high`.
 
 Pi accepts `contextWindow` and `maxTokens` for custom models; it has no `contextTokens` field. The `828400` values above are long-profile examples for models whose selected Pool catalog source reports an 872000-token raw ceiling. Provider accounts can temporarily report different ceilings for the same model; a selected 272000-token profile exposes `258400` instead. Use each model's `/v1/models.context_length` as the authoritative `contextWindow`, not the raw ceiling. For the long-profile example, Pi compacts when usage exceeds `contextWindow - reserveTokens`; the 128000-token reserve leaves an explicit output budget and starts compaction at 700400 tokens.
 
-## Default model
+### Default model
 
-If you want plain `pi` or `pi -p ...` to start on Codex Pooler, add the defaults to `~/.pi/agent/settings.json`:
+If you want plain `pi` or `pi -p ...` to start on Codex Pooler, add the defaults to `settings.json` in the same folder as `models.json`:
 
-```json
+```json title="settings.json" frame="code"
 {
   "defaultProvider": "codex-pooler",
-  "defaultModel": "gpt-5.6-terra",
+  "defaultModel": "gpt-6.1-sol",
   "defaultThinkingLevel": "xhigh",
   "enabledModels": [
-    "codex-pooler/gpt-5.6-luna",
-    "codex-pooler/gpt-5.6-terra",
-    "codex-pooler/gpt-5.6-sol"
+    "codex-pooler/gpt-6-luna",
+    "codex-pooler/gpt-6.1-sol",
+    "codex-pooler/gpt-6-astra"
   ],
   "compaction": {
     "reserveTokens": 128000
@@ -110,23 +156,36 @@ If you want plain `pi` or `pi -p ...` to start on Codex Pooler, add the defaults
 }
 ```
 
-## Connection Check
+<a id="connection-check"></a>
+
+## Verify the connection
 
 Run a one-shot prompt from the repository you want Pi to inspect:
 
+**macOS / Linux / WSL**
+
 ```bash
-export CODEX_POOLER_API_KEY=<pool-api-key>
 pi --provider codex-pooler \
-  --model gpt-5.6-terra \
+  --model gpt-6.1-sol \
   --no-session \
   --no-context-files \
   --tools bash \
   -p 'Reply with exactly: pi ok'
 ```
 
+**Windows PowerShell**
+
+```powershell
+pi --provider codex-pooler --model gpt-6.1-sol --no-session --no-context-files --tools bash -p 'Reply with exactly: pi ok'
+```
+
 `--no-session` keeps the check ephemeral. `--no-context-files` keeps it independent from local project instructions. For normal interactive use, omit those flags if you want Pi to load `AGENTS.md`, skills, sessions, and project settings.
 
-## MCP boundary
+In Codex Pooler's request logs, match the request time, API key, model, and final status to your test. A reply alone does not confirm that the client used your Pooler instance.
+
+<a id="mcp-boundary"></a>
+
+## Compatibility notes
 
 Pi model requests use Codex Pooler's narrow OpenAI-compatible `/v1` support for selected SDK routes. Codex Pooler doesn't provide full OpenAI API parity.
 

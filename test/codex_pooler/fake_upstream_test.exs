@@ -4,7 +4,576 @@ defmodule CodexPooler.FakeUpstreamTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.PoolerFixtures
 
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  # The client's own receive timeout is the scenario clock in the timeout
+  # cases: the fake holds the response until released, so the client gives up
+  # first regardless of load. Keep it short; the barrier waits stay separate.
+  @client_receive_timeout_ms 250
+
+  # Detection budget for fake-side barrier notifications; the green path never
+  # waits on it.
+  @barrier_detection_timeout_ms 5_000
+
   describe "local fake upstream" do
+    @tag :fake_upstream_pin
+    test "legacy sequences remain permissive and repeat their final response" do
+      upstream =
+        start_upstream(
+          {:sequence,
+           [
+             FakeUpstream.json_response(%{"id" => "resp_first"}),
+             FakeUpstream.json_response(%{"id" => "resp_final"})
+           ]}
+        )
+
+      assert %{status: 200, body: %{"id" => "resp_first"}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/first")
+
+      assert %{status: 200, body: %{"id" => "resp_final"}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/final")
+
+      assert %{status: 200, body: %{"id" => "resp_final"}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/legacy-repeat")
+
+      assert FakeUpstream.count(upstream) == 3
+    end
+
+    @tag :fake_upstream_pin
+    test "an explicit persistent response mode remains reusable" do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_persistent"}))
+
+      for path <- ["/one", "/two"] do
+        assert %{status: 200, body: %{"id" => "resp_persistent"}} =
+                 Req.get!(FakeUpstream.url(upstream) <> path)
+      end
+
+      assert FakeUpstream.count(upstream) == 2
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "strict finite sequences consume once and reject an extra request" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.json_response(%{"id" => "resp_once"})
+          ])
+        )
+
+      assert %{status: 200, body: %{"id" => "resp_once"}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/once")
+
+      assert %{status: 500, body: %{"error" => %{"code" => "fake_upstream_scenario_failure"}}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/extra", retry: false)
+
+      assert_raise ExUnit.AssertionError, ~r/unexpected_extra_request.*transport=http/s, fn ->
+        FakeUpstream.verify!(upstream)
+      end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "a strict scenario can reject the websocket handshake and keeps its accounting" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              headers: [required: %{"authorization" => "Bearer handshake-token"}],
+              respond:
+                FakeUpstream.websocket_upgrade_error(%{"error" => %{"code" => "invalid_api_key"}},
+                  status: 401
+                )
+            )
+          ])
+        )
+
+      upgrade_headers = [
+        {"upgrade", "websocket"},
+        {"connection", "upgrade"},
+        {"authorization", "Bearer handshake-token"}
+      ]
+
+      assert %{status: 401, body: %{"error" => %{"code" => "invalid_api_key"}}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+                 headers: upgrade_headers,
+                 retry: false
+               )
+
+      # The rejected handshake is neither a request nor a connection.
+      assert FakeUpstream.requests(upstream) == []
+      assert FakeUpstream.websocket_connection_count(upstream) == 0
+      assert :ok = FakeUpstream.verify!(upstream)
+
+      # A second handshake is an extra request against the finite scenario.
+      assert %{status: 500, body: %{"error" => %{"code" => "fake_upstream_scenario_failure"}}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+                 headers: upgrade_headers,
+                 retry: false
+               )
+
+      assert_raise ExUnit.AssertionError, ~r/unexpected_extra_request/, fn ->
+        FakeUpstream.verify!(upstream)
+      end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "a strict handshake rejection checks its expectations against the upgrade request" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              headers: [required: %{"authorization" => "Bearer expected-token"}],
+              respond:
+                FakeUpstream.websocket_upgrade_error(%{"error" => %{"code" => "invalid_api_key"}},
+                  status: 401
+                )
+            )
+          ])
+        )
+
+      assert %{status: 500, body: %{"error" => %{"code" => "fake_upstream_scenario_failure"}}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+                 headers: [
+                   {"upgrade", "websocket"},
+                   {"connection", "upgrade"},
+                   {"authorization", "Bearer other-token"}
+                 ],
+                 retry: false
+               )
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/expectation_mismatch field=headers\.authorization expected="Bearer expected-token" actual="Bearer other-token"/,
+                   fn -> FakeUpstream.verify!(upstream) end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "repeat-last behavior is explicit" do
+      upstream =
+        start_upstream(
+          FakeUpstream.repeat_last([
+            FakeUpstream.json_response(%{"id" => "resp_first"}),
+            FakeUpstream.json_response(%{"id" => "resp_repeat"})
+          ])
+        )
+
+      assert %{body: %{"id" => "resp_first"}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/first")
+
+      for path <- ["/second", "/third"] do
+        assert %{body: %{"id" => "resp_repeat"}} =
+                 Req.get!(FakeUpstream.url(upstream) <> path)
+      end
+
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "final verification rejects an unused strict entry" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.json_response(%{"id" => "resp_expected"})
+          ])
+        )
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/unused_strict_entries.*remaining=1.*consumed=0/s,
+                   fn -> FakeUpstream.verify!(upstream) end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "request expectations withhold success and expose exact structural mismatch" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/backend-api/codex/responses",
+              headers: [required: %{"x-synthetic-contract" => "expected"}, forbidden: ["x-bad"]],
+              json: [
+                valid: true,
+                required: ["type", "input.0.role"],
+                forbidden: ["unsupported_field"],
+                equals: %{
+                  "type" => "response.create",
+                  "input.0.role" => "user"
+                }
+              ],
+              respond: FakeUpstream.json_response(%{"id" => "resp_should_not_escape"})
+            )
+          ])
+        )
+
+      response =
+        Req.post!(FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+          json: %{"type" => "wrong.create", "input" => [%{"role" => "assistant"}]},
+          headers: [{"x-synthetic-contract", "actual"}, {"x-bad", "present"}],
+          retry: false
+        )
+
+      assert response.status == 500
+      refute response.body["id"] == "resp_should_not_escape"
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/expectation_mismatch.*headers.x-synthetic-contract.*expected="expected".*actual="actual".*headers.x-bad.*expected=:forbidden.*actual="present".*json.input.0.role.*expected="user".*actual="assistant".*json.type.*expected="response.create".*actual="wrong.create"/s,
+                   fn -> FakeUpstream.verify!(upstream) end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "request expectations reject invalid JSON and missing required paths" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/strict-json",
+              json: [valid: true, required: ["type"]],
+              respond: FakeUpstream.json_response(%{"id" => "resp_invalid_json"})
+            )
+          ])
+        )
+
+      response =
+        Req.post!(FakeUpstream.url(upstream) <> "/strict-json",
+          body: "{not-json",
+          headers: [{"content-type", "application/json"}],
+          retry: false
+        )
+
+      assert response.status == 500
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/expectation_mismatch.*json.*expected=:valid_json.*actual=:invalid_json.*json.type.*expected=:required.*actual=:missing/s,
+                   fn -> FakeUpstream.verify!(upstream) end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "request expectations report method path and forbidden JSON mismatches" do
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/expected-path",
+              json: [valid: true, forbidden: ["forbidden.nested"]],
+              respond: FakeUpstream.json_response(%{"id" => "resp_mismatch"})
+            )
+          ])
+        )
+
+      assert %{status: 500} =
+               Req.put!(FakeUpstream.url(upstream) <> "/actual-path",
+                 json: %{"forbidden" => %{"nested" => "synthetic-value"}},
+                 retry: false
+               )
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/expectation_mismatch.*field=method expected="POST" actual="PUT".*field=path expected="\/expected-path" actual="\/actual-path".*field=json.forbidden.nested expected=:forbidden actual="synthetic-value"/s,
+                   fn -> FakeUpstream.verify!(upstream) end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "final verification requires registered barrier acknowledgements" do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "unused-permissive"}))
+      barrier_ref = make_ref()
+      :ok = FakeUpstream.require_acknowledgement(upstream, {:barrier, barrier_ref})
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/missing_required_acknowledgement.*barrier/s,
+                   fn -> FakeUpstream.verify!(upstream) end
+
+      :ok = FakeUpstream.acknowledge(upstream, {:barrier, barrier_ref})
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "native frame barriers push one frame per release and keep the connection open" do
+      turn_ref = make_ref()
+      ack_ref = make_ref()
+      created = websocket_event("response.created", "resp_frame_barrier")
+      completed = websocket_event("response.completed", "resp_frame_barrier")
+
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              path: "/backend-api/codex/responses",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond:
+                FakeUpstream.barrier_websocket_frames([created, completed],
+                  notify: self(),
+                  release_ref: turn_ref
+                )
+            ),
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              websocket_connection_ordinal: 1,
+              json: [valid: true, equals: %{"type" => "response.processed"}],
+              respond: FakeUpstream.barrier_websocket_frames([], notify: self(), release_ref: ack_ref)
+            )
+          ])
+        )
+
+      client = websocket_connect(upstream)
+      client = websocket_send(client, ~s({"type":"response.create"}))
+
+      # Nothing is pushed before the first release, and the next barrier only
+      # appears once the previous one has been released.
+      assert_receive {:fake_upstream_frame_barrier, 0, handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert is_pid(handler)
+      assert {:timeout, client} = websocket_recv(client, 100)
+      refute_received {:fake_upstream_frame_barrier, 1, _, ^turn_ref}
+
+      assert :ok = FakeUpstream.release_frame(upstream, turn_ref)
+
+      assert_receive {:fake_upstream_frame_barrier, 1, ^handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert {:ok, client, [^created]} = websocket_recv(client, @barrier_detection_timeout_ms)
+      assert {:timeout, client} = websocket_recv(client, 100)
+
+      assert :ok = FakeUpstream.release_frame(upstream, turn_ref)
+
+      assert_receive {:fake_upstream_frame_barrier, 2, ^handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert {:ok, client, [^completed]} = websocket_recv(client, @barrier_detection_timeout_ms)
+
+      # The connection stays open after the last frame: a second request on the
+      # same connection is only consumed once the trailing barrier is released.
+      client = websocket_send(client, ~s({"type":"response.processed"}))
+      refute_receive {:fake_upstream_frame_barrier, 0, _, ^ack_ref}, 100
+      assert :ok = FakeUpstream.release_frame(upstream, turn_ref)
+
+      assert_receive {:fake_upstream_frame_barrier, 0, ^handler, ^ack_ref},
+                     @barrier_detection_timeout_ms
+
+      assert :ok = FakeUpstream.release_frame(upstream, ack_ref)
+      assert {:timeout, client} = websocket_recv(client, 100)
+      assert Mint.HTTP.open?(client.conn)
+      assert FakeUpstream.websocket_connection_count(upstream) == 1
+
+      assert [turn_request, ack_request] = FakeUpstream.requests(upstream)
+      assert turn_request.json == %{"type" => "response.create"}
+      assert ack_request.json == %{"type" => "response.processed"}
+      assert :ok = FakeUpstream.verify!(upstream)
+      assert {:error, :no_frame_barrier_waiting} = FakeUpstream.release_frame(upstream, turn_ref)
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "releasing the remaining frame barriers pushes the rest while still notifying" do
+      turn_ref = make_ref()
+      created = websocket_event("response.created", "resp_frame_release_all")
+      completed = websocket_event("response.completed", "resp_frame_release_all")
+
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              json: [valid: true],
+              respond:
+                FakeUpstream.barrier_websocket_frames([created, completed],
+                  notify: self(),
+                  release_ref: turn_ref
+                )
+            )
+          ])
+        )
+
+      client = websocket_connect(upstream)
+      client = websocket_send(client, "{}")
+
+      assert_receive {:fake_upstream_frame_barrier, 0, handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert :ok = FakeUpstream.release_remaining_frames(upstream, turn_ref)
+
+      assert_receive {:fake_upstream_frame_barrier, 1, ^handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert_receive {:fake_upstream_frame_barrier, 2, ^handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert {:ok, client, frames} =
+               websocket_recv_count(client, 2, @barrier_detection_timeout_ms)
+
+      assert frames == [created, completed]
+      assert Mint.HTTP.open?(client.conn)
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "final verification reports an unreleased frame barrier" do
+      turn_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.barrier_websocket_frames(
+              [websocket_event("response.completed", "resp_frame_unreleased")],
+              notify: self(),
+              release_ref: turn_ref
+            )
+          ])
+        )
+
+      client = websocket_connect(upstream)
+      _client = websocket_send(client, "{}")
+
+      assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/missing_required_acknowledgement acknowledgement=\{:frame_barrier, #Reference<[^>]+>, 0\}\n.*frame_barrier, #Reference<[^>]+>, 1\}/s,
+                   fn -> FakeUpstream.verify!(upstream) end
+
+      assert :ok = FakeUpstream.release_remaining_frames(upstream, turn_ref)
+
+      assert_receive {:fake_upstream_frame_barrier, 1, _handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "stopping the fake while a frame barrier is held does not wait out the shutdown timeout" do
+      turn_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.barrier_websocket_frames(
+            [websocket_event("response.completed", "resp_frame_held_at_stop")],
+            notify: self(),
+            release_ref: turn_ref
+          )
+        )
+
+      client = websocket_connect(upstream)
+      _client = websocket_send(client, "{}")
+
+      assert_receive {:fake_upstream_frame_barrier, 0, handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      monitor = Process.monitor(handler)
+      started_at = System.monotonic_time(:millisecond)
+      assert :ok = FakeUpstream.stop(upstream)
+      assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, @barrier_detection_timeout_ms
+
+      # ThousandIsland brutal-kills a connection that ignores the shutdown exit
+      # only after 15 s; the held barrier must leave well before that.
+      assert System.monotonic_time(:millisecond) - started_at < @barrier_detection_timeout_ms
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "stopping the fake while a websocket close barrier is held does not wait out the shutdown timeout" do
+      release_ref = make_ref()
+      terminal = websocket_event("response.completed", "resp_close_held_at_stop")
+
+      upstream =
+        start_upstream(
+          FakeUpstream.websocket_terminal_then_close_barrier(terminal,
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      client = websocket_connect(upstream)
+      client = websocket_send(client, "{}")
+
+      assert_receive {:fake_upstream_websocket_barrier, :before_terminal, handler, ^release_ref},
+                     @barrier_detection_timeout_ms
+
+      send(handler, {:fake_upstream_release_websocket, release_ref})
+      assert {:ok, _client, [^terminal]} = websocket_recv(client, @barrier_detection_timeout_ms)
+
+      assert_receive {:fake_upstream_websocket_barrier, :before_close, ^handler, ^release_ref},
+                     @barrier_detection_timeout_ms
+
+      monitor = Process.monitor(handler)
+      started_at = System.monotonic_time(:millisecond)
+      assert :ok = FakeUpstream.stop(upstream)
+      assert_receive {:DOWN, ^monitor, :process, ^handler, _reason}, @barrier_detection_timeout_ms
+      assert System.monotonic_time(:millisecond) - started_at < @barrier_detection_timeout_ms
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "an exhausted scenario refuses the next handshake after a frame barrier reply" do
+      turn_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond: FakeUpstream.barrier_websocket_frames([], notify: self(), release_ref: turn_ref)
+            )
+          ])
+        )
+
+      client = websocket_connect(upstream)
+      _client = websocket_send(client, ~s({"type":"response.create"}))
+
+      assert_receive {:fake_upstream_frame_barrier, 0, _handler, ^turn_ref},
+                     @barrier_detection_timeout_ms
+
+      assert :ok = FakeUpstream.release_frame(upstream, turn_ref)
+      assert :ok = FakeUpstream.verify!(upstream)
+
+      assert %{status: 500, body: %{"error" => %{"code" => "fake_upstream_scenario_failure"}}} =
+               Req.get!(FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+                 headers: [{"upgrade", "websocket"}, {"connection", "upgrade"}],
+                 retry: false
+               )
+
+      assert FakeUpstream.websocket_connection_count(upstream) == 1
+
+      assert_raise ExUnit.AssertionError, ~r/unexpected_extra_request.*transport=http/s, fn ->
+        FakeUpstream.verify!(upstream)
+      end
+    end
+
+    @tag :fake_upstream_strict_contract
+    test "a frame barrier reply withholds every frame when its request expectation fails" do
+      turn_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "WEBSOCKET",
+              json: [valid: true, equals: %{"type" => "response.create"}],
+              respond:
+                FakeUpstream.barrier_websocket_frames(
+                  [websocket_event("response.completed", "resp_frame_withheld")],
+                  notify: self(),
+                  release_ref: turn_ref
+                )
+            )
+          ])
+        )
+
+      client = websocket_connect(upstream)
+      client = websocket_send(client, ~s({"type":"response.cancel"}))
+
+      assert {:ok, _client, [{:close, 1011, "fake upstream scenario failure"}]} =
+               websocket_recv_raw(client, @barrier_detection_timeout_ms)
+
+      refute_received {:fake_upstream_frame_barrier, _, _, ^turn_ref}
+
+      assert_raise ExUnit.AssertionError,
+                   ~r/expectation_mismatch field=json.type expected="response.create" actual="response.cancel"/,
+                   fn -> FakeUpstream.verify!(upstream) end
+    end
+
     test "keeps the existing low-level failure modes deterministic" do
       release_ref = make_ref()
 
@@ -25,13 +594,11 @@ defmodule CodexPooler.FakeUpstreamTest do
 
     test "serves deterministic JSON responses and captures request details" do
       upstream =
-        start_upstream(
-          FakeUpstream.json_response(%{"id" => "resp_test", "status" => "completed"})
-        )
+        start_upstream(FakeUpstream.json_response(%{"id" => "resp_test", "status" => "completed"}))
 
       response =
         Req.post!(FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
-          json: %{"model" => "gpt-5.4-mini", "input" => "say hello"},
+          json: %{"model" => "gpt-6-luna", "input" => "say hello"},
           headers: [{"authorization", "Bearer upstream-token"}]
         )
 
@@ -41,7 +608,7 @@ defmodule CodexPooler.FakeUpstreamTest do
       assert [request] = FakeUpstream.requests(upstream)
       assert request.method == "POST"
       assert request.path == "/backend-api/codex/responses"
-      assert request.json["model"] == "gpt-5.4-mini"
+      assert request.json["model"] == "gpt-6-luna"
       assert {"authorization", "Bearer upstream-token"} in request.headers
     end
 
@@ -113,6 +680,150 @@ defmodule CodexPooler.FakeUpstreamTest do
       assert server_response.body["error"]["code"] == "server_error"
     end
 
+    # findings#226: a cancellation scenario ends the client path on purpose and
+    # then releases the held tail. The fake must observe that close as the
+    # expected outcome, never as a crash, and never acknowledge a chunk it
+    # could not write.
+    test "an expected client close during a barrier SSE tail stops writes with a bounded outcome" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.barrier_sse_stream(barrier_sse_events(5),
+            barrier_after: 1,
+            notify: self(),
+            release_ref: release_ref,
+            on_client_close: :expected,
+            owner: "fake_upstream_test:expected_close"
+          )
+        )
+
+      {result, logs} =
+        ExUnit.CaptureLog.with_log(fn ->
+          {conn, ref} = open_barrier_sse_request!(upstream)
+          assert_receive {:fake_upstream_chunk_sent, 1}, @barrier_detection_timeout_ms
+
+          assert_receive {:fake_upstream_chunk_barrier, 1, handler, ^release_ref},
+                         @barrier_detection_timeout_ms
+
+          {conn, first_chunk} = receive_first_sse_chunk!(conn, ref)
+          assert first_chunk =~ "event: response.created"
+          Mint.HTTP.close(conn)
+          # Release only once the handler has observed the close on its own socket.
+          assert_receive {:fake_upstream_client_gone, 1, ^handler, ^release_ref},
+                         @barrier_detection_timeout_ms
+
+          send(handler, {:fake_upstream_release_chunk, release_ref})
+
+          assert_receive {:fake_upstream_client_closed, closed_index, ^handler, ^release_ref},
+                         @barrier_detection_timeout_ms
+
+          closed_index
+        end)
+
+      closed_index = result
+      # The close was observed before the first tail write, so that write is
+      # refused, never acknowledged, and no later chunk is attempted.
+      assert closed_index == 2
+      refute_received {:fake_upstream_chunk_sent, ^closed_index}
+      refute_received {:fake_upstream_client_closed, _index, _handler, _ref}
+      # Acceptance: handler completion without an error log of any kind.
+      refute logs =~ "[error]"
+      refute logs =~ "SseWriteError"
+      refute logs =~ "MatchError"
+
+      assert [
+               %{
+                 scenario: :barrier_sse,
+                 owner: "fake_upstream_test:expected_close",
+                 outcome: :client_closed_expected,
+                 chunk_index: ^closed_index,
+                 chunk_count: 7,
+                 reason: reason
+               }
+             ] = FakeUpstream.sse_outcomes(upstream)
+
+      assert reason in [:closed, :enotconn, :einval, :econnaborted, :econnreset, :epipe]
+    end
+
+    test "a complete barrier SSE delivery stays strict and acknowledges every chunk" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.barrier_sse_stream(barrier_sse_events(5),
+            barrier_after: 1,
+            notify: self(),
+            release_ref: release_ref,
+            owner: "fake_upstream_test:complete"
+          )
+        )
+
+      {conn, ref} = open_barrier_sse_request!(upstream)
+
+      assert_receive {:fake_upstream_chunk_barrier, 1, handler, ^release_ref},
+                     @barrier_detection_timeout_ms
+
+      send(handler, {:fake_upstream_release_chunk, release_ref})
+      {_conn, body} = receive_sse_until_done!(conn, ref)
+
+      for index <- 1..7 do
+        assert_receive {:fake_upstream_chunk_sent, ^index}, @barrier_detection_timeout_ms
+      end
+
+      refute_received {:fake_upstream_client_closed, _index, _handler, _ref}
+      assert body =~ "data: [DONE]"
+      assert FakeUpstream.sse_outcomes(upstream) == []
+    end
+
+    test "a premature client close in strict barrier SSE mode fails the handler with its owner" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.barrier_sse_stream(barrier_sse_events(5),
+            barrier_after: 1,
+            notify: self(),
+            release_ref: release_ref,
+            owner: "fake_upstream_test:strict_close"
+          )
+        )
+
+      {{exit_reason, acknowledged}, logs} =
+        ExUnit.CaptureLog.with_log(fn ->
+          {conn, ref} = open_barrier_sse_request!(upstream)
+
+          assert_receive {:fake_upstream_chunk_barrier, 1, handler, ^release_ref},
+                         @barrier_detection_timeout_ms
+
+          {conn, _first_chunk} = receive_first_sse_chunk!(conn, ref)
+          monitor = Process.monitor(handler)
+          Mint.HTTP.close(conn)
+
+          assert_receive {:fake_upstream_client_gone, 1, ^handler, ^release_ref},
+                         @barrier_detection_timeout_ms
+
+          send(handler, {:fake_upstream_release_chunk, release_ref})
+
+          assert_receive {:DOWN, ^monitor, :process, ^handler, exit_reason},
+                         @barrier_detection_timeout_ms
+
+          {exit_reason, drain_chunk_sent_acknowledgements([])}
+        end)
+
+      # Bandit catches the raise, logs it, and closes the connection itself, so
+      # the handler always stops with :local_closed; the SseWriteError log names
+      # the owner, the mode and the refused chunk.
+      assert exit_reason == {:shutdown, :local_closed}
+      assert logs =~ "SseWriteError"
+      assert logs =~ "owner=fake_upstream_test:strict_close mode=fail"
+      assert logs =~ "chunk 2/7 write failed: closed"
+      # Every acknowledged chunk precedes the failed write; the failed one is absent.
+      assert acknowledged == Enum.to_list(1..length(acknowledged))
+      refute_received {:fake_upstream_client_closed, _index, _handler, _ref}
+      assert FakeUpstream.sse_outcomes(upstream) == []
+    end
+
     test "closes the HTTP connection before headers" do
       upstream = start_upstream(FakeUpstream.close_before_headers())
 
@@ -120,6 +831,76 @@ defmodule CodexPooler.FakeUpstreamTest do
                Req.get(FakeUpstream.url(upstream) <> "/close", retry: false)
 
       assert transport_closed?(error)
+    end
+
+    test "holds response headers behind the dedicated owner-liveness gate" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.gated_json_headers(%{"id" => "resp_gated_headers"},
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      task = Task.async(fn -> Req.get!(FakeUpstream.url(upstream) <> "/gated-headers") end)
+
+      assert_receive {:fake_upstream_gate, :before_headers, upstream_pid, ^release_ref}, @detection_timeout_ms
+      refute Task.yield(task, 0)
+
+      send(upstream_pid, {:fake_upstream_release_gate, release_ref})
+
+      assert %{status: 200, body: %{"id" => "resp_gated_headers"}} = Task.await(task, 2_000)
+    end
+
+    test "holds SSE response headers behind the dedicated owner-liveness gate" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.gated_sse_headers(
+            [{"response.completed", %{"type" => "response.completed"}}],
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      task = Task.async(fn -> Req.get!(FakeUpstream.url(upstream) <> "/gated-sse-headers") end)
+
+      assert_receive {:fake_upstream_gate, :before_headers, upstream_pid, ^release_ref}, @detection_timeout_ms
+      refute Task.yield(task, 0)
+      send(upstream_pid, {:fake_upstream_release_gate, release_ref})
+
+      assert %{status: 200, body: body} = Task.await(task, 15_000)
+      assert body =~ "response.completed"
+      assert body =~ "data: [DONE]"
+    end
+
+    test "holds only terminal SSE data behind the dedicated owner-liveness gate" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.gated_terminal_sse_stream(
+            [{"response.created", %{"type" => "response.created"}}],
+            {"response.completed", %{"type" => "response.completed"}},
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      response = Req.get!(FakeUpstream.url(upstream) <> "/gated-terminal", into: :self)
+
+      assert_receive {:fake_upstream_gate, :before_terminal, upstream_pid, ^release_ref}, @detection_timeout_ms
+      assert {:ok, [data: created]} = receive_stream_message(response)
+      assert created =~ "response.created"
+
+      send(upstream_pid, {:fake_upstream_release_gate, release_ref})
+
+      assert {:ok, [data: completed]} = receive_stream_message(response)
+      assert completed =~ "response.completed"
+      assert {:ok, [data: "data: [DONE]\n\n"]} = receive_stream_message(response)
     end
 
     test "holds only the terminal SSE event behind an explicit barrier" do
@@ -137,9 +918,8 @@ defmodule CodexPooler.FakeUpstreamTest do
 
       response = Req.get!(FakeUpstream.url(upstream) <> "/late-terminal", into: :self)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid,
-                      ^release_ref},
-                     1_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
+                     @detection_timeout_ms
 
       assert {:ok, [data: created]} = receive_stream_message(response)
       assert created =~ "response.created"
@@ -160,13 +940,12 @@ defmodule CodexPooler.FakeUpstreamTest do
                  "status" => "failed",
                  "error" => %{"code" => "server_error"}
                }
-             } = Jason.decode!(terminal)
+             } = CodexPooler.JSON.decode!(terminal)
 
       assert FakeUpstream.websocket_close() ==
                {:websocket_sse_then_close, [], 1011, "synthetic websocket close"}
 
-      assert {:websocket_upgrade_error, 503, %{"error" => %{"code" => "upgrade_failed"}}, [], nil,
-              nil} =
+      assert {:websocket_upgrade_error, 503, %{"error" => %{"code" => "upgrade_failed"}}, [], nil, nil} =
                FakeUpstream.websocket_upgrade_error(
                  %{"error" => %{"code" => "upgrade_failed"}},
                  status: 503
@@ -177,19 +956,16 @@ defmodule CodexPooler.FakeUpstreamTest do
       release_ref = make_ref()
 
       upstream =
-        start_upstream(
-          FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref)
-        )
+        start_upstream(FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref))
 
       assert {:error, error} =
                Req.get(FakeUpstream.url(upstream) <> "/slow",
-                 receive_timeout: 1_000,
+                 receive_timeout: @client_receive_timeout_ms,
                  retry: false
                )
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid,
-                      ^release_ref},
-                     1_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                     @detection_timeout_ms
 
       send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
 
@@ -210,10 +986,10 @@ defmodule CodexPooler.FakeUpstreamTest do
       task = stream_timeout_request(FakeUpstream.url(upstream) <> "/stream-timeout", self())
 
       assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
-                     1_000
+                     @detection_timeout_ms
 
       try do
-        assert_receive {:fake_upstream_stream_data, "data: partial\n\n"}, 1_000
+        assert_receive {:fake_upstream_stream_data, "data: partial\n\n"}, @detection_timeout_ms
         assert {:error, error} = Task.await(task, 2_000)
 
         assert transport_timeout?(error)
@@ -267,6 +1043,131 @@ defmodule CodexPooler.FakeUpstreamTest do
     upstream
   end
 
+  defp websocket_event(type, response_id) do
+    CodexPooler.JSON.encode!(%{"type" => type, "response" => %{"id" => response_id}})
+  end
+
+  defp websocket_connect(upstream) do
+    uri = URI.parse(FakeUpstream.url(upstream))
+
+    {:ok, conn} =
+      Mint.HTTP.connect(:http, uri.host, uri.port, protocols: [:http1], mode: :passive)
+
+    on_exit(fn -> Mint.HTTP.close(conn) end)
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, conn, "/backend-api/codex/responses", [])
+    {:ok, conn, responses} = Mint.HTTP.recv(conn, 0, @barrier_detection_timeout_ms)
+    assert {:status, ref, 101} in responses
+    {:headers, ^ref, headers} = Enum.find(responses, &match?({:headers, _, _}, &1))
+    {:ok, conn, websocket} = Mint.WebSocket.new(conn, ref, 101, headers, mode: :passive)
+    %{conn: conn, websocket: websocket, ref: ref}
+  end
+
+  defp websocket_send(%{conn: conn, websocket: websocket, ref: ref} = client, text) do
+    {:ok, websocket, data} = Mint.WebSocket.encode(websocket, {:text, text})
+    {:ok, conn} = Mint.WebSocket.stream_request_body(conn, ref, data)
+    %{client | conn: conn, websocket: websocket}
+  end
+
+  # One passive receive: the decoded text frames of the next batch, or a timeout
+  # when the fake pushed nothing within `timeout_ms`.
+  defp websocket_recv(client, timeout_ms) do
+    case websocket_recv_raw(client, timeout_ms) do
+      {:ok, client, frames} -> {:ok, client, Enum.map(frames, fn {:text, text} -> text end)}
+      {:timeout, client} -> {:timeout, client}
+    end
+  end
+
+  defp websocket_recv_raw(%{conn: conn, websocket: websocket, ref: ref} = client, timeout_ms) do
+    case Mint.WebSocket.recv(conn, 0, timeout_ms) do
+      {:ok, conn, responses} ->
+        {websocket, frames} =
+          Enum.reduce(responses, {websocket, []}, fn
+            {:data, ^ref, data}, {websocket, frames} ->
+              {:ok, websocket, decoded} = Mint.WebSocket.decode(websocket, data)
+              {websocket, frames ++ decoded}
+
+            _response, acc ->
+              acc
+          end)
+
+        {:ok, %{client | conn: conn, websocket: websocket}, frames}
+
+      {:error, conn, reason, []}
+      when reason in [:timeout, %Mint.TransportError{reason: :timeout}] ->
+        {:timeout, %{client | conn: conn}}
+    end
+  end
+
+  defp websocket_recv_count(client, count, timeout_ms, acc \\ [])
+
+  defp websocket_recv_count(client, count, _timeout_ms, acc) when length(acc) >= count,
+    do: {:ok, client, Enum.take(acc, count)}
+
+  defp websocket_recv_count(client, count, timeout_ms, acc) do
+    assert {:ok, client, frames} = websocket_recv(client, timeout_ms)
+    websocket_recv_count(client, count, timeout_ms, acc ++ frames)
+  end
+
+  # One head event the barrier holds after, then `tail_count` tail events; the
+  # `[DONE]` marker the constructor appends makes the total `tail_count + 2`.
+  defp barrier_sse_events(tail_count) do
+    [{"response.created", %{"id" => "resp_barrier_sse"}}] ++
+      Enum.map(1..tail_count, fn index ->
+        {"response.output_text.delta", %{"delta" => "tail #{index}"}}
+      end)
+  end
+
+  # A raw client the test can close mid-stream, which `Req` cannot.
+  defp open_barrier_sse_request!(upstream) do
+    %URI{host: host, port: port} = URI.parse(FakeUpstream.url(upstream))
+    {:ok, conn} = Mint.HTTP.connect(:http, host, port, protocols: [:http1])
+    {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/barrier-sse", [], nil)
+    {conn, ref}
+  end
+
+  defp receive_first_sse_chunk!(conn, ref) do
+    receive_sse(conn, ref, "", fn body -> String.contains?(body, "\n\n") end)
+  end
+
+  defp receive_sse_until_done!(conn, ref) do
+    receive_sse(conn, ref, "", fn body -> String.contains?(body, "data: [DONE]") end)
+  end
+
+  # Only socket messages reach Mint; the fake's own notifications stay in the
+  # mailbox for the assertions that expect them.
+  defp receive_sse(conn, ref, body, done?) do
+    receive do
+      message when elem(message, 0) in [:tcp, :tcp_closed, :tcp_error] ->
+        case Mint.HTTP.stream(conn, message) do
+          :unknown ->
+            receive_sse(conn, ref, body, done?)
+
+          {:ok, conn, responses} ->
+            body =
+              Enum.reduce(responses, body, fn
+                {:data, ^ref, data}, acc -> acc <> data
+                _other, acc -> acc
+              end)
+
+            if done?.(body), do: {conn, body}, else: receive_sse(conn, ref, body, done?)
+
+          {:error, _conn, reason, _responses} ->
+            flunk("barrier SSE client stream failed: #{inspect(reason)}")
+        end
+    after
+      @barrier_detection_timeout_ms -> flunk("timed out waiting for barrier SSE data")
+    end
+  end
+
+  defp drain_chunk_sent_acknowledgements(acknowledged) do
+    receive do
+      {:fake_upstream_chunk_sent, index} ->
+        drain_chunk_sent_acknowledgements([index | acknowledged])
+    after
+      0 -> Enum.reverse(acknowledged)
+    end
+  end
+
   defp receive_stream_chunks(response, count) do
     Enum.map(1..count, fn _ ->
       assert {:ok, [data: data]} = receive_stream_message(response)
@@ -290,7 +1191,7 @@ defmodule CodexPooler.FakeUpstreamTest do
           send(parent, {:fake_upstream_stream_data, data})
           {:cont, {request, response}}
         end,
-        receive_timeout: 1_000,
+        receive_timeout: @client_receive_timeout_ms,
         retry: false
       )
     end)

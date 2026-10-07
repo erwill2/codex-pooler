@@ -30,6 +30,12 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     text
   )
 
+  # What a native Codex client's compaction carries besides the compaction's
+  # own fields, and what it reaches the provider with: its metadata (turn
+  # metadata among it), `include` and `tool_choice`, as every other request of
+  # its turn does (findings#270 row 270-368).
+  @client_fields ~w(client_metadata include tool_choice)
+
   @stream_headers [{"content-type", "text/event-stream"}]
 
   @type payload :: %{optional(String.t()) => term()}
@@ -48,10 +54,21 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   @spec compaction_result_transport(payload()) :: compaction_result_transport()
   def compaction_result_transport(%{"stream" => true}), do: :sse
 
-  def compaction_result_transport(%{"client_metadata" => %{} = metadata}) do
+  def compaction_result_transport(%{"input" => input} = payload) when is_list(input) do
+    if Enum.any?(input, &match?(%{"type" => "compaction_trigger"}, &1)),
+      do: :sse,
+      else: declared_result_transport(payload)
+  end
+
+  def compaction_result_transport(payload), do: declared_result_transport(payload)
+
+  defp declared_result_transport(%{"client_metadata" => %{} = metadata}) do
     case metadata["x-codex-turn-metadata"] do
+      %{"compaction" => %{"implementation" => "responses_compaction_v2"}} ->
+        :sse
+
       turn_metadata when is_binary(turn_metadata) ->
-        case Jason.decode(turn_metadata) do
+        case CodexPooler.JSON.decode(turn_metadata) do
           {:ok, %{"compaction" => %{"implementation" => "responses_compaction_v2"}}} -> :sse
           _result -> :buffered
         end
@@ -61,10 +78,10 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     end
   end
 
-  def compaction_result_transport(%{}), do: :buffered
+  defp declared_result_transport(%{}), do: :buffered
 
   @spec v2_streaming?(payload()) :: boolean()
-  def v2_streaming?(payload), do: compaction_result_transport(payload) == :sse
+  def v2_streaming?(payload), do: declared_result_transport(payload) == :sse
 
   @type result_mode :: :sse | :public_sse | :response | :websocket | :native_websocket
 
@@ -104,8 +121,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
 
       Map.has_key?(payload, "parallel_tool_calls") and
           not is_boolean(payload["parallel_tool_calls"]) ->
-        {:error,
-         Error.invalid_request("parallel_tool_calls must be a boolean", "parallel_tool_calls")}
+        {:error, Error.invalid_request("parallel_tool_calls must be a boolean", "parallel_tool_calls")}
 
       Map.has_key?(payload, "text") and not is_map(payload["text"]) ->
         {:error, Error.invalid_request("text must be an object", "text")}
@@ -135,6 +151,25 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     |> maybe_put_stream(result_transport)
     |> maybe_put_previous_response_id(payload)
   end
+
+  @doc """
+  Restores the native client's metadata, include and tool choice after compact projection.
+
+  The released client sends these fields on remote compaction Responses requests.
+  Native bridges preserve them with the same normalization as ordinary turns;
+  direct compact aliases and public `/v1` compaction keep the narrow projection.
+  """
+  @spec put_client_fields(payload(), payload()) :: payload()
+  def put_client_fields(compact_payload, source) when is_map(compact_payload) and is_map(source) do
+    source
+    |> Map.take(@client_fields)
+    |> Enum.reject(fn {_field, value} -> is_nil(value) end)
+    |> Enum.into(compact_payload)
+  end
+
+  @doc "The fields `put_client_fields/2` puts back, which no claim over a bridged compaction binds."
+  @spec client_fields() :: [String.t()]
+  def client_fields, do: @client_fields
 
   @spec streaming_result?(RequestOptions.t()) :: boolean()
   def streaming_result?(%RequestOptions{
@@ -173,7 +208,8 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
          %{
            status: 502,
            code: "invalid_compaction_response",
-           message: "upstream compact response was not valid JSON"
+           message: "upstream compact response was not valid JSON",
+           compaction_invalid_reason: "invalid_json"
          }}
 
       {:error, :missing_encrypted_content} ->
@@ -181,7 +217,8 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
          %{
            status: 502,
            code: "invalid_compaction_response",
-           message: "upstream compact response did not include encrypted compaction content"
+           message: "upstream compact response did not include encrypted compaction content",
+           compaction_invalid_reason: "missing_encrypted_content"
          }}
     end
   end
@@ -330,7 +367,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   defp maybe_put_stream(payload, :buffered), do: Map.delete(payload, "stream")
 
   defp decode_result(%{raw_body: body}) when is_binary(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       _result -> {:error, :invalid_json}
     end
@@ -415,17 +452,42 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
 
   defp nonblank_compaction_content?(content), do: String.trim(content) != ""
 
+  # Every public compaction output item carries a string id: the SDK stream
+  # helpers and types require one (openai-node refuses an empty id, and
+  # `@ai-sdk/openai` and openai-python type it as a string), and the provider's
+  # own public stream always sends a `cmp_` id. When the upstream item has
+  # none, the id is derived from the encrypted content, so it is stable for the
+  # item and recognizable on replay, where the `/v1` input adapter drops it
+  # again and the upstream receives the item as it produced it (findings#254).
   defp normalize_public_compaction_item(source_item) do
-    item = %{
-      "type" => "compaction",
-      "encrypted_content" => source_item["encrypted_content"]
-    }
+    encrypted_content = source_item["encrypted_content"]
 
-    case Map.fetch(source_item, "id") do
-      {:ok, id} when is_nil(id) or is_binary(id) -> Map.put(item, "id", id)
-      _result -> item
-    end
+    id =
+      case Map.get(source_item, "id") do
+        id when is_binary(id) -> if String.trim(id) == "", do: public_compaction_item_id(encrypted_content), else: id
+        _absent_or_null -> public_compaction_item_id(encrypted_content)
+      end
+
+    %{"type" => "compaction", "encrypted_content" => encrypted_content, "id" => id}
   end
+
+  @doc false
+  @spec public_compaction_item_id(String.t()) :: String.t()
+  def public_compaction_item_id(encrypted_content) when is_binary(encrypted_content) do
+    digest =
+      :crypto.hash(:sha256, ["codex-pooler/public-compaction-item/v1\n", encrypted_content])
+      |> Base.encode16(case: :lower)
+
+    "cmp_" <> binary_part(digest, 0, 40)
+  end
+
+  @doc false
+  @spec derived_public_compaction_item_id?(term(), term()) :: boolean()
+  def derived_public_compaction_item_id?(id, encrypted_content)
+      when is_binary(id) and is_binary(encrypted_content),
+      do: id == public_compaction_item_id(encrypted_content)
+
+  def derived_public_compaction_item_id?(_id, _encrypted_content), do: false
 
   @doc false
   @spec normalize_native_item(payload()) :: payload()
@@ -480,7 +542,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     %{
       status: 200,
       headers: stream_headers(result),
-      raw_body: sse_body(decoded, item, &public_response/2)
+      raw_body: public_sse_body(decoded, item)
     }
   end
 
@@ -490,18 +552,17 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     %{
       status: 200,
       headers: json_headers(result),
-      raw_body: Jason.encode!(response)
+      raw_body: CodexPooler.JSON.encode!(response)
     }
   end
 
+  # The same item grammar as the public SSE body; the downstream socket stamps
+  # sequence numbers and the stream id on each message itself (findings#254).
   defp adapted_result(result, decoded, item, :websocket) do
     %{
       status: 200,
       headers: json_headers(result),
-      websocket_messages: [
-        %{"type" => "response.output_item.done", "item" => item},
-        %{"type" => "response.completed", "response" => public_response(decoded, item)}
-      ]
+      websocket_messages: Enum.map(public_stream_events(decoded, item), fn {type, event} -> Map.put(event, "type", type) end)
     }
   end
 
@@ -516,7 +577,58 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     }
   end
 
-  defp public_response(decoded, item), do: Map.put(response(decoded, item), "object", "response")
+  # The public stream follows the Responses streaming grammar the official
+  # SDK stream helpers enforce, as the provider's own compaction stream does:
+  # the response opens with an empty output, the item is announced at its
+  # output index before it is closed, and one response id runs throughout.
+  # Public SSE and the public websocket emit the same events.
+  defp public_stream_events(decoded, item) do
+    response = public_response(decoded, item)
+    opening = %{response | "status" => "in_progress", "output" => []} |> Map.delete("usage")
+
+    [
+      {"response.created", %{"response" => opening}},
+      {"response.output_item.added", %{"output_index" => 0, "item" => item}},
+      {"response.output_item.done", %{"output_index" => 0, "item" => item}},
+      {"response.completed", %{"response" => response}}
+    ]
+  end
+
+  defp public_sse_body(decoded, item) do
+    decoded
+    |> public_stream_events(item)
+    |> Enum.with_index()
+    |> Enum.map(fn {{type, event}, sequence_number} ->
+      sse_block(type, event |> Map.put("type", type) |> Map.put("sequence_number", sequence_number))
+    end)
+    |> Kernel.++(["data: [DONE]\n\n"])
+    |> IO.iodata_to_binary()
+  end
+
+  defp public_response(decoded, item) do
+    decoded
+    |> response(item)
+    |> Map.put("object", "response")
+    |> maybe_put_response_identity(decoded)
+  end
+
+  # The creation time and model the upstream response states, when it states
+  # them; neither is invented.
+  defp maybe_put_response_identity(response, decoded) do
+    response
+    |> then(fn response ->
+      case Map.get(decoded, "created_at") do
+        created_at when is_integer(created_at) and created_at >= 0 -> Map.put(response, "created_at", created_at)
+        _absent -> response
+      end
+    end)
+    |> then(fn response ->
+      case Map.get(decoded, "model") do
+        model when is_binary(model) and model != "" -> Map.put(response, "model", model)
+        _absent -> response
+      end
+    end)
+  end
 
   defp response(decoded, item) do
     %{
@@ -536,7 +648,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   defp maybe_put_usage(response, _decoded), do: response
 
   defp sse_block(event, data) do
-    ["event: ", event, "\n", "data: ", Jason.encode!(data), "\n\n"]
+    ["event: ", event, "\n", "data: ", CodexPooler.JSON.encode!(data), "\n\n"]
   end
 
   defp stream_headers(result) do

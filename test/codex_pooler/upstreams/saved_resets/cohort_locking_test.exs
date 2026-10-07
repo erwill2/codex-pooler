@@ -5,9 +5,14 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
 
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Repo
+  alias CodexPooler.SavedResetConfirmationFixtures
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
 
   @tag :saved_reset_cohort_locking
   test "normalizes a gateway cohort into one ordered identity lock query" do
@@ -22,6 +27,9 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
 
     handler_id = {__MODULE__, System.unique_integer([:positive, :monotonic])}
     test_pid = self()
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -41,12 +49,11 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
       assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
                SavedResetRedemption.redeem(assignment,
                  trigger_kind: "gateway_auto",
-                 gateway_auto_context:
-                   gateway_context(assignment, target, [sibling.id, target.id, sibling.id]),
+                 gateway_auto_context: gateway_context(assignment, target, [sibling.id, target.id, sibling.id]),
                  started_at: as_of
                )
 
-      assert_receive {:cohort_lock, query, [locked_ids]}, 1_000
+      assert_receive {:cohort_lock, query, [locked_ids]}, @detection_timeout_ms
       assert query =~ ~r/ORDER BY .*\."id" FOR UPDATE/
 
       assert Enum.sort(Enum.map(locked_ids, &Ecto.UUID.load!/1)) ==
@@ -69,8 +76,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
     assert {:ok, %{status: :noop, code: "gateway_auto_context_mismatch"}} =
              SavedResetRedemption.redeem(assignment,
                trigger_kind: "gateway_auto",
-               gateway_auto_context:
-                 gateway_context(assignment, target, [target.id, Ecto.UUID.generate()]),
+               gateway_auto_context: gateway_context(assignment, target, [target.id, Ecto.UUID.generate()]),
                started_at: as_of
              )
 
@@ -166,7 +172,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
                  window_kind: "secondary",
                  window_minutes: 10_080,
                  used_percent: Decimal.new("100"),
-                 reset_at: DateTime.add(as_of, 1, :hour),
+                 reset_at: DateTime.add(as_of, 2, :hour),
                  observed_at: as_of,
                  last_sync_at: as_of,
                  source: "codex_usage_api",
@@ -175,10 +181,12 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
                  quota_family: "account"
                }
              ])
+
+    SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
   end
 
   defp gateway_context(assignment, identity, cohort_identity_ids) do
-    %{
+    SavedResetConfirmationFixtures.put_confirmation_refs(%{
       trigger: :blocked_weekly_exhaustion,
       pool_upstream_assignment_id: assignment.id,
       upstream_identity_id: identity.id,
@@ -198,7 +206,7 @@ defmodule CodexPooler.Upstreams.SavedResets.CohortLockingTest do
         upstream_model_id: "test-model"
       },
       hard_pinned_continuity?: false
-    }
+    })
   end
 
   defp usage_payload do

@@ -49,6 +49,20 @@ defmodule CodexPooler.Upstreams.Quota.CreditBalanceStore do
 
   def current(_metadata, _epoch, _as_of), do: nil
 
+  @doc """
+  Moves a valid balance recorded at `from_epoch` to `to_epoch` and leaves every
+  other value as it is: a token refresh keeps the provider account whose
+  balance this is (findings#334). Only the epoch changes; the balance and
+  `observed_at` stay byte for byte, so the freshness bound is unchanged.
+  """
+  @spec carry_forward(map(), pos_integer(), pos_integer()) :: map()
+  def carry_forward(metadata, from_epoch, to_epoch) when is_map(metadata) and is_integer(to_epoch) and to_epoch > 0 do
+    case decode(metadata[@key]) do
+      {:ok, _snapshot, ^from_epoch} -> put_in(metadata, [@key, "credential_epoch"], to_epoch)
+      _absent_invalid_or_other_epoch -> metadata
+    end
+  end
+
   defp newer?(encoded, observed_at, epoch) do
     case decode(encoded) do
       {:ok, %{observed_at: previous}, ^epoch} -> DateTime.compare(observed_at, previous) == :gt
@@ -70,9 +84,7 @@ defmodule CodexPooler.Upstreams.Quota.CreditBalanceStore do
               is_binary(observed_at) and is_integer(epoch) and epoch > 0 do
     with true <- valid_flags?(has_credits, unlimited),
          {:ok, parsed, 0} <- DateTime.from_iso8601(observed_at) do
-      {:ok,
-       %{balance: balance, observed_at: parsed, has_credits: has_credits, unlimited: unlimited},
-       epoch}
+      {:ok, %{balance: balance, observed_at: parsed, has_credits: has_credits, unlimited: unlimited}, epoch}
     else
       _invalid -> :error
     end

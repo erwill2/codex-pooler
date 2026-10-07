@@ -9,13 +9,16 @@ defmodule CodexPooler.Dev.Seeds.Full do
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Catalog.Sync.PreservedSources
+  alias CodexPooler.Dev.LocalTarget
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
   alias CodexPooler.InstanceSettings
   alias CodexPooler.Pools.{OperatorPoolAssignment, Pool}
+  alias CodexPooler.Quotas.Evidence.CodexParsers
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+  alias CodexPooler.Upstreams.Quota.CapacityFactsStore
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @typep quota_window_spec :: %{
@@ -29,13 +32,33 @@ defmodule CodexPooler.Dev.Seeds.Full do
          }
 
   @seed_key "codex_pooler_dev_seed"
+  @pool_slugs ["dev-primary", "dev-secondary", "dev-disabled"]
+
+  # The Fast tier the provider's catalog declares for the seeded gpt-6 models,
+  # in the shape the upstream sync stores per source assignment. The "Dev
+  # limited models" key enforces `priority`, and the runtime filter refuses a
+  # non-default tier the source assignment does not declare (`503
+  # no_compatible_backend`), so the seed declares what the provider declares.
+  @provider_service_tiers %{
+    "gpt-6-luna" => %{"id" => "priority", "name" => "Fast", "description" => "1.5x speed"},
+    "gpt-6-sol" => %{"id" => "priority", "name" => "Fast", "description" => "1.5x speed"},
+    "gpt-6-astra" => %{"id" => "priority", "name" => "Fast", "description" => "2x speed, increased usage"}
+  }
 
   @spec run(%{
           required(:owner) => User.t(),
           required(:operators) => [User.t()],
-          required(:password) => String.t()
+          required(:password) => String.t(),
+          optional(:upstream_base_url) => String.t()
         }) :: map()
-  def run(%{owner: owner, operators: operators, password: password}) do
+  def run(%{owner: owner, operators: operators, password: password} = context) do
+    # Every synthetic identity points at a fake that exists (the local perf
+    # fake by default, a replica's in-cluster fake when given), never at the
+    # real provider with a fake token.
+    upstream_base_url = Map.get(context, :upstream_base_url, LocalTarget.default_fake_upstream_base_url())
+
+    validate_pool_ownership!()
+
     {:ok, _settings} =
       InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
         "development" => %{"account_reconciliation_paused" => true}
@@ -56,7 +79,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
 
     api_keys = seed_api_keys!(owner, pool_active)
     seed_operator_pool_assignments!(owner, operators, pool_active)
-    identities = seed_identities!(owner)
+    identities = seed_identities!(owner, upstream_base_url)
     expiry_fixtures = Enum.take(identities, -4)
     seed_expiry_fixture_secrets!(expiry_fixtures)
     assignments = seed_assignments!(owner, pool_active, identities)
@@ -95,8 +118,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
       api_keys: api_keys,
       upstream_identities: identities,
       expiry_fixtures: expiry_fixtures,
-      assignments:
-        Enum.take(assignments, 6) ++ [secondary_assignment] ++ Enum.drop(assignments, 6),
+      assignments: Enum.take(assignments, 6) ++ [secondary_assignment] ++ Enum.drop(assignments, 6),
       models: models ++ secondary_models,
       quota_windows: quota_windows,
       request_logs: request_logs,
@@ -107,21 +129,14 @@ defmodule CodexPooler.Dev.Seeds.Full do
   end
 
   defp reset_full_fake_data! do
-    Repo.delete_all(
-      from job in Oban.Job, where: fragment("?->>?", job.meta, "dev_seed") == ^@seed_key
-    )
+    Repo.delete_all(from job in Oban.Job, where: fragment("?->>?", job.meta, "dev_seed") == ^@seed_key)
 
-    Repo.delete_all(
-      from event in AuditEvent, where: fragment("?->>?", event.details, "dev_seed") == ^@seed_key
-    )
+    Repo.delete_all(from event in AuditEvent, where: fragment("?->>?", event.details, "dev_seed") == ^@seed_key)
 
-    Repo.delete_all(
-      from invite in Invite, where: like(invite.invited_email, "dev-invite-%@example.com")
-    )
-
-    Repo.delete_all(
-      from pool in Pool, where: pool.slug in ["dev-primary", "dev-secondary", "dev-disabled"]
-    )
+    invite_ids = Enum.map(1..4, &seed_id("invite-#{&1}"))
+    pool_ids = Enum.map(@pool_slugs, &seed_id/1)
+    Repo.delete_all(from invite in Invite, where: invite.id in ^invite_ids)
+    Repo.delete_all(from pool in Pool, where: pool.id in ^pool_ids)
 
     Repo.delete_all(
       from identity in UpstreamIdentity,
@@ -129,10 +144,22 @@ defmodule CodexPooler.Dev.Seeds.Full do
     )
   end
 
+  # Pools and invites have no metadata column. Stable namespace IDs are the
+  # ownership marker; a matching slug or email alone never authorizes deletion.
+  defp seed_id(name) do
+    :crypto.hash(:sha256, "#{@seed_key}:#{name}") |> binary_part(0, 16) |> Ecto.UUID.load!()
+  end
+
+  defp validate_pool_ownership! do
+    for pool <- Repo.all(from pool in Pool, where: pool.slug in ^@pool_slugs) do
+      if pool.id != seed_id(pool.slug), do: raise("Pool #{pool.slug} is not owned by the full seed; preserve it or explicitly remove it before seeding")
+    end
+  end
+
   defp seed_pool!(owner, attrs) do
     timestamp = now()
 
-    %Pool{}
+    %Pool{id: seed_id(attrs.slug)}
     |> Pool.changeset(%{
       slug: attrs.slug,
       name: attrs.name,
@@ -153,7 +180,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
     revoked = create_api_key!(scope, pool, "Dev revoked key", %{labels: ["dev", "revoked"]})
 
     update_api_key!(limited, %{
-      allowed_model_identifiers: ["gpt-5.4-mini", "gpt-5.4"],
+      allowed_model_identifiers: ["gpt-6-luna", "gpt-6-sol"],
       enforced_reasoning_effort: "medium",
       enforced_service_tier: "priority"
     })
@@ -205,7 +232,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
     |> Repo.update!()
   end
 
-  defp seed_identities!(owner) do
+  defp seed_identities!(owner, upstream_base_url) do
     [
       identity_attrs(owner, "dev-acct-active", "Dev Active Pro", "active", "pro", "Pro"),
       identity_attrs(owner, "dev-acct-ready-quota", "Dev Ready Quota", "active", "pro", "Pro"),
@@ -294,6 +321,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
       )
     ]
     |> Enum.map(fn attrs ->
+      attrs = Map.update!(attrs, :metadata, &Map.put(&1, "base_url", upstream_base_url))
       %UpstreamIdentity{} |> UpstreamIdentity.changeset(attrs) |> Repo.insert!()
     end)
   end
@@ -463,47 +491,44 @@ defmodule CodexPooler.Dev.Seeds.Full do
     absent_id = absent_assignment.id
 
     [
-      model_attrs(pool, "gpt-5.4-mini", "GPT 5.4 Mini", "active",
+      model_attrs(pool, "gpt-6-luna", "GPT 6 Luna", "active",
         source_assignment_models: %{
-          active_id => observed_source_metadata(),
-          ready_id => observed_source_metadata(),
-          clear_id => observed_source_metadata(),
-          absent_id => observed_source_metadata()
+          active_id => observed_source_metadata("gpt-6-luna"),
+          ready_id => observed_source_metadata("gpt-6-luna"),
+          clear_id => observed_source_metadata("gpt-6-luna"),
+          absent_id => observed_source_metadata("gpt-6-luna")
         }
       ),
-      model_attrs(pool, "gpt-5.4", "GPT 5.4", "active",
+      model_attrs(pool, "gpt-6-sol", "GPT 6 Sol", "active",
         source_assignment_models: %{
-          active_id => observed_source_metadata(),
-          ready_id => observed_source_metadata()
+          active_id => observed_source_metadata("gpt-6-sol"),
+          ready_id => observed_source_metadata("gpt-6-sol")
         },
         missing_sync_assignment_ids: [active_id]
       ),
-      model_attrs(pool, "gpt-5.5", "GPT 5.5", "active",
-        source_assignment_models: %{active_id => observed_source_metadata()}
-      ),
+      model_attrs(pool, "gpt-6-astra", "GPT 6 Astra", "active", source_assignment_models: %{active_id => observed_source_metadata("gpt-6-astra")}),
       model_attrs(pool, "gpt-5.5-pro", "GPT 5.5 Pro", "stale", stale_at: minutes_ago(45)),
-      model_attrs(pool, "codex-image", "Codex Image", "suppressed",
-        suppressed_at: minutes_ago(15)
-      )
+      model_attrs(pool, "codex-image", "Codex Image", "suppressed", suppressed_at: minutes_ago(15))
     ]
     |> Enum.map(fn attrs -> %Model{} |> Model.changeset(attrs) |> Repo.insert!() end)
   end
 
   defp seed_secondary_models!(pool, secondary_assignment) do
     [
-      model_attrs(pool, "gpt-5.4-mini", "GPT 5.4 Mini", "active",
-        source_assignment_models: %{secondary_assignment.id => observed_source_metadata()}
-      )
+      model_attrs(pool, "gpt-6-luna", "GPT 6 Luna", "active", source_assignment_models: %{secondary_assignment.id => observed_source_metadata("gpt-6-luna")})
     ]
     |> Enum.map(fn attrs -> %Model{} |> Model.changeset(attrs) |> Repo.insert!() end)
   end
 
-  defp observed_source_metadata do
+  defp observed_source_metadata(exposed_model_id) do
     %{
       "supports_responses" => true,
       "supports_streaming" => true,
       "supports_tools" => true,
-      "supports_reasoning" => true
+      "supports_reasoning" => true,
+      "service_tiers" => [Map.fetch!(@provider_service_tiers, exposed_model_id)],
+      "default_service_tier" => nil,
+      "additional_speed_tiers" => ["fast"]
     }
   end
 
@@ -539,7 +564,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
          ]
        ) do
     [
-      circuit_attrs(pool, active_assignment, active_identity, "gpt-5.4-mini", "proxy_stream",
+      circuit_attrs(pool, active_assignment, active_identity, "gpt-6-luna", "proxy_stream",
         status: "open",
         reason_code: "upstream_model_unavailable",
         failure_count: 4,
@@ -547,7 +572,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
         opened_at: minutes_ago(6),
         next_probe_at: nil
       ),
-      circuit_attrs(pool, ready_assignment, ready_identity, "gpt-5.4-mini", "proxy_stream",
+      circuit_attrs(pool, ready_assignment, ready_identity, "gpt-6-luna", "proxy_stream",
         status: "open",
         reason_code: "upstream_model_unavailable",
         failure_count: 3,
@@ -555,7 +580,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
         opened_at: minutes_ago(4),
         next_probe_at: minutes_ago(1)
       ),
-      circuit_attrs(pool, clear_assignment, clear_identity, "gpt-5.4-mini", "proxy_stream",
+      circuit_attrs(pool, clear_assignment, clear_identity, "gpt-6-luna", "proxy_stream",
         status: "closed",
         failure_count: 0,
         success_count: 12,
@@ -602,9 +627,9 @@ defmodule CodexPooler.Dev.Seeds.Full do
       ),
       quota_attrs(
         active,
-        quota_window_spec("secondary", 10_080, "gpt-5.4", 500, 95, "81", "fresh"),
-        display_label: "GPT 5.4",
-        model: "gpt-5.4"
+        quota_window_spec("secondary", 10_080, "gpt-6-sol", 500, 95, "81", "fresh"),
+        display_label: "GPT 6 Sol",
+        model: "gpt-6-sol"
       ),
       quota_attrs(ready, quota_window_spec("primary", 300, "account", 1000, 720, "28", "fresh")),
       quota_attrs(
@@ -757,8 +782,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
         usage_status: spec.usage_status,
         correlation_id: "#{Map.get(spec, :correlation_prefix, "dev-seed-request")}-#{index}",
         user_agent: "codex-pooler-dev-seed/1.0",
-        request_metadata:
-          Map.merge(%{"dev_seed" => @seed_key}, Map.get(spec, :request_metadata, %{})),
+        request_metadata: Map.merge(%{"dev_seed" => @seed_key}, Map.get(spec, :request_metadata, %{})),
         admitted_at: timestamp,
         completed_at: Map.get(spec, :completed_at, timestamp),
         response_status_code: spec.response_status_code,
@@ -861,7 +885,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
     |> Enum.with_index(1)
     |> Enum.map(fn {attrs, index} ->
       attrs = Map.put(attrs, :token_hash, :crypto.hash(:sha256, "dev-seed-invite-#{index}"))
-      %Invite{} |> Invite.changeset(Map.put_new(attrs, :created_at, timestamp)) |> Repo.insert!()
+      %Invite{id: seed_id("invite-#{index}")} |> Invite.changeset(Map.put_new(attrs, :created_at, timestamp)) |> Repo.insert!()
     end)
   end
 
@@ -1082,8 +1106,24 @@ defmodule CodexPooler.Dev.Seeds.Full do
         AccountAvailabilityStore.metadata_key(),
         AccountAvailabilityStore.encode!(availability_state, observed_at, 1)
       )
+      |> windowless_capacity_metadata(availability_state, observed_at)
     end)
   end
+
+  defp windowless_capacity_metadata(metadata, :available, observed_at) do
+    # Availability alone does not establish included capacity. Keep this ready
+    # fixture backed by a complete, non-credit synthetic usage observation.
+    payload = %{
+      "rate_limit" => %{"allowed" => true, "limit_reached" => false},
+      "spend_control" => %{"reached" => false},
+      "credits" => %{"balance" => "0", "has_credits" => false, "unlimited" => false}
+    }
+
+    {:ok, parsed} = CodexParsers.parse_codex_usage_result(payload, observed_at)
+    CapacityFactsStore.transition(metadata, parsed.capacity_facts, 1)
+  end
+
+  defp windowless_capacity_metadata(metadata, _availability_state, _observed_at), do: metadata
 
   defp expiry_fixture_identity_attrs(owner, account_id, label, fixture) do
     owner
@@ -1152,17 +1192,17 @@ defmodule CodexPooler.Dev.Seeds.Full do
     }
   end
 
+  # Access token only: a release-mode VM (the kind replica) honours no local
+  # token endpoint, so a synthetic refresh token would be sent to the real
+  # issuer on the first proactive or on-demand refresh. Without one, a refresh
+  # ends in reauth_required (missing_refresh_token) with no provider request,
+  # and the expiry states the admin UI shows come from metadata alone.
   defp seed_expiry_fixture_secrets!(identities) do
     Enum.each(identities, fn identity ->
       fixture = identity.metadata["expiry_fixture"]
 
-      for {kind, plaintext} <- [
-            {"access_token", "synthetic-expiry-access-#{fixture}"},
-            {"refresh_token", "synthetic-expiry-refresh-#{fixture}"}
-          ] do
-        {:ok, _secret} =
-          Upstreams.store_encrypted_secret(identity, %{secret_kind: kind, plaintext: plaintext})
-      end
+      {:ok, _secret} =
+        Upstreams.store_encrypted_secret(identity, %{secret_kind: "access_token", plaintext: "synthetic-expiry-access-#{fixture}"})
     end)
   end
 

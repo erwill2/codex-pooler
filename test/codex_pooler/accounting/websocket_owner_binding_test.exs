@@ -5,6 +5,7 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBindingTest do
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.WebsocketOwnerBinding
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexTurn}
   alias CodexPooler.Gateway.Websocket
@@ -20,6 +21,118 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBindingTest do
     changed = RequestOptions.put_transport(fixture.options, websocket_owner_downstream_epoch: 2)
     assert {:error, :stale_websocket_owner_binding} = bind(%{fixture | options: changed})
     assert Repo.reload!(fixture.request).request_metadata == bound.request_metadata
+  end
+
+  # A bridged attempt that ended before output moves the request to its next
+  # candidate, which attaches to the same owner under the same lease with the
+  # next downstream epoch (findings#206 row 206-582).
+  test "a later bridge attempt follows a newer attach of the same owner; the same attempt and an older epoch stay stale" do
+    fixture = fixture()
+
+    assert {:ok, %{request: first}} = WebsocketOwnerBinding.bind_bridge(fixture.auth, fixture.request, fixture.attempt, fixture.options)
+    newer = RequestOptions.put_transport(fixture.options, websocket_owner_downstream_epoch: 2)
+
+    # The same attempt re-attached by a newer downstream stays stale.
+    assert {:error, :stale_websocket_owner_binding} = WebsocketOwnerBinding.bind_bridge(fixture.auth, fixture.request, fixture.attempt, newer)
+
+    update_row(fixture.attempt, status: "retryable_failed", completed_at: past())
+    later = attempt_fixture(fixture.request, fixture.assignment, %{attempt_number: 2, status: "in_progress", completed_at: nil, transport: "http_sse"})
+
+    # The native owner binding never follows a newer attach.
+    assert {:error, :stale_websocket_owner_binding} = Accounting.bind_websocket_owner(fixture.auth, fixture.request, later, newer)
+
+    assert Repo.reload!(fixture.request).request_metadata == first.request_metadata
+
+    assert {:ok, %{request: rebound, attempt: attempt}} = WebsocketOwnerBinding.bind_bridge(fixture.auth, fixture.request, later, newer)
+    assert rebound.request_metadata["websocket_owner_forwarding"] == Map.put(expected_binding(fixture), "downstream_epoch", 2)
+    assert attempt.transport == "websocket"
+
+    # That attempt, now carried on the websocket, is not re-bound by a newer attach either.
+    newest = RequestOptions.put_transport(fixture.options, websocket_owner_downstream_epoch: 3)
+    assert {:error, :stale_websocket_owner_binding} = WebsocketOwnerBinding.bind_bridge(fixture.auth, fixture.request, attempt, newest)
+
+    # An older attach never takes the binding back.
+    update_row(later, status: "retryable_failed", completed_at: past())
+    third = attempt_fixture(fixture.request, fixture.assignment, %{attempt_number: 3, status: "in_progress", completed_at: nil, transport: "http_sse"})
+    assert {:error, :stale_websocket_owner_binding} = WebsocketOwnerBinding.bind_bridge(fixture.auth, fixture.request, third, fixture.options)
+    assert Repo.reload!(fixture.request).request_metadata == rebound.request_metadata
+  end
+
+  test "bridge binding marks the upstream carrier in the same transaction" do
+    fixture = fixture()
+
+    assert {:ok, %{request: request, attempt: attempt}} =
+             WebsocketOwnerBinding.bind_bridge(
+               fixture.auth,
+               fixture.request,
+               fixture.attempt,
+               fixture.options
+             )
+
+    assert request.request_metadata["websocket_owner_forwarding"] == expected_binding(fixture)
+    assert request.transport == "http_sse"
+    assert attempt.transport == "websocket"
+    assert Repo.reload!(fixture.attempt).transport == "websocket"
+  end
+
+  test "proven pre-submission fallback atomically restores the HTTP attempt" do
+    fixture = fixture()
+
+    assert {:ok, %{request: request, attempt: attempt}} =
+             WebsocketOwnerBinding.bind_bridge(
+               fixture.auth,
+               fixture.request,
+               fixture.attempt,
+               fixture.options
+             )
+
+    assert {:ok, %{request: restored, attempt: restored_attempt}} =
+             WebsocketOwnerBinding.restore_http_fallback(
+               fixture.auth,
+               request,
+               attempt,
+               fixture.options
+             )
+
+    assert restored.request_metadata["websocket_owner_forwarding"] == nil
+    assert restored.transport == "http_sse"
+    assert restored_attempt.transport == "http_sse"
+    assert Repo.reload!(fixture.attempt).transport == "http_sse"
+  end
+
+  test "fallback restore refuses stale authority or terminal work without changing it" do
+    for invalid <- [
+          :released_lease,
+          :expired_lease,
+          :wrong_lease,
+          :key_epoch,
+          :changed_binding,
+          :terminal_request,
+          :terminal_attempt,
+          :replacement_attempt
+        ] do
+      fixture = fixture()
+
+      assert {:ok, %{request: request, attempt: attempt}} =
+               WebsocketOwnerBinding.bind_bridge(
+                 fixture.auth,
+                 fixture.request,
+                 fixture.attempt,
+                 fixture.options
+               )
+
+      invalidate(%{fixture | request: request, attempt: attempt}, invalid)
+
+      assert {:error, :stale_websocket_owner_binding} =
+               WebsocketOwnerBinding.restore_http_fallback(
+                 fixture.auth,
+                 request,
+                 attempt,
+                 fixture.options
+               )
+
+      assert Repo.reload!(attempt).transport == "websocket"
+    end
   end
 
   for invalid <- [
@@ -72,7 +185,11 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBindingTest do
   end
 
   defp fixture do
-    setup = accounting_setup()
+    setup =
+      accounting_setup(%{
+        price_version: "websocket-owner-binding-#{System.unique_integer([:positive])}"
+      })
+
     assert {:ok, session} = Websocket.start_codex_session(setup.auth, %{})
 
     request =
@@ -148,6 +265,14 @@ defmodule CodexPooler.Accounting.WebsocketOwnerBindingTest do
       status: "in_progress",
       completed_at: nil
     })
+  end
+
+  defp invalidate(fixture, :changed_binding) do
+    update_row(fixture.request,
+      request_metadata: %{
+        "websocket_owner_forwarding" => Map.put(expected_binding(fixture), "downstream_epoch", 2)
+      }
+    )
   end
 
   defp change_lease(fixture, attrs),

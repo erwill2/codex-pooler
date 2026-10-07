@@ -5,7 +5,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ImageObservationTest do
 
   test "HTTP JSON errors retain safe code type and param before body disposal" do
     body =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "error" => %{
           "code" => "unsupported_parameter",
           "type" => "invalid_request_error",
@@ -15,9 +15,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ImageObservationTest do
       })
 
     {:ok, upstream} =
-      CodexPooler.FakeUpstream.start_link(
-        {:raw_body, 400, body, [{"content-type", "application/json"}]}
-      )
+      CodexPooler.FakeUpstream.start_link({:raw_body, 400, body, [{"content-type", "application/json"}]})
 
     on_exit(fn -> CodexPooler.FakeUpstream.stop(upstream) end)
     response = Req.post!(CodexPooler.FakeUpstream.url(upstream), retry: false, decode_body: false)
@@ -33,7 +31,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ImageObservationTest do
 
   test "malformed JSON error identifiers become fingerprints and arbitrary fields drop" do
     body =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "error" => %{
           "code" => "private\ncode",
           "type" => ["private"],
@@ -56,12 +54,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ImageObservationTest do
           {[%{"type" => "image_generation_call", "status" => "failed"}], "failed_image_item"},
           {[%{"type" => "image_generation_call", "result" => ""}], "empty_image_result"},
           {[%{"type" => "image_generation_call", "result" => 42}], "nonstring_image_result"},
-          {[%{"type" => "image_generation_call", "result" => "private-content"}],
-           "usable_image_result"}
+          {[%{"type" => "image_generation_call", "result" => "private-content"}], "usable_image_result"}
         ] do
       body =
         "data: " <>
-          Jason.encode!(%{"type" => "response.completed", "response" => %{"output" => output}}) <>
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.completed",
+            "response" => %{"output" => output}
+          }) <>
           "\n\n"
 
       observation = ImageObservation.from_sse(body)
@@ -74,7 +74,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ImageObservationTest do
   test "retains only fixed type counters for a tool-only response" do
     body =
       "data: " <>
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.completed",
           "response" => %{
             "output" => [
@@ -103,7 +103,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ImageObservationTest do
   test "counts refusals and caps duplicate observations without retaining refusal text" do
     event =
       "data: " <>
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.output_item.done",
           "item" => %{
             "type" => "message",

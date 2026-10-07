@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.LiveUpdatesHooks
   alias CodexPoolerWeb.Admin.LogPagination
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.RequestLogDetailDrawer
@@ -37,6 +38,17 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   # mechanism.
   @max_page 100_000
 
+  # How far past the current page the total is counted. An exact total reads
+  # every matching row, which for the all-Pools view is the whole request
+  # history, on every load and on every live refresh (findings#206 row
+  # 206-385). Past this many rows the pager says "10000+" instead: the operator
+  # still sees that more match and can page on, and never a wrong number.
+  @count_window 10_000
+
+  # Arrivals behind a pinned page are counted up to this many; past it the
+  # banner says "1000+ newer".
+  @newer_count_limit 1_000
+
   @impl true
   def mount(_params, _session, socket) do
     {:ok,
@@ -50,8 +62,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
        filter_form: to_form(%{}, as: :filters),
        filter_values: %{},
        filter_errors: [],
-       datetime_preferences:
-         DateTimeDisplay.preferences_for_user(socket.assigns.current_scope.user),
+       datetime_preferences: DateTimeDisplay.preferences_for_user(socket.assigns.current_scope.user),
        pool_filter_options: [],
        model_filter_options: [],
        upstream_account_options: [],
@@ -68,8 +79,10 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
        request_log_snapshot_at: nil,
        request_log_pin_at: nil,
        request_log_newer_count: 0,
+       request_log_newer_count_exact?: true,
        selected_request_log: nil
-     )}
+     )
+     |> NotificationCenterHooks.follow_viewer_visibility()}
   end
 
   @impl true
@@ -105,51 +118,44 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   def handle_event("clear_request_id_filter", _params, socket) do
     params = Map.put(socket.assigns.filter_values, "request_id", "")
 
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+    {:noreply, push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
   end
 
   def handle_event("select_pool_filter", %{"pool-id" => pool_id}, socket) do
     params = Map.put(socket.assigns.filter_values, "pool_id", pool_id)
 
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+    {:noreply, push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
   end
 
   def handle_event("select_status_filter", %{"status" => status}, socket) do
     params = Map.put(socket.assigns.filter_values, "status", status)
 
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+    {:noreply, push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
   end
 
   def handle_event("select_upstream_filter", %{"upstream-id" => upstream_id}, socket) do
     params = Map.put(socket.assigns.filter_values, "upstream_identity_id", upstream_id)
 
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+    {:noreply, push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
   end
 
   def handle_event("select_model_filter", %{"model" => model}, socket) do
     params = Map.put(socket.assigns.filter_values, "model", model)
 
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+    {:noreply, push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
   end
 
   def handle_event("open_request_log", %{"request-id" => request_id}, socket) do
     {:noreply,
      push_patch(socket,
-       to:
-         ~p"/admin/request-logs?#{open_request_log_query_params(socket.assigns.current_params, request_id)}"
+       to: ~p"/admin/request-logs?#{open_request_log_query_params(socket.assigns.current_params, request_id)}"
      )}
   end
 
   def handle_event("close_request_log", _params, socket) do
     {:noreply,
      push_patch(socket,
-       to:
-         ~p"/admin/request-logs?#{close_request_log_query_params(socket.assigns.current_params)}"
+       to: ~p"/admin/request-logs?#{close_request_log_query_params(socket.assigns.current_params)}"
      )}
   end
 
@@ -176,6 +182,22 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
 
   def handle_info(:live_updates_resumed, socket) do
     {:noreply, request_request_logs_refresh(socket)}
+  end
+
+  # A role change or a Pool granted or revoked changes which Pools this page
+  # may read. It re-reads them with the rows, the filter options and its Pool
+  # subscriptions at once, not at the next navigation, and an open request the
+  # viewer can no longer see closes (findings#206 row 206-329). A Pool or
+  # upstream account filter the viewer lost leaves the address bar too, so the
+  # URL names the list the page shows instead of a filter error the operator
+  # did not cause (206-431).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    accepted_filters = accepted_scope_filters(socket)
+
+    {:noreply,
+     socket
+     |> request_request_logs(socket.assigns.current_params, :filter_patch)
+     |> drop_lost_scope_filters(accepted_filters)}
   end
 
   @impl true
@@ -210,6 +232,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       current_scope={@current_scope}
       active_nav={:request_logs}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <div id="request-log-detail-drawer-root" class="drawer drawer-end">
         <input
@@ -229,7 +252,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
               id="request-log-page-header"
               title="Request logs"
               description="Every request through the gateway: where it routed, how it ended, and what it cost."
-            />
+            >
+              <:actions>
+                <.link id="request-log-model-guide-link" href="https://www.codex-pooler.com/docs/operators/lens/#read-the-request-log-warnings" target="_blank" rel="noopener noreferrer" class="btn btn-ghost btn-sm gap-1.5"><.icon name="hero-question-mark-circle" class="size-4" /><span class="admin-control-label">Model warnings explained</span></.link>
+              </:actions>
+            </AdminComponents.page_header>
 
             <AdminComponents.filter_form
               id="request-log-filter-form"
@@ -292,10 +319,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
                 <AdminComponents.cally_date_filter
                   field={@filter_form[:date_from]}
                   label="Date from"
+                  timezone={@datetime_preferences.timezone}
                 />
                 <AdminComponents.cally_date_filter
                   field={@filter_form[:date_to]}
                   label="Date to"
+                  timezone={@datetime_preferences.timezone}
                 />
               </:advanced>
             </AdminComponents.filter_form>
@@ -323,6 +352,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
               pin_at={@request_log_pin_at}
               frozen?={@request_log_snapshot_at != nil}
               newer_count={@request_log_newer_count}
+              newer_count_exact?={@request_log_newer_count_exact?}
             />
           </section>
         </div>
@@ -401,7 +431,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       |> MapSet.new()
 
     {filters, form_values, filter_errors} =
-      RequestLogFilterForm.parse_filters(params, selected_pool, visible_upstream_identity_ids)
+      RequestLogFilterForm.parse_filters(params, selected_pool, visible_upstream_identity_ids, socket.assigns.datetime_preferences.timezone)
 
     filter_errors = Enum.reject([pool_error | filter_errors], &is_nil/1)
     visible_pool_ids = pool_ids(pools)
@@ -412,7 +442,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       filters: filters,
       visible_pool_ids: visible_pool_ids,
       snapshot_at: snapshot_at,
-      offset: page_offset(params),
+      offset: if(is_nil(snapshot_at), do: 0, else: page_offset(params)),
       params: params,
       stage: stage,
       current_request_logs: socket.assigns.request_logs,
@@ -531,10 +561,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
           preparation.visible_pool_ids,
           preparation.snapshot_at
         ),
-      model_filter_models:
-        request_log_models(preparation.selected_pool, preparation.visible_pool_ids),
-      selected_request_log:
-        selected_request_log(preparation.scope, preparation.selected_request_id)
+      model_filter_models: request_log_models(preparation.selected_pool, preparation.visible_pool_ids),
+      selected_request_log: selected_request_log(preparation.scope, preparation.selected_request_id)
     }
   end
 
@@ -547,9 +575,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       |> assign(
         request_logs: result.request_logs,
         request_log_pin_at: result.pin_at,
-        request_log_newer_count: result.newer_count,
-        model_filter_options:
-          model_filter_options(result.model_filter_models, socket.assigns.filter_values["model"]),
+        request_log_newer_count: result.newer_count.total,
+        request_log_newer_count_exact?: result.newer_count.total_exact?,
+        model_filter_options: model_filter_options(result.model_filter_models, socket.assigns.filter_values["model"]),
         request_logs_loading?: false,
         request_logs_loaded?: true,
         request_logs_rerun?: false
@@ -611,7 +639,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       # that arrives unpinned — a bookmark, a hand-edited URL — goes to the live
       # first page. Paging from page one always carries its pin, so this is the
       # stale-address case, not the ordinary one.
-      page > 1 and is_nil(snapshot_at) ->
+      page_number(params) > 1 and is_nil(snapshot_at) ->
         patch_request_log_window(socket, params, 1, nil)
 
       page > last_page ->
@@ -645,6 +673,35 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   defp cursor_params({%DateTime{} = at, id}), do: {DateTime.to_iso8601(at), id}
   defp cursor_params(_cursor), do: {nil, nil}
 
+  # The URL filters that depend on what the viewer may see, each only when the
+  # page accepted it: the Pool it selected and the upstream account it filters
+  # by. A filter the operator's own URL already got wrong is not in the list,
+  # so its error stays on screen.
+  defp accepted_scope_filters(%{assigns: %{selected_pool: selected_pool, request_log_filters: filters}}) do
+    pool = if selected_pool, do: ["pool_id"], else: []
+    upstream = if Keyword.has_key?(filters, :upstream_identity_id), do: ["upstream_identity_id"], else: []
+    pool ++ upstream
+  end
+
+  # A filter accepted before the re-read and refused after it names a Pool or
+  # an account the viewer lost. It leaves the URL like a filter change: the page
+  # window starts over on the live first page, the other filters stay, and an
+  # open request stays in the URL for the drawer's own check to close.
+  defp drop_lost_scope_filters(socket, accepted_filters) do
+    lost = accepted_filters -- accepted_scope_filters(socket)
+
+    if lost == [] do
+      socket
+    else
+      params =
+        socket.assigns.current_params
+        |> Map.drop(lost ++ ["page", @snapshot_param, @snapshot_id_param])
+        |> normalize_request_log_query_params()
+
+      push_patch(socket, to: ~p"/admin/request-logs?#{params}")
+    end
+  end
+
   defp assign_selected_request_log(socket, params) do
     case selected_request_id(params) do
       nil ->
@@ -654,9 +711,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
         assign(
           socket,
           :selected_request_log,
-          Accounting.get_request_log_for_scope(socket.assigns.current_scope, request_id,
-            surface: :admin
-          )
+          Accounting.get_request_log_for_scope(socket.assigns.current_scope, request_id, surface: :admin)
         )
     end
   end
@@ -671,8 +726,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     if selected_request_id(socket.assigns.current_params) &&
          is_nil(socket.assigns.selected_request_log) do
       push_patch(socket,
-        to:
-          ~p"/admin/request-logs?#{close_request_log_query_params(socket.assigns.current_params)}"
+        to: ~p"/admin/request-logs?#{close_request_log_query_params(socket.assigns.current_params)}"
       )
     else
       socket
@@ -713,7 +767,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   defp request_logs(selected_pool, filters, visible_pool_ids, offset) do
     request_log_page(selected_pool, filters, visible_pool_ids,
       offset: offset,
-      limit: @page_size
+      limit: @page_size,
+      count_limit: offset + @count_window
     )
   end
 
@@ -737,7 +792,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
 
   # Counting arrivals uses the operator's own filters plus a lower bound at the
   # freeze, never the frozen upper bound — the two together select nothing.
-  defp newer_request_log_count(_selected_pool, _filters, _visible_pool_ids, nil), do: 0
+  defp newer_request_log_count(_selected_pool, _filters, _visible_pool_ids, nil), do: %{total: 0, total_exact?: true}
 
   defp newer_request_log_count(selected_pool, filters, visible_pool_ids, cursor) do
     # The complement of the pinned window, expressed in the same key, so the
@@ -745,13 +800,13 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     # on. The operator's own filters are carried through untouched.
     filters = Keyword.put(filters, :after, cursor)
 
-    # Only the total is wanted. The list query still costs its count, but asking
-    # for one row instead of fifty keeps the join and the debug projection off
-    # the debounce path; a count-only query in the facade is the real fix.
-    %{total: total} =
-      request_log_page(selected_pool, filters, visible_pool_ids, offset: 0, limit: 1)
+    # Only the total is wanted, and only up to the banner's limit. Asking for one
+    # row instead of fifty keeps the join and the debug projection off the
+    # debounce path.
+    %{total: total, total_exact?: total_exact?} =
+      request_log_page(selected_pool, filters, visible_pool_ids, offset: 0, limit: 1, count_limit: @newer_count_limit)
 
-    total
+    %{total: total, total_exact?: total_exact?}
   end
 
   # The head of the page, as a cursor: the row itself, not the moment it landed.
@@ -916,5 +971,5 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     }
   end
 
-  defp empty_request_logs, do: %{items: [], total: 0, limit: @page_size, offset: 0}
+  defp empty_request_logs, do: %{items: [], total: 0, total_exact?: true, limit: @page_size, offset: 0}
 end

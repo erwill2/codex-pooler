@@ -7,11 +7,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
 
   alias CodexPooler.Events
   alias CodexPooler.Gateway.Routing.CircuitHealth
+  alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.EndpointMetadata
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResets
@@ -43,6 +45,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   @observe_only_timeout_seconds 24 * 60 * 60
   @provider_staleness_floor_seconds 30 * 60
   @replay_delays_seconds %{1 => 60, 2 => 5 * 60, 3 => 15 * 60, 4 => 60 * 60, 5 => 3 * 60 * 60}
+  @max_windows_reset 16
 
   @type trigger_kind :: String.t()
 
@@ -59,7 +62,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           optional(:available_count_before) => non_neg_integer(),
           optional(:available_count_after) => non_neg_integer(),
           optional(:http_status) => non_neg_integer(),
-          optional(:reason) => String.t()
+          optional(:reason) => String.t(),
+          optional(:windows_reset) => non_neg_integer(),
+          optional(:five_hour_before) => map(),
+          optional(:five_hour_after) => map()
         }
 
   @type scheduled_noop_result :: %{
@@ -690,7 +696,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   end
 
   defp list_recovery_chatgpt_credits(recovery) do
-    case Req.get(recovery.list_url,
+    case OutboundHTTP.get(recovery.list_url,
            headers:
              CloudflareCookies.request_headers(
                recovery.list_url,
@@ -701,7 +707,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
                )
              ),
            retry: false,
-           receive_timeout: recovery.receive_timeout
+           receive_timeout: recovery.receive_timeout,
+           finch: OutboundHTTP.pool_options_for_url(recovery.list_url)
          )
          |> store_cloudflare_cookies(recovery.list_url) do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
@@ -766,16 +773,12 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         )
 
       _available_missing_or_empty when recovery.recovery_mode == :observe_only ->
-        if observe_only_timeout?(recovery, now) do
-          settle_observe_only_exhausted!(recovery, now)
-        else
-          persist_recovery_observation(
-            recovery,
-            "target_available",
-            now,
-            @observe_only_interval_seconds
-          )
-        end
+        persist_recovery_observation(
+          recovery,
+          "target_available",
+          now,
+          @observe_only_interval_seconds
+        )
 
       _available_missing_or_empty ->
         reserve_and_dispatch_recovery(recovery, target, now)
@@ -813,8 +816,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          now
        ) do
     identity
-    |> Windows.list_evidence()
-    |> PostResetEvidence.classify(dispatched_at, later_datetime(now, now()))
+    |> PostResetEvidence.classify(
+      Windows.list_evidence(identity),
+      dispatched_at,
+      later_datetime(now, now())
+    )
     |> Kernel.==(:confirmed)
   end
 
@@ -1027,7 +1033,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       %{"redeem_request_id" => idempotency_key(recovery)}
       |> maybe_put_recovery_credit_id(endpoint_kind, credit_id)
 
-    case Req.post(recovery.consume_url,
+    case OutboundHTTP.post(recovery.consume_url,
            headers:
              CloudflareCookies.request_headers(
                recovery.consume_url,
@@ -1037,14 +1043,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
                  :post
                )
              ),
-           json: body,
+           body: CodexPooler.JSON.encode_to_iodata!(body),
            retry: false,
-           receive_timeout: recovery.receive_timeout
+           receive_timeout: recovery.receive_timeout,
+           finch: OutboundHTTP.pool_options_for_url(recovery.consume_url)
          )
          |> store_cloudflare_cookies(recovery.consume_url) do
       {:ok, %{status: status, body: response_body}} ->
         code = response_code(response_body, status, endpoint_kind)
-        finalize_recovery_response(recovery, code, status, dispatch_response_now(recovery, now))
+        finalize_recovery_response(recovery, code, status, dispatch_response_now(recovery, now), consume_windows_reset(response_body))
 
       {:error, _reason} ->
         preserve_and_snooze_recovery(
@@ -1075,22 +1082,23 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
 
   defp maybe_put_recovery_credit_id(body, :codex, _credit_id), do: body
 
-  defp finalize_recovery_response(recovery, code, status, now)
+  defp finalize_recovery_response(recovery, code, status, now, windows_reset)
        when code in @known_applied_codes do
     result =
-      result_from_response(
-        code,
+      code
+      |> result_from_response(
         status,
         SavedResets.snapshot(recovery.identity).available_count,
         recovery.identity,
         recovery.assignment,
         Map.put(recovery, :finished_at, now)
       )
+      |> put_present(:windows_reset, windows_reset)
 
     finalize_reserved_attempt(result, Map.put(recovery, :finished_at, now))
   end
 
-  defp finalize_recovery_response(recovery, code, _status, now),
+  defp finalize_recovery_response(recovery, code, _status, now, _windows_reset),
     do: preserve_and_snooze_recovery(recovery, code, now)
 
   defp preserve_and_snooze_recovery(recovery, code, now) do
@@ -1235,8 +1243,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     else
       case recovery_replay_due_at(%{
              "provider_dispatches" => recovery.provider_dispatches,
-             "last_provider_dispatched_at" =>
-               encode_optional_datetime(recovery.last_provider_dispatched_at),
+             "last_provider_dispatched_at" => encode_optional_datetime(recovery.last_provider_dispatched_at),
              "next_action_at" => nil
            }) do
         {:ok, replay_due_at} -> later_datetime(requested_due_at, replay_due_at)
@@ -1379,6 +1386,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       Keyword.get(opts, :receive_timeout, SavedResets.redemption_receive_timeout_ms())
 
     started_at_override = Keyword.get(opts, :started_at)
+    # `:clock` is a test-facing knob for the decision time read after both row
+    # locks when no `:started_at` override is given; production reads `now/0`.
+    clock = Keyword.get(opts, :clock, &now/0)
 
     opts =
       opts
@@ -1390,7 +1400,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     |> claim_scheduled_attempt(
       expected_identity_id,
       receive_timeout,
-      started_at_override
+      started_at_override,
+      clock
     )
     |> redeem_claim(opts)
   end
@@ -1434,8 +1445,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
 
       %UpstreamIdentity{status: @identity_disabled} ->
-        {:error,
-         lifecycle_error(:upstream_identity_unavailable, "upstream identity is not available")}
+        {:error, lifecycle_error(:upstream_identity_unavailable, "upstream identity is not available")}
 
       %UpstreamIdentity{status: status} = identity
       when status not in [@identity_deleted, @identity_disabled] ->
@@ -1450,9 +1460,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     do: {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
 
   defp ensure_identity_usable(%UpstreamIdentity{status: @identity_disabled}),
-    do:
-      {:error,
-       lifecycle_error(:upstream_identity_unavailable, "upstream identity is not available")}
+    do: {:error, lifecycle_error(:upstream_identity_unavailable, "upstream identity is not available")}
 
   defp ensure_identity_usable(%UpstreamIdentity{}), do: :ok
 
@@ -1523,20 +1531,20 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          gateway_auto_context
        ) do
     Repo.transaction(fn ->
-      case lock_claim_identity(identity.id, gateway_auto_context) do
-        {:ok, locked_identity, locked_cohort} ->
-          claim_locked_identity!(
-            locked_identity,
-            locked_cohort,
-            assignment,
-            trigger_kind,
-            receive_timeout,
-            started_at,
-            gateway_auto_context
-          )
-
-        {:noop, code} ->
-          {:noop, noop_result(identity, assignment, code)}
+      with {:ok, locked_identity, locked_cohort} <-
+             lock_claim_identity(identity.id, gateway_auto_context),
+           :ok <- lock_confirmation_windows(gateway_auto_context) do
+        claim_locked_identity!(
+          locked_identity,
+          locked_cohort,
+          assignment,
+          trigger_kind,
+          receive_timeout,
+          started_at,
+          gateway_auto_context
+        )
+      else
+        {:noop, code} -> {:noop, noop_result(identity, assignment, code)}
       end
     end)
     |> case do
@@ -1546,11 +1554,40 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     end
   end
 
+  # The referenced proof rows are locked after the sorted identity cohort and
+  # before the assignment and capacity rows, in both the claim and the
+  # dispatch-reservation transaction. Evidence writers take the identity
+  # reference lock first, so they queue behind the claim and the order stays
+  # acyclic. A missing, moved or duplicated row means the scan-time proof no
+  # longer exists and the claim fails closed before any side effect.
+  defp lock_confirmation_windows(nil), do: :ok
+  defp lock_confirmation_windows(%{automatic_confirmation_refs: []}), do: :ok
+
+  defp lock_confirmation_windows(%{automatic_confirmation_refs: refs}) when is_list(refs) do
+    expected = Enum.map(refs, &{&1.upstream_identity_id, &1.account_quota_window_id})
+    window_ids = Enum.map(refs, & &1.account_quota_window_id)
+
+    locked =
+      Repo.all(
+        from window in AccountQuotaWindow,
+          where: window.id in ^window_ids,
+          order_by: [asc: window.upstream_identity_id, asc: window.id],
+          lock: "FOR UPDATE"
+      )
+
+    if Enum.map(locked, &{&1.upstream_identity_id, &1.id}) == expected,
+      do: :ok,
+      else: {:noop, "gateway_auto_confirmation_mismatch"}
+  end
+
+  defp lock_confirmation_windows(_context), do: {:noop, "gateway_auto_context_invalid"}
+
   defp claim_scheduled_attempt(
          assignment_id,
          expected_identity_id,
          receive_timeout,
-         started_at_override
+         started_at_override,
+         clock
        ) do
     Repo.transaction(fn ->
       case lock_scheduled_identity(expected_identity_id) do
@@ -1560,7 +1597,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
             assignment_id,
             expected_identity_id,
             receive_timeout,
-            started_at_override
+            started_at_override,
+            clock
           )
 
         nil ->
@@ -1579,11 +1617,12 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          assignment_id,
          expected_identity_id,
          receive_timeout,
-         started_at_override
+         started_at_override,
+         clock
        ) do
     case lock_scheduled_assignment(assignment_id) do
       %PoolUpstreamAssignment{} = locked_assignment ->
-        decision_at = started_at_override || now()
+        decision_at = started_at_override || clock.()
 
         case AutoEligibility.validate_locked_scheduled_expiry(
                locked_identity,
@@ -1698,6 +1737,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
               nil,
               gateway_auto_trigger_detail(gateway_auto_context)
             )
+            |> put_claim_gateway_auto_context(gateway_auto_context)
 
           {:noop, code} ->
             {:noop, noop_result(locked_identity, current_assignment, code)}
@@ -1716,7 +1756,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          locked_cohort,
          locked_assignment,
          gateway_auto_context,
-         timestamp
+         timestamp,
+         stage \\ :claim
        ) do
     with :ok <-
            sibling_consume_fence(
@@ -1738,7 +1779,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
              locked_identity,
              locked_assignment,
              gateway_auto_context,
-             evaluated_at
+             evaluated_at,
+             stage
            ),
          :ok <-
            sibling_transient_exclusion_fence(
@@ -1748,15 +1790,31 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
              gateway_auto_context,
              current_capacity,
              evaluated_at
+           ),
+         :ok <-
+           sibling_usable_capacity_fence(
+             locked_identity,
+             locked_cohort,
+             gateway_auto_context,
+             current_capacity,
+             evaluated_at,
+             stage
            ) do
-      sibling_usable_capacity_fence(
-        locked_identity,
-        locked_cohort,
-        gateway_auto_context,
-        current_capacity,
-        evaluated_at
-      )
+      confirmation_fence(locked_identity, gateway_auto_context, evaluated_at)
     end
+  end
+
+  # The corroborated proof is the last fence before the local claim persists
+  # and again before the irreversible dispatch reservation, so every earlier
+  # policy, latch, sibling and capacity veto keeps its own bounded code.
+  defp confirmation_fence(_locked_identity, nil, _evaluated_at), do: :ok
+
+  defp confirmation_fence(locked_identity, gateway_auto_context, evaluated_at) do
+    AutoEligibility.validate_confirmation_refs(
+      locked_identity,
+      gateway_auto_context,
+      evaluated_at
+    )
   end
 
   defp current_capacity_evaluated_at(%{evaluated_at: %DateTime{} = evaluated_at}, _timestamp),
@@ -1768,7 +1826,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          _locked_identity,
          _locked_assignment,
          nil,
-         _evaluated_at
+         _evaluated_at,
+         _stage
        ),
        do: :ok
 
@@ -1776,9 +1835,25 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          locked_identity,
          locked_assignment,
          gateway_auto_context,
-         evaluated_at
+         evaluated_at,
+         :claim
        ) do
     AutoEligibility.validate_locked_gateway_auto(
+      locked_identity,
+      locked_assignment,
+      gateway_auto_context,
+      evaluated_at
+    )
+  end
+
+  defp revalidate_current_gateway_auto(
+         locked_identity,
+         locked_assignment,
+         gateway_auto_context,
+         evaluated_at,
+         :reservation
+       ) do
+    AutoEligibility.validate_reserved_gateway_auto(
       locked_identity,
       locked_assignment,
       gateway_auto_context,
@@ -1884,9 +1959,34 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   defp sibling_usable_capacity_fence(
          locked_identity,
          locked_cohort,
+         %{trigger: :blocked_weekly_exhaustion} = context,
+         %{routable_assignment_ids: routable_ids},
+         timestamp,
+         stage
+       ) do
+    usable? =
+      context.candidate_assignment_ids
+      |> Enum.zip(context.candidate_identity_ids)
+      |> Enum.any?(fn {assignment_id, identity_id} ->
+        identity = Map.get(locked_cohort, identity_id)
+
+        allowed_by_continuity? = not context.hard_pinned_continuity? or identity_id == locked_identity.id
+        own_reservation? = stage == :reservation and identity_id == locked_identity.id
+
+        allowed_by_continuity? and MapSet.member?(routable_ids, assignment_id) and
+          AutoEligibility.locked_request_usable_capacity?(identity, context, assignment_id, timestamp, own_reservation?)
+      end)
+
+    if usable?, do: {:noop, "gateway_auto_sibling_usable_capacity"}, else: :ok
+  end
+
+  defp sibling_usable_capacity_fence(
+         locked_identity,
+         locked_cohort,
          %{trigger: :threshold_pressure, hard_pinned_continuity?: false} = gateway_auto_context,
          current_capacity,
-         timestamp
+         timestamp,
+         _stage
        ) do
     if current_usable_sibling_capacity?(
          locked_identity,
@@ -1906,7 +2006,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          _locked_cohort,
          _context,
          _current_capacity,
-         _timestamp
+         _timestamp,
+         _stage
        ),
        do: :ok
 
@@ -2071,6 +2172,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           |> put_trigger_detail(trigger_detail)
           |> put_scheduled_decision_evidence(scheduled_decision_evidence)
           |> put_carried_applied_consume(metadata["saved_reset_redemption"] || %{})
+          |> put_claim_confirmation_resources(metadata["saved_reset_redemption"] || %{}, locked_identity, started_at)
 
         {metadata, claim} =
           put_provider_replay_contract(metadata, claim, locked_identity, assignment, started_at)
@@ -2100,6 +2202,40 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     end
   end
 
+  defp reset_confirmation_descriptors(identity, timestamp) do
+    identity
+    |> Windows.list_evidence()
+    |> Windows.effective_quota_windows(timestamp)
+    |> Enum.filter(fn window ->
+      window.quota_key == "account" and window.quota_scope == "account" and window.window_minutes in [10_080, 43_200] and
+        window.source == "codex_usage_api" and window.source_precision in ["authoritative", "observed"]
+    end)
+    |> Enum.map(&%{"window_kind" => &1.window_kind, "window_minutes" => &1.window_minutes})
+    |> Enum.uniq()
+    |> Enum.take(2)
+  end
+
+  defp put_claim_confirmation_resources(claim, redemption, identity, timestamp) do
+    if claim["attempt_id"] == redemption["attempt_id"] and claim["generation"] == redemption["generation"] do
+      put_captured_confirmation_resources(claim, redemption)
+    else
+      Map.put(claim, "included_window_descriptors", reset_confirmation_descriptors(identity, timestamp))
+    end
+  end
+
+  defp put_captured_confirmation_resources(base, redemption) do
+    case Map.fetch(redemption, "included_window_descriptors") do
+      {:ok, descriptors} -> Map.put(base, "included_window_descriptors", descriptors)
+      :error -> base
+    end
+  end
+
+  defp put_claim_gateway_auto_context(%{identity: _identity} = claim, gateway_auto_context)
+       when is_map(gateway_auto_context),
+       do: Map.put(claim, :gateway_auto_context, gateway_auto_context)
+
+  defp put_claim_gateway_auto_context(claim_or_noop, _gateway_auto_context), do: claim_or_noop
+
   defp do_redeem(%{identity: identity, assignment: assignment} = claim, opts) do
     case Secrets.decrypt_active_secret(identity, "access_token") do
       {:ok, access_token} ->
@@ -2111,6 +2247,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         case result do
           {:error, reason} ->
             {:error, reason}
+
+          {:settled, settled_result} ->
+            broadcast_redemption(settled_result.identity)
+            {:ok, settled_result}
 
           {:ambiguous, code, ambiguous_claim} ->
             preserve_ambiguous_attempt(ambiguous_claim, code)
@@ -2167,8 +2307,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
             available_count_before: available_count,
             available_count_after: 0,
             http_status: http_status,
-            saved_reset_observation:
-              no_credit_observation_intent(snapshot, available_count, claim.started_at)
+            saved_reset_observation: no_credit_observation_intent(snapshot, available_count, claim.started_at)
           }
 
         %{credit_id: credit_id, available_count: available_count} ->
@@ -2221,14 +2360,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   end
 
   defp list_chatgpt_credits(url, identity, access_token, receive_timeout) do
-    case Req.get(url,
+    case OutboundHTTP.get(url,
            headers:
              CloudflareCookies.request_headers(
                url,
                request_headers(access_token, identity.chatgpt_account_id, :get)
              ),
            retry: false,
-           receive_timeout: receive_timeout
+           receive_timeout: receive_timeout,
+           finch: OutboundHTTP.pool_options_for_url(url)
          )
          |> store_cloudflare_cookies(url) do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
@@ -2281,17 +2421,26 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
        ) do
     credit_id = if endpoint_kind == :chatgpt, do: body["credit_id"]
 
-    with {:ok, reserved_claim, reserved_credit_id} <-
-           reserve_provider_dispatch(claim, url, endpoint_kind, credit_id) do
-      consume_reserved_credit(
-        url,
-        access_token,
-        body,
-        available_count_before,
-        reserved_claim,
-        reserved_credit_id,
-        endpoint_kind
-      )
+    case reserve_provider_dispatch(claim, url, endpoint_kind, credit_id) do
+      {:ok, reserved_claim, reserved_credit_id} ->
+        consume_reserved_credit(
+          url,
+          access_token,
+          body,
+          available_count_before,
+          reserved_claim,
+          reserved_credit_id,
+          endpoint_kind
+        )
+
+      {:noop, code, settled_identity} ->
+        {:settled,
+         noop_result(settled_identity, claim.assignment, code)
+         |> Map.put(:available_count_before, available_count_before)
+         |> Map.put(:available_count_after, available_count_before)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -2309,7 +2458,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         do: Map.put(body, "credit_id", reserved_credit_id),
         else: body
 
-    case Req.post(url,
+    case OutboundHTTP.post(url,
            headers:
              CloudflareCookies.request_headers(
                url,
@@ -2319,9 +2468,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
                  :post
                )
              ),
-           json: body,
+           body: CodexPooler.JSON.encode_to_iodata!(body),
            retry: false,
-           receive_timeout: reserved_claim.receive_timeout
+           receive_timeout: reserved_claim.receive_timeout,
+           finch: OutboundHTTP.pool_options_for_url(url)
          )
          |> store_cloudflare_cookies(url) do
       {:ok, %{status: status, body: response_body}} ->
@@ -2329,7 +2479,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           response_code(response_body, status, endpoint_kind),
           status,
           available_count_before,
-          reserved_claim
+          reserved_claim,
+          consume_windows_reset(response_body)
         )
 
       {:error, _reason} ->
@@ -2339,20 +2490,17 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     _exception -> preserve_ambiguous_attempt(reserved_claim, "persistence_failed")
   end
 
-  defp handle_consume_response(code, status, available_count_before, claim)
+  defp handle_consume_response(code, status, available_count_before, claim, windows_reset)
        when code in @known_provider_result_codes do
-    {:finalize,
-     result_from_response(
-       code,
-       status,
-       available_count_before,
-       claim.identity,
-       claim.assignment,
-       claim
-     ), claim}
+    result =
+      code
+      |> result_from_response(status, available_count_before, claim.identity, claim.assignment, claim)
+      |> put_present(:windows_reset, windows_reset)
+
+    {:finalize, result, claim}
   end
 
-  defp handle_consume_response(code, _status, _available_count_before, claim),
+  defp handle_consume_response(code, _status, _available_count_before, claim, _windows_reset),
     do: {:ambiguous, code, claim}
 
   defp store_cloudflare_cookies(result, url) do
@@ -2366,11 +2514,10 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         # The provider consumed a credit as of now; capture that before the
         # refresh so evidence is only accepted when observed at/after it.
         consumed_at = claim[:finished_at] || now()
+        five_hour_before = identity |> Windows.list_evidence() |> five_hour_before()
 
-        case PoolReconciliation.refresh_quota_from_usage(identity, assignment,
-               receive_timeout: claim.receive_timeout
-             ) do
-          {:ok, refreshed_identity} ->
+        case PoolReconciliation.refresh_quota_and_probe_from_usage(identity, assignment, receive_timeout: claim.receive_timeout) do
+          {:ok, refreshed_identity, probe} ->
             available_count_after = SavedResets.snapshot(refreshed_identity).available_count
 
             %{
@@ -2383,6 +2530,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
               available_count_after: available_count_after,
               http_status: status
             }
+            |> put_present(:five_hour_before, five_hour_before)
+            |> put_present(:five_hour_after, five_hour_after(probe, Windows.list_evidence(refreshed_identity)))
 
           {:error, _reason} ->
             # The provider returned `reset`: a credit was consumed. A failed or
@@ -2401,9 +2550,23 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
               http_status: status,
               reason: "quota refresh after saved reset is pending confirmation"
             }
+            |> put_present(:five_hour_before, five_hour_before)
         end
 
-      code in ["no_credit", "nothing_to_reset"] ->
+      code == "no_credit" ->
+        observed_at = claim[:finished_at] || now()
+
+        %{
+          status: :noop,
+          applied?: false,
+          code: code,
+          available_count_before: available_count_before,
+          available_count_after: 0,
+          http_status: status,
+          saved_reset_observation: no_credit_observation_intent(SavedResets.snapshot(identity, observed_at), 0, observed_at)
+        }
+
+      code == "nothing_to_reset" ->
         %{
           status: :noop,
           applied?: false,
@@ -2445,16 +2608,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
 
     case snapshot.usage_path do
       "/wham/usage" ->
-        {:ok, base <> "/wham/rate-limit-reset-credits",
-         base <> "/wham/rate-limit-reset-credits/consume"}
+        {:ok, base <> "/wham/rate-limit-reset-credits", base <> "/wham/rate-limit-reset-credits/consume"}
 
       "/backend-api/wham/usage" ->
-        {:ok, base <> "/backend-api/wham/rate-limit-reset-credits",
-         base <> "/backend-api/wham/rate-limit-reset-credits/consume"}
+        {:ok, base <> "/backend-api/wham/rate-limit-reset-credits", base <> "/backend-api/wham/rate-limit-reset-credits/consume"}
 
       nil ->
-        {:ok, base <> "/backend-api/wham/rate-limit-reset-credits",
-         base <> "/backend-api/wham/rate-limit-reset-credits/consume"}
+        {:ok, base <> "/backend-api/wham/rate-limit-reset-credits", base <> "/backend-api/wham/rate-limit-reset-credits/consume"}
 
       _usage_path ->
         {:error, %{status: :noop, applied?: false, code: "saved_reset_endpoint_unknown"}}
@@ -2505,20 +2665,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     end
   end
 
-  defp send_chatgpt_account_header?(chatgpt_account_id) when is_binary(chatgpt_account_id) do
-    chatgpt_account_id = String.trim(chatgpt_account_id)
-
-    chatgpt_account_id != "" and not String.starts_with?(chatgpt_account_id, "email_") and
-      not String.starts_with?(chatgpt_account_id, "local_")
-  end
-
-  defp send_chatgpt_account_header?(_chatgpt_account_id), do: false
-
-  defp emitted_chatgpt_account_scope(chatgpt_account_id) do
-    if send_chatgpt_account_header?(chatgpt_account_id),
-      do: String.trim(chatgpt_account_id),
-      else: nil
-  end
+  defp emitted_chatgpt_account_scope(chatgpt_account_id),
+    do: UpstreamIdentity.account_scope(chatgpt_account_id)
 
   defp put_provider_replay_contract(metadata, claim, identity, assignment, started_at) do
     snapshot = SavedResets.snapshot(identity, started_at)
@@ -2549,8 +2697,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         endpoint_family = "chatgpt_api"
         account_scope = emitted_chatgpt_account_scope(identity.chatgpt_account_id) || ""
 
-        {:ok, endpoint_family, consume_url,
-         CreditLocator.scope_fingerprint(endpoint_family, consume_url, account_scope)}
+        {:ok, endpoint_family, consume_url, CreditLocator.scope_fingerprint(endpoint_family, consume_url, account_scope)}
 
       {:error, _result} ->
         :unsupported
@@ -2562,8 +2709,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       {:ok, consume_url} ->
         endpoint_family = "codex_api"
 
-        {:ok, endpoint_family, consume_url,
-         CreditLocator.scope_fingerprint(endpoint_family, consume_url, "")}
+        {:ok, endpoint_family, consume_url, CreditLocator.scope_fingerprint(endpoint_family, consume_url, "")}
 
       {:error, _result} ->
         :unsupported
@@ -2572,16 +2718,31 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
 
   defp provider_scope(_identity, _assignment, _snapshot), do: :unsupported
 
+  # Immediately before the first provider dispatch every irreversible fence is
+  # rerun under the same lock order as the claim: sorted identity cohort,
+  # referenced proof windows, assignment, capacity circuits. An automatic claim
+  # whose proof cleared, whose policy, bank, epoch or reset changed, or whose
+  # siblings recovered while the credit list was fetched settles to
+  # `consume_not_applied` with zero dispatches instead of posting.
   defp reserve_provider_dispatch(claim, consume_url, endpoint_kind, selected_credit_id) do
     Repo.transaction(fn ->
-      identity = lock_identity!(claim.identity.id)
+      {identity, locked_cohort, cohort_result} = lock_reservation_cohort(claim)
       metadata = identity.metadata || %{}
       redemption = metadata["saved_reset_redemption"] || %{}
 
       with :ok <- validate_reservation_identity(redemption, claim),
            :ok <- validate_reservation_dispatch(redemption, claim),
+           :ok <- cohort_result,
+           :ok <- lock_confirmation_windows(claim[:gateway_auto_context]),
            {:ok, locked_assignment} <-
              lock_reservation_assignment(claim.assignment.id, identity.id),
+           :ok <-
+             gateway_auto_reservation_fence(
+               identity,
+               locked_cohort,
+               locked_assignment,
+               claim[:gateway_auto_context]
+             ),
            {:ok, endpoint_family, ^consume_url, scope_fingerprint} <-
              provider_scope(identity, locked_assignment, SavedResets.snapshot(identity)),
            :ok <-
@@ -2628,14 +2789,71 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           |> Map.put(:assignment, locked_assignment)
           |> Map.put(:reserved_provider_dispatches, replay["provider_dispatches"])
 
-        {reserved_claim, credit_id}
+        {:reserved, reserved_claim, credit_id}
       else
-        _invalid -> Repo.rollback(:saved_reset_dispatch_reservation_invalid)
+        {:noop, code} when is_binary(code) ->
+          settle_cancelled_reservation!(identity, claim, redemption, code)
+
+        _invalid ->
+          Repo.rollback(:saved_reset_dispatch_reservation_invalid)
       end
     end)
     |> case do
-      {:ok, {reserved_claim, credit_id}} -> {:ok, reserved_claim, credit_id}
+      {:ok, {:reserved, reserved_claim, credit_id}} -> {:ok, reserved_claim, credit_id}
+      {:ok, {:cancelled, code, settled_identity}} -> {:noop, code, settled_identity}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp lock_reservation_cohort(%{gateway_auto_context: context} = claim) when is_map(context) do
+    case lock_claim_identity(claim.identity.id, context) do
+      {:ok, identity, locked_cohort} ->
+        {identity, locked_cohort, :ok}
+
+      {:noop, code} ->
+        {lock_identity!(claim.identity.id), %{}, {:noop, code}}
+    end
+  end
+
+  defp lock_reservation_cohort(claim) do
+    {lock_identity!(claim.identity.id), %{}, :ok}
+  end
+
+  defp gateway_auto_reservation_fence(_identity, _locked_cohort, _locked_assignment, nil),
+    do: :ok
+
+  # The reservation clock is sampled after every lock and never precedes the
+  # claim's own clock, so a fence that held at claim time cannot flip purely
+  # because the caller supplied a slightly later scan timestamp.
+  defp gateway_auto_reservation_fence(identity, locked_cohort, locked_assignment, context)
+       when is_map(context) do
+    gateway_auto_sibling_fence(
+      identity,
+      locked_cohort,
+      locked_assignment,
+      context,
+      later_datetime(context_started_at(identity), now()),
+      :reservation
+    )
+  end
+
+  defp context_started_at(%UpstreamIdentity{metadata: metadata}) do
+    case parse_datetime(get_in(metadata || %{}, ["saved_reset_redemption", "started_at"])) do
+      %DateTime{} = started_at -> started_at
+      nil -> now()
+    end
+  end
+
+  # A zero-dispatch automatic claim that lost its authorization before the
+  # provider POST is settled through the existing guarded transition; the
+  # bounded fence code is returned to the caller while the record carries the
+  # lifecycle phase.
+  defp settle_cancelled_reservation!(identity, claim, redemption, code) do
+    expected = %{generation: claim.generation, attempt_id: claim.attempt_id}
+
+    case settle_consume_not_applied!(identity, claim.assignment, redemption, expected, now()) do
+      {:noop, _phase, settled_identity, _assignment} ->
+        {:cancelled, code, settled_identity}
     end
   end
 
@@ -2822,6 +3040,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       |> put_scheduled_decision_evidence(claim[:scheduled_decision_evidence])
       |> put_carried_applied_consume(redemption)
       |> put_provider_replay_history(redemption)
+      |> put_captured_confirmation_resources(redemption)
       |> Map.merge(redemption_lifecycle_fields(finalized_result))
       |> put_finalizer_confirmation_metadata(
         finalized_result,
@@ -2911,7 +3130,56 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       "available_count_after" => Map.get(result, :available_count_after),
       "http_status" => Map.get(result, :http_status)
     }
+    |> put_present("windows_reset", Map.get(result, :windows_reset))
+    |> put_present("five_hour_before", Map.get(result, :five_hour_before))
+    |> put_present("five_hour_after", Map.get(result, :five_hour_after))
   end
+
+  # What a consume tells about the windows it resets, kept until it is known
+  # whether a reset also clears an exhausted 5-hour window (findings#310):
+  # the provider's own count of reset windows, the account's stored Usage API
+  # 5-hour reading before the consume's quota refresh, and the 5-hour reading
+  # of that refresh's own Usage API response, marked with whether the stored
+  # window took it. The response is read directly because the evidence store
+  # keeps a fresh positive reading against a lone 0% one, which is exactly
+  # the reading a reset of the 5-hour window would produce.
+  defp consume_windows_reset(%{"windows_reset" => count}) when is_integer(count) and count >= 0 and count <= @max_windows_reset, do: count
+  defp consume_windows_reset(_body), do: nil
+
+  defp five_hour_before(windows) do
+    case windows |> Enum.filter(&usage_five_hour_window?/1) |> Enum.max_by(& &1.observed_at, DateTime, fn -> nil end) do
+      nil -> nil
+      window -> reading(window.used_percent, window.reset_at, window.observed_at)
+    end
+  end
+
+  defp five_hour_after(%{windows: observed_windows}, stored_windows) when is_list(observed_windows) do
+    with %{} = observed <- Enum.find(observed_windows, &usage_five_hour_window?/1),
+         %{} = reading <- reading(observed.used_percent, observed.reset_at, observed.observed_at) do
+      Map.put(reading, "accepted", Enum.any?(stored_windows, &(usage_five_hour_window?(&1) and stored_reading?(&1, observed))))
+    else
+      _absent -> nil
+    end
+  end
+
+  defp stored_reading?(%{observed_at: %DateTime{} = stored_at, used_percent: %Decimal{} = stored}, %{observed_at: %DateTime{} = observed_at, used_percent: %Decimal{} = observed}),
+    do: DateTime.compare(stored_at, observed_at) != :lt and Decimal.equal?(stored, observed)
+
+  defp stored_reading?(_stored, _observed), do: false
+
+  defp usage_five_hour_window?(%{quota_key: "account", quota_scope: scope, window_kind: "primary", window_minutes: 300, source: "codex_usage_api", observed_at: %DateTime{}})
+       when scope in [nil, "account"],
+       do: true
+
+  defp usage_five_hour_window?(_window), do: false
+
+  defp reading(%Decimal{} = used_percent, %DateTime{} = reset_at, %DateTime{} = observed_at),
+    do: %{"used_percent" => used_percent |> Decimal.round(1) |> Decimal.to_string(:normal), "reset_at" => DateTime.to_iso8601(reset_at), "observed_at" => DateTime.to_iso8601(observed_at)}
+
+  defp reading(_used_percent, _reset_at, _observed_at), do: nil
+
+  defp put_present(map, _key, nil), do: map
+  defp put_present(map, key, value), do: Map.put(map, key, value)
 
   # A result carrying a lifecycle `:phase` records the phase-driven legacy status
   # plus the consume timestamp and bounded-window deadline. Every other result
@@ -2937,14 +3205,14 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   # to the present or that fresh evidence would be invisible.
   defp post_reset_phase(%UpstreamIdentity{} = refreshed_identity, consumed_at, timestamp) do
     post_reset_phase(
-      Windows.list_evidence(refreshed_identity),
+      {refreshed_identity, Windows.list_evidence(refreshed_identity)},
       consumed_at,
       later_datetime(timestamp, now())
     )
   end
 
-  defp post_reset_phase(evidence, consumed_at, timestamp) when is_list(evidence) do
-    case PostResetEvidence.classify(evidence, consumed_at, timestamp) do
+  defp post_reset_phase({identity, evidence}, consumed_at, timestamp) do
+    case PostResetEvidence.classify(identity, evidence, consumed_at, timestamp) do
       :confirmed -> RedemptionLifecycle.confirmed_by_quota()
       _pending_or_reblocked -> RedemptionLifecycle.consumed_pending_probe()
     end
@@ -2959,7 +3227,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     decision_at = later_datetime(finished_at, now())
     evidence = Windows.list_evidence(identity)
 
-    {finalize_confirmation_phase(result, evidence, decision_at), evidence, decision_at}
+    {finalize_confirmation_phase(result, {identity, evidence}, decision_at), evidence, decision_at}
   end
 
   defp finalize_confirmation(_identity, result, _finished_at), do: {result, [], nil}
@@ -3179,8 +3447,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           }
           |> Map.merge(expiration_metadata(snapshot, intent.authoritative_zero?, observed_at))
 
-        {Map.put(metadata, "saved_resets", saved_reset_metadata),
-         identity.saved_reset_first_seen_ledger}
+        {Map.put(metadata, "saved_resets", saved_reset_metadata), identity.saved_reset_first_seen_ledger}
 
       :skip ->
         {metadata, identity.saved_reset_first_seen_ledger}
@@ -3268,6 +3535,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         }
       }
       |> put_carried_applied_consume(redemption)
+      |> put_captured_confirmation_resources(redemption)
     )
   end
 

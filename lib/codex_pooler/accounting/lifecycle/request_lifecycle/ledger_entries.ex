@@ -3,6 +3,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
 
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Accounting.PreAttemptRelease
   alias CodexPooler.Accounting.PricingResolution
   alias CodexPooler.Accounting.RequestLifecycle.ReferenceLocks
   alias CodexPooler.Accounting.RequestLifecycle.WindowUsage
@@ -14,10 +15,17 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @amount_recorded "recorded"
   @amount_voided "voided"
   @usage_pending "usage_pending"
-  @source_event_conflict_target {:unsafe_fragment,
-                                 "(source_event_id) WHERE source_event_id IS NOT NULL"}
+  @usage_not_applicable "not_applicable"
+  @source_event_conflict_target {:unsafe_fragment, "(source_event_id) WHERE source_event_id IS NOT NULL"}
 
   @type cost :: Decimal.t() | nil
+  @type reservation_auth :: %{
+          required(:pool) => CodexPooler.Pools.Pool.t(),
+          required(:api_key) => APIKey.t(),
+          optional(:pool_id) => Ecto.UUID.t(),
+          optional(:api_key_id) => Ecto.UUID.t(),
+          optional(:key_prefix) => String.t()
+        }
   @type estimate :: %{
           required(:input_tokens) => non_neg_integer() | nil,
           required(:cached_input_tokens) => non_neg_integer() | nil,
@@ -30,7 +38,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @type ledger_attrs :: %{
           required(:request_id) => Ecto.UUID.t(),
           required(:pool_id) => Ecto.UUID.t(),
-          required(:api_key_id) => Ecto.UUID.t(),
+          required(:api_key_id) => Ecto.UUID.t() | nil,
           required(:model_id) => Ecto.UUID.t() | nil,
           required(:entry_kind) => String.t(),
           required(:amount_status) => String.t(),
@@ -119,6 +127,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
 
     attrs
     |> Map.put(:correction_of_entry_id, existing.id)
+    |> Map.put(:occurred_at, existing.occurred_at)
     |> Map.put(
       :source_event_id,
       reconciled_settlement_source_event_id(Map.fetch!(attrs, :request_id))
@@ -132,9 +141,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           }
   defdelegate window_usages(api_key_id, windows), to: WindowUsage
 
+  @spec window_usages(Ecto.UUID.t(), WindowUsage.windows(), DateTime.t()) ::
+          %{usage_window() => window_usage()}
+  defdelegate window_usages(api_key_id, windows, as_of), to: WindowUsage
+
   @spec reservation_attrs(
           Request.t(),
-          CodexPooler.Access.auth_context(),
+          reservation_auth(),
           APIKey.t(),
           pricing(),
           estimate(),
@@ -202,7 +215,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       reasoning_tokens: positive_or_nil(state.usage.reasoning_tokens),
       total_tokens: positive_or_nil(state.usage.total_tokens),
       request_count: 1,
-      estimated_cost_micros: reservation.estimated_cost_micros,
+      estimated_cost_micros: settlement_estimated_cost(state.usage, reservation),
       settled_cost_micros: ledger_cost_value(settled_cost),
       source_event_id: settlement_source_event_id(request.id),
       occurred_at: state.usage.recorded_at,
@@ -248,17 +261,22 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           LedgerEntry.t(),
           String.t(),
           String.t() | nil,
-          DateTime.t()
+          String.t() | nil,
+          DateTime.t(),
+          Attempt.t() | nil
         ) :: ledger_attrs()
   def reservation_failure_release_attrs(
         request,
         reservation,
         usage_status,
         last_error_code,
-        timestamp
+        pre_attempt_phase,
+        timestamp,
+        released_after_attempt \\ nil
       ) do
     %{
       request_id: request.id,
+      attempt_id: released_after_attempt && released_after_attempt.id,
       pricing_snapshot_id: reservation.pricing_snapshot_id,
       pool_id: request.pool_id,
       api_key_id: request.api_key_id,
@@ -279,7 +297,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       source_event_id: release_source_event_id(request.id),
       occurred_at: timestamp,
       created_at: timestamp,
-      details: reservation_failure_release_details(request, last_error_code)
+      details:
+        reservation_failure_release_details(
+          request,
+          last_error_code,
+          pre_attempt_phase,
+          released_after_attempt
+        )
     }
   end
 
@@ -302,7 +326,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       "attempt_status" => attempt.status,
       "response_status_code" => Map.fetch!(context, :response_status_code),
       "retry_count" => Map.fetch!(context, :retry_count),
-      "estimated_from_reserve" => usage.status != "usage_known",
+      "estimated_from_reserve" => usage.status not in ["usage_known", @usage_not_applicable],
       "settled_cost_micros" => context |> Map.fetch!(:settled_cost) |> decimal_string_or_nil(),
       "cached_input_cost_micros" => cached_input_cost_micros(usage, pricing),
       "cache_write_rate_status" => cache_write_rate_status(usage, pricing),
@@ -321,13 +345,36 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
     |> Map.merge(PricingResolution.details(pricing))
   end
 
-  defp reservation_failure_release_details(request, last_error_code) do
+  # `request_status` is the status this same write just set, so it says nothing
+  # about the phase the reservation was released from. `pre_attempt_phase` is
+  # the field that does, and it is written for every reservation-failure
+  # release — an explicit `unrecorded` when the caller declared nothing, never
+  # an absent key, so the absent key keeps meaning "not a pre-attempt release,
+  # or older than this field".
+  defp reservation_failure_release_details(request, last_error_code, pre_attempt_phase, nil) do
+    %{
+      "reservation_source_event_id" => reservation_source_event_id(request.id),
+      "release_reason" => last_error_code,
+      "request_status" => request.status,
+      PreAttemptRelease.detail_key() => PreAttemptRelease.phase(pre_attempt_phase)
+    }
+  end
+
+  # Released after a terminal attempt: the attempt id on the entry says so,
+  # and the pre-attempt phase key stays absent (findings#221).
+  defp reservation_failure_release_details(request, last_error_code, _phase, _attempt) do
     %{
       "reservation_source_event_id" => reservation_source_event_id(request.id),
       "release_reason" => last_error_code,
       "request_status" => request.status
     }
   end
+
+  # A settlement whose usage does not apply did no provider work, so it
+  # carries no estimate either: the reservation's estimated cost would read as
+  # the request's cost wherever usage is not known and priced.
+  defp settlement_estimated_cost(%{status: @usage_not_applicable}, _reservation), do: Decimal.new(0)
+  defp settlement_estimated_cost(_usage, reservation), do: reservation.estimated_cost_micros
 
   defp positive_or_nil(value), do: if(value && value > 0, do: value, else: nil)
   defp nonnegative_or_nil(value) when is_integer(value) and value >= 0, do: value

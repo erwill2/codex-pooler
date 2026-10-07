@@ -22,7 +22,7 @@ defmodule CodexPooler.Gateway.Runtime.SavedResetCapacityFenceTest do
 
   @endpoint "/backend-api/codex/responses"
 
-  test "pre-dispatch continuity narrowing retains sibling capacity for the threshold fence" do
+  test "opaque pre-dispatch continuity narrowing retains sibling capacity for the threshold fence" do
     {:ok, upstream} =
       FakeUpstream.start_link(
         {:path_json,
@@ -56,13 +56,7 @@ defmodule CodexPooler.Gateway.Runtime.SavedResetCapacityFenceTest do
 
     payload = %{
       "model" => model.exposed_model_id,
-      "input" => [
-        %{
-          "type" => "message",
-          "role" => "user",
-          "content" => [%{"type" => "input_text", "text" => "capacity fence fixture"}]
-        }
-      ]
+      "input" => [%{"type" => "item_reference", "id" => "msg_capacity_fence_fixture"}]
     }
 
     {:ok, policy} = Access.normalize_api_key_policy(auth.api_key)
@@ -179,6 +173,11 @@ defmodule CodexPooler.Gateway.Runtime.SavedResetCapacityFenceTest do
     outside_identity_id = Ecto.UUID.generate()
 
     invalid_contexts = [
+      Map.put(context, :credit_request_contexts, %{}),
+      put_in(context, [:credit_request_contexts, setup.assignment.id, :transport], :invalid),
+      put_in(context, [:credit_request_contexts, setup.assignment.id, :serving_mode], :invalid),
+      put_in(context, [:credit_request_contexts, setup.assignment.id, :upstream_model], "different-model"),
+      put_in(context, [:credit_request_contexts, setup.assignment.id, :qualified_credit_scopes], []),
       Map.delete(context, :capacity_identity_ids),
       Map.update!(context, :capacity_assignment_ids, &[Ecto.UUID.generate() | &1]),
       context
@@ -297,6 +296,8 @@ defmodule CodexPooler.Gateway.Runtime.SavedResetCapacityFenceTest do
                  freshness_state: "fresh"
                }
              ])
+
+    CodexPooler.SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
   end
 
   defp usage_payload do

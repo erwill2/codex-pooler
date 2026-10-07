@@ -96,10 +96,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.TerminalDiscriminatorTest do
        response.audio.transcript.delta
        response.audio.transcript.done
      )},
-    {"response.function_call",
-     ~w(response.function_call_arguments.delta response.function_call_arguments.done)},
-    {"response.custom_tool_call",
-     ~w(response.custom_tool_call_input.delta response.custom_tool_call_input.done)},
+    {"response.function_call", ~w(response.function_call_arguments.delta response.function_call_arguments.done)},
+    {"response.custom_tool_call", ~w(response.custom_tool_call_input.delta response.custom_tool_call_input.done)},
     {"response.code_interpreter", ~w(
        response.code_interpreter_call.in_progress
        response.code_interpreter_call.interpreting
@@ -136,7 +134,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.TerminalDiscriminatorTest do
        response.mcp_list_tools.failed
      )},
     {"response.metadata", ~w(response.metadata)},
-    {"response.moderation", ~w(response.moderation.started response.moderation.completed)}
+    {"response.moderation", ~w(response.moderation.started response.moderation.completed)},
+    {"response.compaction", ~w(response.compaction.compacting)}
   ]
 
   test "classifies upstream response websocket event families without treating sibling events as terminals" do
@@ -243,5 +242,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.TerminalDiscriminatorTest do
     end
   end
 
-  defp classify(event), do: event |> Jason.encode!() |> TerminalDiscriminator.classify()
+  defp classify(event),
+    do: event |> CodexPooler.JSON.encode!() |> TerminalDiscriminator.classify()
 end

@@ -1,0 +1,158 @@
+defmodule CodexPooler.Gateway.Transports.Streaming.PreparedFrameCapabilityLifetimeTest do
+  @moduledoc """
+  Findings #169: the capability behind a prepared websocket frame is a GenServer
+  whose reclaim bound is its own process timeout, and nothing refreshed it. A
+  frame that waits between sealing and dispatch — queued behind an in-flight
+  turn, or held across an owner handoff — therefore lost its capability while it
+  waited, and the dispatch that followed reported the frame's provenance as
+  invalid rather than the frame as merely late.
+
+  The bound is not a freshness or replay bound: the post-consume replies
+  deliberately return without a timeout so a second dispatch answers `:consumed`
+  rather than `:invalid`, which already leaves the redeem window open for the
+  sealing process's whole life. It reclaims a capability nothing will use again.
+  Parking says the frame is still reachable, so the timer refreshes instead of
+  firing and abandonment falls to the owner monitor.
+
+  The timeout is driven here by delivering the exact message an OTP receive
+  timeout delivers, so the 30 s bound is exercised at its real value without
+  waiting it out.
+  """
+
+  use ExUnit.Case, async: true
+
+  alias CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame.Capability
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  # Absence of a process exit; the exit itself is immediate when it happens.
+  @absence_budget_ms 100
+
+  test "an unparked capability is reclaimed when its timeout fires" do
+    capability = Capability.issue()
+    token = frame_token()
+    assert :ok = Capability.seal(capability, token)
+
+    monitor = Process.monitor(capability.server)
+    send(capability.server, :timeout)
+
+    assert_receive {:DOWN, ^monitor, :process, _server, :normal}, @detection_timeout_ms
+    assert {:error, :invalid} = Capability.validate(capability, token)
+  end
+
+  test "a parked capability refreshes the timeout and keeps verifying its frame" do
+    capability = Capability.issue()
+    token = frame_token()
+    assert :ok = Capability.seal(capability, token)
+    assert :ok = Capability.park(capability)
+
+    monitor = Process.monitor(capability.server)
+    send(capability.server, :timeout)
+
+    refute_receive {:DOWN, ^monitor, :process, _server, _reason}, @absence_budget_ms
+    assert :ok = Capability.validate(capability, token)
+    assert {:ok, nil} = Capability.consume_for_dispatch(capability, token)
+  end
+
+  test "parking does not weaken the frame binding" do
+    capability = Capability.issue()
+    sealed_token = frame_token()
+    other_token = frame_token()
+    assert :ok = Capability.seal(capability, sealed_token)
+    assert :ok = Capability.park(capability)
+
+    assert {:error, :invalid} = Capability.validate(capability, other_token)
+    assert {:error, :invalid} = Capability.consume(capability, other_token)
+    assert :ok = Capability.validate(capability, sealed_token)
+  end
+
+  test "a parked capability is still reclaimed when the process that sealed it exits" do
+    test_process = self()
+
+    sealer =
+      spawn(fn ->
+        capability = Capability.issue()
+        token = frame_token()
+        :ok = Capability.seal(capability, token)
+        :ok = Capability.park(capability)
+        send(test_process, {:sealed, capability, token})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive {:sealed, capability, token}, @detection_timeout_ms
+    monitor = Process.monitor(capability.server)
+    # A call after the monitor delivers it before the trigger below (see CodexPooler.TestProcess).
+    :sys.get_state(capability.server)
+
+    send(sealer, :stop)
+
+    assert_receive {:DOWN, ^monitor, :process, _server, :normal}, @detection_timeout_ms
+    assert {:error, :invalid} = Capability.validate(capability, token)
+  end
+
+  # Findings #172: parking has no expiry of its own, so the capability of a
+  # frame that is dropped rather than dispatched needs a way back.
+  test "releasing a parked capability reclaims it at the drop" do
+    capability = Capability.issue()
+    token = frame_token()
+    assert :ok = Capability.seal(capability, token)
+    assert :ok = Capability.park(capability)
+
+    monitor = Process.monitor(capability.server)
+    assert :ok = Capability.release(capability)
+
+    assert_receive {:DOWN, ^monitor, :process, _server, :normal}, @detection_timeout_ms
+
+    # Indistinguishable from the timeout reclaim above, which is what keeps a
+    # late dispatch a retryable owner condition rather than a forged frame.
+    assert {:error, :invalid} = Capability.validate(capability, token)
+  end
+
+  test "a consumed capability refuses release so a second dispatch still answers consumed" do
+    capability = Capability.issue()
+    token = frame_token()
+    assert :ok = Capability.seal(capability, token)
+    assert {:ok, nil} = Capability.consume_for_dispatch(capability, token)
+
+    monitor = Process.monitor(capability.server)
+    assert {:error, :consumed} = Capability.release(capability)
+
+    refute_receive {:DOWN, ^monitor, :process, _server, _reason}, @absence_budget_ms
+    assert {:error, :consumed} = Capability.validate(capability, token)
+  end
+
+  # findings#221: a consumed capability answers `:consumed` for a bounded
+  # window after dispatch, then is reclaimed instead of living until the
+  # sealing socket exits.
+  test "a consumed capability is reclaimed after its bounded retention" do
+    capability = Capability.issue(consumed_retention_ms: 50)
+    token = frame_token()
+    assert :ok = Capability.seal(capability, token)
+    assert {:ok, nil} = Capability.consume_for_dispatch(capability, token)
+    monitor = Process.monitor(capability.server)
+    assert {:error, :consumed} = Capability.validate(capability, token)
+    assert_receive {:DOWN, ^monitor, :process, _server, :normal}, @detection_timeout_ms
+    assert {:error, :invalid} = Capability.validate(capability, token)
+    assert {:error, :invalid} = Capability.consume(capability, token)
+  end
+
+  test "release is bound to the capability's own reference" do
+    capability = Capability.issue()
+    token = frame_token()
+    assert :ok = Capability.seal(capability, token)
+    assert :ok = Capability.park(capability)
+
+    monitor = Process.monitor(capability.server)
+    assert {:error, :invalid} = Capability.release(%{capability | reference: make_ref()})
+
+    refute_receive {:DOWN, ^monitor, :process, _server, _reason}, @absence_budget_ms
+    assert :ok = Capability.validate(capability, token)
+  end
+
+  defp frame_token, do: "prepared-frame-token-#{System.unique_integer([:positive])}"
+end

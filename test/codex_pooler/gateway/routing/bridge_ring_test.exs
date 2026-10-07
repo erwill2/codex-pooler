@@ -16,12 +16,11 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     SessionContinuity
   }
 
-  alias CodexPooler.Gateway.Routing.{BridgeRing, CandidateEligibility, RoutePlanInput}
-  alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
+  alias CodexPooler.Gateway.Routing.AffinityTelemetry
+  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
   alias CodexPooler.Gateway.Routing.SessionContinuity, as: RoutingSessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Pools
-  alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
@@ -85,6 +84,27 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert candidate_ids(second_plan.candidates) == expected_ids
       assert first_plan.selected_assignment_id == hd(expected_ids)
       assert second_plan.selected_assignment_id == hd(expected_ids)
+    end
+
+    test "idempotency affinity survives request-id changes without exposing the raw key" do
+      setup = routing_setup(3)
+      raw_key = "idempotency-affinity-private-key"
+
+      first_plan =
+        plan_for(setup, "bridge_ring", "first-request-id", idempotency_key: raw_key)
+
+      second_plan =
+        plan_for(setup, "bridge_ring", "second-request-id", idempotency_key: raw_key)
+
+      assert first_plan.affinity.kind == "idempotency_key"
+      assert second_plan.affinity.kind == "idempotency_key"
+      assert first_plan.affinity.key_hash == second_plan.affinity.key_hash
+      assert byte_size(first_plan.affinity.key_hash) == 32
+      assert first_plan.affinity.seed == first_plan.affinity.key_hash
+      assert second_plan.affinity.seed == second_plan.affinity.key_hash
+      assert candidate_ids(first_plan.candidates) == candidate_ids(second_plan.candidates)
+      refute inspect(first_plan, limit: :infinity, printable_limit: :infinity) =~ raw_key
+      refute inspect(second_plan, limit: :infinity, printable_limit: :infinity) =~ raw_key
     end
 
     test "deterministic_rotation rotates the current candidate list by seed" do
@@ -386,7 +406,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
                    options
                  )
 
-        normalized_payload = Jason.decode!(encoded)
+        normalized_payload = CodexPooler.JSON.decode!(encoded)
 
         assert sha256_fingerprint(Map.fetch!(normalized_payload, "prompt_cache_key")) ==
                  prompt_cache_key_fingerprint
@@ -403,8 +423,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
         capture_repo_queries(fn ->
           [node_b_options, node_c_options] = request_options
 
-          {RoutingSessionContinuity.attach_codex_session(setup.auth, payload, node_b_options),
-           RoutingSessionContinuity.attach_codex_session(setup.auth, payload, node_c_options)}
+          {RoutingSessionContinuity.attach_codex_session(setup.auth, payload, node_b_options), RoutingSessionContinuity.attach_codex_session(setup.auth, payload, node_c_options)}
         end)
 
       [node_b_options, node_c_options] = request_options
@@ -501,7 +520,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       refute Map.has_key?(plan.request_metadata, "routing_locality_assignment_fingerprint")
     end
 
-    test "oversized prompt-cache keys are absent from locality decisions" do
+    test "oversized prompt-cache keys are refused as locality seeds and named as oversized" do
       setup = routing_setup(3)
       oversized_key = "oversized-cache-key-" <> String.duplicate("x", 257)
 
@@ -511,10 +530,31 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert plan.request_metadata["routing_locality_applied"] == false
 
       assert plan.request_metadata["routing_locality_unhonored_reason"] ==
-               "prompt_cache_key_absent"
+               "prompt_cache_key_oversized"
 
       refute Map.has_key?(plan.request_metadata, "routing_locality_seed_fingerprint")
       refute inspect(plan.request_metadata) =~ oversized_key
+    end
+
+    # A key the client sent never reads `prompt_cache_key_absent`: each refusal
+    # names its bound, and a keyed request retargeted to a route that takes no
+    # seed names the route (findings#255 rows 255-80 and 255-81).
+    for {label, key, reason, opts} <- [
+          {"blank", "  \t ", "prompt_cache_key_blank", []},
+          {"non-string", 42, "prompt_cache_key_invalid", []},
+          {"retargeted to compact", "retargeted-cache-key", "route_excluded", [retarget: "/backend-api/codex/responses/compact"]},
+          {"sent to a GET", "get-cache-key", "route_excluded", [request_method: "GET"]}
+        ] do
+      @tag prompt_cache_key: key, expected_reason: reason, plan_opts: opts
+      test "a #{label} prompt-cache key reads #{reason}", %{prompt_cache_key: key, expected_reason: reason, plan_opts: opts} do
+        setup = routing_setup(3)
+        plan = plan_for_prompt_cache(setup, "bridge_ring", "unusable-key-request", key, opts)
+
+        assert plan.request_metadata["routing_locality_status"] == "unavailable"
+        assert plan.request_metadata["routing_locality_applied"] == false
+        assert plan.request_metadata["routing_locality_unhonored_reason"] == reason
+        refute Map.has_key?(plan.request_metadata, "routing_locality_seed_fingerprint")
+      end
     end
 
     test "eligible-set changes deterministically reselect among remaining candidates" do
@@ -532,9 +572,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
         prompt_cache_order_ids(setup, remaining_candidates, prompt_cache_key)
 
       plan =
-        plan_for_prompt_cache(setup, "bridge_ring", "remaining-request", prompt_cache_key,
-          candidates: remaining_candidates
-        )
+        plan_for_prompt_cache(setup, "bridge_ring", "remaining-request", prompt_cache_key, candidates: remaining_candidates)
 
       refute dropped_id in candidate_ids(plan.candidates)
       assert candidate_ids(plan.candidates) == remaining_expected_ids
@@ -562,9 +600,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       expected_ids = prompt_cache_order_ids(setup, remaining_candidates, prompt_cache_key)
 
       plan =
-        plan_for_prompt_cache(setup, "bridge_ring", "filtered-request", prompt_cache_key,
-          candidates: remaining_candidates
-        )
+        plan_for_prompt_cache(setup, "bridge_ring", "filtered-request", prompt_cache_key, candidates: remaining_candidates)
 
       refute filtered_assignment.id in candidate_ids(plan.candidates)
       assert candidate_ids(plan.candidates) == expected_ids
@@ -595,9 +631,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       insert_affinity!(setup, sticky_assignment, sticky_identity, request_id)
 
       plan =
-        plan_for_prompt_cache(setup, "bridge_ring", "continuity-request", prompt_cache_key,
-          request_id: request_id
-        )
+        plan_for_prompt_cache(setup, "bridge_ring", "continuity-request", prompt_cache_key, request_id: request_id)
 
       assert plan.affinity.status == "hit"
       assert plan.selected_assignment_id == sticky_id
@@ -627,9 +661,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       refute prompt_preferred_id == hd(base_ids)
 
       plan =
-        plan_for_prompt_cache(setup, "bridge_ring", routing_seed, prompt_cache_key,
-          prompt_cache_affinity_enabled: false
-        )
+        plan_for_prompt_cache(setup, "bridge_ring", routing_seed, prompt_cache_key, prompt_cache_affinity_enabled: false)
 
       assert candidate_ids(plan.candidates) == base_ids
       assert plan.selected_assignment_id == hd(base_ids)
@@ -645,14 +677,10 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       expected_ids = prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)
 
       http_plan =
-        plan_for_prompt_cache(setup, "bridge_ring", "http-request", prompt_cache_key,
-          payload: %{"stream" => false}
-        )
+        plan_for_prompt_cache(setup, "bridge_ring", "http-request", prompt_cache_key, payload: %{"stream" => false})
 
       stream_plan =
-        plan_for_prompt_cache(setup, "bridge_ring", "stream-request", prompt_cache_key,
-          payload: %{"stream" => true}
-        )
+        plan_for_prompt_cache(setup, "bridge_ring", "stream-request", prompt_cache_key, payload: %{"stream" => true})
 
       assert http_plan.selected_assignment_id == hd(expected_ids)
       assert stream_plan.selected_assignment_id == hd(expected_ids)
@@ -758,6 +786,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert quota_first_plan.selected_assignment_id == requested_model_remaining.id
     end
 
+    @tag slow: "persists four quota observations and two routing configurations around the real request snapshot"
     test "quota_first and routing settings consume the request-local route-state snapshot" do
       setup = routing_setup(2)
       [snapshot_best, snapshot_worst] = setup.assignments
@@ -837,121 +866,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
         put_test_quota_snapshots(route_state, snapshots, refreshed_at)
 
       refreshed_plan =
-        plan_for(setup, "quota_first", "quota-snapshot-boundary",
-          route_state: refreshed_route_state
-        )
+        plan_for(setup, "quota_first", "quota-snapshot-boundary", route_state: refreshed_route_state)
 
       assert refreshed_plan.selected_assignment_id == second_assignment.id
-    end
-
-    test "quota_first scores reported-percent exhaustion as empty capacity for prepared credit-backed probes" do
-      setup = routing_setup(2)
-      seed = "bridge-ring-seed-1"
-
-      [exhausted_candidate, positive_candidate] =
-        rendezvous_ordered_candidates(setup.candidates, seed)
-
-      {exhausted_assignment, exhausted_identity} = exhausted_candidate
-      {positive_assignment, positive_identity} = positive_candidate
-      snapshot_at = ~U[2026-08-07 12:00:00.000000Z]
-
-      prime_account_quota!(setup, exhausted_assignment, Decimal.new("20"))
-
-      prime_weekly_account_quota!(setup, exhausted_assignment, Decimal.new("100"), credits: 3)
-
-      prime_account_quota!(setup, positive_assignment, Decimal.new("40"))
-
-      assert seed_preferring_assignment(
-               [positive_assignment.id, exhausted_assignment.id],
-               exhausted_assignment.id
-             ) == seed
-
-      assert {:ok, prepared_candidates, prepared_decision} =
-               quota_eligible_candidates(setup, [positive_candidate, exhausted_candidate])
-
-      assert candidate_ids(prepared_candidates) == [
-               positive_assignment.id,
-               exhausted_assignment.id
-             ]
-
-      assert prepared_decision["precise_candidate_count"] == 1
-      assert prepared_decision["credit_backed_probe_candidate_count"] == 1
-
-      assert %{routing_state: :precise} =
-               QuotaWindows.routing_quota_eligibility(
-                 positive_identity,
-                 quota_scope_opts(setup.model)
-               )
-
-      assert %{routing_state: :credit_backed_probe} =
-               QuotaWindows.routing_quota_eligibility(
-                 exhausted_identity,
-                 quota_scope_opts(setup.model)
-               )
-
-      snapshot_candidates = [positive_candidate, exhausted_candidate]
-
-      route_state =
-        RouteState.new(%{visible_model: setup.model, candidates: snapshot_candidates})
-        |> put_test_quota_snapshots(
-          %{
-            positive_identity.id => [account_window_at(Decimal.new("40"), snapshot_at)],
-            exhausted_identity.id => [
-              account_window_at(Decimal.new("20"), snapshot_at),
-              credit_backed_weekly_window_at(snapshot_at)
-            ]
-          },
-          snapshot_at
-        )
-
-      assert {:ok, ^prepared_candidates, snapshot_decision} =
-               quota_eligible_candidates(setup, snapshot_candidates, route_state)
-
-      assert snapshot_decision["precise_candidate_count"] == 1
-      assert snapshot_decision["credit_backed_probe_candidate_count"] == 1
-
-      request =
-        request_fixture(setup.auth, %{
-          model_id: setup.model.id,
-          requested_model: setup.model.exposed_model_id,
-          correlation_id: "quota-reported-percent-exhaustion"
-        })
-
-      route_plan_input = RoutePlanInput.from_reserved(%{request: request})
-      update_routing_settings!(setup.pool, "quota_first", 2)
-
-      live_plan = quota_first_plan(setup, prepared_candidates, route_plan_input, seed)
-
-      snapshot_plan =
-        quota_first_plan(setup, prepared_candidates, route_plan_input, seed,
-          route_state: route_state
-        )
-
-      sweep_results =
-        Enum.map(1..500, fn index ->
-          sweep_seed = "quota-first-sweep-#{index}"
-
-          live =
-            quota_first_plan(setup, prepared_candidates, route_plan_input, sweep_seed)
-            |> Map.fetch!(:selected_assignment_id)
-
-          snapshot =
-            quota_first_plan(setup, prepared_candidates, route_plan_input, sweep_seed,
-              route_state: route_state
-            )
-            |> Map.fetch!(:selected_assignment_id)
-
-          %{seed: sweep_seed, live: live, snapshot: snapshot}
-        end)
-
-      assert %{live: positive_assignment.id, snapshot: positive_assignment.id} == %{
-               live: live_plan.selected_assignment_id,
-               snapshot: snapshot_plan.selected_assignment_id
-             }
-
-      assert Enum.all?(sweep_results, fn result ->
-               result.live == positive_assignment.id and result.snapshot == positive_assignment.id
-             end)
     end
 
     test "quota_first excludes nonqualifying exhaustion reports from snapshot capacity scoring" do
@@ -977,8 +894,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       update_routing_settings!(setup.pool, "quota_first", 2)
 
       excluded_controls = [
-        {"stale", %{observed_at: DateTime.add(snapshot_at, -901, :second)},
-         reported_assignment.id},
+        {"stale", %{observed_at: DateTime.add(snapshot_at, -901, :second)}, reported_assignment.id},
         {"resetless", %{reset_at: nil}, reported_assignment.id},
         {"expired", %{reset_at: DateTime.add(snapshot_at, -1, :second)}, reported_assignment.id},
         {"active_limit_zero", %{active_limit: 0}, reported_assignment.id},
@@ -1003,9 +919,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
           )
 
         plan =
-          quota_first_plan(setup, setup.candidates, route_plan_input, "#{seed}-#{label}",
-            route_state: route_state
-          )
+          quota_first_plan(setup, setup.candidates, route_plan_input, "#{seed}-#{label}", route_state: route_state)
 
         assert plan.selected_assignment_id == expected_assignment_id,
                "#{label} must stay out of capacity scoring"
@@ -1032,9 +946,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
         )
 
       monthly_plan =
-        quota_first_plan(setup, setup.candidates, route_plan_input, "#{seed}-monthly-primary",
-          route_state: monthly_route_state
-        )
+        quota_first_plan(setup, setup.candidates, route_plan_input, "#{seed}-monthly-primary", route_state: monthly_route_state)
 
       assert monthly_plan.selected_assignment_id == positive_assignment.id
     end
@@ -1106,9 +1018,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       insert_demotion!(setup, preferred_assignment, preferred_identity, "upstream_5xx")
 
       plan =
-        plan_for(setup, "bridge_ring", "session-preference-demotion",
-          session_assignment_id: preferred_assignment.id
-        )
+        plan_for(setup, "bridge_ring", "session-preference-demotion", session_assignment_id: preferred_assignment.id)
 
       assert List.last(candidate_ids(plan.candidates)) == preferred_assignment.id
       refute plan.selected_assignment_id == preferred_assignment.id
@@ -1209,6 +1119,33 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert recovered_plan.selected_assignment_id == demoted_id
     end
 
+    # A success is only counter-evidence for the demotion state that existed
+    # when its own turn started. Production saw long turns clear rows written
+    # after they began, one of them 61 s after its own start, which would cut a
+    # 120 s repeat-overload window down to a fraction of its length
+    # (icoretech/codex-pooler-findings#158).
+    test "a success that began before a demotion existed leaves that demotion active" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "in-flight-success-key")
+      {assignment, identity} = hd(plan.candidates)
+
+      # One captured clock, taken after this turn planned its route, so the
+      # demotion below is demonstrably younger than the turn that succeeds.
+      after_planning = DateTime.utc_now()
+
+      demotion =
+        insert_demotion!(setup, assignment, identity, "upstream_5xx", now: DateTime.add(after_planning, 1, :millisecond))
+
+      assert DateTime.compare(demotion.updated_at, after_planning) == :gt
+
+      assert :ok = BridgeRing.record_success(plan, assignment, identity)
+
+      assert [%BridgeDemotion{} = still_demoted] = active_demotions(setup, assignment)
+      assert still_demoted.id == demotion.id
+      assert still_demoted.status == "active"
+      assert still_demoted.demoted_until == demotion.demoted_until
+    end
+
     test "bridge_ring_size truncates candidates after strategy ordering affinity and demotion" do
       setup = routing_setup(4)
       seed = "ring-size-truncation-seed"
@@ -1230,6 +1167,84 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert candidate_ids(plan.candidates) == Enum.take(expected_ids, 2)
       assert length(plan.candidates) == 2
       assert plan.selected_assignment_id == hd(expected_ids)
+    end
+  end
+
+  # The windowless provider-availability tier is a quota tier, and demotion is
+  # an ordering penalty inside it: ordinary_active ++ ordinary_demoted ++
+  # windowless_active ++ windowless_demoted, each group in strategy order.
+  describe "plan_route/1 windowless tier and demotion precedence" do
+    test "a demoted ordinary candidate stays ahead of an active windowless candidate" do
+      %{setup: setup, candidates: [windowless, ordinary], route_state: route_state} =
+        tiered_setup([:windowless, :ordinary])
+
+      demote!(setup, ordinary)
+
+      plan = tiered_plan(setup, [windowless, ordinary], route_state)
+
+      assert Map.keys(plan.demotions) == candidate_ids([ordinary])
+      assert candidate_ids(plan.candidates) == candidate_ids([ordinary, windowless])
+      assert plan.selected_assignment_id == candidate_id(ordinary)
+    end
+
+    test "a demoted windowless candidate falls behind an active windowless candidate" do
+      %{setup: setup, candidates: [demoted, active, ordinary], route_state: route_state} =
+        tiered_setup([:windowless, :windowless, :ordinary])
+
+      demote!(setup, demoted)
+
+      plan = tiered_plan(setup, [demoted, active, ordinary], route_state)
+
+      assert candidate_ids(plan.candidates) == candidate_ids([ordinary, active, demoted])
+      assert plan.selected_assignment_id == candidate_id(ordinary)
+    end
+
+    test "when every candidate is demoted the tier and strategy order still decide" do
+      %{setup: setup, candidates: candidates, route_state: route_state} =
+        tiered_setup([:windowless, :ordinary, :windowless, :ordinary])
+
+      [windowless_a, ordinary_a, windowless_b, ordinary_b] = candidates
+      Enum.each(candidates, &demote!(setup, &1))
+
+      plan = tiered_plan(setup, candidates, route_state)
+
+      assert map_size(plan.demotions) == 4
+
+      assert candidate_ids(plan.candidates) ==
+               candidate_ids([ordinary_a, ordinary_b, windowless_a, windowless_b])
+
+      assert plan.selected_assignment_id == candidate_id(ordinary_a)
+    end
+
+    test "ring truncation keeps tiers and demotion order, so healthy windowless or demoted candidates can fall outside the ring" do
+      %{setup: setup, candidates: candidates, route_state: route_state} =
+        tiered_setup([:windowless, :ordinary, :ordinary, :windowless])
+
+      [windowless_active, ordinary_demoted, ordinary_active, windowless_demoted] = candidates
+      demote!(setup, ordinary_demoted)
+      demote!(setup, windowless_demoted)
+
+      full_order = [ordinary_active, ordinary_demoted, windowless_active, windowless_demoted]
+
+      three_plan = tiered_plan(setup, candidates, route_state, ring_size: 3)
+
+      assert three_plan.bridge_ring_size == 3
+      assert candidate_ids(three_plan.candidates) == candidate_ids(Enum.take(full_order, 3))
+      refute candidate_id(windowless_demoted) in candidate_ids(three_plan.candidates)
+
+      # The ring is truncated after ordering: a demoted ordinary candidate keeps
+      # its ring slot while the healthy windowless candidate is dropped.
+      two_plan = tiered_plan(setup, candidates, route_state, ring_size: 2)
+
+      assert candidate_ids(two_plan.candidates) ==
+               candidate_ids([ordinary_active, ordinary_demoted])
+
+      refute candidate_id(windowless_active) in candidate_ids(two_plan.candidates)
+      assert two_plan.selected_assignment_id == candidate_id(ordinary_active)
+
+      # Demotion lookup still covers the whole eligible set, not only the ring.
+      assert Enum.sort(Map.keys(two_plan.demotions)) ==
+               Enum.sort(candidate_ids([ordinary_demoted, windowless_demoted]))
     end
   end
 
@@ -1266,6 +1281,759 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert plan.affinity.status == "disabled"
       assert :ok = BridgeRing.record_success(plan, assignment, identity)
       assert [] = all_affinities(setup)
+    end
+  end
+
+  # The affinity row is one event record under one ordering key, so these assert
+  # the whole tuple -- assignment, identity, metadata, both timestamps -- rather
+  # than one field, and they drive `record_success/3` and `record_failure/5`
+  # rather than the upsert, because the ordering rule is only worth anything
+  # where the real success and failure paths reach it.
+  describe "affinity event ordering" do
+    test "the later completion of two overlapping turns owns the whole tuple" do
+      setup = routing_setup(2)
+      seed = "affinity-overlap-ordering-key"
+      [{early_assignment, early_identity}, {late_assignment, late_identity}] = setup.candidates
+
+      # Both turns plan before either finishes: one key, two turns in flight.
+      early_plan = plan_for(setup, "bridge_ring", seed)
+      late_plan = plan_for(setup, "bridge_ring", seed)
+
+      assert early_plan.affinity.status == "miss"
+      assert late_plan.affinity.status == "miss"
+
+      assert :ok = BridgeRing.record_success(early_plan, early_assignment, early_identity)
+      assert [%BridgeAffinity{} = after_early] = active_affinities(setup, seed)
+      assert after_early.pool_upstream_assignment_id == early_assignment.id
+
+      assert :ok = BridgeRing.record_success(late_plan, late_assignment, late_identity)
+
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.id == after_early.id
+      assert row.pool_upstream_assignment_id == late_assignment.id
+      assert row.upstream_identity_id == late_identity.id
+      assert row.metadata == %{"source" => "gateway_success"}
+      assert row.updated_at == row.last_hit_at
+      assert DateTime.compare(row.last_hit_at, after_early.last_hit_at) == :gt
+      assert is_nil(row.last_miss_at)
+    end
+
+    test "a completion older than the stored event moves no part of the tuple" do
+      setup = routing_setup(2)
+      seed = "affinity-stale-completion-key"
+
+      [{stored_assignment, stored_identity}, {stale_assignment, stale_identity}] =
+        setup.candidates
+
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 stored_assignment,
+                 stored_identity
+               )
+
+      assert [%BridgeAffinity{} = stored] = active_affinities(setup, seed)
+
+      # The clock model is each writer's own wall clock at the moment its
+      # outcome lands, so the out-of-order writer is a node whose clock runs
+      # ahead: its event is already stamped in this writer's future. Only the
+      # stored row is posed; what is asserted is what the real success path
+      # does to it afterwards.
+      skewed = DateTime.add(stored.updated_at, 5, :second)
+
+      assert {1, nil} =
+               BridgeAffinity
+               |> where([row], row.id == ^stored.id)
+               |> Repo.update_all(set: [last_hit_at: skewed, updated_at: skewed])
+
+      stale_plan = plan_for(setup, "bridge_ring", seed)
+      assert stale_plan.affinity.status == "hit"
+
+      assert :ok = BridgeRing.record_success(stale_plan, stale_assignment, stale_identity)
+
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.id == stored.id
+      assert row.pool_upstream_assignment_id == stored_assignment.id
+      assert row.upstream_identity_id == stored_identity.id
+      assert row.last_hit_at == skewed
+      assert row.updated_at == skewed
+      assert row.metadata == %{"source" => "gateway_success"}
+
+      # The hint the ring reads is the one the stale completion failed to move.
+      replanned = plan_for(setup, "bridge_ring", seed)
+      {promoted_assignment, _identity} = hd(replanned.candidates)
+
+      assert replanned.affinity.status == "hit"
+      assert replanned.affinity.row.pool_upstream_assignment_id == stored_assignment.id
+      assert promoted_assignment.id == stored_assignment.id
+    end
+
+    test "a failure older than the stored event moves no part of the tuple" do
+      setup = routing_setup(2)
+      seed = "affinity-stale-miss-key"
+
+      [{stored_assignment, stored_identity}, {stale_assignment, stale_identity}] =
+        setup.candidates
+
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 stored_assignment,
+                 stored_identity
+               )
+
+      assert [%BridgeAffinity{} = stored] = active_affinities(setup, seed)
+      skewed = DateTime.add(stored.updated_at, 5, :second)
+
+      assert {1, nil} =
+               BridgeAffinity
+               |> where([row], row.id == ^stored.id)
+               |> Repo.update_all(set: [last_miss_at: skewed, updated_at: skewed])
+
+      stale_plan = plan_for(setup, "bridge_ring", seed)
+      assert stale_plan.affinity.status == "hit"
+
+      assert "upstream_5xx" ==
+               BridgeRing.record_failure(
+                 stale_plan,
+                 stale_assignment,
+                 stale_identity,
+                 "upstream_5xx"
+               )
+
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.id == stored.id
+      assert row.last_miss_at == skewed
+      assert row.updated_at == skewed
+      assert row.last_hit_at == stored.last_hit_at
+      assert row.pool_upstream_assignment_id == stored_assignment.id
+      assert row.upstream_identity_id == stored_identity.id
+    end
+
+    # The positive half of the miss rule: fencing that refused everything would
+    # satisfy the stale case above and record nothing at all.
+    test "a failure newer than the stored event records the miss" do
+      setup = routing_setup(2)
+      seed = "affinity-ordered-miss-key"
+      [{assignment, identity} | _rest] = setup.candidates
+
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 assignment,
+                 identity
+               )
+
+      assert [%BridgeAffinity{} = stored] = active_affinities(setup, seed)
+      assert is_nil(stored.last_miss_at)
+
+      assert "upstream_5xx" ==
+               BridgeRing.record_failure(
+                 plan_for(setup, "bridge_ring", seed),
+                 assignment,
+                 identity,
+                 "upstream_5xx"
+               )
+
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.id == stored.id
+      assert row.last_miss_at == row.updated_at
+      assert DateTime.compare(row.last_miss_at, stored.updated_at) == :gt
+      assert row.last_hit_at == stored.last_hit_at
+      assert row.pool_upstream_assignment_id == assignment.id
+      assert row.upstream_identity_id == identity.id
+    end
+  end
+
+  # The fence from #163 refuses by applying no row, and both writers returned
+  # `:ok` either way, so a replica whose clock ran backwards lost every affinity
+  # write it attempted and nothing recorded it. These cover the counter that
+  # makes the refusal visible, and — more importantly than the counter — that
+  # the refusal still cannot fail a turn whose work is already finalized.
+  describe "affinity stale-write signal" do
+    test "a fenced success upsert is counted and still returns :ok" do
+      setup = routing_setup(2)
+      seed = "affinity-stale-write-success-key"
+
+      [{stored_assignment, stored_identity}, {stale_assignment, stale_identity}] =
+        setup.candidates
+
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 stored_assignment,
+                 stored_identity
+               )
+
+      assert [%BridgeAffinity{} = stored] = active_affinities(setup, seed)
+      pose_event_clock_ahead(stored, last_hit_at: 5)
+
+      stale_plan = plan_for(setup, "bridge_ring", seed)
+      capture_stale_writes()
+
+      assert :ok = BridgeRing.record_success(stale_plan, stale_assignment, stale_identity)
+
+      assert_receive {:affinity_stale_write, _event, %{count: 1}, metadata}
+      assert metadata.operation == "success_upsert"
+      # Pinned to the kind the planner actually produced, so a new affinity kind
+      # that the telemetry vocabulary does not know fails here rather than
+      # silently exporting `unknown`.
+      assert metadata.affinity_kind == stale_plan.affinity.kind
+      assert metadata.affinity_kind in AffinityTelemetry.affinity_kinds()
+      refute Map.has_key?(metadata, :node)
+      refute_stale_write()
+
+      # Observability only: the row the fence protected is untouched.
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.id == stored.id
+      assert row.pool_upstream_assignment_id == stored_assignment.id
+    end
+
+    test "a fenced miss update is counted and still returns its reason code" do
+      setup = routing_setup(2)
+      seed = "affinity-stale-write-miss-key"
+
+      [{stored_assignment, stored_identity}, {stale_assignment, stale_identity}] =
+        setup.candidates
+
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 stored_assignment,
+                 stored_identity
+               )
+
+      assert [%BridgeAffinity{} = stored] = active_affinities(setup, seed)
+      pose_event_clock_ahead(stored, last_miss_at: 5)
+
+      stale_plan = plan_for(setup, "bridge_ring", seed)
+      assert stale_plan.affinity.status == "hit"
+      capture_stale_writes()
+
+      assert "upstream_5xx" ==
+               BridgeRing.record_failure(
+                 stale_plan,
+                 stale_assignment,
+                 stale_identity,
+                 "upstream_5xx"
+               )
+
+      assert_receive {:affinity_stale_write, _event, %{count: 1}, metadata}
+      assert metadata.operation == "miss_update"
+      assert metadata.affinity_kind == stale_plan.affinity.kind
+      assert metadata.affinity_kind in AffinityTelemetry.affinity_kinds()
+      refute_stale_write()
+    end
+
+    # Without this a counter wired to fire on every write would satisfy both
+    # cases above. It also fixes the meaning of the first write on a key: there
+    # is no stored event to be older than, so it is not a stale write.
+    test "an in-order write is not counted, and neither is the first write on a key" do
+      setup = routing_setup(2)
+      seed = "affinity-in-order-key"
+      [{assignment, identity} | _rest] = setup.candidates
+
+      capture_stale_writes()
+
+      # First success: an insert, with no stored event to be fenced against.
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 assignment,
+                 identity
+               )
+
+      refute_stale_write()
+
+      # First failure on a key with no row at all: nothing is written, and a
+      # write that never happened is not a refused one.
+      assert "upstream_5xx" ==
+               BridgeRing.record_failure(
+                 plan_for(setup, "bridge_ring", "affinity-in-order-rowless-key"),
+                 assignment,
+                 identity,
+                 "upstream_5xx"
+               )
+
+      refute_stale_write()
+
+      # A later success and a later failure on the stored key both apply.
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 assignment,
+                 identity
+               )
+
+      assert "upstream_5xx" ==
+               BridgeRing.record_failure(
+                 plan_for(setup, "bridge_ring", seed),
+                 assignment,
+                 identity,
+                 "upstream_5xx"
+               )
+
+      refute_stale_write()
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.last_miss_at == row.updated_at
+    end
+
+    # Two processes, one key, deliberately ordered event clocks: the writer
+    # whose clock runs ahead lands, the writer behind it is refused. Only the
+    # second is counted, which is what makes this a stale-write signal rather
+    # than a generic affinity miss.
+    test "only the writer behind the stored event is counted" do
+      setup = routing_setup(2)
+      seed = "affinity-two-writer-key"
+
+      [{ahead_assignment, ahead_identity}, {behind_assignment, behind_identity}] =
+        setup.candidates
+
+      ahead_plan = plan_for(setup, "bridge_ring", seed)
+      behind_plan = plan_for(setup, "bridge_ring", seed)
+
+      capture_stale_writes()
+
+      ahead =
+        Task.async(fn ->
+          :ok = BridgeRing.record_success(ahead_plan, ahead_assignment, ahead_identity)
+
+          # This writer's own clock is the one that runs ahead of its peer's.
+          [stored] = active_affinities(setup, seed)
+          pose_event_clock_ahead(stored, last_hit_at: 5)
+          stored.id
+        end)
+
+      stored_id = Task.await(ahead, 5_000)
+      refute_stale_write()
+
+      behind =
+        Task.async(fn ->
+          BridgeRing.record_success(behind_plan, behind_assignment, behind_identity)
+        end)
+
+      assert :ok = Task.await(behind, 5_000)
+
+      assert_receive {:affinity_stale_write, _event, %{count: 1}, metadata}
+      assert metadata.operation == "success_upsert"
+      assert metadata.affinity_kind == behind_plan.affinity.kind
+      refute_stale_write()
+
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.id == stored_id
+      assert row.pool_upstream_assignment_id == ahead_assignment.id
+    end
+
+    # The property that outranks the metric: the turn has already settled, so a
+    # broken handler must cost nothing.
+    test "a handler that raises does not fail the settled turn" do
+      setup = routing_setup(2)
+      seed = "affinity-raising-handler-key"
+
+      [{stored_assignment, stored_identity}, {stale_assignment, stale_identity}] =
+        setup.candidates
+
+      assert :ok =
+               BridgeRing.record_success(
+                 plan_for(setup, "bridge_ring", seed),
+                 stored_assignment,
+                 stored_identity
+               )
+
+      assert [%BridgeAffinity{} = stored] = active_affinities(setup, seed)
+      pose_event_clock_ahead(stored, last_hit_at: 5)
+
+      handler_id = "affinity-stale-write-raising-#{System.unique_integer([:positive])}"
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          AffinityTelemetry.event(),
+          fn _event, _measurements, _metadata, _config ->
+            raise "handler exploded"
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      stale_plan = plan_for(setup, "bridge_ring", seed)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok =
+                 BridgeRing.record_success(stale_plan, stale_assignment, stale_identity)
+      end)
+
+      assert [%BridgeAffinity{} = row] = active_affinities(setup, seed)
+      assert row.pool_upstream_assignment_id == stored_assignment.id
+    end
+  end
+
+  describe "record_overload/4" do
+    test "writes an ordering-only demotion and leaves affinity alone" do
+      setup = routing_setup(2)
+      seed = "overload-demotion-key"
+      plan = plan_for(setup, "bridge_ring", seed)
+      {assignment, identity} = hd(plan.candidates)
+
+      assert "provider_overloaded" == BridgeRing.record_overload(plan, assignment, identity)
+
+      assert [%BridgeDemotion{} = demotion] = active_demotions(setup, assignment)
+      assert demotion.reason_code == "provider_overloaded"
+      assert demotion.upstream_identity_id == identity.id
+      assert demotion.metadata == %{"source" => "gateway_overload"}
+      assert demotion.attempt_count == 1
+      assert DateTime.diff(demotion.demoted_until, demotion.created_at, :second) == 20
+
+      # The session's prompt cache has to survive one overload, so unlike an
+      # ordinary failure this records no affinity miss at all.
+      assert [] == all_affinities(setup)
+    end
+
+    test "a second overload while the window is open extends it" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "overload-repeat-key")
+      {assignment, identity} = hd(plan.candidates)
+
+      assert "provider_overloaded" == BridgeRing.record_overload(plan, assignment, identity)
+      assert "provider_overloaded" == BridgeRing.record_overload(plan, assignment, identity)
+
+      assert [%BridgeDemotion{} = demotion] = active_demotions(setup, assignment)
+      assert demotion.attempt_count == 2
+      assert DateTime.diff(demotion.demoted_until, demotion.created_at, :second) == 120
+    end
+
+    test "an ordinary failure demotion is not a repeat, and its longer window survives" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "overload-after-failure-key")
+      {assignment, identity} = hd(plan.candidates)
+
+      assert "upstream_5xx" ==
+               BridgeRing.record_failure(plan, assignment, identity, "upstream_5xx")
+
+      assert "provider_overloaded" == BridgeRing.record_overload(plan, assignment, identity)
+
+      # One row: both write the same conflict target. The overload is a first
+      # one, because the open window belongs to a different reason, and the
+      # conflict clause keeps the later expiry rather than cutting it short.
+      assert [%BridgeDemotion{} = demotion] = active_demotions(setup, assignment)
+      assert demotion.reason_code == "provider_overloaded"
+      assert DateTime.diff(demotion.demoted_until, demotion.created_at, :second) == 60
+    end
+
+    # An overload is a claim about the provider's capacity at one moment, not
+    # about this route's health, so one success is not counter-evidence for it.
+    # The window is the whole penalty and it expires on its own.
+    test "a success does not clear a live overload window" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "overload-live-window-key")
+      {assignment, identity} = hd(plan.candidates)
+
+      assert "provider_overloaded" == BridgeRing.record_overload(plan, assignment, identity)
+      assert [%BridgeDemotion{} = overload] = active_demotions(setup, assignment)
+
+      # One captured clock: after the overload row exists and before the next
+      # turn plans, so that turn demonstrably begins after the demotion and the
+      # window is demonstrably still live when it succeeds. Only the overload
+      # rule can spare this row; the start fence cannot.
+      after_overload = DateTime.utc_now()
+      assert DateTime.compare(after_overload, overload.updated_at) == :gt
+      assert DateTime.compare(overload.demoted_until, after_overload) == :gt
+
+      later_plan = plan_for(setup, "bridge_ring", "overload-live-window-key")
+
+      assert :ok = BridgeRing.record_success(later_plan, assignment, identity)
+
+      assert [%BridgeDemotion{} = still_demoted] = active_demotions(setup, assignment)
+      assert still_demoted.id == overload.id
+      assert still_demoted.reason_code == "provider_overloaded"
+      assert still_demoted.demoted_until == overload.demoted_until
+    end
+
+    # Nothing is left to truncate once the window has lapsed: routing and repeat
+    # escalation both already ignore it, so resolving keeps the operator-visible
+    # active count honest at no behavioral cost.
+    test "two concurrent first overloads escalate through their shared database row" do
+      setup = in_db_observer(fn -> routing_setup(2) end)
+      cleanup_unboxed_fixture(setup.pool.id, Enum.map(setup.identities, & &1.id))
+      plan = in_db_observer(fn -> plan_for(setup, "bridge_ring", "overload-two-backends") end)
+      {assignment, identity} = hd(plan.candidates)
+      parent = self()
+      ref = make_ref()
+      handler_id = {__MODULE__, ref}
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :repo, :query],
+          fn _event, _measurements, metadata, _config ->
+            query = String.upcase(Map.get(metadata, :query, ""))
+
+            if Process.get({__MODULE__, :overload_read_barrier}) == ref and
+                 String.starts_with?(query, "SELECT TRUE") and
+                 String.contains?(query, "BRIDGE_DEMOTIONS") do
+              Process.delete({__MODULE__, :overload_read_barrier})
+              send(parent, {:overload_read_done, ref, self()})
+
+              receive do
+                {:release_overload_write, ^ref} -> :ok
+              after
+                15_000 -> raise "overload write barrier was not released"
+              end
+            end
+          end,
+          nil
+        )
+
+      tasks =
+        for _ <- 1..2 do
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              %{rows: [[backend]]} = Repo.query!("SELECT pg_backend_pid()")
+              send(parent, {:overload_backend, ref, backend})
+              Process.put({__MODULE__, :overload_read_barrier}, ref)
+              BridgeRing.record_overload(plan, assignment, identity)
+            end)
+          end)
+        end
+
+      on_exit(fn ->
+        Enum.each(tasks, fn task ->
+          if Process.alive?(task.pid), do: Process.exit(task.pid, :kill)
+        end)
+      end)
+
+      assert_receive {:overload_backend, ^ref, first_backend}, 15_000
+      assert_receive {:overload_backend, ^ref, second_backend}, 15_000
+      refute first_backend == second_backend
+      assert_receive {:overload_read_done, ^ref, first}, 15_000
+      assert_receive {:overload_read_done, ^ref, second}, 15_000
+      send(first, {:release_overload_write, ref})
+      send(second, {:release_overload_write, ref})
+
+      assert Enum.map(tasks, &Task.await(&1, 15_000)) == [
+               "provider_overloaded",
+               "provider_overloaded"
+             ]
+
+      demotion =
+        in_db_observer(fn ->
+          Repo.one!(from d in BridgeDemotion, where: d.pool_id == ^setup.pool.id)
+        end)
+
+      assert demotion.attempt_count == 2
+      assert DateTime.diff(demotion.demoted_until, demotion.updated_at, :second) == 120
+    end
+
+    test "an ordinary failure extends a first overload without making it resolvable" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "overload-first-mixed")
+      {assignment, identity} = hd(plan.candidates)
+      assert "provider_overloaded" = BridgeRing.record_overload(plan, assignment, identity)
+      assert [first] = active_demotions(setup, assignment)
+      assert DateTime.diff(first.demoted_until, first.created_at, :second) == 20
+
+      assert "upstream_5xx" =
+               BridgeRing.record_failure(plan, assignment, identity, "upstream_5xx")
+
+      assert [extended] = active_demotions(setup, assignment)
+      assert extended.reason_code == "provider_overloaded"
+      assert DateTime.diff(extended.demoted_until, extended.updated_at, :second) == 60
+      later_plan = plan_for(setup, "bridge_ring", "overload-first-mixed")
+      assert :ok = BridgeRing.record_success(later_plan, assignment, identity)
+      assert [retained] = active_demotions(setup, assignment)
+      assert retained.demoted_until == extended.demoted_until
+    end
+
+    test "an older ordinary failure cannot shorten or relabel newer overload evidence" do
+      setup = routing_setup(2)
+      {assignment, identity} = hd(setup.candidates)
+      peer_event = DateTime.add(DateTime.utc_now(), 30, :second)
+
+      overload =
+        insert_demotion!(setup, assignment, identity, "provider_overloaded",
+          now: peer_event,
+          demoted_until: DateTime.add(peer_event, 120, :second)
+        )
+
+      plan = plan_for(setup, "bridge_ring", "overload-newer-peer")
+      assert DateTime.compare(plan.planned_at, peer_event) == :lt
+
+      assert "upstream_5xx" =
+               BridgeRing.record_failure(plan, assignment, identity, "upstream_5xx")
+
+      retained = Repo.reload!(overload)
+      assert retained.reason_code == "provider_overloaded"
+      assert retained.updated_at == peer_event
+      assert retained.demoted_until == overload.demoted_until
+      assert :ok = BridgeRing.record_success(plan, assignment, identity)
+      assert Repo.reload!(overload).status == "active"
+    end
+
+    test "an expired overload does not make the next ordinary failure sticky" do
+      setup = routing_setup(2)
+      {assignment, identity} = hd(setup.candidates)
+      captured = DateTime.utc_now()
+
+      insert_demotion!(setup, assignment, identity, "provider_overloaded",
+        now: DateTime.add(captured, -60, :second),
+        demoted_until: DateTime.add(captured, -40, :second)
+      )
+
+      plan = plan_for(setup, "bridge_ring", "expired-overload-health")
+
+      assert "upstream_5xx" =
+               BridgeRing.record_failure(plan, assignment, identity, "upstream_5xx")
+
+      assert [health] = active_demotions(setup, assignment)
+      assert health.reason_code == "upstream_5xx"
+      later_plan = plan_for(setup, "bridge_ring", "expired-overload-health")
+      assert :ok = BridgeRing.record_success(later_plan, assignment, identity)
+      assert [] == active_demotions(setup, assignment)
+    end
+
+    test "an ordinary failure cannot make a live overload window resolvable by success" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "overload-mixed-failure")
+      {assignment, identity} = hd(plan.candidates)
+
+      assert "provider_overloaded" = BridgeRing.record_overload(plan, assignment, identity)
+      assert "provider_overloaded" = BridgeRing.record_overload(plan, assignment, identity)
+      assert [overload] = active_demotions(setup, assignment)
+
+      assert "upstream_5xx" =
+               BridgeRing.record_failure(plan, assignment, identity, "upstream_5xx")
+
+      later_plan = plan_for(setup, "bridge_ring", "overload-mixed-failure")
+      assert :ok = BridgeRing.record_success(later_plan, assignment, identity)
+
+      assert DateTime.compare(overload.demoted_until, DateTime.utc_now()) == :gt
+      assert [retained] = active_demotions(setup, assignment)
+      assert retained.demoted_until == overload.demoted_until
+    end
+
+    test "a success clears an overload row whose window already lapsed" do
+      setup = routing_setup(2)
+      captured = DateTime.utc_now()
+      {assignment, identity} = hd(setup.candidates)
+
+      lapsed =
+        insert_demotion!(setup, assignment, identity, "provider_overloaded",
+          now: DateTime.add(captured, -60, :second),
+          demoted_until: DateTime.add(captured, -40, :second)
+        )
+
+      # The window lapsed before the captured clock, and the turn below plans
+      # after it, so the window is already over when the success lands.
+      assert DateTime.compare(lapsed.demoted_until, captured) == :lt
+
+      plan = plan_for(setup, "bridge_ring", "overload-lapsed-window-key")
+
+      assert :ok = BridgeRing.record_success(plan, assignment, identity)
+
+      assert [] == active_demotions(setup, assignment)
+      assert [%BridgeDemotion{status: "resolved"}] = all_demotions(setup, assignment)
+    end
+  end
+
+  describe "overload demotion ordering" do
+    test "an overloaded candidate sinks to the back but stays in the ring" do
+      setup = routing_setup(3)
+      plan = plan_for(setup, "bridge_ring", "overload-order-key")
+      {assignment, identity} = hd(plan.candidates)
+
+      BridgeRing.record_overload(plan, assignment, identity)
+
+      replanned = plan_for(setup, "bridge_ring", "overload-order-key")
+      ring_ids = Enum.map(replanned.candidates, fn {candidate, _identity} -> candidate.id end)
+
+      assert length(ring_ids) == 3
+      assert assignment.id in ring_ids
+      assert List.last(ring_ids) == assignment.id
+    end
+
+    test "truncation drops an overloaded candidate only when the ring is already full of others" do
+      setup = routing_setup(4)
+      plan = plan_for(setup, "bridge_ring", "overload-truncation-key", ring_size: 3)
+      {assignment, identity} = hd(plan.candidates)
+
+      BridgeRing.record_overload(plan, assignment, identity)
+
+      replanned = plan_for(setup, "bridge_ring", "overload-truncation-key", ring_size: 3)
+      ring_ids = Enum.map(replanned.candidates, fn {candidate, _identity} -> candidate.id end)
+
+      # The penalty is ordering, never exclusion of something needed: a demoted
+      # candidate leaves the window only when three others already precede it,
+      # which is exactly when it is not wanted as a fallback.
+      assert length(ring_ids) == 3
+      refute assignment.id in ring_ids
+    end
+
+    test "when every candidate is overloaded the ring is unchanged" do
+      setup = routing_setup(3)
+      plan = plan_for(setup, "bridge_ring", "overload-all-key")
+      before_ids = Enum.map(plan.candidates, fn {candidate, _identity} -> candidate.id end)
+
+      Enum.each(plan.candidates, fn {assignment, identity} ->
+        BridgeRing.record_overload(plan, assignment, identity)
+      end)
+
+      replanned = plan_for(setup, "bridge_ring", "overload-all-key")
+      after_ids = Enum.map(replanned.candidates, fn {candidate, _identity} -> candidate.id end)
+
+      assert after_ids == before_ids
+    end
+  end
+
+  describe "session preference metadata" do
+    test "a pinned session records the preference it asked for" do
+      setup = routing_setup(3)
+      preferred = Enum.at(setup.assignments, 2)
+
+      plan =
+        plan_for(setup, "bridge_ring", "preference-pinned-key", session_assignment_id: preferred.id)
+
+      assert plan.request_metadata["session_preference_kind"] == "pinned"
+      assert plan.request_metadata["session_preference_status"] == "applied"
+      assert plan.selected_assignment_id == preferred.id
+    end
+
+    test "a recreated session records the closed session's account" do
+      setup = routing_setup(3)
+      preferred = Enum.at(setup.assignments, 1)
+
+      plan =
+        plan_for(setup, "bridge_ring", "preference-recreated-key", recreated_from_assignment_id: preferred.id)
+
+      # This is the shape that shipped as a no-op once and stayed invisible:
+      # a replacement session carries its predecessor's account in memory only,
+      # with no durable pin to read back.
+      assert plan.request_metadata["session_preference_kind"] == "recreated"
+      assert plan.request_metadata["session_preference_status"] == "applied"
+      assert plan.selected_assignment_id == preferred.id
+    end
+
+    test "a preference for an ineligible account is recorded as unavailable, not as applied" do
+      setup = routing_setup(3)
+      absent_assignment_id = Ecto.UUID.generate()
+
+      plan =
+        plan_for(setup, "bridge_ring", "preference-absent-key", session_assignment_id: absent_assignment_id)
+
+      # The distinction the whole key exists for: hoisting nothing must not read
+      # the same as being honoured.
+      assert plan.request_metadata["session_preference_kind"] == "pinned"
+      assert plan.request_metadata["session_preference_status"] == "candidate_unavailable"
+      refute plan.selected_assignment_id == absent_assignment_id
+    end
+
+    test "a turn with no session records no preference at all" do
+      setup = routing_setup(2)
+      plan = plan_for(setup, "bridge_ring", "preference-absent-session-key")
+
+      refute Map.has_key?(plan.request_metadata, "session_preference_kind")
+      refute Map.has_key?(plan.request_metadata, "session_preference_status")
     end
   end
 
@@ -1318,8 +2086,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
   defp routing_setup(candidate_count) do
     pool =
       pool_fixture(%{
-        slug:
-          "bridge-pool-#{System.unique_integer([:positive, :monotonic])}-#{System.os_time(:nanosecond)}"
+        slug: "bridge-pool-#{System.unique_integer([:positive, :monotonic])}-#{System.os_time(:nanosecond)}"
       })
 
     auth = active_api_key_fixture(pool)
@@ -1371,13 +2138,34 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       })
 
     request_options =
-      RequestOptions.build(%{request_id: seed}, "/backend-api/codex/responses", %{})
+      RequestOptions.build(
+        %{
+          request_id: seed,
+          idempotency_key: Keyword.get(opts, :idempotency_key)
+        },
+        "/backend-api/codex/responses",
+        %{}
+      )
 
     request_options =
       case Keyword.fetch(opts, :session_assignment_id) do
         {:ok, assignment_id} ->
           RequestOptions.put_continuity(request_options,
             codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}
+          )
+
+        :error ->
+          request_options
+      end
+
+    request_options =
+      case Keyword.fetch(opts, :recreated_from_assignment_id) do
+        {:ok, assignment_id} ->
+          RequestOptions.put_continuity(request_options,
+            codex_session: %CodexSession{
+              pool_upstream_assignment_id: nil,
+              recreated_from_assignment_id: assignment_id
+            }
           )
 
         :error ->
@@ -1417,9 +2205,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
           from session in CodexSession,
             where: session.pool_id == ^auth.pool.id and session.api_key_id == ^auth.api_key.id,
             order_by: [asc: session.id],
-            select:
-              {session.id, session.status, session.owner_instance_id,
-               session.owner_lease_expires_at, session.updated_at}
+            select: {session.id, session.status, session.owner_instance_id, session.owner_lease_expires_at, session.updated_at}
         ),
       aliases:
         Repo.all(
@@ -1428,18 +2214,14 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
               alias_record.pool_id == ^auth.pool.id and
                 alias_record.api_key_id == ^auth.api_key.id,
             order_by: [asc: alias_record.id],
-            select:
-              {alias_record.id, alias_record.alias_kind, alias_record.status,
-               alias_record.updated_at}
+            select: {alias_record.id, alias_record.alias_kind, alias_record.status, alias_record.updated_at}
         ),
       owner_leases:
         Repo.all(
           from lease in BridgeOwnerLease,
             where: lease.pool_id == ^auth.pool.id and lease.api_key_id == ^auth.api_key.id,
             order_by: [asc: lease.id],
-            select:
-              {lease.id, lease.owner_instance_id, lease.status, lease.renewed_at,
-               lease.expires_at, lease.updated_at}
+            select: {lease.id, lease.owner_instance_id, lease.status, lease.renewed_at, lease.expires_at, lease.updated_at}
         )
     }
   end
@@ -1453,6 +2235,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
   defp capture_repo_queries(fun) when is_function(fun, 0) do
     parent = self()
     handler_id = {__MODULE__, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -1479,17 +2264,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     after
       0 -> Enum.reverse(queries)
     end
-  end
-
-  defp credit_backed_weekly_window_at(observed_at) do
-    quota_window_at(observed_at, %{
-      quota_key: "account",
-      window_kind: "secondary",
-      window_minutes: 10_080,
-      used_percent: Decimal.new("100"),
-      credits: 3,
-      reset_at: DateTime.add(observed_at, 604_800, :second)
-    })
   end
 
   defp weekly_window_at(observed_at, attrs) do
@@ -1528,33 +2302,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     )
   end
 
-  defp quota_eligible_candidates(setup, candidates, route_state \\ nil) do
-    request_options =
-      RequestOptions.build(
-        %{request_id: "quota-preparation"},
-        "/backend-api/codex/responses",
-        %{}
-      )
-
-    filter_input =
-      FilterInput.new(%{
-        model: setup.model,
-        endpoint: "/backend-api/codex/responses",
-        payload: %{},
-        request_options: request_options,
-        candidates: candidates
-      })
-
-    case route_state do
-      nil ->
-        CandidateEligibility.filter_quota_eligible_candidates(filter_input)
-
-      %RouteState{} ->
-        CandidateEligibility.filter_quota_eligible_candidates(filter_input, route_state)
-    end
-  end
-
-  defp quota_first_plan(setup, candidates, route_plan_input, seed, opts \\ []) do
+  defp quota_first_plan(setup, candidates, route_plan_input, seed, opts) do
     request_options =
       RequestOptions.build(%{request_id: seed}, "/backend-api/codex/responses", %{})
 
@@ -1566,12 +2314,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       request_options: request_options,
       route_state: Keyword.get(opts, :route_state)
     })
-  end
-
-  defp rendezvous_ordered_candidates(candidates, seed) do
-    Enum.sort_by(candidates, fn {assignment, _identity} ->
-      -rendezvous_score(seed, assignment.id)
-    end)
   end
 
   defp seed_avoiding_assignment(candidates, assignment_id) do
@@ -1607,6 +2349,12 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
         Keyword.get(opts, :endpoint, "/backend-api/codex/responses"),
         payload
       )
+
+    request_options =
+      case Keyword.fetch(opts, :retarget) do
+        {:ok, endpoint} -> RequestOptions.retarget(request_options, endpoint, payload)
+        :error -> request_options
+      end
 
     BridgeRing.plan_route(%{
       auth: setup.auth,
@@ -1727,22 +2475,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     })
   end
 
-  defp prime_weekly_account_quota!(setup, assignment, used_percent, opts) do
-    setup
-    |> prime_quota_window!(
-      assignment,
-      %{
-        quota_key: "account",
-        window_kind: "secondary",
-        window_minutes: 10_080,
-        quota_scope: "account",
-        quota_family: "account",
-        used_percent: used_percent
-      }
-      |> Map.merge(Map.new(opts))
-    )
-  end
-
   defp prime_quota_window!(setup, assignment, attrs) do
     {_assignment, identity} = candidate_by_id!(setup.candidates, assignment.id)
 
@@ -1763,17 +2495,6 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       )
 
     assert {:ok, [_window]} = QuotaWindows.upsert_quota_windows(identity, [attrs])
-  end
-
-  defp quota_scope_opts(model) do
-    [
-      model: model.exposed_model_id,
-      requested_model: model.exposed_model_id,
-      catalog_model: model.exposed_model_id,
-      exposed_model_id: model.exposed_model_id,
-      upstream_model: model.upstream_model_id,
-      upstream_model_id: model.upstream_model_id
-    ]
   end
 
   defp affinity_hash(setup, kind, key_value) do
@@ -1825,6 +2546,42 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     )
   end
 
+  defp capture_stale_writes do
+    parent = self()
+    handler_id = "affinity-stale-write-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        AffinityTelemetry.event(),
+        fn event, measurements, metadata, _config ->
+          send(parent, {:affinity_stale_write, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    :ok
+  end
+
+  defp refute_stale_write do
+    refute_receive {:affinity_stale_write, _event, _measurements, _metadata}, 50
+  end
+
+  # Poses the stored row as the work of a peer whose clock runs ahead of this
+  # writer's. Only the stored row is posed; what the tests assert is what the
+  # real success and failure paths do to it afterwards.
+  defp pose_event_clock_ahead(%BridgeAffinity{} = affinity, [{column, seconds}]) do
+    skewed = DateTime.add(affinity.updated_at, seconds, :second)
+
+    {1, nil} =
+      BridgeAffinity
+      |> where([row], row.id == ^affinity.id)
+      |> Repo.update_all(set: [{column, skewed}, {:updated_at, skewed}])
+
+    skewed
+  end
+
   defp run_concurrently(count, callback) do
     parent = self()
     barrier = make_ref()
@@ -1870,8 +2627,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
   end
 
   defp cleanup_fixture(pool_id, upstream_identity_ids) do
-    pool = Repo.get(Pool, pool_id)
-    if pool, do: Repo.delete!(pool)
+    CodexPooler.PoolerFixtures.delete_committed_pools!([pool_id])
 
     Repo.delete_all(
       from identity in UpstreamIdentity,
@@ -1968,14 +2724,69 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     |> :binary.decode_unsigned()
   end
 
+  # Builds candidates in the given tier order: `:windowless` identities carry a
+  # fresh provider-attested availability observation and no account windows,
+  # `:ordinary` identities carry a fresh reset-bearing account window.
+  defp tiered_setup(tiers) do
+    setup = routing_setup(length(tiers))
+    snapshot_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    candidates =
+      setup.candidates
+      |> Enum.zip(tiers)
+      |> Enum.map(fn
+        {{assignment, identity}, :windowless} ->
+          availability = AccountAvailabilityStore.encode!(:available, snapshot_at, 1)
+
+          metadata =
+            Map.put(identity.metadata, AccountAvailabilityStore.metadata_key(), availability)
+
+          {assignment, %{identity | metadata: metadata}}
+
+        {candidate, :ordinary} ->
+          candidate
+      end)
+
+    windows_by_identity_id =
+      candidates
+      |> Enum.zip(tiers)
+      |> Map.new(fn
+        {{_assignment, identity}, :windowless} ->
+          {identity.id, []}
+
+        {{_assignment, identity}, :ordinary} ->
+          {identity.id, [account_window_at(Decimal.new("20"), snapshot_at)]}
+      end)
+
+    route_state =
+      RouteState.new(%{visible_model: setup.model, candidates: candidates})
+      |> put_test_quota_snapshots(windows_by_identity_id, snapshot_at)
+
+    %{setup: setup, candidates: candidates, route_state: route_state}
+  end
+
+  # deterministic_rotation at rotation index 0 keeps the input order, so the
+  # expected order is readable from the candidate list itself.
+  defp tiered_plan(setup, candidates, route_state, opts \\ []) do
+    plan_for(setup, "deterministic_rotation", seed_rotating_to_index(0, length(candidates)),
+      candidates: candidates,
+      ring_size: Keyword.get(opts, :ring_size, length(candidates)),
+      route_state: route_state
+    )
+  end
+
+  defp demote!(setup, {assignment, identity}),
+    do: insert_demotion!(setup, assignment, identity, "upstream_5xx")
+
+  defp candidate_id({assignment, _identity}), do: assignment.id
+
   defp put_test_quota_snapshots(route_state, windows_by_identity_id, as_of) do
     identities =
       Map.new(route_state.candidates, fn {_assignment, identity} -> {identity.id, identity} end)
 
     snapshots =
       Map.new(windows_by_identity_id, fn {identity_id, windows} ->
-        {identity_id,
-         RoutingQuotaSnapshot.from_identity(Map.fetch!(identities, identity_id), windows, as_of)}
+        {identity_id, RoutingQuotaSnapshot.from_identity(Map.fetch!(identities, identity_id), windows, as_of)}
       end)
 
     RouteState.put_quota_snapshots(route_state, snapshots)

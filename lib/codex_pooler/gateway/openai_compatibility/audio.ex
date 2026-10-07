@@ -2,7 +2,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Audio do
   @moduledoc false
 
   alias CodexPooler.Gateway
-  alias CodexPooler.Gateway.OpenAICompatibility.{Error, Validation}
+  alias CodexPooler.Gateway.OpenAICompatibility.{Error, PublicResponse, Validation}
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
   @backend_transcription_endpoint "/backend-api/transcribe"
@@ -48,13 +48,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Audio do
     end
   end
 
-  @spec normalize_response(map()) :: map()
-  def normalize_response(response) when is_map(response), do: Map.delete(response, "languages")
+  @spec normalize_response(map(), String.t()) :: PublicResponse.normalized_body()
+  def normalize_response(response, format \\ "json")
+  def normalize_response(%{"text" => text}, "text") when is_binary(text), do: {:text, text}
+  def normalize_response(response, "json") when is_map(response), do: Map.delete(response, "languages")
 
   defp prepare_transcription(payload) do
     with {:ok, payload} <- Validation.normalize_payload(payload),
          :ok <- Validation.reject_high_impact_fields(payload),
          :ok <- reject_unsupported_fields(payload),
+         :ok <- validate_response_format(payload),
+         {:ok, payload} <- normalize_prompt(payload),
          {:ok, payload} <- canonicalize_model(payload),
          {:ok, payload} <- normalize_decoded_lists(payload),
          {:ok, file} <- file_metadata(payload) do
@@ -64,6 +68,35 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Audio do
 
   defp reject_unsupported_fields(payload) do
     Validation.reject_unsupported_fields(payload, :audio)
+  end
+
+  defp validate_response_format(payload) do
+    case Map.fetch(payload, "response_format") do
+      :error ->
+        :ok
+
+      {:ok, format} when format in ["json", "text"] ->
+        :ok
+
+      {:ok, _value} ->
+        {:error, Error.invalid_request("response_format must be json or text", "response_format")}
+    end
+  end
+
+  defp normalize_prompt(payload) do
+    case Map.fetch(payload, "prompt") do
+      :error ->
+        {:ok, payload}
+
+      {:ok, nil} ->
+        {:ok, Map.delete(payload, "prompt")}
+
+      {:ok, prompt} when is_binary(prompt) ->
+        {:ok, payload}
+
+      {:ok, _value} ->
+        {:error, Error.invalid_request("prompt must be a string or null", "prompt")}
+    end
   end
 
   defp canonicalize_model(%{"model" => model} = payload) when model in @supported_models,

@@ -7,6 +7,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
 
   alias CodexPooler.Accounting.UsageResponses
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -60,8 +61,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
         build_codex_usage_for_upstream_identity(identity, opts)
 
       [] ->
-        {:error,
-         accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
+        {:error, accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
 
       [_first, _second | _rest] ->
         {:error,
@@ -73,9 +73,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   end
 
   def build_codex_usage_for_chatgpt_account(_chatgpt_account_id, _opts),
-    do:
-      {:error,
-       accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
+    do: {:error, accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
 
   @spec build_codex_usage_for_upstream_identity(UpstreamIdentity.t(), keyword()) ::
           {:ok, map()} | {:error, accounting_error()}
@@ -83,8 +81,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     if active_assigned_identity?(identity) do
       build_codex_usage_for_identity(identity, opts)
     else
-      {:error,
-       accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
+      {:error, accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
     end
   end
 
@@ -147,7 +144,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     usage =
       %{
         plan_type: public_plan_type(identity),
-        rate_limit: UsageResponses.codex_rate_limit(primary, secondary),
+        rate_limit: account_rate_limit(snapshot, primary, secondary),
         additional_rate_limits: additional_rate_limits
       }
 
@@ -213,7 +210,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     as_of = Keyword.get(opts, :as_of, now())
     windows = RoutingQuotaSnapshot.effective_windows(snapshot)
     {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
-    rate_limit = UsageResponses.codex_rate_limit(primary, secondary)
+    rate_limit = account_rate_limit(snapshot, primary, secondary)
 
     {
       if(rate_limit.allowed, do: 1, else: 0),
@@ -224,9 +221,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     }
   end
 
-  defp codex_usage_candidate_has_quota?(
-         {%UpstreamIdentity{}, %PoolUpstreamAssignment{}, snapshot}
-       ) do
+  defp codex_usage_candidate_has_quota?({%UpstreamIdentity{}, %PoolUpstreamAssignment{}, snapshot}) do
     Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn window ->
       window.quota_scope == "account"
     end) or
@@ -243,6 +238,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   defp usage_routing_state_rank(snapshot) do
     case QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true) do
       %{routing_state: :precise} -> 3
+      %{routing_state: :provider_available} -> 3
       %{routing_state: :credit_backed_probe} -> 2
       %{routing_state: :weekly_only_probe} -> 1
       %{routing_state: :windowless_provider_available} -> 1
@@ -250,14 +246,35 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     end
   end
 
-  defp plan_rank(%UpstreamIdentity{} = identity) do
-    plan = identity.plan_family || plan_label(identity.plan_label) || ""
+  defp account_rate_limit(snapshot, primary, secondary) do
+    rate_limit = UsageResponses.codex_rate_limit(primary, secondary)
+    routing = QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true)
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      AccountAvailabilityStore.blocked?(
+        snapshot.availability,
+        snapshot.credential_epoch,
+        snapshot.as_of
+      ) ->
+        %{rate_limit | allowed: false, limit_reached: true}
+
+      routing.routing_state == :provider_available ->
+        %{rate_limit | allowed: true, limit_reached: false}
+
+      true ->
+        rate_limit
+    end
+  end
+
+  defp plan_rank(%UpstreamIdentity{} = identity) do
+    plan = (identity.plan_family || plan_label(identity.plan_label) || "") |> String.downcase() |> String.replace("_", "-")
+
+    # Presentation precedence for the representative usage account, not quota or pricing entitlement.
+    cond do
+      plan in ~w(team business ent26 enterprise enterprise-cbp-automation enterprise-cbp-usage-based self-serve-business-prolite self-serve-business-usage-based edu edu-plus edu-pro hc education) -> 4
+      plan in ~w(pro prolite promax chatgpt-pro) -> 3
+      plan in ~w(plus chatgpt-plus) -> 2
+      plan in ~w(free go) -> 1
       true -> 0
     end
   end

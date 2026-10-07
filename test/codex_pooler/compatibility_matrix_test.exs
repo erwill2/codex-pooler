@@ -2,6 +2,9 @@ defmodule CodexPooler.CompatibilityMatrixTest do
   use ExUnit.Case, async: true
 
   alias CodexPooler.CompatibilityMatrix
+  alias CodexPooler.Gateway.Metadata.CatalogRepresentation
+  alias CodexPooler.Gateway.Metadata.CodexModelDecodeContract
+  alias CodexPooler.Gateway.Runtime.Finalization.ValidationRejection
   alias CodexPooler.Pools.RoutingSettings
 
   describe "catalog and Responses runtime contract" do
@@ -62,23 +65,39 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                valid_trigger: "exactly_one_final_after_visible_input",
                malformed_trigger: %{status: 400, param: "input", upstream_dispatch: false},
                retained: ["final_compaction_trigger"],
-               strips: ["stream", "include", "prompt_cache_options"],
+               strips: ["include", "prompt_cache_options"],
                upstream_payload: %{
-                 mode: "buffered_responses_json",
+                 mode: "responses_sse",
                  terminal_trigger: "retained",
                  store: false,
-                 stream: "omitted"
+                 stream: true
                },
                response_adaptation: %{
-                 upstream: "buffered_responses_json",
+                 upstream: "responses_sse",
                  downstream: %{
                    http_json: ["response"],
-                   http_sse: ["response.output_item.done", "response.completed", "[DONE]"],
-                   responses_websocket: ["response.output_item.done", "response.completed"]
+                   http_sse: [
+                     "response.created",
+                     "response.output_item.added",
+                     "response.output_item.done",
+                     "response.completed",
+                     "[DONE]"
+                   ],
+                   responses_websocket: [
+                     "response.created",
+                     "response.output_item.added",
+                     "response.output_item.done",
+                     "response.completed"
+                   ]
                  }
                },
                public_compact_route_supported: false,
-               hidden_replay: false
+               hidden_replay: false,
+               public_item_id: %{
+                 upstream_nonblank_string: "preserved",
+                 absent_null_or_blank: "cmp_ plus 40 hex of a domain-separated SHA-256 of encrypted_content",
+                 replay: "a derived id is dropped before upstream dispatch"
+               }
              }
     end
 
@@ -87,10 +106,10 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       boundary = fixture.compaction_recovery_boundary
 
       assert boundary.backend_compaction_trigger.upstream_payload == %{
-               mode: "semantic_v2_sse_or_buffered_responses_json",
+               mode: "responses_sse",
                terminal_trigger: "retained",
                store: false,
-               stream: "semantic_v2_true_otherwise_omitted"
+               stream: true
              }
 
       assert boundary.backend_compaction_trigger.direct_compact_preservation.upstream_payload ==
@@ -126,8 +145,8 @@ defmodule CodexPooler.CompatibilityMatrixTest do
         CompatibilityMatrix.fixture!(:responses_chat).compaction_recovery_boundary
 
       assert boundary.backend_compaction_trigger.result_classification == %{
-               source: "request_client_metadata.x-codex-turn-metadata",
-               marker: "compaction.implementation=responses_compaction_v2",
+               source: "request_input_compaction_trigger",
+               marker: "terminal_compaction_trigger",
                additive_metadata: "ignored",
                returned_compaction_items: "not_inspected"
              }
@@ -149,6 +168,20 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                  applicability: "distinct_v2_and_configured_direct_fallback_adapter",
                  classifier_authority: false
                },
+               cursor: %{
+                 applicability: "http_sse_openai_base_url_override",
+                 support: "local_contract_tested",
+                 request: %{
+                   path: "/v1/chat/completions",
+                   shape: "responses_shaped_body"
+                 },
+                 response: %{formats: ["chat_completions_json", "chat_completions_sse"]},
+                 classifier_authority: false,
+                 websocket_support: false,
+                 compaction_support: false,
+                 verification: "authenticated_live_smoke_required",
+                 verified: false
+               },
                opencode: %{
                  applicability: "http_and_websocket_replay_only",
                  classifier_authority: false
@@ -162,6 +195,27 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                  classifier_authority: false,
                  verification: "not_applicable"
                }
+             }
+    end
+
+    test "pins Cursor's unverified HTTP/SSE base-URL override contract" do
+      assert get_in(CompatibilityMatrix.fixture!(:responses_chat), [
+               :compaction_recovery_boundary,
+               :harness_applicability,
+               :cursor
+             ]) == %{
+               applicability: "http_sse_openai_base_url_override",
+               support: "local_contract_tested",
+               request: %{
+                 path: "/v1/chat/completions",
+                 shape: "responses_shaped_body"
+               },
+               response: %{formats: ["chat_completions_json", "chat_completions_sse"]},
+               classifier_authority: false,
+               websocket_support: false,
+               compaction_support: false,
+               verification: "authenticated_live_smoke_required",
+               verified: false
              }
     end
 
@@ -298,6 +352,8 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       assert fixture.service_tier_boundary == %{
                ultrafast: %{
                  accepted_surfaces: [
+                   %{method: :post, path: "/backend-api/codex/responses", transport: "http_sse"},
+                   %{method: :get, path: "/backend-api/codex/responses", transport: "websocket"},
                    %{method: :post, path: "/v1/responses", transport: "http_json"},
                    %{method: :post, path: "/v1/responses", transport: "http_sse"},
                    %{method: :get, path: "/v1/responses", transport: "responses_websocket"}
@@ -308,6 +364,9 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                    required_literal: "ultrafast",
                    eligible_candidates: "only_exact_ultrafast_advertisements"
                  },
+                 api_key_enforcement: true,
+                 mixed_pool_routing: "compatible_service_tier_variants_only",
+                 catalog_tier_source: "pristine_routable_superset_with_unchanged_default",
                  literal_vocabulary: %{
                    returned_service_tier: "ultrafast",
                    accounting_fields: [
@@ -334,6 +393,93 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                  unchanged: true
                }
              }
+    end
+
+    test "states that a public /v1 Responses SSE terminal-only stream is opened with the Responses grammar" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.contract =~ "preceded by the Responses stream grammar"
+      assert feature.contract =~ "nothing is synthesized once the upstream relayed an output item or a text delta"
+      assert feature.contract =~ "reasoning content is never surfaced as output text"
+    end
+
+    test "states that a replayed public fallback item id is dropped before upstream dispatch" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.contract =~ "carries the fallback id <type>_<output_index>"
+      assert feature.contract =~ "whose id is exactly its own type's fallback id"
+      assert feature.contract =~ "provider ids and every other id are forwarded unchanged"
+    end
+
+    test "states that a bridged provider 4xx refusal answers like the HTTP path" do
+      feature = CompatibilityMatrix.by_slug!(:upstream_websocket_bridge)
+
+      assert feature.contract =~ "answers the public client with the same HTTP status and OpenAI error body as the HTTP path and records the same rejection fields on the websocket attempt, without HTTP resubmission"
+    end
+
+    test "states that an anchored public turn is served only on the connection that produced its anchor" do
+      feature = CompatibilityMatrix.by_slug!(:upstream_websocket_bridge)
+
+      assert feature.contract =~ "a turn anchored on previous_response_id is bound to its owner connection"
+      assert feature.contract =~ "answers the public client 400 previous_response_not_found with param previous_response_id"
+      assert feature.contract =~ "is answered with the same error before any upstream call"
+    end
+
+    test "states that the public SSE relays only the public Responses stream vocabulary" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.contract =~ "relays only the public Responses stream vocabulary, response.* events, the error terminal and keepalive"
+      assert feature.contract =~ "responsesapi.websocket_timing are dropped before sequence numbering"
+    end
+
+    test "states that the public websocket relays only the public Responses stream vocabulary" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.contract =~ "The public GET /v1/responses websocket relays the same vocabulary, response.* events and the error event, on direct and owner-forwarded turns"
+      assert feature.contract =~ "drops codex.* controls, responsesapi.* events and typeless non-terminal frames before sequence numbering"
+    end
+
+    test "states that a provider 4xx refusal reaches the public websocket as the HTTP path's error" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.contract =~ "reaches a public GET /v1/responses websocket client as the websocket error event with that status and the error object a streaming POST /v1/responses answers over HTTP"
+      assert feature.contract =~ "the websocket attempt records the same rejection fields; a 429, a 5xx and those two codes keep the masked response.failed"
+    end
+
+    test "states that a replayed call item named by its own call_id is dropped before upstream dispatch" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.contract =~ "carries its own call_id when it has one"
+      assert feature.contract =~ "function_call, custom_tool_call, shell_call or shell_call_output item whose id equals its own call_id reaches the upstream without an id"
+    end
+
+    test "states that public /v1 surfaces relay no provider event header objects" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+      fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
+
+      assert feature.contract =~ "relay no provider event header objects"
+      assert feature.contract =~ "dropped from every relayed event, terminal or not"
+
+      assert fixture.provider_event_headers == %{
+               surfaces: [
+                 %{method: :post, path: "/v1/responses", transport: "http_sse"},
+                 %{method: :get, path: "/v1/responses", transport: "responses_websocket"}
+               ],
+               dropped_keys: ["headers", "response.headers"],
+               scope: "every_relayed_event",
+               native_websocket_with_snapshot: "projected_native_controls_only"
+             }
+    end
+
+    test "states that a streamed terminal the provider sent with an empty output lists the delivered items" do
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+      fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
+
+      assert feature.contract =~ "whose output the provider sent empty or absent carries the items the stream delivered in response.output_item.done, ordered by output_index"
+      assert feature.contract =~ "a non-empty terminal output is relayed as sent"
+      assert feature.contract =~ "the native backend routes relay the provider's terminal unchanged"
+      assert fixture.streamed_terminal_output.terminals == ["response.completed", "response.incomplete"]
+      assert fixture.streamed_terminal_output.serving_modes == ["full", "lite"]
     end
 
     @tag :hosted_shell_history
@@ -423,7 +569,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                },
                continuation: %{
                  stateless_full_history_replay: "accepted",
-                 previous_response_id_semantic_tool_output: "accepted",
+                 previous_response_id_semantic_tool_output: "producing_websocket_connection_only",
                  call_output_pairing: "not_enforced",
                  item_order: "not_enforced"
                },
@@ -482,13 +628,59 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                digest: "sha256_deterministic_canonical_json",
                format: "weak_cp_models_v1",
                aliases_share_exact_body_and_token: true,
-               cache_coherence: "eventual_after_successful_responses_token"
+               cache_coherence: "eventual_after_successful_responses_token",
+               context_window_policy: %{
+                 default: "selected_upstream_default",
+                 maximum: "selected_upstream_maximum",
+                 compaction: "preserved_including_absent_or_null",
+                 pricing: "does_not_change_context_or_etag",
+                 explicit_operator_override: "retained"
+               },
+               instructions_representation: %{
+                 selector: "codex_build_user_agent",
+                 template_only_since: "0.148.0",
+                 template_only: "base_instructions_dropped_when_instructions_template_is_a_string",
+                 verbatim: "older_0_147_0_or_non_codex_user_agent",
+                 etag_input: "served_representation",
+                 vary_header: "user-agent",
+                 client_version_query: :ignored,
+                 decode_checked: %{
+                   window: {"0.154.0", "0.160.1"},
+                   window_version: "whole_version_prereleases_included",
+                   body: "template_only_minus_entries_the_client_cannot_decode",
+                   left_out_model: %{advertised: false, routable: true},
+                   operator_log: "codex catalog entry left out",
+                   log_fields: ["pool_id", "model", "fields"]
+                 },
+                 turn_selector: "codex_build_user_agent"
+               }
              }
+
+      assert fixture.instructions_representation.template_only_since ==
+               CatalogRepresentation.template_only_since()
+
+      # findings#206 row 206-442: the window the matrix names is the one the
+      # decode contract enforces.
+      {since, through} = CodexModelDecodeContract.verified_range()
+      version = fn {major, minor, patch} -> "#{major}.#{minor}.#{patch}" end
+      assert fixture.instructions_representation.decode_checked.window == {version.(since), version.(through)}
+      assert CatalogRepresentation.for_user_agent("codex_cli_rs/#{version.(since)} (Linux 6.8.0; x86_64) unknown") == :decode_checked
+      assert CatalogRepresentation.for_user_agent("codex_cli_rs/#{version.(through)} (Linux 6.8.0; x86_64) unknown") == :decode_checked
+      assert feature.contract =~ "receives the decode_checked representation"
+      assert feature.contract =~ "a left-out model is not advertised to that client but stays routable"
+
+      assert feature.contract =~ "the ETag is the digest of the representation actually served"
 
       assert feature.canonical_partition.new_turn_capacity == %{
                backend_codex_catalog_driven: "selected_partition_only",
                translated_openai_responses: "all_valid_canonical_assignments"
              }
+
+      # Presentation and default hints that drift between accounts without
+      # changing how a turn executes; `priority` is the picker's sort order
+      # (findings#305 row 498-6). Moves with `CanonicalModelSource`'s
+      # `@digest_excluded_keys`.
+      assert feature.canonical_partition.digest_excluded_hints == ["default_reasoning_level", "default_service_tier", "description", "priority", "visibility"]
 
       assert feature.canonical_partition.shell_type == %{
                equivalent_known_values: ["default", "local", "shell_command", "unified_exec"],
@@ -515,16 +707,41 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       assert feature.canonical_partition.selection_fallback ==
                "largest_partition_when_none_routable"
 
+      assert feature.canonical_partition.reasoning_variants == %{
+               stable_catalog_projection: "routable_capability_family_reasoning_union",
+               canonical_allowance: "all_reasoning_variants_in_quota_selected_capability_family",
+               native_turn_selection: "post_eligibility_assignment_advertising_effective_known_effort",
+               non_reasoning_capability_boundary: "never_crossed",
+               no_advertiser_fallback: "quota_selected_partition",
+               circuit_state_input: false
+             }
+
       assert feature.canonical_partition.pinned_continuation == %{
                valid_canonical_hard_pin: "may_cross_partition",
                malformed_or_retired_source: "unavailable"
              }
 
+      assert feature.canonical_partition.selected_partition_quota_refusal == %{
+               held_back_partition: "route_filtered_once_before_reservation",
+               connection_bound_compaction: "selected_partition_refusal",
+               non_quota_refusal: "selected_partition_refusal",
+               pool_refusal_exclusions: "both_partitions_held_back_marked",
+               summary_counts: ["selected_routable_count", "held_back_routable_count"],
+               summary_markers: %{
+                 held_back_fallback: ["pre_dispatch", "after_refusal"],
+                 held_back_fallback_outcome: ["admitted", "pool_refusal"],
+                 held_back_skip_reason: ["runtime_incompatible", "connection_bound_compaction", "file_affinity", "compact_unsupported", "hard_pin", "non_quota_refusal"]
+               }
+             }
+
+      assert feature.contract =~
+               "first runs its held-back families once through the same quota filtering"
+
       assert feature.contract =~
                "same policy-visible native catalog body and deterministic weak ETag"
 
       assert feature.contract =~
-               "backend Codex catalog-driven new turns use the selected partition"
+               "backend Codex catalog-driven new turns use the selected capability family"
 
       assert feature.contract =~
                "translated OpenAI Responses capacity includes all valid canonical assignments"
@@ -559,11 +776,21 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                http: :request,
                websocket: :response_create_turn,
                retry: :preserve,
+               native_replay: :preserve,
                owner_forwarding: :preserve,
                next_websocket_turn: :reresolve
              }
 
       assert fixture.upstream_etag_relay == false
+      assert fixture.representation_selector == "user_agent_package_version"
+      assert feature.contract =~ "package version after the originator in the request User-Agent"
+      assert feature.contract =~ "selected by the same function from the same header as that catalog fetch"
+
+      assert fixture.provider_metadata_event == %{
+               order: :after_pooler_event,
+               x_models_etag: :removed,
+               consumer_etag_source: :metadata_event_carrying_x_models_etag
+             }
 
       assert fixture.included_routes == [
                "/backend-api/codex/responses",
@@ -642,7 +869,10 @@ defmodule CodexPooler.CompatibilityMatrixTest do
 
       assert feature.current == :bounded_terminal_failure_attempt_detail
       assert feature.routes == CompatibilityMatrix.by_slug!(:upstream_error_param).routes
-      assert fixture.fields == ~w(upstream_error_code stream_terminal_type upstream_error_param)
+
+      assert fixture.fields ==
+               ~w(upstream_error_code stream_terminal_type compaction_invalid_reason upstream_error_param)
+
       assert fixture.projection == "failed_and_retryable_failed_attempt_detail_only"
       assert fixture.readable_identifier == "strict_ascii_80_bytes_or_less_cleartext"
       assert fixture.malformed_identifier == "sha256_12"
@@ -666,9 +896,107 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                rejection_error_param
                rejection_message_present
                rejection_message_bytes
+               rejection_supported_values_state
+               rejection_supported_values
              )
       assert fixture.invalid_shapes == "omitted"
       assert fixture.raw_error_message_or_body == "never_projected"
+    end
+
+    test "pins the bounded upstream validation rejection relay" do
+      feature = CompatibilityMatrix.by_slug!(:upstream_validation_rejection_relay)
+      fixture = CompatibilityMatrix.fixture!(:upstream_validation_rejection_relay)
+
+      assert feature.current == :bounded_allowlisted_validation_rejection_relay
+      assert feature.fixture == :upstream_validation_rejection_relay
+
+      assert fixture.codes ==
+               ValidationRejection.relayable_codes()
+
+      assert fixture.upstream_status == 400
+      assert fixture.error_type == "invalid_request_error"
+      assert fixture.source == CompatibilityMatrix.fixture!(:rejection_metadata).source
+      assert fixture.relayed_fields == ~w(type code param message)
+      assert fixture.message == "pooler_authored_from_code_and_param"
+      assert fixture.supported_values.codes == ValidationRejection.supported_values_codes()
+      assert fixture.supported_values.max_values == 12
+      assert fixture.supported_values.message_max_bytes == 2_048
+      assert fixture.supported_values.rejected_or_earlier_quoted_values == "excluded"
+      assert fixture.supported_values.persisted_as == "rejection_supported_values"
+      assert fixture.supported_values.states == ~w(present none unparseable)
+      assert fixture.supported_values.relayed_under_explicit_full_override == true
+      assert fixture.chat_param == "client_field_for_adapter_renames_else_upstream_path"
+      assert fixture.provider_message_forwarded == false
+      assert fixture.native_streaming_body == "native_json_error_envelope"
+      # A materialized native body is the Pooler envelope too since
+      # findings#254 row 254-54, and a native 400 outside the relay answers the
+      # Pooler refusal error instead of an empty streaming body or the provider
+      # body (row 254-70).
+      assert fixture.native_materialized_body == "native_json_error_envelope"
+      assert fixture.native_non_relayable_400_body == "pooler_refusal_error_from_sanitized_tokens"
+      # A native final 4xx answers as that error with status 400 naming the
+      # upstream status (row 254-80).
+      assert fixture.native_final_4xx_refusal == %{answered_status: 400, statuses: "402..499 except 408 and 429", message_names_upstream_status: true, serving_modes: :all, recorded_status: :upstream}
+      assert fixture.public_v1_body == "openai_error_object"
+      # The Codex backend refuses previous_response_id on HTTP with a detail
+      # body, relayed as the parameter it names (findings#232 row 232-275).
+      assert fixture.unsupported_parameter_detail.relayed_code in ValidationRejection.relayable_codes()
+      assert fixture.unsupported_parameter_detail.other_detail_text == "not_relayed"
+      assert :detail_body in fixture.unchanged_scopes
+      refute :explicit_full_override in fixture.unchanged_scopes
+      # The Codex backend's websocket sends the refusals it answers over HTTP with a code as a wrapped error with the
+      # HTTP message as text and no code and no param; the text is read for the code and field (findings#336).
+      assert :websocket_text_outside_the_read_templates in fixture.unchanged_scopes
+      refute :websocket_frames in fixture.unchanged_scopes
+
+      reading = fixture.websocket_frame_reading
+      assert reading.provider_message_forwarded == false
+      assert reading.provider_code_or_param_on_frame == "never_replaced"
+      assert Map.values(reading.bracket_kind_codes) -- ValidationRejection.relayable_codes() == []
+      assert for({_template, %{code: code}} <- reading.payload_message_codes, do: code) -- ValidationRejection.relayable_codes() == []
+      assert reading.detail_texts["Unsupported parameter: <path>"] in ValidationRejection.relayable_codes()
+      assert reading.unsupported_tool_type.relayed == false
+      assert CompatibilityMatrix.by_slug!(:upstream_validation_rejection_relay).contract =~ "A wrapped websocket error frame of the same refusal"
+      assert fixture.accounting_error_code == "upstream_status"
+      assert fixture.retry == false
+      assert fixture.routing_health == :unchanged
+    end
+
+    test "Full supported-values response example agrees with both published references" do
+      fixture = CompatibilityMatrix.fixture!(:upstream_validation_rejection_relay)
+      full = CompatibilityMatrix.fixture!(:pool_model_serving_modes).full_rejection_diagnostic
+
+      assert fixture.supported_values.relayed_under_explicit_full_override
+      assert full.supported_values_suffix_relayed
+      assert fixture.supported_values.serving_modes == ~w(auto lite full)
+
+      mode_contract =
+        Enum.map_join(fixture.supported_values.serving_modes, ", ", &String.capitalize/1) <>
+          " relay the same bounded supported-values list from persisted attempt metadata."
+
+      for slug <- [:pool_model_serving_modes, :upstream_validation_rejection_relay] do
+        assert CompatibilityMatrix.by_slug!(slug).contract =~ mode_contract
+      end
+
+      assert fixture.full_supported_values_example == %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => "unsupported_value",
+                 "param" => "reasoning.effort",
+                 "message" => "upstream rejected parameter reasoning.effort (unsupported_value); supported values: low, medium, high"
+               }
+             }
+
+      for page <- ~w(responses-lite-vs-full runtime-routes) do
+        path = Path.join("docs-site/src/content/docs/reference", page <> ".mdx")
+        assert File.read!(path) =~ mode_contract
+        examples = Regex.scan(~r/```json\n(.*?)\n```/s, File.read!(path), capture: :all_but_first)
+
+        assert Enum.any?(examples, fn [json] ->
+                 CodexPooler.JSON.decode(json) == {:ok, fixture.full_supported_values_example}
+               end),
+               "#{path} must publish the executable Full supported-values response example"
+      end
     end
   end
 
@@ -712,7 +1040,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                resolves_same_kind: true,
                full_mode: "preserved",
                lite_mode: "rejected_unsupported_parameter_before_dispatch",
-               lite_rejection_scope: "any_map_shaped_tool_choice",
+               lite_rejection_scope: "map_shaped_tool_choice_except_named_function",
                lite_rejection_lanes: [
                  "direct_public_responses",
                  "chat_completions",
@@ -837,92 +1165,23 @@ defmodule CodexPooler.CompatibilityMatrixTest do
     end
   end
 
-  describe "request compression compatibility contract" do
-    test "documents Pool-gated request-side fail-open metadata-only behavior" do
-      feature = CompatibilityMatrix.by_slug!(:request_compression)
-      fixture = CompatibilityMatrix.fixture!(:request_compression)
-
+  describe "tool-output preservation compatibility contract" do
+    test "keeps accepted bytes, adapter boundaries and privacy explicit" do
+      feature = CompatibilityMatrix.by_slug!(:tool_output_preservation)
+      fixture = CompatibilityMatrix.fixture!(:tool_output_preservation)
       assert feature.status == :supported
-      assert feature.current == :pool_gated_request_side_payload_rewrite
-      assert :route in feature.categories
-      assert :auth in feature.categories
-      assert :error in feature.categories
-      assert :streaming in feature.categories
-      assert :ownership in feature.categories
-      assert :degraded in feature.categories
-
-      assert feature.contract =~ "Pool-gated"
-      assert feature.contract =~ "request_compression_enabled"
-      assert feature.contract =~ "request-side only"
-      assert feature.contract =~ "fail-open"
-      assert feature.contract =~ "metadata-only"
-      assert feature.contract =~ "payload_compression"
-      assert feature.contract =~ "command-backed file reads"
-
-      assert feature.contract =~
-               "remain byte-exact before output range lookup or content detection"
-
-      assert feature.contract =~ "malformed or unrecognized commands retain existing behavior"
-      assert feature.contract =~ "valid JSON object or array spans embedded in ordinary prose"
-
-      assert Map.fetch!(fixture, :pool_gate) == %{
-               setting: "request_compression_enabled",
-               default_enabled: false,
-               disabled_behavior: "original_request_passthrough"
-             }
-
-      assert Map.fetch!(fixture, :direction) == "request_side_only"
-      assert Map.fetch!(fixture, :failure_mode) == "fail_open_original_request"
-
-      assert get_in(fixture, [:protected_tool_outputs, :command_backed_reads]) == %{
-               arguments: ["cmd", "command"],
-               native_action: %{type: "exec", command: "argv"},
-               direct_commands: ["cat", "nl", "head", "tail", "sed_print_only"],
-               pipeline: "nl_to_sed_print_only",
-               producer_aliases: %{
-                 function_call: ["call_id"],
-                 local_shell_call: ["call_id", "id"]
-               },
-               output_aliases: %{
-                 function_call_output: ["call_id"],
-                 local_shell_call_output: ["call_id", "id"]
-               },
-               output_compatibility: %{
-                 function_call_output: ["function_call", "local_shell_call"],
-                 local_shell_call_output: ["local_shell_call"]
-               },
-               owner_identity: "positional_producer_path",
-               unresolved_function_output: "protected_legacy",
-               unresolved_local_shell_output: "existing_behavior",
-               duplicate_aliases: "protected_original_output_preserved",
-               cross_kind_collisions: "protected_original_output_preserved",
-               conflicting_output_aliases: "protected_original_output_preserved",
-               recognized_owner_stage: "before_output_range_lookup_and_content_detection",
-               malformed_or_unrecognized: "existing_behavior",
-               output_behavior: "byte_exact",
-               metadata: "aggregate_counts_only"
-             }
-
-      assert get_in(fixture, [:supported_input_shapes, :embedded_json]) == %{
-               container_kinds: ["object", "array"],
-               surrounding_bytes: "preserved",
-               quoted_json_looking_text: "preserved",
-               malformed_or_over_limit_behavior: "original_output_preserved",
-               maximum_spans: 50
-             }
-
-      assert Map.fetch!(fixture, :privacy) == %{
-               raw_outputs_stored: false,
-               raw_response_bodies_stored: false,
-               ccr_retrieval: false,
-               request_log_metadata: "payload_compression",
-               metadata_only: true
-             }
+      assert feature.current == :accepted_tool_output_byte_preservation
+      assert fixture.behavior == "accepted_output_bytes_preserved"
+      assert fixture.adapter_oracle == "original_strings_or_ordered_concatenated_text_parts"
+      assert fixture.serving_modes == ["full", "lite"]
+      assert fixture.call_ids == "preserved"
+      assert fixture.item_order == "preserved"
+      assert fixture.privacy == %{raw_outputs_stored: false, raw_response_bodies_stored: false, new_compression_metadata: false, metadata_only: true}
     end
 
-    test "keeps eligible routes and public compact unsupported behavior explicit" do
-      feature = CompatibilityMatrix.by_slug!(:request_compression)
-      fixture = CompatibilityMatrix.fixture!(:request_compression)
+    test "keeps delivery routes and unsupported public compact explicit" do
+      feature = CompatibilityMatrix.by_slug!(:tool_output_preservation)
+      fixture = CompatibilityMatrix.fixture!(:tool_output_preservation)
 
       assert feature.routes == [
                %{method: :post, path: "/backend-api/codex/responses"},
@@ -937,38 +1196,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                %{method: :get, path: "/v1/responses", transport: "websocket"}
              ]
 
-      assert Map.fetch!(fixture, :eligible_route_families) == [
-               "backend_responses",
-               "backend_v1_responses_alias",
-               "backend_v1_chat_alias",
-               "public_v1_responses",
-               "public_v1_chat_translation",
-               "backend_compact",
-               "backend_v1_compact_alias",
-               "backend_websocket_response_create",
-               "backend_v1_websocket_response_create_alias",
-               "public_v1_websocket_response_create"
-             ]
-
-      assert Map.fetch!(fixture, :ineligible_surfaces) == [
-               "multipart",
-               "files",
-               "audio",
-               "images",
-               "admin",
-               "mcp",
-               "usage",
-               "control_plane"
-             ]
-
-      assert Map.fetch!(fixture, :public_unsupported_compact) == %{
-               method: :post,
-               path: "/v1/responses/compact",
-               status: 404,
-               error_code: "unsupported_endpoint",
-               compression_eligible: false,
-               upstream_dispatch: false
-             }
+      assert fixture.public_unsupported_compact == %{method: :post, path: "/v1/responses/compact", status: 404, error_code: "unsupported_endpoint", upstream_dispatch: false}
     end
   end
 
@@ -1078,7 +1306,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                callback_construction: "owner_node_only",
                incompatible_remote_owner: "reject_before_owner_lookup_or_upstream_submission",
                native_result: "existing_owner_unavailable_error",
-               previsible_bridge_result: "existing_http_fallback"
+               previsible_bridge_result: "fail_closed_without_resubmission"
              }
 
       assert feature.observability == %{
@@ -1126,13 +1354,13 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                native_attach_arity: 2,
                bridge_attach_arity: 3,
                old_owner_native_attach: "compatible_without_connection_metadata",
-               old_owner_bridge_attach: "fail_closed_http_fallback",
+               old_owner_bridge_attach: "fail_closed_without_resubmission",
                owner_submission: %{
                  protocol: "versioned_data_only",
                  callback_construction: "owner_node_only",
                  incompatible_remote_owner: "reject_before_owner_lookup_or_upstream_submission",
                  native_result: "existing_owner_unavailable_error",
-                 previsible_bridge_result: "existing_http_fallback"
+                 previsible_bridge_result: "fail_closed_without_resubmission"
                },
                operator_action: "none"
              }
@@ -1156,6 +1384,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       assert feature.contract =~ "reused upstream connection"
       assert feature.contract =~ "exact previous_response_not_found client retry signal"
       assert feature.contract =~ "later explicit full request"
+      assert feature.contract =~ "a Full continuation on a Lite-served context is sent"
       assert feature.contract =~ "public /v1 terminal masking and shape remain unchanged"
 
       assert fixture.native_continuation_generation_guard == %{
@@ -1176,7 +1405,20 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                  reason_class: "previous_response_generation_mismatch",
                  termination_source: "continuation_generation_guard",
                  raw_payloads_or_response_values: false
-               }
+               },
+               serving_mode_guard: %{
+                 connection_use: "reused",
+                 condition: "lite_continuation_after_a_full_served_last_completed_response_on_the_connection",
+                 full_after_lite: "sent",
+                 unknown_mode: "reuse_rule_only",
+                 reason: "previous_response_serving_mode_mismatch"
+               },
+               provider_refusal: %{
+                 upstream_message_class: "invalid_previous_response_id",
+                 client_error_code: "previous_response_not_found",
+                 attempt_rejection_error_code: "absent"
+               },
+               full_resend: "one_linked_successor_with_or_without_owner_forwarding"
              }
     end
 
@@ -1201,7 +1443,8 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                mid_turn_transitions: %{
                  compact: "owner_capability_plus_sealed_runtime_proof",
                  final: "owner_capability_plus_sealed_runtime_proof",
-                 payload_shape_or_client_metadata_alone: "never_authoritative"
+                 payload_shape_or_client_metadata_alone: "never_authoritative",
+                 final_resume_claim: "durable_codex_turn_or_resume_claim_so_a_verified_resend_is_chained"
                },
                binding: [
                  "phase",
@@ -1326,6 +1569,27 @@ defmodule CodexPooler.CompatibilityMatrixTest do
     end
   end
 
+  test "audio permission contract covers both transcription routes and the persisted default" do
+    feature = CompatibilityMatrix.by_slug!(:audio_transcription_permission)
+    fixture = CompatibilityMatrix.fixture!(:audio_transcription_permission)
+    assert feature.status == :supported
+    assert feature.routes == [%{method: :post, path: "/backend-api/transcribe"}, %{method: :post, path: "/v1/audio/transcriptions"}]
+    assert :allow_audio_transcription in RoutingSettings.__schema__(:fields)
+    assert %RoutingSettings{}.allow_audio_transcription == true
+    assert fixture.pool_gate == %{setting: "allow_audio_transcription", default_enabled: true, disabled_behavior: "403_audio_transcription_disabled"}
+  end
+
+  describe "runtime ingress firewall compatibility contract" do
+    test "states the forwarded client IP, cold settings, revocation and denial telemetry policy the docs describe" do
+      firewall = CompatibilityMatrix.fixture!(:firewall)
+
+      assert %{default_source: :x_forwarded_for, default_proxy_depth: 0, positional_depth: %{range: 1..16, selected_entry: :nth_from_right}} = firewall.forwarded_client_ip
+      assert %{status: 503} = firewall.cold_settings
+      assert %{close_code: 1008} = firewall.revoked_websocket
+      assert %{metric: "codex_pooler_ingress_firewall_denied_count"} = firewall.denial_telemetry
+    end
+  end
+
   describe "pruned runtime compatibility contract" do
     test "does not carry removed control-plane or reset-credit feature rows" do
       refute :control_plane_surface in CompatibilityMatrix.feature_slugs()
@@ -1401,8 +1665,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
         }
       },
       result_transports: %{
-        buffered: "responses_json",
-        v2: "responses_sse_semantic_nested_implementation_with_additive_metadata"
+        trigger: "responses_sse_independent_of_client_metadata"
       },
       turn_state: %{
         source: "client_metadata.x-codex-turn-state_or_upgrade_header",
@@ -1410,14 +1673,33 @@ defmodule CodexPooler.CompatibilityMatrixTest do
         persistence: "hashed_alias_only"
       },
       native_frames: ["response.output_item.done", "response.completed"],
+      collected_result: %{
+        source: "collect_delivery_accumulator_not_diagnostic_retention",
+        max_bytes: 8_388_608,
+        diagnostic_retention_bytes: 65_536,
+        overflow_reason: "compaction_result_too_large"
+      },
       errors: %{
         malformed_trigger: "pre_dispatch_invalid_request",
         compact_saturation: "server_is_overloaded",
         invalid_result: "invalid_compaction_response",
-        provider_terminal: "invalid_compaction_response"
+        oversized_result: "invalid_compaction_response",
+        provider_terminal: "canonical_provider_terminal",
+        provider_usage_limit: %{
+          delivery: "single_dispatch_result_message",
+          native: %{
+            capacity: "usage_limit_capacity_before_connection_pin_every_partition",
+            seat_can_serve_or_return_unknown: "retryable_503_pinned_continuation_unavailable",
+            every_seat_exhausted: "pool_usage_limit_terminal_earliest_return",
+            client_resend: "409_duplicate_turn_before_dispatch",
+            client_fallback: "https_compaction_routed_over_every_partition"
+          },
+          public: "anchor_account_usage_limit_429_with_retry_after",
+          recorded_status: 429
+        }
       },
       socket_reuse: "ordinary_follow_up_same_downstream_socket",
-      collector_retry: false,
+      collector_retry: "one_client_full_history_successor_when_codex_retryable",
       diagnostic: %{
         request_metadata: "compaction_bridge",
         applied: true,
@@ -1485,7 +1767,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
   end
 
   defp responses_allowed_tools_summary do
-    "direct public Responses HTTP and websocket response.create accept an exact type=allowed_tools choice only in Full mode, with mode auto or required and a nonempty ordered tools list; named function and custom entries must resolve to undeferred direct top-level same-kind declarations, while type-only programmatic_tool_calling, web_search_preview, web_search, and image_generation entries require a declared top-level tool of the same type; order and duplicates are forwarded unchanged after only the existing tool-definition schema lowering; malformed or undeclared Full choices fail before admission or accounting, valid Lite choices create one rejected Request without Attempts or Ledger rows, top-level MCP declarations retain the tools error while MCP allow-list members use the tool_choice error, and Chat, native backend Responses, namespaces, additional_tools, deferred tools, aliases, unsupported entries, Realtime, and broad OpenAI tool parity remain excluded"
+    "direct public Responses HTTP and websocket response.create accept an exact type=allowed_tools choice only in Full mode, with mode auto or required and a nonempty ordered tools list; named function and custom entries must resolve to undeferred direct top-level same-kind declarations, while type-only web_search and image_generation entries require a declared top-level tool of the same type; order and duplicates are forwarded unchanged after only the existing tool-definition schema lowering; malformed or undeclared Full choices fail before admission or accounting, valid Lite choices create one rejected Request without Attempts or Ledger rows, top-level MCP declarations retain the tools error while MCP allow-list members use the tool_choice error, and Chat, native backend Responses, namespaces, additional_tools, deferred tools, aliases, unsupported entries, Realtime, and broad OpenAI tool parity remain excluded"
   end
 
   defp responses_allowed_tools_contract do
@@ -1508,12 +1790,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
           defer_loading: ["absent", false]
         },
         built_in: %{
-          types: [
-            "programmatic_tool_calling",
-            "web_search_preview",
-            "web_search",
-            "image_generation"
-          ],
+          types: ["web_search", "image_generation"],
           exact_keys: ["type"],
           declaration_scope: "top_level_tools_only",
           resolution: "at_least_one_same_type_declaration",

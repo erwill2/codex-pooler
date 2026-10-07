@@ -51,7 +51,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "type" => "server_error"
              }
 
-      refute Jason.encode!(normalized_error) =~ internal_reason
+      refute CodexPooler.JSON.encode!(normalized_error) =~ internal_reason
     end
   end
 
@@ -278,8 +278,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
   test "Responses rejects non-text system and developer content before instruction lifting" do
     for {role, part} <- [
-          {"developer",
-           %{"type" => "input_image", "image_url" => "https://example.com/image.png"}},
+          {"developer", %{"type" => "input_image", "image_url" => "https://example.com/image.png"}},
           {"system", %{"type" => "input_file", "file_id" => "file_fixture"}}
         ] do
       assert {:error,
@@ -401,8 +400,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       refute Map.has_key?(result.payload, "tool_choice")
     end
 
+    # findings#313: the provider's `tool_search` tool is accepted with exactly its own keys (direct probe, Codex backend,
+    # Full and Lite manifest) and forwarded unchanged; an unknown key or another `execution` is refused before dispatch.
     @tag :responses_coercion
-    test "Responses retains top-level tool_search rejection while preserving supported additional tools" do
+    test "Responses admits a top-level tool_search with the provider's keys while preserving supported additional tools" do
       supported_additional_tool =
         flat_function_tool(
           "lookup_additional_tool_search_pin",
@@ -415,19 +416,38 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         "name" => "custom_additional_tool_search_pin"
       }
 
-      assert {:error, reason} =
-               Responses.coerce(%{
-                 "model" => "gpt-fixture-text",
-                 "input" => "synthetic input",
-                 "tools" => [%{"type" => "tool_search"}]
-               })
+      deferred_tool = Map.put(supported_additional_tool, "defer_loading", true)
 
-      assert reason == %{
-               status: 400,
-               code: "invalid_request",
-               message: "tool shape is not translatable",
-               param: "tools"
-             }
+      for tool_search <- [
+            %{"type" => "tool_search"},
+            %{"type" => "tool_search", "execution" => "server"},
+            %{"type" => "tool_search", "execution" => "client", "description" => "synthetic search", "parameters" => %{"type" => "object", "properties" => %{}}}
+          ] do
+        assert {:ok, result} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "tools" => [tool_search, deferred_tool]
+                 })
+
+        assert result.payload["tools"] == [tool_search, deferred_tool]
+      end
+
+      for tool_search <- [%{"type" => "tool_search", "zz_unknown" => true}, %{"type" => "tool_search", "execution" => "bogus"}] do
+        assert {:error, reason} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "tools" => [tool_search, deferred_tool]
+                 })
+
+        assert reason == %{
+                 status: 400,
+                 code: "invalid_request",
+                 message: "tool shape is not translatable",
+                 param: "tools"
+               }
+      end
 
       additional_tools_item = %{
         "type" => "additional_tools",
@@ -444,8 +464,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       assert result.payload["input"] == [additional_tools_item]
     end
 
+    # A client-sent manifest is forwarded for the provider to validate, its `tool_search` included (findings#313).
     @tag :unsupported_fields
-    test "Responses rejects tool_search nested in additional_tools before coercion" do
+    test "Responses forwards a tool_search nested in additional_tools for the provider to validate" do
       supported_tool =
         flat_function_tool(
           "lookup_additional_tool_search",
@@ -459,25 +480,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           |> List.delete_at(1)
           |> List.insert_at(position, %{"type" => "tool_search"})
 
-        assert {:error, reason} =
+        manifest = %{"type" => "additional_tools", "role" => "developer", "tools" => tools}
+
+        assert {:ok, result} =
                  Responses.coerce(%{
                    "model" => "gpt-fixture-text",
-                   "input" => [
-                     %{"role" => "user", "content" => "synthetic input"},
-                     %{
-                       "type" => "additional_tools",
-                       "role" => "developer",
-                       "tools" => tools
-                     }
-                   ]
+                   "input" => [%{"role" => "user", "content" => "synthetic input"}, manifest]
                  })
 
-        assert reason == %{
-                 status: 400,
-                 code: "invalid_request",
-                 message: "tool_search tools are not supported",
-                 param: "input"
-               }
+        assert manifest in result.payload["input"]
       end
 
       similarly_named_tool = %{"type" => "tool_search_preview"}
@@ -794,7 +805,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              "arguments" => arguments
            } = function_call
 
-    assert Jason.decode!(arguments) == %{"commands" => ["printf fixture"]}
+    assert CodexPooler.JSON.decode!(arguments) == %{"commands" => ["printf fixture"]}
 
     assert function_output == %{
              "type" => "function_call_output",
@@ -1050,6 +1061,108 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
+  test "Chat coerces Responses-shaped fallbacks while retaining Chat SSE options" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "input" => "synthetic fallback fallback input",
+      "reasoning" => %{"effort" => "low"},
+      "text" => %{"verbosity" => "low"},
+      "include" => ["reasoning.encrypted_content"],
+      "stream" => true,
+      "stream_options" => %{"include_usage" => true}
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+
+    assert result.payload["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [
+                 %{"type" => "input_text", "text" => "synthetic fallback fallback input"}
+               ]
+             }
+           ]
+
+    assert result.payload["reasoning"] == payload["reasoning"]
+    assert result.payload["text"] == payload["text"]
+    assert result.payload["include"] == payload["include"]
+    refute Map.has_key?(result.payload, "stream_options")
+    assert result.chat_payload["stream_options"] == %{"include_usage" => true}
+  end
+
+  test "Chat discards the optional user identifier before normalization" do
+    for input <- [
+          %{"input" => "synthetic input"},
+          %{"messages" => [%{"role" => "user", "content" => "synthetic input"}]}
+        ],
+        user <- [nil, "", "synthetic-user"] do
+      payload = Map.merge(input, %{"model" => "gpt-fixture-text", "user" => user})
+      assert {:ok, result} = Chat.coerce(payload)
+      refute Map.has_key?(result.payload, "user")
+      refute Map.has_key?(result.chat_payload, "user")
+    end
+
+    for user <- [42, %{}, []] do
+      assert {:error, %{code: "invalid_request", param: "user"}} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => "synthetic input",
+                 "user" => user
+               })
+    end
+  end
+
+  test "Chat accepts a flat custom tool beside ordinary messages" do
+    tool = %{"type" => "custom", "name" => "fixture_edit", "format" => %{"type" => "text"}}
+
+    assert {:ok, result} =
+             Chat.coerce(%{
+               "model" => "gpt-fixture-text",
+               "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+               "tools" => [tool]
+             })
+
+    assert result.payload["tools"] == [tool]
+  end
+
+  test "Chat preserves tool replay with an empty assistant content array" do
+    messages = [
+      %{
+        "role" => "assistant",
+        "content" => [],
+        "tool_calls" => [
+          %{
+            "id" => "call_fixture",
+            "type" => "function",
+            "function" => %{"name" => "fixture", "arguments" => "{}"}
+          }
+        ]
+      },
+      %{
+        "role" => "tool",
+        "tool_call_id" => "call_fixture",
+        "content" => [%{"type" => "text", "text" => "synthetic result"}]
+      }
+    ]
+
+    assert {:ok, result} = Chat.coerce(%{"model" => "gpt-fixture-text", "messages" => messages})
+
+    assert Enum.any?(
+             result.payload["input"],
+             &(&1["type"] == "function_call" and &1["call_id"] == "call_fixture")
+           )
+
+    for message <- [
+          %{"role" => "assistant", "content" => []},
+          %{"role" => "assistant", "content" => [], "tool_calls" => []}
+        ] do
+      assert {:error, %{param: "messages"}} =
+               Chat.coerce(%{"model" => "gpt-fixture-text", "messages" => [message]})
+    end
+  end
+
+  @tag :responses_coercion
   test "Chat falls back to Responses-shaped input when messages are empty" do
     payload = %{
       "model" => "gpt-fixture-text",
@@ -1071,22 +1184,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
-  test "Chat keeps non-empty messages authoritative over conflicting input" do
-    payload = %{
-      "model" => "gpt-fixture-text",
-      "messages" => [%{"role" => "user", "content" => "synthetic message input"}],
-      "input" => "synthetic conflicting fallback input"
-    }
-
-    assert {:ok, result} = Chat.coerce(payload)
-
-    assert result.payload["input"] == [
-             %{
-               "type" => "message",
-               "role" => "user",
-               "content" => [%{"type" => "input_text", "text" => "synthetic message input"}]
-             }
-           ]
+  test "Chat rejects non-empty messages combined with Responses fallback fields" do
+    assert {:error,
+            %{
+              status: 400,
+              code: "invalid_request",
+              message: "Responses fields cannot be combined with non-empty messages",
+              param: "input"
+            }} =
+             Chat.coerce(%{
+               "model" => "gpt-fixture-text",
+               "messages" => [%{"role" => "user", "content" => "synthetic message input"}],
+               "input" => "synthetic conflicting fallback input"
+             })
   end
 
   @tag :unsupported_fields
@@ -1106,15 +1216,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
-  test "Images generation preserves latest and legacy model slugs in Responses payloads" do
-    for model <- ["gpt-image-2", "gpt-image-1"] do
+  test "Images generation preserves legacy model slugs in Responses payloads" do
+    for model <- ["gpt-image-1.5", "gpt-image-1"] do
       payload = %{
         "model" => model,
         "prompt" => "synthetic image request",
         "size" => "1024x1024",
         "quality" => "high",
         "background" => "opaque",
-        "input_fidelity" => "high",
         "n" => 1
       }
 
@@ -1129,14 +1238,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
   @tag :responses_coercion
   test "Audio transcription canonicalizes accepted caller models in the dispatch envelope" do
-    for caller_model <- ["gpt-4o-transcribe", "gpt-transcribe"] do
+    for caller_model <- ["gpt-4o-transcribe", "gpt-transcribe"], response_format <- ["json", "text"] do
       upload = audio_upload_fixture("synthetic audio bytes")
 
       payload = %{
         "model" => caller_model,
         "file" => upload,
         "prompt" => "synthetic glossary",
-        "response_format" => "json"
+        "response_format" => response_format
       }
 
       assert {:ok, result} =
@@ -1243,6 +1352,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              "text" => "synthetic transcript",
              "metadata" => %{"languages" => ["nested-value"]}
            }
+  end
+
+  test "Audio text response normalization returns only the exact transcript" do
+    response = %{"text" => "  synthetic transcript\n", "languages" => ["en"], "asset_pointer" => "synthetic-asset"}
+
+    assert Audio.normalize_response(response, "text") == {:text, "  synthetic transcript\n"}
+    assert Audio.normalize_response(%{"text" => ""}, "text") == {:text, ""}
   end
 
   @tag :responses_validation
@@ -1393,8 +1509,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     invalid_payloads = [
       {%{"moderation" => %{}}, "moderation.model"},
       {%{"moderation" => %{"model" => " "}}, "moderation.model"},
-      {%{"moderation" => %{"model" => "omni-moderation-latest", "extra" => true}},
-       "moderation.extra"},
+      {%{"moderation" => %{"model" => "omni-moderation-latest", "extra" => true}}, "moderation.extra"},
       {%{"moderation" => "omni-moderation-latest"}, "moderation"},
       {%{"reasoning" => %{"context" => "recent_turns"}}, "reasoning.context"},
       {%{"reasoning" => %{"effort" => " "}}, "reasoning.effort"},
@@ -2389,9 +2504,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "id" => "cmp_fixture_context",
             "encrypted_content" => "synthetic-encrypted-context-compaction",
             passthrough_key => %{
-              "turn_id" => "turn_fixture_context",
-              "create_time" => 1_777_248_000,
-              "content_item_kinds" => ["user_message"]
+              "turn_id" => "turn_fixture_context"
             }
           },
           %{
@@ -2399,8 +2512,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "encrypted_content" => "synthetic-encrypted-compaction-extra",
             "id" => "cmp_fixture_extra",
             passthrough_key => %{
-              "turn_id" => "turn_fixture_extra",
-              "create_time" => 1_777_248_001
+              "turn_id" => "turn_fixture_extra"
             }
           },
           %{
@@ -2420,7 +2532,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "id" => "tsc_fixture",
             "call_id" => "call_tool_search",
             "status" => "completed",
-            "execution" => "tool_search",
+            "execution" => "server",
             "arguments" => %{"query" => "synthetic"}
           },
           %{
@@ -2428,7 +2540,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "id" => "tso_fixture",
             "call_id" => "call_tool_search",
             "status" => "completed",
-            "execution" => "tool_search",
+            "execution" => "server",
             "tools" => [%{"type" => "function", "name" => "lookup_fixture"}]
           },
           %{
@@ -2471,7 +2583,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                  "action" => %{"type" => "exec"}
                },
                %{"type" => "local_shell_call_output", "output" => "synthetic\n"},
-               %{"type" => "tool_search_call", "execution" => "tool_search"},
+               %{"type" => "tool_search_call", "execution" => "server"},
                %{"type" => "tool_search_output", "tools" => [_tool]},
                %{"type" => "apply_patch_call", "operation" => %{"type" => "create_file"}},
                %{"type" => "apply_patch_call_output", "call_id" => "call_apply_patch"},
@@ -2480,12 +2592,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
       refute Map.has_key?(reasoning, "status")
 
-      assert get_in(extra_compaction, [passthrough_key, "create_time"]) == 1_777_248_001
+      assert get_in(extra_compaction, [passthrough_key, "turn_id"]) == "turn_fixture_extra"
     end
 
-    test "OMP 16.3.14 GPT-5.6 clean first turn preserves supported Responses fields" do
+    test "OMP GPT-6 clean first turn preserves supported Responses fields" do
       payload = %{
-        "model" => "gpt-5.6-terra",
+        "model" => "gpt-6-sol",
         "input" => [
           %{
             "role" => "user",
@@ -3184,6 +3296,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         },
         %{"type" => "local_shell_call", "call_id" => "call_fixture"},
         %{"type" => "mcp_approval_response", "call_id" => "call_fixture", "output" => "bad"},
+        %{"type" => "web_search_call", "id" => "ws_fixture", "action" => %{"type" => "bogus_action"}},
         %{"type" => "unknown_fixture", "id" => "item_fixture"}
       ]
 
@@ -3238,20 +3351,359 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       assert [%{"output" => ^structured_output}] = structured_payload["input"]
     end
 
-    test "function_call_output normalizes input image detail from Responses SDK tool output" do
+    # findings#206 row 206-476: the provider reads `detail` on a tool-output
+    # image (it refuses a value outside low/high/auto/original with param
+    # `input[2].output[1].detail`), so `/v1` forwards it as the native client
+    # does on a Full model; a null detail stays absent, as the native client
+    # never serializes one. Lite strips it later, in the payload normalizer.
+    test "function_call_output keeps input image detail from Responses SDK tool output" do
+      breakpoint = %{"mode" => "explicit"}
+
+      output = [
+        %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+        %{"type" => "input_image", "detail" => "auto", "image_url" => "https://example.com/synthetic-image.png", "prompt_cache_breakpoint" => breakpoint},
+        %{"type" => "input_image", "detail" => "high", "file_id" => "file-fixture-image"},
+        %{"type" => "input_image", "detail" => "original", "image_url" => "https://example.com/original.png"},
+        %{"type" => "input_image", "detail" => "low", "file_id" => "file-fixture-low"},
+        %{"type" => "input_image", "detail" => nil, "file_id" => "file-fixture-null"}
+      ]
+
+      assert {:ok, %{payload: payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [%{"type" => "function_call_output", "call_id" => "call_fixture_image_detail", "output" => output}]
+               })
+
+      assert [%{"type" => "function_call_output", "call_id" => "call_fixture_image_detail", "output" => forwarded}] = payload["input"]
+
+      assert forwarded == [
+               %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+               %{"type" => "input_image", "detail" => "auto", "image_url" => "https://example.com/synthetic-image.png", "prompt_cache_breakpoint" => breakpoint},
+               %{"type" => "input_image", "detail" => "high", "file_id" => "file-fixture-image"},
+               %{"type" => "input_image", "detail" => "original", "image_url" => "https://example.com/original.png"},
+               %{"type" => "input_image", "detail" => "low", "file_id" => "file-fixture-low"},
+               %{"type" => "input_image", "file_id" => "file-fixture-null"}
+             ]
+
+      assert {:ok, %{payload: tool_payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{"role" => "tool", "tool_call_id" => "call_fixture_role_tool", "content" => [%{"type" => "input_image", "detail" => "high", "image_url" => "https://example.com/tool.png"}]}
+                 ]
+               })
+
+      assert [%{"type" => "function_call_output", "output" => [%{"type" => "input_image", "detail" => "high", "image_url" => "https://example.com/tool.png"}]}] = tool_payload["input"]
+    end
+
+    test "input_image detail outside the provider enum is refused with its field path" do
+      bogus_image = %{"type" => "input_image", "detail" => "bogus", "file_id" => "file-fixture-bogus"}
+
+      cases = [
+        {[
+           %{"type" => "function_call", "call_id" => "call_bogus", "name" => "view_image", "arguments" => "{}"},
+           %{"type" => "function_call_output", "call_id" => "call_bogus", "output" => [%{"type" => "input_text", "text" => "loaded"}, bogus_image]}
+         ], "input[1].output[1].detail"},
+        {[%{"role" => "tool", "tool_call_id" => "call_bogus", "content" => [bogus_image]}], "input[0].content[0].detail"},
+        {[%{"type" => "custom_tool_call_output", "call_id" => "call_bogus", "output" => [bogus_image]}], "input[0].output[0].detail"},
+        {[%{"type" => "function_call_output", "call_id" => "call_bogus", "output" => %{"content" => [bogus_image]}}], "input[0].output.content[0].detail"},
+        {[%{"type" => "custom_tool_call_output", "call_id" => "call_bogus", "output" => %{"content" => [bogus_image]}}], "input[0].output.content[0].detail"},
+        {[%{"role" => "system", "content" => "lifted"}, %{"role" => "user", "content" => [%{"type" => "input_text", "text" => "look"}, bogus_image]}], "input[1].content[1].detail"},
+        {[%{"type" => "function_call_output", "call_id" => "call_bogus", "output" => [%{bogus_image | "detail" => 3}]}], "input[0].output[0].detail"},
+        {[%{"type" => "function_call_output", "call_id" => "call_bogus", "output" => [%{bogus_image | "detail" => "HIGH"}]}], "input[0].output[0].detail"}
+      ]
+
+      for {input, param} <- cases do
+        assert {:error, %{status: 400, code: "invalid_value", param: ^param, message: message}} =
+                 Responses.coerce(%{"model" => "gpt-fixture-text", "input" => input})
+
+        assert message == "invalid value for parameter #{param} (invalid_value); supported values: low, high, auto, original"
+      end
+    end
+
+    test "object tool outputs retain valid image detail values" do
+      for type <- ["function_call_output", "custom_tool_call_output"], detail <- [nil, "low", "high", "auto", "original"] do
+        output = %{"content" => [%{"type" => "input_image", "image_url" => "https://example.com/sample.png", "detail" => detail}]}
+        assert {:ok, %{payload: payload}} = Responses.coerce(%{"model" => "sample-model", "input" => [%{"type" => type, "call_id" => "call_sample", "output" => output}]})
+        assert [%{"output" => %{"content" => [image]}}] = payload["input"]
+        assert image["detail"] == detail
+      end
+    end
+
+    # findings#206 row 206-488: the Codex backend accepts a JSON-null `detail`
+    # on a message image (probed 2026-09-24), but the native client never
+    # serializes one and a `/v1` tool-output image already drops it, so a
+    # message image drops it too: a null detail is absent on every `/v1` image.
+    test "message input_image keeps a string detail and drops a null one" do
+      breakpoint = %{"mode" => "explicit"}
+
+      assert {:ok, %{payload: payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{
+                     "type" => "message",
+                     "role" => "user",
+                     "content" => [
+                       %{"type" => "input_text", "text" => "synthetic image question"},
+                       %{"type" => "input_image", "detail" => nil, "image_url" => "https://example.com/null.png"},
+                       %{"type" => "input_image", "detail" => nil, "file_id" => "file-fixture-null", "prompt_cache_breakpoint" => breakpoint},
+                       %{"type" => "input_image", "detail" => "original", "image_url" => "https://example.com/original.png"}
+                     ]
+                   },
+                   %{"role" => "user", "content" => [%{"type" => "input_image", "detail" => nil, "image_url" => "https://example.com/untyped.png"}]}
+                 ]
+               })
+
+      assert [%{"type" => "message", "content" => content}, %{"type" => "message", "content" => untyped}] = payload["input"]
+
+      assert content == [
+               %{"type" => "input_text", "text" => "synthetic image question"},
+               %{"type" => "input_image", "image_url" => "https://example.com/null.png"},
+               %{"type" => "input_image", "file_id" => "file-fixture-null", "prompt_cache_breakpoint" => breakpoint},
+               %{"type" => "input_image", "detail" => "original", "image_url" => "https://example.com/original.png"}
+             ]
+
+      assert untyped == [%{"type" => "input_image", "image_url" => "https://example.com/untyped.png"}]
+    end
+
+    # The public Chat Completions API accepts `image_url.detail` (gpt-6-luna,
+    # probed 2026-09-24) and the Codex backend reads `detail` on an input image,
+    # so the Chat rebuild carries it into the `input_image` like the Responses
+    # adapter does; a null detail stays absent, and Lite strips it later.
+    test "Chat image_url detail becomes the input_image detail" do
+      assert {:ok, result} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [
+                   %{
+                     "role" => "user",
+                     "content" => [
+                       %{"type" => "text", "text" => "synthetic image question"},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/high.png", "detail" => "high"}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/original.png", "detail" => "original"}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/null.png", "detail" => nil}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/object.png"}},
+                       %{"type" => "image_url", "image_url" => "https://example.com/bare.png"}
+                     ]
+                   }
+                 ]
+               })
+
+      assert [%{"type" => "message", "role" => "user", "content" => content}] = result.payload["input"]
+
+      assert content == [
+               %{"type" => "input_text", "text" => "synthetic image question"},
+               %{"type" => "input_image", "image_url" => "https://example.com/high.png", "detail" => "high"},
+               %{"type" => "input_image", "image_url" => "https://example.com/original.png", "detail" => "original"},
+               %{"type" => "input_image", "image_url" => "https://example.com/null.png"},
+               %{"type" => "input_image", "image_url" => "https://example.com/object.png"},
+               %{"type" => "input_image", "image_url" => "https://example.com/bare.png"}
+             ]
+    end
+
+    test "Chat image detail outside the provider enum is refused with the Chat field path" do
+      bogus = %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/bogus.png", "detail" => "bogus"}}
+      text = %{"type" => "text", "text" => "synthetic image question"}
+
+      cases = [
+        {[%{"role" => "system", "content" => "lifted"}, %{"role" => "user", "content" => [text, bogus]}], "messages[1].content[1].image_url.detail"},
+        {[%{"role" => "user", "content" => [put_in(bogus, ["image_url", "detail"], "HIGH")]}], "messages[0].content[0].image_url.detail"},
+        {[%{"role" => "user", "content" => [put_in(bogus, ["image_url", "detail"], 3)]}], "messages[0].content[0].image_url.detail"},
+        {[%{"role" => "user", "content" => put_in(bogus, ["image_url", "detail"], "bogus")}], "messages[0].content.image_url.detail"},
+        {[%{"role" => "user", "content" => [text, %{"type" => "input_image", "image_url" => "https://example.com/bogus.png", "detail" => "bogus"}]}], "messages[0].content[1].detail"}
+      ]
+
+      for {messages, param} <- cases do
+        assert {:error, %{status: 400, code: "invalid_value", param: ^param, message: message}} =
+                 Chat.coerce(%{"model" => "gpt-fixture-text", "messages" => messages})
+
+        assert message == "invalid value for parameter #{param} (invalid_value); supported values: low, high, auto, original"
+      end
+    end
+
+    # Hermes in its default `chat_completions` mode (a `custom` provider without
+    # `api_mode: codex_responses`) sends a screenshot tool result as a Chat tool
+    # message whose content holds `image_url` parts. The Codex backend accepts
+    # an image in a `function_call_output` (findings#206 row 206-476, probed on
+    # `gpt-6-luna`), so the Chat rebuild carries it there with its detail.
+    test "Chat carries image_url parts of a tool message into the function_call_output" do
+      breakpoint = %{"mode" => "explicit"}
+
+      assert {:ok, result} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [
+                   %{"role" => "user", "content" => "synthetic screenshot request"},
+                   %{"role" => "assistant", "content" => nil, "tool_calls" => [%{"id" => "call_fixture_screenshot", "type" => "function", "function" => %{"name" => "computer_use", "arguments" => "{}"}}]},
+                   %{
+                     "role" => "tool",
+                     "name" => "computer_use",
+                     "tool_call_id" => "call_fixture_screenshot",
+                     "content" => [
+                       %{"type" => "text", "text" => "synthetic capture summary"},
+                       %{"type" => "image_url", "image_url" => %{"url" => "data:image/png;base64,iVBORw0KGgo="}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/high.png", "detail" => "high"}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/null.png", "detail" => nil}},
+                       %{"type" => "image_url", "image_url" => "https://example.com/bare.png", "prompt_cache_breakpoint" => breakpoint}
+                     ]
+                   }
+                 ]
+               })
+
+      assert [_user, %{"type" => "function_call", "call_id" => "call_fixture_screenshot"}, function_output] = result.payload["input"]
+
+      assert function_output == %{
+               "type" => "function_call_output",
+               "call_id" => "call_fixture_screenshot",
+               "output" => [
+                 %{"type" => "input_text", "text" => "synthetic capture summary"},
+                 %{"type" => "input_image", "image_url" => "data:image/png;base64,iVBORw0KGgo="},
+                 %{"type" => "input_image", "image_url" => "https://example.com/high.png", "detail" => "high"},
+                 %{"type" => "input_image", "image_url" => "https://example.com/null.png"},
+                 %{"type" => "input_image", "image_url" => "https://example.com/bare.png", "prompt_cache_breakpoint" => breakpoint}
+               ]
+             }
+
+      bogus = %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/bogus.png", "detail" => "bogus"}}
+
+      assert {:error, %{status: 400, code: "invalid_value", param: "messages[0].content[1].image_url.detail"}} =
+               Chat.coerce(%{"model" => "gpt-fixture-text", "messages" => [%{"role" => "tool", "tool_call_id" => "call_bogus", "content" => [%{"type" => "text", "text" => "loaded"}, bogus]}]})
+    end
+
+    # findings#206 row 206-494: a `/v1/responses` `role: "tool"` item may hold
+    # a Chat-style `image_url` part (a Pooler extension shape for clients that
+    # replay Chat tool messages as Responses input). Its `image_url.detail`
+    # reaches the rebuilt `input_image` like every other tool-output image, a
+    # null one stays absent, and a value outside the enum is refused under the
+    # field the client sent.
+    test "role tool image_url part keeps its detail in the function_call_output" do
+      assert {:ok, %{payload: payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{"type" => "function_call", "call_id" => "call_fixture_chat_image", "name" => "computer_use", "arguments" => "{}"},
+                   %{
+                     "role" => "tool",
+                     "tool_call_id" => "call_fixture_chat_image",
+                     "content" => [
+                       %{"type" => "text", "text" => "synthetic capture summary"},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/high.png", "detail" => "high"}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/original.png", "detail" => "original"}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/null.png", "detail" => nil}},
+                       %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/object.png"}},
+                       %{"type" => "image_url", "image_url" => "https://example.com/bare.png"}
+                     ]
+                   }
+                 ]
+               })
+
+      assert [_call, %{"type" => "function_call_output", "call_id" => "call_fixture_chat_image", "output" => output}] = payload["input"]
+
+      assert output == [
+               %{"type" => "input_text", "text" => "synthetic capture summary"},
+               %{"type" => "input_image", "image_url" => "https://example.com/high.png", "detail" => "high"},
+               %{"type" => "input_image", "image_url" => "https://example.com/original.png", "detail" => "original"},
+               %{"type" => "input_image", "image_url" => "https://example.com/null.png"},
+               %{"type" => "input_image", "image_url" => "https://example.com/object.png"},
+               %{"type" => "input_image", "image_url" => "https://example.com/bare.png"}
+             ]
+
+      bogus = %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/bogus.png", "detail" => "bogus"}}
+      text = %{"type" => "text", "text" => "loaded"}
+
+      call = %{"type" => "function_call", "call_id" => "call_bogus", "name" => "view_image", "arguments" => "{}"}
+      tool = fn detail -> %{"role" => "tool", "tool_call_id" => "call_bogus", "content" => [text, put_in(bogus, ["image_url", "detail"], detail)]} end
+
+      cases = [
+        {[tool.("bogus")], "input[0].content[1].image_url.detail"},
+        {[call, tool.("HIGH")], "input[1].content[1].image_url.detail"},
+        {[call, tool.(3)], "input[1].content[1].image_url.detail"}
+      ]
+
+      for {input, param} <- cases do
+        assert {:error, %{status: 400, code: "invalid_value", param: ^param, message: message}} = Responses.coerce(%{"model" => "gpt-fixture-text", "input" => input})
+        assert message == "invalid value for parameter #{param} (invalid_value); supported values: low, high, auto, original"
+      end
+    end
+
+    # findings#206 row 206-494: a Cline `tool-result` part in a Chat message
+    # (the shape the Pooler has translated since the June Cline continuations)
+    # carries its image detail into the rebuilt `function_call_output` image,
+    # and a value outside the enum is refused under the Chat field path.
+    test "Chat Cline tool-result images keep their detail" do
+      assert {:ok, result} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [
+                   %{"role" => "assistant", "content" => [%{"type" => "tool-call", "toolCallId" => "call_fixture_cline_image", "toolName" => "browser_action", "input" => %{"action" => "screenshot"}}]},
+                   %{
+                     "role" => "user",
+                     "content" => [
+                       %{
+                         "type" => "tool-result",
+                         "toolCallId" => "call_fixture_cline_image",
+                         "toolName" => "browser_action",
+                         "output" => [
+                           %{"type" => "text", "text" => "synthetic screenshot taken"},
+                           %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/high.png", "detail" => "high"}},
+                           %{"type" => "input_image", "image_url" => "https://example.com/low.png", "detail" => "low"},
+                           %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/null.png", "detail" => nil}},
+                           %{"type" => "input_image", "image_url" => "https://example.com/input-null.png", "detail" => nil},
+                           %{"type" => "image_url", "image_url" => "https://example.com/bare.png"},
+                           %{"type" => "image", "data" => "YWJj", "mediaType" => "image/png"}
+                         ]
+                       }
+                     ]
+                   }
+                 ]
+               })
+
+      assert [%{"type" => "function_call"}, %{"type" => "function_call_output", "call_id" => "call_fixture_cline_image", "output" => output}] = result.payload["input"]
+
+      assert output == [
+               %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+               %{"type" => "input_image", "image_url" => "https://example.com/high.png", "detail" => "high"},
+               %{"type" => "input_image", "image_url" => "https://example.com/low.png", "detail" => "low"},
+               %{"type" => "input_image", "image_url" => "https://example.com/null.png"},
+               %{"type" => "input_image", "image_url" => "https://example.com/input-null.png"},
+               %{"type" => "input_image", "image_url" => "https://example.com/bare.png"},
+               %{"type" => "input_image", "image_url" => "data:image/png;base64,YWJj"}
+             ]
+
+      tool_result = fn output -> %{"type" => "tool-result", "toolCallId" => "call_bogus", "toolName" => "browser_action", "output" => output} end
+      text = %{"type" => "text", "text" => "loaded"}
+      bogus = %{"type" => "image_url", "image_url" => %{"url" => "https://example.com/bogus.png", "detail" => "bogus"}}
+
+      cases = [
+        {[%{"role" => "user", "content" => "look"}, %{"role" => "user", "content" => [tool_result.([text, bogus])]}], "messages[1].content[0].output[1].image_url.detail"},
+        {[%{"role" => "user", "content" => [text, tool_result.([put_in(bogus, ["image_url", "detail"], "HIGH")])]}], "messages[0].content[1].output[0].image_url.detail"},
+        {[%{"role" => "user", "content" => [tool_result.([%{"type" => "input_image", "image_url" => "https://example.com/bogus.png", "detail" => 3}])]}], "messages[0].content[0].output[0].detail"},
+        {[%{"role" => "user", "content" => tool_result.([text, bogus])}], "messages[0].content.output[1].image_url.detail"}
+      ]
+
+      for {messages, param} <- cases do
+        assert {:error, %{status: 400, code: "invalid_value", param: ^param, message: message}} = Chat.coerce(%{"model" => "gpt-fixture-text", "messages" => messages})
+        assert message == "invalid value for parameter #{param} (invalid_value); supported values: low, high, auto, original"
+      end
+    end
+
+    # findings#258 row 258-11: the Responses SDK types a tool-output image as
+    # `input_image` with `file_id` or `image_url`; the file reference is kept.
+    test "function_call_output keeps an input_image file_id from Responses SDK tool output" do
       assert {:ok, %{payload: payload}} =
                Responses.coerce(%{
                  "model" => "gpt-fixture-text",
                  "input" => [
                    %{
                      "type" => "function_call_output",
-                     "call_id" => "call_fixture_image_detail",
+                     "call_id" => "call_fixture_image_file",
                      "output" => [
-                       %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+                       %{"type" => "input_text", "text" => "synthetic screenshot stored"},
+                       %{"type" => "input_image", "detail" => "auto", "file_id" => "file-fixture-image"},
                        %{
                          "type" => "input_image",
-                         "detail" => "auto",
-                         "image_url" => "https://example.com/synthetic-image.png",
+                         "file_id" => "file-fixture-image-marked",
                          "prompt_cache_breakpoint" => %{"mode" => "explicit"}
                        }
                      ]
@@ -3262,17 +3714,30 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       assert [
                %{
                  "type" => "function_call_output",
-                 "call_id" => "call_fixture_image_detail",
+                 "call_id" => "call_fixture_image_file",
                  "output" => [
-                   %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+                   %{"type" => "input_text", "text" => "synthetic screenshot stored"},
+                   %{"type" => "input_image", "file_id" => "file-fixture-image"},
                    %{
                      "type" => "input_image",
-                     "image_url" => "https://example.com/synthetic-image.png",
+                     "file_id" => "file-fixture-image-marked",
                      "prompt_cache_breakpoint" => %{"mode" => "explicit"}
                    }
                  ]
                }
              ] = payload["input"]
+
+      assert {:error, %{param: "input"}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_fixture_image_blank_file",
+                     "output" => [%{"type" => "input_image", "file_id" => ""}]
+                   }
+                 ]
+               })
     end
 
     test "structured function_call_output preserves explicit null output" do
@@ -3867,7 +4332,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              Responses.coerce(payload)
   end
 
-  describe "issue 241 direct Responses custom tool admission" do
+  describe "responses tool compatibility direct Responses custom tool admission" do
     test "existing function tools and named choices remain semantically unchanged" do
       function_tool =
         flat_function_tool(
@@ -4162,24 +4627,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         {"missing name", %{"type" => "custom"}},
         {"blank name", %{"type" => "custom", "name" => "   "}},
         {"non-string name", %{"type" => "custom", "name" => true}},
-        {"non-string description",
-         %{"type" => "custom", "name" => "custom_fixture", "description" => false}},
-        {"non-boolean defer_loading",
-         %{"type" => "custom", "name" => "custom_fixture", "defer_loading" => "true"}},
-        {"null defer_loading",
-         %{"type" => "custom", "name" => "custom_fixture", "defer_loading" => nil}},
-        {"scalar allowed_callers",
-         %{"type" => "custom", "name" => "custom_fixture", "allowed_callers" => "direct"}},
-        {"boolean allowed_callers",
-         %{"type" => "custom", "name" => "custom_fixture", "allowed_callers" => true}},
+        {"non-string description", %{"type" => "custom", "name" => "custom_fixture", "description" => false}},
+        {"non-boolean defer_loading", %{"type" => "custom", "name" => "custom_fixture", "defer_loading" => "true"}},
+        {"null defer_loading", %{"type" => "custom", "name" => "custom_fixture", "defer_loading" => nil}},
+        {"scalar allowed_callers", %{"type" => "custom", "name" => "custom_fixture", "allowed_callers" => "direct"}},
+        {"boolean allowed_callers", %{"type" => "custom", "name" => "custom_fixture", "allowed_callers" => true}},
         {"invalid caller token",
          %{
            "type" => "custom",
            "name" => "custom_fixture",
            "allowed_callers" => ["direct", "unknown"]
          }},
-        {"invalid caller member type",
-         %{"type" => "custom", "name" => "custom_fixture", "allowed_callers" => [false]}},
+        {"invalid caller member type", %{"type" => "custom", "name" => "custom_fixture", "allowed_callers" => [false]}},
         {"null format", %{"type" => "custom", "name" => "custom_fixture", "format" => nil}},
         {"boolean format", %{"type" => "custom", "name" => "custom_fixture", "format" => true}},
         {"text format with extra key",
@@ -4233,8 +4692,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              "extra" => true
            }
          }},
-        {"unknown custom field",
-         %{"type" => "custom", "name" => "custom_fixture", "parameters" => %{}}}
+        {"unknown custom field", %{"type" => "custom", "name" => "custom_fixture", "parameters" => %{}}}
       ]
 
       Enum.each(invalid_tools, fn {_label, custom_tool} ->
@@ -4262,16 +4720,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         {"blank custom choice name", %{"type" => "custom", "name" => "   "}},
         {"non-string custom choice name", %{"type" => "custom", "name" => true}},
         {"unknown custom choice", %{"type" => "custom", "name" => "missing_fixture"}},
-        {"case-mismatched custom choice",
-         %{"type" => "custom", "name" => "custom_choice_fixture"}},
-        {"whitespace-mismatched custom choice",
-         %{"type" => "custom", "name" => " Custom_Choice_Fixture "}},
-        {"function name used as custom choice",
-         %{"type" => "custom", "name" => "function_choice_fixture"}},
-        {"custom choice with extra key",
-         %{"type" => "custom", "name" => "Custom_Choice_Fixture", "extra" => true}},
-        {"custom name used as function choice",
-         %{"type" => "function", "name" => "Custom_Choice_Fixture"}}
+        {"case-mismatched custom choice", %{"type" => "custom", "name" => "custom_choice_fixture"}},
+        {"whitespace-mismatched custom choice", %{"type" => "custom", "name" => " Custom_Choice_Fixture "}},
+        {"function name used as custom choice", %{"type" => "custom", "name" => "function_choice_fixture"}},
+        {"custom choice with extra key", %{"type" => "custom", "name" => "Custom_Choice_Fixture", "extra" => true}},
+        {"custom name used as function choice", %{"type" => "function", "name" => "Custom_Choice_Fixture"}}
       ]
 
       Enum.each(invalid_choices, fn {_label, choice} ->
@@ -4322,17 +4775,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       collision_cases = [
         {"duplicate top-level functions", [function.("shared"), function.("shared")]},
         {"duplicate custom tools", [custom.("shared"), custom.("shared")]},
-        {"duplicate namespace containers",
-         [namespace.("shared_namespace", ["first"]), namespace.("shared_namespace", ["second"])]},
-        {"duplicate children in one namespace",
-         [namespace.("first_namespace", ["shared", "shared"])]},
-        {"duplicate children across namespaces",
-         [namespace.("first_namespace", ["shared"]), namespace.("second_namespace", ["shared"])]},
+        {"duplicate namespace containers", [namespace.("shared_namespace", ["first"]), namespace.("shared_namespace", ["second"])]},
+        {"duplicate children in one namespace", [namespace.("first_namespace", ["shared", "shared"])]},
+        {"duplicate children across namespaces", [namespace.("first_namespace", ["shared"]), namespace.("second_namespace", ["shared"])]},
         {"function and custom", [function.("shared"), custom.("shared")]},
-        {"function and namespace child",
-         [function.("shared"), namespace.("fixture_namespace", ["shared"])]},
-        {"custom and namespace child",
-         [custom.("shared"), namespace.("fixture_namespace", ["shared"])]}
+        {"function and namespace child", [function.("shared"), namespace.("fixture_namespace", ["shared"])]},
+        {"custom and namespace child", [custom.("shared"), namespace.("fixture_namespace", ["shared"])]}
       ]
 
       Enum.each(collision_cases, fn {_label, tools} ->
@@ -4476,8 +4924,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         {%{"type" => "function", "name" => "", "parameters" => %{}}, "tools"},
         {%{"type" => "function", "name" => "   ", "parameters" => %{}}, "tools"},
         {%{"type" => "function", "name" => "lookup_fixture", "parameters" => []}, "tools"},
-        {%{"type" => "unsupported_tool", "name" => "lookup_fixture", "parameters" => %{}},
-         "tools"},
+        {%{"type" => "unsupported_tool", "name" => "lookup_fixture", "parameters" => %{}}, "tools"},
         {function_tool("chat_only_nested", %{"type" => "object", "properties" => %{}}), "tools"}
       ]
 
@@ -4646,8 +5093,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       }
 
       invalid_cases = [
-        {Map.put(base_payload, "tools", [%{"type" => "custom", "name" => "custom_fixture"}]),
-         "tools"},
+        {Map.put(base_payload, "tools", [%{"type" => "custom", "name" => 42}]), "tools"},
         {Map.put(base_payload, "tools", [%{"type" => "custom", "custom" => %{}}]), "tools"},
         {Map.put(base_payload, "tools", [
            %{
@@ -4657,8 +5103,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
          ]), "tools"},
         {base_payload
          |> Map.put("tools", [valid_custom_tool])
-         |> Map.put("tool_choice", %{"type" => "custom", "name" => "custom_fixture"}),
-         "tool_choice"},
+         |> Map.put("tool_choice", %{"type" => "custom", "name" => "custom_fixture"}), "tool_choice"},
         {base_payload
          |> Map.put("tools", [valid_custom_tool])
          |> Map.put("tool_choice", %{
@@ -4718,9 +5163,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
            "name" => "lookup_fixture",
            "parameters" => %{"type" => "object", "properties" => %{}}
          }, %{"type" => "function", "name" => "lookup_fixture"}},
-        {%{"type" => "custom", "name" => "custom_fixture"},
-         %{"type" => "custom", "name" => "custom_fixture"}},
-        {%{"type" => "programmatic_tool_calling"}, %{"type" => "programmatic_tool_calling"}},
+        {%{"type" => "custom", "name" => "custom_fixture"}, %{"type" => "custom", "name" => "custom_fixture"}},
         {%{"type" => "image_generation"}, %{"type" => "image_generation"}}
       ]
 
@@ -4743,8 +5186,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         flat_function_tool("lookup_fixture", non_strict_tool_schema(), false)
         |> Map.put("defer_loading", false),
         %{"type" => "custom", "name" => "custom_fixture"},
-        %{"type" => "programmatic_tool_calling"},
-        %{"type" => "web_search_preview"},
         %{"type" => "web_search"},
         %{"type" => "web_search"},
         %{"type" => "image_generation"}
@@ -4754,9 +5195,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{"type" => "custom", "name" => "custom_fixture"},
         %{"type" => "web_search"},
         %{"type" => "function", "name" => "lookup_fixture"},
-        %{"type" => "programmatic_tool_calling"},
         %{"type" => "image_generation"},
-        %{"type" => "web_search_preview"},
         %{"type" => "function", "name" => "lookup_fixture"},
         %{"type" => "web_search"}
       ]
@@ -4799,7 +5238,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         direct_custom,
         namespace,
         %{"type" => "programmatic_tool_calling"},
-        %{"type" => "web_search_preview"},
         %{"type" => "web_search"},
         %{"type" => "image_generation"}
       ]
@@ -4808,8 +5246,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
       invalid_cases = [
         {"missing envelope type", %{"mode" => "auto", "tools" => [valid_entry]}, base_tools, nil},
-        {"wrong envelope type", %{"type" => "other", "mode" => "auto", "tools" => [valid_entry]},
-         base_tools, nil},
+        {"wrong envelope type", %{"type" => "other", "mode" => "auto", "tools" => [valid_entry]}, base_tools, nil},
         {"missing mode", %{"type" => "allowed_tools", "tools" => [valid_entry]}, base_tools, nil},
         {"missing tools", %{"type" => "allowed_tools", "mode" => "auto"}, base_tools, nil},
         {"extra root key",
@@ -4819,25 +5256,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
            "tools" => [valid_entry],
            "extra" => true
          }, base_tools, nil},
-        {"unsupported mode",
-         %{"type" => "allowed_tools", "mode" => "none", "tools" => [valid_entry]}, base_tools,
-         nil},
-        {"empty tools", %{"type" => "allowed_tools", "mode" => "auto", "tools" => []}, base_tools,
-         nil},
-        {"non-list tools", %{"type" => "allowed_tools", "mode" => "auto", "tools" => %{}},
-         base_tools, nil},
-        {"non-map entry",
-         %{"type" => "allowed_tools", "mode" => "auto", "tools" => ["lookup_fixture"]},
-         base_tools, nil},
+        {"unsupported mode", %{"type" => "allowed_tools", "mode" => "none", "tools" => [valid_entry]}, base_tools, nil},
+        {"empty tools", %{"type" => "allowed_tools", "mode" => "auto", "tools" => []}, base_tools, nil},
+        {"non-list tools", %{"type" => "allowed_tools", "mode" => "auto", "tools" => %{}}, base_tools, nil},
+        {"non-map entry", %{"type" => "allowed_tools", "mode" => "auto", "tools" => ["lookup_fixture"]}, base_tools, nil},
         {"entry missing type",
          %{
            "type" => "allowed_tools",
            "mode" => "auto",
            "tools" => [%{"name" => "lookup_fixture"}]
          }, base_tools, nil},
-        {"entry missing name",
-         %{"type" => "allowed_tools", "mode" => "auto", "tools" => [%{"type" => "function"}]},
-         base_tools, nil},
+        {"entry missing name", %{"type" => "allowed_tools", "mode" => "auto", "tools" => [%{"type" => "function"}]}, base_tools, nil},
         {"entry blank name",
          %{
            "type" => "allowed_tools",
@@ -4874,9 +5303,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
            "mode" => "auto",
            "tools" => [%{"type" => "custom", "name" => "lookup_fixture"}]
          }, base_tools, nil},
-        {"deferred function",
-         %{"type" => "allowed_tools", "mode" => "auto", "tools" => [valid_entry]},
-         [Map.put(direct_function, "defer_loading", true)], nil},
+        {"deferred function", %{"type" => "allowed_tools", "mode" => "auto", "tools" => [valid_entry]}, [Map.put(direct_function, "defer_loading", true)], nil},
         {"deferred custom",
          %{
            "type" => "allowed_tools",
@@ -4920,6 +5347,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
            "mode" => "auto",
            "tools" => [%{"type" => "web_search", "name" => "web"}]
          }, base_tools, nil},
+        # Refused by the Codex backend on Full, the only mode an allowed_tools choice serves (findings#333).
+        {"declared programmatic_tool_calling member",
+         %{
+           "type" => "allowed_tools",
+           "mode" => "auto",
+           "tools" => [%{"type" => "programmatic_tool_calling"}]
+         }, base_tools, nil},
+        {"web_search_preview member",
+         %{
+           "type" => "allowed_tools",
+           "mode" => "auto",
+           "tools" => [%{"type" => "web_search_preview"}]
+         }, base_tools, nil},
         {"namespace member",
          %{
            "type" => "allowed_tools",
@@ -4945,9 +5385,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           Enum.map(
             ~w(code_interpreter file_search computer apply_patch shell local_shell),
             fn type ->
-              {"unsupported built-in #{type}",
-               %{"type" => "allowed_tools", "mode" => "auto", "tools" => [%{"type" => type}]},
-               base_tools, nil}
+              {"unsupported built-in #{type}", %{"type" => "allowed_tools", "mode" => "auto", "tools" => [%{"type" => type}]}, base_tools, nil}
             end
           )
 
@@ -5066,19 +5504,25 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       end)
     end
 
-    test "Responses accepts only the exact programmatic hosted tool and tool choice" do
+    # The declaration passes the adapter (a Lite manifest accepts it; a Full request is refused once the serving mode is
+    # resolved, `PayloadNormalizer.validate/2`), while a type-only choice naming it is refused on every mode: the Codex
+    # backend refuses the tool on Full and Lite refuses an object choice (findings#333).
+    test "Responses accepts only the exact programmatic hosted tool and refuses a choice naming it" do
       hosted_tool = %{"type" => "programmatic_tool_calling"}
 
       payload = %{
         "model" => "gpt-fixture-text",
         "input" => "synthetic input",
-        "tools" => [hosted_tool],
-        "tool_choice" => hosted_tool
+        "tools" => [hosted_tool]
       }
 
       assert {:ok, result} = Responses.coerce(payload)
       assert result.payload["tools"] == [hosted_tool]
-      assert result.payload["tool_choice"] == hosted_tool
+
+      assert {:error, %{status: 400, code: "invalid_request", param: "tool_choice"}} =
+               payload
+               |> Map.put("tool_choice", hosted_tool)
+               |> Responses.coerce()
 
       for invalid_tool <- [
             %{"type" => "programmatic_tool_calling", "unexpected" => true},
@@ -5281,7 +5725,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{
           "type" => "web_search",
           "external_web_access" => true,
-          "index_gated_web_access" => true
+          "indexed_web_access" => true
         }
       ]
 
@@ -5301,14 +5745,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             %{
               "type" => "web_search",
               "external_web_access" => true,
-              "index_gated_web_access" => false
+              "indexed_web_access" => false
             },
             %{
               "type" => "web_search",
               "external_web_access" => false,
-              "index_gated_web_access" => true
+              "indexed_web_access" => true
             },
-            %{"type" => "web_search", "index_gated_web_access" => true}
+            %{"type" => "web_search", "indexed_web_access" => true}
           ] do
         assert {:error, %{status: 400, code: "invalid_request", param: "tools"}} =
                  Responses.coerce(%{
@@ -5399,7 +5843,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     test "Responses allows only exact safe passthrough built-in tool shapes" do
       for tool <- [
-            %{"type" => "web_search_preview"},
             %{
               "type" => "web_search",
               "external_web_access" => false
@@ -5407,7 +5850,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             %{
               "type" => "web_search",
               "external_web_access" => true,
-              "index_gated_web_access" => true
+              "indexed_web_access" => true
             },
             %{
               "type" => "web_search",
@@ -5437,24 +5880,26 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     test "Responses rejects unsupported hosted built-in and deferred tools" do
       rejected_tools = [
+        # The Codex backend refuses the tool type (findings#333); never rewritten to `web_search`.
+        %{"type" => "web_search_preview"},
         %{"type" => "web_search_preview", "search_context_size" => "low"},
         %{"type" => "web_search", "external_web_access" => "true"},
         %{
           "type" => "web_search",
           "external_web_access" => true,
-          "index_gated_web_access" => "true"
+          "indexed_web_access" => "true"
         },
         %{
           "type" => "web_search",
           "external_web_access" => true,
-          "index_gated_web_access" => false
+          "indexed_web_access" => false
         },
         %{
           "type" => "web_search",
           "external_web_access" => false,
-          "index_gated_web_access" => true
+          "indexed_web_access" => true
         },
-        %{"type" => "web_search", "index_gated_web_access" => true},
+        %{"type" => "web_search", "indexed_web_access" => true},
         %{"type" => "web_search", "external_web_access" => true, "filters" => %{}},
         %{"type" => "image_generation", "quality" => "high"},
         %{"type" => "file_search", "vector_store_ids" => ["vs_fixture"]},
@@ -6229,8 +6674,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert reason == %{
              status: 400,
              code: "invalid_function_parameters",
-             message:
-               "Invalid schema for function 'lookup_missing_additional_properties': strict json_schema object schemas must set additionalProperties to false",
+             message: "Invalid schema for function 'lookup_missing_additional_properties': strict json_schema object schemas must set additionalProperties to false",
              param: "tools.0.parameters"
            }
   end
@@ -6254,8 +6698,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert reason == %{
              status: 400,
              code: "invalid_function_parameters",
-             message:
-               "Invalid schema for function 'lookup_additional_properties_true': strict json_schema object schemas must set additionalProperties to false",
+             message: "Invalid schema for function 'lookup_additional_properties_true': strict json_schema object schemas must set additionalProperties to false",
              param: "tools.0.parameters"
            }
   end
@@ -6278,8 +6721,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert reason == %{
              status: 400,
              code: "invalid_function_parameters",
-             message:
-               "Invalid schema for function 'lookup_omitted_required': strict json_schema object schemas must list every property in required (missing ok)",
+             message: "Invalid schema for function 'lookup_omitted_required': strict json_schema object schemas must list every property in required (missing ok)",
              param: "tools.0.parameters.required"
            }
 
@@ -6303,8 +6745,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert reason == %{
              status: 400,
              code: "invalid_function_parameters",
-             message:
-               "Invalid schema for function 'lookup_missing_required_property': strict json_schema object schemas must list every property in required (missing extra)",
+             message: "Invalid schema for function 'lookup_missing_required_property': strict json_schema object schemas must list every property in required (missing extra)",
              param: "tools.0.parameters.required"
            }
   end
@@ -6316,7 +6757,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "model" => "gpt-fixture-text",
                "input" => "synthetic input",
                "tools" => [
-                 %{"type" => "web_search_preview"},
+                 %{"type" => "web_search"},
                  flat_function_tool("lookup_nested_object", %{
                    "type" => "object",
                    "additionalProperties" => false,
@@ -6335,8 +6776,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert reason == %{
              status: 400,
              code: "invalid_function_parameters",
-             message:
-               "Invalid schema for function 'lookup_nested_object': strict json_schema object schemas must set additionalProperties to false",
+             message: "Invalid schema for function 'lookup_nested_object': strict json_schema object schemas must set additionalProperties to false",
              param: "tools.1.parameters.properties.settings"
            }
   end
@@ -6640,8 +7080,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         ),
         "tools.0.parameters.properties.profile.$ref"
       },
-      {"ref_only_cycle", ref_only_cycle_function_parameters(),
-       "tools.0.parameters.properties.profile.$ref"},
+      {"ref_only_cycle", ref_only_cycle_function_parameters(), "tools.0.parameters.properties.profile.$ref"},
       {
         "non_map_target",
         invalid_local_ref_function_parameters(
@@ -6685,7 +7124,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
-  test "strict false and omitted strict function parameters preserve accepted behavior" do
+  test "Responses preserves omitted strict while Chat makes its non-strict default explicit" do
     response_payload = %{
       "model" => "gpt-fixture-text",
       "input" => "synthetic input",
@@ -7098,6 +7537,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     @tag :input_audio_backport
     @tag timeout: 120_000
+    @tag slow: "decodes the real 50 MiB audio boundary with permitted whitespace"
     test "Responses accepts exactly 50 MiB when only ASCII whitespace exceeds the encoded limit" do
       source = :binary.copy(<<0>>, 52_428_800)
       encoded = Base.encode64(source)
@@ -7116,6 +7556,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     @tag :input_audio_backport
     @tag timeout: 120_000
+    @tag slow: "decodes the real 50 MiB audio rejection boundary"
     test "Responses rejects decoded audio one byte above 50 MiB" do
       source = :binary.copy(<<0>>, 52_428_801)
 
@@ -7213,10 +7654,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "file_fixture"
 
       invalid_payloads = [
-        {%{"type" => "input_image", "image_url" => "sediment://file_fixture"},
-         "unsupported_input_image_format"},
-        {%{"type" => "input_image", "image_url" => "http://example.com/sample.png"},
-         "unsupported_input_image_format"},
+        {%{"type" => "input_image", "image_url" => "sediment://file_fixture"}, "unsupported_input_image_format"},
+        {%{"type" => "input_image", "image_url" => "http://example.com/sample.png"}, "unsupported_input_image_format"},
         {%{
            "type" => "input_image",
            "image_url" => "data:text/html;base64," <> Base.encode64("html fixture")
@@ -7445,6 +7884,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   defp translated_chat_tool(%{"type" => "function", "function" => function}) do
     function
     |> Map.take(["name", "description", "parameters", "strict"])
+    |> Map.put_new("strict", false)
     |> Map.put("type", "function")
   end
 
@@ -7687,7 +8127,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     options = %{"mode" => "explicit", "ttl" => "30m"}
 
     payload = %{
-      "model" => "gpt-5.6",
+      "model" => "gpt-6-sol",
       "prompt_cache_options" => options,
       "input" => [
         %{
@@ -7807,7 +8247,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         ] do
       assert {:ok, result} =
                Responses.coerce(%{
-                 "model" => "gpt-5.6",
+                 "model" => "gpt-6-sol",
                  "input" => "fixture",
                  "prompt_cache_options" => options
                })
@@ -7822,7 +8262,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     breakpoint = prompt_cache_breakpoint()
 
     payload = %{
-      "model" => "gpt-5.6",
+      "model" => "gpt-6-sol",
       "prompt_cache_options" => %{"mode" => "explicit", "ttl" => "30m"},
       "messages" => [
         %{
@@ -7879,7 +8319,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
   test "Chat preserves message-part grouping around repeated special tool parts" do
     payload = %{
-      "model" => "gpt-5.6",
+      "model" => "gpt-6-sol",
       "messages" => [
         %{
           "role" => "user",
@@ -7945,20 +8385,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     ]
 
     for {message, expected} <- cases do
-      assert {:error, ^expected} = Chat.coerce(%{"model" => "gpt-5.6", "messages" => [message]})
+      assert {:error, ^expected} = Chat.coerce(%{"model" => "gpt-6-sol", "messages" => [message]})
     end
   end
 
   @tag :prompt_cache_controls
-  test "Chat rejects image and file parts in tool messages" do
+  # A tool message carries text and images (the image parts become
+  # `function_call_output` images); a file part is still refused.
+  test "Chat rejects file parts in tool messages" do
     breakpoint = prompt_cache_breakpoint()
 
     for part <- [
-          %{
-            "type" => "image_url",
-            "image_url" => "https://example.com/image.png",
-            "prompt_cache_breakpoint" => breakpoint
-          },
           %{
             "type" => "file",
             "file" => %{"file_id" => "file_fixture"},
@@ -7973,7 +8410,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                 param: "messages"
               }} =
                Chat.coerce(%{
-                 "model" => "gpt-5.6",
+                 "model" => "gpt-6-sol",
                  "messages" => [
                    %{"role" => "tool", "tool_call_id" => "call_fixture", "content" => [part]}
                  ]
@@ -8031,7 +8468,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     for {options, expected} <- cases do
       assert {:error, ^expected} =
                Responses.coerce(%{
-                 "model" => "gpt-5.6",
+                 "model" => "gpt-6-sol",
                  "input" => "fixture",
                  "prompt_cache_options" => options
                })
@@ -8074,7 +8511,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     for {breakpoint, expected} <- invalid_breakpoints do
       assert {:error, ^expected} =
                Responses.coerce(%{
-                 "model" => "gpt-5.6",
+                 "model" => "gpt-6-sol",
                  "input" => [
                    %{
                      "role" => "user",
@@ -8156,7 +8593,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                 message: "message content part is not translatable",
                 param: "input"
               }} =
-               Responses.coerce(%{"model" => "gpt-5.6", "input" => [message]})
+               Responses.coerce(%{"model" => "gpt-6-sol", "input" => [message]})
     end
 
     for item <- [
@@ -8213,8 +8650,36 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                 code: "invalid_request",
                 message: "message content part is not translatable",
                 param: "input"
-              }} = Responses.coerce(%{"model" => "gpt-5.6", "input" => [item]})
+              }} = Responses.coerce(%{"model" => "gpt-6-sol", "input" => [item]})
     end
+  end
+
+  # The Responses SDK types a message image with a required `detail`, so a
+  # marked SDK image always carries it; the unmarked path already kept it.
+  @tag :prompt_cache_controls
+  test "marked user input_image keeps its detail for file_id and image_url references" do
+    breakpoint = prompt_cache_breakpoint()
+
+    parts = [
+      %{"type" => "input_image", "detail" => "high", "file_id" => "file-fixture-marked", "prompt_cache_breakpoint" => breakpoint},
+      %{"type" => "input_image", "detail" => "auto", "image_url" => "https://example.com/marked.png", "prompt_cache_breakpoint" => breakpoint}
+    ]
+
+    assert {:ok, %{payload: payload}} =
+             Responses.coerce(%{"model" => "gpt-6-sol", "input" => [%{"role" => "user", "content" => parts}]})
+
+    assert [%{"role" => "user", "content" => ^parts}] = payload["input"]
+
+    assert {:error, %{message: "message content part is not translatable"}} =
+             Responses.coerce(%{
+               "model" => "gpt-6-sol",
+               "input" => [
+                 %{
+                   "role" => "user",
+                   "content" => [%{"type" => "input_image", "detail" => "high", "file_id" => "file-fixture-marked", "extra" => true, "prompt_cache_breakpoint" => breakpoint}]
+                 }
+               ]
+             })
   end
 
   defp prompt_cache_breakpoint, do: %{"mode" => "explicit"}

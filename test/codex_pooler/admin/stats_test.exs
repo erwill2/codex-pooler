@@ -6,6 +6,7 @@ defmodule CodexPooler.Admin.StatsTest do
 
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
+  import CodexPooler.UnboxedFixture, only: [register_unboxed_cleanup!: 1]
 
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting.{Attempt, DailyRollup, DailyRollupCoverage, LedgerEntry, Request}
@@ -23,9 +24,26 @@ defmodule CodexPooler.Admin.StatsTest do
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias Ecto.Adapters.SQL.Sandbox
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  test "turn KPI sums SQL status buckets rather than counting buckets" do
+    buckets = [%{status: "succeeded", count: 12}, %{status: "failed", count: 3}, %{status: "interrupted", count: 2}, %{status: "in_progress", count: 4}]
+    assert Kpis.turn_kpi(buckets) == %{value: 21, succeeded: 12, failed: 5, in_progress: 4}
+  end
+
+  # A turn has no rejected or cancelled status (`codex_turns_status_check`): only a
+  # failed or an interrupted turn is a failed one.
+  test "turn KPI counts as failed only the failed statuses a turn can have" do
+    buckets = [%{status: "failed", count: 3}, %{status: "interrupted", count: 2}, %{status: "rejected", count: 1}, %{status: "cancelled", count: 1}]
+    assert Kpis.turn_kpi(buckets).failed == 5
+  end
 
   test "top_api_keys/2 retains the ten highest-ranked API keys" do
     # Given
@@ -69,6 +87,7 @@ defmodule CodexPooler.Admin.StatsTest do
       assignment_status: "active",
       health_status: "active",
       upstream_label: "Account A",
+      upstream_status: "active",
       state: :unknown
     }
 
@@ -115,6 +134,107 @@ defmodule CodexPooler.Admin.StatsTest do
              dashboard.quota.accounts
 
     assert id == identity.id
+  end
+
+  test "deleted upstreams and removed assignments without usage in the window are absent from stats" do
+    scope = owner_scope()
+    pool = pool_fixture()
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{identity: current} = upstream_assignment_fixture(pool)
+    %{identity: deleted, assignment: deleted_assignment} = upstream_assignment_fixture(pool)
+    %{identity: removed, assignment: removed_assignment} = upstream_assignment_fixture(pool)
+    as_of = ~U[2026-01-10 12:00:00.000000Z]
+    before_window = DateTime.add(as_of, -2, :hour)
+
+    insert_timed_usage!(pool, api_key, deleted_assignment, deleted, before_window, 40)
+    insert_timed_usage!(pool, api_key, removed_assignment, removed, before_window, 60)
+    assert {:ok, _} = Upstreams.soft_delete_account_for_scope(scope, deleted, %{})
+    assert {:ok, _} = PoolAssignments.delete_pool_assignment(pool, removed_assignment)
+
+    assert {:ok, dashboard} = Stats.build_dashboard(scope, %{pool_id: pool.id, window: "1h", as_of: as_of})
+
+    assert [%{upstream_identity_id: current_id, requests: 0, lifecycle_state: :current}] = dashboard.tables.upstreams
+    assert current_id == current.id
+    assert [%{upstream_identity_id: ^current_id}] = dashboard.quota.accounts
+    assert dashboard.quota.summary.total == 1
+    assert dashboard.kpis.tokens.total_tokens == 0
+  end
+
+  test "deleted upstream usage stays attributed while removed membership is scoped to selected pools" do
+    scope = owner_scope()
+    pool = pool_fixture()
+    other_pool = pool_fixture()
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{api_key: other_key} = active_api_key_fixture(other_pool)
+    %{identity: deleted, assignment: deleted_assignment} = upstream_assignment_fixture(pool)
+    %{identity: shared, assignment: removed_assignment} = upstream_assignment_fixture(pool)
+
+    assert {:ok, current_assignment} =
+             PoolAssignments.create_pool_assignment(other_pool, shared, %{
+               status: "active",
+               health_status: "active",
+               eligibility_status: "eligible"
+             })
+
+    as_of = ~U[2026-01-10 12:00:00.000000Z]
+    occurred_at = DateTime.add(as_of, -30, :minute)
+    insert_timed_usage!(pool, api_key, deleted_assignment, deleted, occurred_at, 40)
+    insert_timed_usage!(pool, api_key, removed_assignment, shared, occurred_at, 60)
+    insert_timed_usage!(other_pool, other_key, current_assignment, shared, occurred_at, 20)
+    assert {:ok, _} = Upstreams.soft_delete_account_for_scope(scope, deleted, %{})
+    assert {:ok, _} = PoolAssignments.delete_pool_assignment(pool, removed_assignment)
+
+    assert {:ok, selected} = Stats.build_dashboard(scope, %{pool_id: pool.id, window: "1h", as_of: as_of})
+    rows = Map.new(selected.tables.upstreams, &{&1.upstream_identity_id, &1})
+    assert %{lifecycle_state: :deleted, requests: 1, total_tokens: 40, settled_cost_micros: 40, traffic_share_percent: 50.0} = rows[deleted.id]
+    assert %{lifecycle_state: :removed, requests: 1, total_tokens: 60, settled_cost_micros: 60, traffic_share_percent: 50.0} = rows[shared.id]
+    assert selected.quota.accounts == []
+    assert selected.quota.summary.total == 0
+    assert selected.kpis.tokens.total_tokens == 100
+
+    assert {:ok, aggregate} = Stats.build_dashboard(scope, %{window: "1h", as_of: as_of})
+    aggregate_rows = Map.new(aggregate.tables.upstreams, &{&1.upstream_identity_id, &1})
+    assert %{lifecycle_state: :current, assignment_count: 1, status: "active", requests: 2, total_tokens: 80, traffic_share_percent: 66.7} = aggregate_rows[shared.id]
+    assert %{lifecycle_state: :deleted, requests: 1, total_tokens: 40, traffic_share_percent: 33.3} = aggregate_rows[deleted.id]
+    assert [%{pool_id: current_pool_id, upstream_identity_id: shared_id}] = aggregate.quota.accounts
+    assert current_pool_id == other_pool.id
+    assert shared_id == shared.id
+    assert aggregate.kpis.tokens.total_tokens == 120
+  end
+
+  test "deleted upstream history in hidden pools cannot retain a zero row or change visible shares" do
+    %{user: owner} = bootstrap_owner_fixture()
+    owner_scope = Scope.for_user(owner)
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    pool = pool_fixture()
+    hidden_pool = pool_fixture()
+    operator_pool_assignment_fixture(admin, pool, created_by_user_id: owner.id)
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{api_key: hidden_key} = active_api_key_fixture(hidden_pool)
+    %{identity: visible, assignment: visible_assignment} = upstream_assignment_fixture(pool)
+    %{identity: deleted} = upstream_assignment_fixture(pool)
+    %{identity: hidden, assignment: hidden_assignment} = upstream_assignment_fixture(hidden_pool)
+
+    assert {:ok, shared_hidden_assignment} =
+             PoolAssignments.create_pool_assignment(hidden_pool, deleted, %{
+               status: "active",
+               health_status: "active",
+               eligibility_status: "eligible"
+             })
+
+    as_of = ~U[2026-01-10 12:00:00.000000Z]
+    occurred_at = DateTime.add(as_of, -30, :minute)
+    insert_timed_usage!(pool, api_key, visible_assignment, visible, occurred_at, 10)
+    insert_timed_usage!(hidden_pool, hidden_key, shared_hidden_assignment, deleted, occurred_at, 100)
+    insert_timed_usage!(hidden_pool, hidden_key, hidden_assignment, hidden, occurred_at, 200)
+    assert {:ok, _} = Upstreams.soft_delete_account_for_scope(owner_scope, deleted, %{})
+    assert {:ok, _} = Upstreams.soft_delete_account_for_scope(owner_scope, hidden, %{})
+
+    assert {:ok, dashboard} = Stats.build_dashboard(Scope.for_user(admin), %{window: "1h", as_of: as_of})
+    assert [%{upstream_identity_id: visible_id, requests: 1, total_tokens: 10, traffic_share_percent: 100.0}] = dashboard.tables.upstreams
+    assert visible_id == visible.id
+    assert dashboard.quota.summary.total == 1
+    assert dashboard.kpis.tokens.total_tokens == 10
   end
 
   test "upstream_table/2 calculates shares and sorts by requests before tokens" do
@@ -289,6 +409,7 @@ defmodule CodexPooler.Admin.StatsTest do
 
     session = insert_active_session!(pool, api_key, now)
     insert_turn!(session, request, now, %{status: "succeeded"})
+    insert_turn!(session, failed_request, now, %{status: "succeeded", turn_sequence: 2})
     insert_daily_rollup!(pool, api_key, now)
     upsert_primary_5h!(identity, now)
 
@@ -329,7 +450,7 @@ defmodule CodexPooler.Admin.StatsTest do
     assert Decimal.equal?(dashboard.kpis.settled_cost.usd, Decimal.new("0.750000"))
     assert dashboard.kpis.average_latency_ms.value == 1000
     assert dashboard.kpis.active_sessions.value == 1
-    assert dashboard.kpis.turns.value == 1
+    assert dashboard.kpis.turns.value == 2
 
     assert dashboard.kpis.cache_rate == %{
              value: 16.7,
@@ -383,7 +504,7 @@ defmodule CodexPooler.Admin.StatsTest do
     assert Enum.any?(dashboard.charts.settled_cost, &(&1.settled_cost_micros == 750_000))
     assert [%{request_count: 1, total_tokens: 100}] = dashboard.tables.daily_rollups
 
-    assert %{requests: 2, attempts: 2, settlements: 1, daily_rollups: 1, codex_turns: 1} =
+    assert %{requests: 2, attempts: 2, settlements: 1, daily_rollups: 1, codex_turns: 2} =
              dashboard.sources
 
     assert Enum.any?(dashboard.tables.recent_activity, &(&1.type == :audit_event))
@@ -428,13 +549,16 @@ defmodule CodexPooler.Admin.StatsTest do
                requests: 2,
                succeeded: 1,
                failed: 1,
+               client_cancelled: 0,
                in_progress: 0
              },
+             # `cancelled` is a status nothing writes: an admitted request, and no outcome.
              %{
                bucket: ~U[2026-08-14 12:00:00.000000Z],
                requests: 4,
                succeeded: 0,
-               failed: 2,
+               failed: 1,
+               client_cancelled: 0,
                in_progress: 1
              }
            ]
@@ -556,8 +680,9 @@ defmodule CodexPooler.Admin.StatsTest do
 
     assert length(recent_failures) == 5
 
+    # failure-3 is the `cancelled` request, a status nothing writes: no failure.
     assert Enum.map(recent_failures, & &1.error_code) ==
-             ["failure-6", "failure-5", "failure-4", "failure-3", "failure-2"]
+             ["failure-6", "failure-5", "failure-4", "failure-2", "failure-1"]
 
     assert Enum.all?(recent_failures, fn row ->
              Map.keys(row) |> Enum.sort() ==
@@ -583,8 +708,8 @@ defmodule CodexPooler.Admin.StatsTest do
       end)
 
     assert {:ok, dashboard} = dashboard_result
-    assert dashboard.kpis.requests == %{value: 9, succeeded: 1, failed: 6, in_progress: 1}
-    assert dashboard.kpis.success_rate == %{value: 11.1, unit: "percent"}
+    assert dashboard.kpis.requests == %{value: 9, succeeded: 1, failed: 5, client_cancelled: 0, in_progress: 1}
+    assert dashboard.kpis.success_rate == %{value: 11.1, unit: "percent", client_cancelled: 0}
     assert dashboard.sources.requests == 9
     assert Enum.sum(Enum.map(dashboard.charts.requests, & &1.requests)) == 9
     assert length(dashboard.charts.requests) == 6
@@ -637,6 +762,38 @@ defmodule CodexPooler.Admin.StatsTest do
     refute Enum.any?(request_events, &is_nil(&1.projection))
   end
 
+  # A client cancellation is recorded `failed` with `client_disconnected` (499
+  # on a websocket, the 200 an HTTP stream had already sent): the dashboard
+  # counts it apart, outside the failures, the success rate's base and the
+  # recent failures, while a Pooler-side 499 stays a failure (findings#292).
+  test "client cancellations are counted apart from failures, the success rate and the recent failures" do
+    scope = owner_scope()
+    pool = pool_fixture(%{slug: "stats-client-cancelled"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    as_of = ~U[2026-08-14 08:55:00.000000Z]
+
+    for {status, code, status_code, transport, minutes} <- [
+          {"succeeded", nil, 200, "http_json", 50},
+          {"succeeded", nil, 200, "http_json", 45},
+          {"succeeded", nil, 200, "http_json", 40},
+          {"failed", "client_disconnected", 499, "websocket", 30},
+          {"failed", "client_disconnected", 200, "http_sse", 20},
+          {"failed", "owner_drained", 499, "websocket", 10}
+        ] do
+      request_fixture(%{pool: pool, api_key: api_key}, %{status: status, last_error_code: code, response_status_code: status_code, transport: transport})
+      |> set_request_time!(DateTime.add(as_of, -minutes, :minute))
+    end
+
+    assert {:ok, dashboard} = Stats.build_dashboard(scope, %{pool_id: pool.id, window: "1h", as_of: as_of})
+
+    # Counted as failures, the two cancellations made 3 failed and 50.0%.
+    assert dashboard.kpis.requests == %{value: 6, succeeded: 3, failed: 1, client_cancelled: 2, in_progress: 0}
+    assert dashboard.kpis.success_rate == %{value: 75.0, unit: "percent", client_cancelled: 2}
+    assert Enum.sum(Enum.map(dashboard.charts.requests, & &1.client_cancelled)) == 2
+    assert Enum.sum(Enum.map(dashboard.charts.requests, & &1.failed)) == 1
+    assert Enum.map(dashboard.tables.recent_failures, & &1.error_code) == ["owner_drained"]
+  end
+
   test "failed-only request buckets do not invent settled usage" do
     scope = owner_scope()
     pool = pool_fixture(%{slug: "stats-failed-only"})
@@ -652,7 +809,7 @@ defmodule CodexPooler.Admin.StatsTest do
     assert {:ok, dashboard} =
              Stats.build_dashboard(scope, %{pool_id: pool.id, window: "1h", as_of: as_of})
 
-    assert dashboard.kpis.requests == %{value: 1, succeeded: 0, failed: 1, in_progress: 0}
+    assert dashboard.kpis.requests == %{value: 1, succeeded: 0, failed: 1, client_cancelled: 0, in_progress: 0}
     assert Enum.sum(Enum.map(dashboard.charts.requests, & &1.requests)) == 1
     assert dashboard.kpis.tokens.total_tokens == 0
     assert Enum.sum(Enum.map(dashboard.charts.tokens, & &1.total_tokens)) == 0
@@ -840,14 +997,14 @@ defmodule CodexPooler.Admin.StatsTest do
 
     m55 =
       model_fixture(pool, %{
-        exposed_model_id: "gpt-5.5",
-        display_name: "Display name must not label gpt-5.5"
+        exposed_model_id: "gpt-6-sol",
+        display_name: "Display name must not label gpt-6-sol"
       })
 
     m54 =
       model_fixture(pool, %{
-        exposed_model_id: "gpt-5.4",
-        display_name: "Display name must not label gpt-5.4"
+        exposed_model_id: "gpt-6-luna",
+        display_name: "Display name must not label gpt-6-luna"
       })
 
     m53 = model_fixture(pool, %{exposed_model_id: "gpt-5.3"})
@@ -987,19 +1144,19 @@ defmodule CodexPooler.Admin.StatsTest do
 
     assert model_usage_series_order(model_usage) == [
              "gpt-5.3",
-             "gpt-5.5",
-             "gpt-5.4",
+             "gpt-6-sol",
+             "gpt-6-luna",
              "gpt-5.0",
              "gpt-5.1",
              "Other"
            ]
 
-    assert model_usage_total(model_usage, "gpt-5.5") == 9
+    assert model_usage_total(model_usage, "gpt-6-sol") == 9
     assert model_usage_total(model_usage, "Other") == 1
     assert model_usage_bucket_labels(model_usage) == hourly_bucket_labels(as_of, 6)
     assert length(model_usage) <= 6 * 6
 
-    assert_model_usage_point!(model_usage, "gpt-5.5", hourly_bucket(current_bucket), %{
+    assert_model_usage_point!(model_usage, "gpt-6-sol", hourly_bucket(current_bucket), %{
       request_count: 1,
       input_tokens: 9,
       cached_input_tokens: 0,
@@ -1216,9 +1373,7 @@ defmodule CodexPooler.Admin.StatsTest do
       )
     end
 
-    insert_hourly_model_usage_rollup!(pool, model, ~U[2026-08-14 08:00:00.000000Z],
-      total_tokens: 20
-    )
+    insert_hourly_model_usage_rollup!(pool, model, ~U[2026-08-14 08:00:00.000000Z], total_tokens: 20)
 
     assert {:ok, dashboard} =
              Stats.build_dashboard(scope, %{pool_id: pool.id, window: "5h", as_of: as_of})
@@ -1241,8 +1396,8 @@ defmodule CodexPooler.Admin.StatsTest do
     assert {:ok, dashboard} =
              Stats.build_dashboard(scope, %{pool_id: pool.id, window: "1h", as_of: as_of})
 
-    assert dashboard.kpis.requests == %{value: 0, succeeded: 0, failed: 0, in_progress: 0}
-    assert dashboard.kpis.success_rate == %{value: nil, unit: "percent"}
+    assert dashboard.kpis.requests == %{value: 0, succeeded: 0, failed: 0, client_cancelled: 0, in_progress: 0}
+    assert dashboard.kpis.success_rate == %{value: nil, unit: "percent", client_cancelled: 0}
     assert dashboard.kpis.tokens.total_tokens == 0
     assert dashboard.kpis.tokens_per_second == %{value: nil, unit: "tokens/second"}
     assert dashboard.kpis.settled_cost == %{status: "unavailable", micros: 0, usd: nil}
@@ -1509,20 +1664,22 @@ defmodule CodexPooler.Admin.StatsTest do
     assert result.summary_by_pool_id[hidden_pool.id].total_tokens == 25
     assert Map.keys(result.histogram_by_pool_id) == [pool.id]
 
-    assert Enum.sum(
-             Enum.map(result.histogram_by_pool_id[pool.id].token_histogram, & &1.total_tokens)
-           ) == 100
+    assert Enum.sum(Enum.map(result.histogram_by_pool_id[pool.id].token_histogram, & &1.total_tokens)) == 100
 
-    assert Enum.sum(
-             Enum.map(result.histogram_by_pool_id[pool.id].request_histogram, & &1.requests)
-           ) == 1
+    assert Enum.sum(Enum.map(result.histogram_by_pool_id[pool.id].request_histogram, & &1.requests)) == 1
   end
 
   @tag :pool_usage_rollup_fallback
   test "seven-day Pool usage falls back wholly when the coverage query is unavailable" do
+    # Registered before the commit, never scoped in `try/after`: the coverage lock holder is a
+    # linked task, so its failure kills the test process before an enclosing `after` runs, and
+    # the committed pool, identity, request and ledger rows would outlive the test.
+    suffix = System.unique_integer([:positive])
+    register_unboxed_cleanup!(fn -> delete_unboxed_pool_usage_fixture!(suffix) end)
+
     Sandbox.unboxed_run(Repo, fn ->
       as_of = DateTime.new!(Date.utc_today(), ~T[12:00:00.000000], "Etc/UTC")
-      fixture = insert_unboxed_pool_usage_fixture!(as_of)
+      fixture = insert_unboxed_pool_usage_fixture!(as_of, suffix)
       opts = [as_of: as_of, traffic_window: "7d", histogram_pool_ids: [fixture.pool.id]]
       raw = Stats.pool_usage_by_pool_ids([fixture.pool.id], Keyword.put(opts, :force_raw, true))
       parent = self()
@@ -1559,16 +1716,27 @@ defmodule CodexPooler.Admin.StatsTest do
           parent
         )
 
+      # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
       try do
         assert_receive {^barrier, :coverage_locked}, 5_000
-        Repo.query!("SET lock_timeout TO '100ms'")
 
+        # The session-level timeout is set and reset inside one checkout. An owner killed between
+        # two queries of a plain unboxed checkout (the linked lock task failing, the ExUnit timeout)
+        # hands the connection back to the pool with the 100 ms timeout still set, and whichever
+        # test draws it next fails its own lock waits; an owner killed inside a checkout gets the
+        # connection disconnected instead.
         result =
-          try do
-            Stats.pool_usage_by_pool_ids([fixture.pool.id], opts)
-          after
-            Repo.query!("SET lock_timeout TO DEFAULT")
-          end
+          Repo.checkout(fn ->
+            Repo.query!("SET lock_timeout TO '100ms'")
+
+            try do
+              Stats.pool_usage_by_pool_ids([fixture.pool.id], opts)
+            after
+              Repo.query!("SET lock_timeout TO DEFAULT")
+            end
+          end)
 
         assert result.source == :raw_fallback
         assert result == raw
@@ -1579,14 +1747,13 @@ defmodule CodexPooler.Admin.StatsTest do
                           pool_count: 1,
                           histogram_pool_count: 1
                         }},
-                       1_000
+                       @detection_timeout_ms
 
         refute_receive {^handler_id, _measurements, _metadata}
       after
         :telemetry.detach(handler_id)
         send(lock_task.pid, {barrier, :release})
         assert {:ok, :released} = Task.await(lock_task, 5_000)
-        cleanup_unboxed_pool_usage_fixture!(fixture)
       end
     end)
   end
@@ -2107,11 +2274,10 @@ defmodule CodexPooler.Admin.StatsTest do
         request_metadata: %{
           "prompt" => raw_prompt,
           "authorization" => "Bearer #{raw_token}",
+          "idempotency_key" => raw_idempotency_key,
           "safe_request_id" => "req-safe"
         }
       })
-      |> Ecto.Changeset.change(%{idempotency_key: raw_idempotency_key})
-      |> Repo.update!()
 
     attempt = attempt_fixture(request, assignment)
 
@@ -2144,6 +2310,7 @@ defmodule CodexPooler.Admin.StatsTest do
       assignment_status: "active",
       health_status: "active",
       upstream_label: assignment_label,
+      upstream_status: "active",
       state: :unknown
     }
   end
@@ -2457,8 +2624,7 @@ defmodule CodexPooler.Admin.StatsTest do
     %{datetime | microsecond: {elem(datetime.microsecond, 0), 6}}
   end
 
-  defp insert_unboxed_pool_usage_fixture!(as_of) do
-    suffix = System.unique_integer([:positive])
+  defp insert_unboxed_pool_usage_fixture!(as_of, suffix) do
     occurred_at = DateTime.add(as_of, -30, :minute)
 
     pool =
@@ -2576,15 +2742,26 @@ defmodule CodexPooler.Admin.StatsTest do
     }
   end
 
-  defp cleanup_unboxed_pool_usage_fixture!(fixture) do
-    Repo.delete_all(from pool in Pool, where: pool.id == ^fixture.pool.id)
-    Repo.delete_all(from identity in UpstreamIdentity, where: identity.id == ^fixture.identity.id)
+  # Keyed on the suffix every committed key derives from, so it can be registered before the
+  # fixture exists and still finds one that failed partway. The pool delete cascades to the
+  # request and ledger rows; the refutes come last, so a broken cascade fails loudly without
+  # cutting the rest of the teardown short.
+  defp delete_unboxed_pool_usage_fixture!(suffix) do
+    Repo.delete_all(from pool in Pool, where: pool.slug == ^"stats-unavailable-#{suffix}")
 
-    refute Repo.exists?(from request in Request, where: request.id == ^fixture.request_id)
+    Repo.delete_all(
+      from identity in UpstreamIdentity,
+        where: identity.account_label == ^"Stats unavailable upstream #{suffix}"
+    )
+
+    refute Repo.exists?(
+             from request in Request,
+               where: request.correlation_id == ^"stats-unavailable-#{suffix}"
+           )
 
     refute Repo.exists?(
              from ledger_entry in LedgerEntry,
-               where: ledger_entry.id == ^fixture.ledger_entry_id
+               where: ledger_entry.source_event_id == ^"stats-unavailable-settlement-#{suffix}"
            )
   end
 
@@ -2616,6 +2793,9 @@ defmodule CodexPooler.Admin.StatsTest do
         &__MODULE__.handle_repo_query_event/4,
         {handler_id, self()}
       )
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     try do
       result = fun.()

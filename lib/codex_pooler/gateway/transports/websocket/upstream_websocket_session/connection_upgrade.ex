@@ -1,8 +1,12 @@
 defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade do
   @moduledoc false
 
+  alias CodexPooler.Platform.OutboundHTTP
+
   @type request_caller :: {pid(), reference()} | nil
-  @type upgrade_response :: %{status: non_neg_integer() | nil, headers: Mint.Types.headers()}
+  # `data` holds the bytes the peer wrote behind a `101` in the same read as the response head, which are the
+  # websocket's first bytes (see `finish_connection/6`). The body of any other answer is never kept.
+  @type upgrade_response :: %{status: non_neg_integer() | nil, headers: Mint.Types.headers(), data: binary()}
   @connect_ready_tag :upstream_websocket_connect_ready
   @connect_result_tag :upstream_websocket_connect_result
   @connect_task_shutdown_timeout_ms 1_000
@@ -21,8 +25,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
     with {:ok, target} <- websocket_target(url),
          {:ok, conn} <- connect_websocket(target, timeouts, request_caller),
          {:ok, conn, ref} <- upgrade_websocket(conn, target, headers, request_caller),
-         {:ok, conn, response_headers} <- await_upgrade(conn, ref, timeouts, request_caller) do
-      finish_connection(state, key, conn, ref, response_headers)
+         {:ok, conn, response_headers, upgrade_data} <- await_upgrade(conn, ref, timeouts, request_caller) do
+      finish_connection(state, key, conn, ref, response_headers, upgrade_data)
     else
       {:error, conn, :client_disconnected} ->
         {:ok, _conn} = Mint.HTTP.close(conn)
@@ -37,29 +41,48 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
   end
 
   defp connect_websocket(%{connect_scheme: :http} = target, timeouts, request_caller) do
-    connect_in_task(target, timeouts, request_caller)
+    connect_in_task(
+      target,
+      timeouts,
+      request_caller,
+      OutboundHTTP.proxy_options_for_url(target.uri,
+        transport_opts: [timeout: timeouts.connect_timeout_ms]
+      )
+    )
   end
 
   defp connect_websocket(%{connect_scheme: :https} = target, timeouts, request_caller) do
-    raw_target = %{target | connect_scheme: :http}
+    proxy_options =
+      OutboundHTTP.proxy_options_for_url(target.uri,
+        transport_opts: [timeout: timeouts.connect_timeout_ms]
+      )
 
-    with {:ok, raw_conn} <- connect_in_task(raw_target, timeouts, request_caller) do
-      upgrade_tls_connection(raw_conn, target, timeouts, request_caller)
+    if proxy_options == [] do
+      raw_target = %{target | connect_scheme: :http}
+
+      with {:ok, raw_conn} <- connect_in_task(raw_target, timeouts, request_caller, []) do
+        upgrade_tls_connection(raw_conn, target, timeouts, request_caller)
+      end
+    else
+      connect_in_task(target, timeouts, request_caller, proxy_options)
     end
   end
 
-  defp connect_in_task(target, timeouts, request_caller) do
+  defp connect_in_task(target, timeouts, request_caller, proxy_options) do
     parent = self()
 
     {:ok, connect_pid} =
       Task.start(fn ->
         parent_monitor = Process.monitor(parent)
 
-        result =
-          Mint.HTTP.connect(target.connect_scheme, target.host, target.port,
+        connect_options =
+          [
             protocols: [:http1],
             transport_opts: websocket_transport_opts(target, timeouts)
-          )
+          ] ++ proxy_options
+
+        result =
+          Mint.HTTP.connect(target.connect_scheme, target.host, target.port, connect_options)
 
         send(parent, {@connect_ready_tag, self(), result})
 
@@ -275,8 +298,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
           Mint.Types.headers()
         ) ::
           {:ok, Mint.HTTP.t(), Mint.WebSocket.t()} | {:error, Mint.HTTP.t(), term()}
-  # Mint's Dialyzer contract narrows a status-101 websocket creation to success,
-  # but the runtime boundary can still reject mismatched refs, headers, or state.
+  # Dialyzer reads `Mint.WebSocket.new/4` as always failing: Mint's contract returns the opaque `Mint.WebSocket.t()`,
+  # which does not meet the plain struct its success typing builds, so only the error tuple survives. The success
+  # clause is the one every established upstream websocket takes, and Mint does refuse a mismatched nonce or
+  # extension, so both clauses stay and the no-match warning is silenced.
   @dialyzer {:no_match, new_websocket: 3}
   defp new_websocket(conn, ref, response_headers) do
     case Mint.WebSocket.new(conn, ref, 101, response_headers) do
@@ -285,12 +310,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
     end
   end
 
-  # Keep the defensive error branch paired with new_websocket/3 even though
-  # Dialyzer inherits Mint's narrowed status-101 success type.
-  @dialyzer {:no_match, finish_connection: 5}
-  defp finish_connection(state, key, conn, ref, response_headers) do
+  # Dialyzer inherits new_websocket/3's error-only reading, so it takes the success clause below, and the two helpers
+  # only that clause calls, for unreachable code; every established upstream websocket runs them.
+  #
+  # The state carries the frames decoded from `upgrade_data` under `:upgrade_frames` (absent when there are none);
+  # the session takes them out right after the connection is established and settles them before it writes the
+  # request (findings#304).
+  @dialyzer {:no_match, finish_connection: 6}
+  @dialyzer {:no_unused, [decode_upgrade_data: 2, put_upgrade_frames: 2]}
+  defp finish_connection(state, key, conn, ref, response_headers, upgrade_data) do
     case new_websocket(conn, ref, response_headers) do
       {:ok, conn, websocket} ->
+        {websocket, upgrade_frames} = decode_upgrade_data(websocket, upgrade_data)
+
         connection_state = %{
           key: key,
           conn: conn,
@@ -305,6 +337,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
         state =
           state
           |> Map.merge(connection_state)
+          |> put_upgrade_frames(upgrade_frames)
           |> Map.update!(:generation, &(&1 + 1))
           |> Map.delete(:reconnect_pending?)
 
@@ -314,6 +347,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
         {:error, reason, Map.put(state, :conn, conn)}
     end
   end
+
+  # Mint reports the bytes that follow the `101` in the same read as a data part of the upgrade response, and
+  # `Mint.WebSocket` hands data after the upgrade response to the websocket. The new websocket decodes them here,
+  # in order, so the decoder state carries over: a frame that read cut completes with the next read. A decoder
+  # failure stays in-band, the way Mint reports a frame error, so the session has one place that answers it.
+  defp decode_upgrade_data(websocket, <<>>), do: {websocket, []}
+
+  defp decode_upgrade_data(websocket, data) when is_binary(data) do
+    case Mint.WebSocket.decode(websocket, data) do
+      {:ok, websocket, frames} -> {websocket, frames}
+      {:error, websocket, reason} -> {websocket, [{:error, reason}]}
+    end
+  end
+
+  defp put_upgrade_frames(state, []), do: Map.delete(state, :upgrade_frames)
+  defp put_upgrade_frames(state, frames), do: Map.put(state, :upgrade_frames, frames)
 
   defp websocket_target(url) do
     uri = URI.parse(url)
@@ -326,7 +375,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
       path = websocket_path(uri)
 
       {:ok,
-       %{connect_scheme: connect_scheme, ws_scheme: ws_scheme, host: host, port: port, path: path}}
+       %{
+         connect_scheme: connect_scheme,
+         ws_scheme: ws_scheme,
+         host: host,
+         port: port,
+         path: path,
+         uri: uri
+       }}
     else
       _invalid -> {:error, :invalid_upstream_websocket_url}
     end
@@ -347,12 +403,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
 
   defp websocket_transport_opts(_target, timeouts), do: [timeout: timeouts.connect_timeout_ms]
 
+  # `timeouts` may carry a test-only `:upgrade_clock`, a zero-arity function
+  # returning monotonic milliseconds, read wherever the upgrade deadline is set
+  # or checked; runtime code never passes it and the monotonic clock is used
+  # (findings#206 row 206-320).
   defp await_upgrade(conn, ref, timeouts, request_caller) do
-    deadline = System.monotonic_time(:millisecond) + timeouts.connect_timeout_ms
-    await_upgrade(conn, ref, deadline, request_caller, %{status: nil, headers: []})
+    clock = Map.get(timeouts, :upgrade_clock, &monotonic_ms/0)
+    deadline = {clock.() + timeouts.connect_timeout_ms, clock}
+    await_upgrade(conn, ref, deadline, request_caller, %{status: nil, headers: [], data: <<>>})
   end
 
-  defp await_upgrade(conn, ref, deadline, request_caller, response) do
+  defp monotonic_ms, do: System.monotonic_time(:millisecond)
+
+  defp await_upgrade(conn, ref, {deadline_ms, clock} = deadline, request_caller, response) do
     socket = mint_socket(conn)
     request_caller_pid = request_caller_pid(request_caller)
     request_caller_monitor = request_caller_monitor(request_caller)
@@ -380,7 +443,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
       {:ssl_error, ^socket, _reason} = message ->
         handle_upgrade_message(conn, ref, deadline, request_caller, response, message)
     after
-      max(deadline - System.monotonic_time(:millisecond), 0) ->
+      max(deadline_ms - clock.(), 0) ->
         {:error, :upstream_websocket_upgrade_timeout}
     end
   end
@@ -400,8 +463,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
 
   defp upgrade_response(conn, ref, responses, deadline, request_caller, response) do
     case fold_upgrade_responses(responses, ref, response) do
-      {:done, %{status: 101, headers: headers}} ->
-        {:ok, conn, headers}
+      {:done, %{status: 101, headers: headers, data: data}} ->
+        {:ok, conn, headers, data}
 
       {:done, %{status: status, headers: headers}} when is_integer(status) ->
         {:error, conn, {:websocket_upgrade_failed, status, headers}}
@@ -425,7 +488,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
       Enum.reduce(responses, {response, nil, is_integer(response.status)}, fn
         {:status, ^ref, status}, {_response, completed_response, _open?}
         when is_integer(status) and status >= 0 ->
-          {%{status: status, headers: []}, completed_response, true}
+          {%{status: status, headers: [], data: <<>>}, completed_response, true}
 
         {:headers, ^ref, headers}, {response, completed_response, true}
         when is_list(headers) ->
@@ -436,6 +499,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Conn
             end)
 
           {%{response | headers: response.headers ++ headers}, completed_response, true}
+
+        # Mint returns the bytes behind a `101` as one data part of the response, ahead of its `:done`:
+        # `Mint.WebSocket` documents data after the upgrade response as belonging to the websocket, so they are
+        # kept for it (findings#304). The body of any other answer is dropped as before, so a refusal can never
+        # grow this buffer.
+        {:data, ^ref, data}, {%{status: 101} = response, completed_response, true}
+        when is_binary(data) ->
+          {%{response | data: response.data <> data}, completed_response, true}
 
         {:done, ^ref}, {response, _completed_response, true} ->
           {response, response, false}

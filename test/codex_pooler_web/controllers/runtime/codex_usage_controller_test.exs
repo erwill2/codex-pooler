@@ -15,6 +15,7 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageControllerTest do
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows.EvidenceStore
 
@@ -29,6 +30,180 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageControllerTest do
     "/wham/rate-limit-reset-credits/consume",
     "/backend-api/wham/rate-limit-reset-credits/consume"
   ]
+
+  test "local API-key limits still deny at their exact exhausted token budget" do
+    [limit] =
+      UsageResponses.self_usage_limits(
+        [
+          %{
+            binding_scope: "default",
+            model_identifier: nil,
+            max_requests_per_minute: nil,
+            max_tokens_per_day: nil,
+            max_tokens_per_week: Decimal.new(100)
+          }
+        ],
+        0,
+        0,
+        100,
+        DateTime.utc_now()
+      )
+
+    assert %{allowed: false, limit_reached: true} = UsageResponses.codex_rate_limit(limit, nil)
+  end
+
+  test "model replacement limits do not become a global self-usage token limit" do
+    model = %{
+      binding_scope: "model",
+      model_identifier: "sample-model",
+      max_requests_per_minute: nil,
+      max_tokens_per_day: 1_000,
+      max_tokens_per_week: 2_000
+    }
+
+    as_of = ~U[2026-09-20 12:00:00.000000Z]
+    assert UsageResponses.self_usage_limits([model], 0, 512, 512, as_of) == []
+
+    default = %{
+      model
+      | binding_scope: "default",
+        model_identifier: nil,
+        max_tokens_per_day: 4_000
+    }
+
+    limits = UsageResponses.self_usage_limits([default, model], 0, 512, 512, as_of)
+    assert Enum.all?(limits, &is_nil(&1.model_filter))
+
+    assert Enum.filter(limits, &(&1.limit_window == "daily"))
+           |> Enum.all?(&(&1.max_value == 4_000 and &1.remaining_value == 3_488))
+  end
+
+  test "additional usage keeps explicit denial even below the percentage limit" do
+    now = DateTime.utc_now()
+
+    window = %AccountQuotaWindow{
+      quota_key: "codex_spark",
+      window_kind: "primary",
+      window_minutes: 300,
+      used_percent: Decimal.new(10),
+      reset_at: DateTime.add(now, 3_600, :second),
+      source: "codex_usage_api",
+      freshness_state: "fresh",
+      observed_at: now,
+      metadata: %{"rate_limit_allowed" => false, "rate_limit_reached" => true}
+    }
+
+    assert [
+             %{
+               rate_limit: %{
+                 allowed: false,
+                 limit_reached: true,
+                 primary_window: %{used_percent: 10}
+               }
+             }
+           ] =
+             UsageResponses.additional_codex_rate_limits([window], now)
+  end
+
+  test "usage aliases preserve ordinary provider permission at rounded exhaustion", %{conn: conn} do
+    pool = pool_fixture()
+    setup = active_api_key_fixture(pool)
+    as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
+        }
+      })
+
+    assert {:ok, _} =
+             QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+               identity,
+               %{
+                 "rate_limit" => %{
+                   "allowed" => true,
+                   "limit_reached" => false,
+                   "primary_window" => %{
+                     "used_percent" => 100,
+                     "limit_window_seconds" => 604_800,
+                     "reset_at" => DateTime.to_unix(DateTime.add(as_of, 86_400, :second))
+                   }
+                 }
+               },
+               as_of
+             )
+
+    for path <- @usage_alias_paths do
+      response =
+        conn
+        |> recycle()
+        |> put_req_header("authorization", setup.authorization)
+        |> get(path)
+        |> json_response(200)
+
+      assert response["rate_limit"]["allowed"] == true
+      assert response["rate_limit"]["limit_reached"] == false
+      assert response["rate_limit"]["secondary_window"]["used_percent"] == 100
+    end
+  end
+
+  test "usage aliases retain independent additional-meter permission at 100 percent", %{
+    conn: conn
+  } do
+    pool = pool_fixture()
+    setup = active_api_key_fixture(pool)
+    %{identity: identity} = upstream_assignment_fixture(pool)
+    as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, _} =
+             QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+               identity,
+               %{
+                 "rate_limit" => %{
+                   "allowed" => false,
+                   "limit_reached" => true,
+                   "primary_window" => %{
+                     "used_percent" => 100,
+                     "limit_window_seconds" => 604_800,
+                     "reset_at" => DateTime.to_unix(DateTime.add(as_of, 86_400, :second))
+                   }
+                 },
+                 "additional_rate_limits" => [
+                   %{
+                     "limit_name" => "GPT-5.3-Codex-Spark",
+                     "metered_feature" => "codex_bengalfox",
+                     "rate_limit" => %{
+                       "allowed" => true,
+                       "limit_reached" => false,
+                       "primary_window" => %{
+                         "used_percent" => 100,
+                         "limit_window_seconds" => 18_000,
+                         "reset_at" => DateTime.to_unix(DateTime.add(as_of, 3_600, :second))
+                       }
+                     }
+                   }
+                 ]
+               },
+               as_of
+             )
+
+    for path <- @usage_alias_paths do
+      response =
+        conn
+        |> recycle()
+        |> put_req_header("authorization", setup.authorization)
+        |> get(path)
+        |> json_response(200)
+
+      assert response["rate_limit"]["allowed"] == false
+      assert [meter] = response["additional_rate_limits"]
+      assert meter["rate_limit"]["allowed"] == true
+      assert meter["rate_limit"]["limit_reached"] == false
+      assert meter["rate_limit"]["primary_window"]["used_percent"] == 100
+    end
+  end
 
   test "GET /api/codex/usage returns API-key Codex usage shape", %{conn: conn} do
     setup = active_api_key_fixture()
@@ -1022,7 +1197,7 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageControllerTest do
          conn: conn
        } do
     pool = pool_fixture()
-    now = ~U[2026-06-07 12:00:00Z]
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
     account_id = "monthly-account-#{System.unique_integer([:positive])}"
 
     %{identity: identity} =
@@ -1069,6 +1244,44 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageControllerTest do
     response_text = conn.resp_body
     refute response_text =~ "1134"
     refute response_text =~ "Free-looking label"
+  end
+
+  # The usage routes report what the retention keeps: an elapsed window is
+  # still reported until 30 days after its reset, after which the account has
+  # no usage to report, exactly as after the runtime-cleanup prune deleted it.
+  for {label, days_since_reset, expected_status} <- [{"inside", 29, 200}, {"past", 31, 404}] do
+    test "GET /api/codex/usage for an account whose only evidence reset #{days_since_reset} days ago is #{expected_status} (#{label} retention)",
+         %{conn: conn} do
+      pool = pool_fixture()
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+      reset_at = DateTime.add(now, -unquote(days_since_reset), :day)
+      account_id = "retention-account-#{System.unique_integer([:positive])}"
+
+      %{identity: identity} = upstream_assignment_fixture(pool, %{chatgpt_account_id: account_id, account_label: "Retention usage account"})
+
+      assert {:ok, _secret} = Upstreams.store_encrypted_secret(identity, %{secret_kind: "access_token", plaintext: "retention-usage-token"})
+
+      observed_at = DateTime.add(reset_at, -3, :day)
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 monthly_only_account_primary_quota_window_attrs(%{observed_at: observed_at, last_sync_at: observed_at, reset_at: DateTime.add(now, 1, :day)})
+               ])
+
+      from(window in AccountQuotaWindow, where: window.upstream_identity_id == ^identity.id)
+      |> Repo.update_all(set: [reset_at: reset_at])
+
+      conn =
+        conn
+        |> put_req_header("authorization", "Bearer retention-usage-token")
+        |> put_req_header("chatgpt-account-id", account_id)
+        |> get("/api/codex/usage")
+
+      case unquote(expected_status) do
+        200 -> assert %{"rate_limit" => %{"primary_window" => %{"limit_window_seconds" => 2_592_000}}} = json_response(conn, 200)
+        404 -> assert %{"error" => %{"code" => "no_upstream_usage"}} = json_response(conn, 404)
+      end
+    end
   end
 
   test "GET /api/codex/usage returns a statusful gateway error for inactive ChatGPT account usage",
@@ -1232,7 +1445,7 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageControllerTest do
       end
     end)
 
-    encoded = Jason.encode!(response)
+    encoded = CodexPooler.JSON.encode!(response)
     refute encoded =~ "freshness_state"
     refute encoded =~ "raw_limit_id"
     refute encoded =~ "raw_metered_feature"
@@ -1286,8 +1499,7 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageControllerTest do
       active_limit: Keyword.get(opts, :active_limit),
       credits: Keyword.get(opts, :credits),
       freshness_state: "fresh",
-      metadata:
-        Map.put(status, "reset_after_seconds", DateTime.diff(reset_at, provider_at, :second))
+      metadata: Map.put(status, "reset_after_seconds", DateTime.diff(reset_at, provider_at, :second))
     }
   end
 

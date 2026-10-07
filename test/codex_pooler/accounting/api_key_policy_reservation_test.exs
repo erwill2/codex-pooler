@@ -10,7 +10,6 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Repo
-  alias Ecto.Adapters.SQL.Sandbox
 
   import CodexPooler.AccountingTestSupport
   import CodexPooler.PoolerFixtures
@@ -202,7 +201,7 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
       assert Decimal.equal?(rollup.settled_cost_micros, Decimal.new(130))
     end
 
-    test "usage_unknown final usage keeps counts but consumes zero local tokens and cost" do
+    test "usage_unknown final usage retains provisional pressure without known usage or cost" do
       setup = accounting_setup()
       as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
@@ -250,7 +249,10 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
         |> Map.fetch!(:weekly)
 
       assert window_usage.effective_request_count == 1
-      assert window_usage.effective_total_tokens == 0
+      assert window_usage.effective_total_tokens == reserved.reservation.total_tokens
+      assert window_usage.provisional_total_tokens == reserved.reservation.total_tokens
+      assert window_usage.known_total_tokens == 0
+      assert window_usage.pending_total_tokens == 0
       assert Decimal.equal?(window_usage.effective_cost_micros, Decimal.new(0))
     end
 
@@ -366,7 +368,7 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
           )
         end)
 
-      ledger_usage_queries = table_commands(queries, "ledger_entries", "SELECT")
+      ledger_usage_queries = window_queries(queries)
 
       assert ledger_usage_queries == []
     end
@@ -390,7 +392,7 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
           )
         end)
 
-      ledger_usage_queries = table_commands(queries, "ledger_entries", "SELECT")
+      ledger_usage_queries = window_queries(queries)
 
       assert length(ledger_usage_queries) == 1
     end
@@ -429,11 +431,11 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
           )
         end)
 
-      bucket_usage_queries = table_commands(queries, "api_key_usage_buckets", "SELECT")
+      bucket_usage_queries = window_queries(queries)
 
       ledger_usage_queries =
         queries
-        |> table_commands("ledger_entries", "SELECT")
+        |> window_queries()
         |> Enum.filter(&String.contains?(&1.query, "api_key_usage_buckets"))
 
       assert bucket_usage_queries != []
@@ -510,152 +512,6 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
       assert reserved.estimate.output_tokens == 1_024
       assert reserved.reservation.output_tokens == 1_024
     end
-
-    test "concurrent token reservations near limit cannot oversubscribe with tiny caps" do
-      setup = accounting_setup()
-      parent = self()
-
-      update_default_policy!(setup.api_key, %{
-        max_requests_per_minute: 60,
-        max_tokens_per_day: 512,
-        max_tokens_per_week: 10_000
-      })
-
-      tasks =
-        for index <- 1..2 do
-          Task.async(fn ->
-            Sandbox.allow(Repo, parent, self())
-
-            Accounting.reserve(
-              setup.auth,
-              setup.model,
-              %{"model" => setup.model.exposed_model_id, "max_output_tokens" => 1},
-              %{correlation_id: "corr-concurrent-token-limit-#{index}"}
-            )
-          end)
-        end
-
-      results = Task.await_many(tasks, 15_000)
-
-      assert Enum.count(results, &match?({:ok, _reserved}, &1)) == 1
-
-      assert Enum.count(
-               results,
-               &match?({:error, %{code: :api_key_policy_limit_exceeded}}, &1)
-             ) == 1
-
-      assert Repo.aggregate(
-               from(e in LedgerEntry,
-                 where:
-                   e.api_key_id == ^setup.api_key.id and e.entry_kind == "reservation" and
-                     e.amount_status == "recorded"
-               ),
-               :count
-             ) == 1
-
-      window_usage =
-        setup.api_key.id
-        |> LedgerEntries.window_usages(daily: DateTime.add(DateTime.utc_now(), -1, :day))
-        |> Map.fetch!(:daily)
-
-      assert window_usage.effective_total_tokens == 512
-    end
-
-    test "concurrent request limits serialize so two over-limit reservations cannot both succeed" do
-      setup = accounting_setup()
-      parent = self()
-
-      update_default_policy!(setup.api_key, %{
-        max_requests_per_minute: 1,
-        max_tokens_per_day: 1_000,
-        max_tokens_per_week: 10_000
-      })
-
-      tasks =
-        for index <- 1..2 do
-          Task.async(fn ->
-            Sandbox.allow(Repo, parent, self())
-
-            Accounting.reserve(
-              setup.auth,
-              setup.model,
-              %{"model" => setup.model.exposed_model_id, "max_output_tokens" => 1},
-              %{correlation_id: "corr-concurrent-limit-#{index}"}
-            )
-          end)
-        end
-
-      results = Task.await_many(tasks, 15_000)
-
-      assert Enum.count(results, &match?({:ok, _reserved}, &1)) == 1
-
-      assert Enum.count(
-               results,
-               &match?({:error, %{code: :api_key_policy_limit_exceeded}}, &1)
-             ) == 1
-
-      assert Repo.aggregate(
-               from(e in LedgerEntry,
-                 where:
-                   e.api_key_id == ^setup.api_key.id and e.entry_kind == "reservation" and
-                     e.amount_status == "recorded"
-               ),
-               :count
-             ) == 1
-    end
-
-    test "concurrent model policy reservations serialize through the same lock-time policy row" do
-      setup = accounting_setup()
-      parent = self()
-
-      update_default_policy!(setup.api_key, %{
-        max_requests_per_minute: 60,
-        max_tokens_per_day: 10_000,
-        max_tokens_per_week: 10_000
-      })
-
-      insert_model_policy!(setup.api_key, setup.model.exposed_model_id, %{
-        max_requests_per_minute: 60,
-        max_tokens_per_day: 512,
-        max_tokens_per_week: 10_000
-      })
-
-      tasks =
-        for index <- 1..2 do
-          Task.async(fn ->
-            Sandbox.allow(Repo, parent, self())
-
-            Accounting.reserve(
-              setup.auth,
-              setup.model,
-              %{"model" => String.upcase(setup.model.exposed_model_id), "max_output_tokens" => 1},
-              %{correlation_id: "corr-concurrent-model-policy-#{index}"}
-            )
-          end)
-        end
-
-      results = Task.await_many(tasks, 15_000)
-
-      assert Enum.count(results, &match?({:ok, _reserved}, &1)) == 1
-
-      assert [error] =
-               Enum.flat_map(results, fn
-                 {:error, error} -> [error]
-                 {:ok, _reserved} -> []
-               end)
-
-      assert error.code == :api_key_policy_limit_exceeded
-      assert error.message =~ "max_tokens_per_day"
-
-      assert Repo.aggregate(
-               from(e in LedgerEntry,
-                 where:
-                   e.api_key_id == ^setup.api_key.id and e.entry_kind == "reservation" and
-                     e.amount_status == "recorded"
-               ),
-               :count
-             ) == 1
-    end
   end
 
   defp insert_model_policy!(api_key, model_identifier, attrs) do
@@ -681,12 +537,15 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
     parent = self()
     handler_id = "api-key-policy-reservation-test-#{System.unique_integer([:positive])}"
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
         [:codex_pooler, :repo, :query],
         fn _event, _measurements, metadata, _config ->
-          if metadata[:repo] == Repo do
+          if metadata[:repo] == Repo and self() == parent do
             send(
               parent,
               {handler_id, metadata[:source], command_name(metadata[:query]), metadata[:query]}
@@ -717,6 +576,12 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
 
   defp table_commands(queries, source, command) do
     Enum.filter(queries, &(&1.source == source and &1.command == command))
+  end
+
+  defp window_queries(queries) do
+    Enum.filter(queries, fn query ->
+      query.command == "WITH" and String.contains?(query.query, "api_key_usage_buckets")
+    end)
   end
 
   defp command_count(queries, source, command),

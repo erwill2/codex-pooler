@@ -1,31 +1,67 @@
 defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
   use ExUnit.Case, async: true
 
+  alias CodexPooler.Catalog.OpenAIPricingFormat
   alias CodexPooler.Catalog.OpenAIPricingPreflight
 
   @fixture Path.expand("../../fixtures/pricing/openai/2026-07-28.json", __DIR__)
   @target Path.expand("../../../priv/pricing/openai/pricing.json", __DIR__)
-  @target_sha256 "cd74a2827b92610b89288fa511c78ec63ed76017a912d95470085abc03b0fe56"
 
-  @skipped_pricing_type_paths [
-    "models.gpt-4o-mini-transcribe.pricing_type",
-    "models.gpt-4o-transcribe-diarize.pricing_type",
-    "models.gpt-4o-transcribe.pricing_type",
-    "models.gpt-live-transcribe.pricing_type",
-    "models.gpt-realtime-translate.pricing_type",
-    "models.gpt-realtime-whisper.pricing_type",
-    "models.gpt-transcribe.pricing_type",
-    "models.sora-2-pro.pricing_type",
-    "models.sora-2.pricing_type",
-    "models.whisper.pricing_type"
-  ]
+  test "expanded tool rates reject malformed or inconsistent billing metadata" do
+    payload = @target |> File.read!() |> CodexPooler.JSON.decode!()
+    tool = payload["tools"]["file-search"]
+    assert length(tool["rates"]) == 2
+    assert OpenAIPricingPreflight.validate_payload(payload).compatible?
 
-  @incomplete_bucket_paths [
-    "models.omni-moderation-latest.prices.standard.default",
-    "models.text-embedding-3-large.prices.standard.default",
-    "models.text-embedding-3-small.prices.standard.default",
-    "models.text-embedding-ada-002.prices.standard.default"
-  ]
+    for changed <- [
+          Map.put(tool, "amounts", []),
+          Map.put(tool, "amounts", [-1]),
+          Map.put(tool, "price", 999),
+          Map.put(tool, "price_semantics", "unknown"),
+          Map.put(tool, "rates", []),
+          Map.put(tool, "rates", [nil]),
+          put_in(tool, ["rates"], [Map.put(hd(tool["rates"]), "unknown", 1)]),
+          Map.put(tool, "rates", [hd(tool["rates"]), %{"amounts" => ["2"]}])
+        ] do
+      result =
+        OpenAIPricingPreflight.validate_payload(put_in(payload, ["tools", "file-search"], changed))
+
+      refute result.compatible?
+      assert Enum.any?(result.errors, &(&1.code == :invalid_tool_rates))
+    end
+  end
+
+  test "character pricing is validated and excluded from token accounting" do
+    payload = @target |> File.read!() |> CodexPooler.JSON.decode!()
+
+    for model <- ~w(tts-1 tts-1-hd) do
+      assert payload["models"][model]["pricing_type"] == "per_1m_characters"
+      result = OpenAIPricingFormat.classify(payload)
+      refute Enum.any?(result.rows, &(&1.model_identifier == model))
+      invalid = put_in(payload, ["models", model, "prices", "standard", "text", "input"], "15")
+      refute OpenAIPricingPreflight.validate_payload(invalid).compatible?
+    end
+  end
+
+  test "image modality prices are validated and excluded from generic snapshots in every tier" do
+    payload = @target |> File.read!() |> CodexPooler.JSON.decode!()
+    result = OpenAIPricingFormat.classify(payload)
+
+    assert result.compatible?
+    assert result.errors == []
+
+    for model <- ~w(gpt-image-2.5-flare gpt-image-2.5-sunburst) do
+      refute Enum.any?(result.rows, &(&1.model_identifier == model))
+
+      for tier <- ~w(batch standard), bucket <- ~w(text image) do
+        path = "models.#{model}.prices.#{tier}.#{bucket}"
+        assert Enum.any?(result.warnings, &(&1.code == :unsupported_price_bucket and &1.path == path))
+
+        invalid = put_in(payload, ["models", model, "prices", tier, bucket, "input"], "1")
+        refute OpenAIPricingPreflight.validate_payload(invalid).compatible?
+      end
+    end
+  end
 
   test "classifies the immutable July 28 fixture with exact reviewed coverage" do
     result = OpenAIPricingPreflight.validate_file(@fixture)
@@ -57,50 +93,6 @@ defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
              "models.text-embedding-3-small.prices.standard.default",
              "models.text-embedding-ada-002.prices.standard.default"
            ]
-  end
-
-  test "classifies the reviewed September 3 target with exact artifact and warning coverage" do
-    raw = File.read!(@target)
-    payload = Jason.decode!(raw)
-    result = OpenAIPricingPreflight.validate_file(@target)
-
-    assert byte_size(raw) == 64_430
-    assert Base.encode16(:crypto.hash(:sha256, raw), case: :lower) == @target_sha256
-    assert payload["generated_at"] == "2026-09-03T19:40:10.049982Z"
-    assert payload["models_count"] == 80
-    assert map_size(payload["models"]) == 80
-    assert payload["tools_count"] == 4
-    assert map_size(payload["tools"]) == 4
-
-    assert result.compatible?
-    assert result.errors == []
-    assert length(result.warnings) == 82
-
-    assert result.summary == %{
-             importable_rows: 181,
-             priced_rows: 172,
-             unavailable_rows: 9,
-             skipped_models: 10,
-             skipped_price_buckets: 72
-           }
-
-    assert result.coverage.imported_price_buckets == %{
-             "default" => 115,
-             "long_context" => 33,
-             "short_context" => 33
-           }
-
-    assert Enum.frequencies_by(result.warnings, & &1.code) == %{
-             incomplete_price_bucket: 4,
-             unsupported_price_bucket: 68,
-             unsupported_pricing_type: 10
-           }
-
-    warning_paths = Enum.group_by(result.warnings, & &1.code, & &1.path)
-    assert warning_paths.incomplete_price_bucket == @incomplete_bucket_paths
-    assert warning_paths.unsupported_pricing_type == @skipped_pricing_type_paths
-    assert length(Enum.uniq(warning_paths.unsupported_price_bucket)) == 68
-    assert result.warnings == Enum.sort_by(result.warnings, &{&1.path, &1.code, &1.message})
   end
 
   test "strict root, model, and tool objects reject missing, extra, and wrong typed values" do
@@ -286,6 +278,70 @@ defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
     refute OpenAIPricingPreflight.validate_payload(changed).compatible?
   end
 
+  test "flat default per-minute rates are validated skips without price rows" do
+    payload =
+      unsupported_payload("future-flat-minute", "per_minute", ["per_minute"], %{
+        "standard" => %{"default" => %{"price_per_minute" => 1}}
+      })
+
+    result = OpenAIPricingPreflight.validate_payload(payload)
+    assert result.compatible?, inspect(result.errors)
+    assert result.errors == []
+
+    assert [%{code: :unsupported_pricing_type, path: "models.future-flat-minute.pricing_type"}] =
+             result.warnings
+
+    assert result.summary.skipped_models == 1
+    assert result.summary.importable_rows == 0
+
+    refute Enum.any?(
+             OpenAIPricingFormat.classify(payload).rows,
+             &(&1.model_identifier == "future-flat-minute")
+           )
+  end
+
+  test "malformed flat default per-minute rates stay structural errors" do
+    flat = %{"price_per_minute" => 1}
+
+    variants = [
+      %{"standard" => %{"default" => %{"price_per_minute" => "1"}}},
+      %{"standard" => %{"default" => %{"price_per_minute" => nil}}},
+      %{"standard" => %{"default" => %{"price_per_minute" => -1}}},
+      %{"standard" => %{"default" => %{}}},
+      %{"standard" => %{"default" => Map.put(flat, "unit", "minute")}},
+      %{"standard" => %{"default" => Map.put(flat, "estimated_cost", 1)}},
+      %{"standard" => %{"default" => %{"estimated_cost" => 1}}},
+      %{"standard" => %{"default" => flat, "live_transcription" => %{"estimated_cost" => 1}}},
+      %{"standard" => %{"live_transcription" => flat}},
+      %{"batch" => %{"default" => flat}},
+      %{"standard" => %{"default" => flat}, "priority" => %{"default" => flat}}
+    ]
+
+    Enum.each(variants, fn prices ->
+      payload = unsupported_payload("future-flat-variant", "per_minute", ["per_minute"], prices)
+      result = OpenAIPricingPreflight.validate_payload(payload)
+      refute result.compatible?, inspect(prices)
+
+      assert Enum.any?(result.errors, &(&1.code == :unsupported_pricing_type_shape)),
+             inspect(prices)
+
+      assert result.summary.importable_rows == 0
+    end)
+
+    for {pricing_type, pricing_types} <- [
+          {"mixed", ["per_1m_tokens", "per_minute"]},
+          {"per_second", ["per_second"]},
+          {"per_1m_characters", ["per_1m_characters"]}
+        ] do
+      payload =
+        unsupported_payload("future-flat-other", pricing_type, pricing_types, %{
+          "standard" => %{"default" => flat}
+        })
+
+      refute OpenAIPricingPreflight.validate_payload(payload).compatible?, pricing_type
+    end
+  end
+
   test "accepts the reviewed live per-minute flat-rate descriptors as validated skips" do
     candidates = [
       unsupported_payload("future-live-transcribe", "per_minute", ["per_minute"], %{
@@ -398,6 +454,181 @@ defmodule CodexPooler.Catalog.OpenAIPricingPreflightTest do
 
     assert %{compatible?: false, errors: [%{code: :file_read_failed, path: ^path}]} =
              OpenAIPricingPreflight.validate_file(path)
+  end
+
+  test "malformed root and model values return structured errors without raising" do
+    payload = valid_payload()
+
+    for {key, values} <- [
+          {"generated_at", [nil, 42, "bad-date"]},
+          {"source", [nil, 42, " "]},
+          {"models_count", [nil, -1, "1"]},
+          {"tools_count", [nil, -1, "1"]}
+        ],
+        value <- values do
+      result = OpenAIPricingPreflight.validate_payload(Map.put(payload, key, value))
+      refute result.compatible?
+      assert Enum.any?(result.errors, &(&1.path == key))
+    end
+
+    for {key, values} <- [
+          {"model", [nil, 42, " ", "different-model"]},
+          {"category", [nil, 42, " "]},
+          {"timestamp", [nil, 42, "bad-date"]},
+          {"prices", [%{"standard" => []}, %{"standard" => %{}}, %{42 => %{}}]}
+        ],
+        value <- values do
+      result =
+        OpenAIPricingPreflight.validate_payload(put_in(payload, ["models", "future-model", key], value))
+
+      refute result.compatible?
+      assert result.errors != []
+    end
+  end
+
+  test "non-object roots and nested duplicate keys are rejected" do
+    for root <- [nil, [], 42, "value"] do
+      refute OpenAIPricingPreflight.validate_payload(root).compatible?
+    end
+
+    for raw <- [~s([{"key":1,"key":2}]), ~s({"nested":[{"key":1,"key":2}]})] do
+      assert {:error, :invalid_json} = OpenAIPricingFormat.decode(raw)
+    end
+
+    assert %{compatible?: false, errors: [%{code: :invalid_path}]} =
+             OpenAIPricingPreflight.validate_file(nil)
+  end
+
+  test "identical fast and priority aliases produce one canonical price row" do
+    payload = valid_payload()
+    tier = get_in(payload, ["models", "future-model", "prices", "standard"])
+
+    payload =
+      put_in(payload, ["models", "future-model", "prices"], %{"fast" => tier, "priority" => tier})
+
+    result = OpenAIPricingFormat.classify(payload)
+    assert result.compatible?
+    assert [row] = result.rows
+    assert row.service_tier == "priority"
+    assert row.price_bucket == "default"
+    assert Decimal.equal?(row.input, 1)
+    assert result.summary.importable_rows == 1
+    assert result.summary.priced_rows == 1
+    assert result.coverage.imported_price_buckets["default"] == 1
+  end
+
+  test "non-token descriptors fail closed unless their complete schema is recognized" do
+    for {type, prices} <- [
+          {"mixed", %{"standard" => %{"unknown" => %{"output" => 1}}}},
+          {"per_second", %{"standard" => %{"unknown" => %{"price_per_second" => 1}}}},
+          {"per_second",
+           %{
+             "standard" => %{
+               "720p" => %{
+                 "landscape" => "wrong",
+                 "portrait" => "720x1280",
+                 "price_per_second" => 1
+               }
+             }
+           }},
+          {"future_unit", %{"standard" => %{"default" => %{"input" => 1, "output" => 2}}}}
+        ] do
+      result =
+        unsupported_payload("sample-model", type, [type], prices)
+        |> OpenAIPricingPreflight.validate_payload()
+
+      refute result.compatible?
+      assert Enum.any?(result.errors, &(&1.code == :unsupported_pricing_type_shape))
+    end
+  end
+
+  test "data-sharing inference descriptors are validated but never imported as token buckets" do
+    values = %{
+      "cached_input" => 0.1,
+      "input" => 1,
+      "output" => 2,
+      "training" => 3,
+      "training_unit" => "hour"
+    }
+
+    payload =
+      put_in(
+        valid_payload(),
+        ["models", "future-model", "prices", "standard", "inference_with_data_sharing"],
+        values
+      )
+
+    result = OpenAIPricingFormat.classify(payload)
+    assert result.compatible?
+    assert length(result.rows) == 1
+    assert result.summary.skipped_price_buckets == 1
+
+    for invalid <- [
+          nil,
+          [],
+          Map.put(values, "training_unit", "minute"),
+          Map.put(values, "training", -1)
+        ] do
+      candidate =
+        put_in(
+          payload,
+          ["models", "future-model", "prices", "standard", "inference_with_data_sharing"],
+          invalid
+        )
+
+      refute OpenAIPricingPreflight.validate_payload(candidate).compatible?
+    end
+  end
+
+  test "malformed bucket values and whitespace keys are rejected" do
+    for value <- [nil, 1, [], "1"] do
+      candidate =
+        put_in(
+          valid_payload(),
+          ["models", "future-model", "prices", "standard", "default"],
+          value
+        )
+
+      refute OpenAIPricingPreflight.validate_payload(candidate).compatible?
+    end
+
+    payload = valid_payload()
+    tool = payload["tools"]["sample-tool"]
+
+    for key <- ["", " sample-tool ", 42] do
+      candidate = %{payload | "tools" => %{key => tool}}
+      refute OpenAIPricingPreflight.validate_payload(candidate).compatible?
+    end
+
+    tier = get_in(payload, ["models", "future-model", "prices", "standard"])
+
+    for key <- ["Standard", " standard ", ""] do
+      candidate = put_in(payload, ["models", "future-model", "prices"], %{key => tier})
+      refute OpenAIPricingPreflight.validate_payload(candidate).compatible?
+    end
+  end
+
+  test "coalesced unavailable aliases count one row in each retained bucket" do
+    tier = %{"default" => %{"available" => false}, "long_context" => %{"available" => false}}
+
+    payload =
+      put_in(valid_payload(), ["models", "future-model", "prices"], %{
+        "fast" => tier,
+        "priority" => tier
+      })
+
+    result = OpenAIPricingFormat.classify(payload)
+    assert result.compatible?
+    assert length(result.rows) == 2
+    assert result.summary.importable_rows == 2
+    assert result.summary.unavailable_rows == 2
+    assert result.summary.priced_rows == 0
+
+    assert result.coverage.imported_price_buckets == %{
+             "default" => 1,
+             "long_context" => 1,
+             "short_context" => 0
+           }
   end
 
   defp valid_payload do

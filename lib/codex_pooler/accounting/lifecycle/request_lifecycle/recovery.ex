@@ -4,8 +4,11 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
   import Ecto.Query
 
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogFacts}
+  alias CodexPooler.Accounting.PreAttemptRelease
   alias CodexPooler.Accounting.RequestLifecycle
+  alias CodexPooler.Accounting.RequestLifecycle.TurnClaimRelease
   alias CodexPooler.Gateway.Persistence.RuntimeCleanup
+  alias CodexPooler.Gateway.Runtime.Finalization.ExpiredOwnerGenerationCleanup
   alias CodexPooler.Repo
 
   @stale_after_seconds 6 * 60 * 60
@@ -80,16 +83,23 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
             lock: "FOR UPDATE"
         )
 
+      # The claim is given up with the row (findings#206 row 206-421): a
+      # recovered claim-only row keeps its history under a fresh correlation
+      # id, because `stale_websocket_turn_claim_recovered` is no verdict the
+      # resend policy admits, and the row used to fence every resend of its
+      # request for good. A row that holds more than its claim keeps it.
       if stale_turn_claim?(request) do
-        request
-        |> Ecto.Changeset.change(%{
-          status: "failed",
-          usage_status: "not_applicable",
-          completed_at: now,
-          response_status_code: 499,
-          last_error_code: @turn_claim_recovery_code
-        })
-        |> Repo.update!()
+        TurnClaimRelease.close!(
+          request,
+          %{
+            status: "failed",
+            usage_status: "not_applicable",
+            completed_at: now,
+            response_status_code: 499,
+            last_error_code: @turn_claim_recovery_code
+          },
+          :stale_claim_recovered
+        )
 
         :recovered
       else
@@ -127,22 +137,27 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
         limit: ^limit,
         select: request
     )
-    |> Enum.reject(&RuntimeCleanup.active_runtime_request?(&1, now))
+    # The attempt this sweep would settle is also the attempt the liveness
+    # guard has to judge: its own incarnation owns the work, not whichever
+    # incarnation currently holds its session (findings#253). It is read once
+    # here and carried to the settlement.
+    |> Enum.map(&{&1, latest_attempt(&1.id)})
+    |> Enum.reject(fn {request, attempt} ->
+      RuntimeCleanup.active_runtime_request?(request, attempt, now, [])
+    end)
   end
 
-  defp recover_request(request, {:ok, summary}, now) do
-    case latest_attempt(request.id) do
-      nil ->
-        case release_undispatched_request(request, now) do
-          {:ok, _result} -> {:cont, {:ok, increment(summary, :stale_reservations_released)}}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
+  defp recover_request({request, nil}, {:ok, summary}, now) do
+    case release_undispatched_request(request, now) do
+      {:ok, _result} -> {:cont, {:ok, increment(summary, :stale_reservations_released)}}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
 
-      %Attempt{} = attempt ->
-        case settle_dispatched_request(request, attempt, now) do
-          {:ok, _result} -> {:cont, {:ok, increment(summary, :stale_reservations_settled)}}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
+  defp recover_request({request, %Attempt{} = attempt}, {:ok, summary}, now) do
+    case settle_dispatched_request(request, attempt, now) do
+      {:ok, _result} -> {:cont, {:ok, increment(summary, :stale_reservations_settled)}}
+      {:error, reason} -> {:halt, {:error, reason}}
     end
   end
 
@@ -162,7 +177,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
         on: request.id == attempt.request_id,
         where:
           request.status in ^@terminal_request_statuses and
-            attempt.status in ^@open_attempt_statuses and attempt.started_at <= ^cutoff,
+            attempt.status in @open_attempt_statuses and attempt.started_at <= ^cutoff,
         order_by: [asc: attempt.started_at, asc: attempt.id],
         limit: ^limit,
         select: {request.id, attempt.id}
@@ -228,44 +243,49 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
 
   defp terminal_request_with_open_attempt?(_request, _attempt), do: false
 
+  # Both recovery branches write the same `@recovery_code`, so the error code
+  # alone has never separated a reservation abandoned before any attempt from
+  # one settled after a dispatched attempt; telling them apart meant joining
+  # `attempts`. The phase records that separation on the release itself, and
+  # names this branch for what it is: nothing live ever reached the turn.
   defp release_undispatched_request(%Request{} = request, now) do
-    with {:ok, result} <-
-           RequestLifecycle.finalize_reserved_request_failure(request, %{
-             request_status: "failed",
-             response_status_code: 499,
-             last_error_code: @recovery_code,
-             usage_status: "not_applicable",
-             now: now
-           }) do
-      recover_stale_turn(request, nil, now)
-      {:ok, result}
-    end
+    RequestLifecycle.finalize_reserved_request_failure(request, %{
+      request_status: "failed",
+      response_status_code: 499,
+      last_error_code: @recovery_code,
+      usage_status: "not_applicable",
+      pre_attempt_phase: PreAttemptRelease.stale_sweep(),
+      now: now,
+      before_commit: recover_stale_turn(request, nil, now)
+    })
   end
 
   defp settle_dispatched_request(%Request{} = request, %Attempt{} = attempt, now) do
-    with {:ok, result} <-
-           RequestLifecycle.finalize_request(request, attempt, %{
-             request_status: "failed",
-             attempt_status: "failed",
-             response_status_code: 499,
-             last_error_code: @recovery_code,
-             error_message: "stale reservation recovered after request lifecycle was abandoned",
-             usage: %{status: "usage_unknown", source: @recovery_source},
-             now: now
-           }) do
-      recover_stale_turn(request, attempt, now)
-      {:ok, result}
+    ExpiredOwnerGenerationCleanup.with_stale_backstop_authority(request, attempt, fn ->
+      RequestLifecycle.finalize_request(request, attempt, %{
+        request_status: "failed",
+        attempt_status: "failed",
+        response_status_code: 499,
+        last_error_code: @recovery_code,
+        error_message: "stale reservation recovered after request lifecycle was abandoned",
+        usage: %{status: "usage_unknown", source: @recovery_source},
+        now: now,
+        before_commit: recover_stale_turn(request, attempt, now)
+      })
+    end)
+  end
+
+  # The request's turn is interrupted inside the settlement's own transaction
+  # (`RequestLifecycle`'s `:before_commit`), so no reader sees the request
+  # recovered while its turn is still open (findings#288).
+  defp recover_stale_turn(%Request{id: request_id}, attempt, now) when is_binary(request_id) do
+    fn _settled ->
+      RuntimeCleanup.recover_stale_request_turn(request_id, attempt_id(attempt),
+        now: now,
+        error_code: @recovery_code
+      )
     end
   end
-
-  defp recover_stale_turn(%Request{id: request_id}, attempt, now) when is_binary(request_id) do
-    RuntimeCleanup.recover_stale_request_turn(request_id, attempt_id(attempt),
-      now: now,
-      error_code: @recovery_code
-    )
-  end
-
-  defp recover_stale_turn(%Request{}, _attempt, _now), do: :ok
 
   defp attempt_id(%Attempt{id: attempt_id}) when is_binary(attempt_id), do: attempt_id
   defp attempt_id(_attempt), do: nil

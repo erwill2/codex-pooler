@@ -1,5 +1,6 @@
 defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
   use ExUnit.Case, async: false
+  use CodexPooler.CommittedWriteGuard
 
   import Ecto.Query
   import CodexPoolerWeb.Runtime.AnchoredOwnerDrainSupport
@@ -19,13 +20,17 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
   @budget 15_000
   @moduletag capture_log: true
 
+  @tag slow: "executes real anchored websocket generation, coordinated owner drain, physical close and retry settlement"
   test "visible anchored continuation drains before its retry without orphaning lifecycle rows" do
     {setup, upstream, state, release_ref} = fixture()
     metadata = metadata()
     first = payload(setup, metadata)
 
     assert {:ok, state} =
-             CodexResponsesSocket.handle_in({Jason.encode!(first), [opcode: :text]}, state)
+             CodexResponsesSocket.handle_in(
+               {CodexPooler.JSON.encode!(first), [opcode: :text]},
+               state
+             )
 
     {anchor, call_id, state} = receive_completed_tool(state)
     assert FakeUpstream.count(upstream) == 1
@@ -39,7 +44,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
       })
 
     assert {:ok, state} =
-             CodexResponsesSocket.handle_in({Jason.encode!(continuation), [opcode: :text]}, state)
+             CodexResponsesSocket.handle_in(
+               {CodexPooler.JSON.encode!(continuation), [opcode: :text]},
+               state
+             )
 
     assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
                    @budget
@@ -51,9 +59,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
     assert [%{"type" => "function_call_output", "call_id" => ^call_id}] = wire.json["input"]
 
     assert [request] =
-             Repo.all(
-               from r in Request, where: r.pool_id == ^setup.pool.id and r.status == "in_progress"
-             )
+             Repo.all(from r in Request, where: r.pool_id == ^setup.pool.id and r.status == "in_progress")
 
     assert %{first_visible_output_at: visible, status: "in_progress"} =
              Repo.get_by!(CodexTurn, request_id: request.id)
@@ -88,11 +94,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
 
     assert [%{status: "failed"}] = Repo.all(from a in Attempt, where: a.request_id == ^request.id)
 
-    assert Enum.sort(
-             Repo.all(
-               from e in LedgerEntry, where: e.request_id == ^request.id, select: e.entry_kind
-             )
-           ) == ["release", "reservation", "settlement"]
+    assert Enum.sort(Repo.all(from e in LedgerEntry, where: e.request_id == ^request.id, select: e.entry_kind)) == ["release", "reservation", "settlement"]
 
     assert Repo.aggregate(
              from(l in BridgeOwnerLease,
@@ -118,7 +120,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
     end)
 
     assert {:ok, retry} =
-             CodexResponsesSocket.handle_in({Jason.encode!(continuation), [opcode: :text]}, retry)
+             CodexResponsesSocket.handle_in(
+               {CodexPooler.JSON.encode!(continuation), [opcode: :text]},
+               retry
+             )
 
     retry = receive_until(retry, {:error, "duplicate_turn"})
     assert :ok = CodexResponsesSocket.terminate(:closed, retry)
@@ -137,7 +142,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
     first = payload(setup, metadata())
 
     assert {:ok, state} =
-             CodexResponsesSocket.handle_in({Jason.encode!(first), [opcode: :text]}, state)
+             CodexResponsesSocket.handle_in(
+               {CodexPooler.JSON.encode!(first), [opcode: :text]},
+               state
+             )
 
     {_anchor, call_id, state} = receive_completed_tool(state)
 
@@ -147,7 +155,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
       ])
 
     assert {:ok, state} =
-             CodexResponsesSocket.handle_in({Jason.encode!(unanchored), [opcode: :text]}, state)
+             CodexResponsesSocket.handle_in(
+               {CodexPooler.JSON.encode!(unanchored), [opcode: :text]},
+               state
+             )
 
     assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
                    @budget
@@ -256,9 +267,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexOwnerAnchoredDrainTest do
                    assert_terminal_request(request)
                  end
 
-    assert Repo.all(
-             from e in LedgerEntry, where: e.request_id == ^request.id, select: e.entry_kind
-           ) == ["reservation"]
+    assert Repo.all(from e in LedgerEntry, where: e.request_id == ^request.id, select: e.entry_kind) == ["reservation"]
   end
 
   defp drain_after_commit(owner, response_task, request) do

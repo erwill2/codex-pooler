@@ -4,12 +4,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   alias CodexPooler.Gateway.OpenAICompatibility.Error
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Audio
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.InstructionLifter
+  alias CodexPooler.Gateway.Payloads.CompactionTrigger
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
   @metadata_passthrough_key "internal_chat_message_metadata_passthrough"
   @reserved_passthrough_metadata_key "executed_tool_calls"
   @known_input_item_types ~w(
     additional_tools
+    agent_message
+    web_search_call
     message
     reasoning
     compaction
@@ -37,6 +40,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     agent_message
   )
   @replay_status_values ~w(completed incomplete in_progress searching)
+
+  @call_id_named_item_types ~w(function_call custom_tool_call shell_call shell_call_output)
+
+  # The provider's `input_image.detail` enum, in the order its refusal lists it.
+  @image_details ~w(low high auto original)
 
   @typep audio_normalization_result :: {:ok, map()} | {:error, Error.reason()}
 
@@ -80,6 +88,27 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   end
 
   def normalize_list_input(payload), do: {:ok, payload}
+
+  # An id-less call item is named by its own `call_id` on the public surface
+  # (`PublicResponses.ensure_output_item_id/2`). The Codex backend refuses a
+  # replayed `function_call` whose id equals its `call_id` (400
+  # `invalid_value` on `input[i].id`) and accepts it without an id, so that
+  # exact id is dropped from every call item whose id is optional (findings#254).
+  # A provider id (`fc_`, `ctc_`) never equals the provider's `call_id`
+  # (`call_`), and a `program` item keeps its required id. This runs on the
+  # input as the client sent it, before the OpenCode repair below copies a
+  # provider id into a blank `call_id`.
+  def drop_public_call_id_item_ids(%{"input" => input} = payload) when is_list(input) do
+    {:ok, Map.put(payload, "input", Enum.map(input, &drop_public_call_id_item_id/1))}
+  end
+
+  def drop_public_call_id_item_ids(payload), do: {:ok, payload}
+
+  defp drop_public_call_id_item_id(%{"type" => type, "id" => id, "call_id" => id} = item)
+       when type in @call_id_named_item_types and is_binary(id),
+       do: Map.delete(item, "id")
+
+  defp drop_public_call_id_item_id(item), do: item
 
   def normalize_recoverable_opencode_replay_call_ids(%{"input" => input} = payload)
       when is_list(input) do
@@ -167,9 +196,50 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
 
   defp clean_string(_value), do: nil
 
+  # The public stream names an output item the upstream sent without an id
+  # `<type>_<output_index>` (or `<type>` without an index; see
+  # `PublicResponses.fallback_output_item_id/2`). Replayed into a `store:
+  # false` turn, the Codex backend rejects that id for a message, a
+  # compaction or a web search call (400 `invalid_value` on `input[i].id`;
+  # a web search call wants an id that begins with `ws`) and accepts the item
+  # without one; provider ids are a short prefix plus an opaque suffix
+  # (`msg_`, `rs_`, `cmp_`, `fc_`, `ws_`) and never the item type itself. The input
+  # adapter therefore drops exactly the item's own fallback id before
+  # normalization, so the upstream receives the item as it produced it
+  # (findings#254). A reasoning item keeps its id unless it carries encrypted
+  # content, the only form that stays valid without one.
+  defp drop_public_fallback_item_id(%{"type" => type, "id" => id} = item)
+       when type in ["message", "compaction", "web_search_call"] and is_binary(id) do
+    if public_fallback_item_id?(type, id), do: Map.delete(item, "id"), else: item
+  end
+
+  defp drop_public_fallback_item_id(%{"type" => "reasoning", "id" => id, "encrypted_content" => content} = item)
+       when is_binary(id) and is_binary(content) do
+    if public_fallback_item_id?("reasoning", id) and String.trim(content) != "",
+      do: Map.delete(item, "id"),
+      else: item
+  end
+
+  defp drop_public_fallback_item_id(item), do: item
+
+  defp public_fallback_item_id?(type, type), do: true
+
+  defp public_fallback_item_id?(type, id) do
+    prefix = type <> "_"
+
+    String.starts_with?(id, prefix) and
+      Regex.match?(~r/\A[0-9]+\z/, binary_part(id, byte_size(prefix), byte_size(id) - byte_size(prefix)))
+  end
+
   defp normalize_input_items(input) do
+    with :ok <- validate_input_image_details(input) do
+      normalize_valid_input_items(input)
+    end
+  end
+
+  defp normalize_valid_input_items(input) do
     Enum.reduce_while(input, {:ok, []}, fn item, {:ok, acc} ->
-      item = sanitize_reserved_metadata(item)
+      item = item |> sanitize_reserved_metadata() |> drop_public_fallback_item_id()
 
       case normalize_input_item(item) do
         {:ok, items} when is_list(items) -> {:cont, {:ok, Enum.reverse(items) ++ acc}}
@@ -214,6 +284,69 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   end
 
   defp sanitize_nested_tool_calls(item), do: item
+
+  # The provider validates `detail` on every input image, in a message and in
+  # a tool output alike, and refuses a value outside its enum with 400
+  # `invalid_value` on the field path (findings#206 row 206-476, probed on the
+  # Codex backend and the public API). A Full model receives `detail`, so such
+  # a value is refused here with the same code and path, on the input as the
+  # client sent it, before reservation or dispatch; Lite would strip it, and
+  # the serving mode does not decide whether a request is valid. A null detail
+  # counts as absent.
+  defp validate_input_image_details(input) do
+    input
+    |> Enum.with_index()
+    |> Enum.find_value(:ok, fn {item, index} -> invalid_input_image_detail(item, index) end)
+  end
+
+  defp invalid_input_image_detail(%{"type" => type, "output" => output}, index)
+       when type in ["function_call_output", "custom_tool_call_output"] and is_list(output),
+       do: invalid_image_detail_in(output, "input[#{index}].output")
+
+  defp invalid_input_image_detail(%{"type" => type, "output" => %{"content" => content}}, index)
+       when type in ["function_call_output", "custom_tool_call_output"] and is_list(content),
+       do: invalid_image_detail_in(content, "input[#{index}].output.content")
+
+  # A Chat-style `image_url` part is translated only in a `role: "tool"`
+  # item, where it becomes a tool-output `input_image` carrying
+  # `image_url.detail`, so only there is that detail checked, under the field
+  # the client sent (findings#206 row 206-494).
+  defp invalid_input_image_detail(%{"role" => "tool", "content" => content}, index) when is_list(content),
+    do: invalid_image_detail_in(content, "input[#{index}].content", true)
+
+  defp invalid_input_image_detail(%{"content" => content}, index) when is_list(content),
+    do: invalid_image_detail_in(content, "input[#{index}].content")
+
+  defp invalid_input_image_detail(_item, _index), do: nil
+
+  defp invalid_image_detail_in(parts, path, chat_image_url? \\ false) do
+    parts
+    |> Enum.with_index()
+    |> Enum.find_value(fn
+      {%{"type" => "input_image", "detail" => detail}, part_index} when not is_nil(detail) and detail not in @image_details ->
+        {:error, invalid_image_detail("#{path}[#{part_index}].detail")}
+
+      {%{"type" => "image_url", "image_url" => %{"detail" => detail}}, part_index} when chat_image_url? and not is_nil(detail) and detail not in @image_details ->
+        {:error, invalid_image_detail("#{path}[#{part_index}].image_url.detail")}
+
+      _part ->
+        nil
+    end)
+  end
+
+  @doc """
+  Whether `detail` is absent (nil) or one of the provider's `input_image.detail`
+  values. Shared with the Chat adapter, which validates `image_url.detail`
+  against the same enum under its own field path.
+  """
+  @spec valid_image_detail?(term()) :: boolean()
+  def valid_image_detail?(detail), do: is_nil(detail) or detail in @image_details
+
+  @doc "The Pooler-authored refusal of an image `detail` outside the provider enum, at `param`."
+  @spec invalid_image_detail(String.t()) :: Error.reason()
+  def invalid_image_detail(param) do
+    Error.reason(400, "invalid_value", "invalid value for parameter #{param} (invalid_value); supported values: #{Enum.join(@image_details, ", ")}", param)
+  end
 
   @spec normalize_audio_input_items([map()]) ::
           {:ok, [map()]} | {:error, Error.reason()}
@@ -261,6 +394,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   end
 
   defp normalize_input_item(%{"type" => "additional_tools"} = item), do: {:ok, item}
+
+  # The item carries a top-level `content` list, so it has to be matched before
+  # the generic `content` clauses below would rewrite it into a user message.
+  # `Input.AgentMessage` owns its exact shape and refuses every other form.
+  defp normalize_input_item(%{"type" => "agent_message"} = item), do: {:ok, item}
+
+  # A replayed hosted web search; `Input.WebSearchCall` owns its exact shape.
+  defp normalize_input_item(%{"type" => "web_search_call"} = item), do: {:ok, item}
+
+  # A replayed tool search call or output (findings#313); `Input.ToolSearch` owns their exact shape.
+  defp normalize_input_item(%{"type" => type} = item) when type in ["tool_search_call", "tool_search_output"], do: {:ok, item}
 
   defp normalize_input_item(%{"type" => type}) when type not in @known_input_item_types,
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
@@ -310,6 +454,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     else
       {:ok, Map.delete(item, @metadata_passthrough_key)}
     end
+  end
+
+  # A compaction id the public surface derived for an upstream item that had
+  # none is dropped on replay, so the upstream receives the item as it
+  # produced it (findings#254).
+  defp normalize_input_item(%{"type" => "compaction", "id" => id, "encrypted_content" => content} = item) do
+    if CompactionTrigger.derived_public_compaction_item_id?(id, content),
+      do: {:ok, Map.delete(item, "id")},
+      else: {:ok, item}
   end
 
   defp normalize_input_item(%{"type" => "compaction"} = item), do: {:ok, item}
@@ -390,7 +543,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
 
   defp normalize_input_item(%{"content" => content} = item) when is_list(content) do
     {:ok,
-     item |> Map.put("type", "message") |> Map.put_new("role", "user") |> normalize_message_role()}
+     item
+     |> Map.put("type", "message")
+     |> Map.put_new("role", "user")
+     |> Map.put("content", Enum.map(content, &drop_null_image_detail/1))
+     |> normalize_message_role()}
   end
 
   defp normalize_input_item(%{"role" => _role} = item),
@@ -442,9 +599,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
            }
            |> put_optional_id(Map.get(item, "response_item_id"))
            |> put_optional_metadata(Map.get(item, "metadata") || parent_metadata)
-           |> put_optional_metadata_passthrough(
-             metadata_passthrough || parent_metadata_passthrough
-           )}
+           |> put_optional_metadata_passthrough(metadata_passthrough || parent_metadata_passthrough)}
       end
     end
   end
@@ -598,13 +753,22 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
        when is_binary(image_url) do
     {:ok,
      %{"type" => "input_image", "image_url" => image_url}
+     |> maybe_put_image_detail(part)
+     |> maybe_put_prompt_cache_breakpoint(part)}
+  end
+
+  defp normalize_tool_output_part(%{"type" => "input_image", "file_id" => file_id} = part)
+       when is_binary(file_id) and file_id != "" do
+    {:ok,
+     %{"type" => "input_image", "file_id" => file_id}
+     |> maybe_put_image_detail(part)
      |> maybe_put_prompt_cache_breakpoint(part)}
   end
 
   defp normalize_tool_output_part(%{"type" => "image_url"} = part) do
     case Map.get(part, "image_url") do
-      %{"url" => image_url} when is_binary(image_url) ->
-        {:ok, %{"type" => "input_image", "image_url" => image_url}}
+      %{"url" => image_url} = image when is_binary(image_url) ->
+        {:ok, %{"type" => "input_image", "image_url" => image_url} |> maybe_put_image_detail(image)}
 
       image_url when is_binary(image_url) ->
         {:ok, %{"type" => "input_image", "image_url" => image_url}}
@@ -623,6 +787,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
        do: Map.put(acc, "prompt_cache_breakpoint", breakpoint)
 
   defp maybe_put_prompt_cache_breakpoint(acc, _part), do: acc
+
+  # A tool-output image keeps its `detail` as the native client sends it on a
+  # Full model; the Lite payload normalizer removes it later. Only an enum
+  # value reaches here (`validate_input_image_details/1`), and a null detail
+  # stays absent (findings#206 row 206-476).
+  defp maybe_put_image_detail(acc, %{"detail" => detail}) when is_binary(detail),
+    do: Map.put(acc, "detail", detail)
+
+  defp maybe_put_image_detail(acc, _part), do: acc
+
+  # A message image passes through as sent except for a null `detail`, which
+  # is absent here as on a tool-output image: the Codex backend accepts null
+  # (probed 2026-09-24) but the native client never serializes one
+  # (findings#206 row 206-488).
+  defp drop_null_image_detail(%{"type" => "input_image", "detail" => nil} = part),
+    do: Map.delete(part, "detail")
+
+  defp drop_null_image_detail(part), do: part
 
   defp normalize_message_role(%{"type" => "message", "role" => "system"} = item),
     do: Map.put(item, "role", "developer")

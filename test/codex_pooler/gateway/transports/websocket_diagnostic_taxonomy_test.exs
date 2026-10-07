@@ -14,6 +14,17 @@ defmodule CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomyTest do
       Enum.each(ErrorCodes.known_error_codes(), fn code ->
         assert DiagnosticTaxonomy.identifier(code) == code
       end)
+
+      Enum.each(DiagnosticTaxonomy.internal_lifecycle_reason_codes(), fn code ->
+        assert DiagnosticTaxonomy.identifier(code) == code
+        assert DiagnosticTaxonomy.reason_code(String.to_atom(code)) == code
+      end)
+    end
+
+    test "keeps replay and task-exception lifecycle reasons in the fixed vocabulary" do
+      for code <- ["lifecycle_conflict", "owner_task_exception", "orphaned_turn_closed"] do
+        assert code in DiagnosticTaxonomy.internal_lifecycle_reason_codes()
+      end
     end
 
     test "includes the native fallback codes in the static stream vocabulary" do
@@ -86,6 +97,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomyTest do
       assert DiagnosticTaxonomy.reason_code(%{"reason" => :owner_busy}) == nil
       assert DiagnosticTaxonomy.reason_code({"some_code", :details}) == nil
       assert DiagnosticTaxonomy.reason_code(code: :owner_busy) == nil
+    end
+  end
+
+  describe "resend_predecessor_shape/1" do
+    test "renders only the fixed resend predecessor shape vocabulary" do
+      for shape <- ~w(identical_resend previsible_idle_timeout provider_terminal task_exception lifecycle_cut partial_reasoning_cut partial_http_tool_cut zero_output_http_failure resampled_completion previsible_disconnect quota_rejection advanced_http_resume mailbox_continuation anchor_refusal compaction_cut) do
+        assert DiagnosticTaxonomy.resend_predecessor_shape(shape) == shape
+        assert DiagnosticTaxonomy.resend_predecessor_shape(String.to_atom(shape)) == shape
+      end
+
+      for value <- [nil, "unknown_cut", "identical_resend ", "previsible_idle_timeout\n", "lifecycle_cut ", "prompt", 1, %{shape: :lifecycle_cut}] do
+        assert DiagnosticTaxonomy.resend_predecessor_shape(value) == nil
+      end
     end
   end
 

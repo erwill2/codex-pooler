@@ -418,9 +418,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
             data-role="incident-delivery-attempt-meta"
             class="mt-1 font-mono text-[0.68rem] text-base-content/55"
           >
-            Attempt {attempt.attempt_number}/{attempt.max_attempts} · {format_datetime(
-              attempt.attempted_at || attempt.completed_at
-            )}
+            Delivery attempt {attempt.attempt_number} · {format_datetime(attempt.attempted_at || attempt.completed_at)}
           </p>
           <dl
             :if={attempt.details != []}
@@ -471,7 +469,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
         <summary
           data-role={"#{@role}-trigger"}
           aria-label={@label}
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <span data-role={"#{@role}-icon"} class="shrink-0">
             <.icon name={@selected.icon} class={["size-4", incident_filter_icon_class(@selected)]} />

@@ -9,7 +9,8 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
 
   alias CodexPooler.Gateway.Persistence.{
     BridgeSessionAlias,
-    CodexSession
+    CodexSession,
+    CodexTurn
   }
 
   alias CodexPooler.Gateway.Persistence.StatusVocabulary.Session, as: SessionStatus
@@ -22,8 +23,10 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
   @session_reconnectable_statuses SessionStatus.reconnectable_statuses()
   @alias_active SessionAliasStatus.active_status()
 
-  @session_alias_conflict_target {:unsafe_fragment,
-                                  "(pool_id, api_key_id, alias_kind, alias_hash) WHERE status = 'active'"}
+  @alias_metadata %{"source" => "gateway_continuity"}
+  @serving_modes ~w(full lite)
+
+  @session_alias_conflict_target {:unsafe_fragment, "(pool_id, api_key_id, alias_kind, alias_hash) WHERE status = 'active'"}
 
   @spec active_session_for_update(
           Ecto.UUID.t(),
@@ -33,6 +36,13 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
           DateTime.t()
         ) :: CodexSession.t() | nil
   def active_session_for_update(pool_id, api_key_id, alias_kind, alias_value, now) do
+    pool_id
+    |> active_session_query(api_key_id, alias_kind, alias_value, now)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp active_session_query(pool_id, api_key_id, alias_kind, alias_value, now) do
     alias_hash = alias_hash(alias_value)
 
     query =
@@ -41,16 +51,14 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
         on: alias_record.codex_session_id == session.id,
         where:
           alias_record.pool_id == ^pool_id and alias_record.api_key_id == ^api_key_id and
+            session.api_key_id == ^api_key_id and
             alias_record.alias_kind == ^alias_kind and alias_record.alias_hash == ^alias_hash and
             alias_record.status == ^@alias_active and alias_record.expires_at > ^now and
             session.status in ^@session_reconnectable_statuses,
         order_by: [desc: alias_record.last_seen_at, desc: alias_record.updated_at],
-        limit: 1,
-        lock: "FOR UPDATE"
+        limit: 1
 
-    query
-    |> maybe_require_active_owner_lease(alias_kind, now)
-    |> Repo.one()
+    maybe_require_active_owner_lease(query, alias_kind, now)
   end
 
   @spec resolved_session_for_update(map(), RequestOptions.t(), String.t(), DateTime.t()) ::
@@ -64,6 +72,55 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
     end
   end
 
+  @doc """
+  The live session of the previous window of a native HTTP request's thread,
+  for a request whose own window has none (findings#289): the resume after a
+  compaction names the next window, which only the previous window's
+  `session_header` alias leads back from. The lookup is
+  `active_session_for_update/5` itself, so it is scoped to this request's Pool
+  and API key on the alias and on the session, needs a reconnectable session
+  with a live owner lease, and locks the session before its alias like the
+  lookup of the request's own window. It reads the previous window's alias
+  and never writes it.
+  """
+  @spec previous_window_session_for_update(map(), RequestOptions.t(), DateTime.t()) :: CodexSession.t() | nil
+  def previous_window_session_for_update(%{pool: %{id: pool_id}, api_key: %{id: api_key_id}}, %RequestOptions{} = opts, now) do
+    case ContinuityPayload.previous_window_session_header(opts) do
+      nil -> nil
+      previous_window -> active_session_for_update(pool_id, api_key_id, "session_header", previous_window, now)
+    end
+  end
+
+  @doc """
+  The live session of a native websocket upgrade's previous window, whose
+  assignment the session the upgrade opens prefers (findings#270 row 270-283,
+  `ContinuityPayload.previous_window_preference_header/1`). The upgrade never
+  joins it, so it is read without a lock; it keeps the lookup's scope (the
+  request's Pool and API key, on the alias and on the session) and its live
+  owner lease requirement.
+  """
+  @spec previous_window_preference_session(map(), RequestOptions.t(), DateTime.t()) :: CodexSession.t() | nil
+  def previous_window_preference_session(%{pool: %{id: pool_id}, api_key: %{id: api_key_id}}, %RequestOptions{} = opts, now) do
+    case ContinuityPayload.previous_window_preference_header(opts) do
+      nil -> nil
+      previous_window -> pool_id |> active_session_query(api_key_id, "session_header", previous_window, now) |> Repo.one()
+    end
+  end
+
+  @doc """
+  The `session_header` values through which a request's window reaches a
+  session: its own window or session header and, for a native HTTP request,
+  the previous window of its thread (findings#289). A start that finds no live
+  session closes the lease-expired session they lead to (findings#270 row
+  270-282).
+  """
+  @spec session_header_values(RequestOptions.t()) :: [String.t()]
+  def session_header_values(%RequestOptions{continuity: continuity} = opts) do
+    [blank_to_nil(continuity.session_header), ContinuityPayload.previous_window_session_header(opts)]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
   # Read-only strict lookup for the saved-reset bypass proof: the anchor must
   # resolve through an alias that already exists (before this request registers
   # its own), to a session with a bound assignment. Mirrors the
@@ -71,6 +128,20 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
   # without locking or registering anything.
   @spec previous_response_assignment_id(map(), String.t(), DateTime.t()) :: Ecto.UUID.t() | nil
   def previous_response_assignment_id(auth, previous_response_id, now) do
+    case previous_response_resolution(auth, previous_response_id, now) do
+      %{assignment_id: assignment_id} -> assignment_id
+      nil -> nil
+    end
+  end
+
+  # The same strict lookup, also returning the Full/Lite dialect recorded on the
+  # anchor's alias when its response completed (`response_alias_metadata/1`).
+  # The mode is `nil` when the alias carries none (written before the record
+  # existed); there is no alias at all for a response a request without a
+  # session produced.
+  @spec previous_response_resolution(map(), String.t(), DateTime.t()) ::
+          %{assignment_id: Ecto.UUID.t() | nil, serving_mode: String.t() | nil} | nil
+  def previous_response_resolution(auth, previous_response_id, now) do
     alias_hash = alias_hash(previous_response_id)
 
     Repo.one(
@@ -79,15 +150,23 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
         on: alias_record.codex_session_id == session.id,
         where:
           alias_record.pool_id == ^auth.pool.id and alias_record.api_key_id == ^auth.api_key.id and
+            session.api_key_id == ^auth.api_key.id and
             alias_record.alias_kind == "previous_response_id" and
             alias_record.alias_hash == ^alias_hash and
             alias_record.status == ^@alias_active and alias_record.expires_at > ^now and
             session.status in ^@session_reconnectable_statuses,
         order_by: [desc: alias_record.last_seen_at, desc: alias_record.updated_at],
         limit: 1,
-        select: session.pool_upstream_assignment_id
+        select: %{
+          assignment_id: session.pool_upstream_assignment_id,
+          serving_mode: fragment("?->>'serving_mode'", alias_record.metadata)
+        }
     )
+    |> known_resolution_serving_mode()
   end
+
+  defp known_resolution_serving_mode(%{serving_mode: mode} = resolution), do: %{resolution | serving_mode: known_serving_mode(mode)}
+  defp known_resolution_serving_mode(nil), do: nil
 
   @spec previous_response_session_id(map(), String.t(), DateTime.t()) :: Ecto.UUID.t() | nil
   def previous_response_session_id(auth, previous_response_id, now) do
@@ -99,6 +178,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
         on: alias_record.codex_session_id == session.id,
         where:
           alias_record.pool_id == ^auth.pool.id and alias_record.api_key_id == ^auth.api_key.id and
+            session.api_key_id == ^auth.api_key.id and
             alias_record.alias_kind == "previous_response_id" and
             alias_record.alias_hash == ^alias_hash and
             alias_record.status == ^@alias_active and alias_record.expires_at > ^now and
@@ -113,11 +193,14 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
   def register!(%CodexSession{} = session, auth, %RequestOptions{} = opts, now) do
     expires_at = DateTime.add(now, expired_alias_ttl_seconds(), :second)
 
+    response_alias = {"previous_response_id", blank_to_nil(opts.continuity.response_id)}
+
     rows =
       opts
       |> alias_candidates(session.session_key)
-      |> Enum.map(fn {alias_kind, alias_value} ->
-        alias_attrs(session, auth, alias_kind, alias_value, now, expires_at)
+      |> Enum.map(fn {alias_kind, alias_value} = candidate ->
+        metadata = if candidate == response_alias, do: response_alias_metadata(opts), else: @alias_metadata
+        alias_attrs(session, auth, alias_kind, alias_value, now, expires_at, metadata)
       end)
 
     if rows != [] do
@@ -141,6 +224,17 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
     request_options
     |> ContinuityPayload.put_previous_response_id(payload)
     |> RequestOptions.put_continuity(response_id: response_id)
+  end
+
+  @spec register_session_header_hash(CodexSession.t(), map(), <<_::256>>) :: :ok | {:error, :session_alias_conflict}
+  def register_session_header_hash(session, auth, hash), do: register_session_header_hash(session, auth, hash, database_now())
+
+  @spec point_frame_window_hash(CodexSession.t(), map(), <<_::256>>) :: :created | :refreshed | :moved | :kept | :busy
+  def point_frame_window_hash(session, auth, hash), do: point_frame_window_hash(session, auth, hash, database_now())
+
+  defp database_now do
+    %{rows: [[now]]} = Repo.query!("SELECT clock_timestamp()", [])
+    now
   end
 
   @spec register_session_header_hash(CodexSession.t(), map(), <<_::256>>, DateTime.t()) ::
@@ -193,13 +287,121 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
     end
   end
 
+  @doc """
+  Leads the `session_header` lookup of a window a websocket turn frame carries
+  to the session of the socket that sent it (findings#206, P115). The window's
+  alias is created, refreshed, or moved from the session holding it, unless
+  that session has a turn in progress, whose own reconnect needs the window.
+  It runs under the socket session's lock inside the turn's reservation, so
+  it never waits for the alias row: one another transaction holds (an
+  upgrade resolving the window) is left alone (`:busy`). Answers what it did;
+  a lookup aid, it never fails the turn.
+  """
+  @spec point_frame_window_hash(CodexSession.t(), map(), <<_::256>>, DateTime.t()) :: :created | :refreshed | :moved | :kept | :busy
+  def point_frame_window_hash(
+        %CodexSession{pool_id: pool_id, api_key_id: api_key_id} = session,
+        %{pool: %{id: pool_id}, api_key: %{id: api_key_id}},
+        hash,
+        now
+      )
+      when is_binary(hash) and byte_size(hash) == 32 do
+    expires_at = DateTime.add(now, expired_alias_ttl_seconds(), :second)
+
+    current =
+      Repo.one(
+        from alias_record in BridgeSessionAlias,
+          where:
+            alias_record.pool_id == ^pool_id and alias_record.api_key_id == ^api_key_id and
+              alias_record.alias_kind == "session_header" and alias_record.alias_hash == ^hash and
+              alias_record.status == ^@alias_active,
+          lock: "FOR UPDATE SKIP LOCKED"
+      )
+
+    case current do
+      nil -> register_session_header_hash_row(session, hash, now, expires_at)
+      %BridgeSessionAlias{} = row -> point_existing_alias(row, session, now, expires_at)
+    end
+  end
+
+  defp point_existing_alias(%BridgeSessionAlias{codex_session_id: session_id} = row, %CodexSession{id: session_id}, now, expires_at) do
+    refresh_alias!(row, now, expires_at, row.metadata)
+    :refreshed
+  end
+
+  defp point_existing_alias(%BridgeSessionAlias{codex_session_id: holder_id} = row, %CodexSession{} = session, now, expires_at) do
+    if turn_in_progress?(holder_id) do
+      :kept
+    else
+      row
+      |> Ecto.Changeset.change(codex_session_id: session.id)
+      |> refresh_alias!(now, expires_at, %{"source" => "native_frame_window"})
+
+      :moved
+    end
+  end
+
+  defp register_session_header_hash_row(session, hash, now, expires_at) do
+    Repo.insert_all(
+      BridgeSessionAlias,
+      [
+        %{
+          id: Ecto.UUID.generate(),
+          codex_session_id: session.id,
+          pool_id: session.pool_id,
+          api_key_id: session.api_key_id,
+          alias_kind: "session_header",
+          alias_hash: hash,
+          alias_preview: alias_preview(hash),
+          status: @alias_active,
+          expires_at: expires_at,
+          last_seen_at: now,
+          metadata: %{"source" => "native_frame_window"},
+          created_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing,
+      conflict_target: @session_alias_conflict_target
+    )
+    |> case do
+      {1, _rows} -> :created
+      {0, _rows} -> :busy
+    end
+  end
+
+  defp refresh_alias!(%BridgeSessionAlias{} = row, now, expires_at, metadata), do: row |> Ecto.Changeset.change() |> refresh_alias!(now, expires_at, metadata)
+
+  defp refresh_alias!(%Ecto.Changeset{} = changeset, now, expires_at, metadata) do
+    changeset
+    |> Ecto.Changeset.change(expires_at: expires_at, last_seen_at: now, updated_at: now, metadata: metadata)
+    |> Repo.update!()
+  end
+
+  defp turn_in_progress?(session_id), do: Repo.exists?(from(turn in CodexTurn, where: turn.codex_session_id == ^session_id and turn.status == "in_progress"))
+
   defp maybe_require_active_owner_lease(query, "previous_response_id", _now), do: query
 
+  # The live lease also keeps a lapsed session of a thread's previous window
+  # out. For a native HTTP request (findings#289) it is a second layer,
+  # independent of the lease-expiry recreation that closes a lapsed session
+  # before the lookup (findings#270 row 270-282), and it stays even though that
+  # close runs first. For a websocket upgrade's preference (row 270-283) it is
+  # the only one: a lapsed session gives no preference.
   defp maybe_require_active_owner_lease(query, _alias_kind, now) do
     where(query, [session], session.owner_lease_expires_at > ^now)
   end
 
-  defp alias_attrs(session, auth, alias_kind, alias_value, now, expires_at) do
+  # The alias of the response a request produced records the Full/Lite dialect
+  # that request was served in. A context the provider holds keeps the dialect
+  # of the request that built it: one opened under Full holds no Lite tool
+  # manifest and no instructions message, which Lite sends only on a request
+  # that opens a context (findings#232 rows 232-184 and 232-270).
+  defp response_alias_metadata(%RequestOptions{} = opts) do
+    serving_mode = if RequestOptions.use_responses_lite?(opts), do: "lite", else: "full"
+    Map.put(@alias_metadata, "serving_mode", serving_mode)
+  end
+
+  defp alias_attrs(session, auth, alias_kind, alias_value, now, expires_at, metadata) do
     alias_hash = alias_hash(alias_value)
 
     %{
@@ -213,7 +415,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
       status: @alias_active,
       expires_at: expires_at,
       last_seen_at: now,
-      metadata: %{"source" => "gateway_continuity"},
+      metadata: metadata,
       created_at: now,
       updated_at: now
     }
@@ -221,14 +423,19 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
 
   defp alias_upsert_query(session, now, expires_at) do
     from alias_record in BridgeSessionAlias,
+      as: :alias_record,
+      where:
+        alias_record.alias_kind != "session_header" or alias_record.codex_session_id == ^session.id or
+          not exists(from turn in CodexTurn, where: turn.codex_session_id == parent_as(:alias_record).codex_session_id and turn.status == "in_progress"),
       update: [
         set: [
           codex_session_id: ^session.id,
           alias_preview: fragment("EXCLUDED.alias_preview"),
           expires_at: fragment("GREATEST(?, ?)", alias_record.expires_at, ^expires_at),
-          last_seen_at:
-            fragment("GREATEST(COALESCE(?, ?), ?)", alias_record.last_seen_at, ^now, ^now),
-          metadata: fragment("EXCLUDED.metadata"),
+          last_seen_at: fragment("GREATEST(COALESCE(?, ?), ?)", alias_record.last_seen_at, ^now, ^now),
+          # Merged, so re-registering a response's alias as the anchor of a
+          # later request keeps the dialect recorded when it completed.
+          metadata: fragment("? || EXCLUDED.metadata", alias_record.metadata),
           updated_at: fragment("GREATEST(?, ?)", alias_record.updated_at, ^now)
         ]
       ]
@@ -243,6 +450,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
       on: alias_record.codex_session_id == session.id,
       where:
         alias_record.pool_id == ^auth.pool.id and alias_record.api_key_id == ^auth.api_key.id and
+          session.api_key_id == ^auth.api_key.id and
           alias_record.status == ^@alias_active and alias_record.expires_at > ^now and
           session.status in ^@session_reconnectable_statuses and
           (alias_record.alias_kind == "previous_response_id" or
@@ -326,7 +534,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
   defp response_id_from_body(_body), do: nil
 
   defp response_id_from_json_body(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, decoded} -> response_id_from_decoded(decoded)
       {:error, _reason} -> nil
     end
@@ -339,7 +547,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
     |> Stream.map(&String.replace_prefix(&1, "data: ", ""))
     |> Stream.filter(&String.starts_with?(&1, "{"))
     |> Enum.find_value(fn payload ->
-      case Jason.decode(payload) do
+      case CodexPooler.JSON.decode(payload) do
         {:ok, decoded} -> response_id_from_decoded(decoded)
         {:error, _reason} -> nil
       end
@@ -352,6 +560,9 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.Aliases do
     do: blank_to_nil(id)
 
   defp response_id_from_decoded(_decoded), do: nil
+
+  defp known_serving_mode(mode) when mode in @serving_modes, do: mode
+  defp known_serving_mode(_mode), do: nil
 
   defp alias_hash(value), do: :crypto.hash(:sha256, value)
 

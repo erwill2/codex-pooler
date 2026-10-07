@@ -4,6 +4,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
   import Ecto.Query
 
   alias CodexPooler.Catalog.{OpenAIPricingFormat, PricingSnapshot}
+  alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.Repo
 
   @source "openai-json-pricing"
@@ -36,7 +37,8 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
 
   @spec import_url(term()) :: {:ok, import_result()} | {:error, importer_error()}
   def import_url(url) when is_binary(url) do
-    with {:ok, raw} <- fetch(url),
+    with :ok <- validate_url(url),
+         {:ok, raw} <- fetch(url),
          {:ok, payload} <- decode(raw),
          {:ok, classified} <- classify(payload) do
       persist(classified, url)
@@ -45,8 +47,25 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
 
   def import_url(_url), do: {:error, error(:invalid_url, "url must be a string")}
 
+  defp validate_url(url) do
+    case URI.new(url) do
+      {:ok, %URI{scheme: scheme, host: host, port: port}}
+      when scheme in ["http", "https"] and is_binary(host) and host != "" and
+             port in 1..65_535 ->
+        :ok
+
+      _invalid ->
+        {:error, error(:invalid_url, "url must be an absolute HTTP or HTTPS URL")}
+    end
+  end
+
   defp fetch(url) do
-    case Req.get(url, decode_body: false, receive_timeout: :timer.seconds(30), retry: false) do
+    case OutboundHTTP.get(url,
+           decode_body: false,
+           receive_timeout: :timer.seconds(30),
+           retry: false,
+           finch: OutboundHTTP.pool_options_for_url(url)
+         ) do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_binary(body) ->
         {:ok, body}
 
@@ -309,9 +328,7 @@ defmodule CodexPooler.Catalog.OpenAIPricingImporter do
   defp decimal_equal?(_left, _right), do: false
 
   defp rollback_conflict do
-    Repo.rollback(
-      error(:concurrent_pricing_conflict, error_message(:concurrent_pricing_conflict))
-    )
+    Repo.rollback(error(:concurrent_pricing_conflict, error_message(:concurrent_pricing_conflict)))
   end
 
   defp file_error(reason) do

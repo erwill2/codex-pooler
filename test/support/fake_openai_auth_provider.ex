@@ -51,8 +51,7 @@ defmodule CodexPooler.FakeOpenAIAuthProvider do
   @spec authorization_code_response(keyword()) :: map()
   def authorization_code_response(opts \\ []) do
     %{
-      "authorization_code" =>
-        Keyword.get(opts, :authorization_code, "authorization-code-example"),
+      "authorization_code" => Keyword.get(opts, :authorization_code, "authorization-code-example"),
       "code_verifier" => Keyword.get(opts, :code_verifier, "code-verifier-example")
     }
   end
@@ -75,7 +74,7 @@ defmodule CodexPooler.FakeOpenAIAuthProvider do
       )
 
     header = Base.url_encode64(~s({"alg":"none"}), padding: false)
-    payload = Base.url_encode64(Jason.encode!(claims), padding: false)
+    payload = Base.url_encode64(CodexPooler.JSON.encode!(claims), padding: false)
     header <> "." <> payload <> ".signature"
   end
 

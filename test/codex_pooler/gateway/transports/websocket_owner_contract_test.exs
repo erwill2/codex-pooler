@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
   use ExUnit.Case, async: true
 
   alias CodexPooler.Gateway.Transports.Websocket.OwnerDefaults
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.CloseDiagnostics
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
 
   describe "reconnect handoff controls" do
@@ -17,12 +18,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
       control_ref = make_ref()
 
       ready =
-        {:websocket_owner_handoff_ready, "corr-control", 3, owner_turn_id, downstream_pid,
-         control_ref}
+        {:websocket_owner_handoff_ready, "corr-control", 3, owner_turn_id, downstream_pid, control_ref}
 
       failed =
-        {:websocket_owner_handoff_failed, "corr-control", 3, owner_turn_id, downstream_pid,
-         control_ref, :owner_drained}
+        {:websocket_owner_handoff_failed, "corr-control", 3, owner_turn_id, downstream_pid, control_ref, :owner_drained}
 
       assert WebsocketOwnerContract.accept_handoff_message(
                ready,
@@ -213,20 +212,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
 
   describe "downstream owner messages" do
     test "accepts only the permitted downstream tuple payload shapes" do
-      assert WebsocketOwnerContract.downstream_message?(
-               {:websocket_owner_frame, "corr-1", 1, {:data, "encoded text"}}
-             )
+      assert WebsocketOwnerContract.downstream_message?({:websocket_owner_frame, "corr-1", 1, {:data, "encoded text"}})
 
       assert {:ok, safe_payload} =
                WebsocketOwnerContract.safe_error_payload(:owner_busy, @sentinel)
 
-      assert WebsocketOwnerContract.downstream_message?(
-               {:websocket_owner_frame, "corr-1", 1, {:error, :owner_busy, safe_payload}}
-             )
+      assert WebsocketOwnerContract.downstream_message?({:websocket_owner_frame, "corr-1", 1, {:error, :owner_busy, safe_payload}})
 
-      assert WebsocketOwnerContract.downstream_message?(
-               {:websocket_owner_frame, "corr-1", 1, :complete}
-             )
+      assert WebsocketOwnerContract.downstream_message?({:websocket_owner_frame, "corr-1", 1, :complete})
     end
 
     test "rejects invalid downstream tuple shapes and mismatched error payloads" do
@@ -238,8 +231,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
         {:websocket_owner_frame, "corr-1", 0, :complete},
         {:websocket_owner_frame, :not_binary, 1, :complete},
         {:websocket_owner_frame, "corr-1", 1, {:error, :unknown_owner_error, %{}}},
-        {:websocket_owner_frame, "corr-1", 1,
-         {:error, :owner_busy, put_in(safe_payload.metadata.reason, "wrong_reason")}},
+        {:websocket_owner_frame, "corr-1", 1, {:error, :owner_busy, put_in(safe_payload.metadata.reason, "wrong_reason")}},
         {:websocket_owner_frame, "corr-1", 1, {:complete, @sentinel}},
         {:unexpected_owner_frame, "corr-1", 1, :complete}
       ]
@@ -271,8 +263,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
         {:websocket_owner_frame, "corr-public", 7, owner_turn_id, {:data, "encoded public text"}}
 
       stale_frame =
-        {:websocket_owner_frame, "corr-public", 7, old_owner_turn_id,
-         {:data, "encoded stale text"}}
+        {:websocket_owner_frame, "corr-public", 7, old_owner_turn_id, {:data, "encoded stale text"}}
 
       legacy_frame =
         {:websocket_owner_frame, "corr-public", 7, {:data, "encoded legacy text"}}
@@ -326,9 +317,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
       assert WebsocketOwnerContract.accept_downstream_message(wrong_payload_type, 3, "corr-1") ==
                {:error, :invalid_downstream_message}
 
-      refute inspect(
-               WebsocketOwnerContract.accept_downstream_message(wrong_payload_type, 3, "corr-1")
-             ) =~ @sentinel
+      refute inspect(WebsocketOwnerContract.accept_downstream_message(wrong_payload_type, 3, "corr-1")) =~ @sentinel
     end
   end
 
@@ -339,8 +328,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
       owner_turn_id = self()
 
       probe =
-        {:websocket_owner_output_commit_probe, "corr-probe", 3, owner_turn_id, active_turn_ref,
-         self(), probe_ref}
+        {:websocket_owner_output_commit_probe, "corr-probe", 3, owner_turn_id, active_turn_ref, self(), probe_ref}
 
       assert WebsocketOwnerContract.output_commit_probe?(probe)
 
@@ -365,8 +353,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
       owner_turn_id = self()
 
       ack =
-        {:websocket_owner_output_commit_ack, "corr-ack", 5, owner_turn_id, active_turn_ref,
-         probe_ref, true}
+        {:websocket_owner_output_commit_ack, "corr-ack", 5, owner_turn_id, active_turn_ref, probe_ref, true}
 
       assert WebsocketOwnerContract.output_commit_ack?(ack)
 
@@ -390,15 +377,86 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContractTest do
     end
 
     test "rejects malformed probe and acknowledgement values" do
-      refute WebsocketOwnerContract.output_commit_probe?(
-               {:websocket_owner_output_commit_probe, "corr", 1, self(), :not_ref, self(),
-                make_ref()}
-             )
+      refute WebsocketOwnerContract.output_commit_probe?({:websocket_owner_output_commit_probe, "corr", 1, self(), :not_ref, self(), make_ref()})
 
-      refute WebsocketOwnerContract.output_commit_ack?(
-               {:websocket_owner_output_commit_ack, "corr", 1, self(), make_ref(), make_ref(),
-                :not_boolean}
-             )
+      refute WebsocketOwnerContract.output_commit_ack?({:websocket_owner_output_commit_ack, "corr", 1, self(), make_ref(), make_ref(), :not_boolean})
+    end
+  end
+
+  # findings#270: the owner tells its attached downstream that the upstream
+  # connection behind it closed between requests.
+  describe "upstream connection close instruction" do
+    test "keeps cause, lifecycle id and generation of every anchor-ending close the session reports" do
+      causes = CloseDiagnostics.anchor_invalidating_causes()
+      assert :peer_close_frame in causes
+
+      for cause <- causes do
+        lifecycle_id = Ecto.UUID.generate()
+        signal = %{cause: cause, lifecycle_id: lifecycle_id, generation: 2, connection_requests: 3}
+
+        assert WebsocketOwnerContract.upstream_closed_signal(signal) == {:ok, %{cause: cause, lifecycle_id: lifecycle_id, generation: 2}}
+      end
+    end
+
+    test "refuses a cause the session never reports to its subscriber" do
+      for cause <- [:request_key_changed, :owner_drained, :unknown_close_cause, "peer_close_frame", nil] do
+        assert WebsocketOwnerContract.upstream_closed_signal(%{cause: cause, lifecycle_id: Ecto.UUID.generate(), generation: 1}) == :error
+      end
+    end
+
+    test "refuses a lifecycle id or generation that names no connection" do
+      lifecycle_id = Ecto.UUID.generate()
+
+      for signal <- [
+            %{cause: :peer_close_frame, lifecycle_id: @sentinel, generation: 1},
+            %{cause: :peer_close_frame, lifecycle_id: Ecto.UUID.bingenerate(), generation: 1},
+            %{cause: :peer_close_frame, lifecycle_id: lifecycle_id <> "0", generation: 1},
+            %{cause: :peer_close_frame, lifecycle_id: :lifecycle, generation: 1},
+            %{cause: :peer_close_frame, lifecycle_id: lifecycle_id, generation: 0},
+            %{cause: :peer_close_frame, lifecycle_id: lifecycle_id, generation: -1},
+            %{cause: :peer_close_frame, lifecycle_id: lifecycle_id, generation: 1.0},
+            %{cause: :peer_close_frame, lifecycle_id: lifecycle_id},
+            %{cause: :peer_close_frame, generation: 1},
+            %{lifecycle_id: lifecycle_id, generation: 1},
+            {:peer_close_frame, lifecycle_id, 1}
+          ] do
+        assert WebsocketOwnerContract.upstream_closed_signal(signal) == :error
+      end
+    end
+
+    test "the instruction carries exactly the kept signal for one downstream epoch" do
+      signal = %{cause: :transport_closed, lifecycle_id: Ecto.UUID.generate(), generation: 4}
+      message = {:websocket_owner_upstream_closed, "corr-close", 2, signal}
+
+      assert WebsocketOwnerContract.upstream_closed_message?(message)
+      refute WebsocketOwnerContract.upstream_closed_message?({:websocket_owner_upstream_closed, "corr-close", 2, Map.put(signal, :connection_requests, 1)})
+      refute WebsocketOwnerContract.upstream_closed_message?({:websocket_owner_upstream_closed, "corr-close", 0, signal})
+      refute WebsocketOwnerContract.upstream_closed_message?({:websocket_owner_upstream_closed, :corr_close, 2, signal})
+      refute WebsocketOwnerContract.upstream_closed_message?({:websocket_owner_upstream_closed, "corr-close", 2, %{signal | cause: :request_key_changed}})
+      refute WebsocketOwnerContract.upstream_closed_message?({:websocket_owner_upstream_close, "corr-close", 2, signal})
+      refute WebsocketOwnerContract.upstream_closed_message?({:websocket_owner_upstream_closed, "corr-close", 2})
+    end
+
+    test "accepts the instruction only for the matching downstream and drops a stale one" do
+      signal = %{cause: :pong_deadline, lifecycle_id: Ecto.UUID.generate(), generation: 7}
+      message = {:websocket_owner_upstream_closed, "corr-close", 3, signal}
+
+      assert WebsocketOwnerContract.accept_upstream_closed_message(message, 3, "corr-close") == {:ok, signal}
+      assert WebsocketOwnerContract.accept_upstream_closed_message(message, 4, "corr-close") == :drop
+      assert WebsocketOwnerContract.accept_upstream_closed_message(message, 3, "corr-other") == :drop
+
+      invalid = {:websocket_owner_upstream_closed, "corr-close", 3, %{signal | lifecycle_id: @sentinel}}
+      assert WebsocketOwnerContract.accept_upstream_closed_message(invalid, 3, "corr-close") == {:error, :invalid_upstream_closed_message}
+      assert WebsocketOwnerContract.accept_upstream_closed_message(invalid, 4, "corr-close") == {:error, :invalid_upstream_closed_message}
+      refute inspect(WebsocketOwnerContract.accept_upstream_closed_message(invalid, 3, "corr-close")) =~ @sentinel
+    end
+
+    test "is not an owner frame, so the owner error vocabulary never carries it" do
+      message = {:websocket_owner_upstream_closed, "corr-close", 1, %{cause: :peer_close_frame, lifecycle_id: Ecto.UUID.generate(), generation: 1}}
+
+      refute WebsocketOwnerContract.downstream_message?(message)
+      assert WebsocketOwnerContract.accept_downstream_message(message, 1, "corr-close") == {:error, :invalid_downstream_message}
+      refute WebsocketOwnerContract.owner_error?(:upstream_connection_closed)
     end
   end
 end

@@ -15,8 +15,21 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
 
   @endpoint_path "/backend-api/codex/responses"
 
-  test "a same-model tool continuation keeps its explicit response anchor", %{conn: conn} do
-    upstream = start_upstream({:sequence, [tool_response(), success()]})
+  # The Codex backend resolves `previous_response_id` only on the websocket
+  # connection that produced the response and refuses the parameter over HTTP
+  # (findings#232 rows 232-275 and 232-276); FakeUpstream answers the same way.
+  # A native HTTP tool continuation still carries its explicit anchor upstream
+  # (dropping it would hand the provider a delta without its context) and the
+  # client receives the refusal naming the parameter, so it can resend the
+  # full history.
+  test "a same-model tool continuation keeps its explicit response anchor, which the provider refuses over HTTP", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.strict_sequence([
+          strict_http_turn(tool_response(), valid: true, forbidden: ["previous_response_id"])
+        ])
+      )
+
     setup = gateway_setup(upstream)
     {anchor, call_id} = complete_first_model!(conn, setup)
 
@@ -26,19 +39,31 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
       |> auth(setup)
       |> post(@endpoint_path, continuation(setup.model, anchor, call_id))
 
-    assert %{"id" => "resp_example_transition_complete"} = json_response(response, 200)
-    assert anchor != "resp_example_transition_complete"
+    assert %{"error" => %{"code" => "unsupported_parameter", "param" => "previous_response_id"}} = json_response(response, 400)
     assert [_first, second] = FakeUpstream.requests(upstream)
     assert second.json["previous_response_id"] == anchor
     assert [%{"type" => "function_call_output", "call_id" => ^call_id}] = second.json["input"]
     assert Repo.aggregate(Request, :count) == 2
     assert Repo.aggregate(Attempt, :count) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
-  test "a target-model error with an explicit prior-model anchor stays terminal", %{conn: conn} do
-    upstream = start_upstream({:sequence, [tool_response(), model_error()]})
+  # Over HTTP the Codex backend checks the model before `previous_response_id`:
+  # a model the ChatGPT account cannot serve is refused with its model refusal
+  # whether or not the request is anchored (findings#232 row 232-279, live
+  # probe 2026-09-23). The anchored target-model continuation receives that
+  # refusal, not the parameter refusal, and is not retried or re-routed.
+  test "a target-model continuation with an explicit prior-model anchor stays terminal", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.strict_sequence([
+          strict_http_turn(tool_response(), valid: true, forbidden: ["previous_response_id"])
+        ])
+      )
+
     setup = gateway_setup(upstream)
     target = target_model(setup)
+    :ok = FakeUpstream.refuse_http_model(upstream, "provider-gpt-example-target")
     {anchor, call_id} = complete_first_model!(conn, setup)
 
     response =
@@ -47,7 +72,7 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
       |> auth(setup)
       |> post(@endpoint_path, continuation(target, anchor, call_id))
 
-    assert %{"error" => %{"code" => "model_not_found"}} = json_response(response, 404)
+    assert %{"error" => %{"code" => "invalid_request", "param" => nil}} = json_response(response, 400)
     assert [first, second] = FakeUpstream.requests(upstream)
     refute first.json["model"] == second.json["model"]
     assert second.json["previous_response_id"] == anchor
@@ -57,12 +82,13 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
     assert failed.retry_count == 0
     assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^failed.id), :count) == 1
     assert failed.usage_status == "usage_unknown"
+    assert [failed_attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^failed.id))
+    assert "sha256_" <> _fingerprint = failed_attempt.response_metadata["rejection_detail_class"]
+    refute Map.has_key?(failed_attempt.response_metadata, "rejection_error_param")
 
-    assert Enum.sort(
-             Repo.all(
-               from l in LedgerEntry, where: l.request_id == ^failed.id, select: l.entry_kind
-             )
-           ) == ["release", "reservation", "settlement"]
+    assert Enum.sort(Repo.all(from l in LedgerEntry, where: l.request_id == ^failed.id, select: l.entry_kind)) == ["release", "reservation", "settlement"]
+
+    assert :ok = FakeUpstream.verify!(upstream)
   end
 
   test "an allowed first model does not authorize the anchored target model", %{conn: conn} do
@@ -81,7 +107,7 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
       |> auth(setup)
       |> post(@endpoint_path, continuation(target, anchor, call_id))
 
-    assert %{"error" => %{"code" => "model_not_allowed"}} = json_response(response, 403)
+    assert %{"error" => %{"code" => "model_not_allowed"}} = json_response(response, 400)
     assert FakeUpstream.count(upstream) == 1
     assert Repo.aggregate(from(r in Request, where: r.status == "succeeded"), :count) == 1
     assert Repo.aggregate(Attempt, :count) == 1
@@ -153,6 +179,15 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
     }
   end
 
+  defp strict_http_turn(respond, json_expectations) do
+    FakeUpstream.expect_request(
+      method: "POST",
+      path: @endpoint_path,
+      json: json_expectations,
+      respond: respond
+    )
+  end
+
   defp tool_response do
     FakeUpstream.json_response(%{
       "id" => "resp_example_transition_anchor",
@@ -170,28 +205,5 @@ defmodule CodexPooler.Gateway.Runtime.ModelTransitionContractTest do
       ],
       "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
     })
-  end
-
-  defp success do
-    FakeUpstream.json_response(%{
-      "id" => "resp_example_transition_complete",
-      "status" => "completed",
-      "output" => [],
-      "object" => "response",
-      "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-    })
-  end
-
-  defp model_error do
-    FakeUpstream.json_response(
-      %{
-        "error" => %{
-          "code" => "model_not_found",
-          "type" => "invalid_request_error",
-          "param" => "model"
-        }
-      },
-      404
-    )
   end
 end

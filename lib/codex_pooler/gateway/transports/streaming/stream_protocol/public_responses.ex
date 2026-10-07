@@ -2,9 +2,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
   @moduledoc false
 
   alias CodexPooler.Gateway.OpenAICompatibility.{PublicResponse, Responses}
+  alias CodexPooler.Gateway.Runtime.Finalization.ProviderUsageLimit
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+  alias CodexPooler.Gateway.Transports.NativeCodexResponseControl
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesSequence
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesTerminalOutput
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesToolCompletion
 
   @type summary_state :: %{
           required(:schema_version) => pos_integer(),
@@ -32,10 +36,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
           required(:buffer_candidate?) => boolean(),
           required(:created?) => boolean(),
           required(:text_delta?) => boolean(),
+          required(:items_relayed?) => boolean(),
           required(:terminal_kind) => atom() | nil,
           required(:terminal_failure) => StreamProtocol.terminal_failure() | nil,
           required(:custom_tool_namespaces) => map(),
           required(:sequence) => PublicResponsesSequence.state(),
+          required(:tool_completion) => PublicResponsesToolCompletion.state(),
+          required(:terminal_output) => PublicResponsesTerminalOutput.state(),
           required(:summary) => summary_state(),
           required(:passthrough?) => boolean(),
           required(:passthrough_terminal) => nil,
@@ -43,6 +50,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
           required(:passthrough_terminal_failure) => StreamProtocol.terminal_failure() | nil,
           required(:passthrough_terminal_seen?) => boolean()
         }
+
+  @websocket_retry_error_codes ~w(websocket_connection_limit_reached previous_response_not_found)
 
   @spec new_state(map()) :: state()
   def new_state(custom_tool_namespaces \\ %{}) when is_map(custom_tool_namespaces) do
@@ -52,10 +61,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
       buffer_candidate?: false,
       created?: false,
       text_delta?: false,
+      items_relayed?: false,
       terminal_kind: nil,
       terminal_failure: nil,
       custom_tool_namespaces: custom_tool_namespaces,
       sequence: PublicResponsesSequence.new_state(),
+      tool_completion: PublicResponsesToolCompletion.new_state(),
+      terminal_output: PublicResponsesTerminalOutput.new_state(),
       summary: new_summary(),
       passthrough?: false,
       passthrough_terminal: nil,
@@ -89,7 +101,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
   @spec normalize_json_message(binary()) :: binary()
   def normalize_json_message(data) when is_binary(data) do
-    case Jason.decode(data) do
+    case CodexPooler.JSON.decode(data) do
       {:ok, %{} = decoded} ->
         {normalized, _decoded} = normalize_json_message(data, decoded)
         normalized
@@ -99,10 +111,72 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     end
   end
 
+  @doc """
+  Owner-side mapper for public turns carried over the upstream websocket.
+
+  It normalizes like `normalize_json_message/2` except for a provider
+  refusal sent as the websocket transport's wrapped error frame
+  (`provider_rejection_frame?/1`), which it passes through unchanged: the
+  websocket bridge turns that frame into the HTTP response the provider
+  returns for the same request over HTTP (findings#225), and the public
+  websocket surface normalizes every owner frame again with
+  `normalize_json_message/2` before it reaches its client.
+  """
+  @spec normalize_owner_json_message(binary()) :: binary()
+  def normalize_owner_json_message(data) when is_binary(data) do
+    case CodexPooler.JSON.decode(data) do
+      {:ok, %{} = decoded} ->
+        {normalized, _decoded} = normalize_owner_json_message(data, decoded)
+        normalized
+
+      _invalid ->
+        data
+    end
+  end
+
+  @spec normalize_owner_json_message(binary(), map()) :: {binary(), map()}
+  def normalize_owner_json_message(data, %{} = decoded) when is_binary(data) do
+    if provider_rejection_frame?(decoded) or provider_usage_limit_frame?(decoded),
+      do: {data, decoded},
+      else: normalize_json_message(data, decoded)
+  end
+
+  @doc """
+  True for a provider usage limit with a known reset sent as the websocket
+  transport's wrapped `429` frame, or as the canonical `response.failed` the
+  session makes of it, which keeps the wrapped `status` and the provider's
+  error object (`ProviderUsageLimit.frame_error/2`). The owner passes it
+  through unmasked like a refusal frame, and the public websocket, which
+  normalizes every owner frame again, answers it with the wrapped terminal
+  event (findings#206 row 206-546).
+  """
+  @spec provider_usage_limit_frame?(term()) :: boolean()
+  def provider_usage_limit_frame?(%{"type" => type} = decoded) when type in ["error", "response.failed"],
+    do: match?({:ok, _error}, ProviderUsageLimit.frame_error(decoded))
+
+  def provider_usage_limit_frame?(_decoded), do: false
+
+  @doc """
+  True for the websocket transport's wrapped error frame
+  (`{"type": "error", "status": 4xx, "error": {...}}`, `status_code` is the
+  Codex client's alias) in the 4xx window whose rejection fields the HTTP
+  path records (429 excluded), unless it carries one of the two codes the
+  Codex client itself retries on its websocket.
+  """
+  @spec provider_rejection_frame?(term()) :: boolean()
+  def provider_rejection_frame?(%{"type" => "error", "error" => %{} = error} = decoded) do
+    status = Map.get(decoded, "status", Map.get(decoded, "status_code"))
+
+    is_integer(status) and status in 400..499 and status != 429 and
+      Map.get(error, "code") not in @websocket_retry_error_codes
+  end
+
+  def provider_rejection_frame?(_decoded), do: false
+
   @spec normalize_json_message(binary(), map()) :: {binary(), map()}
   def normalize_json_message(_data, %{"type" => "response.failed"} = decoded) do
     normalized = normalize_terminal_errors("response.failed", decoded)
-    {Jason.encode!(normalized), normalized}
+    {CodexPooler.JSON.encode!(normalized), normalized}
   end
 
   def normalize_json_message(data, %{} = decoded) when is_binary(data) do
@@ -331,22 +405,29 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     {IO.iodata_to_binary(iodata), state}
   end
 
-  defp normalize_block("data: [DONE]", state) do
-    state =
-      state
-      |> Map.update!(:sequence, &%{&1 | terminal_latched?: true})
-      |> Map.put(:terminal_kind, :completed)
-      |> Map.put(:terminal_failure, nil)
-      |> put_summary_terminal(:completed, "completed")
+  defp normalize_block(_block, %{sequence: %{terminal_latched?: true}} = state), do: {[], state, false}
 
-    {[], state, true}
+  defp normalize_block("data: [DONE]", state) do
+    case PublicResponsesToolCompletion.completion_verdict(state.tool_completion) do
+      :ok -> normalize_done_marker(state)
+      {:error, reason} -> reject_tool_completion(state, reason)
+    end
   end
 
   defp normalize_block(block, state) do
     {event_type, decoded} = stream_block_event(block)
 
+    state =
+      if effective_source_public_type(event_type, decoded) do
+        %{state | tool_completion: PublicResponsesToolCompletion.observe(state.tool_completion, Map.put_new(decoded, "type", event_type))}
+      else
+        state
+      end
+
     decoded =
-      Responses.restore_custom_tool_call_namespaces(decoded, state.custom_tool_namespaces)
+      decoded
+      |> drop_provider_event_headers()
+      |> Responses.restore_custom_tool_call_namespaces(state.custom_tool_namespaces)
 
     source_type = effective_source_public_type(event_type, decoded)
     source_terminal_outcome = source_terminal_outcome(source_type, decoded)
@@ -373,6 +454,17 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     end
   end
 
+  defp normalize_done_marker(state) do
+    state =
+      state
+      |> Map.update!(:sequence, &%{&1 | terminal_latched?: true})
+      |> Map.put(:terminal_kind, :completed)
+      |> Map.put(:terminal_failure, nil)
+      |> put_summary_terminal(:completed, "completed")
+
+    {[], state, true}
+  end
+
   defp effective_source_public_type(event_type, %{} = decoded) do
     event_type = StreamProtocol.normalize_sse_event_label(event_type)
     data_type = clean_string(Map.get(decoded, "type"))
@@ -397,15 +489,18 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     {block, if(emitted?, do: record_text_done(state, decoded), else: state)}
   end
 
+  defp normalize_public_block("response.output_item.added", decoded, state) do
+    {block, state, emitted?} = emit_public_sse("response.output_item.added", decoded, state)
+    {block, if(emitted?, do: state |> record_visible("response.output_item.added", decoded) |> record_item_relayed(), else: state)}
+  end
+
   defp normalize_public_block("response.output_item.done", decoded, state) do
     {block, state, emitted?} = emit_public_sse("response.output_item.done", decoded, state)
-    {block, if(emitted?, do: record_item_done(state), else: state)}
+    {block, if(emitted?, do: state |> record_item_done() |> record_item_relayed() |> record_terminal_output(decoded, block), else: state)}
   end
 
   defp normalize_public_block(type, decoded, state) when is_binary(type) do
-    if codex_public_event?(type) do
-      {[], state}
-    else
+    if public_stream_event?(type) do
       {block, state, emitted?} = emit_public_sse(type, decoded, state)
 
       state =
@@ -414,13 +509,47 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
           else: state
 
       {block, state}
+    else
+      {[], state}
     end
   end
 
   defp normalize_public_block(_type, _decoded, state), do: {[], state}
 
   defp normalize_public_terminal_block(type, decoded, source_terminal_outcome, state) do
+    case {type, PublicResponsesToolCompletion.completion_verdict(state.tool_completion)} do
+      {"response.completed", {:error, reason}} ->
+        {terminal, state, true} = reject_tool_completion(state, reason)
+        {terminal, state}
+
+      _valid_or_failed ->
+        emit_public_terminal_block(type, decoded, source_terminal_outcome, state)
+    end
+  end
+
+  defp reject_tool_completion(state, reason) do
+    {sequence_number, state} = track_synthetic_terminal_failure(state)
+
+    failure = %{
+      code: "upstream_stream_error",
+      upstream_code: nil,
+      upstream_error_param: nil,
+      event_type: "error",
+      data_type: "error",
+      tool_completion_reason: reason
+    }
+
+    terminal = StreamProtocol.synthetic_public_openai_responses_error_sse(reason, sequence_number)
+    {terminal, %{state | terminal_failure: failure}, true}
+  end
+
+  # A completed or incomplete terminal the provider closed with an empty
+  # output lists the items the stream delivered in its done events, as the
+  # Responses contract carries them (findings#335); the prefix below still
+  # sees the provider's terminal.
+  defp emit_public_terminal_block(type, decoded, source_terminal_outcome, state) do
     {prefix, state} = terminal_prefix(type, decoded, state)
+    decoded = PublicResponsesTerminalOutput.fill(type, decoded, state.terminal_output)
     {terminal, state, emitted?} = emit_public_sse(type, decoded, state)
 
     state =
@@ -431,47 +560,138 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     {[prefix, terminal], state}
   end
 
-  defp terminal_prefix(type, _decoded, %{created?: false, text_delta?: false} = state)
-       when type in ["response.failed", "response.incomplete", "error"],
-       do: {[], state}
-
+  # A terminal that closes a response the upstream never opened is preceded by
+  # the grammar the Responses stream contract requires, so SDK stream helpers
+  # (openai-python `responses.stream()`, openai-node `responses.stream()`,
+  # `@ai-sdk/openai`) can follow it: a `response.created` snapshot, then every
+  # projected terminal output item announced in order with its content parts and text
+  # (findings#254). Only what the terminal carries is replayed; items the
+  # upstream already relayed, or text it already streamed, are never repeated.
   defp terminal_prefix(_type, decoded, state) do
-    {created_prefix, state} =
-      if state.created? do
-        {[], state}
-      else
-        response_id =
-          nested_string(decoded, ["response", "id"]) || decoded_string(decoded, "id") || ""
-
-        created = %{
-          "type" => "response.created",
-          "response" => %{"id" => response_id, "object" => "response", "status" => "in_progress"}
-        }
-
-        {block, state, emitted?} = emit_public_sse("response.created", created, state)
-        {block, if(emitted?, do: record_created(state), else: state)}
-      end
-
-    {delta_prefix, state} =
-      if state.text_delta? do
-        {[], state}
-      else
-        case terminal_output_text(decoded) do
-          "" ->
-            {[], state}
-
-          text ->
-            delta = %{"type" => "response.output_text.delta", "delta" => text}
-
-            {block, state, emitted?} =
-              emit_public_sse("response.output_text.delta", delta, state)
-
-            {block, if(emitted?, do: record_delta(state, delta), else: state)}
-        end
-      end
-
-    {[created_prefix, delta_prefix], state}
+    {created_prefix, state} = created_prefix(decoded, state)
+    {output_prefix, state} = output_prefix(decoded, state)
+    {[created_prefix, output_prefix], state}
   end
+
+  defp created_prefix(_decoded, %{created?: true} = state), do: {[], state}
+
+  defp created_prefix(decoded, state) do
+    created = %{"type" => "response.created", "response" => created_snapshot(decoded)}
+    {block, state, emitted?} = emit_public_sse("response.created", created, state)
+    {block, if(emitted?, do: record_created(state), else: state)}
+  end
+
+  # The opening snapshot carries the identity the terminal response states
+  # (id, creation time, model) with no output yet; a field the terminal does
+  # not carry stays absent rather than being invented.
+  defp created_snapshot(decoded) do
+    response = terminal_response(decoded)
+
+    %{"object" => "response", "status" => "in_progress", "output" => []}
+    |> maybe_put_created_field("id", nested_string(decoded, ["response", "id"]) || decoded_string(decoded, "id"))
+    |> maybe_put_created_field("created_at", Map.get(response, "created_at"))
+    |> maybe_put_created_field("model", Map.get(response, "model"))
+  end
+
+  defp maybe_put_created_field(snapshot, key, value) when key in ["id", "model"] and is_binary(value) and value != "",
+    do: Map.put(snapshot, key, value)
+
+  defp maybe_put_created_field(snapshot, "created_at", value) when is_integer(value) and value >= 0,
+    do: Map.put(snapshot, "created_at", value)
+
+  defp maybe_put_created_field(snapshot, _key, _value), do: snapshot
+
+  defp output_prefix(_decoded, %{text_delta?: true} = state), do: {[], state}
+  defp output_prefix(_decoded, %{items_relayed?: true} = state), do: {[], state}
+
+  defp output_prefix(decoded, state) do
+    decoded
+    |> terminal_response()
+    |> Map.get("output")
+    |> List.wrap()
+    |> Enum.filter(&is_map/1)
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {item, output_index} -> output_item_events(item, output_index) end)
+    |> Enum.reduce({[], state}, fn {type, event}, {blocks, state} ->
+      {block, state, emitted?} = emit_public_sse(type, event, state)
+      {[blocks, block], if(emitted?, do: record_synthesized(state, type, event), else: state)}
+    end)
+  end
+
+  defp terminal_response(%{"response" => %{} = response}), do: response
+  defp terminal_response(%{} = decoded), do: decoded
+
+  # A message is announced empty and filled part by part, because the SDK
+  # accumulators append each content part and each delta onto the announced
+  # item; any other item is announced and closed as the terminal states it.
+  defp output_item_events(%{"type" => "message"} = item, output_index) do
+    item_id = Map.get(item, "id")
+
+    parts =
+      item
+      |> Map.get("content")
+      |> List.wrap()
+      |> Enum.filter(&is_map/1)
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {part, content_index} ->
+        content_part_events(part, %{"item_id" => item_id, "output_index" => output_index, "content_index" => content_index})
+      end)
+
+    [
+      {"response.output_item.added",
+       %{
+         "type" => "response.output_item.added",
+         "output_index" => output_index,
+         "item" => item |> Map.put("status", "in_progress") |> Map.put("content", [])
+       }}
+    ] ++ parts ++ [output_item_done(item, output_index)]
+  end
+
+  defp output_item_events(item, output_index) do
+    [
+      {"response.output_item.added", %{"type" => "response.output_item.added", "output_index" => output_index, "item" => item}},
+      output_item_done(item, output_index)
+    ]
+  end
+
+  defp output_item_done(item, output_index) do
+    {"response.output_item.done", %{"type" => "response.output_item.done", "output_index" => output_index, "item" => item}}
+  end
+
+  defp content_part_events(%{"type" => "output_text", "text" => text} = part, position) when is_binary(text) do
+    opening = part |> Map.put("text", "") |> reset_annotations()
+
+    [{"response.content_part.added", Map.merge(position, %{"type" => "response.content_part.added", "part" => opening})}] ++
+      text_events(text, position) ++
+      [{"response.content_part.done", Map.merge(position, %{"type" => "response.content_part.done", "part" => part})}]
+  end
+
+  defp content_part_events(part, position) do
+    [
+      {"response.content_part.added", Map.merge(position, %{"type" => "response.content_part.added", "part" => part})},
+      {"response.content_part.done", Map.merge(position, %{"type" => "response.content_part.done", "part" => part})}
+    ]
+  end
+
+  defp text_events("", position) do
+    [{"response.output_text.done", Map.merge(position, %{"type" => "response.output_text.done", "text" => ""})}]
+  end
+
+  defp text_events(text, position) do
+    [
+      {"response.output_text.delta", Map.merge(position, %{"type" => "response.output_text.delta", "delta" => text})},
+      {"response.output_text.done", Map.merge(position, %{"type" => "response.output_text.done", "text" => text})}
+    ]
+  end
+
+  defp reset_annotations(%{"annotations" => _annotations} = part), do: Map.put(part, "annotations", [])
+  defp reset_annotations(part), do: part
+
+  defp record_synthesized(state, "response.output_text.delta", event), do: record_delta(state, event)
+  defp record_synthesized(state, "response.output_text.done", event), do: record_text_done(state, event)
+  defp record_synthesized(state, "response.output_item.done", _event), do: state |> record_item_done() |> record_item_relayed()
+  defp record_synthesized(state, "response.output_item.added", _event), do: state |> put_summary(:visible_seen, true) |> record_item_relayed()
+  defp record_synthesized(state, _type, _event), do: state
 
   defp public_sse_block(event_type, decoded) when is_binary(event_type) and is_map(decoded) do
     [
@@ -479,7 +699,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
       event_type,
       "\n",
       "data: ",
-      Jason.encode!(Map.put_new(decoded, "type", event_type)),
+      CodexPooler.JSON.encode!(Map.put_new(decoded, "type", event_type)),
       "\n\n"
     ]
   end
@@ -504,26 +724,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     end
   end
 
-  defp terminal_output_text(decoded) do
-    response = if is_map(decoded["response"]), do: decoded["response"], else: decoded
-
-    response
-    |> Map.get("output", [])
-    |> List.wrap()
-    |> Enum.flat_map(fn
-      %{"content" => content} -> List.wrap(content)
-      %{"text" => text} when is_binary(text) -> [%{"text" => text}]
-      _item -> []
-    end)
-    |> Enum.map(fn
-      %{"text" => text} when is_binary(text) -> text
-      %{"type" => "output_text", "text" => text} when is_binary(text) -> text
-      _content -> ""
-    end)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.join("")
-  end
-
   defp normalize_public_event(type, %{} = decoded)
        when type in ["response.output_item.added", "response.output_item.done"] do
     case decoded do
@@ -541,6 +741,23 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     end
   end
 
+  # Public /v1 events carry no provider header objects: `headers` and the
+  # nested `response.headers` are dropped from every decoded event before it
+  # is shaped and re-encoded, on SSE and on the public websocket alike
+  # (findings#239). The one exemption is `codex.response.metadata`, whose
+  # header object is the event's payload (the owner-forwarded Pooler ETag
+  # event on a public turn); the session already strips an untrusted
+  # provider ETag from it. An event without header objects is returned as is.
+  @spec drop_provider_event_headers(map()) :: map()
+  def drop_provider_event_headers(%{"type" => "codex.response.metadata"} = decoded), do: decoded
+
+  def drop_provider_event_headers(%{} = decoded) do
+    case NativeCodexResponseControl.drop_event_headers(decoded) do
+      {:changed, dropped} -> dropped
+      _unchanged -> decoded
+    end
+  end
+
   @spec normalize_terminal_errors(String.t() | nil, map()) :: map()
   def normalize_terminal_errors("response.failed", %{} = decoded) do
     response =
@@ -549,9 +766,11 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         _value -> %{}
       end
 
+    status = wrapped_throttle_status(decoded)
+
     event = %{
       "type" => "response.failed",
-      "response" => project_failed_response(response)
+      "response" => project_failed_response(response, status)
     }
 
     event =
@@ -560,7 +779,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         :error -> event
       end
 
-    maybe_put_failed_top_level_error(event, decoded)
+    maybe_put_failed_top_level_error(event, decoded, status)
   end
 
   def normalize_terminal_errors(type, %{} = decoded)
@@ -578,7 +797,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         StreamProtocol.canonicalize_codex_responses_json_message(data, prepared)
 
       {:changed, prepared} ->
-        canonical_input = Jason.encode!(prepared)
+        canonical_input = CodexPooler.JSON.encode!(prepared)
         StreamProtocol.canonicalize_codex_responses_json_message(canonical_input, prepared)
     end
   end
@@ -588,7 +807,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
     case normalize_terminal_errors_with_change(type, decoded) do
       {:unchanged, normalized} -> {canonical_data, normalized}
-      {:changed, normalized} -> {Jason.encode!(normalized), normalized}
+      {:changed, normalized} -> {CodexPooler.JSON.encode!(normalized), normalized}
     end
   end
 
@@ -670,9 +889,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
   # A real top-level error alongside a null nested error keeps the existing
   # copy-into-response behavior instead of fabricating from the null.
-  defp normalize_response_error(
-         %{"error" => %{} = public_error, "response" => %{"error" => nil} = response} = decoded
-       ) do
+  defp normalize_response_error(%{"error" => %{} = public_error, "response" => %{"error" => nil} = response} = decoded) do
     Map.put(decoded, "response", Map.put(response, "error", public_error))
   end
 
@@ -686,16 +903,30 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     )
   end
 
-  defp normalize_response_error(
-         %{"error" => %{} = public_error, "response" => %{} = response} = decoded
-       ) do
+  defp normalize_response_error(%{"error" => %{} = public_error, "response" => %{} = response} = decoded) do
     Map.put(decoded, "response", Map.put(response, "error", public_error))
   end
 
   defp normalize_response_error(decoded), do: decoded
 
+  # A provider 429 the upstream websocket sent as its wrapped error frame is
+  # canonicalized to a `response.failed` that keeps the integer `status`; its
+  # masked error is typed from that status like the `/v1` HTTP answer of the
+  # same throttle, `rate_limit_error`, instead of `server_error` (findings#254
+  # row 254-82; HTTP since row 254-72). The masked frame drops the status, and
+  # the public websocket normalizes the owner's frame a second time, so a
+  # redacted throttle error keeps its type there (`PublicResponse.redacted_throttle_error?/1`).
+  defp wrapped_throttle_status(decoded) do
+    if Map.get(decoded, "status", Map.get(decoded, "status_code")) == 429, do: 429
+  end
+
+  defp normalize_terminal_error(error, 429) when is_map(error), do: PublicResponse.normalize_error(error, status: 429)
+  defp normalize_terminal_error(error, _status), do: normalize_terminal_error(error)
+
   defp normalize_terminal_error(%{} = error) do
-    PublicResponse.normalize_error(error, status: PublicResponse.terminal_error_status(error))
+    if PublicResponse.redacted_throttle_error?(error),
+      do: PublicResponse.normalize_error(error, status: 429),
+      else: PublicResponse.normalize_error(error, status: PublicResponse.terminal_error_status(error))
   end
 
   defp normalize_terminal_error(error), do: PublicResponse.normalize_error(error, status: 502)
@@ -706,14 +937,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     {change, normalized}
   end
 
-  defp project_failed_response(response) do
+  defp project_failed_response(response, status) do
     %{
       "id" => safe_failed_response_id(Map.get(response, "id")),
       "created_at" => 0,
       "status" => "failed",
-      "error" => normalize_terminal_error(Map.get(response, "error")),
-      "incomplete_details" =>
-        project_failed_incomplete_details(Map.get(response, "incomplete_details")),
+      "error" => normalize_terminal_error(Map.get(response, "error"), status),
+      "incomplete_details" => project_failed_incomplete_details(Map.get(response, "incomplete_details")),
       "model" => "unknown",
       "object" => "response",
       "output" => [],
@@ -763,8 +993,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     %{
       "input_tokens" => input_tokens,
       "input_tokens_details" => %{
-        "cache_write_tokens" =>
-          bounded_usage_integer(Map.get(input_details, "cache_write_tokens")),
+        "cache_write_tokens" => bounded_usage_integer(Map.get(input_details, "cache_write_tokens")),
         "cached_tokens" => bounded_usage_integer(Map.get(input_details, "cached_tokens"))
       },
       "output_tokens" => output_tokens,
@@ -790,9 +1019,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
   defp bounded_usage_integer(_value), do: 0
 
-  defp maybe_put_failed_top_level_error(event, source) do
+  defp maybe_put_failed_top_level_error(event, source, status) do
     case Map.fetch(source, "error") do
-      {:ok, error} -> Map.put(event, "error", normalize_terminal_error(error))
+      {:ok, error} -> Map.put(event, "error", normalize_terminal_error(error, status))
       :error -> event
     end
   end
@@ -883,6 +1112,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         buffer_candidate?: false,
         created?: false,
         text_delta?: false,
+        items_relayed?: false,
+        terminal_output: PublicResponsesTerminalOutput.new_state(),
         passthrough?: false,
         passthrough_terminal: nil
     }
@@ -907,6 +1138,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
       nil ->
         state
     end
+  end
+
+  defp record_item_relayed(state), do: %{state | items_relayed?: true}
+
+  # The item the client received in the done event, for a terminal the
+  # provider sends with an empty output (findings#335).
+  defp record_terminal_output(state, decoded, block) do
+    %{state | terminal_output: PublicResponsesTerminalOutput.observe(state.terminal_output, decoded, IO.iodata_length(block))}
   end
 
   defp record_text_done(state, decoded) do
@@ -1004,7 +1243,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     if maybe_decodable_tail?(buffer) do
       data = StreamProtocol.sse_field(buffer, "data") || buffer
 
-      match?({:ok, %{}}, Jason.decode(data))
+      match?({:ok, %{}}, CodexPooler.JSON.decode(data))
     else
       false
     end
@@ -1052,7 +1291,19 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
   defp terminal_event?(_type), do: false
 
-  defp codex_public_event?(type) when is_binary(type), do: String.starts_with?(type, "codex.")
+  # The public Responses stream vocabulary is `response.*` plus the `error`
+  # terminal (handled with the terminals) and `keepalive`. Every other type is
+  # backend-internal (`codex.*` controls, the websocket transport's
+  # `responsesapi.websocket_timing`) and is dropped before it takes a sequence
+  # number: openai-node's `responses.stream()` throws `Unhandled response
+  # stream event` on any type outside its vocabulary (findings#225). Unknown
+  # `response.*` types stay relayed so new public events keep flowing.
+  # The public websocket relay shares it (findings#254 row 254-14).
+  @doc false
+  @spec public_stream_event?(term()) :: boolean()
+  def public_stream_event?("response." <> _rest), do: true
+  def public_stream_event?("keepalive"), do: true
+  def public_stream_event?(_type), do: false
 
   defp stream_block_event(block) do
     data = StreamProtocol.sse_field(block, "data")

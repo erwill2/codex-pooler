@@ -9,13 +9,16 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
   alias CodexPooler.Access
   alias CodexPooler.Gateway.Admission, as: GatewayAdmission
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.ErrorClassification
   alias CodexPooler.Gateway.ErrorSanitizer
   alias CodexPooler.Gateway.Metadata
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.TransportEnvelope
+  alias CodexPooler.Platform.ExecutionIdentity
+  alias CodexPooler.Platform.TransientDatabaseError
   alias CodexPooler.Pools.Routing, as: PoolRouting
-
-  @overload_code "server_is_overloaded"
+  alias CodexPoolerWeb.RequestLogger
 
   @type conn :: Plug.Conn.t()
   @type gateway_call_result ::
@@ -40,13 +43,8 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
   def authenticate(%Plug.Conn{private: %{runtime_api_auth: auth}}), do: {:ok, auth}
 
   def authenticate(conn) do
-    case Access.authenticate_authorization_header(
-           get_req_header(conn, "authorization")
-           |> List.first()
-         ) do
-      {:ok, auth} -> {:ok, auth}
-      {:error, reason} -> {:error, Map.put(reason, :status, 401)}
-    end
+    header = conn |> get_req_header("authorization") |> List.first()
+    authenticate_with(fn -> Access.authenticate_authorization_header(header) end)
   end
 
   @spec authenticate_v1(conn()) ::
@@ -61,13 +59,28 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
     do: {:ok, auth}
 
   defp authenticate_v1_auth_context(conn) do
-    case Access.authenticate_v1_authorization_header(
-           get_req_header(conn, "authorization")
-           |> List.first()
-         ) do
+    header = conn |> get_req_header("authorization") |> List.first()
+    authenticate_with(fn -> Access.authenticate_v1_authorization_header(header) end)
+  end
+
+  # Authentication is the first database read of every runtime request. A
+  # database that cannot be reached, is restarting or cancelled the lookup says
+  # nothing about the credential, and nothing has been admitted, reserved or
+  # sent yet: answer a retryable 503 instead of letting the exception render a
+  # 500 (findings#206 row 206-358).
+  defp authenticate_with(fun) do
+    case fun.() do
       {:ok, auth} -> {:ok, auth}
       {:error, reason} -> {:error, Map.put(reason, :status, 401)}
     end
+  rescue
+    error in [DBConnection.ConnectionError, Postgrex.Error] ->
+      if TransientDatabaseError.transient?(error) do
+        Logger.warning("runtime request refused before admission stage=authentication reason_class=#{TransientDatabaseError.reason_class(error)}")
+        {:error, Contracts.database_unavailable_error()}
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
   defp authorize_v1_compatibility(%{pool: pool} = auth) do
@@ -99,12 +112,13 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
         {:ok, params}
 
       _params ->
-        {:error,
-         %{status: 400, code: "invalid_request", message: "request body must be a JSON object"}}
+        {:error, %{status: 400, code: "invalid_request", message: "request body must be a JSON object"}}
     end
   end
 
   @spec read_multipart_body(conn()) :: body_read_result()
+  def read_multipart_body(%Plug.Conn{private: %{runtime_json_parse_error: true}} = conn), do: read_json_body(conn)
+
   def read_multipart_body(conn) do
     case conn.body_params do
       %Plug.Conn.Unfetched{} ->
@@ -141,10 +155,32 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
       session_header: session_header,
       session_header_source: session_header_source,
       user_agent: get_req_header(conn, "user-agent") |> List.first(),
+      originator: client_originator(conn),
       request_content_type: get_req_header(conn, "content-type") |> List.first(),
       forwarded_headers: forwarded_headers(conn),
       client_ip: conn.remote_ip |> :inet.ntoa() |> to_string()
     }
+    |> put_test_owner_liveness_options()
+  end
+
+  if Mix.env() == :test do
+    @owner_liveness_test_option_keys [
+      :bridge_owner_lease_ttl_seconds,
+      :session_lease_heartbeat_test_observer,
+      :owner_instance_id
+    ]
+
+    defp put_test_owner_liveness_options(opts) do
+      case Process.get({__MODULE__, :owner_liveness_test_options}) do
+        test_opts when is_map(test_opts) ->
+          Map.merge(opts, Map.take(test_opts, @owner_liveness_test_option_keys))
+
+        _absent ->
+          opts
+      end
+    end
+  else
+    defp put_test_owner_liveness_options(opts), do: opts
   end
 
   @spec websocket_upgrade_opts() :: keyword()
@@ -163,6 +199,7 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
           conn()
   def upgrade_responses_websocket(conn, auth, opts \\ []) do
     turn_state = websocket_turn_state(conn)
+    continuity_turn_state = websocket_continuity_turn_state(opts, turn_state)
 
     request_options =
       conn
@@ -171,7 +208,8 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
       |> RequestOptions.capture_api_key_runtime_epoch(auth)
       |> maybe_put_websocket_openai_compatibility(opts)
       |> RequestOptions.put_continuity(
-        accepted_turn_state: websocket_continuity_turn_state(opts, turn_state)
+        accepted_turn_state: continuity_turn_state,
+        pooler_issued_turn_state?: pooler_issued_turn_state?(conn, turn_state, continuity_turn_state)
       )
       |> maybe_mark_websocket_openai_origin(opts)
 
@@ -205,7 +243,7 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
          "/backend-api/codex/responses",
          "/backend-api/codex/v1/responses"
        ] do
-      case Metadata.codex_catalog_snapshot(auth, source_endpoint, request_options) do
+      case Metadata.codex_turn_catalog_snapshot(auth, source_endpoint, request_options) do
         {:ok, snapshot} -> {:ok, put_resp_header(conn, "x-models-etag", snapshot.etag)}
         {:error, reason} -> {:error, reason}
       end
@@ -218,12 +256,38 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
   def send_or_error(%Plug.Conn{} = conn, {:ok, result}), do: send_gateway_result(conn, result)
   def send_or_error(%Plug.Conn{} = conn, {:error, reason}), do: send_error(conn, reason)
 
+  @doc """
+  A native Responses route's result as the client that sent the request reads
+  it: the Pool-exhausted refusal as `Contracts.native_usage_limit_answer/2`
+  answers the request's `originator` (findings#279 point 2).
+  """
+  @spec native_usage_limit_answer(conn(), gateway_call_result()) :: gateway_call_result()
+  def native_usage_limit_answer(%Plug.Conn{} = conn, {:error, reason}), do: {:error, Contracts.native_usage_limit_answer(reason, client_originator(conn))}
+  def native_usage_limit_answer(%Plug.Conn{}, result), do: result
+
+  @doc "The client's own `originator` header, which the Pooler never forwards upstream."
+  @spec client_originator(conn()) :: String.t() | nil
+  def client_originator(%Plug.Conn{} = conn), do: conn |> get_req_header("originator") |> List.first()
+
   @spec result_headers(Contracts.gateway_result() | map()) :: Contracts.response_headers()
   def result_headers(%{headers: headers}) when is_list(headers), do: headers
   def result_headers(_result), do: []
 
   @spec send_gateway_result(conn(), Contracts.gateway_result()) :: conn()
-  def send_gateway_result(conn, %{stream: stream} = result) do
+  def send_gateway_result(conn, result) do
+    response = do_send_gateway_result(conn, result)
+    ExecutionIdentity.complete()
+    response
+  end
+
+  @spec send_error(conn(), Contracts.gateway_error() | map()) :: conn()
+  def send_error(conn, error) do
+    response = do_send_error(conn, error)
+    ExecutionIdentity.complete()
+    response
+  end
+
+  defp do_send_gateway_result(conn, %{stream: stream} = result) do
     conn = put_gateway_headers(conn, result_headers(result))
     conn = send_chunked(conn, result.status)
 
@@ -246,55 +310,83 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
   end
 
   # sobelow_skip ["XSS.SendResp"]
-  def send_gateway_result(conn, %{raw_body: body} = result) do
+  defp do_send_gateway_result(conn, %{raw_body: body} = result) do
     conn
     |> put_gateway_headers(result_headers(result))
     |> send_resp(result.status, body)
   end
 
-  def send_gateway_result(conn, %{body: body} = result) do
+  defp do_send_gateway_result(conn, %{body: body} = result) do
     conn
     |> put_gateway_headers(result_headers(result))
     |> put_status(result.status)
     |> json(body)
   end
 
-  @spec send_error(conn(), Contracts.gateway_error() | map()) :: conn()
-  def send_error(conn, %{status: status, code: code, message: message} = error) do
+  defp do_send_error(conn, %{status: status, code: code, message: message} = error) do
     body = %{
       "error" =>
         Map.merge(
           %{
             "message" => message,
-            "type" => client_error_type(code),
+            "type" => ErrorClassification.error_type(code, status),
             "code" => to_string(code),
             "param" => Map.get(error, :param)
           },
-          Contracts.recovery_error_fields(error)
+          error |> Contracts.recovery_error_fields() |> Map.merge(Contracts.usage_limit_error_fields(error))
         )
     }
 
     conn
+    |> put_policy_retry_header(error)
     |> put_gateway_headers(Contracts.recovery_response_headers(error))
+    |> put_gateway_headers(Contracts.usage_limit_response_headers(error))
+    |> RequestLogger.put_usage_limit(Contracts.usage_limit_record(error))
+    |> put_gateway_headers(Contracts.circuit_retry_response_headers(error))
     |> put_status(status)
     |> json(body)
   end
 
-  def send_error(conn, %{code: :api_key_policy_limit_exceeded, message: _message} = error) do
-    send_error(conn, Map.put(error, :status, 403))
-  end
-
-  def send_error(conn, %{code: code, message: message}) do
+  defp do_send_error(conn, %{code: code, message: message}) do
     send_error(conn, %{status: 401, code: code, message: message})
   end
 
-  defp client_error_type(@overload_code), do: "server_error"
-  defp client_error_type(_code), do: "invalid_request_error"
+  # Minimum backoff advice; it does not promise that a slot will be available.
+  defp put_policy_retry_header(conn, %{
+         pooler_policy: true,
+         status: 429,
+         code: "api_key_concurrency_limit_exceeded"
+       }),
+       do: put_resp_header(conn, "retry-after", "1")
+
+  # A key policy window's own boundary (findings#206 row 206-427); advice, not
+  # a promise: settling in-flight work can free the window earlier. A window
+  # that frees in a minute at the soonest (the daily window's hint, the weekly
+  # window without one) also tells the OpenAI SDKs, which retry every 429 twice
+  # within seconds when the hint exceeds their own ceiling, not to retry.
+  defp put_policy_retry_header(conn, %{pooler_policy: true, status: 429, code: "api_key_policy_limit_exceeded"} = error) do
+    case Map.get(error, :retry_after_seconds) do
+      seconds when is_integer(seconds) and seconds > 0 and seconds <= 60 ->
+        put_resp_header(conn, "retry-after", Integer.to_string(seconds))
+
+      seconds when is_integer(seconds) and seconds > 0 ->
+        conn
+        |> put_resp_header("retry-after", Integer.to_string(seconds))
+        |> put_resp_header("x-should-retry", "false")
+
+      _none ->
+        put_resp_header(conn, "x-should-retry", "false")
+    end
+  end
+
+  defp put_policy_retry_header(conn, _error), do: conn
 
   defp forwarded_headers(conn) do
+    provider_session_header_names = TransportEnvelope.provider_session_header_names()
+
     Enum.filter(conn.req_headers, fn {name, _value} ->
       name == "user-agent" or String.starts_with?(name, "x-openai-") or
-        String.starts_with?(name, "x-codex-")
+        String.starts_with?(name, "x-codex-") or name in provider_session_header_names
     end)
   end
 
@@ -305,7 +397,14 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
     |> blank_to_nil()
   end
 
+  # The released Codex client never sends `x-codex-turn-state` on an upgrade:
+  # the token is server-issued, so a websocket upgrade without one gets a fresh
+  # value echoed on the upgrade response (findings#255).
   defp websocket_turn_state(conn), do: accepted_turn_state(conn) || Ecto.UUID.generate()
+
+  defp pooler_issued_turn_state?(conn, issued_turn_state, continuity_turn_state) do
+    continuity_turn_state == issued_turn_state and is_nil(accepted_turn_state(conn))
+  end
 
   defp websocket_continuity_turn_state(opts, turn_state) do
     case Keyword.fetch(opts, :accepted_turn_state) do

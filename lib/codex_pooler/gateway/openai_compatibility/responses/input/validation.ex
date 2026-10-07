@@ -2,8 +2,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   @moduledoc false
 
   alias CodexPooler.Gateway.OpenAICompatibility.Error
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.AgentMessage
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Audio
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.HostedShell
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.ToolSearch
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.WebSearchCall
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
   @metadata_passthrough_key "internal_chat_message_metadata_passthrough"
@@ -34,6 +37,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
 
   defp validate_input_item(%{"type" => "additional_tools"} = item, _payload),
     do: validate_additional_tools_item(item)
+
+  defp validate_input_item(%{"type" => "agent_message"} = item, _payload),
+    do: AgentMessage.validate_item(item)
+
+  defp validate_input_item(%{"type" => "web_search_call"} = item, _payload),
+    do: WebSearchCall.validate_item(item)
+
+  defp validate_input_item(%{"type" => type} = item, _payload) when type in ["tool_search_call", "tool_search_output"],
+    do: ToolSearch.validate_item(item)
 
   defp validate_input_item(%{"role" => "assistant"} = item, _payload),
     do: validate_assistant_replay_item(item)
@@ -67,9 +79,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     end
   end
 
-  defp validate_input_item(%{"type" => "web_search_call"} = item, _payload),
-    do: validate_web_search_call_replay_item(item)
-
   defp validate_input_item(%{"type" => "image_generation_call"} = item, _payload),
     do: validate_image_generation_call_replay_item(item)
 
@@ -79,20 +88,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_input_item(%{"type" => "local_shell_call_output"} = item, _payload),
     do: validate_local_shell_call_output_replay_item(item)
 
-  defp validate_input_item(%{"type" => "tool_search_call"} = item, _payload),
-    do: validate_tool_search_call_replay_item(item)
-
-  defp validate_input_item(%{"type" => "tool_search_output"} = item, _payload),
-    do: validate_tool_search_output_replay_item(item)
-
   defp validate_input_item(%{"type" => "apply_patch_call"} = item, _payload),
     do: validate_apply_patch_call_replay_item(item)
 
   defp validate_input_item(%{"type" => "apply_patch_call_output"} = item, _payload),
     do: validate_apply_patch_call_output_replay_item(item)
-
-  defp validate_input_item(%{"type" => "agent_message"} = item, _payload),
-    do: validate_agent_message_replay_item(item)
 
   defp validate_input_item(%{"type" => "function_call"} = item, _payload),
     do: validate_function_call_replay_item(item)
@@ -156,11 +156,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_additional_tools_tools(_tools),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
+  # A client-sent manifest is forwarded for the provider to validate (its `tool_search` too, findings#313), except a
+  # remote MCP tool.
   defp validate_additional_tool(%{"type" => "mcp"}),
     do: {:error, Error.invalid_request("remote MCP tools are not supported", "input")}
-
-  defp validate_additional_tool(%{"type" => "tool_search"}),
-    do: {:error, Error.invalid_request("tool_search tools are not supported", "input")}
 
   defp validate_additional_tool(_tool), do: :ok
 
@@ -269,9 +268,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_assistant_replay_content(_content),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-  defp validate_assistant_replay_content_part(
-         %{"type" => "output_text", "text" => text, "annotations" => annotations} = part
-       )
+  defp validate_assistant_replay_content_part(%{"type" => "output_text", "text" => text, "annotations" => annotations} = part)
        when is_binary(text) do
     with :ok <- validate_exact_item_keys(part, ["type", "text", "annotations", "logprobs"]),
          :ok <- validate_url_citation_annotations(annotations) do
@@ -315,14 +312,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
        when (is_integer(start_index) or is_float(start_index)) and
               (is_integer(end_index) or is_float(end_index)) and is_binary(url) and
               is_binary(title),
-       do:
-         validate_exact_item_keys(annotation, ["type", "start_index", "end_index", "url", "title"])
+       do: validate_exact_item_keys(annotation, ["type", "start_index", "end_index", "url", "title"])
 
   defp validate_url_citation_annotation(_annotation),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
+  # The assistant message phases of the Codex Responses model: interim `commentary`, `partial_answer` (stable answer
+  # text that may be followed by more output or tools; Codex 8b6bb1c77) and the terminal `final_answer`. The provider
+  # accepted `partial_answer` on a stateless assistant input item in both the Full and Lite request shapes (direct
+  # probe, 2026-10-06; its own unknown-phase message still lists only the other two), so it is forwarded unchanged.
+  @assistant_phases ["commentary", "partial_answer", "final_answer"]
+
   defp validate_optional_assistant_phase(%{"phase" => phase})
-       when phase in ["commentary", "final_answer"],
+       when phase in @assistant_phases,
        do: :ok
 
   defp validate_optional_assistant_phase(%{"phase" => nil}), do: :ok
@@ -384,9 +386,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     end
   end
 
-  defp validate_reasoning_replay_item(
-         %{"summary" => summary, "encrypted_content" => encrypted_content} = item
-       )
+  defp validate_reasoning_replay_item(%{"summary" => summary, "encrypted_content" => encrypted_content} = item)
        when is_binary(encrypted_content) do
     with :ok <-
            validate_exact_item_keys(item, [
@@ -435,9 +435,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_reasoning_replay_content(_content),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-  defp validate_reasoning_replay_content_part(
-         %{"type" => "reasoning_text", "text" => text} = part
-       )
+  defp validate_reasoning_replay_content_part(%{"type" => "reasoning_text", "text" => text} = part)
        when is_binary(text) do
     validate_exact_item_keys(part, ["type", "text"])
   end
@@ -516,34 +514,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_optional_context_compaction_encrypted_content(_item),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-  defp validate_web_search_call_replay_item(item) do
-    with :ok <-
-           validate_exact_item_keys(item, [
-             "type",
-             "id",
-             "status",
-             "action",
-             "metadata",
-             @metadata_passthrough_key
-           ]),
-         :ok <- validate_optional_id(item),
-         :ok <- validate_optional_hosted_call_status(item),
-         :ok <- validate_optional_web_search_action(item) do
-      validate_optional_item_metadata(item)
-    end
-  end
-
-  defp validate_optional_web_search_action(%{"action" => nil}), do: :ok
-
-  defp validate_optional_web_search_action(%{"action" => %{"type" => type} = action})
-       when is_binary(type),
-       do: validate_json_value(action)
-
-  defp validate_optional_web_search_action(%{"action" => _action}),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
-
-  defp validate_optional_web_search_action(_item), do: :ok
-
   defp validate_image_generation_call_replay_item(%{"result" => result} = item)
        when is_binary(result) do
     with :ok <-
@@ -575,50 +545,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_optional_revised_prompt(_item), do: :ok
-
-  defp validate_agent_message_replay_item(
-         %{"author" => author, "recipient" => recipient, "content" => content} = item
-       )
-       when is_binary(author) and is_binary(recipient) do
-    with :ok <-
-           validate_exact_item_keys(item, [
-             "type",
-             "id",
-             "author",
-             "recipient",
-             "content",
-             "metadata",
-             @metadata_passthrough_key
-           ]),
-         :ok <- validate_nonblank(author),
-         :ok <- validate_nonblank(recipient),
-         :ok <- validate_optional_id(item),
-         :ok <- validate_optional_item_metadata(item) do
-      validate_agent_message_content(content)
-    end
-  end
-
-  defp validate_agent_message_replay_item(_item),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
-
-  defp validate_agent_message_content(content) when is_list(content) and content != [],
-    do: validate_each(content, &validate_agent_message_content_part/1)
-
-  defp validate_agent_message_content(_content),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
-
-  defp validate_agent_message_content_part(%{"type" => "input_text", "text" => text} = part)
-       when is_binary(text),
-       do: validate_exact_item_keys(part, ["type", "text"])
-
-  defp validate_agent_message_content_part(
-         %{"type" => "encrypted_content", "encrypted_content" => encrypted_content} = part
-       )
-       when is_binary(encrypted_content),
-       do: validate_exact_item_keys(part, ["type", "encrypted_content"])
-
-  defp validate_agent_message_content_part(_part),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_optional_hosted_call_status(%{"status" => status})
        when status in ["completed", "incomplete", "in_progress", "searching", "failed"],
@@ -675,58 +601,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
       {:error, reason} -> {:error, reason}
     end
   end
-
-  defp validate_tool_search_call_replay_item(%{"execution" => execution} = item)
-       when is_binary(execution) do
-    with :ok <-
-           validate_exact_item_keys(item, [
-             "type",
-             "id",
-             "call_id",
-             "status",
-             "execution",
-             "arguments",
-             "metadata",
-             @metadata_passthrough_key
-           ]),
-         :ok <- validate_nonblank(execution),
-         :ok <- validate_optional_id(item),
-         :ok <- validate_nullable_optional_string(item, "call_id"),
-         :ok <- validate_optional_replay_status_string(item),
-         :ok <- validate_optional_json_field(item, "arguments") do
-      validate_optional_item_metadata(item)
-    end
-  end
-
-  defp validate_tool_search_call_replay_item(_item),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
-
-  defp validate_tool_search_output_replay_item(
-         %{"execution" => execution, "status" => status, "tools" => tools} = item
-       )
-       when is_binary(execution) and is_binary(status) and is_list(tools) do
-    with :ok <-
-           validate_exact_item_keys(item, [
-             "type",
-             "id",
-             "call_id",
-             "status",
-             "execution",
-             "tools",
-             "metadata",
-             @metadata_passthrough_key
-           ]),
-         :ok <- validate_nonblank(execution),
-         :ok <- validate_optional_id(item),
-         :ok <- validate_nullable_optional_string(item, "call_id"),
-         :ok <- validate_optional_replay_status_string(item),
-         :ok <- validate_json_value(tools) do
-      validate_optional_item_metadata(item)
-    end
-  end
-
-  defp validate_tool_search_output_replay_item(_item),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_apply_patch_call_replay_item(
          %{"call_id" => call_id, "operation" => operation} = item
@@ -796,22 +670,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     end
   end
 
-  defp validate_optional_replay_status_string(item) do
-    case Map.fetch(item, "status") do
-      :error ->
-        :ok
-
-      {:ok, nil} ->
-        :ok
-
-      {:ok, status} when is_binary(status) ->
-        validate_nonblank(status)
-
-      {:ok, _status} ->
-        {:error, Error.invalid_request("input item shape is not translatable", "input")}
-    end
-  end
-
   defp validate_optional_json_field(item, key) do
     case Map.fetch(item, key) do
       :error -> :ok
@@ -850,9 +708,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_program_output_replay_item(_item),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-  defp validate_function_call_replay_item(
-         %{"call_id" => call_id, "name" => name, "arguments" => arguments} = item
-       )
+  defp validate_function_call_replay_item(%{"call_id" => call_id, "name" => name, "arguments" => arguments} = item)
        when is_binary(call_id) and is_binary(name) and is_binary(arguments) do
     with :ok <-
            validate_exact_item_keys(item, [
@@ -900,9 +756,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     end
   end
 
-  defp validate_custom_tool_call_replay_item(
-         %{"call_id" => call_id, "name" => name, "input" => input} = item
-       ) do
+  defp validate_custom_tool_call_replay_item(%{"call_id" => call_id, "name" => name, "input" => input} = item) do
     with :ok <-
            validate_exact_item_keys(item, [
              "type",
@@ -1283,17 +1137,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
          context
        )
        when is_binary(image_url) and context in [:user, :tool_output] do
-    with :ok <- validate_content_part_keys(part, ["type", "image_url", "prompt_cache_breakpoint"]) do
+    with :ok <- validate_content_part_keys(part, ["type", "image_url", "detail", "prompt_cache_breakpoint"]) do
       validate_prompt_cache_breakpoint(part)
     end
   end
 
   defp validate_cacheable_content_part(
          %{"type" => "input_image", "file_id" => file_id} = part,
-         :user
+         context
        )
-       when is_binary(file_id) and file_id != "" do
-    with :ok <- validate_content_part_keys(part, ["type", "file_id", "prompt_cache_breakpoint"]) do
+       when is_binary(file_id) and file_id != "" and context in [:user, :tool_output] do
+    with :ok <- validate_content_part_keys(part, ["type", "file_id", "detail", "prompt_cache_breakpoint"]) do
       validate_prompt_cache_breakpoint(part)
     end
   end

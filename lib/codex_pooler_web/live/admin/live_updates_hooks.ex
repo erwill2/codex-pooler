@@ -36,6 +36,11 @@ defmodule CodexPoolerWeb.Admin.LiveUpdatesHooks do
   import Phoenix.Component, only: [assign: 3]
 
   alias CodexPooler.Events
+  alias CodexPooler.InstanceSettings.Cache, as: InstanceSettingsCache
+  alias CodexPooler.OpenAIStatus
+  alias CodexPooler.Status.Events, as: StatusEvents
+  alias CodexPooler.Status.Freshness
+  alias CodexPoolerWeb.Admin.OpenAIIncidentsReadModel
   alias Phoenix.LiveView.Socket
 
   @paused_assign :live_updates_paused?
@@ -58,6 +63,13 @@ defmodule CodexPoolerWeb.Admin.LiveUpdatesHooks do
         :admin_live_updates_gate,
         :handle_info,
         &gate_live_update/2
+      )
+      |> subscribe_openai_status()
+      |> assign_openai_status()
+      |> Phoenix.LiveView.attach_hook(
+        :admin_openai_status,
+        :handle_info,
+        &handle_openai_status/2
       )
 
     {:cont, socket}
@@ -170,7 +182,138 @@ defmodule CodexPoolerWeb.Admin.LiveUpdatesHooks do
     if changed?, do: {:halt, announce(socket, wanted)}, else: {:halt, socket}
   end
 
+  defp handle_live_updates_event("dismiss_openai_status", _params, socket) do
+    operator_id = get_in(socket.assigns, [:current_scope, Access.key(:user), Access.key(:id)])
+    aggregate = Map.get(socket.assigns, :openai_status_aggregate, %{})
+
+    viewed =
+      aggregate
+      |> Map.get(:incidents, [])
+      |> Enum.map(&{&1.id, &1.revision})
+
+    case {operator_id, viewed} do
+      {operator_id, [_ | _]} when is_binary(operator_id) ->
+        case OpenAIStatus.dismiss_many(operator_id, viewed) do
+          {:ok, _count} ->
+            {:halt, assign_openai_status(socket)}
+
+          {:error, :invalid_revision_set} ->
+            {:halt,
+             socket
+             |> assign_openai_status()
+             |> Phoenix.LiveView.put_flash(
+               :error,
+               "Incidents changed. Review the latest updates before dismissing."
+             )}
+
+          {:error, _reason} ->
+            {:halt,
+             socket
+             |> assign_openai_status()
+             |> Phoenix.LiveView.put_flash(:error, "Incidents could not be dismissed. Try again.")}
+        end
+
+      _ ->
+        {:halt, socket}
+    end
+  end
+
   defp handle_live_updates_event(_event, _params, socket), do: {:cont, socket}
+
+  defp assign_openai_status(socket) do
+    operator_id = get_in(socket.assigns, [:current_scope, Access.key(:user), Access.key(:id)])
+    assign(socket, :openai_status_aggregate, OpenAIStatus.aggregate(operator_id: operator_id))
+  end
+
+  defp subscribe_openai_status(socket) do
+    if Phoenix.LiveView.connected?(socket) do
+      :ok = StatusEvents.subscribe()
+      :ok = InstanceSettingsCache.subscribe_applied()
+    end
+
+    socket
+  end
+
+  defp handle_openai_status({InstanceSettingsCache, {:applied, version}}, socket)
+       when is_integer(version) do
+    enabled? = InstanceSettingsCache.current().operator.openai_status_polling_enabled
+    current = get_in(socket.assigns, [:openai_status_aggregate, :polling_enabled?])
+
+    if enabled? != current,
+      do: {:halt, refresh_openai_status(socket)},
+      else: {:halt, socket}
+  end
+
+  defp handle_openai_status({:openai_status_updated, payload}, socket) do
+    case StatusEvents.decode(payload) do
+      {:ok, event} ->
+        current = get_in(socket.assigns, [:openai_status_aggregate, :aggregate_revision]) || -1
+
+        if event.aggregate_revision > current do
+          {:halt, refresh_openai_status(socket)}
+        else
+          {:halt, socket}
+        end
+
+      :ignore ->
+        {:halt, socket}
+    end
+  end
+
+  # Every successful status sync sends either an updated event or this
+  # freshness event, both relayed by PostgreSQL NOTIFY, which can be lost. A
+  # freshness event already naming a newer revision than this view shows means
+  # the updated event for that revision never arrived, so it reloads as the
+  # updated event would have; the next sync bounds how long a view stays stale.
+  defp handle_openai_status({:openai_status_freshness, payload}, socket) do
+    with {:ok, event} <- StatusEvents.decode_freshness(payload),
+         current when is_map(current) <- socket.assigns[:openai_status_aggregate] do
+      if event.aggregate_revision > current.aggregate_revision,
+        do: {:halt, refresh_openai_status(socket)},
+        else: apply_openai_status_freshness(socket, current, event)
+    else
+      _ -> {:halt, socket}
+    end
+  end
+
+  defp handle_openai_status(_message, socket), do: {:cont, socket}
+
+  defp apply_openai_status_freshness(socket, current, event) do
+    with true <- event.aggregate_revision == current.aggregate_revision,
+         true <-
+           is_nil(current.last_success_at) or
+             DateTime.compare(event.last_success_at, current.last_success_at) == :gt do
+      freshness = %{
+        last_success_at: event.last_success_at,
+        stale?: Freshness.stale?(event.last_success_at)
+      }
+
+      socket = assign(socket, :openai_status_aggregate, Map.merge(current, freshness))
+
+      socket =
+        if Map.has_key?(socket.assigns, :incidents_page) do
+          assign(
+            socket,
+            :incidents_page,
+            Map.merge(socket.assigns.incidents_page, Map.put(freshness, :available?, true))
+          )
+        else
+          socket
+        end
+
+      {:halt, socket}
+    else
+      _ -> {:halt, socket}
+    end
+  end
+
+  defp refresh_openai_status(socket) do
+    socket = assign_openai_status(socket)
+
+    if Map.has_key?(socket.assigns, :incidents_page),
+      do: assign(socket, :incidents_page, OpenAIIncidentsReadModel.load()),
+      else: socket
+  end
 
   # The icon swapping is easy to miss on a control this small, and the
   # consequence of pausing — that lists stop moving — is not something to leave
