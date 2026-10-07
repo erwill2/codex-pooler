@@ -969,14 +969,15 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodecTest do
       refute coerced.request_options.payload_context.compaction_trigger_bridge?
     end
 
-    test "bridges terminal native compaction through the selected streaming or buffered transport" do
-      for {client_metadata, result_transport} <- [
-            {v2_client_metadata(), :sse},
-            {%{"x-codex-turn-metadata" => Jason.encode!(%{"compaction" => %{}})}, :buffered},
-            {remote_compaction_v2_client_metadata(), :sse},
-            {nil, :buffered}
+    test "bridges terminal native compaction through streaming when requested" do
+      for client_metadata <- [
+            v2_client_metadata(),
+            %{"x-codex-turn-metadata" => Jason.encode!(%{"compaction" => %{}})},
+            remote_compaction_v2_client_metadata(),
+            nil
           ] do
         payload = native_compaction_trigger_payload(client_metadata)
+        result_transport = :sse
 
         assert {:ok, coerced} =
                  WebsocketCodec.coerce_request(
@@ -997,17 +998,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodecTest do
           "store" => false
         }
 
-        expected_payload =
-          if result_transport == :sse,
-            do: Map.put(expected_payload, "stream", true),
-            else: expected_payload
+        expected_payload = Map.put(expected_payload, "stream", true)
 
         assert coerced.payload == expected_payload
 
         assert is_function(coerced.result_adapter, 1)
 
-        assert coerced.request_options.transport.transport ==
-                 if(result_transport == :sse, do: "websocket", else: "http_compact_json")
+        assert coerced.request_options.transport.transport == "websocket"
 
         assert coerced.request_options.transport.upstream_endpoint ==
                  "/backend-api/codex/responses"
@@ -1137,7 +1134,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodecTest do
       assert coerced.payload["input"] == payload["input"]
     end
 
-    test "does not widen public admission for anchors without tool output" do
+    test "allows public previous-response anchors without tool output" do
       payload = %{
         "type" => "response.create",
         "model" => "gpt-fixture",
@@ -1148,16 +1145,59 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodecTest do
         ]
       }
 
-      assert {:error, error} =
+      assert {:ok, coerced} =
                WebsocketCodec.coerce_request(
                  payload,
                  public_responses_options(payload),
                  fn _frame -> :ok end
                )
 
-      assert error.status == 400
-      assert error.code == "invalid_request"
-      assert error.param == "previous_response_id"
+      assert coerced.endpoint == "/backend-api/codex/responses/compact"
+      assert coerced.payload["previous_response_id"] == payload["previous_response_id"]
+      assert List.last(coerced.payload["input"]) == %{"type" => "compaction_trigger"}
+
+      assert get_in(coerced.payload, ["input", Access.at(0), "content"]) == [
+               %{"type" => "input_text", "text" => "visible public input"}
+             ]
+    end
+
+    test "selects public compaction result transport from streaming or the Codex v2 marker" do
+      for {previous_response_id, marker?} <- [
+            {"resp_fixture_public_v2", true},
+            {nil, true},
+            {"resp_fixture_public_legacy", false},
+            {nil, false}
+          ] do
+        payload = %{
+          "type" => "response.create",
+          "model" => "gpt-fixture",
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_fixture_public_compaction",
+              "output" => "fixture output"
+            },
+            %{"type" => "compaction_trigger"}
+          ],
+          "client_metadata" => if(marker?, do: v2_client_metadata(), else: %{})
+        }
+
+        payload =
+          if previous_response_id,
+            do: Map.put(payload, "previous_response_id", previous_response_id),
+            else: payload
+
+        assert {:ok, coerced} =
+                 WebsocketCodec.coerce_request(
+                   payload,
+                   public_responses_options(payload),
+                   fn _frame -> :ok end
+                 )
+
+        assert coerced.request_options.payload_context.compaction_result_transport == :sse
+        assert coerced.request_options.transport.transport == "websocket"
+        assert coerced.payload["stream"] == true
+      end
     end
 
     test "retains an anchor with an unknown future output suffix" do
@@ -1205,7 +1245,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodecTest do
 
       assert coerced.endpoint == "/backend-api/codex/responses/compact"
       assert coerced.payload["input"] == [%{"type" => "compaction_trigger"}]
-      assert coerced.request_options.payload_context.compaction_result_transport == :buffered
+      assert coerced.payload["stream"] == true
+      assert coerced.request_options.payload_context.compaction_result_transport == :sse
     end
 
     test "rejects malformed native compaction trigger placement without retaining metadata" do

@@ -7,7 +7,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
 
   @synthetic_public_openai_responses_failure_message "upstream request failed: stream interrupted before terminal response event"
-  @native_previous_response_not_found_message "Previous response was not found. Retrying the full request."
 
   @type event_summary :: EventSummary.t()
 
@@ -236,7 +235,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
       "error" => %{
         "type" => "invalid_request_error",
         "code" => "previous_response_not_found",
-        "message" => @native_previous_response_not_found_message
+        "message" => ErrorCodes.previous_response_not_found_message()
       }
     }
   end
@@ -320,7 +319,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonical
 
   defp canonical_codex_responses_error_message(_decoded, _code, upstream_code)
        when upstream_code in ["previous_response_not_found", "invalid_previous_response_id"],
-       do: "upstream stream incomplete"
+       do: ErrorCodes.previous_response_not_found_message()
 
   defp canonical_codex_responses_error_message(decoded, code, _upstream_code) do
     ErrorCodes.nested_string(decoded, ["response", "error", "message"]) ||

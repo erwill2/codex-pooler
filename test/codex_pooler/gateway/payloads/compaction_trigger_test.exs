@@ -24,7 +24,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
 
       assert projected["input"] == payload["input"]
       assert projected["store"] == false
-      refute Map.has_key?(projected, "stream")
+      assert projected["stream"] == true
     end
 
     test "keeps public visible-input strictness for a zero-byte function output" do
@@ -100,6 +100,11 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
       end
 
       assert CompactionTrigger.compaction_result_transport(%{}) == :buffered
+
+      assert CompactionTrigger.compaction_result_transport(%{"stream" => true}) == :sse
+
+      assert CompactionTrigger.project_responses_payload(%{"stream" => true}, :sse)["stream"] ==
+               true
     end
 
     @tag :compaction_state_contract

@@ -81,7 +81,10 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter do
         "o3",
         "o4",
         "gpt-4.1",
-        "gpt-5"
+        "gpt-5",
+        "gpt-6",
+        "gpt-daybreak",
+        "codex-"
       ]) ->
         {:ok, :o200k_base}
 

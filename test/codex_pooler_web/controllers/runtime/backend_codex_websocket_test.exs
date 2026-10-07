@@ -11462,8 +11462,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
         pretty: true
       )
 
-    assert raw_upstream_frame =~ "
-"
+    assert raw_upstream_frame =~ "\n"
 
     upstream = start_upstream(FakeUpstream.websocket_text_frames([raw_upstream_frame]))
 
@@ -11946,7 +11945,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                  "response" => %{
                    "error" => %{
                      "code" => "stream_incomplete",
-                     "message" => "upstream stream incomplete"
+                     "message" => "Previous response was not found. Retrying the full request."
                    }
                  }
                } = decoded_frame
@@ -12072,7 +12071,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
              "response" => %{
                "error" => %{
                  "code" => "stream_incomplete",
-                 "message" => "upstream stream incomplete"
+                 "message" => "Previous response was not found. Retrying the full request."
                }
              }
            } = Jason.decode!(terminal_frame)

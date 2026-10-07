@@ -1269,7 +1269,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                |> Jason.decode!()
 
       assert error["code"] == "stream_incomplete"
-      assert error["message"] == "upstream stream incomplete"
+      assert error["message"] ==
+               "Previous response was not found. Retrying the full request."
       assert response["error"]["code"] == "stream_incomplete"
     end
 
@@ -1295,7 +1296,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
                |> Jason.decode!()
 
       assert error["code"] == "stream_incomplete"
-      assert error["message"] == "upstream stream incomplete"
+      assert error["message"] ==
+               "Previous response was not found. Retrying the full request."
       assert response["error"]["code"] == "stream_incomplete"
     end
 

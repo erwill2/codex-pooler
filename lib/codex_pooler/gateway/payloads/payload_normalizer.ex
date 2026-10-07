@@ -389,6 +389,21 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
             ] and is_binary(effective_model) and effective_model != "",
        do: effective_model
 
+  defp upstream_model_id(
+         %Model{},
+         _endpoint,
+         %RequestOptions{routing: %{requested_model: requested_model}}
+       )
+       when requested_model in ["gpt-reserve", "gpt_reserve"],
+       do: "gpt-reserve"
+
+  defp upstream_model_id(
+         %Model{},
+         _endpoint,
+         %RequestOptions{routing: %{reserve_mode?: true}}
+       ),
+       do: "gpt-reserve"
+
   defp upstream_model_id(%Model{} = model, _endpoint, %RequestOptions{}),
     do: model.upstream_model_id
 
@@ -476,6 +491,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
     |> Map.drop(["type", "generate"])
     |> maybe_drop_backend_codex_previous_response_id(opts)
     |> Map.put_new("instructions", "")
+    |> maybe_enforce_reserve_store_policy(opts)
     |> normalize_backend_codex_http_input(opts)
     |> normalize_backend_codex_reasoning_effort()
     |> ToolSchemaLowering.lower_backend_non_strict_function_tools()
@@ -488,12 +504,22 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
 
   defp normalize_backend_codex_compact_payload(payload, opts) do
     payload
+    |> maybe_enforce_reserve_store_policy(opts)
     |> normalize_backend_codex_reasoning_effort()
     |> ToolSchemaLowering.lower_backend_non_strict_function_tools()
     |> remove_backend_codex_encrypted_tool_schema_markers()
     |> normalize_backend_codex_responses_lite(opts)
     |> normalize_backend_codex_responses_lite_input(opts)
   end
+
+  defp maybe_enforce_reserve_store_policy(payload, %RequestOptions{routing: %{reserve_mode?: true}}),
+    do: Map.put(payload, "store", false)
+
+  defp maybe_enforce_reserve_store_policy(%{"model" => model} = payload, _opts)
+       when model in ["gpt-reserve", "gpt_reserve"],
+       do: Map.put(payload, "store", false)
+
+  defp maybe_enforce_reserve_store_policy(payload, _opts), do: payload
 
   defp normalize_backend_codex_responses_lite(
          payload,
@@ -526,7 +552,6 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
       input = if is_list(input), do: input, else: []
 
       payload
-      |> Map.drop(["tools", "instructions"])
       |> Map.put("input", Enum.map(input, &strip_responses_lite_image_details/1))
     else
       payload
@@ -790,9 +815,23 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
       RequestOptions.use_responses_lite?(opts) ->
         Map.delete(payload, "previous_response_id")
 
+      fallback_assignment?(opts) ->
+        Map.delete(payload, "previous_response_id")
+
       true ->
         payload
     end
+  end
+
+  defp fallback_assignment?(%RequestOptions{} = opts) do
+    session_assignment_id =
+      opts.continuity.codex_session &&
+        opts.continuity.codex_session.pool_upstream_assignment_id
+
+    current_assignment_id = opts.routing.pool_upstream_assignment_id
+
+    is_binary(session_assignment_id) and is_binary(current_assignment_id) and
+      session_assignment_id != current_assignment_id
   end
 
   defp backend_codex_tool_result_continuation?(%{"previous_response_id" => response_id} = payload)
@@ -1245,7 +1284,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
 
   defp normalize_thinking_string(value) do
     case value |> String.trim() |> String.downcase() do
-      effort when effort in ["low", "medium", "high", "xhigh", "max", "ultra"] ->
+      effort when effort in ["low", "medium", "high", "xhigh", "max", "ultra", "persistent"] ->
         %{"effort" => effort}
 
       enabled when enabled in ["enabled", "true", "on"] ->

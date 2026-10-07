@@ -1066,7 +1066,12 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       upstream_identity_id: assignment.upstream_identity_id,
       pricing_snapshot_id: pricing_snapshot && pricing_snapshot.id,
       model_id: request.model_id,
-      upstream_model_id: (model && model.upstream_model_id) || request.requested_model,
+      upstream_model_id:
+        Map.get(
+          attrs,
+          :upstream_model_id,
+          (model && model.upstream_model_id) || request.requested_model
+        ),
       transport: request.transport,
       status: Map.get(attrs, :status, "in_progress"),
       started_at: timestamp,

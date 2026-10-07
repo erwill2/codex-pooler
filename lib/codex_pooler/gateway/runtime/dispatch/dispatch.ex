@@ -14,9 +14,12 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   alias CodexPooler.Gateway.Routing.{ModelMetadata, RouteLifecycle, RoutingSelection}
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
   alias CodexPooler.Gateway.Websocket.DirectCleanup
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   @type dispatch_callback ::
           (SelectedCandidateContext.t() ->
@@ -195,13 +198,26 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
 
   @spec route_selection_updates(dispatch_context(), RoutingSelection.t()) :: keyword()
   defp route_selection_updates(context, %RoutingSelection{} = selection) do
+    reserve_mode? = selected_candidate_reserve_mode?(context, selection)
+
+    routing_attempt_metadata =
+      if reserve_mode? do
+        metadata = selection.attempt_metadata || %{}
+        routing = Map.get(metadata, "routing", %{})
+        Map.put(metadata, "routing", Map.put(routing, "quota_lane", "gpt_reserve"))
+      else
+        selection.attempt_metadata
+      end
+
     updates = [
-      routing_attempt_metadata: selection.attempt_metadata,
+      routing_attempt_metadata: routing_attempt_metadata,
       supports_reasoning_summary_parameter?:
         selected_supports_reasoning_summary_parameter?(
           context.model,
           selection.assignment
-        )
+        ),
+      reserve_mode?: reserve_mode?,
+      pool_upstream_assignment_id: selection.assignment.id
     ]
 
     case RequestOptions.model_serving_mode_snapshot(context.request_options) do
@@ -214,6 +230,52 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
 
       _resolved_snapshot ->
         updates
+    end
+  end
+
+  defp selected_candidate_reserve_mode?(context, selection) do
+    requested_model =
+      context.request_options.routing.requested_model ||
+        (context.reserved.request && context.reserved.request.requested_model)
+
+    cond do
+      requested_model in ["gpt-reserve", "gpt_reserve"] ->
+        true
+
+      true ->
+        snapshot =
+          case Map.get(context, :route_state) do
+            %RouteState{} = route_state ->
+              RouteState.quota_snapshot_for_identity(route_state, selection.identity)
+
+            _ ->
+              snapshots =
+                RoutingQuotaSnapshot.load_by_identity_ids(
+                  [selection.identity.id],
+                  DateTime.utc_now()
+                )
+
+              Map.get(snapshots, selection.identity.id)
+          end
+
+        case snapshot do
+          %RoutingQuotaSnapshot{} = snapshot ->
+            eligibility =
+              QuotaWindows.routing_quota_eligibility_from_snapshot(
+                snapshot,
+                model: context.model.exposed_model_id,
+                upstream_model: context.model.upstream_model_id
+              )
+
+            eligibility.selection[:reserve_mode?] == true or
+              match?(
+                %{quota_key: key} when key in ["gpt_reserve", "gpt-reserve"],
+                eligibility.selection[:secondary]
+              )
+
+          _ ->
+            false
+        end
     end
   end
 
@@ -332,6 +394,13 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
       model: context.model,
       pricing_snapshot: Map.get(context.reserved, :pricing_snapshot),
       upstream_identity: context.identity,
+      upstream_model_id:
+        if(context.request_options.routing.reserve_mode?,
+          do: "gpt-reserve",
+          else:
+            (context.model && context.model.upstream_model_id) ||
+              context.reserved.request.requested_model
+        ),
       response_metadata:
         (context.request_options.routing.routing_attempt_metadata || %{})
         |> Map.merge(ReplayPreparation.attempt_metadata(context))

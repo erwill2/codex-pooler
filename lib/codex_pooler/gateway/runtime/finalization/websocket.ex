@@ -790,7 +790,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
      error(
        status,
        code,
-       collected_provider_failure_message(code),
+       collected_provider_failure_message(failure),
        failure.upstream_error_param
      )}
   end
@@ -809,13 +809,18 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
 
   defp collected_provider_failure_status(_failure), do: 502
 
-  defp collected_provider_failure_message(code) do
-    if code == "stream_incomplete" do
-      "upstream stream incomplete"
-    else
-      "upstream rejected the compact request"
-    end
-  end
+  defp collected_provider_failure_message(%{
+         code: "stream_incomplete",
+         upstream_code: upstream_code
+       })
+       when upstream_code in ["previous_response_not_found", "invalid_previous_response_id"],
+       do: ErrorCodes.previous_response_not_found_message()
+
+  defp collected_provider_failure_message(%{code: "stream_incomplete"}),
+    do: "upstream stream incomplete"
+
+  defp collected_provider_failure_message(_failure),
+    do: "upstream rejected the compact request"
 
   @spec finalize_failed(SelectedCandidateContext.t(), map()) :: {:error, map()}
   def finalize_failed(context, %{reason: :client_disconnected} = finalization) do

@@ -1275,7 +1275,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
         {:valid_websocket, "  response-fixture  ", :websocket, ordinary_input(), true, true},
         {:blank_websocket, "  ", :websocket, ordinary_input(), true, false},
         {:non_binary_websocket, 42, :websocket, ordinary_input(), true, false},
-        {:stripped_http, "response-fixture", :http, ordinary_input(), false, false},
+        {:retained_http, "response-fixture", :http, ordinary_input(), true, true},
         {:retained_semantic_http, "response-fixture", :http, tool_result_input(), true, true},
         {:retained_standalone_http, "response-fixture", :http, standalone_tool_result_input(),
          true, true}
@@ -2472,6 +2472,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
       upstream = Jason.decode!(encoded)
 
       refute Enum.any?(upstream["input"], &match?(%{"type" => "additional_tools"}, &1))
+
       assert Enum.map(upstream["input"], & &1["type"]) == [
                "function_call_output",
                "compaction_trigger"
@@ -2543,8 +2544,8 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
         assert first["stream"] == true, name
         assert first["parallel_tool_calls"] == false, name
         assert get_in(first, ["reasoning", "context"]) == "all_turns", name
-        refute Map.has_key?(first, "tools"), name
-        refute Map.has_key?(first, "instructions"), name
+        assert first["tools"] == source_payload["tools"], name
+        assert first["instructions"] == source_payload["instructions"], name
 
         refute Enum.any?(first["input"], fn item ->
                  item["type"] == "additional_tools" or item["role"] == "developer"
@@ -2591,8 +2592,8 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
       assert first["input"] == [supplied_prefix, strip_image_detail(supplied_message), trigger]
       assert Enum.count(first["input"], &(&1["type"] == "additional_tools")) == 1
       assert first["previous_response_id"] == source_payload["previous_response_id"]
-      refute Map.has_key?(first, "tools")
-      refute Map.has_key?(first, "instructions")
+      assert first["tools"] == source_payload["tools"]
+      assert first["instructions"] == source_payload["instructions"]
     end
 
     test "uses the pre-dispatch applied effort for compact payloads without re-deciding policy" do

@@ -459,7 +459,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
              "id",
              @metadata_passthrough_key
            ]),
-         :ok <- validate_json_value(metadata),
+         :ok <- validate_exact_item_keys(metadata, ["turn_id"]),
          :ok <- validate_nonblank(encrypted_content),
          :ok <- validate_nonblank(id) do
       validate_nonblank(turn_id)
@@ -486,7 +486,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
              "id",
              @metadata_passthrough_key
            ]),
-         :ok <- validate_json_value(metadata),
+         :ok <- validate_exact_item_keys(metadata, ["turn_id"]),
          :ok <- validate_optional_compaction_id(item),
          :ok <- validate_optional_context_compaction_encrypted_content(item) do
       validate_nonblank(turn_id)

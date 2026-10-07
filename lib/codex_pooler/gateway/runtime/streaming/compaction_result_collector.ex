@@ -29,7 +29,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
           {:ok, map()} | {:error, map()}
   def collect(response, %SelectedCandidateContext{} = context, finalization_callbacks) do
     response_context = %ResponseContext{context: context, response: response}
-    state = new_state()
+    state = new_state(compaction_item_mode(context.request_options))
 
     case StreamRelay.run(state, response, handlers(response_context, finalization_callbacks)) do
       {:ok, state} -> state |> finalize_sse_state() |> compact_result()
@@ -46,7 +46,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
     state |> finalize_sse_state() |> websocket_compact_result()
   end
 
-  defp new_state(item_mode \\ :native) do
+  defp new_state(item_mode) do
     %{
       collection: %{
         invalid_reason: nil,
@@ -61,6 +61,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector do
       sse: StreamProtocol.new_sse_block_state(),
       usage_observer: StreamUsageObserver.new()
     }
+  end
+
+  defp compaction_item_mode(%{openai_compatibility: compatibility}) do
+    if compatibility.source_endpoint == "/v1/responses",
+      do: :public,
+      else: :native
   end
 
   defp compact_result(%{collection: %{invalid_reason: nil} = collection}) do

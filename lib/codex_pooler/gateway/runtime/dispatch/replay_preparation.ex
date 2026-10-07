@@ -8,7 +8,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation do
   alias CodexPooler.Pools.RoutingSettings
 
   @metadata_key "native_replay_preparation"
-  @efforts [nil | ~w(none minimal low medium high xhigh max ultra)]
+  @efforts [nil | ~w(none minimal low medium high xhigh max ultra persistent)]
   @modes %{
     "unrestricted" => :unrestricted,
     "allow_up_to" => :allow_up_to,

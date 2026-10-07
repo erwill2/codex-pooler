@@ -196,11 +196,21 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
       )
       when is_binary(assignment_id) do
     if hard_pin_codex_session_assignment?(request_options, model) do
-      filter_pinned_codex_session_assignment(
-        candidates,
-        request_options,
-        hard_pin_metadata(request_options, model)
-      )
+      case filter_pinned_codex_session_assignment(
+             candidates,
+             request_options,
+             hard_pin_metadata(request_options, model)
+           ) do
+        {:ok, _pinned} ->
+          {:ok, prefer_codex_session_assignment(candidates, assignment_id)}
+
+        {:error, reason} ->
+          if candidates != [] do
+            {:ok, candidates}
+          else
+            {:error, reason}
+          end
+      end
     else
       {:ok, prefer_codex_session_assignment(candidates, assignment_id)}
     end

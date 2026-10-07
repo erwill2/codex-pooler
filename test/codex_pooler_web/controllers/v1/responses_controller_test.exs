@@ -2899,27 +2899,43 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       response_id = "resp_v1_compaction_trigger_#{stream?}"
       previous_response_id = "resp_v1_compaction_previous_#{stream?}"
 
+      compact_response = %{
+        "id" => response_id,
+        "object" => "response.compaction",
+        "output" => [
+          %{
+            "type" => "compaction",
+            "encrypted_content" => "synthetic-public-trigger-encrypted-#{stream?}",
+            "id" => nil,
+            "internal_chat_message_metadata_passthrough" => %{
+              "turn_id" => "native-public-turn-must-drop",
+              "compaction" => %{"implementation" => "responses_compaction_v2"},
+              "instruction" => "returned metadata must not select request transport"
+            },
+            "compaction" => %{"implementation" => "responses_compaction_v2"},
+            "summary" => "plaintext-public-summary-must-drop"
+          }
+        ],
+        "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+      }
+
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "id" => response_id,
-            "object" => "response.compaction",
-            "output" => [
-              %{
-                "type" => "compaction",
-                "encrypted_content" => "synthetic-public-trigger-encrypted-#{stream?}",
-                "id" => nil,
-                "internal_chat_message_metadata_passthrough" => %{
-                  "turn_id" => "native-public-turn-must-drop",
-                  "compaction" => %{"implementation" => "responses_compaction_v2"},
-                  "instruction" => "returned metadata must not select request transport"
-                },
-                "compaction" => %{"implementation" => "responses_compaction_v2"},
-                "summary" => "plaintext-public-summary-must-drop"
-              }
-            ],
-            "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
-          })
+          FakeUpstream.sse_stream([
+            {"response.output_item.done",
+             %{
+               "type" => "response.output_item.done",
+               "item" => hd(compact_response["output"])
+             }},
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" =>
+                 compact_response
+                 |> Map.put("object", "response")
+                 |> Map.put("status", "completed")
+             }}
+          ])
         )
 
       setup = gateway_setup(upstream, compact?: true)
@@ -2988,7 +3004,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.path == "/backend-api/codex/responses"
-      refute Map.has_key?(captured.json, "stream")
+      assert captured.json["stream"] == true
       refute Map.has_key?(captured.json, "include")
       assert captured.json["store"] == false
       refute Map.has_key?(captured.json, "prompt_cache_options")
@@ -3005,7 +3021,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
       assert request.endpoint == "/backend-api/codex/responses/compact"
-      assert request.transport == "http_compact_json"
+      assert request.transport == "http_sse"
       assert request.status == "succeeded"
 
       assert get_in(request.request_metadata, ["reservation_snapshot_inputs", "route_class"]) ==
@@ -3018,7 +3034,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                "/backend-api/codex/responses"
 
       assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
-      assert attempt.transport == "http_compact_json"
+      assert attempt.transport == "http_sse"
       assert attempt.status == "succeeded"
 
       assert Repo.aggregate(
@@ -3121,14 +3137,26 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     upstream =
       start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_public_compaction_curl",
-          "object" => "response.compaction",
-          "output" => [
-            %{"type" => "compaction", "encrypted_content" => encrypted_content}
-          ],
-          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
-        })
+        FakeUpstream.sse_stream([
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "item" => %{"type" => "compaction", "encrypted_content" => encrypted_content}
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_public_compaction_curl",
+               "object" => "response",
+               "status" => "completed",
+               "output" => [
+                 %{"type" => "compaction", "encrypted_content" => encrypted_content}
+               ],
+               "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+             }
+           }}
+        ])
       )
 
     setup = gateway_setup(upstream, compact?: true)
@@ -3161,14 +3189,15 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
-    refute Map.has_key?(captured.json, "stream")
+    assert Map.new(captured.headers)["accept"] == "text/event-stream"
+    assert captured.json["stream"] == true
     assert captured.json["store"] == false
     assert Enum.count(captured.json["input"], &(&1 == %{"type" => "compaction_trigger"})) == 1
     assert List.last(captured.json["input"]) == %{"type" => "compaction_trigger"}
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.endpoint == "/backend-api/codex/responses/compact"
-    assert request.transport == "http_compact_json"
+    assert request.transport == "http_sse"
     assert request.status == "succeeded"
 
     metadata_text = inspect(request.request_metadata)
@@ -3240,12 +3269,22 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       upstream =
         start_upstream(
-          FakeUpstream.json_response(%{
-            "output" => [
-              invalid_item,
-              %{"type" => "compaction", "encrypted_content" => encrypted_later}
-            ]
-          })
+          FakeUpstream.sse_stream([
+            {"response.output_item.done",
+             %{"type" => "response.output_item.done", "item" => invalid_item}},
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "object" => "response",
+                 "status" => "completed",
+                 "output" => [
+                   invalid_item,
+                   %{"type" => "compaction", "encrypted_content" => encrypted_later}
+                 ]
+               }
+             }}
+          ])
         )
 
       setup = gateway_setup(upstream, compact?: true)
@@ -3263,9 +3302,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert %{
                "error" => %{
                  "code" => "invalid_compaction_response",
-                 "message" =>
-                   "upstream compact response did not include encrypted compaction content",
-                 "type" => "invalid_request_error"
+                 "message" => "upstream request failed",
+                 "type" => "server_error"
                }
              } = json_response(response, 502)
 

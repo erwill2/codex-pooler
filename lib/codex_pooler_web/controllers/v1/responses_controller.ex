@@ -46,13 +46,17 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
         PublicGatewayDispatch.dispatch_coerced(conn, auth, coerced)
 
       {:ok, compact_payload} ->
-        result_transport = CompactionTrigger.compaction_result_transport(payload)
+        result_mode = public_result_mode(coerced)
+        result_transport = public_compaction_result_transport(payload, result_mode)
+
+        compact_payload =
+          CompactionTrigger.project_responses_payload(compact_payload, result_transport)
 
         request_options =
           coerced.request_options
           |> RequestOptions.retarget(@compact_responses_endpoint, compact_payload)
           |> RequestOptions.put_transport(
-            transport: "http_compact_json",
+            transport: public_compaction_transport(result_transport),
             upstream_endpoint: @backend_responses_endpoint,
             route_class: RouteClass.proxy_compact()
           )
@@ -74,7 +78,7 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
           },
           admission_endpoint: @public_responses_endpoint,
           translated_endpoint: @backend_responses_endpoint,
-          result_adapter: &CompactionTrigger.adapt_gateway_result(&1, public_result_mode(coerced))
+          result_adapter: &CompactionTrigger.adapt_gateway_result(&1, result_mode)
         )
 
       {:error, reason} ->
@@ -90,6 +94,14 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
        do: :public_sse
 
   defp public_result_mode(_coerced), do: :response
+
+  defp public_compaction_result_transport(_payload, :public_sse), do: :sse
+
+  defp public_compaction_result_transport(payload, _result_mode),
+    do: CompactionTrigger.compaction_result_transport(payload)
+
+  defp public_compaction_transport(:sse), do: "http_sse"
+  defp public_compaction_transport(:buffered), do: "http_compact_json"
 
   defp request_opts(conn, params) do
     conn

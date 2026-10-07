@@ -62,7 +62,7 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounterTest do
       assert {:ok, 21, %{encoding: "cl100k_base"}} = TokenCounter.count("gpt-4-turbo", unicode)
 
       assert {:ok, 28, %{encoding: "o200k_base"}} = TokenCounter.count("gpt-4o", diff)
-      assert {:ok, 27, %{encoding: "cl100k_base"}} = TokenCounter.count("gpt-4-turbo", diff)
+      assert {:ok, 28, %{encoding: "cl100k_base"}} = TokenCounter.count("gpt-4-turbo", diff)
     end
 
     test "returns controlled errors for unknown models" do
@@ -102,7 +102,9 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounterTest do
         {"GPT-4", {:ok, :cl100k_base}},
         {"GPT-4-Turbo", {:ok, :cl100k_base}},
         {"gpt5", {:error, :unsupported_model}},
-        {"gpt-6", {:error, :unsupported_model}}
+        {"gpt-6", {:ok, :o200k_base}},
+        {"gpt-6-astra", {:ok, :o200k_base}},
+        {"gpt-7", {:error, :unsupported_model}}
       ]
 
       for {model, expected} <- cases do

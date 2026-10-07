@@ -2063,7 +2063,14 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
             "previous_response_id" => previous_response_id,
             "input" => input,
             "stream" => false,
-            "stream_id" => stream_id
+            "stream_id" => stream_id,
+            "client_metadata" => %{
+              "x-codex-turn-metadata" =>
+                Jason.encode!(%{
+                  "request_kind" => "compaction",
+                  "compaction" => %{"implementation" => "responses_compaction_v2"}
+                })
+            }
           })
 
         {_conn, _websocket, frames} =

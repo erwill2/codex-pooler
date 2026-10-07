@@ -26,7 +26,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
   @turn_state_param "client_metadata.x-codex-turn-state"
   @detection_timeout_ms 15_000
-  @stale_native_content "stale-native-content-must-not-succeed"
   @remote_compaction_v2_fixture_path Path.expand(
                                        "../../../fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_request.json",
                                        __DIR__
@@ -644,8 +643,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
   end
 
   for {path, transport, optional_metadata} <- [
-        {"/backend-api/codex/responses", :buffered, :valid},
-        {"/backend-api/codex/v1/responses", :buffered, :malformed},
         {"/backend-api/codex/responses", :sse, :valid},
         {"/backend-api/codex/v1/responses", :sse, :malformed}
       ] do
@@ -1454,6 +1451,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
                  "status" => 400,
                  "error" => %{
                    "code" => "stream_incomplete",
+                   "message" => "Previous response was not found. Retrying the full request.",
                    "type" => "invalid_request_error",
                    "param" => "previous_response_id"
                  }
@@ -1794,135 +1792,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     end
   end
 
-  test "buffered native bridge forwards one validated frame turn state and adapts once after settlement" do
-    upstream =
-      start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_native_buffered_compaction",
-          "output" => [
-            %{
-              "type" => "compaction",
-              "encrypted_content" => "synthetic-native-buffered-encrypted"
-            }
-          ],
-          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
-        })
-      )
-
-    setup = gateway_setup(upstream, compact?: true)
-    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
-
-    {:ok, state} =
-      direct_socket(auth, "native-buffered-success",
-        accepted_turn_state: "upgrade-turn-state",
-        forwarded_headers: [
-          {"X-Codex-Turn-State", "stale-one"},
-          {"x-codex-turn-state", "stale-two"}
-        ]
-      )
-
-    try do
-      assert {:ok, state} =
-               CodexResponsesSocket.handle_in(
-                 {compact_payload(setup, "  frame-turn-state  "), [opcode: :text]},
-                 state
-               )
-
-      assert {:push, {:text, done_frame}, state} = receive_socket_message(state)
-      assert {:push, {:text, completed_frame}, state} = receive_socket_message(state)
-      assert {:ok, _state} = receive_socket_done(state)
-
-      assert %{"type" => "response.output_item.done", "item" => item} = Jason.decode!(done_frame)
-
-      assert %{
-               "type" => "response.completed",
-               "response" => %{"output" => [^item]}
-             } = Jason.decode!(completed_frame)
-
-      assert [captured] = FakeUpstream.requests(upstream)
-      assert captured.method == "POST"
-      assert captured.path == "/backend-api/codex/responses"
-
-      assert Enum.filter(captured.headers, fn {name, _value} ->
-               String.downcase(name) == "x-codex-turn-state"
-             end) == [{"x-codex-turn-state", "frame-turn-state"}]
-
-      assert [request] = Repo.all(Request)
-      assert request.status == "succeeded"
-
-      assert [attempt] =
-               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^request.id))
-
-      assert attempt.status == "succeeded"
-      assert settlement_count(request.id) == 1
-    after
-      CodexResponsesSocket.terminate(:closed, state)
-    end
-  end
-
-  test "invalid buffered native compact bodies fail before success settlement" do
-    cases = [
-      {FakeUpstream.malformed_json("{malformed-native-compact", 200),
-       "upstream compact response was not valid JSON"},
-      {FakeUpstream.json_response(%{"id" => "resp_missing_native_compact_content"}),
-       "upstream compact response did not include encrypted compaction content"},
-      {buffered_native_compaction_response("resp_empty_native_compact_content", "", :output),
-       "upstream compact response did not include encrypted compaction content"},
-      {buffered_native_compaction_response(
-         "resp_blank_native_compact_content",
-         " \t\r\n",
-         :top_level
-       ), "upstream compact response did not include encrypted compaction content"}
-    ]
-
-    for {mode, expected_message} <- cases do
-      upstream = start_upstream(mode)
-      setup = gateway_setup(upstream, compact?: true)
-      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
-      {:ok, session} = Websocket.start_codex_session(auth, %{})
-
-      assert {:error, error} =
-               Service.execute_websocket_response(
-                 auth,
-                 compact_payload(setup, nil),
-                 RequestOptions.for_websocket(%{codex_session: session}),
-                 fn frame -> send(self(), {:unexpected_frame, frame}) end
-               )
-
-      assert error.status == 502
-      assert error.code == "invalid_compaction_response"
-      assert error.message == expected_message
-      refute_received {:unexpected_frame, _frame}
-
-      assert [request] =
-               Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
-
-      assert request.status == "failed"
-      assert request.last_error_code == "invalid_compaction_response"
-      assert request.retry_count == 0
-
-      assert [attempt] =
-               Repo.all(from(attempt in Attempt, where: attempt.request_id == ^request.id))
-
-      assert attempt.status == "failed"
-      assert attempt.network_error_code == "invalid_compaction_response"
-      refute attempt.retryable
-
-      assert [turn] =
-               Repo.all(
-                 from(turn in CodexTurn,
-                   where: turn.codex_session_id == ^session.id and turn.request_id == ^request.id
-                 )
-               )
-
-      assert turn.status == "failed"
-      assert turn.error_code == "invalid_compaction_response"
-      assert turn.final_attempt_id == attempt.id
-      assert settlement_count(request.id) == 1
-      refute inspect({request, attempt, turn}) =~ @stale_native_content
-    end
-  end
-
   test "native compact saturation emits one error, releases admission, and keeps the socket reusable" do
     unrelated_lease_holder = hold_admission_lease("proxy_http")
     configure_compact_saturation()
@@ -2073,22 +1942,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
         },
         key
       )
-
-  defp compact_expected(:buffered, key),
-    do:
-      Map.fetch!(
-        %{
-          method: "POST",
-          http_count: 1,
-          websocket?: false,
-          transport: "http_compact_json",
-          turn_transport: "http_json"
-        },
-        key
-      )
-
-  defp assert_compact_turn_state_header(headers, :buffered, frame_turn_state),
-    do: assert(header_values(headers, "x-codex-turn-state") == [frame_turn_state])
 
   defp assert_compact_turn_state_header(headers, :sse, _frame_turn_state),
     do: assert(header_values(headers, "x-codex-turn-state") == [])
@@ -2295,24 +2148,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
     }
     |> Map.merge(extra)
     |> Jason.encode!()
-  end
-
-  defp buffered_native_compaction_response(response_id, encrypted_content, :output) do
-    FakeUpstream.json_response(%{
-      "id" => response_id,
-      "output" => [
-        %{"type" => "compaction", "encrypted_content" => encrypted_content},
-        %{"type" => "compaction_summary", "encrypted_content" => @stale_native_content}
-      ],
-      "compaction_summary" => %{"encrypted_content" => @stale_native_content}
-    })
-  end
-
-  defp buffered_native_compaction_response(response_id, encrypted_content, :top_level) do
-    FakeUpstream.json_response(%{
-      "id" => response_id,
-      "compaction_summary" => %{"encrypted_content" => encrypted_content}
-    })
   end
 
   defp invalid_turn_states do
@@ -2608,10 +2443,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketCompactionTriggerTest do
 
     assert route_classes == expected_route_classes
     assert Enum.frequencies(route_classes) == Enum.frequencies(expected_route_classes)
-  end
-
-  defp assert_compact_transport_payload(payload, :buffered) do
-    refute Map.has_key?(payload, "stream")
   end
 
   defp assert_compact_transport_payload(payload, :sse) do

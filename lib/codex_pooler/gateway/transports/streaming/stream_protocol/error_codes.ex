@@ -16,6 +16,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
   ]
   @stream_incomplete_code "stream_incomplete"
   @previous_response_not_found_code "previous_response_not_found"
+  @previous_response_not_found_message "Previous response was not found. Retrying the full request."
   @server_error_code "server_error"
   @rate_limit_exceeded_code "rate_limit_exceeded"
   @terminal_default_code "upstream_websocket_terminal_failure"
@@ -131,6 +132,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes do
   def previous_response_miss_code?(code) when code in @previous_response_miss_codes, do: true
 
   def previous_response_miss_code?(_code), do: false
+
+  @spec previous_response_not_found_message() :: String.t()
+  def previous_response_not_found_message, do: @previous_response_not_found_message
 
   @spec decoded_string(map(), String.t()) :: String.t() | nil
   def decoded_string(decoded, key) when is_map(decoded) do

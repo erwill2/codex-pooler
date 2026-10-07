@@ -46,6 +46,8 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   def compaction_input_mode(%{}), do: :full_history
 
   @spec compaction_result_transport(payload()) :: compaction_result_transport()
+  def compaction_result_transport(%{"stream" => true}), do: :sse
+
   def compaction_result_transport(%{"client_metadata" => %{} = metadata}) do
     case metadata["x-codex-turn-metadata"] do
       turn_metadata when is_binary(turn_metadata) ->
@@ -208,7 +210,8 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
       length(input) < 2 ->
         {:error, invalid_trigger_error()}
 
-      require_visible? and not visible_input_before_trigger?(input) ->
+      require_visible? and compaction_input_mode(payload) != :incremental and
+          not visible_input_before_trigger?(input) ->
         {:error, invalid_trigger_error()}
 
       true ->
