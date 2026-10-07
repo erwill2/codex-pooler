@@ -317,17 +317,27 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
     assert redirected_to(conn) == ~p"/admin/pools"
 
-    external_conn =
-      build_conn()
-      |> init_test_session(%{})
-      |> put_session(:user_return_to, "https://example.com/evil")
+    for unsafe_path <- [
+          "https://example.com/evil",
+          "//example.com",
+          "/\\example.com",
+          "/%2f/example.com",
+          "/%5cexample.com",
+          "/%09example.com",
+          "/\t"
+        ] do
+      external_conn =
+        build_conn()
+        |> init_test_session(%{})
+        |> put_session(:user_return_to, unsafe_path)
 
-    conn =
-      post(external_conn, ~p"/login", %{
-        "user" => %{"email" => "owner@example.com", "password" => valid_user_password()}
-      })
+      conn =
+        post(external_conn, ~p"/login", %{
+          "user" => %{"email" => "owner@example.com", "password" => valid_user_password()}
+        })
 
-    assert redirected_to(conn) == ~p"/admin/pools"
+      assert redirected_to(conn) == ~p"/admin/pools"
+    end
   end
 
   test "password change API rejects anonymous and invalid password requests", %{conn: conn} do
