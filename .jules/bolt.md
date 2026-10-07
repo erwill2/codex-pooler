@@ -1,0 +1,3 @@
+## 2026-03-31 - BridgeRing candidate routing list short-circuiting
+**Learning:** In Elixir gateway routing pipelines where candidates are passed sequentially through multiple sorting, partitioning, and rotation stages (`apply_affinity`, `apply_routing_priority`, `rotate_candidates`, `apply_demotions`), empty (`[]`) and single-element (`[_]`) candidate lists can bypass all `Enum.with_index`, `Enum.sort_by`, `Enum.split_with`, and O(N) `length/1` guard checks when pattern matched directly at function heads.
+**Action:** Always short-circuit `[]` and `[_]` on candidate list transformations in hot routing paths.

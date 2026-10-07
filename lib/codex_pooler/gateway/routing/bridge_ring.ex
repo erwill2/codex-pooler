@@ -291,6 +291,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp affinity_status(true, %BridgeAffinity{}), do: "hit"
   defp affinity_status(true, _affinity), do: "miss"
 
+  defp apply_affinity([], _affinity), do: []
+  defp apply_affinity([_] = candidates, _affinity), do: candidates
   defp apply_affinity(candidates, %{row: nil} = _affinity), do: candidates
 
   defp apply_affinity(candidates, %{row: %BridgeAffinity{} = affinity}) do
@@ -315,7 +317,12 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     matched ++ rest
   end
 
+  defp apply_codex_session_preference([], _opts), do: []
+  defp apply_codex_session_preference([_] = candidates, _opts), do: candidates
   defp apply_codex_session_preference(candidates, %RequestOptions{}), do: candidates
+
+  defp apply_prompt_cache_locality([], _locality), do: []
+  defp apply_prompt_cache_locality([_] = candidates, _locality), do: candidates
 
   defp apply_prompt_cache_locality(candidates, %{status: "applied", seed: seed}) do
     Enum.sort_by(candidates, fn {assignment, _identity} ->
@@ -328,6 +335,10 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  # Empty and single-element lists short-circuit in O(1) time without sorting or indexing.
+  defp apply_routing_priority([]), do: []
+  defp apply_routing_priority([_] = candidates), do: candidates
+
   defp apply_routing_priority(candidates) do
     candidates
     |> Enum.with_index()
@@ -481,6 +492,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     |> Map.new(&{&1.pool_upstream_assignment_id, &1})
   end
 
+  defp apply_demotions([], _demotions), do: []
+  defp apply_demotions([_] = candidates, _demotions), do: candidates
   defp apply_demotions(candidates, demotions) when map_size(demotions) == 0, do: candidates
 
   defp apply_demotions(candidates, demotions) do
@@ -619,7 +632,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp latest_success_sort_key(%DateTime{} = timestamp),
     do: DateTime.to_unix(timestamp, :microsecond)
 
-  defp rotate_candidates(candidates, _seed) when length(candidates) <= 1, do: candidates
+  defp rotate_candidates([], _seed), do: []
+  defp rotate_candidates([_] = candidates, _seed), do: candidates
 
   defp rotate_candidates(candidates, seed) do
     {head, tail} = Enum.split(candidates, :erlang.phash2(seed, length(candidates)))
