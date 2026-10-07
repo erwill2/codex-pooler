@@ -320,7 +320,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
   test "added model reads stay constant as assignment and model counts grow", %{
     scope: scope
   } do
+    alias CodexPooler.Catalog.Model
+    alias CodexPooler.Pools.Pool
+    alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+
     for size <- [1, 50] do
+      Repo.delete_all(Model)
+      Repo.delete_all(PoolUpstreamAssignment)
+      Repo.delete_all(UpstreamIdentity)
+      Repo.delete_all(Pool)
+
       pools =
         for index <- 1..size do
           pool = pool_fixture()

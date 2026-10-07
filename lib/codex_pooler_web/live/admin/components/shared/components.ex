@@ -285,6 +285,7 @@ defmodule CodexPoolerWeb.Admin.Components do
           type="button"
           class="btn btn-ghost btn-sm btn-square shrink-0"
           aria-label={@close_label}
+          title={@close_label}
           phx-click={@close_event}
         >
           <.icon name="hero-x-mark" class="size-5" />
