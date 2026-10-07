@@ -68,7 +68,7 @@ defmodule CodexPooler.Quotas.Evidence.Descriptors do
           }
       end
 
-    if normalized_id == "codex" and is_nil(present_string(limit_name)) do
+    if normalized_id in ["codex", "base_model_inference"] and is_nil(present_string(limit_name)) do
       Map.merge(account_descriptor(), Map.drop(overrides, [:raw_limit_id, :raw_metered_feature]))
     else
       Map.merge(base, overrides)

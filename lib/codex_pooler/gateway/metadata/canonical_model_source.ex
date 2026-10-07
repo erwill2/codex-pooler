@@ -88,6 +88,7 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
           context_window_overrides
         )
         |> Map.put("use_responses_lite", effective_model_serving_mode == "lite")
+        |> apply_visibility_overlay(model)
 
       {:ok, payload}
     end
@@ -95,6 +96,23 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
 
   def project(_source, %Model{}, _pricing_buckets, _context_window_overrides, _mode),
     do: {:error, :invalid_model_metadata}
+
+  defp apply_visibility_overlay(payload, %Model{} = model) do
+    identifiers = [model.exposed_model_id, model.upstream_model_id]
+
+    payload =
+      if Enum.any?(identifiers, &(&1 in ["gpt-6-astra", "astra", "gpt-reserve", "gpt_reserve"])),
+        do: Map.put(payload, "visibility", "list"),
+        else: payload
+
+    if Enum.any?(identifiers, &(&1 in ["gpt-reserve", "gpt_reserve"])) do
+      payload
+      |> Map.put("priority", 1)
+      |> Map.put("multi_agent_version", "v2")
+    else
+      payload
+    end
+  end
 
   defp canonical_json_map(source) do
     _etag = CodexCatalog.etag(source)

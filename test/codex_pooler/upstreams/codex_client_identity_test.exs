@@ -40,7 +40,7 @@ defmodule CodexPooler.Upstreams.CodexClientIdentityTest do
       |> Application.fetch_env!(CodexClientIdentity)
       |> Keyword.fetch!(:default_client_version)
 
-    for version <- [nil, "", "rust-v0.153.4", "not-a-version", 153, %{}] do
+    for version <- [nil, "", "rust-v0.155.1", "not-a-version", 153, %{}] do
       Application.put_env(:codex_pooler, CodexPooler.Catalog, codex_client_version: version)
 
       assert CodexClientIdentity.version() == managed_version

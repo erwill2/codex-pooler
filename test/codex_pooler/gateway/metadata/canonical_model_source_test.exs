@@ -260,6 +260,49 @@ defmodule CodexPooler.Gateway.Metadata.CanonicalModelSourceTest do
     end
   end
 
+  test "gpt-reserve model visibility is projected as list even when upstream source advertises hide" do
+    source =
+      source_metadata()
+      |> Map.put("visibility", "hide")
+
+    model = %Model{
+      upstream_model_id: "gpt-reserve",
+      exposed_model_id: "gpt-reserve",
+      display_name: "GPT-Reserve",
+      status: "active",
+      supports_responses: true,
+      supports_streaming: true,
+      supports_tools: true,
+      supports_reasoning: true,
+      metadata: source
+    }
+
+    assert {:ok, payload} = CanonicalModelSource.project(source, model, %{}, %{}, "full")
+    assert payload["visibility"] == "list"
+  end
+
+  test "Astra model visibility is projected as list for the Codex IDE picker" do
+    source =
+      source_metadata()
+      |> Map.put("slug", "gpt-6-astra")
+      |> Map.put("visibility", "hide")
+
+    model = %Model{
+      upstream_model_id: "gpt-6-astra",
+      exposed_model_id: "gpt-6-astra",
+      display_name: "GPT-6-Astra",
+      status: "active",
+      supports_responses: true,
+      supports_streaming: true,
+      supports_tools: true,
+      supports_reasoning: true,
+      metadata: source
+    }
+
+    assert {:ok, payload} = CanonicalModelSource.project(source, model, %{}, %{}, "full")
+    assert payload["visibility"] == "list"
+  end
+
   defp source_metadata do
     %{
       "slug" => "gpt-schema-fixture",
