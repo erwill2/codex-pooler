@@ -96,6 +96,7 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
       @expired
     ],
     @confirmed_by_upstream => [@confirmed_by_quota, @reblocked, @expired],
+    @reblocked => [@confirmed_by_upstream, @confirmed_by_quota],
     @expired => [@confirmed_by_quota, @reblocked]
   }
 
@@ -217,10 +218,9 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
 
   @spec applied_reblocked?(redemption() | term()) :: boolean()
   def applied_reblocked?(%{} = redemption) do
-    phase(redemption) == @reblocked and consumed_credit?(redemption) and
-      valid_attempt_id?(Map.get(redemption, "attempt_id")) and
-      is_integer(Map.get(redemption, "generation")) and
-      match?(%DateTime{}, parse_datetime(Map.get(redemption, "consumed_at")))
+    phase(redemption) == @reblocked and
+      Map.get(redemption, "status") == legacy_status_for(@reblocked) and
+      consumed_credit?(redemption) and valid_reblocked_probe_identity?(redemption)
   end
 
   def applied_reblocked?(_redemption), do: false
@@ -408,9 +408,32 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   """
   @spec probe_claimable?(redemption() | term(), DateTime.t()) :: boolean()
   def probe_claimable?(redemption, %DateTime{} = now) do
-    phase(redemption) == @consumed_pending_probe and probe_holder(redemption) == nil and
-      not expired?(redemption, now)
+    (pending_probe?(redemption) or applied_reblocked?(redemption)) and
+      probe_holder(redemption) == nil and not expired?(redemption, now)
   end
+
+  defp pending_probe?(%{} = redemption) do
+    phase(redemption) == @consumed_pending_probe and
+      Map.get(redemption, "status") == legacy_status_for(@consumed_pending_probe) and
+      consumed_credit?(redemption) and valid_pending_probe_identity?(redemption)
+  end
+
+  defp pending_probe?(_redemption), do: false
+
+  defp valid_reblocked_probe_identity?(redemption) do
+    valid_attempt_id?(Map.get(redemption, "attempt_id")) and
+      is_integer(Map.get(redemption, "generation")) and
+      match?(%DateTime{}, parse_datetime(Map.get(redemption, "consumed_at")))
+  end
+
+  defp valid_pending_probe_identity?(redemption) do
+    present_binary?(Map.get(redemption, "attempt_id")) and
+      is_integer(Map.get(redemption, "generation")) and
+      match?(%DateTime{}, parse_datetime(Map.get(redemption, "consumed_at")))
+  end
+
+  defp present_binary?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_binary?(_value), do: false
 
   @doc """
   Compare-and-set guard for a lifecycle transition. The move is permitted only
@@ -443,19 +466,24 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
          expected_attempt_id
        ) do
     exact_transition_identity?(redemption, expected_generation, expected_attempt_id) and
-      match?(
-        %{"version" => 1, "provider_dispatches" => 0},
-        Map.get(redemption, "provider_replay")
-      )
+      (match?(
+         %{"version" => 1, "provider_dispatches" => 0},
+         Map.get(redemption, "provider_replay")
+       ) or
+         match?(
+           %{"mode" => "observe_only"},
+           Map.get(redemption, "provider_replay")
+         ))
   end
 
   defp allowed_transition?(
          redemption,
          @reblocked,
-         @confirmed_by_quota,
+         to_phase,
          expected_generation,
          expected_attempt_id
-       ) do
+       )
+       when to_phase in [@confirmed_by_upstream, @confirmed_by_quota] do
     applied_reblocked?(redemption) and
       exact_transition_identity?(redemption, expected_generation, expected_attempt_id)
   end

@@ -818,6 +818,29 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert replay["next_action_at"] == now |> DateTime.add(6, :hour) |> DateTime.to_iso8601()
     end
 
+    test "observe-only Codex ambiguity settles as consume_not_applied after 24 hour timeout" do
+      fixture = ambiguous_codex_recovery_fixture!()
+      now = DateTime.add(fixture.last_provider_dispatched_at, 25, :hour)
+
+      fixture =
+        make_recovery_due!(fixture, now,
+          provider_dispatches: 6,
+          started_at: DateTime.add(now, -25, :hour)
+        )
+
+      assert {:ok, %{status: :noop, code: "consume_not_applied"}} = resume_recovery(fixture, now)
+      assert FakeUpstream.count(fixture.fake) == 1
+
+      redemption =
+        Repo.reload!(fixture.identity).metadata["saved_reset_redemption"]
+
+      assert redemption["status"] == "failed"
+      assert redemption["phase"] == "consume_not_applied"
+      assert is_binary(redemption["finished_at"])
+      assert redemption["result"]["applied"] == false
+      assert redemption["result"]["code"] == "consume_not_applied"
+    end
+
     test "observe-only starts exactly at the provider staleness floor" do
       fixture = ambiguous_codex_recovery_fixture!()
       floor_at = DateTime.add(fixture.last_provider_dispatched_at, 30, :minute)

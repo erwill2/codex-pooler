@@ -40,6 +40,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   @maximum_provider_dispatches 6
   @replay_cutoff_seconds 6 * 60 * 60
   @observe_only_interval_seconds 6 * 60 * 60
+  @observe_only_timeout_seconds 24 * 60 * 60
   @provider_staleness_floor_seconds 30 * 60
   @replay_delays_seconds %{1 => 60, 2 => 5 * 60, 3 => 15 * 60, 4 => 60 * 60, 5 => 3 * 60 * 60}
 
@@ -765,12 +766,16 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
         )
 
       _available_missing_or_empty when recovery.recovery_mode == :observe_only ->
-        persist_recovery_observation(
-          recovery,
-          "target_available",
-          now,
-          @observe_only_interval_seconds
-        )
+        if observe_only_timeout?(recovery, now) do
+          settle_observe_only_exhausted!(recovery, now)
+        else
+          persist_recovery_observation(
+            recovery,
+            "target_available",
+            now,
+            @observe_only_interval_seconds
+          )
+        end
 
       _available_missing_or_empty ->
         reserve_and_dispatch_recovery(recovery, target, now)
@@ -778,15 +783,20 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   end
 
   defp resume_codex_recovery(%{recovery_mode: :observe_only} = recovery, now) do
-    if fresh_usable_quota_after_dispatch?(recovery, now) do
-      settle_recovered_applied(recovery, "reset", nil, now)
-    else
-      persist_recovery_observation(
-        recovery,
-        "quota_unresolved",
-        now,
-        @observe_only_interval_seconds
-      )
+    cond do
+      fresh_usable_quota_after_dispatch?(recovery, now) ->
+        settle_recovered_applied(recovery, "reset", nil, now)
+
+      observe_only_timeout?(recovery, now) ->
+        settle_observe_only_exhausted!(recovery, now)
+
+      true ->
+        persist_recovery_observation(
+          recovery,
+          "quota_unresolved",
+          now,
+          @observe_only_interval_seconds
+        )
     end
   end
 
@@ -809,6 +819,30 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   end
 
   defp fresh_usable_quota_after_dispatch?(_recovery, _now), do: false
+
+  defp observe_only_timeout?(recovery, now) do
+    DateTime.compare(
+      now,
+      DateTime.add(recovery.started_at, @observe_only_timeout_seconds, :second)
+    ) != :lt
+  end
+
+  defp settle_observe_only_exhausted!(recovery, now) do
+    Repo.transaction(fn ->
+      identity = lock_identity!(recovery.identity.id)
+      metadata = identity.metadata || %{}
+      redemption = metadata["saved_reset_redemption"] || %{}
+      expected = %{generation: recovery.generation, attempt_id: recovery.attempt_id}
+      settle_consume_not_applied!(identity, recovery.assignment, redemption, expected, now)
+    end)
+    |> case do
+      {:ok, {:noop, code, identity, assignment}} ->
+        {:ok, noop_result(identity, assignment, code)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp reserve_and_dispatch_recovery(recovery, selected_credit_id, now) do
     case reserve_recovery_dispatch(recovery, selected_credit_id, now) do

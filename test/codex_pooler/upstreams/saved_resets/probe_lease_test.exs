@@ -635,6 +635,28 @@ defmodule CodexPooler.Upstreams.SavedResets.ProbeLeaseTest do
     assert phase(identity) == "confirmed_by_quota"
   end
 
+  test "an applied reblocked identity can claim a probe and confirm upstream" do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    attempt_id = Ecto.UUID.generate()
+
+    %{assignment: assignment, identity: identity} =
+      pending_fixture(
+        phase: "reblocked",
+        attempt_id: attempt_id,
+        consumed_at: now
+      )
+
+    probe = bound_probe(assignment, identity)
+
+    assert {:ok, :claimed} = ProbeLease.claim(identity, @generation, attempt_id, probe, now)
+    assert phase(identity) == "consumed_pending_probe"
+
+    assert {:ok, :confirmed} =
+             ProbeLease.confirm_upstream(identity, @generation, attempt_id, probe, now)
+
+    assert phase(identity) == "confirmed_by_upstream"
+  end
+
   defp legacy_probe(token, claimed_at) do
     %{"token" => token, "claimed_at" => DateTime.to_iso8601(claimed_at)}
   end

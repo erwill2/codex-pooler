@@ -227,7 +227,9 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycleTest do
                "00000000-0000-4000-8000-000000000002"
              )
 
-      for target <- Lifecycle.phases() -- ["confirmed_by_quota"] do
+      assert Lifecycle.can_transition?(from, "confirmed_by_upstream", 3, @attempt_id)
+
+      for target <- Lifecycle.phases() -- ["confirmed_by_quota", "confirmed_by_upstream"] do
         refute Lifecycle.can_transition?(from, target, 3, @attempt_id)
       end
     end
@@ -279,6 +281,67 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycleTest do
       refute Lifecycle.routeable?(redemption, @base)
       refute Lifecycle.probe_claimable?(redemption, @base)
       assert redemption["result"]["applied"] == false
+    end
+  end
+
+  describe "probe_claimable?/2" do
+    test "is true for consumed_pending_probe within the bounded window" do
+      redemption =
+        "consumed_pending_probe"
+        |> consumed()
+        |> Map.put("result", %{"code" => "reset", "applied" => true})
+
+      assert Lifecycle.probe_claimable?(redemption, DateTime.add(@base, 1, :minute))
+      refute Lifecycle.probe_claimable?(redemption, DateTime.add(@base, 16, :minute))
+
+      held = Map.put(redemption, "probe", %{"token" => "token-123"})
+      refute Lifecycle.probe_claimable?(held, DateTime.add(@base, 1, :minute))
+    end
+
+    test "is false for malformed or status-inconsistent applied records" do
+      now = DateTime.add(@base, 1, :minute)
+
+      pending =
+        "consumed_pending_probe"
+        |> consumed()
+        |> Map.put("result", %{"code" => "reset", "applied" => true})
+
+      reblocked =
+        "reblocked"
+        |> consumed(attempt_id: @attempt_id)
+        |> Map.put("result", %{"code" => "reset", "applied" => true})
+
+      refute Lifecycle.probe_claimable?(Map.put(pending, "status", "succeeded"), now)
+      refute Lifecycle.probe_claimable?(Map.delete(pending, "attempt_id"), now)
+      refute Lifecycle.probe_claimable?(Map.put(reblocked, "status", "redeeming"), now)
+      refute Lifecycle.probe_claimable?(Map.delete(reblocked, "generation"), now)
+    end
+
+    test "is true for applied reblocked within the bounded window" do
+      redemption =
+        "reblocked"
+        |> consumed(attempt_id: @attempt_id)
+        |> Map.put("result", %{"code" => "reset", "applied" => true})
+
+      assert Lifecycle.probe_claimable?(redemption, DateTime.add(@base, 1, :minute))
+      refute Lifecycle.probe_claimable?(redemption, DateTime.add(@base, 16, :minute))
+
+      held = Map.put(redemption, "probe", %{"token" => "token-123"})
+      refute Lifecycle.probe_claimable?(held, DateTime.add(@base, 1, :minute))
+    end
+
+    test "is false for unapplied reblocked or other phases" do
+      unapplied =
+        "reblocked"
+        |> consumed(attempt_id: @attempt_id)
+        |> Map.put("result", %{"code" => "nothing_to_reset", "applied" => false})
+
+      refute Lifecycle.probe_claimable?(unapplied, DateTime.add(@base, 1, :minute))
+
+      for other <-
+            ~w(consuming confirmed_by_upstream confirmed_by_quota expired consume_not_applied) do
+        refute Lifecycle.probe_claimable?(consumed(other), DateTime.add(@base, 1, :minute))
+      end
     end
   end
 end

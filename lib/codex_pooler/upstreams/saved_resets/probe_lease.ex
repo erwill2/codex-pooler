@@ -213,7 +213,14 @@ defmodule CodexPooler.Upstreams.SavedResets.ProbeLease do
   end
 
   defp write_probe!(identity, redemption, %ResetProbe{} = probe, now) do
-    updated = Map.put(redemption, "probe", persisted_v2_probe(probe, now))
+    updated =
+      redemption
+      |> Map.put("probe", persisted_v2_probe(probe, now))
+      |> Map.put("phase", RedemptionLifecycle.consumed_pending_probe())
+      |> Map.put(
+        "status",
+        RedemptionLifecycle.legacy_status_for(RedemptionLifecycle.consumed_pending_probe())
+      )
 
     persist_redemption!(identity, updated, now)
   end

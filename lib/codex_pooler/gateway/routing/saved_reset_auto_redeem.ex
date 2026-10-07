@@ -10,6 +10,7 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   alias CodexPooler.Gateway.Routing.QuotaRefresh.{Executor, Plan}
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets
@@ -62,7 +63,13 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
       when code in ["quota_exhausted", :quota_exhausted] and is_map(refresh_plan) and
              is_list(opts) do
     if all_candidates_excluded_only_by_weekly_exhaustion?(error, refresh_plan) do
-      maybe_redeem_candidate(result, refresh_plan, :blocked_weekly_exhaustion, timestamp, opts)
+      maybe_claim_probe_or_redeem_candidate(
+        result,
+        refresh_plan,
+        :blocked_weekly_exhaustion,
+        timestamp,
+        opts
+      )
     else
       result
     end
@@ -139,6 +146,58 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
       )
       when is_list(opts),
       do: result
+
+  defp maybe_claim_probe_or_redeem_candidate(result, refresh_plan, trigger, timestamp, opts) do
+    case find_probe_claimable_candidate(refresh_plan, timestamp) do
+      {assignment, identity} ->
+        case claim_probe(refresh_plan, assignment, identity) do
+          {:ok, probe} ->
+            force_probe_route(refresh_plan, assignment, identity, probe)
+
+          {:error, _reason} ->
+            maybe_redeem_candidate(result, refresh_plan, trigger, timestamp, opts)
+        end
+
+      nil ->
+        maybe_redeem_candidate(result, refresh_plan, trigger, timestamp, opts)
+    end
+  end
+
+  defp find_probe_claimable_candidate(refresh_plan, timestamp) do
+    refresh_plan
+    |> candidate_order()
+    |> Enum.find_value(&probe_claimable_candidate(&1, timestamp))
+  end
+
+  defp probe_claimable_candidate(
+         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity} = candidate,
+         timestamp
+       ) do
+    redemption = (identity.metadata || %{})["saved_reset_redemption"] || %{}
+
+    cond do
+      RedemptionLifecycle.probe_claimable?(redemption, timestamp) ->
+        candidate
+
+      true ->
+        case Repo.get(UpstreamIdentity, identity.id) do
+          %UpstreamIdentity{metadata: %{"saved_reset_redemption" => db_redemption}} =
+              fresh_identity ->
+            if RedemptionLifecycle.probe_claimable?(db_redemption, timestamp) do
+              {elem(candidate, 0), fresh_identity}
+            else
+              nil
+            end
+
+          _other ->
+            nil
+        end
+    end
+  rescue
+    _exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] -> nil
+  end
+
+  defp probe_claimable_candidate(_candidate, _timestamp), do: nil
 
   defp maybe_redeem_candidate(result, refresh_plan, trigger, timestamp, opts) do
     refresh_plan
@@ -336,9 +395,9 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   end
 
   defp reset_probe(%{filter_input: %{request_options: request_options}}),
-    do: request_options.routing.reset_probe
+    do: request_options.routing.reset_probe || ResetProbe.new()
 
-  defp reset_probe(_refresh_plan), do: nil
+  defp reset_probe(_refresh_plan), do: ResetProbe.new()
 
   defp effective_model(%{filter_input: %{request_options: request_options, model: model}}),
     do: request_options.routing.effective_model || model.exposed_model_id
