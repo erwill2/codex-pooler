@@ -1300,7 +1300,7 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       assert is_binary(redemption["probe"]["token"])
     end
 
-    test "a recent latched candidate prevents a sibling auto-redeem" do
+    test "a recent latched candidate gets the guarded probe and prevents a sibling auto-redeem" do
       {:ok, latched_upstream} = auto_redeem_fake()
       {:ok, sibling_upstream} = auto_redeem_fake()
 
@@ -1332,14 +1332,22 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
           "latched-skip"
         )
 
-      assert {:error, %{code: "quota_exhausted"}} =
+      assert {:ok, [{routed_assignment, routed_identity}], filtered_options} =
                RouteFiltering.filter_candidates(filter_input)
+
+      assert routed_assignment.id == latched_assignment.id
+      assert routed_identity.id == latched_identity.id
+      assert filtered_options.routing.quota_decision["routing_state"] == "reset_probe"
 
       assert [] = FakeUpstream.requests(latched_upstream)
       assert [] = FakeUpstream.requests(sibling_upstream)
 
       persisted = Repo.reload!(latched_identity)
-      assert get_in(persisted.metadata, ["saved_reset_redemption", "phase"]) == "reblocked"
+
+      assert get_in(persisted.metadata, ["saved_reset_redemption", "phase"]) ==
+               "consumed_pending_probe"
+
+      assert is_binary(get_in(persisted.metadata, ["saved_reset_redemption", "probe", "token"]))
 
       sibling_persisted = Repo.reload!(sibling_identity)
       refute get_in(sibling_persisted.metadata, ["saved_reset_redemption"])
@@ -2340,6 +2348,98 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
              ) == 1
 
       assert Enum.any?(FakeUpstream.requests(upstream), &(&1.path == "/api/codex/usage"))
+    end
+
+    test "an unconfirmed redeemed reset routes as a guarded probe instead of blocking with quota_exhausted" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      attempt_id = Ecto.UUID.generate()
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      redeemed =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: %{
+            "saved_reset_redemption" => %{
+              "status" => "redeeming",
+              "phase" => "consumed_pending_probe",
+              "attempt_id" => attempt_id,
+              "generation" => 1,
+              "consumed_at" => DateTime.to_iso8601(now),
+              "deadline_at" => now |> DateTime.add(15, :minute) |> DateTime.to_iso8601(),
+              "result" => %{"code" => "reset", "applied" => true}
+            }
+          }
+        })
+
+      upsert_weekly_exhausted_quota!(redeemed.identity)
+
+      filter_input =
+        filter_input(
+          pool,
+          api_key,
+          [{redeemed.assignment, redeemed.identity}],
+          "redeemed-unconfirmed-probe-route"
+        )
+
+      route_state = route_state(filter_input)
+
+      assert {:ok, [claimed_candidate], decision, filtered_route_state} =
+               RouteFiltering.filter_candidates_with_route_state(filter_input, route_state)
+
+      assert {redeemed.assignment.id, redeemed.identity.id} ==
+               candidate_ids_pair(claimed_candidate)
+
+      assert decision.routing.quota_decision["routing_state"] == "reset_probe"
+      assert decision.routing.quota_decision["reset_probe_candidate_count"] == 1
+      assert %ResetProbe{} = probe = decision.routing.reset_probe
+      assert probe == filtered_route_state.reset_probe
+      assert probe.pool_upstream_assignment_id == redeemed.assignment.id
+      assert probe.upstream_identity_id == redeemed.identity.id
+    end
+
+    test "an applied reblocked reset routes as a guarded probe instead of blocking with quota_exhausted" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      attempt_id = Ecto.UUID.generate()
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      redeemed =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: %{
+            "saved_reset_redemption" => %{
+              "status" => "failed",
+              "phase" => "reblocked",
+              "attempt_id" => attempt_id,
+              "generation" => 1,
+              "consumed_at" => DateTime.to_iso8601(now),
+              "deadline_at" => now |> DateTime.add(15, :minute) |> DateTime.to_iso8601(),
+              "result" => %{"code" => "reset", "applied" => true}
+            }
+          }
+        })
+
+      upsert_weekly_exhausted_quota!(redeemed.identity)
+
+      filter_input =
+        filter_input(
+          pool,
+          api_key,
+          [{redeemed.assignment, redeemed.identity}],
+          "reblocked-applied-probe-route"
+        )
+
+      route_state = route_state(filter_input)
+
+      assert {:ok, [claimed_candidate], decision, filtered_route_state} =
+               RouteFiltering.filter_candidates_with_route_state(filter_input, route_state)
+
+      assert {redeemed.assignment.id, redeemed.identity.id} ==
+               candidate_ids_pair(claimed_candidate)
+
+      assert decision.routing.quota_decision["routing_state"] == "reset_probe"
+      assert decision.routing.quota_decision["reset_probe_candidate_count"] == 1
+      assert %ResetProbe{} = probe = decision.routing.reset_probe
+      assert probe == filtered_route_state.reset_probe
+      assert probe.pool_upstream_assignment_id == redeemed.assignment.id
+      assert probe.upstream_identity_id == redeemed.identity.id
     end
 
     @tag :saved_reset_expiry_ownership

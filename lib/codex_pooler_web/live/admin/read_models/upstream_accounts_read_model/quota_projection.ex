@@ -161,10 +161,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
       when is_list(windows) do
     additional_limits =
       windows
-      |> Enum.reject(
-        &(account_quota_window?(&1) or
-            Evidence.current_freshness_state(&1, snapshot_at) == "stale")
-      )
+      |> Enum.reject(&reject_additional_quota_window?(&1, snapshot_at))
       |> Enum.filter(&informative_additional_quota_window?/1)
       |> Enum.sort_by(&quota_limit_sort_key/1)
       |> quota_limit_presentations()
@@ -267,6 +264,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
        do: true
 
   defp account_quota_window?(%Quota.AccountQuotaWindow{}), do: false
+
+  defp reject_additional_quota_window?(%Quota.AccountQuotaWindow{} = window, snapshot_at) do
+    account_quota_window?(window) or
+      (Evidence.current_freshness_state(window, snapshot_at) == "stale" and
+         not reserve_window?(window))
+  end
+
+  defp reject_additional_quota_window?(_window, _snapshot_at), do: true
+
+  defp reserve_window?(%Quota.AccountQuotaWindow{} = window) do
+    window.quota_key in ["gpt_reserve", "gpt-reserve"] or
+      window.model in ["gpt-reserve", "gpt_reserve"] or
+      (window.quota_family == "codex_model" and window.quota_key == "gpt_reserve")
+  end
 
   defp informative_additional_quota_window?(%Quota.AccountQuotaWindow{} = window) do
     not is_nil(quota_remaining_percent(window)) or not is_nil(quota_count_label(window))
@@ -476,6 +487,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   defp humanize_quota_label("codex_other"), do: "GPT-5.3-Codex-Spark"
   defp humanize_quota_label("gpt_5_3_codex_spark"), do: "GPT-5.3-Codex-Spark"
   defp humanize_quota_label("gpt-5.3-codex-spark"), do: "GPT-5.3-Codex-Spark"
+  defp humanize_quota_label("gpt_6_astra"), do: "GPT-6-Astra"
+  defp humanize_quota_label("gpt-6-astra"), do: "GPT-6-Astra"
 
   defp humanize_quota_label(label) when is_binary(label) do
     label

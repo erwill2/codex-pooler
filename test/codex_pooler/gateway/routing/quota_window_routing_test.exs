@@ -988,6 +988,72 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
                )
     end
 
+    test "fresh account usage does not supersede stale runtime evidence for another quota group" do
+      stale_observed_at =
+        DateTime.add(@observed_at, -Evidence.freshness_ttl_seconds() - 1, :second)
+
+      assert %{
+               eligible?: false,
+               routing_state: :blocked,
+               exclusions: [%{quota_key: "codex_spark", reason_codes: ["not_fresh"]}]
+             } =
+               Windows.routing_quota_eligibility_from_windows(
+                 [
+                   account_primary_window(observed_at: @observed_at),
+                   model_window(
+                     source: "codex_response_headers",
+                     freshness_state: "stale",
+                     observed_at: stale_observed_at
+                   )
+                 ],
+                 at: @observed_at,
+                 model: "sample-codex-spark",
+                 requested_model: "sample-codex-spark",
+                 upstream_model: "sample-codex-spark-upstream"
+               )
+    end
+
+    test "superseded canonical runtime evidence is classified as runtime in telemetry" do
+      handler_id = "routing-runtime-source-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :quota, :cycle, :decision],
+          fn event, measurements, metadata, _config ->
+            send(test_pid, {event, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      stale_observed_at =
+        DateTime.add(@observed_at, -Evidence.freshness_ttl_seconds() - 1, :second)
+
+      stale_runtime =
+        account_primary_window(
+          source: "codex_response_headers",
+          freshness_state: "stale",
+          observed_at: stale_observed_at
+        )
+
+      fresh_usage =
+        account_primary_window(
+          source: "codex_usage_api",
+          observed_at: @observed_at
+        )
+
+      Windows.reject_superseded_primary_windows([stale_runtime, fresh_usage], @observed_at)
+
+      assert_receive {
+        [:codex_pooler, :quota, :cycle, :decision],
+        %{count: 1},
+        %{decision: :superseded_primary_rejected, source: "runtime"}
+      }
+    end
+
     test "superseded 5h primary does not fabricate eligibility when weekly evidence is stale and imprecise" do
       assert %{
                eligible?: false,
@@ -1239,6 +1305,70 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
         assert "exhausted" in reason_codes
       end
     end
+
+    test "gpt-reserve bypasses exhausted primary 5h burst window to route on weekly reserve" do
+      windows = [
+        account_primary_window(used_percent: Decimal.new("100")),
+        reserve_window(used_percent: Decimal.new("0"))
+      ]
+
+      assert %{eligible?: true, routing_state: :weekly_only_probe} =
+               Windows.routing_quota_eligibility_from_windows(
+                 windows,
+                 at: @observed_at,
+                 model: "gpt-5",
+                 requested_model: "gpt-5"
+               )
+
+
+      assert %{eligible?: true, routing_state: :weekly_only_probe} =
+               Windows.routing_quota_eligibility_from_windows(
+                 windows,
+                 at: @observed_at,
+                 model: "gpt-reserve",
+                 requested_model: "gpt-reserve"
+               )
+    end
+
+    test "gpt-reserve bypasses account availability blocked state when reserve window is usable" do
+      windows = [
+        account_primary_window(used_percent: Decimal.new("100")),
+        account_secondary_window(used_percent: Decimal.new("100")),
+        reserve_window(used_percent: Decimal.new("3"))
+      ]
+
+      snapshot = routing_snapshot(:blocked, windows)
+
+      assert %{eligible?: false, routing_state: :blocked} =
+               Windows.routing_quota_eligibility_from_snapshot(
+                 snapshot,
+                 model: "gpt-5",
+                 requested_model: "gpt-5"
+               )
+
+      assert %{eligible?: true, routing_state: :weekly_only_probe} =
+               Windows.routing_quota_eligibility_from_snapshot(
+                 snapshot,
+                 model: "gpt-reserve",
+                 requested_model: "gpt-reserve"
+               )
+    end
+
+    test "Astra remains on ordinary account quota and does not consume the hidden reserve meter" do
+      windows = [
+        account_primary_window(used_percent: Decimal.new("100")),
+        reserve_window(used_percent: Decimal.new("0"))
+      ]
+
+      assert %{eligible?: false, routing_state: :blocked} =
+               Windows.routing_quota_eligibility_from_windows(
+                 windows,
+                 at: @observed_at,
+                 model: "gpt-6-astra",
+                 requested_model: "gpt-6-astra",
+                 upstream_model: "gpt-6-astra"
+               )
+    end
   end
 
   defp account_primary_window(attrs \\ []) do
@@ -1279,6 +1409,21 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
 
   defp exhausted_spark_window do
     model_window(used_percent: Decimal.new("100"))
+  end
+
+  defp reserve_window(attrs) do
+    model_window(
+      Keyword.merge(
+        [
+          quota_key: "gpt_reserve",
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          model: "gpt-reserve",
+          upstream_model: nil
+        ],
+        attrs
+      )
+    )
   end
 
   defp account_secondary_window(attrs) do

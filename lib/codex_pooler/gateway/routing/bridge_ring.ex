@@ -120,6 +120,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       |> apply_prompt_cache_locality(prompt_cache_locality)
       |> apply_affinity(affinity)
       |> apply_codex_session_preference(request_options)
+      |> apply_reserve_mode_tier(model, request_options, route_state)
       |> apply_demotions(demotions)
       |> apply_windowless_tier(model, route_state)
 
@@ -582,6 +583,47 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       end)
 
     active ++ demoted
+  end
+
+  defp apply_reserve_mode_tier(
+         candidates,
+         %Model{} = model,
+         %RequestOptions{} = request_options,
+         %RouteState{} = route_state
+       ) do
+    if explicit_reserve_request?(request_options) do
+      candidates
+    else
+      {reserve, standard} =
+        Enum.split_with(candidates, fn {_assignment, identity} ->
+          candidate_in_reserve_mode?(identity, model, route_state)
+        end)
+
+      standard ++ reserve
+    end
+  end
+
+  defp apply_reserve_mode_tier(candidates, %Model{}, _request_options, nil), do: candidates
+
+  defp explicit_reserve_request?(%RequestOptions{} = request_options) do
+    request_options.routing.reserve_mode? == true or
+      request_options.routing.requested_model in ["gpt-reserve", "gpt_reserve"]
+  end
+
+  defp candidate_in_reserve_mode?(identity, %Model{} = model, %RouteState{} = route_state) do
+    snapshot = RouteState.quota_snapshot_for_identity(route_state, identity)
+
+    if snapshot do
+      eligibility =
+        QuotaWindows.routing_quota_eligibility_from_snapshot(
+          snapshot,
+          QuotaEligibility.quota_scope_opts(model)
+        )
+
+      match?(%{selection: %{reserve_mode?: true}}, eligibility)
+    else
+      false
+    end
   end
 
   defp apply_windowless_tier(candidates, %Model{} = model, %RouteState{} = route_state) do

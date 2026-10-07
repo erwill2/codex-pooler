@@ -260,6 +260,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
         />
       </span>
       <span class="flex h-5 min-w-0 items-center gap-2 text-base-content/45">
+        <%= if get_in(@request_log.metadata, ["routing", "quota_lane"]) == "gpt_reserve" do %>
+          <span data-role="quota-lane" class="truncate text-warning" title="quota lane">GPT-Reserve</span>
+        <% end %>
         <span
           data-role="pool-name"
           class="flex min-w-0 items-center gap-1.5"

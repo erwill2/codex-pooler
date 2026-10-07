@@ -33,7 +33,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
     :model_serving_mode_configured,
     :model_serving_mode,
     :model_serving_mode_source,
-    :use_responses_lite?
+    :use_responses_lite?,
+    :reserve_mode?,
+    :pool_upstream_assignment_id
   ]
 
   # Bounded canonical partition filtering evidence. Counts plus a short digest
@@ -66,7 +68,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
           model_serving_mode_configured: configured_model_serving_mode() | nil,
           model_serving_mode: effective_model_serving_mode() | nil,
           model_serving_mode_source: model_serving_mode_source() | nil,
-          use_responses_lite?: boolean()
+          use_responses_lite?: boolean(),
+          reserve_mode?: boolean() | nil,
+          pool_upstream_assignment_id: Ecto.UUID.t() | String.t() | nil
         }
 
   @spec accounting_quota_decision(t()) :: map() | nil

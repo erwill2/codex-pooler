@@ -1,7 +1,7 @@
 defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   @moduledoc false
 
-  alias CodexPooler.Quotas.{Evidence, WindowClassifier}
+  alias CodexPooler.Quotas.{Evidence, ModelWeeklyResetSemantics, WindowClassifier}
   alias CodexPooler.Upstreams.Quota
 
   alias CodexPooler.Upstreams.Quota.{
@@ -17,23 +17,35 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   def selection_data_from_windows(windows, opts \\ []) when is_list(windows) do
     timestamp = Keyword.get(opts, :at, now())
 
-    routing_windows =
-      windows
-      |> Enum.filter(&window_in_model_scope?(&1, opts))
-      |> reject_superseded_primary_windows(timestamp)
-      |> WindowSelector.logical_windows(timestamp)
-      |> select_current_account_primary_variant(timestamp)
+    if reserve_model_request?(opts) do
+      selection_data_for_reserve(windows, timestamp)
+    else
+      routing_windows =
+        windows
+        |> Enum.filter(&window_in_model_scope?(&1, opts))
+        |> reject_superseded_primary_windows(timestamp)
+        |> WindowSelector.logical_windows(timestamp)
+        |> select_current_account_primary_variant(timestamp)
 
-    %{
-      windows: windows,
-      routing_windows: routing_windows,
-      primary: WindowSelector.best_account_primary_variant(routing_windows, timestamp),
-      secondary:
-        WindowSelector.best_account_window(routing_windows, :weekly_secondary, timestamp),
-      fresh_windows: Enum.filter(routing_windows, &fresh_window?(&1, timestamp)),
-      blocked_windows: Enum.reject(routing_windows, &usable_window?(&1, timestamp)),
-      usable?: Enum.any?(routing_windows, &usable_window?(&1, timestamp))
-    }
+      ordinary = %{
+        windows: windows,
+        routing_windows: routing_windows,
+        primary: WindowSelector.best_account_primary_variant(routing_windows, timestamp),
+        secondary:
+          WindowSelector.best_account_window(routing_windows, :weekly_secondary, timestamp),
+        fresh_windows: Enum.filter(routing_windows, &fresh_window?(&1, timestamp)),
+        blocked_windows: Enum.reject(routing_windows, &usable_window?(&1, timestamp)),
+        usable?: Enum.any?(routing_windows, &usable_window?(&1, timestamp))
+      }
+
+      if not routing_quota_eligible?(routing_quota_state(ordinary, timestamp)) and
+           luna_reserve_supported?(opts) do
+        reserve = selection_data_for_reserve(windows, timestamp)
+        if reserve.usable?, do: reserve, else: ordinary
+      else
+        ordinary
+      end
+    end
   end
 
   @spec eligibility_from_windows([Quota.AccountQuotaWindow.t()], keyword()) :: map()
@@ -51,11 +63,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     ordinary = eligibility_from_windows(raw_windows, opts)
 
     cond do
-      AccountAvailabilityStore.blocked?(
-        snapshot.availability,
-        snapshot.credential_epoch,
-        snapshot.as_of
-      ) ->
+      not (reserve_model_request?(opts) or ordinary.selection[:reserve_mode?] == true) and
+          AccountAvailabilityStore.blocked?(
+            snapshot.availability,
+            snapshot.credential_epoch,
+            snapshot.as_of
+          ) ->
         availability_exclusion(:blocked, ordinary.selection)
 
       ordinary.eligible? ->
@@ -175,7 +188,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
           [Quota.AccountQuotaWindow.t()]
   def reject_superseded_primary_windows(windows, timestamp \\ now()) when is_list(windows) do
     Enum.reject(windows, fn window ->
-      if superseded_primary_window?(window, windows, timestamp) do
+      if superseded_window?(window, windows, timestamp) do
         :telemetry.execute(
           [:codex_pooler, :quota, :cycle, :decision],
           %{count: 1},
@@ -202,10 +215,22 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   defp source_class(%Quota.AccountQuotaWindow{source: "codex_usage_api"}), do: "provider_usage"
 
   defp source_class(%Quota.AccountQuotaWindow{source: source})
-       when source in ["runtime", "rate_limit", "response_header"],
+       when source in [
+              "runtime",
+              "rate_limit",
+              "response_header",
+              "codex_response_headers",
+              "codex_rate_limit_event",
+              "codex_rate_limit_error"
+            ],
        do: "runtime"
 
   defp source_class(%Quota.AccountQuotaWindow{}), do: "unknown"
+
+  defp superseded_window?(window, windows, timestamp) do
+    superseded_primary_window?(window, windows, timestamp) or
+      superseded_runtime_window?(window, windows, timestamp)
+  end
 
   defp superseded_primary_window?(
          %Quota.AccountQuotaWindow{window_kind: "primary"} = window,
@@ -217,6 +242,27 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   end
 
   defp superseded_primary_window?(_window, _windows, _timestamp), do: false
+
+  defp superseded_runtime_window?(
+         %Quota.AccountQuotaWindow{source: source} = window,
+         windows,
+         timestamp
+       )
+       when source in [
+              "codex_response_headers",
+              "codex_rate_limit_event",
+              "codex_rate_limit_error"
+            ] do
+    (not fresh_window?(window, timestamp) or Evidence.expired?(window, timestamp)) and
+      Enum.any?(windows, fn other ->
+        quota_group_key(other) == quota_group_key(window) and
+          other.source == "codex_usage_api" and fresh_window?(other, timestamp) and
+          match?(%DateTime{}, other.observed_at) and match?(%DateTime{}, window.observed_at) and
+          DateTime.compare(other.observed_at, window.observed_at) == :gt
+      end)
+  end
+
+  defp superseded_runtime_window?(_window, _windows, _timestamp), do: false
 
   defp newer_quota_group_sibling?(sibling, window, timestamp) do
     sibling != window and quota_group_key(sibling) == quota_group_key(window) and
@@ -296,6 +342,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
       reasons -> Enum.reverse(reasons)
     end
   end
+
+  defp routing_quota_state(%{reserve_mode?: true, usable?: true}, _timestamp),
+    do: :weekly_only_probe
+
+  defp routing_quota_state(%{reserve_mode?: true}, _timestamp),
+    do: :blocked
 
   defp routing_quota_state(
          %{primary: %Quota.AccountQuotaWindow{}, blocked_windows: []},
@@ -488,6 +540,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     end
   end
 
+  defp quota_routing_warnings(%{reserve_mode?: true}, _timestamp, _state), do: []
+
   defp quota_routing_warnings(selection, _timestamp, :weekly_only_probe) do
     secondary = selection.secondary
 
@@ -511,6 +565,23 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   defp quota_routing_warnings(_selection, _timestamp, _state), do: []
 
   defp quota_routing_exclusions(_selection, _timestamp, true), do: []
+
+  defp quota_routing_exclusions(%{reserve_mode?: true, secondary: nil}, _timestamp, false) do
+    [
+      %{
+        code: "quota_reserve_missing",
+        message: "upstream account does not have gpt-reserve quota"
+      }
+    ]
+  end
+
+  defp quota_routing_exclusions(
+         %{reserve_mode?: true, secondary: %Quota.AccountQuotaWindow{} = secondary},
+         timestamp,
+         false
+       ) do
+    [quota_exhausted_exclusion(secondary, timestamp)]
+  end
 
   defp quota_routing_exclusions(%{windows: []}, _timestamp, false) do
     [
@@ -592,15 +663,19 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
          %Quota.AccountQuotaWindow{quota_scope: "model"} = window,
          opts
        ) do
-    case model_candidates(opts) do
-      [] ->
-        true
+    if reserve_model_request?(opts) do
+      reserve_window?(window)
+    else
+      case model_candidates(opts) do
+        [] ->
+          true
 
-      candidates ->
-        Enum.any?(candidates, fn candidate ->
-          same_optional_token?(candidate, window.model) or
-            same_optional_token?(candidate, window.upstream_model)
-        end)
+        candidates ->
+          Enum.any?(candidates, fn candidate ->
+            same_optional_token?(candidate, window.model) or
+              same_optional_token?(candidate, window.upstream_model)
+          end)
+      end
     end
   end
 
@@ -608,13 +683,113 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
          %Quota.AccountQuotaWindow{quota_scope: "upstream_model"} = window,
          opts
        ) do
-    case upstream_model_candidates(opts) do
-      [] -> true
-      candidates -> Enum.any?(candidates, &same_optional_token?(&1, window.upstream_model))
+    if reserve_model_request?(opts) do
+      false
+    else
+      case upstream_model_candidates(opts) do
+        [] -> true
+        candidates -> Enum.any?(candidates, &same_optional_token?(&1, window.upstream_model))
+      end
     end
   end
 
-  defp window_in_requested_scope?(%Quota.AccountQuotaWindow{}, _opts), do: true
+  defp window_in_requested_scope?(%Quota.AccountQuotaWindow{} = window, opts) do
+    if reserve_model_request?(opts) do
+      reserve_window?(window)
+    else
+      true
+    end
+  end
+
+  defp selection_data_for_reserve(windows, timestamp) do
+    reserve_windows =
+      windows
+      |> Enum.filter(&reserve_window?/1)
+      |> WindowSelector.logical_windows(timestamp)
+
+    best_reserve =
+      reserve_windows
+      |> Enum.sort_by(
+        fn w ->
+          {
+            if(fresh_window?(w, timestamp), do: 1, else: 0),
+            if(reserve_usable_window?(w, timestamp), do: 1, else: 0),
+            DateTime.to_unix(w.reset_at || ~U[1970-01-01 00:00:00Z])
+          }
+        end,
+        :desc
+      )
+      |> List.first()
+
+    usable? = best_reserve != nil and reserve_usable_window?(best_reserve, timestamp)
+
+    blocked_windows =
+      case best_reserve do
+        nil -> []
+        w -> if usable?, do: [], else: [w]
+      end
+
+    %{
+      windows: windows,
+      routing_windows: if(best_reserve, do: [best_reserve], else: []),
+      primary: nil,
+      secondary: best_reserve,
+      fresh_windows:
+        if(best_reserve && fresh_window?(best_reserve, timestamp), do: [best_reserve], else: []),
+      blocked_windows: blocked_windows,
+      usable?: usable?,
+      reserve_mode?: true
+    }
+  end
+
+  defp reserve_usable_window?(
+         %Quota.AccountQuotaWindow{source_precision: source_precision} = window,
+         timestamp
+       )
+       when source_precision in ["observed", "authoritative"] do
+    Evidence.reset_bearing?(window) and not exhausted?(window) and
+      reserve_window_valid_timing?(window, timestamp)
+  end
+
+  defp reserve_usable_window?(%Quota.AccountQuotaWindow{} = window, timestamp) do
+    not exhausted?(window) and reserve_window_valid_timing?(window, timestamp)
+  end
+
+  defp reserve_window_valid_timing?(window, timestamp) do
+    not Evidence.expired?(window, timestamp) or
+      ModelWeeklyResetSemantics.classify(window) == :floating or
+      zero_used_reserve_window?(window)
+  end
+
+  defp zero_used_reserve_window?(%Quota.AccountQuotaWindow{used_percent: %Decimal{} = percent}) do
+    Decimal.compare(percent, Decimal.new(0)) == :eq
+  end
+
+  defp zero_used_reserve_window?(_), do: false
+
+  defp reserve_window?(%Quota.AccountQuotaWindow{} = window) do
+    window.quota_key in ["gpt_reserve", "gpt-reserve"] or
+      window.model in ["gpt-reserve", "gpt_reserve"] or
+      (window.quota_family == "codex_model" and window.quota_key == "gpt_reserve")
+  end
+
+  defp reserve_window?(_), do: false
+
+  defp reserve_model_request?(opts) do
+    Keyword.get(opts, :reserve_mode?, false) or
+      Enum.any?(model_candidates(opts), &(&1 in ["gpt-reserve", "gpt_reserve"]))
+  end
+
+  defp luna_reserve_supported?(opts) do
+    Keyword.get(opts, :reserve_mode?, false) or
+      Keyword.get(opts, :reserve_fallback?, false) or
+      (model_candidates(opts) != [] and not astra_model_request?(opts))
+  end
+
+  defp astra_model_request?(opts) do
+    Enum.any?(model_candidates(opts), &(&1 in ["gpt-6-astra", "astra"]))
+  end
+
 
   defp model_candidates(opts) do
     opts

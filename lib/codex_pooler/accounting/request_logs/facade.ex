@@ -174,7 +174,11 @@ defmodule CodexPooler.Accounting.RequestLogs do
        ) do
     request_attempts = Map.get(attempts, request.id, [])
     turn = Map.get(turns_by_request, request.id)
-    metadata = safe_request_log_metadata(request.request_metadata || %{}, request_attempts)
+    metadata =
+      request.request_metadata
+      |> Kernel.||(%{})
+      |> safe_request_log_metadata(request_attempts)
+      |> put_attempt_quota_lane(request_attempts)
     reasoning_metadata = latest_attempt_reasoning_metadata(request_attempts)
 
     %{
@@ -231,6 +235,15 @@ defmodule CodexPooler.Accounting.RequestLogs do
     |> Accounting.sanitize_metadata()
     |> PayloadCompressionProjection.normalize_metadata(attempts)
     |> control_plane_metadata_only()
+  end
+
+  defp put_attempt_quota_lane(metadata, attempts) do
+    case Enum.find_value(attempts, fn attempt ->
+           get_in(attempt.response_metadata || %{}, ["routing", "quota_lane"])
+         end) do
+      "gpt_reserve" -> put_in(metadata, ["routing", "quota_lane"], "gpt_reserve")
+      _ -> metadata
+    end
   end
 
   defp control_plane_metadata_only(%{"routing" => %{"route_class" => route_class}} = metadata)

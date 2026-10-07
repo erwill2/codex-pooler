@@ -156,7 +156,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
     %{}
     |> Map.put(:visible_candidates_by_model_id, candidates_by_model_id(models, candidates))
-    |> Map.put(:candidates_by_model_id, routable_candidates_by_model_id(models, candidates))
+    |> Map.put(
+      :candidates_by_model_id,
+      routable_candidates_by_model_id(models, candidates, timestamp)
+    )
     |> Map.put(:hydrated_at, timestamp)
     |> then(fn hydration ->
       Map.put(hydration, :visible_models, visible_models(models, hydration))
@@ -442,7 +445,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     )
   end
 
-  defp list_visible_candidate_rows(models, timestamp) when is_list(models) do
+  defp list_visible_candidate_rows(models, _timestamp) when is_list(models) do
     assignment_ids = models |> Enum.flat_map(&source_assignment_ids/1) |> Enum.uniq()
 
     if assignment_ids == [] do
@@ -459,8 +462,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
             assignment.id in ^assignment_ids and assignment.status == ^assignment_active_status and
               assignment.eligibility_status == ^assignment_eligible_status and
               assignment.health_status not in ^@health_excluded and
-              identity.status in ^@visible_identity_statuses and
-              (is_nil(assignment.cooldown_until) or assignment.cooldown_until <= ^timestamp),
+              identity.status in ^@visible_identity_statuses,
           order_by: [asc: assignment.created_at, asc: assignment.id],
           select: {assignment, identity}
       )
@@ -480,14 +482,15 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     end)
   end
 
-  defp routable_candidates_by_model_id(models, candidates) do
+  defp routable_candidates_by_model_id(models, candidates, timestamp) do
     active_health_status = PoolUpstreamAssignment.active_health_status()
 
     candidates_by_model_id(models, candidates)
     |> Map.new(fn {model_id, model_candidates} ->
       {model_id,
        Enum.filter(model_candidates, fn {assignment, _identity} ->
-         assignment.health_status == active_health_status
+         assignment.health_status == active_health_status and
+           cooldown_expired?(assignment.cooldown_until, timestamp)
        end)}
     end)
   end
@@ -503,6 +506,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp routable_candidates_by_source_ids(%{} = hydration, %Model{} = model) do
     active_health_status = PoolUpstreamAssignment.active_health_status()
+    timestamp = Map.get(hydration, :hydrated_at, DateTime.utc_now())
     source_ids = MapSet.new(source_assignment_ids(model))
 
     hydration
@@ -512,13 +516,20 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     |> Enum.uniq_by(fn {assignment, _identity} -> assignment.id end)
     |> Enum.filter(fn {assignment, _identity} ->
       assignment.health_status == active_health_status and
+        cooldown_expired?(assignment.cooldown_until, timestamp) and
         MapSet.member?(source_ids, assignment.id)
     end)
   end
 
+  defp cooldown_expired?(nil, _timestamp), do: true
+
+  defp cooldown_expired?(%DateTime{} = cooldown_until, %DateTime{} = timestamp) do
+    DateTime.compare(cooldown_until, timestamp) != :gt
+  end
+
   defp visible_models(models, %{visible_candidates_by_model_id: visible_candidates}) do
     Enum.filter(models, fn %Model{} = model ->
-      Map.get(visible_candidates, model.id, []) != []
+      source_assignment_ids(model) != [] or Map.get(visible_candidates, model.id, []) != []
     end)
   end
 

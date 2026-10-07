@@ -439,13 +439,15 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   defp stale_quota_refreshable_reason?(_reason), do: false
 
   defp stale_quota_refreshable_reason_codes?(reason_codes) when is_list(reason_codes) do
-    "not_fresh" in reason_codes and
-      not Enum.any?(reason_codes, &(&1 in ["reset_missing", "exhausted"]))
+    ("not_fresh" in reason_codes or "expired" in reason_codes) and
+      ("expired" in reason_codes or not Enum.any?(reason_codes, &(&1 in ["reset_missing", "exhausted"])))
   end
 
   defp stale_quota_refreshable_reason_codes?(_reason_codes), do: false
 
-  defp quota_scope_opts(%Model{} = model) do
+  @doc false
+  @spec quota_scope_opts(Model.t()) :: keyword()
+  def quota_scope_opts(%Model{} = model) do
     [
       model: model.exposed_model_id,
       requested_model: model.exposed_model_id,
@@ -468,14 +470,32 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
     reasons = Enum.flat_map(exclusions, &Map.get(&1, :reasons, []))
 
     if Enum.any?(reasons, &quota_exhaustion_reason?/1) do
+      count = length(exclusions)
+
+      message =
+        if count == 1 do
+          "upstream account in pool is quota exhausted (0 of 1 account available until reset)"
+        else
+          "all upstream accounts in pool are quota exhausted (0 of #{count} accounts available until reset)"
+        end
+
       %{
         code: "quota_exhausted",
-        message: "upstream quota is exhausted until its reset time"
+        message: message
       }
     else
+      count = length(exclusions)
+
+      message =
+        if count > 0 do
+          "no upstream account in pool has usable reset-bearing quota evidence for this model (0 of #{count} accounts available)"
+        else
+          "no upstream account has fresh reset-bearing quota evidence for this model"
+        end
+
       %{
         code: "quota_evidence_unavailable",
-        message: "no upstream account has fresh reset-bearing quota evidence for this model"
+        message: message
       }
     end
   end

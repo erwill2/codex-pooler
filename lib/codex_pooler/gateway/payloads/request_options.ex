@@ -166,6 +166,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :routing_attempt_metadata,
     :routing_circuit_state,
     :use_responses_lite?,
+    :reserve_mode?,
     :session_header,
     :session_header_source,
     :session_key,
@@ -939,7 +940,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       model_serving_mode_configured: Map.get(opts, :model_serving_mode_configured),
       model_serving_mode: Map.get(opts, :model_serving_mode),
       model_serving_mode_source: Map.get(opts, :model_serving_mode_source),
-      use_responses_lite?: Map.get(opts, :use_responses_lite?, false) == true
+      use_responses_lite?: Map.get(opts, :use_responses_lite?, false) == true,
+      reserve_mode?: Map.get(opts, :reserve_mode?, false) == true
     }
     |> validate_routing_model_serving_mode!()
   end

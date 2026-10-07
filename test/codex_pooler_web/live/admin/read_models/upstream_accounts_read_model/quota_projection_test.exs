@@ -1408,6 +1408,58 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     refute Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
   end
 
+  @tag :quota_projection
+  test "quota_limit_rows preserves stale gpt-reserve window as historical while rejecting other stale windows" do
+    stale_reset = DateTime.add(@snapshot_at, -1, :day)
+    observed_at = DateTime.add(@snapshot_at, -2, :day)
+
+    stale_reserve =
+      account_window(
+        quota_scope: "model",
+        quota_family: "codex_model",
+        quota_key: "gpt_reserve",
+        model: "gpt-reserve",
+        display_label: "GPT-Reserve",
+        window_kind: "primary",
+        window_minutes: 300,
+        used_percent: Decimal.new("0"),
+        reset_at: stale_reset,
+        observed_at: observed_at,
+        freshness_state: "stale"
+      )
+
+    stale_generic =
+      account_window(
+        quota_scope: "feature",
+        quota_family: "custom",
+        quota_key: "ephemeral_meter",
+        display_label: "Ephemeral Meter",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("50"),
+        reset_at: stale_reset,
+        observed_at: observed_at,
+        freshness_state: "stale"
+      )
+
+    windows = [stale_reserve, stale_generic]
+
+    rows =
+      QuotaProjection.quota_limit_rows(
+        windows,
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    additional = Enum.drop(rows, 3)
+
+    assert length(additional) == 1
+    [reserve_row] = additional
+    assert reserve_row.meter_state == :historical
+    assert reserve_row.evidence_state == :stale
+    assert reserve_row.percent_value == 100
+  end
+
   defp account_window(attrs) do
     observed_at = Keyword.fetch!(attrs, :observed_at)
 

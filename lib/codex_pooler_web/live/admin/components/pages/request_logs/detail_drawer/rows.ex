@@ -100,6 +100,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
         "Selected rank",
         Map.get(routing, "selected_bridge_candidate_rank")
       ),
+      detail("request-log-detail-quota-lane", "Quota lane", quota_lane(routing)),
       detail(
         "request-log-detail-candidate-exclusions",
         "Candidate exclusions",
@@ -109,6 +110,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
 
     (rows ++ serving_mode_rows("request-log-detail", routing)) |> present_rows()
   end
+
+  defp quota_lane(%{"quota_lane" => "gpt_reserve"}), do: "GPT-Reserve Weekly"
+  defp quota_lane(_routing), do: nil
 
   @spec serving_mode_rows(String.t(), map() | nil) :: [detail_row()]
   def serving_mode_rows(prefix, snapshot) do
