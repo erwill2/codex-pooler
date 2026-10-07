@@ -3,7 +3,7 @@ defmodule CodexPooler.Access.APIKeys.ReasoningEffortPolicy do
 
   alias CodexPooler.Access.APIKey
 
-  @known_efforts ~w(none minimal low medium high xhigh max ultra)
+  @known_efforts ~w(none minimal low medium high xhigh max ultra persistent)
   @fallback_efforts ~w(low medium high xhigh)
 
   defmodule Decision do

@@ -5,7 +5,7 @@ defmodule CodexPooler.Access.APIKeys.ReasoningEffortPolicyTest do
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.{Decision, MetadataProjection}
 
-  @known ~w(none minimal low medium high xhigh max ultra)
+  @known ~w(none minimal low medium high xhigh max ultra persistent)
   @fallback ~w(low medium high xhigh)
 
   describe "resolve_reasoning_effort/4" do

@@ -7,7 +7,7 @@ defmodule CodexPooler.Access.APIKey do
   alias CodexPooler.ServiceTier
 
   @derive {Inspect, except: [:key_hash]}
-  @reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
+  @reasoning_efforts ~w(none minimal low medium high xhigh max ultra persistent)
   @service_tiers ~w(auto default flex priority scale)
 
   @type reasoning_effort :: String.t()

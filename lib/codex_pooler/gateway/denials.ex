@@ -8,7 +8,7 @@ defmodule CodexPooler.Gateway.Denials do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.SessionContinuity
 
-  @known_reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
+  @known_reasoning_efforts ~w(none minimal low medium high xhigh max ultra persistent)
 
   @pinned_continuation_reauth_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
   @pinned_continuation_unavailable_operator_action "wait for the pinned upstream to recover, then restart the client without continuation anchors"

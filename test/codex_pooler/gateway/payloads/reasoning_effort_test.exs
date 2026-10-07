@@ -104,6 +104,7 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffortTest do
   test "normalizes known tokens for comparison without accepting custom tokens" do
     assert ReasoningEffort.normalize_known("  XHIGH ") == "xhigh"
     assert ReasoningEffort.normalize_known("minimal") == "minimal"
+    assert ReasoningEffort.normalize_known("persistent") == "persistent"
     assert ReasoningEffort.normalize_known("custom-effort") == nil
     assert ReasoningEffort.normalize_known(:high) == nil
   end

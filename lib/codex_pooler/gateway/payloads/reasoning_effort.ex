@@ -3,7 +3,7 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
-  @known_efforts ~w(none minimal low medium high xhigh max ultra)
+  @known_efforts ~w(none minimal low medium high xhigh max ultra persistent)
 
   @spec extract(map(), RequestOptions.t()) :: String.t() | nil
   def extract(payload, %RequestOptions{} = request_options) when is_map(payload) do
@@ -115,7 +115,7 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffort do
 
   defp thinking_effort(value) when is_binary(value) do
     case normalize_for_compare(value) do
-      effort when effort in ~w(low medium high xhigh max ultra) -> effort
+      effort when effort in ~w(low medium high xhigh max ultra persistent) -> effort
       enabled when enabled in ~w(enabled true on) -> "medium"
       _value -> nil
     end
