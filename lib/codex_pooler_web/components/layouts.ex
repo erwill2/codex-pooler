@@ -196,6 +196,9 @@ defmodule CodexPoolerWeb.Layouts do
       <div class="absolute w-1/3 h-full rounded-full border-1 border-base-200 bg-base-100 brightness-200 left-0 [[data-theme=light]_&]:left-1/3 [[data-theme=dark]_&]:left-2/3 transition-[left]" />
 
       <button
+        type="button"
+        aria-label={gettext("Match system theme")}
+        title={gettext("Match system theme")}
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="system"
@@ -204,6 +207,9 @@ defmodule CodexPoolerWeb.Layouts do
       </button>
 
       <button
+        type="button"
+        aria-label={gettext("Light theme")}
+        title={gettext("Light theme")}
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="light"
@@ -212,6 +218,9 @@ defmodule CodexPoolerWeb.Layouts do
       </button>
 
       <button
+        type="button"
+        aria-label={gettext("Dark theme")}
+        title={gettext("Dark theme")}
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="dark"
