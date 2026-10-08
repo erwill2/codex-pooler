@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
 
   alias CodexPoolerWeb.Admin.AvatarComponents
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: ResetFormatting
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
@@ -18,13 +19,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   """
   attr :cockpit, :map, required: true
   attr :datetime_preferences, :map, required: true
+  attr :now, :any, default: nil
 
   def relink_card(assigns) do
+    now = assigns.now || DateTime.utc_now()
+
     assigns =
-      assign(
-        assigns,
+      assigns
+      |> assign(:now, now)
+      |> assign(
         :flow,
-        UpstreamCockpitReadModel.pending_relink_flow(assigns.cockpit.oauth_flows)
+        UpstreamCockpitReadModel.pending_relink_flow(assigns.cockpit.oauth_flows, now)
       )
 
     ~H"""
@@ -68,7 +73,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
           done
           connector
           title={relink_issued_title(@flow.flow_kind)}
-          time={ResetFormatting.relative_time_label(@flow.inserted_at)}
+          time={ResetFormatting.relative_time_label(@flow.inserted_at, @now)}
           time_title={Formatting.format_oauth_flow_time(@flow.inserted_at, @datetime_preferences)}
           hint={relink_issued_hint(@flow.flow_kind)}
         >
@@ -92,23 +97,34 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
                 <.icon name="hero-clipboard-document" class="copy-icon size-3.5" />
               </button>
             </span>
-            <a
+            <div
               :if={@flow.device.verification_uri}
-              id="upstream-cockpit-relink-verification-link"
-              href={@flow.device.verification_uri}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="inline-flex items-center gap-1 text-xs font-semibold text-info hover:underline"
+              class="flex min-w-0 items-center gap-1"
             >
-              <span>Open verification page</span>
-              <.icon name="hero-arrow-top-right-on-square" class="size-3" />
-            </a>
+              <a
+                id="upstream-cockpit-relink-verification-link"
+                href={@flow.device.verification_uri}
+                target="_blank"
+                rel="noopener noreferrer"
+                class="inline-flex min-w-0 items-center gap-1 text-xs font-semibold text-info hover:underline"
+              >
+                <span>Open verification page</span>
+                <.icon name="hero-arrow-top-right-on-square" class="size-3 shrink-0" />
+              </a>
+              <AdminComponents.clipboard_button
+                id="upstream-cockpit-relink-copy-verification-url"
+                copy_text={@flow.device.verification_uri}
+                aria_label="Copy device verification URL"
+                class="btn btn-ghost btn-xs btn-square text-base-content/45 hover:text-base-content"
+                icon_class="size-3.5"
+              />
+            </div>
           </div>
         </.relink_step>
         <.relink_step
           pulse_class={relink_dot_class(@flow.flow_kind)}
           title={relink_waiting_title(@flow.flow_kind)}
-          time={relink_checked_label(@flow)}
+          time={relink_checked_label(@flow, @now)}
           time_title={Formatting.format_oauth_flow_time(@flow.last_polled_at, @datetime_preferences)}
           hint={relink_waiting_hint(@flow.flow_kind)}
         />
@@ -121,7 +137,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
           class="inline-flex items-baseline gap-1.5 text-[11px] tabular-nums text-base-content/55"
         >
           <.icon name="hero-clock" class="size-3 shrink-0 translate-y-0.5" />
-          <span>expires {ResetFormatting.relative_time_label(@flow.expires_at)}</span>
+          <span>expires {ResetFormatting.relative_time_label(@flow.expires_at, @now)}</span>
         </span>
         <button
           id="upstream-cockpit-relink-cancel"
@@ -214,10 +230,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   defp relink_waiting_hint(_kind),
     do: "Completion arrives via callback once the sign-in finishes."
 
-  defp relink_checked_label(%{last_polled_at: %DateTime{} = polled_at}),
-    do: "checked #{ResetFormatting.relative_time_label(polled_at)}"
+  defp relink_checked_label(%{last_polled_at: %DateTime{} = polled_at}, now),
+    do: "checked #{ResetFormatting.relative_time_label(polled_at, now)}"
 
-  defp relink_checked_label(_flow), do: nil
+  defp relink_checked_label(_flow, _now), do: nil
 
   @doc """
   Credential card: the account rendered as a badge — avatar with a lifecycle
@@ -241,14 +257,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         <div class="flex items-center gap-3">
           <.cockpit_avatar identity={@cockpit.identity} status={@cockpit.header.status} />
           <div class="min-w-0 flex-1">
-            <h2 class="truncate text-xl font-bold leading-tight text-base-content">
+            <h2
+              id="upstream-cockpit-title"
+              data-role="upstream-cockpit-title"
+              class="min-w-0 break-words text-xl font-bold leading-tight text-base-content"
+            >
               {@cockpit.header.title}
             </h2>
             <p
               id="upstream-cockpit-status"
               class={["mt-0.5 text-xs font-semibold", status_text_class(@cockpit.header.status)]}
             >
-              {Formatting.humanize_state(@cockpit.header.status)}
+              {@cockpit.header.status_label}
             </p>
           </div>
           <AdminBadges.plan_badge
@@ -397,8 +417,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
       %{
         id: "upstream-vitals-access-token",
         label: "Access token",
-        value: Formatting.strip_label_prefix(header.access_token_label, "access token "),
-        class: access_token_class(header.access_token_label)
+        value: credential_expiry_label(header.credential_expiry),
+        class: credential_expiry_class(header.credential_expiry)
       },
       %{
         id: "upstream-vitals-token-refresh",
@@ -466,11 +486,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   defp reconciliation_class("failed"), do: "text-error"
   defp reconciliation_class(_status), do: "text-warning"
 
-  defp access_token_class(label) when is_binary(label) do
-    if String.contains?(label, "expired"), do: "text-error", else: "text-base-content/80"
-  end
+  defp credential_expiry_label(%{state: "known_future", age: age}) when is_binary(age),
+    do: "expires #{age}"
 
-  defp access_token_class(_label), do: "text-base-content/80"
+  defp credential_expiry_label(%{state: "known_past", age: age}) when is_binary(age),
+    do: "expired #{age}"
+
+  defp credential_expiry_label(_expiry), do: "expiry unavailable"
+
+  defp credential_expiry_class(%{state: "known_past"}), do: "text-error"
+
+  defp credential_expiry_class(_expiry), do: "text-base-content/80"
 
   defp refresh_status_class(status) when status in ["succeeded", "imported"], do: "text-success"
   defp refresh_status_class("refreshing"), do: "text-info"

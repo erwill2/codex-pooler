@@ -6,8 +6,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.RequestLogDetailDrawer
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.{Charts, Dialogs, Sections, Summary}
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.UsagePollPause
 
   attr :cockpit, :map, required: true
   attr :auth_json_form, :any, required: true
@@ -25,9 +27,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
   attr :deleting_account, :map, default: nil
   attr :delete_account_form, :any, required: true
   attr :saved_reset_policy_form, :any, required: true
+  attr :editing_provider_credits_policy, :map, default: nil
+  attr :provider_credits_policy_form, :any, default: nil
   attr :confirming_saved_reset_redemption, :map, default: nil
   attr :selected_request_log, :map, default: nil
   attr :refresh_data_message, :string, default: nil
+  attr :request_metrics_loaded?, :boolean, default: true
+  attr :request_metrics_loading?, :boolean, default: false
+  attr :request_metrics_running?, :boolean, default: false
   attr :uploads, :map, required: true
   attr :datetime_preferences, :map, required: true
 
@@ -42,11 +49,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
       />
 
       <div class="drawer-content min-w-0">
-        <section id="upstream-cockpit" class="grid gap-4">
+        <section
+          id="upstream-cockpit"
+          phx-hook="SavedResetConnection"
+          class="grid gap-4"
+          aria-busy={to_string(@request_metrics_loading? || @request_metrics_running?)}
+        >
+          <AdminComponents.saved_reset_connection_notice id="saved-reset-connection-cockpit" in_flight={match?(%{saved_reset_operation: %{open?: true}}, @cockpit)} />
           <AdminComponents.page_header
             id="upstream-cockpit-page-header"
             title="Upstream health"
-            description="Credential, routing, and quota status for one upstream account, plus the actions to recover it."
+            description="One upstream account up close: serving state, quota evidence, and its recovery actions."
           />
 
           <AuthJsonDialog.auth_json_import_dialog
@@ -58,12 +71,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
           />
 
           <Dialogs.oauth_relink_dialog
+            account_label={@cockpit.header.title}
             oauth_relinking={@oauth_relinking}
             oauth_relink_form={@oauth_relink_form}
             oauth_relink_flow={@oauth_relink_flow}
             oauth_relink_authorization_url={@oauth_relink_authorization_url}
             oauth_relink_result={@oauth_relink_result}
             oauth_relink_error={@oauth_relink_error}
+            datetime_preferences={@datetime_preferences}
           />
 
           <Dialogs.rename_account_dialog account={@renaming_account} form={@rename_account_form} />
@@ -74,6 +89,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
             identity_observability={@cockpit.header.identity_observability}
             reauth_required?={@cockpit.flags.reauth_required?}
           />
+
+          <UsagePollPause.usage_poll_pause id_prefix="upstream-cockpit" pause={Map.get(@cockpit, :usage_poll_pause)} />
 
           <div class="grid items-start gap-4 xl:grid-cols-[minmax(0,4fr)_minmax(0,8fr)]">
             <div class="grid gap-4 xl:sticky xl:top-4">
@@ -90,16 +107,28 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
               <Sections.readiness_section
                 cockpit={@cockpit}
                 datetime_preferences={@datetime_preferences}
+                request_metrics_loaded?={@request_metrics_loaded?}
+                request_metrics_loading?={@request_metrics_loading?}
+                request_metrics_running?={@request_metrics_running?}
               />
               <Charts.quota_section
                 cockpit={@cockpit}
                 saved_reset_policy_form={@saved_reset_policy_form}
                 datetime_preferences={@datetime_preferences}
               />
-              <Charts.request_section cockpit={@cockpit} refresh_data_message={@refresh_data_message} />
+              <UpstreamPageComponents.provider_credits_policy_dialog account={@editing_provider_credits_policy} form={@provider_credits_policy_form} />
+              <Charts.request_section
+                cockpit={@cockpit}
+                refresh_data_message={@refresh_data_message}
+                request_metrics_loaded?={@request_metrics_loaded?}
+                request_metrics_loading?={@request_metrics_loading?}
+                request_metrics_running?={@request_metrics_running?}
+              />
               <Sections.recent_events_section
                 cockpit={@cockpit}
                 datetime_preferences={@datetime_preferences}
+                request_data_loaded?={@request_metrics_loaded?}
+                request_data_loading?={@request_metrics_loading? || @request_metrics_running?}
               />
             </div>
           </div>

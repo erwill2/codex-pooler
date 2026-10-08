@@ -1,19 +1,80 @@
 defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   use CodexPooler.DataCase, async: false
 
+  @moduletag capture_log: true
+
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
   import ExUnit.CaptureLog
 
+  alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession}
+  alias CodexPooler.Gateway.Runtime.Service
+  alias CodexPooler.Gateway.Transports.OrdinarySuccessTestSeed
+  alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
+  alias CodexPooler.Gateway.Transports.Streaming.RuntimeAdmissionProof
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesSequence
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
+  alias CodexPooler.Gateway.Transports.Websocket.ForwardedSendWitnessV1
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.RemoteReconnectControlV2
+  alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerAdmissionControlV1
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.DownstreamState
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
+  alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
   alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.ProviderCreditsDispatchSupport
+  alias CodexPoolerWeb.CodexResponsesSocket
 
+  @detection_timeout_ms 15_000
+
+  defmodule RetiringRegisteredOwner do
+    use GenServer
+
+    def start_link(context, parent) do
+      GenServer.start_link(__MODULE__, {context, parent})
+    end
+
+    @impl GenServer
+    def init({context, parent}) do
+      {:ok, _owner} =
+        Registry.register(WebsocketOwnerSession.Registry, context.codex_session_id, nil)
+
+      send(parent, {:retiring_registered_owner_ready, self()})
+      {:ok, context}
+    end
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, context) do
+      {:stop, :normal,
+       {:ok,
+        %{
+          codex_session_id: context.codex_session_id,
+          owner_lease_token: context.owner_lease_token,
+          owner_instance_id: context.owner_instance_id,
+          upstream_alive?: false,
+          draining?: false,
+          active_turn?: false
+        }}, context}
+    end
+  end
+
+  # Scenario timer for the owner's terminal-delivery fallback in tests that
+  # release the retained task result before the terminal frames: it outlasts
+  # every detection wait, so a test stalled between the two releases cannot
+  # see the production one second timeout settle the turn first (findings#206
+  # row 206-292). The timeout path itself is driven by injected messages.
+  @terminal_delivery_scenario_timeout_ms 60_000
   @sentinel "SECRET_SENTINEL_DO_NOT_STORE_123"
 
   setup do
@@ -21,10 +82,36 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
     on_exit(fn -> cleanup_owner_session(codex_session_id) end)
 
-    {:ok,
-     codex_session_id: codex_session_id,
-     owner_lease_token: "owner-token-#{System.unique_integer([:positive])}",
-     owner_instance_id: Atom.to_string(node())}
+    {:ok, codex_session_id: codex_session_id, owner_lease_token: "owner-token-#{System.unique_integer([:positive])}", owner_instance_id: Atom.to_string(node())}
+  end
+
+  test "a busy owner consumes an exact abandoned submission before answering busy", context do
+    parent = self()
+    gate = make_ref()
+
+    upstream = %{
+      start: fn -> Agent.start_link(fn -> :ready end) end,
+      send: fn _upstream, _request, _writer ->
+        send(parent, {:busy_turn_started, self()})
+        receive do: ({:release_busy_turn, ^gate} -> :ok)
+        {:ok, %{status: 200, headers: [], terminal: "response.completed", body: ""}}
+      end,
+      close: fn pid -> Agent.stop(pid) end
+    }
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("abandon-busy"))
+    task = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, Map.put(downstream, :owner_turn_id, self()), %UpstreamWebsocketSession.Request{url: "https://example.com", payload: "{}", headers: [], timeouts: %{}, websocket_delivery_mode: :collect_compaction, effective_serving_mode: "full"}, false) end)
+    assert_receive {:busy_turn_started, executor}, @detection_timeout_ms
+    on_exit(fn -> send(executor, {:release_busy_turn, gate}) end)
+    abandoned = Map.put(downstream, :owner_turn_id, self())
+    assert {:error, _} = WebsocketOwnerSession.abandon_turn(owner, abandoned)
+    assert length(:sys.get_state(owner).abandoned_submissions) == 1
+    assert {:error, :stale_downstream} = GenServer.call(owner, {:submit_upstream, abandoned, "{}", false})
+    assert :sys.get_state(owner).abandoned_submissions == []
+    assert {:error, :owner_busy} = GenServer.call(owner, {:submit_upstream, abandoned, "{}", false})
+    send(executor, {:release_busy_turn, gate})
+    assert {:ok, _} = Task.await(task, @detection_timeout_ms)
   end
 
   test "starts one local registered owner per codex_session_id", context do
@@ -49,6 +136,1264 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert fresh_owner != owner
     assert_receive {:websocket_owner_harness_upstream_started, fresh_upstream_pid}
     assert fresh_upstream_pid != upstream_pid
+  end
+
+  test "forwarded admission controls serialize one owner-issued reservation and clear on detach",
+       context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {owner, seed_url} = start_seeded_owner(context, upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("admission-owner"))
+
+    now = System.system_time(:millisecond)
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    assert {:ok, pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, downstream,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: now + 30_000
+               )
+             )
+
+    assert NativeCompactionAdmission.phase(pending) == :pending_compact
+
+    controls = [make_ref(), make_ref()]
+
+    reservations =
+      controls
+      |> Enum.map(fn control_ref ->
+        Task.async(fn ->
+          WebsocketOwnerSession.admission_control(
+            owner,
+            admission_control(:reserve, downstream,
+              binding: binding,
+              phase: :compact,
+              control_ref: control_ref,
+              now_ms: now
+            )
+          )
+        end)
+      end)
+      |> Enum.map(&Task.await/1)
+
+    assert Enum.count(reservations, &match?({:ok, %NativeCompactionAdmission.Capability{}}, &1)) ==
+             1
+
+    assert Enum.count(reservations, &(&1 == {:error, :invalid_transition})) == 1
+
+    state = :sys.get_state(owner)
+    refute inspect(state.native_compaction_admission) =~ context.owner_lease_token
+    refute inspect(state.native_compaction_admission) =~ context.owner_instance_id
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+    state = :sys.get_state(owner)
+    assert state.native_compaction_admission == nil
+    assert state.native_compaction_admission_downstream == nil
+  end
+
+  test "forwarded accounting rejection logs the admission state before clearing it", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {owner, seed_url} = start_seeded_owner(context, upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("admission-diagnostic")
+             )
+
+    now_ms = System.system_time(:millisecond)
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    capability = reserve_accounted_capability(owner, downstream, binding, receipt, now_ms)
+
+    for current_state <- [:accounting_started_compact, :cleared] do
+      log =
+        capture_log(fn ->
+          assert {:error, :invalid_transition} =
+                   WebsocketOwnerSession.admission_control(
+                     owner,
+                     admission_control(:mark_accounting_started, downstream,
+                       capability: capability,
+                       now_ms: now_ms
+                     )
+                   )
+        end)
+
+      assert [line] = String.split(log, "\n", trim: true)
+      assert line =~ "native compaction admission rejected"
+      assert line =~ "step=mark_accounting_started"
+      assert line =~ "phase=compact"
+      assert line =~ "current_state=#{current_state}"
+      assert line =~ "expected_state=reserved_compact"
+      assert line =~ "topology=forwarded"
+      assert line =~ "reason=invalid_transition"
+      assert line =~ "native_lifecycle_id=#{binding.lifecycle_id}"
+      refute log =~ context.owner_lease_token
+      refute log =~ Base.encode16(capability.token)
+      assert :sys.get_state(owner).native_compaction_admission == nil
+    end
+  end
+
+  # Every owner-side clear of a native compaction admission names its cause
+  # from the fixed lifecycle vocabulary; before findings#258 row 258-50 these
+  # paths fell back to `:request_rejected`, which no request caused.
+  describe "native compaction admission clear reasons" do
+    test "a drain clears an armed admission as owner_drained", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+      owner_ref = Process.monitor(armed.owner)
+
+      assert {:ok, :settled} = WebsocketOwnerSession.drain_owner(armed.owner)
+      assert_receive {:admission_clear, %{reason: :owner_drained, phase_from: :pending_compact, phase_to: :cleared}}
+      assert_receive {:DOWN, ^owner_ref, :process, _owner, _reason}
+      refute_received {:admission_clear, %{reason: :request_rejected}}
+    end
+
+    test "a rollout drain start clears an armed admission as owner_drained", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+
+      :ok = WebsocketOwnerSession.begin_drain(armed.owner)
+      assert :sys.get_state(armed.owner).draining?
+      assert_receive {:admission_clear, %{reason: :owner_drained, phase_from: :pending_compact}}
+      refute_received {:admission_clear, %{reason: :request_rejected}}
+    end
+
+    test "the exit of the owner's upstream clears an armed admission as upstream_exited", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+      owner_ref = Process.monitor(armed.owner)
+
+      Process.exit(:sys.get_state(armed.owner).upstream_pid, :shutdown)
+
+      assert_receive {:DOWN, ^owner_ref, :process, _owner, _reason}
+      assert_receive {:admission_clear, %{reason: :upstream_exited, phase_from: :pending_compact}}
+      refute_received {:admission_clear, %{reason: :request_rejected}}
+    end
+
+    test "a stale owner lease clears an armed admission as stale_owner", context do
+      persistence = %{
+        renew_owner_token: fn _session_id, _owner_lease_token, %RequestOptions{} -> {:error, :stale_owner} end,
+        release_owner_lease: fn _session_id, _owner_lease_token, _reason -> :ok end,
+        interrupt_codex_session: fn _session_id, _opts -> :ok end
+      }
+
+      armed = armed_admission!(context, persistence: persistence)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+      owner_ref = Process.monitor(armed.owner)
+
+      capture_log(fn ->
+        send(armed.owner, :renew_owner_lease)
+        assert_receive {:DOWN, ^owner_ref, :process, _owner, {:shutdown, :stale_owner}}
+      end)
+
+      assert_receive {:admission_clear, %{reason: :stale_owner, phase_from: :pending_compact}}
+      refute_received {:admission_clear, %{reason: :request_rejected}}
+    end
+
+    test "a submission without the admission's capability clears it as capability_rejected", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+
+      request = %UpstreamWebsocketSession.Request{
+        websocket_request()
+        | native_compaction_capability: nil,
+          expected_connection_lifecycle: %{lifecycle_id: armed.binding.lifecycle_id, generation: armed.binding.generation}
+      }
+
+      assert {:error, :native_compaction_capability_rejected} = WebsocketOwnerSession.submit_request(armed.owner, armed.downstream, request)
+      assert_receive {:admission_clear, %{reason: :capability_rejected, phase_from: :pending_compact}}
+      refute_received {:admission_clear, %{reason: :request_rejected}}
+    end
+
+    test "a rejected request still clears as request_rejected", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+
+      assert {:ok, nil} = WebsocketOwnerSession.admission_control(armed.owner, admission_control(:clear, armed.downstream, []))
+      assert_receive {:admission_clear, %{reason: :request_rejected, phase_from: :pending_compact}}
+    end
+
+    test "a replacement socket clears the admission armed for the socket it replaced", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+      replacement_pid = spawn(fn -> receive do: (:stop -> :ok) end)
+      on_exit(fn -> send(replacement_pid, :stop) end)
+
+      assert {:ok, replacement} = WebsocketOwnerSession.attach_downstream(armed.owner, %{pid: replacement_pid, correlation_id: "admission-replacement"})
+
+      assert replacement.epoch == armed.downstream.epoch + 1
+      assert_receive {:admission_clear, %{reason: :downstream_detached, phase_from: :pending_compact, phase_to: :cleared}}
+      assert %{native_compaction_admission: nil, native_compaction_admission_downstream: nil} = :sys.get_state(armed.owner)
+      assert {:ok, nil} = WebsocketOwnerSession.admission_control(armed.owner, admission_control(:snapshot, replacement, []))
+    end
+  end
+
+  # findings#206 row 206-265: a socket that attached while the previous one was
+  # still attached (a client reconnect over a half-open connection, or a
+  # previous socket whose close never reached the owner) inherited the
+  # admission bound to the replaced socket. Its full-history compact reached the
+  # provider and settled succeeded, then the collection authorization was refused
+  # `stale_downstream` and the client received `invalid_compaction_response`, so
+  # it paid again for an HTTP compact.
+  test "a full-history compact on a replacement socket is authorized after an admission armed for the replaced socket",
+       context do
+    item =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_item.done",
+        "item" => %{"type" => "compaction", "encrypted_content" => "synthetic-compact"}
+      })
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.strict_sequence([
+          FakeUpstream.websocket_text_frames([terminal_frame("response.completed", "resp_replaced_socket_ordinary")]),
+          FakeUpstream.websocket_text_frames([item, terminal_frame("response.completed", "resp_replacement_compact")])
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    assert {:ok, owner} = start_owner(context, [])
+
+    assert {:ok, replaced} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("replaced-socket"))
+
+    {binding, receipt} = OrdinarySuccessTestSeed.request(owner, replaced, forwarded_binding(context, replaced), FakeUpstream.url(upstream))
+
+    assert {:ok, pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, replaced,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: System.system_time(:millisecond) + 30_000
+               )
+             )
+
+    assert NativeCompactionAdmission.phase(pending) == :pending_compact
+
+    replacement_pid = spawn(fn -> receive do: (:stop -> :ok) end)
+    on_exit(fn -> send(replacement_pid, :stop) end)
+
+    assert {:ok, replacement} = WebsocketOwnerSession.attach_downstream(owner, %{pid: replacement_pid, correlation_id: "replacement-socket"})
+
+    request = %UpstreamWebsocketSession.Request{
+      url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+      headers: [],
+      payload:
+        CodexPooler.JSON.encode!(%{
+          "model" => "sample-model",
+          "input" => [%{"role" => "user", "content" => "sample"}, %{"type" => "compaction_trigger"}]
+        }),
+      request_id: Ecto.UUID.generate(),
+      attempt_id: Ecto.UUID.generate(),
+      websocket_delivery_mode: :collect_full_history,
+      effective_serving_mode: "full",
+      native_compaction_metadata: %NativeCodexTurnMetadata{
+        request_kind: :compaction,
+        semantic_turn_key: <<1::256>>,
+        window_id_digest: <<2::256>>,
+        context_window_id_digest: <<3::256>>,
+        window_number: 1
+      },
+      timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
+      message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1
+    }
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request)
+
+    assert {:ok, %{first_compact_result: compact_receipt}} = WebsocketOwnerSession.submit_request(owner, replacement, request)
+
+    assert {:ok, _provenance} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:authorize_first_compact_collection, replacement,
+                 binding: compact_receipt.binding,
+                 control_ref: compact_receipt.result_ref,
+                 first_compact_collection: compact_receipt
+               )
+             )
+
+    assert FakeUpstream.count(upstream) == 2
+  end
+
+  test "forwarded admission follows one socket across per-turn correlation ids", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {owner, seed_url} = start_seeded_owner(context, upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("admission-lineage")
+             )
+
+    now_ms = System.system_time(:millisecond)
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    assert {:ok, _pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, downstream,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: now_ms + 30_000
+               )
+             )
+
+    next_turn_downstream = %{downstream | correlation_id: "admission-lineage-next-turn"}
+
+    assert {:ok, %NativeCompactionAdmission.Capability{}} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:reserve, next_turn_downstream,
+                 binding: binding,
+                 phase: :compact,
+                 control_ref: make_ref(),
+                 now_ms: now_ms
+               )
+             )
+
+    wrong_socket = %{next_turn_downstream | pid: spawn(fn -> receive do: (:stop -> :ok) end)}
+    on_exit(fn -> send(wrong_socket.pid, :stop) end)
+
+    assert {:error, :stale_downstream} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:snapshot, wrong_socket, [])
+             )
+  end
+
+  test "forwarded admission controls reject stale epoch lease and instance bindings", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {owner, seed_url} = start_seeded_owner(context, upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("admission-fence"))
+
+    now = System.system_time(:millisecond)
+
+    {current_binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    for topology <- [
+          forwarded_binding(context, %{downstream | epoch: downstream.epoch + 1}),
+          forwarded_binding(%{context | owner_lease_token: "wrong-lease"}, downstream),
+          forwarded_binding(%{context | owner_instance_id: "wrong-instance"}, downstream)
+        ] do
+      binding = %{current_binding | topology: topology.topology}
+
+      assert {:error, :binding_mismatch} =
+               WebsocketOwnerSession.admission_control(
+                 owner,
+                 admission_control(:record_ordinary_success, downstream,
+                   binding: binding,
+                   first_compact_collection: receipt,
+                   expires_at_ms: now + 30_000
+                 )
+               )
+
+      assert :sys.get_state(owner).native_compaction_admission == nil
+    end
+  end
+
+  test "forwarded admission preserves the current capability after a stale reserve control",
+       context do
+    {owner, upstream, seed_url} = start_physical_owner(context)
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("stale-reserve"))
+
+    now_ms = System.system_time(:millisecond)
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    assert {:ok, _pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, downstream,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: now_ms + 30_000
+               )
+             )
+
+    assert {:ok, capability} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:reserve, downstream,
+                 binding: binding,
+                 phase: :compact,
+                 control_ref: make_ref(),
+                 now_ms: now_ms
+               )
+             )
+
+    stale_binding = %{binding | generation: binding.generation + 1}
+
+    assert {:error, :invalid_transition} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:reserve, downstream,
+                 binding: stale_binding,
+                 phase: :compact,
+                 control_ref: make_ref(),
+                 now_ms: now_ms
+               )
+             )
+
+    assert NativeCompactionAdmission.phase(:sys.get_state(owner).native_compaction_admission) ==
+             :reserved_compact
+
+    refute_received {:websocket_owner_harness_request, _request}
+
+    assert {:ok, _accounting} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:mark_accounting_started, downstream,
+                 capability: capability,
+                 now_ms: now_ms
+               )
+             )
+
+    # An anchored compaction is collected, and the session answers it with its
+    # terminal result: only a completed one is a collected compaction
+    # (findings#281).
+    request = %UpstreamWebsocketSession.Request{
+      websocket_request()
+      | native_compaction_capability: capability,
+        expected_connection_lifecycle: %{
+          lifecycle_id: binding.lifecycle_id,
+          generation: binding.generation
+        },
+        effective_serving_mode: "full",
+        websocket_delivery_mode: :collect_compaction,
+        url: seed_url <> "/backend-api/codex/responses",
+        payload: CodexPooler.JSON.encode!(%{"model" => "ordinary-authority-seed", "input" => []}),
+        timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
+        writer: nil
+    }
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request)
+
+    assert {:ok, %{terminal: "response.completed", provider_credits_admission: admission}} = WebsocketOwnerSession.submit_request(owner, downstream, request)
+    assert ProviderCreditsAdmission.valid_receipt?(admission)
+    assert :sys.get_state(owner).forwarded_send_witness.status == :redeemed
+    assert FakeUpstream.count(upstream) == 2
+
+    assert NativeCompactionAdmission.phase(:sys.get_state(owner).native_compaction_admission) ==
+             :collected_unconfirmed
+  end
+
+  test "soft reconnect handoff timeout cannot restore admission cleared by detach", context do
+    waiting =
+      start_waiting_handoff(context, "admission-soft-timeout", seed_native_admission: true)
+
+    assert waiting.seeded_admission_phase == :pending_compact
+    assert :sys.get_state(waiting.owner).native_compaction_admission == nil
+
+    pending = waiting.pending
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token}
+    )
+
+    assert_receive {:reconnect_handoff_invalidated, 1}
+    assert :sys.get_state(waiting.owner).native_compaction_admission == nil
+
+    Process.exit(waiting.task_pid, :kill)
+    Process.exit(waiting.submitter, :kill)
+  end
+
+  test "forwarded admission controls authorize and record one trusted first compact collection",
+       context do
+    item =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_item.done",
+        "item" => %{"type" => "compaction", "encrypted_content" => "synthetic-compact"}
+      })
+
+    terminal = terminal_frame("response.completed", "resp_first_compact_collection")
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(FakeUpstream.websocket_text_frames([item, terminal]))
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    assert {:ok, owner} = start_owner(context, [])
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("first-compact"))
+
+    request = %UpstreamWebsocketSession.Request{
+      url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+      headers: [],
+      payload:
+        CodexPooler.JSON.encode!(%{
+          "model" => "sample-model",
+          "input" => [
+            %{"role" => "user", "content" => "sample"},
+            %{"type" => "compaction_trigger"}
+          ]
+        }),
+      request_id: Ecto.UUID.generate(),
+      attempt_id: Ecto.UUID.generate(),
+      websocket_delivery_mode: :collect_full_history,
+      effective_serving_mode: "full",
+      native_compaction_metadata: %NativeCodexTurnMetadata{
+        request_kind: :compaction,
+        semantic_turn_key: <<1::256>>,
+        window_id_digest: <<2::256>>,
+        context_window_id_digest: <<3::256>>,
+        window_number: 1
+      },
+      timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
+      message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1
+    }
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request)
+
+    assert {:ok, %{first_compact_result: receipt}} =
+             WebsocketOwnerSession.submit_request(owner, downstream, request)
+
+    binding = receipt.binding
+
+    assert {:ok, provenance} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:authorize_first_compact_collection, downstream,
+                 binding: binding,
+                 control_ref: receipt.result_ref,
+                 first_compact_collection: receipt
+               )
+             )
+
+    assert {:ok, collected} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_first_compact_collected, downstream, first_compact_collection: provenance)
+             )
+
+    assert NativeCompactionAdmission.phase(collected) == :collected_unconfirmed
+
+    assert {:error, :invalid_transition} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_first_compact_collected, downstream, first_compact_collection: provenance)
+             )
+  end
+
+  test "owner issues and atomically redeems one forwarded send witness", context do
+    observer = attach_native_compaction_observer()
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {owner, seed_url} = start_seeded_owner(context, upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("witness-owner"))
+
+    now = System.system_time(:millisecond)
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    assert {:ok, _pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, downstream,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: now + 30_000
+               )
+             )
+
+    assert {:ok, capability} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:reserve, downstream,
+                 binding: binding,
+                 phase: :compact,
+                 control_ref: make_ref(),
+                 now_ms: now
+               )
+             )
+
+    assert {:ok, _accounting} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:mark_accounting_started, downstream,
+                 capability: capability,
+                 now_ms: now
+               )
+             )
+
+    assert {:ok, %ForwardedSendWitnessV1{} = witness} =
+             WebsocketOwnerSession.issue_forwarded_send_witness(
+               owner,
+               downstream,
+               capability,
+               now
+             )
+
+    state = :sys.get_state(owner)
+    assert state.forwarded_send_witness.status == :issued
+    assert byte_size(state.forwarded_send_witness.digest) == 32
+    refute inspect(state.native_compaction_admission) =~ context.owner_lease_token
+
+    assert :ok =
+             WebsocketOwnerSession.redeem_forwarded_send(
+               owner,
+               witness,
+               %{lifecycle_id: binding.lifecycle_id, generation: binding.generation},
+               :full
+             )
+
+    assert :sys.get_state(owner).forwarded_send_witness.status == :redeemed
+
+    assert observer.() == %{
+             compact_owner_issued: 1,
+             compact_reserved: 1,
+             compact_accounting_started: 1,
+             compact_consumed: 1
+           }
+
+    assert {:error, :forwarded_send_witness_rejected} =
+             WebsocketOwnerSession.redeem_forwarded_send(
+               owner,
+               witness,
+               %{lifecycle_id: binding.lifecycle_id, generation: binding.generation},
+               :full
+             )
+
+    assert :sys.get_state(owner).native_compaction_admission == nil
+  end
+
+  test "owner rejects stale lifecycle mode and epoch witnesses and clears permanently", context do
+    for {label, mutate} <- [
+          {:generation,
+           fn binding, downstream ->
+             {%{lifecycle_id: binding.lifecycle_id, generation: binding.generation + 1}, :full, downstream}
+           end},
+          {:mode,
+           fn binding, downstream ->
+             {%{lifecycle_id: binding.lifecycle_id, generation: binding.generation}, :lite, downstream}
+           end},
+          {:epoch,
+           fn binding, downstream ->
+             {%{lifecycle_id: binding.lifecycle_id, generation: binding.generation}, :full, %{downstream | epoch: downstream.epoch + 1}}
+           end}
+        ] do
+      local_context = unique_owner_context(context, "witness-#{label}")
+      upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+      {owner, seed_url} = start_seeded_owner(local_context, upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+      assert {:ok, downstream} =
+               WebsocketOwnerSession.attach_downstream(
+                 owner,
+                 downstream_target("witness-#{label}")
+               )
+
+      now = System.system_time(:millisecond)
+
+      {binding, receipt} =
+        OrdinarySuccessTestSeed.request(
+          owner,
+          downstream,
+          forwarded_binding(local_context, downstream),
+          seed_url
+        )
+
+      capability = reserve_accounted_capability(owner, downstream, binding, receipt, now)
+
+      assert {:ok, witness} =
+               WebsocketOwnerSession.issue_forwarded_send_witness(
+                 owner,
+                 downstream,
+                 capability,
+                 now
+               )
+
+      {lifecycle, mode, redemption_downstream} = mutate.(binding, downstream)
+
+      witness =
+        if label == :epoch do
+          %{witness | downstream_epoch: redemption_downstream.epoch}
+        else
+          witness
+        end
+
+      assert {:error, :forwarded_send_witness_rejected} =
+               WebsocketOwnerSession.redeem_forwarded_send(owner, witness, lifecycle, mode)
+
+      assert :sys.get_state(owner).native_compaction_admission == nil
+      refute_received {:websocket_owner_harness_request, _request}
+    end
+  end
+
+  test "capability owner submission carries one opaque physical-send handoff",
+       context do
+    observer = attach_native_compaction_observer()
+    {owner, upstream, seed_url} = start_physical_owner(context)
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("witness-fail-closed")
+             )
+
+    now = System.system_time(:millisecond)
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        downstream,
+        forwarded_binding(context, downstream),
+        seed_url
+      )
+
+    capability = reserve_accounted_capability(owner, downstream, binding, receipt, now)
+
+    # An anchored compaction is collected, and the session answers it with its
+    # terminal result: only a completed one is a collected compaction
+    # (findings#281).
+    request = %UpstreamWebsocketSession.Request{
+      websocket_request()
+      | native_compaction_capability: capability,
+        expected_connection_lifecycle: %{
+          lifecycle_id: binding.lifecycle_id,
+          generation: binding.generation
+        },
+        effective_serving_mode: "full",
+        websocket_delivery_mode: :collect_compaction,
+        url: seed_url <> "/backend-api/codex/responses",
+        payload: CodexPooler.JSON.encode!(%{"model" => "ordinary-authority-seed", "input" => []}),
+        timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
+        writer: nil
+    }
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request)
+
+    assert {:ok, %{terminal: "response.completed", provider_credits_admission: admission}} = WebsocketOwnerSession.submit_request(owner, downstream, request)
+    assert ProviderCreditsAdmission.valid_receipt?(admission)
+    witness = :sys.get_state(owner).forwarded_send_witness
+    assert witness.status == :redeemed
+    refute inspect(admission) =~ context.owner_lease_token
+    refute inspect(admission) =~ context.owner_instance_id
+    refute inspect(witness.binding.topology) =~ context.owner_lease_token
+    assert FakeUpstream.count(upstream) == 2
+    assert NativeCompactionAdmission.phase(:sys.get_state(owner).native_compaction_admission) == :collected_unconfirmed
+    assert {:error, :invalid_transition} = WebsocketOwnerSession.admission_control(owner, admission_control(:mark_accounting_started, downstream, capability: capability, now_ms: now))
+    assert FakeUpstream.count(upstream) == 2
+
+    assert observer.() == %{
+             compact_owner_issued: 1,
+             compact_reserved: 1,
+             compact_accounting_started: 1,
+             compact_consumed: 1
+           }
+  end
+
+  test "collect request returns retained result without owner frame or terminal lifecycle",
+       context do
+    parent = self()
+
+    upstream = %{
+      start: fn ->
+        pid =
+          spawn(fn ->
+            receive do
+              :stop -> :ok
+            end
+          end)
+
+        send(parent, {:collect_upstream_started, pid})
+        {:ok, pid}
+      end,
+      send: fn upstream_pid, request, writer ->
+        send(
+          parent,
+          {:collect_upstream_send, upstream_pid, request.websocket_delivery_mode, request.effective_serving_mode, writer}
+        )
+
+        {:ok,
+         %{
+           status: 200,
+           headers: [],
+           terminal: "response.completed",
+           body: "retained-collect-result"
+         }}
+      end,
+      close: fn pid ->
+        send(pid, :stop)
+        :ok
+      end
+    }
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:collect_upstream_started, upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("collect-owner"))
+
+    request = %UpstreamWebsocketSession.Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "collect-request",
+      timeouts: %{},
+      writer: nil,
+      websocket_delivery_mode: :collect_compaction,
+      effective_serving_mode: "full"
+    }
+
+    assert {:ok, %{body: "retained-collect-result", terminal: "response.completed"}} =
+             WebsocketOwnerSession.submit_request(owner, downstream, request, false)
+
+    assert_receive {:collect_upstream_send, ^upstream_pid, :collect_compaction, "full", nil}
+    refute_received {:websocket_owner_frame, _, _, _}
+    refute_received {:websocket_owner_output_commit_probe, _, _, _, _, _, _}
+
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  # A socket that starts closing before the owner accepted any turn of it: the
+  # owner detaches and fences that downstream at once, so the socket's task can
+  # neither prepare nor submit a turn for its gone client, and a new downstream
+  # attaches normally (findings#232 rows 232-171 and 232-175).
+  test "a closing downstream with nothing accepted is detached and fenced before any submission", context do
+    parent = self()
+
+    upstream = %{
+      start: fn ->
+        {:ok, spawn(fn -> receive(do: (:stop -> :ok)) end)}
+      end,
+      send: fn _upstream_pid, request, _writer ->
+        send(parent, {:fenced_owner_upstream_send, request.payload})
+        {:ok, %{status: 200, headers: [], terminal: "response.completed", body: "completed"}}
+      end,
+      close: fn pid ->
+        send(pid, :stop)
+        :ok
+      end
+    }
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert {:ok, closing} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("fenced-closing"))
+
+    assert :detached = WebsocketOwnerSession.detach_previsible_downstream(owner, closing)
+    assert %{downstream: nil, active_turn: nil} = :sys.get_state(owner)
+
+    request = %UpstreamWebsocketSession.Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "fenced-request",
+      timeouts: %{},
+      writer: nil,
+      websocket_delivery_mode: :collect_compaction,
+      effective_serving_mode: "full"
+    }
+
+    assert {:error, :client_disconnected} = WebsocketOwnerSession.submit_request(owner, closing, request, false)
+    assert {:error, :client_disconnected} = WebsocketOwnerSession.prepare_next_replay_descriptor(owner, closing, %{})
+    refute_received {:fenced_owner_upstream_send, _payload}
+
+    # The fence names only the closed downstream: the client's reconnect
+    # attaches as usual and its submission is served.
+    assert {:ok, reconnect} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("fenced-reconnect"))
+    assert reconnect.epoch == closing.epoch + 1
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             WebsocketOwnerSession.submit_request(owner, reconnect, %{request | payload: "reconnect-request"}, false)
+
+    assert_receive {:fenced_owner_upstream_send, "reconnect-request"}
+  end
+
+  # The early owner call carries no lease token check: the owner acts on it
+  # only for the exact downstream (pid, epoch, correlation) it has attached. A
+  # closed socket's late call, arriving after the same client's new socket
+  # attached and before that socket sends its resend, must leave the new
+  # downstream attached and unfenced.
+  test "a closed socket's late early-detach call does not fence the downstream that replaced it", context do
+    parent = self()
+
+    upstream = %{
+      start: fn ->
+        {:ok, spawn(fn -> receive(do: (:stop -> :ok)) end)}
+      end,
+      send: fn _upstream_pid, request, _writer ->
+        send(parent, {:replaced_owner_upstream_send, request.payload})
+        {:ok, %{status: 200, headers: [], terminal: "response.completed", body: "completed"}}
+      end,
+      close: fn pid ->
+        send(pid, :stop)
+        :ok
+      end
+    }
+
+    closed_socket = spawn(fn -> receive(do: (:stop -> :ok)) end)
+    new_socket = spawn(fn -> receive(do: (:stop -> :ok)) end)
+
+    on_exit(fn ->
+      send(closed_socket, :stop)
+      send(new_socket, :stop)
+    end)
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert {:ok, closed} = WebsocketOwnerSession.attach_downstream(owner, %{pid: closed_socket, correlation_id: "replaced-closed"})
+    assert {:ok, replacement} = WebsocketOwnerSession.attach_downstream(owner, %{pid: new_socket, correlation_id: "replaced-new"})
+    assert replacement.epoch == closed.epoch + 1
+
+    assert :not_previsible = WebsocketOwnerSession.detach_previsible_downstream(owner, closed)
+    assert %{downstream: %{pid: ^new_socket, epoch: epoch}, closed_downstream: nil} = :sys.get_state(owner)
+    assert epoch == replacement.epoch
+
+    request = %UpstreamWebsocketSession.Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "replacement-request",
+      timeouts: %{},
+      writer: nil,
+      websocket_delivery_mode: :collect_compaction,
+      effective_serving_mode: "full"
+    }
+
+    assert {:ok, %{terminal: "response.completed"}} = WebsocketOwnerSession.submit_request(owner, replacement, request, false)
+    assert_receive {:replaced_owner_upstream_send, "replacement-request"}
+  end
+
+  test "a closing downstream whose turn the owner already accepted is not fenced", context do
+    release_ref = make_ref()
+    parent = self()
+
+    upstream = %{
+      start: fn ->
+        {:ok, spawn(fn -> receive(do: (:stop -> :ok)) end)}
+      end,
+      send: fn _upstream_pid, _request, _writer ->
+        send(parent, {:accepted_owner_upstream_send, self()})
+
+        receive do
+          {:release_accepted_owner_upstream, ^release_ref} -> :ok
+        end
+
+        {:ok, %{status: 200, headers: [], terminal: "response.completed", body: "completed"}}
+      end,
+      close: fn pid ->
+        send(pid, :stop)
+        :ok
+      end
+    }
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("accepted-closing"))
+
+    request = %UpstreamWebsocketSession.Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "accepted-request",
+      timeouts: %{},
+      writer: nil,
+      websocket_delivery_mode: :collect_compaction,
+      effective_serving_mode: "full"
+    }
+
+    submitter = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, downstream, request, false) end)
+    assert_receive {:accepted_owner_upstream_send, upstream_task}
+
+    assert :not_previsible = WebsocketOwnerSession.detach_previsible_downstream(owner, downstream)
+    assert %{downstream: %{epoch: epoch}, closed_downstream: nil} = :sys.get_state(owner)
+    assert epoch == downstream.epoch
+
+    send(upstream_task, {:release_accepted_owner_upstream, release_ref})
+    assert {:ok, %{terminal: "response.completed"}} = Task.await(submitter)
+  end
+
+  test "replaces a stale registered owner that retires after reporting its status", context do
+    context = %{context | codex_session_id: Ecto.UUID.generate()}
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    persistence = owner_exit_persistence_spy(self(), context)
+
+    {:ok, stale_owner} = RetiringRegisteredOwner.start_link(context, self())
+    assert_receive {:retiring_registered_owner_ready, ^stale_owner}
+    stale_owner_ref = Process.monitor(stale_owner)
+
+    assert {:ok, replacement_owner} =
+             start_owner(context, upstream: upstream, persistence: persistence)
+
+    assert_receive {:DOWN, ^stale_owner_ref, :process, ^stale_owner, :normal}
+    assert_receive {:websocket_owner_harness_upstream_started, replacement_upstream_pid}
+    assert replacement_owner != stale_owner
+    assert Process.alive?(replacement_owner)
+    assert Process.alive?(replacement_upstream_pid)
+    assert WebsocketOwnerSession.lookup(context.codex_session_id) == {:ok, replacement_owner}
+  end
+
+  @tag :rollout_drain_t3
+  test "T3 marker refuses owner creation and reuse while an existing turn still completes",
+       context do
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["in-flight-delta", "in-flight-terminal"]
+      )
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("marker-in-flight"))
+
+    submit_task =
+      Task.async(fn -> WebsocketOwnerSession.submit_frame(owner, downstream, "in-flight") end)
+
+    assert_receive {:websocket_owner_frame, "marker-in-flight", 1, {:data, "in-flight-delta"}}
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+
+    _marker_path = WebsocketRolloutDrainSupport.configure_drain_marker!()
+
+    fresh_context = unique_owner_context(context, "marker-refusal")
+    fresh_upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    assert {:error, :owner_drained} = start_owner(fresh_context, upstream: fresh_upstream)
+    assert {:error, :owner_drained} = start_owner(context, upstream: upstream)
+    assert Process.alive?(owner)
+    refute_received {:websocket_owner_harness_upstream_started, _fresh_upstream_pid}
+
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+
+    assert :ok = Task.await(submit_task, @detection_timeout_ms)
+    assert_receive {:websocket_owner_frame, "marker-in-flight", 1, {:data, "in-flight-terminal"}}
+    assert_receive {:websocket_owner_frame, "marker-in-flight", 1, :complete}
+    assert Process.alive?(owner)
+  end
+
+  # Codex closes its socket right after a final refusal's error frame. When the
+  # upstream task's result came back late (a connection-checkout stall), the
+  # socket's detach cancelled the task and the refusal the client had received
+  # was settled `499 client_disconnected` without its rejection fields
+  # (findings#254 row 254-110, production, Full). A turn whose terminal already
+  # went to that downstream keeps its task: its own result settles it.
+  test "a detach after the turn's terminal reached the downstream keeps the task so its result settles the turn", context do
+    block_ref = make_ref()
+    refusal = CodexPooler.JSON.encode!(%{"type" => "error", "status" => 400, "error" => %{"type" => "invalid_request_error", "message" => "synthetic refusal"}})
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self(), block_ref: block_ref, messages: [refusal])
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("refusal-then-close"))
+
+    submit_task = Task.async(fn -> WebsocketOwnerSession.submit_frame(owner, downstream, "refused-turn") end)
+
+    assert_receive {:websocket_owner_frame, "refusal-then-close", 1, {:data, ^refusal}}
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+
+    assert Task.await(submit_task, @detection_timeout_ms) == :ok
+    assert Process.alive?(owner)
+  end
+
+  @tag :rollout_drain_t3
+  test "T3 a draining existing owner refuses reuse without stopping its active turn", context do
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["draining-owner-delta", "draining-owner-terminal"]
+      )
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("draining-owner"))
+
+    submit_task =
+      Task.async(fn -> WebsocketOwnerSession.submit_frame(owner, downstream, "in-flight") end)
+
+    assert_receive {:websocket_owner_frame, "draining-owner", 1, {:data, "draining-owner-delta"}}
+
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+
+    assert :ok = WebsocketOwnerSession.begin_drain(owner)
+
+    assert {:ok, %{active_turn?: true, draining?: true}} =
+             WebsocketOwnerSession.owner_status(owner)
+
+    assert {:error, :owner_drained} = start_owner(context, upstream: upstream)
+    assert Process.alive?(owner)
+
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+
+    assert :ok = Task.await(submit_task, @detection_timeout_ms)
+
+    assert_receive {:websocket_owner_frame, "draining-owner", 1, {:data, "draining-owner-terminal"}}
+
+    assert_receive {:websocket_owner_frame, "draining-owner", 1, :complete}
+    assert Process.alive?(owner)
+  end
+
+  @tag :rollout_drain_t3
+  test "T3 runtime rollout drain refuses fresh owner creation", context do
+    # The drain reads a registry of its own, so an owner another test left in the application
+    # registry cannot change `owners_seen` (findings#206 row 206-387).
+    harness = WebsocketRolloutDrainSupport.start_rollout_drain_harness(self(), owner_registry: WebsocketRolloutDrainSupport.start_owner_registry!())
+    WebsocketRolloutDrainSupport.configure_rollout_drain_server(harness.name)
+
+    assert %{result: :ok, owners_seen: 0} =
+             RolloutDrain.start_drain(name: harness.name, timeout_ms: 100)
+
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    assert {:error, :owner_drained} = start_owner(context, upstream: upstream)
+    assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(context.codex_session_id)
+    refute_received {:websocket_owner_harness_upstream_started, _upstream_pid}
+  end
+
+  test "graceful drain preserves a reserved compaction retry until its single submit", context do
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["reserved-compact-delta", "reserved-compact-terminal"]
+      )
+
+    owner = start_supervised_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("reserved-compact"))
+
+    assert {:ok, hold} =
+             WebsocketOwnerSession.reserve_compaction_retry_submit(
+               owner,
+               context.owner_lease_token,
+               downstream,
+               self()
+             )
+
+    assert :ok = WebsocketOwnerSession.begin_drain(owner)
+
+    assert {:ok, %{active_turn?: true, draining?: true}} =
+             WebsocketOwnerSession.owner_status(owner)
+
+    assert {:error, :owner_unavailable} =
+             WebsocketOwnerSession.reserve_compaction_retry_submit(
+               owner,
+               context.owner_lease_token,
+               downstream,
+               self()
+             )
+
+    request = websocket_request()
+
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.submit_request(owner, downstream, request)
+
+    assert WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid) == []
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_compaction_retry(owner, downstream, request, false, hold)
+      end)
+
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref},
+                   @detection_timeout_ms
+
+    assert %{compaction_retry_submit_hold: nil, draining?: true, active_turn: active} =
+             :sys.get_state(owner)
+
+    assert is_map(active)
+
+    assert {:error, :owner_unavailable} =
+             WebsocketOwnerSession.submit_compaction_retry(
+               owner,
+               downstream,
+               request,
+               false,
+               hold
+             )
+
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+    assert :ok = Task.await(submit_task, @detection_timeout_ms)
+    assert [_single_request] = WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid)
+    assert %{active_turn: nil, draining?: true} = :sys.get_state(owner)
+  end
+
+  test "hard drain terminates a held compaction retry before any upstream send", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    owner = start_supervised_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("held-hard-drain"))
+
+    assert {:ok, hold} =
+             WebsocketOwnerSession.reserve_compaction_retry_submit(
+               owner,
+               context.owner_lease_token,
+               downstream,
+               self()
+             )
+
+    monitor = Process.monitor(owner)
+    assert WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid) == []
+    assert :ok = WebsocketOwnerSession.drain_owner(owner)
+
+    assert_receive {:DOWN, ^monitor, :process, ^owner, :normal},
+                   @detection_timeout_ms
+
+    assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
+    assert :ok = WebsocketOwnerSession.cancel_compaction_retry_submit(hold)
   end
 
   test "owner survives caller shutdown so websocket cleanup can detach", context do
@@ -80,6 +1425,273 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     :ok = GenServer.stop(owner)
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
     assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
+  end
+
+  test "unrelated exit messages do not retire the owner", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    send(owner, {:EXIT, self(), :shutdown})
+
+    assert {:ok, %{upstream_alive?: true}} = WebsocketOwnerSession.owner_status(owner)
+    assert Process.alive?(upstream_pid)
+  end
+
+  test "idle owner retires when its current upstream exits", context do
+    context = uuid_owner_context(context)
+    {upstream, upstream_pid} = exit_controlled_upstream(self(), :idle)
+    persistence = owner_exit_persistence_spy(self(), context)
+
+    assert {:ok, owner} =
+             start_owner(context, upstream: upstream, persistence: persistence)
+
+    assert_receive {:exit_controlled_upstream_started, :idle, ^upstream_pid}
+    owner_ref = monitor_owner(owner)
+
+    Process.exit(upstream_pid, :shutdown)
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+    assert_receive {:owner_exit_release, session_id, lease_token, "owner_crashed", nil}, @detection_timeout_ms
+    assert session_id == context.codex_session_id
+    assert lease_token == context.owner_lease_token
+    refute_received {:owner_exit_interrupt, _, _}
+    assert_receive {:exit_controlled_upstream_closed, :idle, ^upstream_pid}, @detection_timeout_ms
+    assert await_owner_unavailable(context.codex_session_id) == {:error, :owner_unavailable}
+  end
+
+  test "pre-visible active owner settles once and retires when its current upstream exits",
+       context do
+    context = uuid_owner_context(context)
+    {upstream, upstream_pid} = exit_controlled_upstream(self(), :pre_visible)
+    persistence = owner_exit_persistence_spy(self(), context)
+
+    assert {:ok, owner} =
+             start_owner(context, upstream: upstream, persistence: persistence)
+
+    assert_receive {:exit_controlled_upstream_started, :pre_visible, ^upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("upstream-exit-pre")
+             )
+
+    submitter = owner_exit_submitter(self(), owner, downstream, :pre_visible)
+    assert_receive {:exit_controlled_upstream_send, :pre_visible, ^upstream_pid, 1}
+    owner_ref = monitor_owner(owner)
+
+    Process.exit(upstream_pid, :shutdown)
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-pre", 1, {:error, :owner_crashed, safe_payload}}, @detection_timeout_ms
+
+    assert safe_payload.code == "owner_crashed"
+    assert_receive {:websocket_owner_frame, "upstream-exit-pre", 1, :complete}, @detection_timeout_ms
+
+    assert_receive {:owner_exit_submitter_outcome, :pre_visible, {:return, {:error, :owner_crashed}}}, @detection_timeout_ms
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+    assert_owner_exit_persisted_once(context)
+    assert_receive {:exit_controlled_upstream_closed, :pre_visible, ^upstream_pid}, @detection_timeout_ms
+    assert await_owner_unavailable(context.codex_session_id) == {:error, :owner_unavailable}
+    refute_received {:exit_controlled_upstream_send, :pre_visible, _upstream_pid, 2}
+    refute_received {:websocket_owner_frame, "upstream-exit-pre", 1, _duplicate}
+    refute Process.alive?(submitter)
+  end
+
+  test "post-visible active owner preserves the commit barrier before retiring", context do
+    context = uuid_owner_context(context)
+    {upstream, upstream_pid} = exit_controlled_upstream(self(), :post_visible)
+    persistence = owner_exit_persistence_spy(self(), context)
+
+    assert {:ok, owner} =
+             start_owner(context, upstream: upstream, persistence: persistence)
+
+    assert_receive {:exit_controlled_upstream_started, :post_visible, ^upstream_pid}
+
+    assert {:ok, stable_downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("upstream-exit-post")
+             )
+
+    submitter = owner_exit_submitter(self(), owner, stable_downstream, :post_visible, true)
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-post", 1, ^submitter, {:data, "visible-before-upstream-exit"}}
+
+    assert_receive {:exit_controlled_upstream_send, :post_visible, ^upstream_pid, 1}
+    owner_ref = monitor_owner(owner)
+
+    Process.exit(upstream_pid, :shutdown)
+
+    assert_receive {:websocket_owner_output_commit_probe, "upstream-exit-post", 1, ^submitter, active_turn_ref, ^owner, probe_ref}, @detection_timeout_ms
+
+    refute_received {:websocket_owner_frame, "upstream-exit-post", 1, ^submitter, :complete}
+    refute_received {:owner_exit_release, _session_id, _lease_token, _reason, _cause}
+
+    send(
+      owner,
+      {:websocket_owner_output_commit_ack, "upstream-exit-post", 1, submitter, active_turn_ref, probe_ref, true}
+    )
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-post", 1, ^submitter, {:error, :upstream_stream_error, safe_payload}}, @detection_timeout_ms
+
+    assert safe_payload.code == "server_error"
+    assert_receive {:websocket_owner_frame, "upstream-exit-post", 1, ^submitter, :complete}, @detection_timeout_ms
+
+    assert_receive {:owner_exit_submitter_outcome, :post_visible, {:return, {:error, %{reason: :owner_crashed}}}}, @detection_timeout_ms
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+    assert_owner_exit_persisted_once(context)
+    assert_receive {:exit_controlled_upstream_closed, :post_visible, ^upstream_pid}, @detection_timeout_ms
+    assert await_owner_unavailable(context.codex_session_id) == {:error, :owner_unavailable}
+    refute_received {:exit_controlled_upstream_send, :post_visible, _upstream_pid, 2}
+    refute_received {:websocket_owner_frame, "upstream-exit-post", 1, ^submitter, _duplicate}
+    refute Process.alive?(submitter)
+  end
+
+  @tag :owner_exit_settlement_fix
+  test "post-visible owner retires when downstream detaches during the commit probe", context do
+    context = uuid_owner_context(context)
+    {upstream, upstream_pid} = exit_controlled_upstream(self(), :post_visible)
+    persistence = owner_exit_persistence_spy(self(), context)
+
+    assert {:ok, owner} =
+             start_owner(context, upstream: upstream, persistence: persistence)
+
+    assert_receive {:exit_controlled_upstream_started, :post_visible, ^upstream_pid}
+
+    assert {:ok, stable_downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("upstream-exit-probe-detach")
+             )
+
+    submitter =
+      owner_exit_submitter(self(), owner, stable_downstream, :probe_detach, true)
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-probe-detach", 1, ^submitter, {:data, "visible-before-upstream-exit"}}
+
+    assert_receive {:exit_controlled_upstream_send, :post_visible, ^upstream_pid, 1}
+    owner_ref = monitor_owner(owner)
+
+    Process.exit(upstream_pid, :shutdown)
+
+    assert_receive {:websocket_owner_output_commit_probe, "upstream-exit-probe-detach", 1, ^submitter, _active_turn_ref, ^owner, _probe_ref}, @detection_timeout_ms
+
+    refute_received {:owner_exit_release, _session_id, _lease_token, _reason, _cause}
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, stable_downstream)
+
+    assert_receive {:owner_exit_submitter_outcome, :probe_detach, {:return, {:error, :client_disconnected}}}, @detection_timeout_ms
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+    assert_owner_exit_persisted_once(context)
+    assert_receive {:exit_controlled_upstream_closed, :post_visible, ^upstream_pid}, @detection_timeout_ms
+    assert WebsocketOwnerSession.lookup(context.codex_session_id) == {:error, :owner_unavailable}
+
+    refute_received {:websocket_owner_frame, "upstream-exit-probe-detach", 1, ^submitter, :complete}
+  end
+
+  @tag :owner_exit_settlement_fix
+  test "post-visible owner retires when its submitter dies during the commit probe", context do
+    context = uuid_owner_context(context)
+    {upstream, upstream_pid} = exit_controlled_upstream(self(), :post_visible)
+    persistence = owner_exit_persistence_spy(self(), context)
+
+    assert {:ok, owner} =
+             start_owner(context, upstream: upstream, persistence: persistence)
+
+    assert_receive {:exit_controlled_upstream_started, :post_visible, ^upstream_pid}
+
+    assert {:ok, stable_downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("upstream-exit-submitter-death")
+             )
+
+    submitter =
+      owner_exit_submitter(self(), owner, stable_downstream, :submitter_death, true)
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-submitter-death", 1, ^submitter, {:data, "visible-before-upstream-exit"}}
+
+    assert_receive {:exit_controlled_upstream_send, :post_visible, ^upstream_pid, 1}
+    owner_ref = monitor_owner(owner)
+
+    Process.exit(upstream_pid, :shutdown)
+
+    assert_receive {:websocket_owner_output_commit_probe, "upstream-exit-submitter-death", 1, ^submitter, _active_turn_ref, ^owner, _probe_ref}, @detection_timeout_ms
+
+    refute_received {:owner_exit_release, _session_id, _lease_token, _reason, _cause}
+    submitter_ref = Process.monitor(submitter)
+    Process.exit(submitter, :shutdown)
+    assert_receive {:DOWN, ^submitter_ref, :process, ^submitter, :shutdown}, @detection_timeout_ms
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-submitter-death", 1, ^submitter, {:error, :client_disconnected, safe_payload}}, @detection_timeout_ms
+
+    assert safe_payload.code == "client_disconnected"
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-submitter-death", 1, ^submitter, :complete}, @detection_timeout_ms
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+    assert_owner_exit_persisted_once(context)
+    assert_receive {:exit_controlled_upstream_closed, :post_visible, ^upstream_pid}, @detection_timeout_ms
+    assert WebsocketOwnerSession.lookup(context.codex_session_id) == {:error, :owner_unavailable}
+    refute_received {:owner_exit_submitter_outcome, :submitter_death, _outcome}
+  end
+
+  @tag :owner_exit_settlement_fix
+  test "post-visible owner retires when commit probe delivery fails", context do
+    context = uuid_owner_context(context)
+    {upstream, upstream_pid} = exit_controlled_upstream(self(), :post_visible)
+    persistence = owner_exit_persistence_spy(self(), context)
+    parent = self()
+
+    downstream_sender = fn
+      _pid, {:websocket_owner_output_commit_probe, _, _, _, _, _, _} ->
+        send(parent, :owner_exit_probe_delivery_failed)
+        {:error, :owner_unavailable}
+
+      pid, message ->
+        send(pid, message)
+        :ok
+    end
+
+    assert {:ok, owner} =
+             start_owner(context,
+               upstream: upstream,
+               persistence: persistence,
+               downstream_sender: downstream_sender
+             )
+
+    assert_receive {:exit_controlled_upstream_started, :post_visible, ^upstream_pid}
+
+    assert {:ok, stable_downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("upstream-exit-probe-failure")
+             )
+
+    submitter =
+      owner_exit_submitter(self(), owner, stable_downstream, :probe_failure, true)
+
+    assert_receive {:websocket_owner_frame, "upstream-exit-probe-failure", 1, ^submitter, {:data, "visible-before-upstream-exit"}}
+
+    assert_receive {:exit_controlled_upstream_send, :post_visible, ^upstream_pid, 1}
+    owner_ref = monitor_owner(owner)
+
+    Process.exit(upstream_pid, :shutdown)
+
+    assert_receive :owner_exit_probe_delivery_failed, @detection_timeout_ms
+
+    assert_receive {:owner_exit_submitter_outcome, :probe_failure, {:return, {:error, %{reason: :owner_crashed}}}}, @detection_timeout_ms
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :owner_crashed}, @detection_timeout_ms
+    assert_owner_exit_persisted_once(context)
+    assert_receive {:exit_controlled_upstream_closed, :post_visible, ^upstream_pid}, @detection_timeout_ms
+    assert WebsocketOwnerSession.lookup(context.codex_session_id) == {:error, :owner_unavailable}
+
+    refute_received {:websocket_owner_frame, "upstream-exit-probe-failure", 1, ^submitter, :complete}
   end
 
   test "reject_if_busy attach refuses to steal an attached downstream", context do
@@ -157,24 +1769,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
     assert Process.read_timer(first_timer_ref) == false
     assert :ok = WebsocketOwnerSession.submit_frame(owner, second_downstream, @sentinel)
-    assert_receive {:websocket_owner_frame, "idle-second", 1, {:data, "reattached-delta"}}
-    assert_receive {:websocket_owner_frame, "idle-second", 1, :complete}
+    assert_receive {:websocket_owner_frame, "idle-second", 2, {:data, "reattached-delta"}}
+    assert_receive {:websocket_owner_frame, "idle-second", 2, :complete}
 
     owner_ref = Process.monitor(owner)
     assert :ok = WebsocketOwnerSession.detach_downstream(owner, second_downstream)
-    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}, 1_000
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}, @detection_timeout_ms
     assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
   end
 
   test "local gateway owners capture node settings only when each owner starts" do
     previous_operational_settings = Application.get_env(:codex_pooler, OperationalSettings)
 
-    previous_forwarding =
-      Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
 
     on_exit(fn ->
       restore_operational_settings(previous_operational_settings)
-      restore_owner_forwarding(previous_forwarding)
     end)
 
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
@@ -217,17 +1827,45 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert %{idle_shutdown_ms: ^second_timeout} = :sys.get_state(second_owner)
   end
 
+  # Findings #119 item 4: the forwarder options carried the handoff timeouts
+  # accepted by `start_owner/1`, but the local gateway start path forwarded
+  # only the upstream boundary, so the started owner silently kept defaults.
+  test "local gateway owners start with the handoff timeouts from the forwarder options" do
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+
+    auth = auth_context()
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    handoff_soft_timeout_ms = 25
+    handoff_absolute_timeout_ms = 2_000
+
+    assert {:ok, runtime} =
+             Gateway.prepare_websocket_session(auth, %{
+               accepted_turn_state: "owner-handoff-#{System.unique_integer([:positive])}",
+               websocket_owner_forwarder_opts: [
+                 upstream: upstream,
+                 handoff_soft_timeout_ms: handoff_soft_timeout_ms,
+                 handoff_absolute_timeout_ms: handoff_absolute_timeout_ms
+               ]
+             })
+
+    session_id = runtime.codex_session.id
+    on_exit(fn -> cleanup_owner_session(session_id) end)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    assert {:ok, owner} = WebsocketOwnerSession.lookup(session_id)
+
+    assert %{
+             handoff_soft_timeout_ms: ^handoff_soft_timeout_ms,
+             handoff_absolute_timeout_ms: ^handoff_absolute_timeout_ms
+           } = :sys.get_state(owner)
+  end
+
   test "owner lifecycle logs start reuse lookup miss and terminate metadata", context do
     upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
     request_id = "req-owner-lifecycle-#{System.unique_integer([:positive])}"
-    previous_level = Logger.level()
-
-    Logger.configure(level: :info)
-
-    on_exit(fn -> Logger.configure(level: previous_level) end)
 
     logs =
-      capture_log([level: :info], fn ->
+      capture_info_log(fn ->
         assert {:ok, owner} = start_owner(context, upstream: upstream, request_id: request_id)
         assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
 
@@ -256,6 +1894,41 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert logs =~ "owner_exit_reason=owner_drained"
     refute logs =~ context.owner_lease_token
     refute logs =~ @sentinel
+  end
+
+  test "uses the renewal delay policy for every owner lease cycle" do
+    context = db_owner_context()
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    test_pid = self()
+    delay_ref = make_ref()
+
+    owner_renewal_delay = fn timeout ->
+      send(test_pid, {:websocket_owner_renewal_delay, delay_ref, timeout})
+      45_000
+    end
+
+    # 10 s is below the default ttl's third, so the cap leaves it as given; the
+    # policy's longer answer is still bounded by the interval.
+    assert {:ok, owner} =
+             start_owner(context,
+               upstream: upstream,
+               owner_renewal_ms: 10_000,
+               owner_renewal_delay: owner_renewal_delay
+             )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    assert_receive {:websocket_owner_renewal_delay, ^delay_ref, 10_000}
+
+    assert %{owner_renewal_ref: first_timer_ref} = :sys.get_state(owner)
+    assert is_reference(first_timer_ref)
+    assert Process.read_timer(first_timer_ref) in 0..10_000
+    cancel_owner_timer(first_timer_ref)
+
+    send(owner, :renew_owner_lease)
+
+    assert_receive {:websocket_owner_renewal_delay, ^delay_ref, 10_000}
   end
 
   test "renews persisted owner lease while owner remains alive" do
@@ -288,6 +1961,75 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
              :gt
 
     assert {:ok, ^owner, :existing} = start_owner(context, upstream: upstream)
+  end
+
+  # The HTTP heartbeat caps its cadence at ttl / 3; the websocket owner renews
+  # on the same `OwnerRenewalSchedule` cap, so a renewal setting at or above
+  # the lease ttl cannot let a live owner's lease lapse between renewals
+  # (findings#206 row 206-499). The delay policy takes the whole interval, the
+  # stagger's worst case, and every scheduled renewal must land before the
+  # lease it renews expires.
+  test "renews before its lease expires when the renewal setting is at or above the lease ttl" do
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
+
+    for {ttl_seconds, renewal_seconds} <- [{45, 60}, {24, 24}] do
+      settings = %{OperationalSettings.current() | bridge_owner_lease_ttl_seconds: ttl_seconds, bridge_owner_lease_renewal_seconds: renewal_seconds}
+      Application.put_env(:codex_pooler, OperationalSettings, Keyword.put(previous, :settings, settings))
+
+      context = db_owner_context()
+      on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+
+      upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+      test_pid = self()
+      delay_ref = make_ref()
+
+      owner_renewal_delay = fn interval ->
+        send(test_pid, {:websocket_owner_renewal_interval, delay_ref, interval})
+        interval
+      end
+
+      assert {:ok, owner} = start_owner(context, upstream: upstream, owner_renewal_delay: owner_renewal_delay)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+      for cycle <- [:start, :renewed] do
+        if cycle == :renewed, do: send(owner, :renew_owner_lease)
+
+        assert_receive {:websocket_owner_renewal_interval, ^delay_ref, interval}
+        assert interval <= div(ttl_seconds * 1_000, 3), "ttl=#{ttl_seconds} renewal=#{renewal_seconds} cycle=#{cycle} interval=#{interval}"
+
+        assert %{owner_renewal_ref: timer_ref} = :sys.get_state(owner)
+        renewal_in_ms = Process.read_timer(timer_ref)
+        lease_left_ms = lease_left_ms!(context.codex_session_id)
+
+        assert is_integer(renewal_in_ms) and renewal_in_ms < lease_left_ms,
+               "ttl=#{ttl_seconds} renewal=#{renewal_seconds} cycle=#{cycle} renewal_in_ms=#{inspect(renewal_in_ms)} lease_left_ms=#{lease_left_ms}"
+      end
+
+      assert active_lease!(context.codex_session_id).lease_token == context.owner_lease_token
+    end
+  end
+
+  test "caps an explicit renewal interval at a third of the lease ttl" do
+    context = db_owner_context()
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    test_pid = self()
+    delay_ref = make_ref()
+    ttl_ms = OperationalSettings.current().bridge_owner_lease_ttl_seconds * 1_000
+
+    owner_renewal_delay = fn interval ->
+      send(test_pid, {:websocket_owner_renewal_interval, delay_ref, interval})
+      interval
+    end
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream, owner_renewal_ms: ttl_ms, owner_renewal_delay: owner_renewal_delay)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    assert_receive {:websocket_owner_renewal_interval, ^delay_ref, interval}
+    assert interval == div(ttl_ms, 3)
+
+    assert %{owner_renewal_ref: timer_ref} = :sys.get_state(owner)
+    assert Process.read_timer(timer_ref) < lease_left_ms!(context.codex_session_id)
   end
 
   test "stops as stale owner when renewal token is no longer current", context do
@@ -333,7 +2075,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
   test "serializes accepted frame sends in upstream writer order", context do
     upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
-    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    persistence = %{
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}}
+      end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        persistence: persistence,
+        replay_suspender: fn _input -> {:error, :terminal_won} end
+      )
+
     assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
 
     {:ok, downstream} =
@@ -345,9 +2102,105 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid) == ["frame-a", "frame-b"]
   end
 
+  test "restore accepts only the exact stable boundary and computes reconnect state", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    persistence = %{
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}}
+      end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+
+    {:ok, owner} = start_owner(context, upstream: upstream, persistence: persistence)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    restore_input = %{pid: self(), epoch: 9, correlation_id: "restore-exact"}
+
+    assert {:ok, stable_downstream} =
+             WebsocketOwnerSession.restore_downstream(owner, restore_input)
+
+    assert MapSet.new(Map.keys(stable_downstream)) ==
+             MapSet.new([:pid, :epoch, :correlation_id, :active_turn_reconnect?])
+
+    assert stable_downstream.active_turn_reconnect? == false
+    assert :sys.get_state(owner).downstream == stable_downstream
+
+    assert WebsocketOwnerSession.restore_downstream(
+             owner,
+             Map.put(restore_input, :owner_turn_id, self())
+           ) == {:error, :stale_downstream}
+
+    assert :sys.get_state(owner).downstream == stable_downstream
+  end
+
+  test "public active turn keeps identity only in per-call state and emits five-element frames",
+       context do
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["public-delta-a", "public-delta-b"]
+      )
+
+    persistence = %{
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}}
+      end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+
+    {:ok, owner} = start_owner(context, upstream: upstream, persistence: persistence)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("public-owner-turn"))
+
+    owner_turn_id = self()
+    per_call_downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_frame(owner, per_call_downstream, "public-request")
+      end)
+
+    assert_receive {:websocket_owner_frame, "public-owner-turn", 1, ^owner_turn_id, {:data, "public-delta-a"}}
+
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+
+    owner_state = :sys.get_state(owner)
+
+    assert MapSet.new(Map.keys(owner_state.downstream)) ==
+             MapSet.new([:pid, :epoch, :correlation_id, :active_turn_reconnect?])
+
+    refute Map.has_key?(owner_state.downstream, :owner_turn_id)
+
+    assert MapSet.new(Map.keys(owner_state.active_turn.downstream)) ==
+             MapSet.new([
+               :pid,
+               :epoch,
+               :correlation_id,
+               :active_turn_reconnect?,
+               :owner_turn_id
+             ])
+
+    assert owner_state.active_turn.downstream.owner_turn_id == owner_turn_id
+
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+    assert :ok = Task.await(submit_task, @detection_timeout_ms)
+
+    assert_receive {:websocket_owner_frame, "public-owner-turn", 1, ^owner_turn_id, {:data, "public-delta-b"}}
+
+    assert_receive {:websocket_owner_frame, "public-owner-turn", 1, ^owner_turn_id, :complete}
+    refute_received {:websocket_owner_frame, "public-owner-turn", 1, _legacy_payload}
+  end
+
   test "returns upstream request result while completing the active downstream", context do
     terminal_frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.completed",
         "response" => %{
           "id" => "resp_owner_result",
@@ -384,9 +2237,1331 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert_receive {:websocket_owner_frame, "request-result", 1, :complete}
   end
 
+  test "observer-bearing requests return owner acceptance through the call result", context do
+    terminal_frame = terminal_frame("response.completed", "resp_owner_acceptance")
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        messages: [terminal_frame],
+        return_request_result?: true
+      )
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("owner-acceptance"))
+
+    test_pid = self()
+
+    request = %{
+      websocket_request()
+      | submission_observer: fn ->
+          send(test_pid, {:owner_submission_observer_ran, self()})
+        end
+    }
+
+    assert {:websocket_owner_submission_accepted, {:ok, %{terminal: "response.completed", status: 200}}} =
+             WebsocketOwnerSession.submit_request(owner, downstream, request)
+
+    refute_received {:owner_submission_observer_ran, _observer_pid}
+    assert_receive {:websocket_owner_frame, "owner-acceptance", 1, {:data, ^terminal_frame}}
+    assert_receive {:websocket_owner_frame, "owner-acceptance", 1, :complete}
+  end
+
+  test "terminal-first delivery waits for the matching upstream task result", context do
+    terminal_frame = terminal_frame("response.completed", "resp_terminal_first")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("terminal-first"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+
+    assert_receive {:websocket_owner_frame, "terminal-first", 1, {:data, ^terminal_frame}}
+
+    assert %{active_turn: %{terminal_forwarded?: true, pending_result: nil}} =
+             :sys.get_state(owner)
+
+    refute_received {:websocket_owner_frame, "terminal-first", 1, :complete}
+
+    release_controlled(barriers, controls, :task_result)
+
+    assert Task.await(submit_task, @detection_timeout_ms) == terminal_result(terminal_frame, "response.completed")
+    assert_receive {:websocket_owner_frame, "terminal-first", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "result-first settlement waits until the matching terminal reaches the downstream",
+       context do
+    terminal_frame = terminal_frame("response.completed", "resp_result_first")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        terminal_delivery_timeout_ms: @terminal_delivery_scenario_timeout_ms
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("result-first"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+
+    assert %{
+             active_turn: %{
+               terminal_forwarded?: false,
+               pending_result: pending_result,
+               terminal_delivery_timer_ref: terminal_delivery_timer_ref
+             }
+           } = await_pending_terminal_result(owner)
+
+    assert Process.read_timer(terminal_delivery_timer_ref) > @detection_timeout_ms
+    assert pending_result == terminal_result(terminal_frame, "response.completed")
+    assert Task.yield(submit_task, 0) == nil
+    refute_received {:websocket_owner_frame, "result-first", 1, :complete}
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+
+    assert_receive {:websocket_owner_frame, "result-first", 1, {:data, ^terminal_frame}}
+    assert Task.await(submit_task, @detection_timeout_ms) == terminal_result(terminal_frame, "response.completed")
+    assert_receive {:websocket_owner_frame, "result-first", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "local owner preserves the structured response identity through terminal settlement",
+       context do
+    response_id = "resp_local_owner_identity"
+    terminal_frame = terminal_frame("response.completed", response_id)
+
+    expected_result =
+      terminal_result(terminal_frame, "response.completed")
+      |> elem(1)
+      |> Map.put(:response_id, response_id)
+
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: {:ok, expected_result}
+      )
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        terminal_delivery_timeout_ms: @terminal_delivery_scenario_timeout_ms
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("local-response-identity"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+
+    assert Task.await(submit_task, @detection_timeout_ms) == {:ok, expected_result}
+
+    assert_receive {:websocket_owner_frame, "local-response-identity", 1, {:data, ^terminal_frame}}
+
+    assert_receive {:websocket_owner_frame, "local-response-identity", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "classified terminal delivery does not reparse a non-JSON downstream frame", context do
+    terminal_frame = "terminal-frame-already-classified"
+    terminal_result = terminal_result(terminal_frame, "response.completed")
+
+    upstream = %{
+      start: fn -> Agent.start_link(fn -> :ready end) end,
+      send: fn _upstream_pid, _request, writer ->
+        writer.(
+          terminal_frame,
+          %TerminalDiscriminator{terminal: "response.completed"}
+        )
+
+        terminal_result
+      end,
+      close: fn upstream_pid -> Agent.stop(upstream_pid) end
+    }
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("classified-terminal"))
+
+    assert WebsocketOwnerSession.submit_request(owner, downstream, websocket_request()) ==
+             terminal_result
+
+    assert_receive {:websocket_owner_frame, "classified-terminal", 1, {:data, ^terminal_frame}}
+    assert_receive {:websocket_owner_frame, "classified-terminal", 1, :complete}
+    refute_received {:websocket_owner_frame, "classified-terminal", 1, {:data, ^terminal_frame}}
+    refute_received {:websocket_owner_frame, "classified-terminal", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "result-first settlement preserves every normalized terminal class exactly once",
+       context do
+    for {frame_type, result_type} <- [
+          {"response.completed", "response.completed"},
+          {"response.done", "response.completed"},
+          {"response.failed", "response.failed"},
+          {"response.incomplete", "response.incomplete"},
+          {"error", "error"}
+        ] do
+      case_id = String.replace(frame_type, ".", "-")
+      terminal_frame = terminal_frame(frame_type, "resp_#{case_id}")
+      controls = WebsocketOwnerNodeHarness.two_sender_controls()
+      owner_context = unique_owner_context(context, case_id)
+
+      upstream =
+        WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+          terminal_frames: [terminal_frame],
+          task_result: terminal_result(terminal_frame, result_type)
+        )
+
+      {:ok, owner} =
+        start_owner(owner_context,
+          upstream: upstream,
+          terminal_delivery_timeout_ms: @terminal_delivery_scenario_timeout_ms
+        )
+
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+      {:ok, downstream} =
+        WebsocketOwnerSession.attach_downstream(owner, downstream_target(case_id))
+
+      submit_task =
+        Task.async(fn ->
+          WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+        end)
+
+      barriers = await_two_sender_barriers(controls)
+      release_controlled(barriers, controls, :task_result)
+
+      assert %{active_turn: %{pending_result: pending_result}} =
+               await_pending_terminal_result(owner)
+
+      assert pending_result == terminal_result(terminal_frame, result_type)
+
+      release_controlled(barriers, controls, :nonterminal_frames)
+      terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+      release_controlled(terminal_barrier, controls, :terminal_frames)
+
+      assert_receive {:websocket_owner_frame, ^case_id, 1, {:data, ^terminal_frame}}
+      assert Task.await(submit_task, @detection_timeout_ms) == terminal_result(terminal_frame, result_type)
+      assert_receive {:websocket_owner_frame, ^case_id, 1, :complete}
+      refute_received {:websocket_owner_frame, ^case_id, 1, {:data, ^terminal_frame}}
+      refute_received {:websocket_owner_frame, ^case_id, 1, :complete}
+      assert %{active_turn: nil} = :sys.get_state(owner)
+    end
+  end
+
+  test "nonterminal task results retain eager settlement", context do
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls, task_result: {:ok, %{status: 200, terminal: nil}})
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("nonterminal-result"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+
+    assert Task.await(submit_task, @detection_timeout_ms) == {:ok, %{status: 200, terminal: nil}}
+    assert_receive {:websocket_owner_frame, "nonterminal-result", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+  end
+
+  test "public interrupted turns preserve ack ordering and consume a prior socket terminal",
+       context do
+    for committed? <- [false, true] do
+      owner_context = unique_owner_context(context, "commit-#{committed?}")
+      visible_frame = "visible-#{committed?}"
+      upstream = interrupted_upstream(self(), visible_frame)
+      {:ok, owner} = start_owner(owner_context, upstream: upstream)
+
+      {:ok, stable_downstream} =
+        WebsocketOwnerSession.attach_downstream(
+          owner,
+          downstream_target("commit-#{committed?}")
+        )
+
+      owner_turn_id = self()
+      downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+      submit_task =
+        Task.async(fn ->
+          WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+        end)
+
+      assert_receive {:websocket_owner_frame, correlation_id, epoch, ^owner_turn_id, {:data, ^visible_frame}}
+
+      assert_receive {:websocket_owner_output_commit_probe, ^correlation_id, ^epoch, ^owner_turn_id, active_turn_ref, ^owner, probe_ref}
+
+      assert Task.yield(submit_task, 0) == nil
+
+      send(
+        owner,
+        {:websocket_owner_output_commit_ack, correlation_id, epoch, owner_turn_id, active_turn_ref, probe_ref, committed?}
+      )
+
+      if committed? do
+        assert_receive {:websocket_owner_frame, ^correlation_id, ^epoch, ^owner_turn_id, {:error, :upstream_stream_error, safe_payload}}
+
+        assert safe_payload.code == "server_error"
+      else
+        refute_received {:websocket_owner_frame, ^correlation_id, ^epoch, ^owner_turn_id, {:error, :upstream_stream_error, _payload}}
+      end
+
+      assert_receive {:websocket_owner_frame, ^correlation_id, ^epoch, ^owner_turn_id, :complete}
+      assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+      assert %{active_turn: nil} = :sys.get_state(owner)
+    end
+
+    visible_frame =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_text.delta",
+        "delta" => "visible-before-overflow",
+        "sequence_number" => PublicResponsesSequence.max_safe_integer() - 1
+      })
+
+    overflow_frame =
+      CodexPooler.JSON.encode!(%{
+        "type" => "response.output_text.delta",
+        "delta" => "overflow"
+      })
+
+    upstream = %{
+      start: fn -> Agent.start_link(fn -> :ready end) end,
+      send: fn _upstream_pid, _request, writer ->
+        _result = writer.(visible_frame, TerminalDiscriminator.classify(visible_frame))
+        _result = writer.(overflow_frame, TerminalDiscriminator.classify(overflow_frame))
+        interrupted_result()
+      end,
+      close: fn upstream_pid -> Agent.stop(upstream_pid) end
+    }
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("socket-overflow"))
+
+    submit_task =
+      Task.async(fn ->
+        receive do
+          {:submit_owner_turn, downstream} ->
+            WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+        end
+      end)
+
+    owner_turn_id = submit_task.pid
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+    send(owner_turn_id, {:submit_owner_turn, downstream})
+
+    opts =
+      %{}
+      |> RequestOptions.for_websocket()
+      |> RequestOptions.put_openai_compatibility(public_openai_responses_stream: true)
+
+    socket_state = %{
+      opts: opts,
+      tasks: MapSet.new([owner_turn_id]),
+      task_monitors: %{},
+      queued_response_payloads: :queue.new(),
+      public_response_task_pid: owner_turn_id,
+      public_responses_websocket_state: nil,
+      public_turn_task_done?: false,
+      public_turn_owner_complete?: false,
+      public_turn_aborted?: false,
+      public_turn_output_committed?: false,
+      websocket_owner_downstream: stable_downstream
+    }
+
+    assert_receive {:websocket_owner_frame, "socket-overflow", 1, ^owner_turn_id, {:data, ^visible_frame}}
+
+    assert {:push, {:text, visible_payload}, socket_state} =
+             CodexResponsesSocket.handle_info(
+               {:websocket_owner_frame, "socket-overflow", 1, owner_turn_id, {:data, visible_frame}},
+               socket_state
+             )
+
+    assert CodexPooler.JSON.decode!(visible_payload)["type"] == "response.output_text.delta"
+
+    assert_receive {:websocket_owner_frame, "socket-overflow", 1, ^owner_turn_id, {:data, ^overflow_frame}}
+
+    assert {:push, {:text, overflow_payload}, socket_state} =
+             CodexResponsesSocket.handle_info(
+               {:websocket_owner_frame, "socket-overflow", 1, owner_turn_id, {:data, overflow_frame}},
+               socket_state
+             )
+
+    assert CodexPooler.JSON.decode!(overflow_payload)["error"]["code"] ==
+             "websocket_sequence_exhausted"
+
+    assert_receive {:websocket_owner_output_commit_probe, "socket-overflow", 1, ^owner_turn_id, active_turn_ref, ^owner, probe_ref} = probe
+
+    assert {:ok, ^socket_state} = CodexResponsesSocket.handle_info(probe, socket_state)
+
+    assert_receive {:websocket_owner_frame, "socket-overflow", 1, ^owner_turn_id, {:error, :upstream_stream_error, safe_payload}} = owner_error
+
+    {{:ok, socket_state}, logs} =
+      with_log([level: :warning], fn ->
+        CodexResponsesSocket.handle_info(owner_error, socket_state)
+      end)
+
+    assert length(Regex.scan(~r/websocket native turn failed/, logs)) == 1
+    refute logs =~ "owner_forward_timeout"
+    refute CodexPooler.JSON.encode!(safe_payload) =~ "owner_forward_timeout"
+
+    assert_receive {:websocket_owner_frame, "socket-overflow", 1, ^owner_turn_id, :complete} =
+                     owner_complete
+
+    assert {:ok, completed_state} =
+             CodexResponsesSocket.handle_info(owner_complete, socket_state)
+
+    assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    assert {:ok, final_state} =
+             CodexResponsesSocket.handle_info(
+               {:codex_response_done, owner_turn_id, {:response_task_result, interrupted_result()}},
+               completed_state
+             )
+
+    assert final_state.public_response_task_pid == nil
+    refute final_state.public_turn_output_committed?
+
+    refute_received {:websocket_owner_frame, "socket-overflow", 1, ^owner_turn_id, {:error, :owner_forward_timeout, _payload}}
+
+    refute_received {:websocket_owner_frame, "socket-overflow", 1, ^owner_turn_id, _payload}
+
+    assert is_reference(active_turn_ref)
+    assert is_reference(probe_ref)
+  end
+
+  test "public interrupted turn pins probe ref and times out with a safe error", context do
+    upstream = interrupted_upstream(self(), "visible-timeout")
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("commit-timeout"))
+
+    owner_turn_id = self()
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:websocket_owner_frame, correlation_id, epoch, ^owner_turn_id, {:data, "visible-timeout"}}
+
+    assert_receive {:websocket_owner_output_commit_probe, ^correlation_id, ^epoch, ^owner_turn_id, active_turn_ref, ^owner, probe_ref}
+
+    send(
+      owner,
+      {:websocket_owner_output_commit_ack, correlation_id, epoch, owner_turn_id, active_turn_ref, make_ref(), true}
+    )
+
+    assert Task.yield(submit_task, 0) == nil
+
+    %{active_turn: %{output_commit_probe: probe_state}} = :sys.get_state(owner)
+    Process.cancel_timer(probe_state.timer_ref)
+    send(owner, {:websocket_owner_output_commit_timeout, active_turn_ref, probe_ref})
+
+    assert_receive {:websocket_owner_frame, ^correlation_id, ^epoch, ^owner_turn_id, {:error, :owner_forward_timeout, timeout_payload}}
+
+    assert timeout_payload.code == "owner_forward_timeout"
+    assert_receive {:websocket_owner_frame, ^correlation_id, ^epoch, ^owner_turn_id, :complete}
+    assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+
+    send(
+      owner,
+      {:websocket_owner_output_commit_ack, correlation_id, epoch, owner_turn_id, active_turn_ref, probe_ref, true}
+    )
+
+    refute_received {:websocket_owner_frame, ^correlation_id, ^epoch, ^owner_turn_id, _payload}
+  end
+
+  # Findings #119 item 3: a downstream that is provably gone must release the
+  # owner's retained failure result on the monitor signal, never on the
+  # forward-timeout timer. The elapsed bound is strict: a timer-driven
+  # settlement cannot finish before the full default budget.
+  test "output-commit probe settles the failure result when the downstream process dies",
+       context do
+    upstream = interrupted_upstream(self(), "visible-downstream-down")
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    parent = self()
+
+    downstream_pid = spawn(fn -> receive_probe_messages(parent) end)
+    downstream_monitor = Process.monitor(downstream_pid)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, %{
+        pid: downstream_pid,
+        correlation_id: "commit-downstream-down"
+      })
+
+    owner_turn_id = self()
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:probe_downstream_message, {:websocket_owner_frame, "commit-downstream-down", epoch, ^owner_turn_id, {:data, "visible-downstream-down"}}}
+
+    assert_receive {:probe_downstream_message, {:websocket_owner_output_commit_probe, "commit-downstream-down", ^epoch, ^owner_turn_id, _active_turn_ref, ^owner, _probe_ref}}
+
+    assert Task.yield(submit_task, 0) == nil
+
+    started_at_ms = System.monotonic_time(:millisecond)
+    Process.exit(downstream_pid, :kill)
+    assert_receive {:DOWN, ^downstream_monitor, :process, ^downstream_pid, :killed}
+
+    assert Task.await(submit_task, @detection_timeout_ms) ==
+             interrupted_result()
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+    assert elapsed_ms < WebsocketOwnerContract.default_forward_timeout_ms()
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    refute_received {:probe_downstream_message, {:websocket_owner_frame, "commit-downstream-down", ^epoch, ^owner_turn_id, {:error, :owner_forward_timeout, _payload}}}
+  end
+
+  test "output-commit probe keeps the configured budget for a live downstream that never acks",
+       context do
+    upstream = interrupted_upstream(self(), "visible-silent")
+    probe_timeout_ms = 50
+
+    {:ok, owner} =
+      start_owner(context, upstream: upstream, output_commit_probe_timeout_ms: probe_timeout_ms)
+
+    assert %{output_commit_probe_timeout_ms: ^probe_timeout_ms} = :sys.get_state(owner)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("commit-silent"))
+
+    owner_turn_id = self()
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:websocket_owner_frame, "commit-silent", epoch, ^owner_turn_id, {:data, "visible-silent"}}
+
+    assert_receive {:websocket_owner_output_commit_probe, "commit-silent", ^epoch, ^owner_turn_id, _active_turn_ref, ^owner, _probe_ref}
+
+    # The downstream stays alive and attached but deliberately never acks, so
+    # the only exit is the (shortened) budget timer.
+    assert_receive {:websocket_owner_frame, "commit-silent", ^epoch, ^owner_turn_id, {:error, :owner_forward_timeout, timeout_payload}},
+                   @detection_timeout_ms
+
+    assert timeout_payload.code == "owner_forward_timeout"
+    assert_receive {:websocket_owner_frame, "commit-silent", ^epoch, ^owner_turn_id, :complete}
+    assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "output-commit probe budget defaults to the forward timeout and ignores invalid overrides",
+       context do
+    {:ok, default_owner} = start_owner(context, upstream: interrupted_upstream(self(), "x"))
+
+    assert %{output_commit_probe_timeout_ms: default_ms} = :sys.get_state(default_owner)
+    assert default_ms == WebsocketOwnerContract.default_forward_timeout_ms()
+
+    invalid_context = %{context | codex_session_id: Ecto.UUID.generate()}
+    on_exit(fn -> cleanup_owner_session(invalid_context.codex_session_id) end)
+
+    {:ok, invalid_owner} =
+      start_owner(invalid_context,
+        upstream: interrupted_upstream(self(), "y"),
+        output_commit_probe_timeout_ms: 0
+      )
+
+    assert %{output_commit_probe_timeout_ms: ^default_ms} = :sys.get_state(invalid_owner)
+
+    # This owner carries a UUID session id with no persisted lease, so stopping
+    # it runs lifecycle recovery. Stop it here, where the warnings are captured
+    # and asserted, rather than from on_exit, where they would print.
+    log = capture_log(fn -> cleanup_owner_session(invalid_context.codex_session_id) end)
+
+    assert log =~
+             "websocket owner exit persistence failed codex_session_id=#{invalid_context.codex_session_id} operation=release_owner_lease"
+
+    assert log =~
+             "websocket owner lifecycle recovery failed codex_session_id=#{invalid_context.codex_session_id} recovery_reason=owner_drained failure_reason=stale_owner_cleanup"
+  end
+
+  test "native owner interruption probe is acknowledged by the sole socket task", context do
+    upstream = interrupted_upstream(self(), "visible-native-ack")
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("native-probe-ack"))
+
+    owner_turn_id = self()
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:websocket_owner_frame, "native-probe-ack", epoch, ^owner_turn_id, {:data, "visible-native-ack"}}
+
+    assert_receive {:websocket_owner_output_commit_probe, "native-probe-ack", ^epoch, ^owner_turn_id, _active_turn_ref, ^owner, _probe_ref} = probe
+
+    socket_state = %{
+      opts: RequestOptions.for_websocket(%{}),
+      tasks: MapSet.new([owner_turn_id]),
+      public_response_task_pid: nil,
+      public_turn_aborted?: false,
+      public_turn_owner_complete?: false,
+      native_turn_output_task_pids: MapSet.new([owner_turn_id]),
+      websocket_owner_downstream: stable_downstream
+    }
+
+    assert {:ok, ^socket_state} = CodexResponsesSocket.handle_info(probe, socket_state)
+    assert_receive {:websocket_owner_frame, "native-probe-ack", ^epoch, ^owner_turn_id, :complete}
+    assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+
+    refute_received {:websocket_owner_frame, "native-probe-ack", ^epoch, ^owner_turn_id, {:error, :owner_forward_timeout, _payload}}
+  end
+
+  test "reconnect while probing settles the old turn without downstream delivery", context do
+    upstream = interrupted_upstream(self(), "visible-reconnect")
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, first} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("commit-reconnect-old"))
+
+    downstream = Map.put(first, :owner_turn_id, self())
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:websocket_owner_frame, "commit-reconnect-old", 1, _owner_turn_id, {:data, "visible-reconnect"}}
+
+    assert_receive {:websocket_owner_output_commit_probe, "commit-reconnect-old", 1, _owner_turn_id, _active_turn_ref, ^owner, _probe_ref}
+
+    assert {:ok, second} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("commit-reconnect-new")
+             )
+
+    assert second.epoch == 2
+    refute second.active_turn_reconnect?
+    assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+    refute_received {:websocket_owner_frame, "commit-reconnect-old", 1, _owner_turn_id, :complete}
+    refute_received {:websocket_owner_frame, "commit-reconnect-new", 2, _payload}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "probing turn stays busy and graceful drain lets the acknowledgement finish", context do
+    probe = start_output_commit_probe(context, "probe-busy")
+
+    assert WebsocketOwnerSession.submit_frame(
+             probe.owner,
+             probe.downstream,
+             "overlapping-request"
+           ) == {:error, :owner_busy}
+
+    assert :ok = WebsocketOwnerSession.begin_drain(probe.owner)
+
+    send(
+      probe.owner,
+      {:websocket_owner_output_commit_ack, probe.correlation_id, probe.epoch, probe.owner_turn_id, probe.active_turn_ref, probe.probe_ref, false}
+    )
+
+    assert_receive {:websocket_owner_frame, "probe-busy", 1, _owner_turn_id, :complete}
+    assert Task.await(probe.submit_task, @detection_timeout_ms) == interrupted_result()
+    assert %{active_turn: nil, draining?: true} = :sys.get_state(probe.owner)
+  end
+
+  test "explicit detach cancels a probe and ignores its late acknowledgement", context do
+    probe = start_output_commit_probe(context, "probe-detach")
+    %{active_turn: %{output_commit_probe: %{timer_ref: timer_ref}}} = :sys.get_state(probe.owner)
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(probe.owner, probe.stable_downstream)
+    assert Task.await(probe.submit_task, @detection_timeout_ms) == {:error, :client_disconnected}
+    assert Process.read_timer(timer_ref) == false
+    assert %{active_turn: nil, downstream: nil} = :sys.get_state(probe.owner)
+
+    send(
+      probe.owner,
+      {:websocket_owner_output_commit_ack, probe.correlation_id, probe.epoch, probe.owner_turn_id, probe.active_turn_ref, probe.probe_ref, true}
+    )
+
+    refute_received {:websocket_owner_frame, "probe-detach", 1, _owner_turn_id, _payload}
+  end
+
+  test "downstream death settles the retained interruption without delivery", context do
+    parent = self()
+
+    downstream_pid =
+      spawn(fn ->
+        receive_probe_messages(parent)
+      end)
+
+    upstream = interrupted_upstream(self(), "visible-downstream-death")
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, %{
+        pid: downstream_pid,
+        correlation_id: "probe-downstream-death"
+      })
+
+    owner_turn_id = self()
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:probe_downstream_message, {:websocket_owner_frame, "probe-downstream-death", 1, ^owner_turn_id, {:data, "visible-downstream-death"}}}
+
+    assert_receive {:probe_downstream_message, {:websocket_owner_output_commit_probe, "probe-downstream-death", 1, ^owner_turn_id, _active_turn_ref, ^owner, _probe_ref}}
+
+    downstream_ref = Process.monitor(downstream_pid)
+    Process.exit(downstream_pid, :shutdown)
+    assert_receive {:DOWN, ^downstream_ref, :process, ^downstream_pid, :shutdown}
+
+    assert Task.await(submit_task, @detection_timeout_ms) == interrupted_result()
+    assert %{active_turn: nil, downstream: nil} = :sys.get_state(owner)
+    refute_received {:probe_downstream_message, {:websocket_owner_frame, _, _, _, :complete}}
+  end
+
+  test "exact terminal timeout invalidates upstream and emits one committed failure", context do
+    terminal_frame = terminal_frame("response.completed", "resp_timeout")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+    parent = self()
+
+    upstream =
+      self()
+      |> WebsocketOwnerNodeHarness.two_sender_upstream_boundary(controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+      |> Map.put(:invalidate, fn upstream_pid ->
+        send(parent, {:terminal_timeout_invalidation, upstream_pid})
+        WebsocketOwnerNodeHarness.controlled_result(parent, controls, :invalidation_result, :ok)
+      end)
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("terminal-timeout"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+
+    %{active_turn: active_turn} = await_pending_terminal_result(owner)
+    cancel_owner_timer(active_turn.terminal_delivery_timer_ref)
+    {turn_ref, timer_token} = active_turn.terminal_delivery_timeout
+
+    send(owner, {:websocket_owner_terminal_delivery_timeout, turn_ref, make_ref()})
+    assert %{active_turn: %{pending_result: pending_result}} = :sys.get_state(owner)
+    assert pending_result == terminal_result(terminal_frame, "response.completed")
+
+    timer_task = controlled_timer_task(self(), owner, controls, {turn_ref, timer_token})
+    timer_barrier = await_controlled_barrier(:timer_message, controls)
+    release_controlled(timer_barrier, controls, :timer_message)
+    assert Task.await(timer_task, @detection_timeout_ms) == :ok
+
+    assert_receive {:terminal_timeout_invalidation, ^upstream_pid}
+    invalidation_barrier = await_controlled_barrier(:invalidation_result, controls)
+    release_controlled(invalidation_barrier, controls, :invalidation_result)
+
+    assert {:error, timeout_result} = Task.await(submit_task, @detection_timeout_ms)
+    assert timeout_result.reason == :upstream_websocket_terminal_delivery_timeout
+    assert timeout_result.transport_failure["phase"] == "terminal_delivery"
+    assert timeout_result.transport_failure["upstream_committed"] == true
+    assert timeout_result.transport_failure["terminal_seen"] == true
+    assert timeout_result.transport_failure["terminal_forwarded"] == false
+
+    assert_receive {:websocket_owner_frame, "terminal-timeout", 1, {:error, :upstream_websocket_terminal_delivery_timeout, safe_payload}}
+
+    assert safe_payload.code == "upstream_stream_error"
+    assert safe_payload.metadata.reason == "upstream_websocket_terminal_delivery_timeout"
+    assert_receive {:websocket_owner_frame, "terminal-timeout", 1, :complete}
+    refute_received {:websocket_owner_frame, "terminal-timeout", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+    refute_receive {:websocket_owner_frame, "terminal-timeout", 1, {:data, ^terminal_frame}}
+  end
+
+  test "terminal timeout keeps invalidation failure precedence", context do
+    terminal_frame = terminal_frame("response.completed", "resp_invalidation_failure")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+    parent = self()
+
+    upstream =
+      self()
+      |> WebsocketOwnerNodeHarness.two_sender_upstream_boundary(controls,
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+      |> Map.put(:invalidate, fn _upstream_pid ->
+        WebsocketOwnerNodeHarness.controlled_result(
+          parent,
+          controls,
+          :invalidation_result,
+          {:error, :upstream_websocket_not_connected}
+        )
+      end)
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("invalidation-failure"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+    %{active_turn: active_turn} = await_pending_terminal_result(owner)
+    cancel_owner_timer(active_turn.terminal_delivery_timer_ref)
+    {turn_ref, timer_token} = active_turn.terminal_delivery_timeout
+    send(owner, {:websocket_owner_terminal_delivery_timeout, turn_ref, timer_token})
+
+    invalidation_barrier = await_controlled_barrier(:invalidation_result, controls)
+    release_controlled(invalidation_barrier, controls, :invalidation_result)
+
+    assert Task.await(submit_task, @detection_timeout_ms) == {:error, :upstream_websocket_not_connected}
+
+    assert_receive {:websocket_owner_frame, "invalidation-failure", 1, {:error, :owner_crashed, safe_payload}}
+
+    assert safe_payload.code == "owner_crashed"
+    assert_receive {:websocket_owner_frame, "invalidation-failure", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+  end
+
+  test "terminal downstream send failure settles once before a late task result", context do
+    terminal_frame = terminal_frame("response.completed", "resp_send_failure")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    downstream_sender =
+      controlled_terminal_downstream_sender(self(), controls, {:error, :owner_unavailable})
+
+    {:ok, owner} = start_owner(context, upstream: upstream, downstream_sender: downstream_sender)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("send-failure"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+
+    send_barrier = await_controlled_barrier(:downstream_send_result, controls)
+    release_controlled(send_barrier, controls, :downstream_send_result)
+
+    # The reply keeps the terminal it could not deliver, so the task settles
+    # the provider's usage (findings#270 row 270-293).
+    assert {:error, %{reason: :owner_unavailable, body: ^terminal_frame, headers: [], started: false}} = Task.await(submit_task, @detection_timeout_ms)
+
+    assert_receive {:websocket_owner_frame, "send-failure", 1, {:error, :owner_unavailable, safe_payload}}
+
+    assert safe_payload.code == "owner_unavailable"
+    assert_receive {:websocket_owner_frame, "send-failure", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    release_controlled(barriers, controls, :task_result)
+    refute_received {:websocket_owner_frame, "send-failure", 1, :complete}
+  end
+
+  test "duplicate terminal and stale timeout messages cannot settle the next turn", context do
+    terminal_frame = terminal_frame("response.completed", "resp_duplicate_terminal")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame, terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        terminal_delivery_timeout_ms: @terminal_delivery_scenario_timeout_ms
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("duplicate-terminal"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    assert %{active_turn: %{task_ref: stale_task_ref}} = :sys.get_state(owner)
+    release_controlled(barriers, controls, :task_result)
+    %{active_turn: active_turn} = await_pending_terminal_result(owner)
+    stale_timeout = active_turn.terminal_delivery_timeout
+    stale_result = active_turn.pending_result
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+
+    assert_receive {:websocket_owner_frame, "duplicate-terminal", 1, {:data, ^terminal_frame}}
+    assert {:ok, result} = Task.await(submit_task, @detection_timeout_ms)
+    assert result == terminal_result(terminal_frame, "response.completed") |> elem(1)
+    refute Map.has_key?(result, :response_id)
+    assert_receive {:websocket_owner_frame, "duplicate-terminal", 1, :complete}
+    refute_received {:websocket_owner_frame, "duplicate-terminal", 1, {:data, ^terminal_frame}}
+
+    {stale_turn_ref, stale_timer_token} = stale_timeout
+    send(owner, {:websocket_owner_terminal_delivery_timeout, stale_turn_ref, stale_timer_token})
+    assert %{active_turn: nil} = :sys.get_state(owner)
+
+    {:ok, reconnected_downstream} =
+      WebsocketOwnerSession.attach_downstream(
+        owner,
+        downstream_target("reconnect-after-terminal")
+      )
+
+    assert reconnected_downstream.epoch == downstream.epoch + 1
+
+    next_submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_frame(owner, reconnected_downstream, "next-turn")
+      end)
+
+    next_barriers = await_two_sender_barriers(controls)
+    assert %{active_turn: %{ref: next_turn_ref}} = :sys.get_state(owner)
+
+    send(owner, {stale_task_ref, stale_result})
+    send(owner, {:websocket_owner_terminal_delivery_timeout, stale_turn_ref, stale_timer_token})
+    send(owner, {:websocket_owner_upstream_frame, active_turn.ref, terminal_frame})
+
+    assert %{active_turn: %{ref: ^next_turn_ref, pending_result: nil}} = :sys.get_state(owner)
+
+    release_controlled(next_barriers, controls, :nonterminal_frames)
+    next_terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(next_terminal_barrier, controls, :terminal_frames)
+    release_controlled(next_barriers, controls, :task_result)
+
+    assert Task.await(next_submit_task, @detection_timeout_ms) ==
+             terminal_result(terminal_frame, "response.completed")
+
+    assert_receive {:websocket_owner_frame, "reconnect-after-terminal", 2, :complete}
+
+    refute_received {:websocket_owner_frame, "reconnect-after-terminal", 2, {:error, :upstream_websocket_terminal_delivery_timeout, _payload}}
+
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  test "detach while a terminal result is pending keeps client disconnect precedence", context do
+    terminal_frame = terminal_frame("response.completed", "resp_detach_pending")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("detach-pending"))
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+    %{active_turn: active_turn} = await_pending_terminal_result(owner)
+    timer_ref = active_turn.terminal_delivery_timer_ref
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+    assert Task.await(submit_task, @detection_timeout_ms) == {:error, :client_disconnected}
+    assert %{active_turn: nil, downstream: nil} = :sys.get_state(owner)
+    assert Process.read_timer(timer_ref) == false
+    refute_received {:websocket_owner_frame, "detach-pending", 1, _payload}
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+  end
+
+  test "downstream death while a terminal result is pending preserves the upstream result",
+       context do
+    terminal_frame = terminal_frame("response.completed", "resp_downstream_death_pending")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    target = collector(self(), :pending_downstream_death)
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, %{
+        pid: target,
+        correlation_id: "downstream-death-pending"
+      })
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :task_result)
+    %{active_turn: active_turn} = await_pending_terminal_result(owner)
+    timer_ref = active_turn.terminal_delivery_timer_ref
+    target_ref = Process.monitor(target)
+    Process.unlink(target)
+    Process.exit(target, :shutdown)
+    assert_receive {:DOWN, ^target_ref, :process, ^target, :shutdown}
+
+    assert Task.await(submit_task, @detection_timeout_ms) == terminal_result(terminal_frame, "response.completed")
+    assert %{active_turn: nil, downstream: nil} = :sys.get_state(owner)
+    assert Process.read_timer(timer_ref) == false
+    refute_received {:collected_owner_frame, :pending_downstream_death, _message}
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+  end
+
+  @tag :rollout_drain_deadline_contract
+  test "rollout drain deadline aborts a pending terminal result irreversibly", context do
+    pending = start_pending_terminal_turn(context, "pending-drain")
+    owner = pending.owner
+    terminal_frame = pending.terminal_frame
+    cancel_owner_timer(pending.active_turn.terminal_delivery_timer_ref)
+    owner_ref = Process.monitor(owner)
+
+    harness = WebsocketRolloutDrainSupport.start_rollout_drain_harness(self())
+    deadline = harness.deadline
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain(
+          [name: harness.name, timeout_ms: 500] ++
+            WebsocketRolloutDrainSupport.deadline_options(harness.deadline)
+        )
+      end)
+
+    on_exit(fn ->
+      frame_sender = pending.barriers.nonterminal_frames
+      if Process.alive?(frame_sender), do: Process.exit(frame_sender, :kill)
+
+      if Process.alive?(pending.submitter), do: Process.exit(pending.submitter, :kill)
+    end)
+
+    assert_receive {:rollout_drain_deadline_wait, ^deadline, wait_ms}
+    refute_received {:websocket_owner_frame, "pending-drain", 1, {:error, :owner_drained, _}}
+    assert Process.alive?(owner)
+
+    assert :ok = WebsocketRolloutDrainSupport.VirtualDeadline.advance(harness.deadline, wait_ms)
+
+    assert_receive {:websocket_owner_frame, "pending-drain", 1, {:error, :owner_drained, safe_payload}}
+
+    assert safe_payload.code == "owner_drained"
+    assert safe_payload.message == "websocket owner is draining"
+    assert safe_payload.metadata.reason == "owner_drained"
+    assert_receive {:websocket_owner_frame, "pending-drain", 1, :complete}
+
+    assert_receive {:pending_submitter_outcome, "pending-drain", {:return, {:error, :owner_drained}}}
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+    assert Process.read_timer(pending.active_turn.terminal_delivery_timer_ref) == false
+
+    assert %{turns_completed: 0, turns_aborted: 1} = Task.await(drain_task, @detection_timeout_ms)
+
+    release_pending_terminal_sender(pending)
+    refute_received {:websocket_owner_frame, "pending-drain", 1, {:data, ^terminal_frame}}
+    refute_received {:websocket_owner_frame, "pending-drain", 1, :complete}
+    refute_received {:pending_submitter_outcome, "pending-drain", _outcome}
+
+    assert_stale_messages_do_not_settle_fresh_turn(context, pending, "after-drain")
+  end
+
+  test "direct drain characterizes the current immediate active-turn abort contract", context do
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["characterization-delta", "unreachable-after-drain"]
+      )
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("direct-drain-characterization")
+             )
+
+    parent = self()
+
+    spawn(fn ->
+      outcome =
+        try do
+          {:return, WebsocketOwnerSession.submit_frame(owner, downstream, "characterization-request")}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      send(parent, {:direct_drain_characterization_outcome, outcome})
+    end)
+
+    assert_receive {:websocket_owner_frame, "direct-drain-characterization", 1, {:data, "characterization-delta"}}
+
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+    owner_ref = Process.monitor(owner)
+
+    assert :ok = WebsocketOwnerSession.drain_owner(owner)
+
+    assert_receive {:websocket_owner_frame, "direct-drain-characterization", 1, {:error, :owner_drained, safe_payload}}
+
+    assert safe_payload.code == "owner_drained"
+    assert_receive {:websocket_owner_frame, "direct-drain-characterization", 1, :complete}
+    assert_receive {:direct_drain_characterization_outcome, {:return, {:error, :owner_drained}}}
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+
+    refute_received {:websocket_owner_frame, "direct-drain-characterization", 1, {:data, "unreachable-after-drain"}}
+  end
+
+  @tag :owner_exit_reason_label_baseline
+  test "idle expiry and rollout deadline cut retain existing owner-exit metadata" do
+    idle_context = db_owner_context()
+    drain_context = db_owner_context()
+
+    on_exit(fn -> cleanup_owner_session(idle_context.codex_session_id) end)
+    on_exit(fn -> cleanup_owner_session(drain_context.codex_session_id) end)
+
+    idle_exit = observe_owner_exit(idle_context, :idle_expiry)
+    drain_exit = observe_owner_exit(drain_context, :rollout_deadline_cut)
+
+    assert Map.take(idle_exit.metadata, [:owner_exit_reason, :release_reason]) == %{
+             owner_exit_reason: "owner_drained",
+             release_reason: "owner_drained"
+           }
+
+    assert Map.take(drain_exit.metadata, [:owner_exit_reason, :release_reason]) ==
+             Map.take(idle_exit.metadata, [:owner_exit_reason, :release_reason])
+  end
+
+  @tag :owner_exit_reason_label_red
+  test "owner exit metadata adds a bounded cause without replacing owner_drained" do
+    idle_context = db_owner_context()
+    drain_context = db_owner_context()
+
+    on_exit(fn -> cleanup_owner_session(idle_context.codex_session_id) end)
+    on_exit(fn -> cleanup_owner_session(drain_context.codex_session_id) end)
+
+    idle_exit = observe_owner_exit(idle_context, :idle_expiry)
+    drain_exit = observe_owner_exit(drain_context, :rollout_deadline_cut)
+
+    assert idle_exit.metadata.owner_exit_reason == "owner_drained"
+    assert drain_exit.metadata.owner_exit_reason == "owner_drained"
+    assert idle_exit.metadata.owner_exit_cause == "idle_expiry"
+    assert drain_exit.metadata.owner_exit_cause == "drain_cut"
+    assert idle_exit.metadata.persisted_owner_exit_cause == "idle_expiry"
+    assert drain_exit.metadata.persisted_owner_exit_cause == "drain_cut"
+  end
+
+  test "lease loss while a terminal result is pending stops stale without terminalization",
+       context do
+    parent = self()
+
+    persistence = %{
+      renew_owner_token: fn session_id, owner_lease_token, %RequestOptions{} ->
+        send(parent, {:pending_owner_renewal_attempt, session_id, owner_lease_token})
+        {:error, :stale_owner}
+      end,
+      release_owner_lease: fn _session_id, _owner_lease_token, _reason ->
+        send(parent, :unexpected_pending_owner_release)
+        :ok
+      end,
+      interrupt_codex_session: fn _session_id, _opts ->
+        send(parent, :unexpected_pending_owner_interrupt)
+        :ok
+      end
+    }
+
+    pending =
+      start_pending_terminal_turn(context, "pending-lease-loss", persistence: persistence)
+
+    owner = pending.owner
+    cancel_owner_timer(pending.active_turn.terminal_delivery_timer_ref)
+    owner_ref = Process.monitor(owner)
+
+    codex_session_id = context.codex_session_id
+    owner_lease_token = context.owner_lease_token
+
+    logs =
+      capture_log(fn ->
+        send(owner, :renew_owner_lease)
+
+        assert_receive {:pending_owner_renewal_attempt, ^codex_session_id, ^owner_lease_token}
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, {:shutdown, :stale_owner}}
+      end)
+
+    assert logs =~ "websocket owner renewal stale"
+    assert logs =~ "reason=stale_owner"
+    assert_receive {:pending_submitter_outcome, "pending-lease-loss", {:exit, _reason}}
+    assert Process.read_timer(pending.active_turn.terminal_delivery_timer_ref) == false
+
+    release_abandoned_terminal_sender(pending)
+
+    refute_received {:websocket_owner_frame, "pending-lease-loss", 1, _payload}
+    refute_received {:pending_submitter_outcome, "pending-lease-loss", _outcome}
+    refute_received :unexpected_pending_owner_release
+    refute_received :unexpected_pending_owner_interrupt
+
+    assert_stale_messages_do_not_settle_fresh_turn(context, pending, "after-lease-loss")
+  end
+
+  test "late upstream task DOWN cannot displace a pending terminal result", context do
+    pending = start_pending_terminal_turn(context, "pending-task-down")
+    pending_result = pending.active_turn.pending_result
+    terminal_frame = pending.terminal_frame
+    cancel_owner_timer(pending.active_turn.terminal_delivery_timer_ref)
+
+    send(
+      pending.owner,
+      {:DOWN, pending.task_ref, :process, pending.task_pid, :shutdown}
+    )
+
+    assert %{active_turn: active_turn} = :sys.get_state(pending.owner)
+    assert active_turn.ref == pending.active_turn.ref
+    assert active_turn.pending_result == pending_result
+    refute_received {:websocket_owner_frame, "pending-task-down", 1, _payload}
+
+    release_pending_terminal_sender(pending)
+
+    assert_receive {:websocket_owner_frame, "pending-task-down", 1, {:data, ^terminal_frame}}
+
+    assert_receive {:pending_submitter_outcome, "pending-task-down", {:return, ^pending_result}}
+
+    assert_receive {:websocket_owner_frame, "pending-task-down", 1, :complete}
+    refute_received {:websocket_owner_frame, "pending-task-down", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(pending.owner)
+
+    assert_stale_messages_do_not_settle_next_turn(
+      pending.owner,
+      pending.downstream,
+      pending.controls,
+      pending,
+      pending.terminal_frame
+    )
+  end
+
   test "forwards a terminal failure body when the upstream request returns an error", context do
     terminal_frame =
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "type" => "response.failed",
         "response" => %{
           "id" => "resp_owner_failure",
@@ -419,7 +3594,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
              WebsocketOwnerSession.submit_request(owner, downstream, request)
 
     assert_receive {:websocket_owner_frame, "terminal-failure", 1, {:data, ^terminal_frame}}
-    refute_received {:websocket_owner_frame, "terminal-failure", 1, :complete}
+    assert_receive {:websocket_owner_frame, "terminal-failure", 1, :complete}
   end
 
   test "latest reconnect increments downstream epoch and fences old downstream sends", context do
@@ -444,6 +3619,1586 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
     assert WebsocketOwnerSession.detach_downstream(owner, first_downstream) ==
              {:error, :duplicate_downstream}
+  end
+
+  # A fresh intent is a frame the runtime matched to no recorded turn. A live
+  # owner running a turn refuses it as backpressure, `owner_busy`, like the
+  # legacy preflight; only the very request it is running, which lost the race
+  # to its own winner, is named as such so the socket can answer the counted
+  # duplicate (findings#225, row 225-84).
+  @tag :replay_matrix
+  test "a fresh preflight meeting a running turn is owner_busy unless it is that very request", context do
+    context = %{context | codex_session_id: Ecto.UUID.generate(), owner_lease_token: Ecto.UUID.generate()}
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+    block_ref = make_ref()
+
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self(), block_ref: block_ref, messages: ["running"])
+
+    persistence = %{
+      renew_owner_token: fn _, token, _ -> {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}} end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+
+    {:ok, owner} = start_owner(context, upstream: upstream, persistence: persistence)
+    assert_receive {:websocket_owner_harness_upstream_started, _}
+    {:ok, first} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("fresh-busy-a"))
+    authorization = authorization_binding(context.codex_session_id)
+    semantic = semantic_turn_key(context.codex_session_id, "turn-a")
+    replay = <<42::256>>
+
+    descriptor = %{
+      semantic_turn_key: semantic,
+      replay_claim_digest: replay,
+      authorization_snapshot: authorization,
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: Ecto.UUID.generate(),
+      replay_generation: 0
+    }
+
+    assert :ok = WebsocketOwnerSession.prepare_next_replay_descriptor(owner, first, descriptor)
+    submit = Task.async(fn -> WebsocketOwnerSession.submit_request(owner, first, native_websocket_request("turn-a")) end)
+    assert_receive {:websocket_owner_frame, "fresh-busy-a", 1, {:data, "running"}}
+    assert_receive {:websocket_owner_harness_barrier, barrier, ^block_ref}
+
+    racer = %{pid: self(), epoch: 2, correlation_id: "fresh-busy-b"}
+    other_semantic = semantic_turn_key(context.codex_session_id, "turn-b")
+
+    assert {:error, :duplicate_active_turn} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, fresh_control(context, racer, semantic, replay, authorization))
+
+    # Same turn, different request (a continuation's replay claim): not the running request.
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, fresh_control(context, racer, semantic, <<43::256>>, authorization))
+
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, fresh_control(context, racer, other_semantic, <<44::256>>, authorization))
+
+    # Refusals leave the running turn and its downstream untouched.
+    assert %{active_turn: %{descriptor: %{downstream_status: :attached}}, downstream_epoch: 1} = :sys.get_state(owner)
+
+    send(barrier, {:websocket_owner_harness_release, block_ref})
+    assert :ok = Task.await(submit, 15_000)
+    assert_receive {:websocket_owner_frame, "fresh-busy-a", 1, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  @tag :replay_active_reattach
+  @tag :replay_matrix
+  test "exact lost active descriptor reattaches without another upstream send", context do
+    context = %{
+      context
+      | codex_session_id: Ecto.UUID.generate(),
+        owner_lease_token: Ecto.UUID.generate()
+    }
+
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["before-loss", "future"]
+      )
+
+    persistence = %{
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}}
+      end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+
+    {:ok, owner} = start_owner(context, upstream: upstream, persistence: persistence)
+    assert_receive {:websocket_owner_harness_upstream_started, _}
+    {:ok, first} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("active-a"))
+    authorization = authorization_binding(context.codex_session_id)
+    semantic = semantic_turn_key(context.codex_session_id, "turn-a")
+    replay = <<42::256>>
+
+    descriptor = %{
+      semantic_turn_key: semantic,
+      replay_claim_digest: replay,
+      authorization_snapshot: authorization,
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: Ecto.UUID.generate(),
+      replay_generation: 0
+    }
+
+    assert :ok = WebsocketOwnerSession.prepare_next_replay_descriptor(owner, first, descriptor)
+
+    submit =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, first, native_websocket_request("turn-a"))
+      end)
+
+    assert_receive {:websocket_owner_frame, "active-a", 1, {:data, "before-loss"}}
+    assert_receive {:websocket_owner_harness_barrier, barrier, ^block_ref}
+
+    healthy = reconnect_control(context, first, semantic, replay, authorization, descriptor)
+    assert {:error, :owner_busy} = WebsocketOwnerSession.reconnect_control_v2(owner, healthy)
+    assert :reattachable = WebsocketOwnerSession.record_active_downstream_loss(owner, first)
+    assert %{active_turn: %{descriptor: %{downstream_status: :lost}}} = :sys.get_state(owner)
+
+    stale = %{pid: self(), epoch: 99, correlation_id: "active-stale"}
+    stale_control = reconnect_control(context, stale, semantic, replay, authorization, descriptor)
+
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, stale_control)
+
+    replacement = %{pid: self(), epoch: 2, correlation_id: "active-b"}
+    control = reconnect_control(context, replacement, semantic, replay, authorization, descriptor)
+
+    assert {:ok, :same_turn_reattach, attached} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, control)
+
+    assert attached.epoch == 2
+
+    send(barrier, {:websocket_owner_harness_release, block_ref})
+    assert :ok = Task.await(submit, 15_000)
+    assert_receive {:websocket_owner_frame, "active-b", 2, _turn_pid, {:data, "future"}}
+    assert_receive {:websocket_owner_frame, "active-b", 2, _turn_pid, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  @tag :replay_active_reattach
+  @tag :replay_race
+  @tag :replay_topology
+  test "monitored replay-active downstream loss becomes reattachable without durable suspension",
+       context do
+    context = replay_owner_context(context, "monitored-active-loss")
+    release_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: release_ref,
+        messages: ["before-loss", "after-loss"]
+      )
+
+    {:ok, owner} = start_owner(context, upstream: upstream, persistence: replay_persistence())
+    assert_receive {:websocket_owner_harness_upstream_started, _}
+
+    downstream_pid = spawn(fn -> receive do: (:stop -> :ok) end)
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, %{
+        pid: downstream_pid,
+        correlation_id: "monitored-active-loss"
+      })
+
+    authorization = authorization_binding(context.codex_session_id)
+    descriptor = replay_descriptor(context.codex_session_id, authorization)
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(owner, downstream, descriptor)
+
+    submitter =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(
+          owner,
+          downstream,
+          native_websocket_request("monitored-active-loss")
+        )
+      end)
+
+    assert_receive {:websocket_owner_harness_barrier, barrier, ^release_ref}
+    Process.exit(downstream_pid, :kill)
+
+    assert %{active_turn: %{descriptor: %{downstream_status: :lost}}, suspended_replay: nil} =
+             await_lost_owner_state(owner)
+
+    replacement = %{pid: self(), epoch: 2, correlation_id: "monitored-active-replacement"}
+
+    control =
+      reconnect_control(
+        context,
+        replacement,
+        descriptor.semantic_turn_key,
+        descriptor.replay_claim_digest,
+        authorization,
+        descriptor
+      )
+
+    assert {:ok, :same_turn_reattach, %{epoch: 2}} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, control)
+
+    send(barrier, {:websocket_owner_harness_release, release_ref})
+    assert :ok = Task.await(submitter, 15_000)
+  end
+
+  @tag :replay_provisional_state
+  test "suspend terminal winner exits suspending through ordinary terminal completion",
+       context do
+    assert_suspend_failure_outcome(context, :terminal_won)
+  end
+
+  @tag :replay_provisional_state
+  test "suspend storage failure exits suspending through ordinary disconnect settlement",
+       context do
+    assert_suspend_failure_outcome(context, :storage_failed)
+  end
+
+  @tag :replay_generation_race
+  @tag :replay_race
+  test "terminal result and replay suspension preserve the winner in both orders", context do
+    assert_terminal_suspend_race(context, :terminal_first)
+    assert_terminal_suspend_race(context, :suspend_first)
+  end
+
+  @tag :replay_generation_race
+  @tag :replay_cleanup
+  @tag :replay_protocol_v2
+  test "started replay terminal clears owner state and the next request is fresh", context do
+    context = replay_owner_context(context, "terminal-fresh-reset")
+    terminal = terminal_frame("response.completed", "resp_terminal_fresh_reset")
+    parent = self()
+    lifecycle = replay_lifecycle_fixture()
+    consume_binding = replay_consume_binding(lifecycle)
+    upstream = replay_terminal_after_suspension_upstream(parent, terminal)
+
+    {owner, seed_url} =
+      start_seeded_owner(context, upstream,
+        persistence: replay_persistence(),
+        monotonic_now_ms: fn -> 10_000 end,
+        replay_suspender: fn _input -> {:ok, lifecycle} end,
+        replay_status_reader: fn reference ->
+          send(parent, {:terminal_replay_status_read, reference})
+          {:consumed, consume_binding, :started, DateTime.utc_now()}
+        end
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, predecessor} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("terminal-fresh-reset"))
+
+    {binding, receipt} =
+      OrdinarySuccessTestSeed.request(
+        owner,
+        predecessor,
+        forwarded_binding(context, predecessor),
+        seed_url
+      )
+
+    assert_receive {:websocket_owner_frame, "terminal-fresh-reset", 1, {:data, _}}
+    assert_receive {:websocket_owner_frame, "terminal-fresh-reset", 1, :complete}
+
+    assert {:ok, _admission} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, predecessor,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: System.system_time(:millisecond) + 30_000
+               )
+             )
+
+    authorization = authorization_binding(context.codex_session_id)
+
+    original_descriptor = %{
+      semantic_turn_key: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      authorization_snapshot: authorization,
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: lifecycle.eligible_attempt_id,
+      replay_generation: 0
+    }
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(
+               owner,
+               predecessor,
+               original_descriptor
+             )
+
+    submitter =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(
+          owner,
+          predecessor,
+          native_websocket_request("terminal-fresh-reset")
+        )
+      end)
+
+    assert_receive :terminal_replay_predecessor_started, 15_000
+    assert :suspended = WebsocketOwnerSession.detach_downstream(owner, predecessor)
+    assert Task.await(submitter, 15_000) == {:error, :client_disconnected}
+
+    assert %{
+             suspended_replay: %{provisional_status: :armed},
+             native_compaction_admission: %NativeCompactionAdmission{phase: :pending_compact}
+           } =
+             :sys.get_state(owner)
+
+    downstream_target = %{pid: self(), epoch: 2, correlation_id: "terminal-fresh-reset"}
+    {preflight, reserve} = provisional_controls(context, downstream_target, authorization)
+
+    assert {:ok, :provisional, token, 1, _generation, downstream} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    assert {:ok, :consume_reserved, _timeout, _receipt, _digest} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, %{
+               reserve
+               | provisional_token: token
+             })
+
+    %{suspended_replay: reserved} = :sys.get_state(owner)
+    reconciliation_timer_ref = reserved.reconciliation_timer_ref
+    send(owner, {:websocket_owner_replay_reconcile, reserved.reconciliation_token})
+    assert_receive {:terminal_replay_status_read, reference}, 15_000
+    assert reference.provisional_token == token
+
+    assert %{suspended_replay: %{provisional_status: :started, consume_binding: ^consume_binding}} =
+             :sys.get_state(owner)
+
+    replay_descriptor = %{
+      semantic_turn_key: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      authorization_snapshot: authorization,
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: consume_binding.replay_attempt_id,
+      replay_generation: 1
+    }
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(
+               owner,
+               downstream,
+               replay_descriptor
+             )
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             WebsocketOwnerSession.submit_request(
+               owner,
+               downstream,
+               native_websocket_request("terminal-fresh-reset")
+             )
+
+    assert_receive {:websocket_owner_frame, "terminal-fresh-reset", 2, {:data, ^terminal}}
+    assert_receive {:websocket_owner_frame, "terminal-fresh-reset", 2, :complete}
+
+    assert %{
+             active_turn: nil,
+             suspended_replay: nil,
+             downstream: retained_downstream,
+             downstream_monitor: downstream_monitor,
+             downstream_epoch: 2,
+             provisional_issuances: [10_000]
+           } = :sys.get_state(owner)
+
+    assert Map.take(retained_downstream, [:pid, :epoch, :correlation_id]) == downstream
+    assert retained_downstream.active_turn_reconnect?
+    assert is_reference(downstream_monitor)
+    assert Process.read_timer(reconciliation_timer_ref) == false
+
+    send(owner, {:websocket_owner_upstream_frame, make_ref(), "stale-terminal-success"})
+    refute_received {:websocket_owner_frame, "terminal-fresh-reset", 1, _payload}
+
+    fresh_payload = %{
+      "type" => "response.create",
+      "model" => "gpt-test",
+      "turn_id" => "terminal-fresh-next",
+      "input" => []
+    }
+
+    fresh_options =
+      RequestOptions.for_websocket(
+        %{codex_session: %{id: context.codex_session_id}},
+        fresh_payload
+      )
+
+    assert {:ok, fresh_prepared} =
+             Service.prepare_websocket_response(
+               CodexPooler.JSON.encode!(fresh_payload),
+               fresh_options,
+               fn _frame -> :ok end
+             )
+
+    assert fresh_prepared.semantic_turn_key != <<1::256>>
+    assert fresh_prepared.replay_claim_digest != <<2::256>>
+
+    fresh_downstream = Map.take(downstream, [:pid, :epoch, :correlation_id])
+
+    assert {:ok, nil} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:snapshot, fresh_downstream, [])
+             )
+
+    {:ok, fresh_control} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :fresh,
+        codex_session_id: context.codex_session_id,
+        downstream: fresh_downstream,
+        semantic_turn_digest: fresh_prepared.semantic_turn_key,
+        replay_claim_digest: fresh_prepared.replay_claim_digest,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: authorization,
+        consume_binding: nil
+      })
+
+    assert {:ok, :fresh_dispatch, ^fresh_downstream} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, fresh_control)
+
+    assert :ok =
+             WebsocketCodec.validate_prepared_frame(fresh_prepared)
+
+    assert %{
+             suspended_replay: nil,
+             downstream_epoch: 2,
+             provisional_issuances: [10_000]
+           } = :sys.get_state(owner)
+  end
+
+  @tag :replay_generation_race
+  @tag :replay_cleanup
+  @tag :replay_protocol_v2
+  test "started replay failure clears owner state and the next request is fresh", context do
+    context = replay_owner_context(context, "failure-fresh-reset")
+    upstream = replay_failure_upstream(self(), :upstream_websocket_closed_before_terminal)
+
+    {:ok, owner} = start_owner(context, upstream: upstream, persistence: replay_persistence())
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("failure-fresh-reset"))
+
+    owner_state = :sys.get_state(owner)
+    authorization = authorization_binding(context.codex_session_id)
+    lifecycle = replay_lifecycle_fixture()
+    consume_binding = replay_consume_binding(lifecycle)
+    provisional_token = <<3::256>>
+    reconciliation_token = make_ref()
+
+    reconciliation_timer_ref =
+      Process.send_after(
+        owner,
+        {:websocket_owner_replay_reconcile, reconciliation_token},
+        60_000
+      )
+
+    :sys.replace_state(owner, fn state ->
+      suspended = %{
+        semantic_turn_digest: <<1::256>>,
+        replay_claim_digest: <<2::256>>,
+        authorization_snapshot: authorization,
+        replay_generation: 1,
+        downstream: downstream,
+        predecessor_epoch: 1,
+        owner_process_generation: owner_state.process_generation,
+        provisional_token: provisional_token,
+        provisional_status: :started,
+        deadline_ms: nil,
+        consume_binding: consume_binding,
+        reserve_timeout_ms: nil,
+        reserve_receipt: nil,
+        reserve_receipt_digest: nil,
+        reserve_receipt_used?: true,
+        reconciliation_timer_ref: reconciliation_timer_ref,
+        reconciliation_token: reconciliation_token,
+        lifecycle: lifecycle
+      }
+
+      %{state | suspended_replay: suspended, provisional_issuances: [10_000]}
+    end)
+
+    replay_descriptor = %{
+      semantic_turn_key: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      authorization_snapshot: authorization,
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: consume_binding.replay_attempt_id,
+      replay_generation: 1
+    }
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(
+               owner,
+               downstream,
+               replay_descriptor
+             )
+
+    assert {:error, %{reason: :upstream_websocket_closed_before_terminal}} =
+             WebsocketOwnerSession.submit_request(
+               owner,
+               downstream,
+               native_websocket_request("failure-fresh-reset")
+             )
+
+    assert_receive {:websocket_owner_frame, "failure-fresh-reset", 1, {:error, :owner_crashed, _safe_payload}}
+
+    assert_receive {:websocket_owner_frame, "failure-fresh-reset", 1, :complete}
+
+    assert %{
+             active_turn: nil,
+             suspended_replay: nil,
+             downstream: ^downstream,
+             downstream_monitor: downstream_monitor,
+             downstream_epoch: 1,
+             provisional_issuances: [10_000]
+           } = :sys.get_state(owner)
+
+    assert is_reference(downstream_monitor)
+    assert Process.read_timer(reconciliation_timer_ref) == false
+
+    send(owner, {:websocket_owner_upstream_frame, make_ref(), "stale-terminal-failure"})
+    refute_received {:websocket_owner_frame, "failure-fresh-reset", 1, _payload}
+
+    fresh_downstream = Map.take(downstream, [:pid, :epoch, :correlation_id])
+
+    {:ok, fresh_control} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :fresh,
+        codex_session_id: context.codex_session_id,
+        downstream: fresh_downstream,
+        semantic_turn_digest: <<5::256>>,
+        replay_claim_digest: <<6::256>>,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: authorization,
+        consume_binding: nil
+      })
+
+    assert {:ok, :fresh_dispatch, ^fresh_downstream} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, fresh_control)
+  end
+
+  # findings#206 row 206-348: an owner holding only an armed pre-visible replay
+  # answers a different turn from the session's next socket by retiring the
+  # replay (settled once through `replay_retirer`) and dispatching the turn;
+  # every other shape keeps the `owner_busy` it answered before.
+  describe "a different turn from the next socket at an armed pre-visible replay" do
+    @describetag :replay_protocol_v2
+    @describetag :superseded_replay
+
+    test "retires the replay once, attaches the socket and dispatches the turn", context do
+      armed = armed_previsible_replay!(context, "superseded-retire")
+      next = %{pid: self(), epoch: 2, correlation_id: "superseded-retire-next"}
+
+      log =
+        capture_info_log(fn ->
+          assert {:ok, :fresh_dispatch, ^next} =
+                   WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, next, <<5::256>>, <<6::256>>))
+        end)
+
+      lifecycle = armed.lifecycle
+      assert_received {:superseded_replay_retired, ^lifecycle}
+      refute_received {:superseded_replay_retired, _lifecycle}
+      expected_downstream = Map.put(next, :active_turn_reconnect?, true)
+
+      assert %{active_turn: nil, suspended_replay: nil, downstream: ^expected_downstream, downstream_epoch: 2, downstream_monitor: monitor} = :sys.get_state(armed.owner)
+      assert is_reference(monitor)
+      assert log =~ "websocket owner replay superseded"
+      assert log =~ "request_id=#{lifecycle.request_id}"
+      assert log =~ "predecessor_epoch=1 downstream_epoch=2 disposition=closed"
+
+      # The attached socket is the owner's current downstream: its next turn
+      # is an ordinary fresh dispatch with nothing left to retire.
+      assert {:ok, :fresh_dispatch, ^next} =
+               WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, next, <<7::256>>, <<8::256>>))
+
+      refute_received {:superseded_replay_retired, _lifecycle}
+    end
+
+    test "never retires it for the replay's own turn", context do
+      armed = armed_previsible_replay!(context, "superseded-same-turn")
+      next = %{pid: self(), epoch: 2, correlation_id: "superseded-same-turn-next"}
+
+      # Same semantic turn with another claim (a continuation of that turn),
+      # and another turn presenting the armed claim: neither is a new turn.
+      for {semantic, claim} <- [{armed.semantic_turn_digest, <<6::256>>}, {<<5::256>>, armed.replay_claim_digest}] do
+        assert {:error, :owner_busy} =
+                 WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, next, semantic, claim))
+      end
+
+      assert_replay_kept!(armed)
+    end
+
+    test "only the socket at the next epoch supersedes it", context do
+      armed = armed_previsible_replay!(context, "superseded-epoch")
+
+      for epoch <- [1, 3] do
+        stale = %{pid: self(), epoch: epoch, correlation_id: "superseded-epoch-#{epoch}"}
+
+        assert {:error, :owner_busy} =
+                 WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, stale, <<5::256>>, <<6::256>>))
+      end
+
+      assert_replay_kept!(armed)
+    end
+
+    test "a resend already redeeming the replay keeps it", context do
+      armed = armed_previsible_replay!(context, "superseded-provisional")
+      :sys.replace_state(armed.owner, fn state -> put_in(state.suspended_replay.provisional_status, :provisional) end)
+      next = %{pid: self(), epoch: 2, correlation_id: "superseded-provisional-next"}
+
+      assert {:error, :owner_busy} =
+               WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, next, <<5::256>>, <<6::256>>))
+
+      refute_received {:superseded_replay_retired, _lifecycle}
+      assert %{suspended_replay: %{provisional_status: :provisional}, downstream: nil} = :sys.get_state(armed.owner)
+    end
+
+    test "a retirement the database refused keeps the replay and the refusal", context do
+      armed = armed_previsible_replay!(context, "superseded-refused", retire_result: {:error, :database_unavailable})
+      next = %{pid: self(), epoch: 2, correlation_id: "superseded-refused-next"}
+
+      assert {:error, :owner_busy} =
+               WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, next, <<5::256>>, <<6::256>>))
+
+      lifecycle = armed.lifecycle
+      assert_received {:superseded_replay_retired, ^lifecycle}
+      assert %{suspended_replay: %{provisional_status: :armed}, downstream: nil, downstream_epoch: 1} = :sys.get_state(armed.owner)
+    end
+
+    # A turn the owner still runs for a gone socket may still be billed by the
+    # provider: one whose output the client saw, and one lost before output
+    # with its request in flight. Neither is ever superseded.
+    for {label, visible?, status} <- [{"visible output", true, :attached}, {"a request in flight", false, :lost}] do
+      @tag visible?: visible?, status: status
+      test "an owner still running a detached turn with #{label} keeps refusing", %{visible?: visible?, status: status} = context do
+        armed = armed_previsible_replay!(context, "superseded-active-#{visible?}")
+        task = spawn(fn -> receive do: (:stop -> :ok) end)
+        on_exit(fn -> send(task, :stop) end)
+
+        active_turn = %{
+          task_pid: task,
+          downstream: nil,
+          visible_output?: visible?,
+          terminal_forwarded?: false,
+          pending_result: nil,
+          descriptor: %{semantic_turn_digest: armed.semantic_turn_digest, replay_claim_digest: armed.replay_claim_digest, downstream_status: status, visible_output?: visible?}
+        }
+
+        :sys.replace_state(armed.owner, fn state -> %{state | suspended_replay: nil, active_turn: active_turn} end)
+        next = %{pid: self(), epoch: 2, correlation_id: "superseded-active-next"}
+
+        assert {:error, :owner_busy} =
+                 WebsocketOwnerSession.reconnect_control_v2(armed.owner, superseding_control(armed, next, <<5::256>>, <<6::256>>))
+
+        refute_received {:superseded_replay_retired, _lifecycle}
+        assert %{active_turn: %{task_pid: ^task}, downstream: nil, downstream_epoch: 1} = :sys.get_state(armed.owner)
+        assert Process.alive?(task)
+        :sys.replace_state(armed.owner, fn state -> %{state | active_turn: nil} end)
+      end
+    end
+  end
+
+  # findings#206 row 206-362: the socket that received a running turn through
+  # its attach sends a request of its own, and the owner cancels that turn as
+  # the socket's close would, keeping the socket attached. Only an inherited,
+  # visible, relayed turn without a terminal is taken over; every other shape
+  # answers an error and leaves the turn running.
+  describe "taking over the turn a socket inherited at its attach" do
+    @describetag :inherited_turn_take_over
+
+    test "cancels a visible inherited turn once and keeps the socket attached", context do
+      inherited = inherited_turn_owner!(context, "take-over-visible", %{}, true)
+      task_monitor = Process.monitor(inherited.task)
+
+      log =
+        capture_info_log(fn ->
+          assert {:ok, %{semantic_turn_digest: <<9::256>>}} = WebsocketOwnerSession.take_over_inherited_turn(inherited.owner, inherited.downstream)
+        end)
+
+      task = inherited.task
+      assert_receive {:DOWN, ^task_monitor, :process, ^task, :shutdown}, @detection_timeout_ms
+      downstream = inherited.downstream
+      assert %{downstream: %{pid: pid, epoch: 1}, active_turn: %{downstream: nil, canceled_result: {:error, :client_disconnected}}} = :sys.get_state(inherited.owner)
+      assert pid == downstream.pid
+      assert log =~ "websocket owner inherited turn taken over"
+      assert log =~ "downstream_epoch=1"
+
+      # A second request finds nothing of this socket's left to take over.
+      assert {:error, :stale_downstream} = WebsocketOwnerSession.take_over_inherited_turn(inherited.owner, inherited.downstream)
+      :sys.replace_state(inherited.owner, fn state -> %{state | active_turn: nil} end)
+    end
+
+    for {label, turn, inherited?, requested, expected} <- [
+          {"a turn before visible output", %{visible_output?: false}, true, :same, :owner_busy},
+          {"a turn this socket submitted itself", %{}, false, :same, :owner_busy},
+          {"a collected delivery", %{collect?: true}, true, :same, :owner_busy},
+          {"a compaction phase", %{admission_phase: :compact}, true, :same, :owner_busy},
+          {"a turn whose terminal was relayed", %{terminal_forwarded?: true}, true, :same, :owner_busy},
+          {"another socket's request", %{}, true, :next_epoch, :stale_downstream},
+          {"a draining owner", %{}, true, :draining, :owner_drained}
+        ] do
+      @tag turn: turn, inherited?: inherited?, requested: requested, expected: expected
+      test "leaves #{label} running", %{turn: turn, inherited?: inherited?, requested: requested, expected: expected} = context do
+        inherited = inherited_turn_owner!(context, "take-over-refused", turn, inherited?)
+
+        requested_downstream =
+          case requested do
+            :same -> inherited.downstream
+            :next_epoch -> %{inherited.downstream | epoch: 2}
+            :draining -> tap(inherited.downstream, fn _downstream -> :sys.replace_state(inherited.owner, &%{&1 | draining?: true}) end)
+          end
+
+        assert {:error, ^expected} = WebsocketOwnerSession.take_over_inherited_turn(inherited.owner, requested_downstream)
+        task = inherited.task
+        assert %{active_turn: %{task_pid: ^task, downstream: %{pid: _pid}} = active_turn} = :sys.get_state(inherited.owner)
+        refute Map.has_key?(active_turn, :canceled_result)
+        assert Process.alive?(task)
+        :sys.replace_state(inherited.owner, fn state -> %{state | active_turn: nil, draining?: false} end)
+      end
+    end
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "suspended V2 provisional reserve query cancel is idempotent and bounded", context do
+    context = %{
+      context
+      | codex_session_id: Ecto.UUID.generate(),
+        owner_lease_token: Ecto.UUID.generate()
+    }
+
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+
+    persistence = %{
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}}
+      end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+
+    clock = monotonic_clock()
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: persistence,
+        handoff_absolute_timeout_ms: 1_000,
+        monotonic_now_ms: fn -> :atomics.get(clock, 1) end
+      )
+
+    owner_state = :sys.get_state(owner)
+    authorization = authorization_binding(context.codex_session_id)
+
+    :sys.replace_state(owner, fn state ->
+      %{
+        state
+        | suspended_replay: %{
+            semantic_turn_digest: <<1::256>>,
+            replay_claim_digest: <<2::256>>,
+            authorization_snapshot: authorization,
+            replay_generation: 1,
+            downstream: nil,
+            predecessor_epoch: 1,
+            owner_process_generation: owner_state.process_generation,
+            provisional_token: nil,
+            provisional_status: :armed,
+            deadline_ms: nil,
+            consume_binding: nil,
+            reserve_timeout_ms: nil,
+            reserve_receipt: nil,
+            reserve_receipt_digest: nil,
+            lifecycle: %{
+              entitlement_id: Ecto.UUID.generate(),
+              request_id: Ecto.UUID.generate(),
+              codex_turn_id: Ecto.UUID.generate(),
+              eligible_attempt_id: Ecto.UUID.generate(),
+              owner_lease_digest: <<3::256>>
+            }
+          }
+      }
+    end)
+
+    downstream = %{pid: self(), epoch: 1, correlation_id: "provisional"}
+
+    {:ok, preflight} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :suspended_replay,
+        codex_session_id: context.codex_session_id,
+        downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+        semantic_turn_digest: <<1::256>>,
+        replay_claim_digest: <<2::256>>,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: authorization,
+        consume_binding: nil
+      })
+
+    assert {:ok, :provisional, token, 1, _generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    assert :sys.get_state(owner).suspended_replay.deadline_ms == 11_000
+
+    :atomics.put(clock, 1, 10_625)
+
+    reserve_attrs = %{
+      version: 2,
+      action: :provisional_reserve,
+      intent: :suspended_replay,
+      codex_session_id: context.codex_session_id,
+      downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      provisional_token: token,
+      replay_generation: 1,
+      owner_lease_token: context.owner_lease_token,
+      control_ref: make_ref(),
+      authorization_binding: nil,
+      consume_binding: nil
+    }
+
+    {:ok, reserve} =
+      RemoteReconnectControlV2.new(reserve_attrs)
+
+    assert {:ok, :consume_reserved, remaining_timeout_ms, reserve_receipt, reserve_digest} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, reserve)
+
+    assert remaining_timeout_ms == 375
+
+    assert {:ok, :consume_reserved, ^remaining_timeout_ms, ^reserve_receipt, ^reserve_digest} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, reserve)
+
+    {:ok, cancel} =
+      RemoteReconnectControlV2.new(%{
+        reserve_attrs
+        | action: :provisional_cancel,
+          downstream: nil
+      })
+
+    assert {:ok, :cancelled} = WebsocketOwnerSession.reconnect_control_v2(owner, cancel)
+
+    assert %{downstream: nil, downstream_monitor: nil, idle_shutdown_ref: idle_ref} =
+             :sys.get_state(owner)
+
+    assert is_reference(idle_ref)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "provisional issuance rejects an invalid configured timeout before minting state",
+       context do
+    for invalid_timeout_ms <- [999, 60_001] do
+      context = replay_owner_context(context, "invalid-issuance-timeout-#{invalid_timeout_ms}")
+
+      {:ok, owner} =
+        start_owner(context,
+          persistence: replay_persistence(),
+          handoff_absolute_timeout_ms: invalid_timeout_ms,
+          monotonic_now_ms: fn -> 10_000 end
+        )
+
+      {authorization, _lifecycle, _owner_generation} = install_armed_replay(owner, context)
+      downstream = %{pid: self(), epoch: 1, correlation_id: "invalid-issuance-timeout"}
+      {preflight, _reserve} = provisional_controls(context, downstream, authorization)
+
+      assert {:error, :owner_busy} = WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+      assert %{
+               downstream: nil,
+               downstream_epoch: 0,
+               downstream_monitor: nil,
+               provisional_issuances: [],
+               suspended_replay: %{
+                 provisional_status: :armed,
+                 provisional_token: nil,
+                 deadline_ms: nil,
+                 downstream: nil
+               }
+             } = :sys.get_state(owner)
+    end
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "provisional issuance samples the injected monotonic clock exactly once", context do
+    context = replay_owner_context(context, "single-issuance-sample")
+    clock = :atomics.new(1, [])
+
+    monotonic_now_ms = fn ->
+      calls = :atomics.add_get(clock, 1, 1)
+      10_000 + (calls - 1) * 100
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        handoff_absolute_timeout_ms: 1_000,
+        monotonic_now_ms: monotonic_now_ms
+      )
+
+    {authorization, _lifecycle, _owner_generation} = install_armed_replay(owner, context)
+    downstream = %{pid: self(), epoch: 1, correlation_id: "single-issuance-sample"}
+    {preflight, _reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, _token, 1, _generation, _downstream} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    assert :atomics.get(clock, 1) == 1
+
+    assert %{
+             provisional_issuances: [10_000],
+             suspended_replay: %{deadline_ms: 11_000}
+           } = :sys.get_state(owner)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "suspended preflight rejects caller epoch authority and mints the owner next epoch",
+       context do
+    context = replay_owner_context(context, "suspended-owner-epoch")
+    {:ok, owner} = start_owner(context, persistence: replay_persistence())
+    {authorization, _lifecycle, _generation} = install_armed_replay(owner, context)
+
+    :sys.replace_state(owner, fn state -> %{state | downstream_epoch: 1} end)
+
+    caller_downstream = %{pid: self(), epoch: 99, correlation_id: "epoch-replay"}
+    {invalid, _reserve} = provisional_controls(context, caller_downstream, authorization)
+
+    assert {:error, :owner_busy} = WebsocketOwnerSession.reconnect_control_v2(owner, invalid)
+
+    owner_next = %{caller_downstream | epoch: 2}
+    {valid, _reserve} = provisional_controls(context, owner_next, authorization)
+
+    assert {:ok, :provisional, _token, 1, _owner_generation, attached} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, valid)
+
+    assert attached.epoch == 2
+    assert :sys.get_state(owner).downstream_epoch == 2
+
+    assert {:error, :owner_busy} = WebsocketOwnerSession.reconnect_control_v2(owner, valid)
+
+    delayed = put_in(valid.downstream.epoch, 2)
+    assert {:error, :owner_busy} = WebsocketOwnerSession.reconnect_control_v2(owner, delayed)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "durable replay suspension replies to the blocked owner submitter before clearing the turn",
+       context do
+    context = replay_owner_context(context, "suspension-reply")
+    release_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: release_ref,
+        messages: ["before-suspension", "after-suspension"]
+      )
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        persistence: replay_persistence(),
+        replay_suspender: fn _input ->
+          {:ok,
+           %{
+             entitlement_id: Ecto.UUID.generate(),
+             request_id: Ecto.UUID.generate(),
+             codex_turn_id: Ecto.UUID.generate(),
+             eligible_attempt_id: Ecto.UUID.generate(),
+             owner_lease_digest: <<3::256>>
+           }}
+        end
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("suspension-reply"))
+
+    descriptor = %{
+      semantic_turn_key: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      authorization_snapshot: authorization_binding(context.codex_session_id),
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: Ecto.UUID.generate(),
+      replay_generation: 0
+    }
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(owner, downstream, descriptor)
+
+    submitter =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(
+          owner,
+          downstream,
+          native_websocket_request("suspension-reply")
+        )
+      end)
+
+    assert_receive {:websocket_owner_frame, "suspension-reply", 1, {:data, "before-suspension"}}
+
+    assert_receive {:websocket_owner_harness_barrier, _worker_pid, ^release_ref}
+    submitter_monitor = Process.monitor(submitter.pid)
+
+    assert :suspended = WebsocketOwnerSession.detach_downstream(owner, downstream)
+    assert Task.await(submitter, 15_000) == {:error, :client_disconnected}
+    assert_receive {:DOWN, ^submitter_monitor, :process, _pid, _reason}
+
+    assert %{active_turn: nil, suspended_replay: %{provisional_status: :armed}} =
+             :sys.get_state(owner)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_cleanup
+  test "reserved provisional replay reconciles the token-bound durable result on its owner timer",
+       context do
+    context = replay_owner_context(context, "timer-consumed")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    {authorization, lifecycle, owner_generation} = install_armed_replay(owner, context)
+    downstream = %{pid: self(), epoch: 1, correlation_id: "timer-consumed"}
+    {preflight, reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, ^owner_generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    assert {:ok, :consume_reserved, reserve_timeout_ms, _receipt, _digest} =
+             WebsocketOwnerSession.reconnect_control_v2(
+               owner,
+               %{reserve | provisional_token: token}
+             )
+
+    assert reserve_timeout_ms in 1..1_000
+
+    %{suspended_replay: reserved} = :sys.get_state(owner)
+    assert is_reference(reserved.reconciliation_timer_ref)
+    assert is_reference(reserved.reconciliation_token)
+
+    send(owner, {:websocket_owner_replay_reconcile, reserved.reconciliation_token})
+
+    assert_receive {:replay_status_query, owner_pid, reference}
+    assert reference.provisional_token == token
+
+    binding = %{
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      eligible_attempt_id: lifecycle.eligible_attempt_id,
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      provisional_binding_digest: <<4::256>>,
+      owner_lease_digest: lifecycle.owner_lease_digest
+    }
+
+    abandon_at = DateTime.utc_now() |> DateTime.add(1, :second)
+
+    send(
+      owner_pid,
+      {:replay_status_result, {:consumed, binding, :committed_not_started, abandon_at}}
+    )
+
+    assert %{suspended_replay: %{provisional_status: :committed_not_started} = reconciled} =
+             :sys.get_state(owner)
+
+    assert reconciled.consume_binding == binding
+    assert is_nil(reconciled.reconciliation_timer_ref)
+    assert is_nil(reconciled.reconciliation_token)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_cleanup
+  test "timer-driven unconsumed replay cancellation clears owner state and retires",
+       context do
+    context = replay_owner_context(context, "timer-armed")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    {authorization, _lifecycle, _owner_generation} = install_armed_replay(owner, context)
+    downstream = %{pid: self(), epoch: 1, correlation_id: "timer-armed"}
+    {preflight, reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, _owner_generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    assert {:ok, :consume_reserved, reserve_timeout_ms, _receipt, _digest} =
+             WebsocketOwnerSession.reconnect_control_v2(
+               owner,
+               %{reserve | provisional_token: token}
+             )
+
+    assert reserve_timeout_ms in 1..1_000
+
+    %{suspended_replay: reserved} = :sys.get_state(owner)
+    send(owner, {:websocket_owner_replay_reconcile, reserved.reconciliation_token})
+
+    assert_receive {:replay_status_query, owner_pid, reference}
+    assert reference.provisional_token == token
+    send(owner_pid, {:replay_status_result, :armed})
+
+    assert %{
+             active_turn: nil,
+             suspended_replay: nil,
+             downstream: nil,
+             downstream_monitor: nil,
+             idle_shutdown_ref: idle_shutdown_ref
+           } = :sys.get_state(owner)
+
+    assert is_reference(idle_shutdown_ref)
+    assert Process.read_timer(reserved.reconciliation_timer_ref) == false
+
+    owner_monitor = Process.monitor(owner)
+    send(owner, :idle_shutdown)
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}, 15_000
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_cleanup
+  @tag :replay_protocol_v2
+  test "factual terminal reconciliation clears replay state before a fresh preflight", context do
+    context = replay_owner_context(context, "timer-terminal")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    {authorization, _lifecycle, _owner_generation} = install_armed_replay(owner, context)
+    downstream = %{pid: self(), epoch: 1, correlation_id: "timer-terminal"}
+    {preflight, reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, _owner_generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    assert {:ok, :consume_reserved, remaining_timeout_ms, _receipt, _digest} =
+             WebsocketOwnerSession.reconnect_control_v2(
+               owner,
+               %{reserve | provisional_token: token}
+             )
+
+    assert remaining_timeout_ms in 1..1_000
+
+    %{suspended_replay: reserved} = :sys.get_state(owner)
+    reconciliation_timer_ref = reserved.reconciliation_timer_ref
+    downstream_monitor = :sys.get_state(owner).downstream_monitor
+    send(owner, {:websocket_owner_replay_reconcile, reserved.reconciliation_token})
+
+    assert_receive {:replay_status_query, owner_pid, reference}
+    assert reference.provisional_token == token
+    send(owner_pid, {:replay_status_result, :terminal})
+
+    assert %{
+             suspended_replay: nil,
+             downstream: nil,
+             downstream_monitor: nil,
+             downstream_epoch: 1
+           } = :sys.get_state(owner)
+
+    assert Process.read_timer(reconciliation_timer_ref) == false
+    assert Process.demonitor(downstream_monitor, [:info]) == false
+
+    {:ok, stale_query} =
+      RemoteReconnectControlV2.new(%{
+        Map.from_struct(reserve)
+        | action: :provisional_query,
+          downstream: nil,
+          provisional_token: token
+      })
+
+    assert {:error, :owner_unavailable} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, stale_query)
+
+    fresh_downstream = %{pid: self(), epoch: 2, correlation_id: "timer-terminal-fresh"}
+
+    {:ok, fresh} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :fresh,
+        codex_session_id: context.codex_session_id,
+        downstream: fresh_downstream,
+        semantic_turn_digest: <<5::256>>,
+        replay_claim_digest: <<6::256>>,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: authorization,
+        consume_binding: nil
+      })
+
+    assert {:ok, :fresh_dispatch, ^fresh_downstream} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, fresh)
+
+    assert %{suspended_replay: nil, downstream_epoch: 1} = :sys.get_state(owner)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "provisional downstream loss adopts a concurrent durable consume before cancellation",
+       context do
+    context = replay_owner_context(context, "provisional-loss-consumed")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    {authorization, lifecycle, _owner_generation} = install_armed_replay(owner, context)
+
+    downstream_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    downstream = %{pid: downstream_pid, epoch: 1, correlation_id: "provisional-loss-consumed"}
+    {preflight, _reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, _generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    binding = %{
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      eligible_attempt_id: lifecycle.eligible_attempt_id,
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      provisional_binding_digest: <<4::256>>,
+      owner_lease_digest: lifecycle.owner_lease_digest
+    }
+
+    Process.exit(downstream_pid, :kill)
+    assert_receive {:replay_status_query, owner_pid, reference}
+    assert reference.provisional_token == token
+
+    send(
+      owner_pid,
+      {:replay_status_result, {:consumed, binding, :committed_not_started, DateTime.utc_now()}}
+    )
+
+    assert %{suspended_replay: %{provisional_status: :committed_not_started} = replay} =
+             :sys.get_state(owner)
+
+    assert replay.consume_binding == binding
+    assert is_nil(replay.downstream)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  test "provisional downstream loss keeps unknown durable state fail closed without cancellation",
+       context do
+    context = replay_owner_context(context, "provisional-loss-unknown")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    {authorization, _lifecycle, _owner_generation} = install_armed_replay(owner, context)
+
+    downstream_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    downstream = %{pid: downstream_pid, epoch: 1, correlation_id: "provisional-loss-unknown"}
+    {preflight, _reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, _generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    Process.exit(downstream_pid, :kill)
+    assert_receive {:replay_status_query, owner_pid, reference}
+    assert reference.provisional_token == token
+    send(owner_pid, {:replay_status_result, {:error, :binding_mismatch}})
+
+    assert %{suspended_replay: %{provisional_status: :provisional} = replay} =
+             :sys.get_state(owner)
+
+    assert is_nil(replay.downstream)
+  end
+
+  @tag :replay_provisional_state
+  @tag :replay_race
+  @tag :replay_protocol_v2
+  @tag :replay_race
+  test "token-only query and cancel reconcile after provisional downstream loss", context do
+    context = replay_owner_context(context, "detached-token-control")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000,
+        monotonic_now_ms: fn -> 10_000 end
+      )
+
+    {authorization, _lifecycle, _owner_generation} = install_armed_replay(owner, context)
+
+    downstream_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    downstream = %{pid: downstream_pid, epoch: 1, correlation_id: "detached-token-control"}
+    {preflight, reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, _generation, _attached} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    Process.exit(downstream_pid, :kill)
+    assert_receive {:replay_status_query, loss_reader, loss_reference}
+    assert loss_reference.provisional_token == token
+    send(loss_reader, {:replay_status_result, {:error, :binding_mismatch}})
+
+    assert %{downstream: nil, suspended_replay: %{downstream: nil}} = :sys.get_state(owner)
+
+    {:ok, query} =
+      RemoteReconnectControlV2.new(%{
+        Map.from_struct(reserve)
+        | action: :provisional_query,
+          downstream: nil,
+          provisional_token: token
+      })
+
+    query_task = Task.async(fn -> WebsocketOwnerSession.reconnect_control_v2(owner, query) end)
+    assert_receive {:replay_status_query, query_reader, query_reference}
+    assert query_reference == loss_reference
+    send(query_reader, {:replay_status_result, :armed})
+    assert Task.await(query_task, 15_000) == {:ok, :provisional}
+    assert %{downstream: nil, suspended_replay: %{downstream: nil}} = :sys.get_state(owner)
+
+    {:ok, cancel} =
+      RemoteReconnectControlV2.new(%{
+        Map.from_struct(query)
+        | action: :provisional_cancel
+      })
+
+    cancel_task = Task.async(fn -> WebsocketOwnerSession.reconnect_control_v2(owner, cancel) end)
+    assert_receive {:replay_status_query, cancel_reader, cancel_reference}
+    assert cancel_reference == loss_reference
+    send(cancel_reader, {:replay_status_result, :armed})
+    assert Task.await(cancel_task, 15_000) == {:ok, :cancelled}
+
+    assert %{
+             downstream: nil,
+             downstream_monitor: nil,
+             downstream_epoch: 1,
+             suspended_replay: nil,
+             idle_shutdown_ref: idle_shutdown_ref
+           } = :sys.get_state(owner)
+
+    assert is_reference(idle_shutdown_ref)
+  end
+
+  @tag :replay_provisional_state
+  test "explicit provisional detach queries durable status before cancellation", context do
+    context = replay_owner_context(context, "provisional-detach-consumed")
+    parent = self()
+
+    replay_status_reader = fn reference ->
+      send(parent, {:replay_status_query, self(), reference})
+
+      receive do
+        {:replay_status_result, result} -> result
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        persistence: replay_persistence(),
+        replay_status_reader: replay_status_reader,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    {authorization, lifecycle, _owner_generation} = install_armed_replay(owner, context)
+    downstream = %{pid: self(), epoch: 1, correlation_id: "provisional-detach-consumed"}
+    {preflight, _reserve} = provisional_controls(context, downstream, authorization)
+
+    assert {:ok, :provisional, token, 1, _generation, _} =
+             WebsocketOwnerSession.reconnect_control_v2(owner, preflight)
+
+    binding = %{
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      eligible_attempt_id: lifecycle.eligible_attempt_id,
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      provisional_binding_digest: <<4::256>>,
+      owner_lease_digest: lifecycle.owner_lease_digest
+    }
+
+    detach = Task.async(fn -> WebsocketOwnerSession.detach_downstream(owner, downstream) end)
+    assert_receive {:replay_status_query, owner_pid, reference}
+    assert reference.provisional_token == token
+
+    send(
+      owner_pid,
+      {:replay_status_result, {:consumed, binding, :committed_not_started, DateTime.utc_now()}}
+    )
+
+    assert Task.await(detach, 15_000) == :ok
+
+    assert %{suspended_replay: %{provisional_status: :committed_not_started} = replay} =
+             :sys.get_state(owner)
+
+    assert replay.consume_binding == binding
+    assert is_nil(replay.downstream)
+  end
+
+  @tag :replay_protocol_v2
+  @tag :replay_topology
+  test "replay data plane rejects a stale owner process generation before upstream send",
+       context do
+    context = replay_owner_context(context, "generation-mismatch")
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    {:ok, owner} =
+      start_owner(context, upstream: upstream, persistence: replay_persistence())
+
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("generation-mismatch"))
+
+    {_authorization, lifecycle, owner_generation} = install_armed_replay(owner, context)
+    token = :crypto.strong_rand_bytes(32)
+
+    binding = %NativeReplayAdmission.Binding{
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      eligible_attempt_id: lifecycle.eligible_attempt_id,
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      provisional_binding_digest: <<4::256>>,
+      owner_lease_digest: lifecycle.owner_lease_digest,
+      downstream_epoch: downstream.epoch,
+      owner_process_generation: owner_generation + 1
+    }
+
+    consume_binding = NativeReplayAdmission.consume_binding(binding)
+
+    :sys.replace_state(owner, fn state ->
+      suspended = %{
+        state.suspended_replay
+        | provisional_token: token,
+          provisional_status: :committed_not_started,
+          downstream: downstream,
+          consume_binding: consume_binding
+      }
+
+      %{state | suspended_replay: suspended}
+    end)
+
+    proof = RuntimeAdmissionProof.new(self(), make_ref(), make_ref(), <<7::256>>, :native_replay)
+
+    request = %{
+      native_websocket_request("generation-mismatch")
+      | native_replay_binding: binding,
+        native_replay_proof: proof,
+        provisional_token: token
+    }
+
+    assert {:error, :owner_unavailable} =
+             WebsocketOwnerSession.submit_request(owner, downstream, request)
+
+    assert WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid) == []
   end
 
   test "latest reconnect fences old downstream request submissions", context do
@@ -500,15 +5255,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert :ok = WebsocketOwnerSession.push_downstream(owner, {:error, :owner_busy, safe_payload})
     assert :ok = WebsocketOwnerSession.push_downstream(owner, :complete)
 
-    assert_receive {:collected_owner_frame, :active,
-                    {:websocket_owner_frame, "corr-active", 2, {:data, "encoded-response"}}}
+    assert_receive {:collected_owner_frame, :active, {:websocket_owner_frame, "corr-active", 2, {:data, "encoded-response"}}}
 
-    assert_receive {:collected_owner_frame, :active,
-                    {:websocket_owner_frame, "corr-active", 2,
-                     {:error, :owner_busy, ^safe_payload}}}
+    assert_receive {:collected_owner_frame, :active, {:websocket_owner_frame, "corr-active", 2, {:error, :owner_busy, ^safe_payload}}}
 
-    assert_receive {:collected_owner_frame, :active,
-                    {:websocket_owner_frame, "corr-active", 2, :complete}}
+    assert_receive {:collected_owner_frame, :active, {:websocket_owner_frame, "corr-active", 2, :complete}}
 
     refute_receive {:collected_owner_frame, :stale, _message}
     assert stale_downstream.epoch == 1
@@ -540,8 +5291,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     submit_task =
       Task.async(fn -> WebsocketOwnerSession.submit_frame(owner, first_downstream, @sentinel) end)
 
-    assert_receive {:collected_owner_frame, :first,
-                    {:websocket_owner_frame, "corr-first", 1, {:data, "delta-a"}}}
+    assert_receive {:collected_owner_frame, :first, {:websocket_owner_frame, "corr-first", 1, {:data, "delta-a"}}}
 
     assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
 
@@ -566,20 +5316,469 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert WebsocketOwnerSession.submit_frame(owner, second_downstream, "overlap-frame") ==
              {:error, :owner_busy}
 
+    assert WebsocketOwnerSession.preflight_reconnect(
+             owner,
+             second_downstream,
+             semantic_turn_key(context.codex_session_id, "unknown-active"),
+             make_ref()
+           ) == {:error, :owner_busy}
+
     send(barrier_pid, {:websocket_owner_harness_release, block_ref})
-    assert :ok = Task.await(submit_task, 1_000)
+    assert :ok = Task.await(submit_task, @detection_timeout_ms)
 
-    assert_receive {:collected_owner_frame, :second,
-                    {:websocket_owner_frame, "corr-second", 2, {:data, "delta-b"}}}
+    assert_receive {:collected_owner_frame, :second, {:websocket_owner_frame, "corr-second", 2, {:data, "delta-b"}}}
 
-    assert_receive {:collected_owner_frame, :second,
-                    {:websocket_owner_frame, "corr-second", 2, :complete}}
+    assert_receive {:collected_owner_frame, :second, {:websocket_owner_frame, "corr-second", 2, :complete}}
 
-    refute_receive {:collected_owner_frame, :first,
-                    {:websocket_owner_frame, "corr-first", 1, {:data, "delta-b"}}}
+    refute_receive {:collected_owner_frame, :first, {:websocket_owner_frame, "corr-first", 1, {:data, "delta-b"}}}
 
     owner_state = :sys.get_state(owner)
     refute inspect(owner_state) =~ @sentinel
+  end
+
+  test "an explicit cancelled active-turn downstream never falls back to the replacement" do
+    replacement = %{pid: self(), epoch: 2, correlation_id: "replacement"}
+
+    assert DownstreamState.active_turn_downstream(%{
+             active_turn: %{downstream: nil},
+             downstream: replacement
+           }) == nil
+
+    assert WebsocketOwnerSession.preflight_reconnect(self(), replacement, <<1>>, make_ref()) ==
+             {:error, :owner_busy}
+  end
+
+  test "classifies native reconnects and releases one edited replacement after safe quiescence",
+       context do
+    parent = self()
+
+    upstream = reconnect_handoff_upstream(parent)
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        handoff_soft_timeout_ms: 50,
+        handoff_absolute_timeout_ms: 1_000
+      )
+
+    assert_receive {:reconnect_handoff_upstream_started, _upstream_pid}
+
+    {:ok, first_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("handoff-a"))
+
+    key_a = semantic_turn_key(context.codex_session_id, "turn-a")
+    key_b = semantic_turn_key(context.codex_session_id, "turn-b")
+    ref = make_ref()
+
+    assert {:ok, :dispatch} =
+             WebsocketOwnerSession.preflight_reconnect(owner, first_downstream, key_a, make_ref())
+
+    submitter =
+      spawn(fn ->
+        result =
+          WebsocketOwnerSession.submit_request(
+            owner,
+            first_downstream,
+            native_websocket_request("turn-a")
+          )
+
+        send(parent, {:handoff_old_result, result})
+
+        receive do
+          :release_handoff_submitter -> :ok
+        end
+      end)
+
+    assert_receive {:reconnect_handoff_first_send, first_task_pid}
+    first_task_ref = Process.monitor(first_task_pid)
+    %{active_turn: predecessor} = :sys.get_state(owner)
+
+    assert {:ok, :same_turn_replay} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               first_downstream,
+               key_a,
+               make_ref()
+             )
+
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               first_downstream,
+               key_b,
+               make_ref()
+             )
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, first_downstream)
+
+    assert {:ok, replacement_downstream} =
+             WebsocketOwnerSession.attach_downstream(owner, downstream_target("handoff-b"))
+
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               replacement_downstream,
+               key_a,
+               make_ref()
+             )
+
+    assert {:ok, :replacement_handoff, ^ref} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               replacement_downstream,
+               key_b,
+               ref
+             )
+
+    assert {:ok, :duplicate_replacement, ^ref} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               replacement_downstream,
+               key_b,
+               make_ref()
+             )
+
+    assert {:error, :owner_busy} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               replacement_downstream,
+               semantic_turn_key(context.codex_session_id, "turn-c"),
+               make_ref()
+             )
+
+    assert_receive {:reconnect_handoff_invalidated, 1}
+    assert_receive {:DOWN, ^first_task_ref, :process, ^first_task_pid, :killed}
+    assert_receive {:handoff_old_result, {:error, :client_disconnected}}
+    refute_received {:websocket_owner_handoff_ready, _, _, _, _, _}
+
+    send(submitter, :release_handoff_submitter)
+
+    assert_receive {:websocket_owner_handoff_ready, "handoff-b", 2, _, _, ^ref}
+
+    assert :ok =
+             WebsocketOwnerSession.submit_request(
+               owner,
+               replacement_downstream,
+               native_websocket_request("turn-b")
+             )
+
+    assert_receive {:reconnect_handoff_replacement_send, 2}
+    assert_receive {:websocket_owner_frame, "handoff-b", 2, :complete}
+
+    send(owner, {predecessor.task_ref, :ok})
+    send(owner, {:DOWN, predecessor.task_ref, :process, predecessor.task_pid, :shutdown})
+    send(owner, {:websocket_owner_upstream_frame, predecessor.ref, "stale-frame"})
+    send(owner, {:websocket_owner_terminal_delivery_timeout, predecessor.ref, make_ref()})
+
+    assert %{pending_handoff: nil, active_turn: nil} = :sys.get_state(owner)
+    refute_received {:websocket_owner_frame, "handoff-b", 2, {:data, "stale-frame"}}
+  end
+
+  # The handoff soft timeout invalidates the upstream connection behind a
+  # predecessor it stops (findings#206 row 206-327). The upstream session
+  # serves one call at a time and holds a request's call until its turn
+  # settles, ending it at once when the caller dies. An invalidation sent while
+  # the predecessor's task still held the session waited out its one-second
+  # call bound with the owner blocked, answered a timeout, and ran only after
+  # the task was gone anyway; the task goes first now, and the invalidation is
+  # served. The session below keeps that contract and the owner calls it
+  # through the production `invalidate_connection/1`.
+  test "a handoff soft timeout stops the predecessor holding the upstream session before invalidating it", context do
+    %{owner: owner, task_pid: task_pid, pending: pending, submitter: submitter} = start_held_session_handoff(context, "held-session", :hold_session)
+
+    send(owner, {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token})
+
+    assert_receive {:held_session_invalidate, predecessor_alive?, result}, @detection_timeout_ms
+    refute predecessor_alive?
+    assert result == :ok
+    assert_received {:held_session_request_ended, ^task_pid}
+    assert_received :held_session_invalidated
+    refute Process.alive?(task_pid)
+    send(submitter, :release_held_session_submitter)
+  end
+
+  # The other direction: a predecessor that holds no session call is stopped
+  # the same way, and the invalidation still reaches the idle session.
+  test "a handoff soft timeout still invalidates an idle upstream session after stopping the predecessor", context do
+    %{owner: owner, task_pid: task_pid, pending: pending, submitter: submitter} = start_held_session_handoff(context, "idle-session", :outside_session)
+
+    send(owner, {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token})
+
+    assert_receive {:held_session_invalidate, predecessor_alive?, :ok}, @detection_timeout_ms
+    refute predecessor_alive?
+    assert_received :held_session_invalidated
+    refute_received {:held_session_request_ended, _task_pid}
+    refute Process.alive?(task_pid)
+    send(submitter, :release_held_session_submitter)
+  end
+
+  test "absolute reconnect handoff deadline fails once and retires without replacement work",
+       context do
+    parent = self()
+    upstream = reconnect_handoff_upstream(parent)
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        handoff_soft_timeout_ms: 25,
+        handoff_absolute_timeout_ms: 100
+      )
+
+    assert_receive {:reconnect_handoff_upstream_started, _upstream_pid}
+
+    {:ok, first_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("timeout-a"))
+
+    submitter =
+      spawn(fn ->
+        result =
+          WebsocketOwnerSession.submit_request(
+            owner,
+            first_downstream,
+            native_websocket_request("turn-a")
+          )
+
+        send(parent, {:timeout_old_result, result})
+
+        receive do
+          :release_timeout_submitter -> :ok
+        end
+      end)
+
+    assert_receive {:reconnect_handoff_first_send, first_task_pid}
+    first_task_ref = Process.monitor(first_task_pid)
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, first_downstream)
+
+    {:ok, replacement_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("timeout-b"))
+
+    ref = make_ref()
+
+    assert {:ok, :replacement_handoff, ^ref} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               replacement_downstream,
+               semantic_turn_key(context.codex_session_id, "turn-b"),
+               ref
+             )
+
+    owner_monitor = Process.monitor(owner)
+    assert_receive {:reconnect_handoff_invalidated, 1}
+    assert_receive {:DOWN, ^first_task_ref, :process, ^first_task_pid, :killed}
+    assert_receive {:timeout_old_result, {:error, :client_disconnected}}
+
+    assert_receive {:websocket_owner_handoff_failed, "timeout-b", 2, _, _, ^ref, :owner_forward_timeout}
+
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}
+    refute_received {:reconnect_handoff_replacement_send, _count}
+    send(submitter, :release_timeout_submitter)
+  end
+
+  test "pending replacement socket close before and after ready clears the handoff", context do
+    waiting = start_waiting_handoff(context, "socket-close-before")
+    pending = waiting.pending
+    task_monitor = waiting.task_monitor
+    task_pid = waiting.task_pid
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(waiting.owner, waiting.replacement)
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}
+
+    assert_receive {:handoff_fixture_old_result, "socket-close-before", {:error, :client_disconnected}}
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token}
+    )
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_absolute_timeout, pending.control_ref, pending.absolute_token}
+    )
+
+    assert %{pending_handoff: nil, active_turn: nil} = :sys.get_state(waiting.owner)
+    refute_received {:websocket_owner_handoff_ready, _, _, _, _, _}
+    refute_received {:websocket_owner_handoff_failed, _, _, _, _, _, _}
+    refute_received {:reconnect_handoff_replacement_send, _count}
+    send(waiting.submitter, :release_handoff_fixture_submitter)
+
+    ready_context = unique_owner_context(context, "socket-close-after")
+    ready = start_ready_handoff(ready_context, "socket-close-after")
+    ready_pending = ready.pending
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(ready.owner, ready.replacement)
+
+    send(
+      ready.owner,
+      {:websocket_owner_handoff_absolute_timeout, ready_pending.control_ref, ready_pending.absolute_token}
+    )
+
+    assert %{pending_handoff: nil, active_turn: nil} = :sys.get_state(ready.owner)
+    refute_received {:websocket_owner_handoff_failed, _, _, _, _, _, _}
+    refute_received {:reconnect_handoff_replacement_send, _count}
+  end
+
+  test "lease revocation clears a waiting handoff and terminates its predecessor", context do
+    parent = self()
+
+    persistence = %{
+      renew_owner_token: fn _session_id, _owner_lease_token, %RequestOptions{} ->
+        send(parent, :handoff_renewal_revoked)
+        {:error, :stale_owner}
+      end,
+      release_owner_lease: fn _session_id, _owner_lease_token, _reason -> :ok end,
+      interrupt_codex_session: fn _session_id, _opts -> :ok end
+    }
+
+    waiting = start_waiting_handoff(context, "lease-revocation", persistence: persistence)
+    owner_monitor = Process.monitor(waiting.owner)
+    owner = waiting.owner
+    task_monitor = waiting.task_monitor
+    task_pid = waiting.task_pid
+
+    send(waiting.owner, :renew_owner_lease)
+
+    assert_receive :handoff_renewal_revoked
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, {:shutdown, :stale_owner}}
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}
+    refute_received {:websocket_owner_handoff_ready, _, _, _, _, _}
+    refute_received {:reconnect_handoff_replacement_send, _count}
+    Process.exit(waiting.submitter, :kill)
+  end
+
+  test "rollout drain fails a waiting handoff once and stale timers cannot make it ready",
+       context do
+    waiting = start_waiting_handoff(context, "rollout-drain")
+    pending = waiting.pending
+    control_ref = pending.control_ref
+
+    assert :ok = WebsocketOwnerSession.begin_drain(waiting.owner)
+
+    assert_receive {:websocket_owner_handoff_failed, "rollout-drain-b", 2, _, _, ^control_ref, :owner_drained}
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token}
+    )
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_absolute_timeout, pending.control_ref, pending.absolute_token}
+    )
+
+    assert %{pending_handoff: nil, draining?: true} = :sys.get_state(waiting.owner)
+    refute_received {:websocket_owner_handoff_failed, _, _, _, _, _, :owner_drained}
+    refute_received {:websocket_owner_handoff_ready, _, _, _, _, _}
+
+    Process.exit(waiting.task_pid, :kill)
+    Process.exit(waiting.submitter, :kill)
+  end
+
+  test "stale predecessor errors completion and probe artifacts cannot reach the replacement",
+       context do
+    ready = start_ready_handoff(context, "stale-artifacts")
+    predecessor = ready.predecessor
+
+    assert :ok =
+             WebsocketOwnerSession.submit_request(
+               ready.owner,
+               ready.replacement,
+               native_websocket_request("stale-artifacts-b")
+             )
+
+    assert_receive {:reconnect_handoff_replacement_send, 2}
+    assert_receive {:websocket_owner_frame, "stale-artifacts-b", 2, :complete}
+
+    stale_error = CodexPooler.JSON.encode!(%{"type" => "error", "error" => %{"code" => "stale"}})
+    stale_complete = terminal_frame("response.completed", "resp_stale_artifacts")
+    probe_ref = make_ref()
+
+    send(ready.owner, {:websocket_owner_upstream_frame, predecessor.ref, stale_error})
+    send(ready.owner, {:websocket_owner_upstream_frame, predecessor.ref, stale_complete})
+
+    send(
+      ready.owner,
+      {:websocket_owner_output_commit_ack, "stale-artifacts-a", 1, self(), predecessor.ref, probe_ref, true}
+    )
+
+    send(
+      ready.owner,
+      {:websocket_owner_output_commit_timeout, predecessor.ref, probe_ref}
+    )
+
+    assert %{active_turn: nil, pending_handoff: nil} = :sys.get_state(ready.owner)
+    refute_received {:websocket_owner_frame, "stale-artifacts-b", 2, _payload}
+  end
+
+  test "duplicate and stale handoff timer tokens have exactly one effect", context do
+    waiting = start_waiting_handoff(context, "timer-fencing")
+    pending = waiting.pending
+    control_ref = pending.control_ref
+    task_monitor = waiting.task_monitor
+    task_pid = waiting.task_pid
+
+    send(waiting.owner, {:websocket_owner_handoff_soft_timeout, pending.control_ref, make_ref()})
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_absolute_timeout, pending.control_ref, make_ref()}
+    )
+
+    assert %{pending_handoff: %{status: :waiting}} = :sys.get_state(waiting.owner)
+    refute_received {:reconnect_handoff_invalidated, _count}
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token}
+    )
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token}
+    )
+
+    assert_receive {:reconnect_handoff_invalidated, 1}
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}
+    assert_receive {:handoff_fixture_old_result, "timer-fencing", {:error, :client_disconnected}}
+    refute_received {:reconnect_handoff_invalidated, _count}
+
+    send(waiting.submitter, :release_handoff_fixture_submitter)
+    assert_receive {:websocket_owner_handoff_ready, "timer-fencing-b", 2, _, _, ^control_ref}
+
+    assert :ok =
+             WebsocketOwnerSession.submit_request(
+               waiting.owner,
+               waiting.replacement,
+               native_websocket_request("timer-fencing-b")
+             )
+
+    assert_receive {:reconnect_handoff_replacement_send, 2}
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_absolute_timeout, pending.control_ref, pending.absolute_token}
+    )
+
+    assert %{active_turn: nil, pending_handoff: nil} = :sys.get_state(waiting.owner)
+    refute_received {:websocket_owner_handoff_failed, _, _, _, _, _, _}
+  end
+
+  test "ready replacement expires through the owner API without submitting replacement work",
+       context do
+    ready = start_ready_handoff(context, "submission-expiry")
+    pending = ready.pending
+    owner_monitor = Process.monitor(ready.owner)
+    owner = ready.owner
+    control_ref = pending.control_ref
+
+    send(
+      ready.owner,
+      {:websocket_owner_handoff_absolute_timeout, pending.control_ref, pending.absolute_token}
+    )
+
+    assert_receive {:websocket_owner_handoff_failed, "submission-expiry-b", 2, _, _, ^control_ref, :owner_forward_timeout}
+
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner, :normal}
+    refute_received {:reconnect_handoff_replacement_send, _count}
   end
 
   test "submitter exit while upstream worker is blocked clears active turn", context do
@@ -605,8 +5804,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
         send(parent, {:websocket_owner_submitter_result, result})
       end)
 
-    assert_receive {:websocket_owner_frame, "submitter-exit", 1,
-                    {:data, "delta-before-submitter-exit"}}
+    assert_receive {:websocket_owner_frame, "submitter-exit", 1, {:data, "delta-before-submitter-exit"}}
 
     assert_receive {:websocket_owner_harness_barrier, upstream_worker_pid, ^block_ref}
 
@@ -617,15 +5815,85 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert_receive {:DOWN, ^submitter_ref, :process, ^submitter, :shutdown}
     assert_receive {:DOWN, ^upstream_worker_ref, :process, ^upstream_worker_pid, :shutdown}
 
-    assert_receive {:websocket_owner_frame, "submitter-exit", 1,
-                    {:error, :client_disconnected, safe_payload}}
+    assert_receive {:websocket_owner_frame, "submitter-exit", 1, {:error, :client_disconnected, safe_payload}}
 
     assert safe_payload.code == "client_disconnected"
+    assert_receive {:websocket_owner_frame, "submitter-exit", 1, :complete}
     assert %{active_turn: nil} = await_active_turn_cleared(owner)
     refute_received {:websocket_owner_submitter_result, _result}
 
-    refute_receive {:websocket_owner_frame, "submitter-exit", 1,
-                    {:data, "delta-after-submitter-exit"}}
+    refute_receive {:websocket_owner_frame, "submitter-exit", 1, {:data, "delta-after-submitter-exit"}}
+  end
+
+  test "local bridge submitter exit cancels the default upstream websocket request", context do
+    release_ref = make_ref()
+    parent = self()
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.timeout_mid_stream(
+          ~s({"type":"response.created","response":{"id":"resp_detach_local_owner","status":"in_progress"}}),
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+    {:ok, owner} = start_owner(context, [])
+
+    submitter =
+      spawn(fn ->
+        send(parent, {:local_owner_bridge_submitter_ready, self()})
+
+        receive do
+          {:submit_local_owner_bridge, downstream, request} ->
+            result = WebsocketOwnerSession.submit_request(owner, downstream, request)
+            send(parent, {:local_owner_bridge_submitter_result, result})
+        end
+      end)
+
+    assert_receive {:local_owner_bridge_submitter_ready, ^submitter}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, %{
+        pid: submitter,
+        correlation_id: "detach-local-owner"
+      })
+
+    # The receive timeout is a scenario bound the submitter's exit must beat, so
+    # it outlasts every detection wait below: at one second a test that stalled
+    # past it at the barrier found the turn already timed out.
+    send(
+      submitter,
+      {:submit_local_owner_bridge, downstream,
+       %{
+         websocket_request()
+         | url: FakeUpstream.url(upstream),
+           timeouts: %{connect_timeout_ms: 1_000, receive_timeout_ms: 60_000}
+       }}
+    )
+
+    submitter_ref = Process.monitor(submitter)
+
+    assert_receive {:fake_upstream_timeout_barrier, :mid_stream, socket_pid, ^release_ref},
+                   @detection_timeout_ms
+
+    assert %{active_turn: %{task_pid: active_turn_worker_pid}} = :sys.get_state(owner)
+
+    active_turn_worker_ref = Process.monitor(active_turn_worker_pid)
+    socket_ref = Process.monitor(socket_pid)
+
+    Process.exit(submitter, :shutdown)
+
+    assert_receive {:DOWN, ^submitter_ref, :process, ^submitter, :shutdown}, @detection_timeout_ms
+
+    assert_receive {:DOWN, ^active_turn_worker_ref, :process, ^active_turn_worker_pid, :shutdown},
+                   @detection_timeout_ms
+
+    assert_receive {:DOWN, ^socket_ref, :process, ^socket_pid, _reason}, @detection_timeout_ms
+    assert %{active_turn: nil, downstream: nil} = await_owner_cleared(owner)
+    refute_received {:local_owner_bridge_submitter_result, _result}
   end
 
   test "active upstream request completes when downstream exits first", context do
@@ -651,9 +5919,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     submit_task =
       Task.async(fn -> WebsocketOwnerSession.submit_frame(owner, downstream, @sentinel) end)
 
-    assert_receive {:collected_owner_frame, :downstream_exit,
-                    {:websocket_owner_frame, "corr-downstream-exit", 1,
-                     {:data, "delta-before-exit"}}}
+    assert_receive {:collected_owner_frame, :downstream_exit, {:websocket_owner_frame, "corr-downstream-exit", 1, {:data, "delta-before-exit"}}}
 
     assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
 
@@ -668,17 +5934,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert is_map(active_turn)
     assert Process.alive?(owner)
 
-    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
-    assert :ok = Task.await(submit_task, 1_000)
-
+    # Monitored before the release: the owner shuts down 1 ms after the turn
+    # completes, so a monitor taken after the await can already read `:noproc`.
     owner_ref = Process.monitor(owner)
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+    assert :ok = Task.await(submit_task, @detection_timeout_ms)
+
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
     assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
     refute_received {:collected_owner_frame, :downstream_exit, _message}
   end
 
   @tag :owner_exit_persistence_failure
-  test "owner exit persistence failure emits sanitized observability", context do
+  test "idle owner lease release failure emits sanitized observability without request cleanup",
+       context do
     upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
     codex_session_id = Ecto.UUID.generate()
     owner_lease_token = "owner-token-#{@sentinel}"
@@ -718,65 +5987,1094 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert logs =~ "codex_session_id=#{codex_session_id}"
     assert logs =~ "operation=release_owner_lease"
     assert logs =~ "reason_class=owner_unavailable"
-    assert logs =~ "operation=interrupt_codex_session"
-    assert logs =~ "reason_class=RuntimeError"
+    refute logs =~ "operation=interrupt_codex_session"
+    refute logs =~ "reason_class=RuntimeError"
     assert logs =~ "owner_exit_reason=owner_drained"
-    assert logs =~ "recovery_hint=task_7_owner_exit_recovery"
+    assert logs =~ "recovery_hint=owner_exit_recovery"
     refute logs =~ owner_lease_token
     refute logs =~ context.owner_lease_token
     refute logs =~ @sentinel
   end
 
-  defp await_owner_unavailable(codex_session_id, attempts \\ 100)
+  @tag :replay_cleanup
+  @tag :replay_lock_order
+  test "idle owner shutdown has no request replay candidate",
+       context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    codex_session_id = Ecto.UUID.generate()
+    owner_lease_token = Ecto.UUID.generate()
+    parent = self()
 
-  defp await_owner_unavailable(codex_session_id, attempts) when attempts > 0 do
+    persistence = %{
+      close_request_replays: fn ^codex_session_id, ^owner_lease_token, :owner_shutdown ->
+        send(parent, :replay_close_attempted)
+        {:error, :synthetic_replay_close_failure}
+      end,
+      interrupt_codex_session: fn _session_id, _opts ->
+        send(parent, :unexpected_owner_interrupt)
+        {:ok, :interrupted}
+      end,
+      release_owner_lease: fn _session_id, _lease_token, _reason, _cause ->
+        send(parent, :unexpected_owner_lease_release)
+        :ok
+      end,
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: context.owner_instance_id}}
+      end
+    }
+
+    logs =
+      capture_log(fn ->
+        assert {:ok, owner} =
+                 WebsocketOwnerSession.start_owner(
+                   codex_session_id: codex_session_id,
+                   owner_lease_token: owner_lease_token,
+                   owner_instance_id: context.owner_instance_id,
+                   upstream: upstream,
+                   persistence: persistence
+                 )
+
+        assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+        owner_ref = Process.monitor(owner)
+        assert :ok = GenServer.stop(owner)
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+      end)
+
+    refute_received :replay_close_attempted
+    refute_received :unexpected_owner_interrupt
+    assert_receive :unexpected_owner_lease_release
+    refute logs =~ "operation=interrupt_codex_session"
+    refute logs =~ "reason_class=request_replay_close_failed"
+    refute logs =~ owner_lease_token
+  end
+
+  # findings#270: the owner's upstream session signals every close of a
+  # connection that carried a request, between requests and for a cause that
+  # ends every anchor it produced. The owner tells its attached downstream
+  # (after the `:complete` of a turn whose terminal it had already relayed),
+  # and leaves one fixed-vocabulary line for every signal it does not pass on.
+  describe "upstream connection close between requests" do
+    test "tells the attached idle downstream, with the signal only", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-idle")
+      signal = upstream_close_signal(:peer_close_frame, 3)
+
+      log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+      instruction = upstream_close_instruction("upstream-close-idle", 1, signal)
+      assert_received ^instruction
+      assert WebsocketOwnerContract.upstream_closed_message?(instruction)
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+      assert upstream_close_skip_lines(log) == []
+      assert %{active_turn: nil, downstream: %{epoch: 1}} = :sys.get_state(owner)
+    end
+
+    test "a real upstream session tells its owner, which tells the idle downstream", context do
+      completed = terminal_frame("response.completed", "resp_upstream_close_real")
+      {:ok, upstream} = FakeUpstream.start_link(FakeUpstream.websocket_text_frames([completed]))
+      on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+      {:ok, owner} = start_owner(context, [])
+      upstream_pid = :sys.get_state(owner).upstream_pid
+      # The default boundary starts the session inside the owner's `init/1`.
+      assert %{connection_close_subscriber: ^owner} = :sys.get_state(upstream_pid)
+
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-real"))
+
+      request = %{
+        native_websocket_request("upstream-close-real")
+        | url: FakeUpstream.url(upstream),
+          timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: @detection_timeout_ms}
+      }
+
+      assert {:ok, %{upstream_websocket_connection: connection}} = WebsocketOwnerSession.submit_request(owner, downstream, request)
+      assert_receive {:websocket_owner_frame, "upstream-close-real", 1, {:data, _completed}}
+      assert_receive {:websocket_owner_frame, "upstream-close-real", 1, :complete}
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+
+      close_ref = make_ref()
+      assert :ok = FakeUpstream.close_websocket_connection(upstream, 1, close_ref: close_ref, notify: self(), code: 1000)
+      assert_receive {:fake_upstream_websocket_peer_closed, 1, ^close_ref}, @detection_timeout_ms
+
+      assert_receive {:websocket_owner_upstream_closed, "upstream-close-real", 1, signal}, @detection_timeout_ms
+      assert signal == %{cause: :peer_close_frame, lifecycle_id: connection.lifecycle_id, generation: connection.generation}
+      assert connection.generation == 1
+      FakeUpstream.verify!(upstream)
+    end
+
+    test "waits for the turn whose terminal reached the downstream and follows its :complete", context do
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred")
+      submitter = deferred.submitter
+
+      log =
+        capture_info_log(fn ->
+          release_controlled(deferred.barriers, deferred.controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, result}}, @detection_timeout_ms
+          assert result == terminal_result(deferred.terminal, "response.completed")
+          assert %{active_turn: nil} = :sys.get_state(deferred.owner)
+        end)
+
+      assert next_owner_message("upstream-close-deferred") == {:websocket_owner_frame, "upstream-close-deferred", 1, :complete}
+      assert next_owner_message("upstream-close-deferred") == upstream_close_instruction("upstream-close-deferred", 1, deferred.signal)
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+      assert upstream_close_skip_lines(log) == []
+    end
+
+    test "drops a deferred instruction whose downstream detached before the turn ended", context do
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred-detach")
+      submitter = deferred.submitter
+      assert :ok = WebsocketOwnerSession.detach_downstream(deferred.owner, deferred.downstream)
+
+      log =
+        capture_info_log(fn ->
+          release_controlled(deferred.barriers, deferred.controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, _result}}, @detection_timeout_ms
+          assert %{active_turn: nil, downstream: nil} = :sys.get_state(deferred.owner)
+        end)
+
+      assert_upstream_close_skipped!(log, deferred.signal, :no_downstream, context.codex_session_id)
+      refute_received {:websocket_owner_frame, "upstream-close-deferred-detach", 1, :complete}
+    end
+
+    test "drops a deferred instruction when another socket replaced its downstream", context do
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred-replaced")
+      submitter = deferred.submitter
+      replacement = upstream_close_collector(self(), :replacement)
+
+      assert {:ok, %{epoch: 2}} = WebsocketOwnerSession.attach_downstream(deferred.owner, %{pid: replacement, correlation_id: "upstream-close-replacement"})
+
+      log =
+        capture_info_log(fn ->
+          release_controlled(deferred.barriers, deferred.controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, _result}}, @detection_timeout_ms
+          assert %{active_turn: nil, downstream: %{epoch: 2}} = :sys.get_state(deferred.owner)
+        end)
+
+      # The owner wrote to the collector before it answered the state read.
+      send(replacement, :upstream_close_collector_marker)
+      assert_receive {:upstream_close_collected, :replacement, :upstream_close_collector_marker}, @detection_timeout_ms
+      assert_received {:upstream_close_collected, :replacement, {:websocket_owner_frame, "upstream-close-replacement", 2, :complete}}
+      refute_received {:upstream_close_collected, :replacement, {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}}
+      assert_upstream_close_skipped!(log, deferred.signal, :downstream_replaced, context.codex_session_id)
+    end
+
+    # The drain waits for the turn whose terminal went out (findings#287) and
+    # drops the deferred instruction from its first instant, as a rollout
+    # drain start does.
+    test "a drain drops a deferred instruction", context do
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred-drain")
+      submitter = deferred.submitter
+      owner_ref = Process.monitor(deferred.owner)
+
+      log =
+        capture_info_log(fn ->
+          drain = Task.async(fn -> WebsocketOwnerSession.drain_owner(deferred.owner) end)
+          assert %{draining?: true, drain_settlement: %{}, active_turn: active_turn} = await_drain_settlement(deferred.owner)
+          refute Map.has_key?(active_turn, :upstream_close)
+          release_controlled(deferred.barriers, deferred.controls, :task_result)
+          assert Task.await(drain, @detection_timeout_ms) == :ok
+          assert_receive {:DOWN, ^owner_ref, :process, _owner, :normal}, @detection_timeout_ms
+        end)
+
+      expected = terminal_result(deferred.terminal, "response.completed")
+      assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, ^expected}}, @detection_timeout_ms
+      assert_received {:websocket_owner_frame, "upstream-close-deferred-drain", 1, :complete}
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+      assert_upstream_close_skipped!(log, deferred.signal, :draining, context.codex_session_id)
+    end
+
+    test "a rollout drain start drops a deferred instruction at once", context do
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred-begin-drain")
+      submitter = deferred.submitter
+
+      log =
+        capture_info_log(fn ->
+          :ok = WebsocketOwnerSession.begin_drain(deferred.owner)
+          assert %{draining?: true, active_turn: active_turn} = :sys.get_state(deferred.owner)
+          refute Map.has_key?(active_turn, :upstream_close)
+          release_controlled(deferred.barriers, deferred.controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, _result}}, @detection_timeout_ms
+          assert %{active_turn: nil} = :sys.get_state(deferred.owner)
+        end)
+
+      assert_received {:websocket_owner_frame, "upstream-close-deferred-begin-drain", 1, :complete}
+      assert_upstream_close_skipped!(log, deferred.signal, :draining, context.codex_session_id)
+    end
+
+    test "an owner that stops before the turn ended logs the deferred instruction it drops", context do
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred-stop")
+      submitter = deferred.submitter
+
+      log = capture_info_log(fn -> assert :ok = GenServer.stop(deferred.owner, :shutdown, @detection_timeout_ms) end)
+
+      assert_receive {:upstream_close_submitter_outcome, ^submitter, {:exit, _reason}}, @detection_timeout_ms
+      assert_upstream_close_skipped!(log, deferred.signal, :draining, context.codex_session_id)
+    end
+
+    test "a handoff that takes the deferred turn over drops its instruction", context do
+      waiting = start_waiting_handoff(context, "upstream-close-handoff-ready")
+      pending = waiting.pending
+      task_monitor = waiting.task_monitor
+      task_pid = waiting.task_pid
+      signal = upstream_close_signal(:peer_close_frame)
+
+      # Deferred on the predecessor as if its terminal had reached the replaced
+      # socket first: the handoff ends that turn without finishing it.
+      :sys.replace_state(waiting.owner, fn state ->
+        deferred = %{downstream: Map.take(waiting.replacement, [:pid, :epoch, :correlation_id]), signal: Map.take(signal, [:cause, :lifecycle_id, :generation])}
+        %{state | active_turn: Map.put(state.active_turn, :upstream_close, deferred)}
+      end)
+
+      log =
+        capture_info_log(fn ->
+          send(waiting.owner, {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token})
+          assert_receive {:reconnect_handoff_invalidated, 1}
+          assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}
+          assert_receive {:handoff_fixture_old_result, "upstream-close-handoff-ready", {:error, :client_disconnected}}
+          send(waiting.submitter, :release_handoff_fixture_submitter)
+          assert_receive {:websocket_owner_handoff_ready, "upstream-close-handoff-ready-b", 2, _owner_turn_id, _pid, _control_ref}
+          assert %{active_turn: nil, pending_handoff: %{status: :ready}} = :sys.get_state(waiting.owner)
+        end)
+
+      assert_upstream_close_skipped!(log, signal, :handoff, context.codex_session_id)
+    end
+
+    test "a replay suspension drops the instruction deferred on its turn", context do
+      context = replay_owner_context(context, "upstream-close-suspended")
+      release_ref = make_ref()
+      upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self(), block_ref: release_ref, messages: ["before-suspension", "after-suspension"])
+      lifecycle = replay_lifecycle_fixture()
+
+      {:ok, owner} =
+        start_owner(context,
+          upstream: upstream,
+          persistence: replay_persistence(),
+          replay_suspender: fn _input -> {:ok, lifecycle} end
+        )
+
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-suspended"))
+      descriptor = replay_descriptor(context.codex_session_id, authorization_binding(context.codex_session_id))
+      assert :ok = WebsocketOwnerSession.prepare_next_replay_descriptor(owner, downstream, descriptor)
+      submitter = upstream_close_submitter(owner, downstream, native_websocket_request("upstream-close-suspended"))
+      assert_receive {:websocket_owner_frame, "upstream-close-suspended", 1, {:data, "before-suspension"}}
+      assert_receive {:websocket_owner_harness_barrier, _worker_pid, ^release_ref}
+      signal = upstream_close_signal(:peer_close_frame)
+
+      # A deferral needs a relayed terminal, which ends replay eligibility, so
+      # this state is injected: the suspension must still drop it with a line.
+      :sys.replace_state(owner, fn state ->
+        deferred = %{downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]), signal: Map.take(signal, [:cause, :lifecycle_id, :generation])}
+        %{state | active_turn: Map.put(state.active_turn, :upstream_close, deferred)}
+      end)
+
+      log =
+        capture_info_log(fn ->
+          assert :suspended = WebsocketOwnerSession.detach_downstream(owner, downstream)
+          assert %{active_turn: nil, suspended_replay: %{provisional_status: :armed}} = :sys.get_state(owner)
+        end)
+
+      assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, {:error, :client_disconnected}}}, @detection_timeout_ms
+      assert_upstream_close_skipped!(log, signal, :replay_armed, context.codex_session_id)
+    end
+
+    test "keeps the downstream of a running turn open when its terminal has not reached it", context do
+      terminal = terminal_frame("response.completed", "resp_upstream_close_turn_active")
+      controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+      upstream =
+        WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+          terminal_frames: [terminal],
+          task_result: terminal_result(terminal, "response.completed")
+        )
+
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-turn-active"))
+      submitter = upstream_close_submitter(owner, downstream, native_websocket_request("upstream-close-turn-active"))
+      barriers = await_two_sender_barriers(controls)
+      signal = upstream_close_signal(:transport_closed)
+
+      log =
+        capture_info_log(fn ->
+          assert %{active_turn: %{terminal_forwarded?: false} = active_turn} = send_upstream_close(owner, signal)
+          refute Map.has_key?(active_turn, :upstream_close)
+          release_controlled(barriers, controls, :nonterminal_frames)
+          terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+          release_controlled(terminal_barrier, controls, :terminal_frames)
+          release_controlled(barriers, controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, _result}}, @detection_timeout_ms
+          assert %{active_turn: nil} = :sys.get_state(owner)
+        end)
+
+      assert_received {:websocket_owner_frame, "upstream-close-turn-active", 1, :complete}
+      assert_upstream_close_skipped!(log, signal, :turn_active, context.codex_session_id)
+    end
+
+    test "keeps the downstream open for a cancelled turn whose terminal it received", context do
+      parent = self()
+      gate = make_ref()
+      terminal = terminal_frame("response.completed", "resp_upstream_close_abandoned")
+
+      upstream = %{
+        start: fn -> Agent.start_link(fn -> :ready end) end,
+        send: fn _upstream_pid, _request, writer ->
+          # Outlives the owner's cancel, as a turn still reading its provider.
+          Process.flag(:trap_exit, true)
+          writer.(terminal, TerminalDiscriminator.classify(terminal))
+          send(parent, {:upstream_close_abandoned_sent, self()})
+          receive do: ({:release_upstream_close_abandoned, ^gate} -> :ok)
+          terminal_result(terminal, "response.completed")
+        end,
+        close: fn pid -> Agent.stop(pid) end
+      }
+
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      {:ok, stable_downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-abandoned"))
+      per_call_downstream = Map.put(stable_downstream, :owner_turn_id, self())
+      submitter = upstream_close_submitter(owner, per_call_downstream, native_websocket_request("upstream-close-abandoned"))
+      assert_receive {:upstream_close_abandoned_sent, executor}, @detection_timeout_ms
+      on_exit(fn -> send(executor, {:release_upstream_close_abandoned, gate}) end)
+      owner_turn_id = self()
+      assert_receive {:websocket_owner_frame, "upstream-close-abandoned", 1, ^owner_turn_id, {:data, ^terminal}}, @detection_timeout_ms
+      assert :ok = WebsocketOwnerSession.abandon_turn(owner, per_call_downstream)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log =
+        capture_info_log(fn ->
+          assert %{active_turn: %{terminal_forwarded?: true, canceled_result: {:error, :owner_forward_timeout}} = active_turn} = send_upstream_close(owner, signal)
+          refute Map.has_key?(active_turn, :upstream_close)
+          send(executor, {:release_upstream_close_abandoned, gate})
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, {:error, :owner_forward_timeout}}}, @detection_timeout_ms
+          assert %{active_turn: nil, downstream: %{epoch: 1}} = :sys.get_state(owner)
+        end)
+
+      assert_upstream_close_skipped!(log, signal, :turn_active, context.codex_session_id)
+    end
+
+    test "keeps the downstream of a public turn open", context do
+      terminal = terminal_frame("response.completed", "resp_upstream_close_public")
+      controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+      upstream =
+        WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+          terminal_frames: [terminal],
+          task_result: terminal_result(terminal, "response.completed")
+        )
+
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-public"))
+      # No native message mapper: the owner keys it as a public turn.
+      submitter = upstream_close_submitter(owner, downstream, websocket_request())
+      barriers = await_two_sender_barriers(controls)
+      release_controlled(barriers, controls, :nonterminal_frames)
+      terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+      release_controlled(terminal_barrier, controls, :terminal_frames)
+      assert_receive {:websocket_owner_frame, "upstream-close-public", 1, {:data, ^terminal}}
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log =
+        capture_info_log(fn ->
+          assert %{active_turn: %{terminal_forwarded?: true, descriptor: %{kind: :public}}} = send_upstream_close(owner, signal)
+          release_controlled(barriers, controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, _result}}, @detection_timeout_ms
+          assert %{active_turn: nil} = :sys.get_state(owner)
+        end)
+
+      assert_received {:websocket_owner_frame, "upstream-close-public", 1, :complete}
+      assert_upstream_close_skipped!(log, signal, :public_turn, context.codex_session_id)
+    end
+
+    test "keeps a downstream that announced its close open", context do
+      block_ref = make_ref()
+      upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self(), block_ref: block_ref, messages: ["upstream-close-closing-delta", "upstream-close-closing-tail"])
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-closing"))
+      submitter = upstream_close_submitter(owner, downstream, native_websocket_request("upstream-close-closing"))
+      assert_receive {:websocket_owner_frame, "upstream-close-closing", 1, {:data, "upstream-close-closing-delta"}}
+      assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+      assert :not_previsible = WebsocketOwnerSession.detach_previsible_downstream(owner, downstream)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log =
+        capture_info_log(fn ->
+          assert %{closing_downstream: %{epoch: 1}} = send_upstream_close(owner, signal)
+          send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, :ok}}, @detection_timeout_ms
+          assert %{active_turn: nil} = :sys.get_state(owner)
+        end)
+
+      assert_received {:websocket_owner_frame, "upstream-close-closing", 1, :complete}
+      assert_upstream_close_skipped!(log, signal, :downstream_closing, context.codex_session_id)
+    end
+
+    test "keeps the downstream open while a reconnect handoff is pending", context do
+      waiting = start_waiting_handoff(context, "upstream-close-handoff")
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> assert %{pending_handoff: %{status: :waiting}} = send_upstream_close(waiting.owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :handoff, context.codex_session_id)
+      Process.exit(waiting.task_pid, :kill)
+      Process.exit(waiting.submitter, :kill)
+    end
+
+    test "keeps the downstream open while a pre-visible replay is suspended", context do
+      armed = armed_previsible_replay!(context, "upstream-close-replay")
+      # The resend socket a provisional replay attaches, flagged as a reconnect.
+      resend = %{pid: self(), epoch: 2, correlation_id: "upstream-close-replay-resend", active_turn_reconnect?: true}
+      :sys.replace_state(armed.owner, &%{&1 | downstream: resend})
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> assert %{suspended_replay: %{provisional_status: :armed}} = send_upstream_close(armed.owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :replay_armed, armed.context.codex_session_id)
+      :sys.replace_state(armed.owner, &%{&1 | downstream: nil})
+    end
+
+    test "keeps the downstream open while a compaction retry holds the owner", context do
+      %{owner: owner, downstream: downstream} = idle_upstream_close_owner!(context, "upstream-close-retry-hold")
+      assert {:ok, hold} = WebsocketOwnerSession.reserve_compaction_retry_submit(owner, context.owner_lease_token, Map.put(downstream, :owner_turn_id, self()), self())
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> assert %{compaction_retry_submit_hold: %{}} = send_upstream_close(owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :compaction, context.codex_session_id)
+      assert :ok = WebsocketOwnerSession.cancel_compaction_retry_submit(hold)
+    end
+
+    test "keeps the downstream open while a collected compaction runs", context do
+      gate = make_ref()
+      parent = self()
+
+      upstream = %{
+        start: fn -> Agent.start_link(fn -> :ready end) end,
+        send: fn _upstream, _request, _writer ->
+          send(parent, {:upstream_close_collection_started, self()})
+          receive do: ({:release_upstream_close_collection, ^gate} -> :ok)
+          {:ok, %{status: 200, headers: [], terminal: "response.completed", body: ""}}
+        end,
+        close: fn pid -> Agent.stop(pid) end
+      }
+
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-collection"))
+      request = %UpstreamWebsocketSession.Request{url: "https://example.com", payload: "{}", headers: [], timeouts: %{}, websocket_delivery_mode: :collect_compaction, effective_serving_mode: "full"}
+      submitter = upstream_close_submitter(owner, downstream, request)
+      assert_receive {:upstream_close_collection_started, executor}, @detection_timeout_ms
+      on_exit(fn -> send(executor, {:release_upstream_close_collection, gate}) end)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> assert %{active_turn: %{collect?: true}} = send_upstream_close(owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :compaction, context.codex_session_id)
+      send(executor, {:release_upstream_close_collection, gate})
+      assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, {:ok, _result}}}, @detection_timeout_ms
+    end
+
+    for phase <- [:reserved_compact, :accounting_started_compact, :consumed_compact, :collected_unconfirmed, :reserved_final, :accounting_started_final] do
+      test "keeps the downstream open while the native compaction admission is #{phase}", context do
+        phase = unquote(phase)
+        %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-#{phase}")
+        :sys.replace_state(owner, &%{&1 | native_compaction_admission: %NativeCompactionAdmission{phase: phase}})
+        signal = upstream_close_signal(:peer_close_frame)
+
+        log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+        assert_upstream_close_skipped!(log, signal, :compaction, context.codex_session_id)
+        :sys.replace_state(owner, &%{&1 | native_compaction_admission: nil})
+      end
+    end
+
+    for phase <- [:ordinary_success, :pending_final, :consumed_final, :cleared] do
+      test "tells the idle downstream while the native compaction admission is #{phase}", context do
+        phase = unquote(phase)
+        label = "upstream-close-idle-#{phase}"
+        %{owner: owner} = idle_upstream_close_owner!(context, label)
+        :sys.replace_state(owner, &%{&1 | native_compaction_admission: %NativeCompactionAdmission{phase: phase}})
+        signal = upstream_close_signal(:peer_close_frame)
+
+        log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+        instruction = upstream_close_instruction(label, 1, signal)
+        assert_received ^instruction
+        assert upstream_close_skip_lines(log) == []
+      end
+    end
+
+    test "tells the idle downstream while pending_compact waits after an ordinary success", context do
+      armed = armed_admission!(context)
+      assert %{native_compaction_admission: %NativeCompactionAdmission{phase: :pending_compact}} = :sys.get_state(armed.owner)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> send_upstream_close(armed.owner, signal) end)
+
+      instruction = upstream_close_instruction("admission-clear-reason", armed.downstream.epoch, signal)
+      assert_received ^instruction
+      assert upstream_close_skip_lines(log) == []
+    end
+
+    test "tells the idle downstream while a real ordinary success waits for its admission record", context do
+      upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+      {owner, seed_url} = start_seeded_owner(context, upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+      assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-ordinary-receipt"))
+      {_binding, _receipt} = OrdinarySuccessTestSeed.request(owner, downstream, forwarded_binding(context, downstream), seed_url)
+      assert %{ordinary_success_result: %{}, native_compaction_admission: nil, active_turn: nil} = :sys.get_state(owner)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+      instruction = upstream_close_instruction("upstream-close-ordinary-receipt", downstream.epoch, signal)
+      assert_received ^instruction
+      assert upstream_close_skip_lines(log) == []
+    end
+
+    test "keeps the downstream open while a real compaction admission is reserved, accounted and sent", context do
+      armed = armed_admission!(context)
+      now_ms = System.system_time(:millisecond)
+
+      assert {:ok, capability} =
+               WebsocketOwnerSession.admission_control(armed.owner, admission_control(:reserve, armed.downstream, binding: armed.binding, phase: :compact, control_ref: make_ref(), now_ms: now_ms))
+
+      reserved = upstream_close_signal(:peer_close_frame)
+      reserved_log = capture_info_log(fn -> assert %{native_compaction_admission: %NativeCompactionAdmission{phase: :reserved_compact}} = send_upstream_close(armed.owner, reserved) end)
+      assert_upstream_close_skipped!(reserved_log, reserved, :compaction, context.codex_session_id)
+
+      assert {:ok, _accounting} = WebsocketOwnerSession.admission_control(armed.owner, admission_control(:mark_accounting_started, armed.downstream, capability: capability, now_ms: now_ms))
+      accounted = upstream_close_signal(:peer_close_frame)
+      accounted_log = capture_info_log(fn -> assert %{native_compaction_admission: %NativeCompactionAdmission{phase: :accounting_started_compact}} = send_upstream_close(armed.owner, accounted) end)
+      assert_upstream_close_skipped!(accounted_log, accounted, :compaction, context.codex_session_id)
+
+      assert {:ok, _witness} = WebsocketOwnerSession.issue_forwarded_send_witness(armed.owner, armed.downstream, capability, now_ms)
+      sent = upstream_close_signal(:peer_close_frame)
+
+      sent_log =
+        capture_info_log(fn ->
+          assert %{native_compaction_admission: %NativeCompactionAdmission{phase: :consumed_compact}, forwarded_send_witness: %{status: :issued}} = send_upstream_close(armed.owner, sent)
+        end)
+
+      assert_upstream_close_skipped!(sent_log, sent, :compaction, context.codex_session_id)
+    end
+
+    test "keeps the downstream open while a first full-history compaction waits for its authorization", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-first-compact")
+      :sys.replace_state(owner, &%{&1 | first_compact_result: %{retained: true}})
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :compaction, context.codex_session_id)
+      :sys.replace_state(owner, &%{&1 | first_compact_result: nil})
+    end
+
+    test "a send witness counts as a compaction until it is redeemed", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-witness")
+      witness = %WebsocketOwnerSession.ForwardedSendWitnessState{digest: <<0::256>>, binding: nil, control_ref: make_ref(), downstream: %{}, status: :issued}
+      :sys.replace_state(owner, &%{&1 | forwarded_send_witness: witness, native_compaction_admission: %NativeCompactionAdmission{phase: :consumed_final}})
+      issued = upstream_close_signal(:peer_close_frame)
+
+      issued_log = capture_info_log(fn -> send_upstream_close(owner, issued) end)
+
+      assert_upstream_close_skipped!(issued_log, issued, :compaction, context.codex_session_id)
+
+      # A redeemed witness outlives its final until the admission is cleared.
+      :sys.replace_state(owner, &%{&1 | forwarded_send_witness: %{witness | status: :redeemed}})
+      redeemed = upstream_close_signal(:peer_close_frame)
+
+      redeemed_log = capture_info_log(fn -> send_upstream_close(owner, redeemed) end)
+
+      instruction = upstream_close_instruction("upstream-close-witness", 1, redeemed)
+      assert_received ^instruction
+      assert upstream_close_skip_lines(redeemed_log) == []
+    end
+
+    test "keeps a downstream open while the owner drains", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-draining")
+      :ok = WebsocketOwnerSession.begin_drain(owner)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> assert %{draining?: true} = send_upstream_close(owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :draining, context.codex_session_id)
+    end
+
+    test "logs a signal that finds no downstream attached", context do
+      %{owner: owner, downstream: downstream} = idle_upstream_close_owner!(context, "upstream-close-detached")
+      assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log = capture_info_log(fn -> assert %{downstream: nil} = send_upstream_close(owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :no_downstream, context.codex_session_id)
+    end
+
+    test "tells only the socket attached last", context do
+      upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+      first = upstream_close_collector(self(), :first)
+      second = upstream_close_collector(self(), :second)
+      assert {:ok, %{epoch: 1}} = WebsocketOwnerSession.attach_downstream(owner, %{pid: first, correlation_id: "upstream-close-first"})
+      assert {:ok, %{epoch: 2}} = WebsocketOwnerSession.attach_downstream(owner, %{pid: second, correlation_id: "upstream-close-second"})
+      signal = upstream_close_signal(:peer_close_frame)
+
+      send_upstream_close(owner, signal)
+
+      instruction = upstream_close_instruction("upstream-close-second", 2, signal)
+      assert_receive {:upstream_close_collected, :second, ^instruction}, @detection_timeout_ms
+      send(first, :upstream_close_collector_marker)
+      assert_receive {:upstream_close_collected, :first, :upstream_close_collector_marker}, @detection_timeout_ms
+      refute_received {:upstream_close_collected, :first, {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}}
+    end
+
+    test "never tells a downstream about its own invalidation after a terminal delivery timeout", context do
+      terminal = terminal_frame("response.completed", "resp_upstream_close_invalidated")
+      controls = WebsocketOwnerNodeHarness.two_sender_controls()
+      parent = self()
+      signal = upstream_close_signal(:invalidated)
+
+      upstream =
+        self()
+        |> WebsocketOwnerNodeHarness.two_sender_upstream_boundary(controls,
+          terminal_frames: [terminal],
+          task_result: terminal_result(terminal, "response.completed")
+        )
+        |> Map.put(:invalidate, fn upstream_pid ->
+          # As `UpstreamWebsocketSession.invalidate_connection/1` does: the
+          # signal reaches the owner before the invalidation call returns.
+          send(self(), {:upstream_websocket_connection_closed, upstream_pid, signal})
+          send(parent, {:upstream_close_invalidated, upstream_pid})
+          :ok
+        end)
+
+      {:ok, owner} = start_owner(context, upstream: upstream)
+      assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+      {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("upstream-close-invalidated"))
+      submitter = upstream_close_submitter(owner, downstream, native_websocket_request("upstream-close-invalidated"))
+      barriers = await_two_sender_barriers(controls)
+      release_controlled(barriers, controls, :task_result)
+      %{active_turn: active_turn} = await_pending_terminal_result(owner)
+      cancel_owner_timer(active_turn.terminal_delivery_timer_ref)
+      {turn_ref, timer_token} = active_turn.terminal_delivery_timeout
+
+      log =
+        capture_info_log(fn ->
+          send(owner, {:websocket_owner_terminal_delivery_timeout, turn_ref, timer_token})
+          assert_receive {:upstream_close_invalidated, ^upstream_pid}, @detection_timeout_ms
+          assert_receive {:websocket_owner_frame, "upstream-close-invalidated", 1, :complete}, @detection_timeout_ms
+          # The turn ended inside the timeout's handler; the signal it queued
+          # is handled after it, with nothing left running.
+          assert %{active_turn: nil, downstream: %{epoch: 1}} = :sys.get_state(owner)
+        end)
+
+      assert_received {:websocket_owner_frame, "upstream-close-invalidated", 1, {:error, :upstream_websocket_terminal_delivery_timeout, _payload}}
+      assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, {:error, %{reason: :upstream_websocket_terminal_delivery_timeout}}}}, @detection_timeout_ms
+      assert_upstream_close_skipped!(log, signal, :owner_invalidation, context.codex_session_id)
+
+      release_controlled(barriers, controls, :nonterminal_frames)
+      terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+      release_controlled(terminal_barrier, controls, :terminal_frames)
+    end
+
+    test "never tells a downstream about its own invalidation at a handoff soft timeout", context do
+      parent = self()
+      signal = upstream_close_signal(:invalidated)
+
+      invalidate = fn upstream_pid ->
+        send(self(), {:upstream_websocket_connection_closed, upstream_pid, signal})
+        send(parent, {:reconnect_handoff_invalidated, 1})
+        :ok
+      end
+
+      waiting = start_waiting_handoff(context, "upstream-close-own-invalidation", invalidate: invalidate)
+      pending = waiting.pending
+      task_monitor = waiting.task_monitor
+      task_pid = waiting.task_pid
+
+      log =
+        capture_info_log(fn ->
+          send(waiting.owner, {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token})
+          assert_receive {:reconnect_handoff_invalidated, 1}, @detection_timeout_ms
+          :sys.get_state(waiting.owner)
+        end)
+
+      assert_upstream_close_skipped!(log, signal, :owner_invalidation, context.codex_session_id)
+      assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}, @detection_timeout_ms
+      assert_receive {:handoff_fixture_old_result, "upstream-close-own-invalidation", {:error, :client_disconnected}}, @detection_timeout_ms
+      send(waiting.submitter, :release_handoff_fixture_submitter)
+      assert_receive {:websocket_owner_handoff_ready, "upstream-close-own-invalidation-b", 2, _owner_turn_id, _pid, _control_ref}, @detection_timeout_ms
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+    end
+
+    test "ignores a signal from another upstream session", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-foreign")
+      signal = upstream_close_signal(:peer_close_frame)
+
+      log =
+        capture_info_log(fn ->
+          send(owner, {:upstream_websocket_connection_closed, self(), signal})
+          :sys.get_state(owner)
+        end)
+
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+      assert upstream_close_skip_lines(log) == []
+    end
+
+    test "ignores a signal outside the anchor-ending vocabulary", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "upstream-close-invalid")
+
+      log =
+        capture_info_log(fn ->
+          send_upstream_close(owner, upstream_close_signal(:request_key_changed))
+          send_upstream_close(owner, %{upstream_close_signal(:peer_close_frame) | generation: 0})
+          send_upstream_close(owner, %{upstream_close_signal(:peer_close_frame) | lifecycle_id: "not-a-lifecycle"})
+        end)
+
+      refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+      assert upstream_close_skip_lines(log) == []
+    end
+  end
+
+  # A close the owner hears only after its session opened a newer connection
+  # names a connection the downstream's anchor no longer lives on (findings#270
+  # row 270-199): the owner keeps the downstream open with its own skip reason.
+  # The session's open connection is read through the boundary; a boundary
+  # that cannot tell keeps the instruction.
+  describe "upstream connection close superseded by a newer connection" do
+    test "keeps the downstream open for a close older than the open connection", context do
+      lifecycle_id = Ecto.UUID.generate()
+      %{owner: owner} = superseding_owner!(context, "superseded-close", fn -> {:ok, %{lifecycle_id: lifecycle_id, generation: 2}} end)
+      signal = %{upstream_close_signal(:peer_close_frame) | lifecycle_id: lifecycle_id}
+
+      log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+      assert_upstream_close_skipped!(log, signal, :superseded_connection, context.codex_session_id)
+    end
+
+    for {label, open_connection} <- [
+          {"the open connection", :same_generation},
+          {"a connection with none open after it", :between_connections},
+          {"a session of another lifecycle", :other_lifecycle},
+          {"a session that cannot tell", :unreadable}
+        ] do
+      test "tells the downstream about the close of #{label}", context do
+        lifecycle_id = Ecto.UUID.generate()
+        reader = superseding_reader(unquote(open_connection), lifecycle_id)
+        %{owner: owner} = superseding_owner!(context, "superseding-#{unquote(open_connection)}", reader)
+        signal = %{upstream_close_signal(:peer_close_frame) | lifecycle_id: lifecycle_id}
+
+        log = capture_info_log(fn -> send_upstream_close(owner, signal) end)
+
+        instruction = upstream_close_instruction("superseding-#{unquote(open_connection)}", 1, signal)
+        assert_received ^instruction
+        assert upstream_close_skip_lines(log) == []
+      end
+    end
+  end
+
+  # The admission's use-time check of findings#275 reads the session only
+  # while the owner runs no turn (findings#270 row 270-199): the session serves
+  # a request inside its call handler, so a read during a turn would stall the
+  # owner. A reservation during a turn keeps the admission's own checks.
+  describe "admission use-time check during a running turn" do
+    test "reads the session's open connection only while no turn runs", context do
+      test_pid = self()
+
+      reader = fn _session ->
+        send(test_pid, :live_connection_read)
+        {:ok, %{lifecycle_id: Ecto.UUID.generate(), generation: nil}}
+      end
+
+      armed = armed_admission!(context, upstream_extra: %{live_connection: reader})
+      :sys.replace_state(armed.owner, &%{&1 | active_turn: %{injected_turn: true}})
+      now_ms = System.system_time(:millisecond)
+      reserve = admission_control(:reserve, armed.downstream, binding: armed.binding, phase: :compact, control_ref: make_ref(), now_ms: now_ms)
+
+      assert {:ok, _capability} = WebsocketOwnerSession.admission_control(armed.owner, reserve)
+      refute_received :live_connection_read
+
+      :sys.replace_state(armed.owner, &%{&1 | active_turn: nil, native_compaction_admission: %{&1.native_compaction_admission | phase: :pending_compact, capability: nil}})
+      assert {:ok, _capability} = WebsocketOwnerSession.admission_control(armed.owner, %{reserve | control_ref: make_ref()})
+      assert_received :live_connection_read
+    end
+  end
+
+  # The deferred instruction is checked again when its turn ended: a session
+  # that opened a newer connection in the meantime supersedes the close.
+  describe "deferred upstream connection close superseded by a newer connection" do
+    test "is dropped with superseded_connection once its turn ended", context do
+      lifecycle_id = Ecto.UUID.generate()
+      reader = fn _session -> {:ok, %{lifecycle_id: lifecycle_id, generation: 2}} end
+      signal = %{upstream_close_signal(:peer_close_frame) | lifecycle_id: lifecycle_id}
+      deferred = deferred_upstream_close!(context, "upstream-close-deferred-superseded", %{live_connection: reader}, signal)
+      submitter = deferred.submitter
+
+      log =
+        capture_info_log(fn ->
+          release_controlled(deferred.barriers, deferred.controls, :task_result)
+          assert_receive {:upstream_close_submitter_outcome, ^submitter, {:return, _result}}, @detection_timeout_ms
+          assert %{active_turn: nil} = :sys.get_state(deferred.owner)
+        end)
+
+      assert next_owner_message("upstream-close-deferred-superseded") == {:websocket_owner_frame, "upstream-close-deferred-superseded", 1, :complete}
+      assert_upstream_close_skipped!(log, signal, :superseded_connection, context.codex_session_id)
+    end
+  end
+
+  defp superseding_reader(:same_generation, lifecycle_id), do: fn -> {:ok, %{lifecycle_id: lifecycle_id, generation: 1}} end
+  defp superseding_reader(:between_connections, lifecycle_id), do: fn -> {:ok, %{lifecycle_id: lifecycle_id, generation: nil}} end
+  defp superseding_reader(:other_lifecycle, _lifecycle_id), do: fn -> {:ok, %{lifecycle_id: Ecto.UUID.generate(), generation: 2}} end
+  defp superseding_reader(:unreadable, _lifecycle_id), do: fn -> {:error, :unavailable} end
+
+  # An idle owner whose boundary reads the session's open connection through
+  # `reader`; the harness upstream is no session, so the reader stands in.
+  defp superseding_owner!(context, label, reader) do
+    upstream = Map.put(WebsocketOwnerNodeHarness.fake_upstream_boundary(self()), :live_connection, fn _upstream_pid -> reader.() end)
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+    %{owner: owner, downstream: downstream}
+  end
+
+  # The owner drops an admission bound to the connection its session closed,
+  # as the direct session drops its own with the connection (findings#274):
+  # nothing can use it any more, and a stale one failed the final (502) or
+  # refused the next compaction (503) while the socket stayed open.
+  describe "admission bound to a closed upstream connection" do
+    test "is dropped with reason connection_closed once the armed connection closes", context do
+      armed = armed_admission!(context)
+      attach_admission_clear_observer(armed.binding.lifecycle_id)
+      signal = %{upstream_close_signal(:peer_close_frame) | lifecycle_id: armed.binding.lifecycle_id, generation: armed.binding.generation}
+
+      assert %{native_compaction_admission: nil, native_compaction_admission_downstream: nil} = send_upstream_close(armed.owner, signal)
+      assert_receive {:admission_clear, %{reason: :connection_closed, phase_from: :pending_compact, phase_to: :cleared, topology: :forwarded}}
+    end
+
+    for phase <- [:ordinary_success, :pending_final, :consumed_final] do
+      test "is dropped in the idle #{phase} phase", context do
+        %{owner: owner} = idle_upstream_close_owner!(context, "closed-connection-#{unquote(phase)}")
+        signal = upstream_close_signal(:peer_close_frame)
+        attach_admission_clear_observer(signal.lifecycle_id)
+        :sys.replace_state(owner, &%{&1 | native_compaction_admission: closed_connection_admission(unquote(phase), signal)})
+
+        assert %{native_compaction_admission: nil} = send_upstream_close(owner, signal)
+        assert_receive {:admission_clear, %{reason: :connection_closed, phase_from: unquote(phase)}}
+      end
+    end
+
+    test "is kept when it names another connection", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "closed-connection-other")
+      signal = upstream_close_signal(:peer_close_frame, 2)
+      attach_admission_clear_observer(signal.lifecycle_id)
+
+      for admission <- [closed_connection_admission(:pending_final, %{signal | generation: 3}), closed_connection_admission(:pending_final, %{signal | lifecycle_id: Ecto.UUID.generate()})] do
+        :sys.replace_state(owner, &%{&1 | native_compaction_admission: admission})
+        assert %{native_compaction_admission: ^admission} = send_upstream_close(owner, signal)
+      end
+
+      refute_received {:admission_clear, _observation}
+    end
+
+    test "is kept while a collection waits for its confirmation", context do
+      %{owner: owner} = idle_upstream_close_owner!(context, "closed-connection-collection")
+      signal = upstream_close_signal(:peer_close_frame)
+      attach_admission_clear_observer(signal.lifecycle_id)
+      authorized = closed_connection_admission(:ordinary_success, signal)
+      authorized = %{authorized | first_compact_collection: NativeCompactionAdmission.FirstCompactCollection.issue(authorized.binding, make_ref())}
+      witness = %WebsocketOwnerSession.ForwardedSendWitnessState{digest: <<0::256>>, binding: nil, control_ref: make_ref(), downstream: %{}, status: :issued}
+
+      held = [
+        collected_unconfirmed: %{native_compaction_admission: closed_connection_admission(:collected_unconfirmed, signal)},
+        first_collection_authorized: %{native_compaction_admission: authorized},
+        first_compact_result_held: %{native_compaction_admission: closed_connection_admission(:pending_compact, signal), first_compact_result: %{retained: true}},
+        send_witness_issued: %{native_compaction_admission: closed_connection_admission(:consumed_final, signal), forwarded_send_witness: witness}
+      ]
+
+      for {label, fields} <- held do
+        :sys.replace_state(owner, &Map.merge(&1, fields))
+        assert Map.take(send_upstream_close(owner, signal), Map.keys(fields)) == fields, "#{label} lost its admission"
+        :sys.replace_state(owner, &%{&1 | native_compaction_admission: nil, first_compact_result: nil, forwarded_send_witness: nil})
+      end
+
+      refute_received {:admission_clear, _observation}
+    end
+  end
+
+  defp closed_connection_admission(phase, signal) do
+    binding = %NativeCompactionAdmission.Binding{
+      semantic_turn_key: <<1::256>>,
+      window_digest: <<2::256>>,
+      context_digest: <<3::256>>,
+      window_number: 1,
+      serving_mode: :full,
+      topology: %NativeCompactionAdmission.Topology.Direct{},
+      lifecycle_id: signal.lifecycle_id,
+      generation: signal.generation
+    }
+
+    %NativeCompactionAdmission{phase: phase, binding: binding}
+  end
+
+  defp idle_upstream_close_owner!(context, label) do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+    %{owner: owner, downstream: downstream}
+  end
+
+  # The signal as the owner's upstream session sends it; `connection_requests`
+  # never reaches the downstream.
+  defp upstream_close_signal(cause, generation \\ 1),
+    do: %{cause: cause, lifecycle_id: Ecto.UUID.generate(), generation: generation, connection_requests: 2}
+
+  # Sends the signal as the owner's upstream session does and returns the
+  # owner's state once it handled it: the state read is ordered behind this
+  # process's own message.
+  defp send_upstream_close(owner, signal) do
+    send(owner, {:upstream_websocket_connection_closed, :sys.get_state(owner).upstream_pid, signal})
+    :sys.get_state(owner)
+  end
+
+  defp upstream_close_instruction(correlation_id, epoch, signal),
+    do: {:websocket_owner_upstream_closed, correlation_id, epoch, Map.take(signal, [:cause, :lifecycle_id, :generation])}
+
+  defp upstream_close_skip_line(signal, reason, codex_session_id),
+    do: "websocket downstream kept open after upstream connection close reason_code=#{signal.cause} skip_reason=#{reason} lifecycle_id=#{signal.lifecycle_id} generation=#{signal.generation} forwarding=on codex_session_id=#{codex_session_id}"
+
+  defp upstream_close_skip_lines(log),
+    do: ~r/websocket downstream kept open after upstream connection close[^\n]*/ |> Regex.scan(log) |> List.flatten()
+
+  defp assert_upstream_close_skipped!(log, signal, reason, codex_session_id) do
+    refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+    assert upstream_close_skip_lines(log) == [upstream_close_skip_line(signal, reason, codex_session_id)]
+  end
+
+  # The next message from the owner for this downstream, whichever it is:
+  # both are sent by the owner, so the mailbox keeps their order.
+  defp next_owner_message(correlation_id) do
+    receive do
+      {:websocket_owner_frame, ^correlation_id, _epoch, _payload} = message -> message
+      {:websocket_owner_upstream_closed, ^correlation_id, _epoch, _signal} = message -> message
+    after
+      @detection_timeout_ms -> flunk("expected an owner message for #{correlation_id}")
+    end
+  end
+
+  defp upstream_close_submitter(owner, downstream, request) do
+    parent = self()
+
+    spawn(fn ->
+      outcome =
+        try do
+          {:return, WebsocketOwnerSession.submit_request(owner, downstream, request)}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      send(parent, {:upstream_close_submitter_outcome, self(), outcome})
+    end)
+  end
+
+  defp upstream_close_collector(parent, label), do: spawn_link(fn -> upstream_close_collector_loop(parent, label) end)
+
+  defp upstream_close_collector_loop(parent, label) do
+    receive do
+      message ->
+        send(parent, {:upstream_close_collected, label, message})
+        upstream_close_collector_loop(parent, label)
+    end
+  end
+
+  # A native relayed turn whose terminal already reached the attached
+  # downstream (this test process) while its task result is held, with a
+  # connection close signal deferred on it.
+  defp deferred_upstream_close!(context, label, upstream_extra \\ %{}, signal \\ upstream_close_signal(:peer_close_frame)) do
+    terminal = terminal_frame("response.completed", "resp_#{label}")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      self()
+      |> WebsocketOwnerNodeHarness.two_sender_upstream_boundary(controls,
+        terminal_frames: [terminal],
+        task_result: terminal_result(terminal, "response.completed")
+      )
+      |> Map.merge(upstream_extra)
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+    submitter = upstream_close_submitter(owner, downstream, native_websocket_request(label))
+    barriers = await_two_sender_barriers(controls)
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+    assert_receive {:websocket_owner_frame, ^label, 1, {:data, ^terminal}}, @detection_timeout_ms
+
+    deferred = %{downstream: %{pid: self(), epoch: 1, correlation_id: label}, signal: Map.take(signal, [:cause, :lifecycle_id, :generation])}
+    assert %{active_turn: %{terminal_forwarded?: true, upstream_close: ^deferred}} = send_upstream_close(owner, signal)
+    refute_received {:websocket_owner_upstream_closed, _correlation_id, _epoch, _signal}
+    refute_received {:websocket_owner_frame, ^label, 1, :complete}
+
+    %{owner: owner, downstream: downstream, signal: signal, terminal: terminal, controls: controls, barriers: barriers, submitter: submitter}
+  end
+
+  # Owner registration, retirement and turn clearing emit no message the test
+  # can await, so the helpers below poll authoritative state (the registry or
+  # the owner's own state) against one monotonic detection deadline and return
+  # the last observation when it expires, for the caller's assertion to report.
+  defp detection_deadline, do: System.monotonic_time(:millisecond) + @detection_timeout_ms
+
+  defp poll_again?(deadline) do
+    if System.monotonic_time(:millisecond) < deadline do
+      receive do
+      after
+        1 -> true
+      end
+    else
+      false
+    end
+  end
+
+  defp await_owner_unavailable(codex_session_id, deadline \\ detection_deadline()) do
     case WebsocketOwnerSession.lookup(codex_session_id) do
       {:error, :owner_unavailable} = unavailable ->
         unavailable
 
-      {:ok, _pid} ->
-        yield_once({:await_owner_unavailable, codex_session_id, attempts})
-        await_owner_unavailable(codex_session_id, attempts - 1)
+      {:ok, _pid} = found ->
+        if poll_again?(deadline), do: await_owner_unavailable(codex_session_id, deadline), else: found
     end
   end
 
-  defp await_owner_unavailable(codex_session_id, 0),
-    do: WebsocketOwnerSession.lookup(codex_session_id)
-
-  defp await_fresh_owner(context, upstream, old_owner, attempts \\ 100)
-
-  defp await_fresh_owner(context, upstream, old_owner, attempts) when attempts > 0 do
+  defp await_fresh_owner(context, upstream, old_owner, deadline \\ detection_deadline()) do
     case start_owner(context, upstream: upstream) do
       {:ok, fresh_owner} when fresh_owner != old_owner ->
         {:ok, fresh_owner}
 
-      {:ok, owner, :existing} when owner != old_owner and is_pid(owner) ->
-        if Process.alive?(owner) do
-          {:ok, owner}
-        else
-          yield_once({:await_fresh_owner, context.codex_session_id, attempts})
-          await_fresh_owner(context, upstream, old_owner, attempts - 1)
+      {:ok, owner, :existing} = existing when owner != old_owner and is_pid(owner) ->
+        cond do
+          Process.alive?(owner) -> {:ok, owner}
+          poll_again?(deadline) -> await_fresh_owner(context, upstream, old_owner, deadline)
+          true -> existing
         end
 
-      _other ->
-        yield_once({:await_fresh_owner, context.codex_session_id, attempts})
-        await_fresh_owner(context, upstream, old_owner, attempts - 1)
+      other ->
+        if poll_again?(deadline), do: await_fresh_owner(context, upstream, old_owner, deadline), else: other
     end
   end
-
-  defp await_fresh_owner(context, upstream, _old_owner, 0),
-    do: start_owner(context, upstream: upstream)
 
   defp cleanup_owner_session(codex_session_id) do
     case WebsocketOwnerSession.lookup(codex_session_id) do
       {:ok, owner} ->
         owner_ref = Process.monitor(owner)
-        _result = GenServer.stop(owner, :normal, 1_000)
+        _result = GenServer.stop(owner, :normal, 15_000)
 
         receive do
           {:DOWN, ^owner_ref, :process, ^owner, _reason} -> :ok
         after
-          1_000 -> :ok
+          15_000 -> flunk("websocket owner did not terminate during test cleanup")
         end
 
       {:error, :owner_unavailable} ->
@@ -786,28 +7084,273 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     :exit, _reason -> :ok
   end
 
-  defp yield_once(message) do
-    send(self(), message)
-
-    receive do
-      ^message -> :ok
-    end
-  end
-
-  defp await_active_turn_cleared(owner, attempts \\ 100)
-
-  defp await_active_turn_cleared(owner, attempts) when attempts > 0 do
+  defp await_active_turn_cleared(owner, deadline \\ detection_deadline()) do
     case :sys.get_state(owner) do
       %{active_turn: nil} = state ->
         state
 
-      _state ->
-        yield_once({:await_active_turn_cleared, owner, attempts})
-        await_active_turn_cleared(owner, attempts - 1)
+      state ->
+        if poll_again?(deadline), do: await_active_turn_cleared(owner, deadline), else: state
     end
   end
 
-  defp await_active_turn_cleared(owner, 0), do: :sys.get_state(owner)
+  defp await_owner_cleared(owner, deadline \\ detection_deadline()) do
+    case :sys.get_state(owner) do
+      %{active_turn: nil, downstream: nil} = state ->
+        state
+
+      state ->
+        if poll_again?(deadline), do: await_owner_cleared(owner, deadline), else: state
+    end
+  end
+
+  defp await_drain_settlement(owner, deadline \\ detection_deadline()) do
+    case :sys.get_state(owner) do
+      %{drain_settlement: %{}} = state -> state
+      state -> if poll_again?(deadline), do: await_drain_settlement(owner, deadline), else: state
+    end
+  end
+
+  defp await_pending_terminal_result(owner, deadline \\ detection_deadline()) do
+    case :sys.get_state(owner) do
+      %{active_turn: %{pending_result: pending_result}} = state when not is_nil(pending_result) ->
+        state
+
+      state ->
+        if poll_again?(deadline), do: await_pending_terminal_result(owner, deadline), else: state
+    end
+  end
+
+  defp start_pending_terminal_turn(context, label, owner_opts \\ []) do
+    terminal_frame = terminal_frame("response.completed", "resp_#{label}")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    {:ok, owner} = start_owner(context, Keyword.put(owner_opts, :upstream, upstream))
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+
+    submitter = pending_submitter(self(), owner, downstream, label)
+    barriers = await_two_sender_barriers(controls)
+
+    assert %{active_turn: %{task_ref: task_ref, task_pid: task_pid}} = :sys.get_state(owner)
+    release_controlled(barriers, controls, :task_result)
+    %{active_turn: active_turn} = await_pending_terminal_result(owner)
+
+    assert active_turn.pending_result ==
+             terminal_result(terminal_frame, "response.completed")
+
+    assert active_turn.task_ref == nil
+
+    %{
+      active_turn: active_turn,
+      barriers: barriers,
+      context: context,
+      controls: controls,
+      downstream: downstream,
+      label: label,
+      owner: owner,
+      submitter: submitter,
+      task_pid: task_pid,
+      task_ref: task_ref,
+      terminal_frame: terminal_frame
+    }
+  end
+
+  defp pending_submitter(parent, owner, downstream, label) do
+    spawn(fn ->
+      outcome =
+        try do
+          request = %{
+            websocket_request()
+            | request_id: Ecto.UUID.generate(),
+              attempt_id: Ecto.UUID.generate()
+          }
+
+          {:return, WebsocketOwnerSession.submit_request(owner, downstream, request)}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      send(parent, {:pending_submitter_outcome, label, outcome})
+    end)
+  end
+
+  defp release_pending_terminal_sender(pending) do
+    release_controlled(pending.barriers, pending.controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, pending.controls)
+    release_controlled(terminal_barrier, pending.controls, :terminal_frames)
+  end
+
+  defp release_abandoned_terminal_sender(pending) do
+    release_pending_terminal_sender(pending)
+    refute Process.alive?(pending.submitter)
+  end
+
+  defp assert_stale_messages_do_not_settle_fresh_turn(context, stale, label) do
+    terminal_frame = terminal_frame("response.completed", "resp_#{label}")
+    controls = WebsocketOwnerNodeHarness.two_sender_controls()
+
+    upstream =
+      WebsocketOwnerNodeHarness.two_sender_upstream_boundary(self(), controls,
+        terminal_frames: [terminal_frame],
+        task_result: terminal_result(terminal_frame, "response.completed")
+      )
+
+    assert {:ok, owner} = await_fresh_owner(context, upstream, stale.owner)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+
+    assert_stale_messages_do_not_settle_next_turn(
+      owner,
+      downstream,
+      controls,
+      stale,
+      terminal_frame
+    )
+  end
+
+  defp assert_stale_messages_do_not_settle_next_turn(
+         owner,
+         downstream,
+         controls,
+         stale,
+         terminal_frame
+       ) do
+    correlation_id = downstream.correlation_id
+    epoch = downstream.epoch
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    barriers = await_two_sender_barriers(controls)
+    assert %{active_turn: %{ref: next_turn_ref}} = :sys.get_state(owner)
+
+    send(owner, {:websocket_owner_upstream_frame, stale.active_turn.ref, stale.terminal_frame})
+
+    {stale_turn_ref, stale_timer_token} = stale.active_turn.terminal_delivery_timeout
+    send(owner, {:websocket_owner_terminal_delivery_timeout, stale_turn_ref, stale_timer_token})
+    send(owner, {:DOWN, stale.task_ref, :process, stale.task_pid, :shutdown})
+
+    assert %{active_turn: %{ref: ^next_turn_ref, pending_result: nil}} = :sys.get_state(owner)
+    refute_received {:websocket_owner_frame, ^correlation_id, ^epoch, _payload}
+
+    release_controlled(barriers, controls, :nonterminal_frames)
+    terminal_barrier = await_controlled_barrier(:terminal_frames, controls)
+    release_controlled(terminal_barrier, controls, :terminal_frames)
+    release_controlled(barriers, controls, :task_result)
+
+    assert_receive {:websocket_owner_frame, ^correlation_id, ^epoch, {:data, ^terminal_frame}}
+
+    assert Task.await(submit_task, @detection_timeout_ms) ==
+             terminal_result(terminal_frame, "response.completed")
+
+    assert_receive {:websocket_owner_frame, ^correlation_id, ^epoch, :complete}
+    refute_received {:websocket_owner_frame, ^correlation_id, ^epoch, :complete}
+    assert %{active_turn: nil} = :sys.get_state(owner)
+  end
+
+  defp await_two_sender_barriers(controls) do
+    task_result = await_controlled_barrier(:task_result, controls)
+    nonterminal_frames = await_controlled_barrier(:nonterminal_frames, controls)
+    %{task_result: task_result, nonterminal_frames: nonterminal_frames}
+  end
+
+  defp await_controlled_barrier(stage, controls) do
+    release_ref = Map.fetch!(controls, stage)
+
+    assert_receive {:websocket_owner_harness_controlled_barrier, ^stage, barrier_pid, ^release_ref},
+                   @detection_timeout_ms
+
+    barrier_pid
+  end
+
+  defp release_controlled(barriers, controls, stage) when is_map(barriers) do
+    barriers
+    |> Map.fetch!(stage)
+    |> release_controlled(controls, stage)
+  end
+
+  defp release_controlled(barrier_pid, controls, stage) when is_pid(barrier_pid) do
+    WebsocketOwnerNodeHarness.release_controlled(barrier_pid, controls, stage)
+  end
+
+  defp controlled_timer_task(test_pid, owner, controls, {turn_ref, timer_token}) do
+    Task.async(fn ->
+      WebsocketOwnerNodeHarness.controlled_timer_message(
+        test_pid,
+        owner,
+        controls,
+        {:websocket_owner_terminal_delivery_timeout, turn_ref, timer_token}
+      )
+    end)
+  end
+
+  defp controlled_terminal_downstream_sender(test_pid, controls, result) do
+    fn pid, message ->
+      if terminal_downstream_message?(message) do
+        WebsocketOwnerNodeHarness.controlled_result(
+          test_pid,
+          controls,
+          :downstream_send_result,
+          result
+        )
+      else
+        send(pid, message)
+        :ok
+      end
+    end
+  end
+
+  defp terminal_downstream_message?({:websocket_owner_frame, _correlation_id, _epoch, {:data, payload}}),
+    do: terminal_payload?(payload)
+
+  defp terminal_downstream_message?(_message), do: false
+
+  defp terminal_payload?(payload) do
+    case CodexPooler.JSON.decode(payload) do
+      {:ok, %{"type" => type}} ->
+        type in [
+          "response.completed",
+          "response.done",
+          "response.failed",
+          "response.incomplete",
+          "error"
+        ]
+
+      _result ->
+        false
+    end
+  end
+
+  defp cancel_owner_timer(timer_ref) when is_reference(timer_ref) do
+    assert Process.cancel_timer(timer_ref) != false
+  end
+
+  defp unique_owner_context(context, label) do
+    codex_session_id = "#{context.codex_session_id}-#{label}"
+    on_exit(fn -> cleanup_owner_session(codex_session_id) end)
+    %{context | codex_session_id: codex_session_id}
+  end
+
+  # The owner-exit tests start their owners under a UUID session id, which is what runs the persistence callbacks they
+  # spy on; the setup's cleanup covers only the original id, so this one registers its own before an owner starts.
+  defp uuid_owner_context(context) do
+    codex_session_id = Ecto.UUID.generate()
+    on_exit(fn -> cleanup_owner_session(codex_session_id) end)
+    %{context | codex_session_id: codex_session_id}
+  end
 
   defp start_owner(context, opts) do
     WebsocketOwnerSession.start_owner(
@@ -817,6 +7360,192 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
         owner_instance_id: context.owner_instance_id
       )
     )
+  end
+
+  defp start_supervised_owner(context, opts) do
+    start_supervised!(%{
+      id: {WebsocketOwnerSession, context.codex_session_id},
+      restart: :temporary,
+      start:
+        {WebsocketOwnerSession, :start_link,
+         [
+           Keyword.merge(opts,
+             codex_session_id: context.codex_session_id,
+             owner_lease_token: context.owner_lease_token,
+             owner_instance_id: context.owner_instance_id
+           )
+         ]}
+    })
+  end
+
+  # Raises the primary Logger level only inside the capture window so nothing
+  # emitted outside it (owner startup, on_exit cleanup) can leak to the
+  # console; capture_log's :level option alone does not raise the primary
+  # level, so info-level lines would otherwise never fire.
+  defp capture_info_log(fun) when is_function(fun, 0) do
+    previous_level = Logger.level()
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+
+    try do
+      Logger.configure(level: :info)
+      capture_log([level: :info], fun)
+    after
+      Logger.configure(level: previous_level)
+    end
+  end
+
+  defp observe_owner_exit(context, :idle_expiry) do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    owner = start_supervised_owner(context, upstream: upstream, idle_shutdown_ms: 1)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("idle-exit-metadata")
+             )
+
+    owner_ref = Process.monitor(owner)
+
+    logs =
+      capture_info_log(fn ->
+        assert :ok = WebsocketOwnerSession.detach_downstream(owner, downstream)
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+      end)
+
+    assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
+    await_owner_absent(context.codex_session_id)
+    owner_exit_observation(logs, context.codex_session_id)
+  end
+
+  defp observe_owner_exit(context, :rollout_deadline_cut) do
+    # The owner and the drain use a registry of their own, so the drain sees exactly this owner
+    # and never one another test left in the application registry (findings#206 row 206-387).
+    owner_registry = WebsocketRolloutDrainSupport.start_owner_registry!()
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["rollout-cut-before-deadline", "unreachable-after-rollout-cut"]
+      )
+
+    owner = start_supervised_owner(context, upstream: upstream, registry: owner_registry)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner,
+               downstream_target("rollout-deadline-cut-metadata")
+             )
+
+    parent = self()
+
+    submitter =
+      spawn(fn ->
+        outcome =
+          try do
+            {:return, WebsocketOwnerSession.submit_frame(owner, downstream, "rollout-cut-request")}
+          catch
+            :exit, reason -> {:exit, reason}
+          end
+
+        send(parent, {:rollout_deadline_cut_submitter_outcome, outcome})
+      end)
+
+    submitter_ref = Process.monitor(submitter)
+
+    assert_receive {:websocket_owner_frame, "rollout-deadline-cut-metadata", 1, {:data, "rollout-cut-before-deadline"}}
+
+    assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
+
+    owner_ref = Process.monitor(owner)
+    harness = WebsocketRolloutDrainSupport.start_rollout_drain_harness(self(), owner_registry: owner_registry)
+    deadline = harness.deadline
+
+    logs =
+      capture_info_log(fn ->
+        drain_task =
+          Task.async(fn ->
+            RolloutDrain.start_drain(
+              [name: harness.name, timeout_ms: 25, deadline_margin_ms: 20, deadline_floor_ms: 10] ++
+                WebsocketRolloutDrainSupport.deadline_options(deadline)
+            )
+          end)
+
+        assert_receive {:rollout_drain_deadline_wait, ^deadline, 10}
+
+        refute_received {:websocket_owner_frame, "rollout-deadline-cut-metadata", 1, {:error, :owner_drained, _safe_payload}}
+
+        assert Process.alive?(owner)
+        assert :ok = WebsocketRolloutDrainSupport.VirtualDeadline.advance(deadline, 10)
+
+        assert_receive {:websocket_owner_frame, "rollout-deadline-cut-metadata", 1, {:error, :owner_drained, _safe_payload}}
+
+        assert_receive {:websocket_owner_frame, "rollout-deadline-cut-metadata", 1, :complete}
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+
+        assert %{
+                 result: :ok,
+                 owners_seen: 1,
+                 owners_drained: 1,
+                 owners_idle: 0,
+                 owners_failed: 0,
+                 turns_completed: 0,
+                 turns_aborted: 1,
+                 timeout_ms: 25,
+                 already_draining?: false
+               } = Task.await(drain_task, @detection_timeout_ms)
+
+        assert WebsocketRolloutDrainSupport.VirtualDeadline.waiter_pids(deadline) == []
+      end)
+
+    assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
+    assert_receive {:rollout_deadline_cut_submitter_outcome, {:return, {:error, :owner_drained}}}
+    assert_receive {:DOWN, ^submitter_ref, :process, ^submitter, _reason}
+
+    send(barrier_pid, {:websocket_owner_harness_release, block_ref})
+
+    refute_received {:websocket_owner_frame, "rollout-deadline-cut-metadata", 1, {:data, "unreachable-after-rollout-cut"}}
+
+    refute Enum.any?(Registry.lookup(owner_registry, context.codex_session_id), fn {pid, _value} -> Process.alive?(pid) end)
+    owner_exit_observation(logs, context.codex_session_id)
+  end
+
+  defp await_owner_absent(codex_session_id) do
+    case WebsocketOwnerSession.lookup(codex_session_id) do
+      {:error, :owner_unavailable} -> :ok
+      {:ok, _owner} -> flunk("websocket owner remained registered after terminal cleanup")
+    end
+  end
+
+  defp owner_exit_observation(logs, codex_session_id) do
+    assert logs =~ "websocket owner terminated"
+    assert logs =~ "codex_session_id=#{codex_session_id}"
+
+    %{
+      logs: logs,
+      metadata: %{
+        owner_exit_reason: logged_owner_exit_reason(logs),
+        owner_exit_cause: logged_owner_exit_cause(logs),
+        release_reason: released_lease!(codex_session_id).metadata["release_reason"],
+        persisted_owner_exit_cause: released_lease!(codex_session_id).metadata["owner_exit_cause"]
+      }
+    }
+  end
+
+  defp logged_owner_exit_reason(logs) do
+    assert [_, reason] = Regex.run(~r/owner_exit_reason=([a-z_]+)/, logs)
+    reason
+  end
+
+  defp logged_owner_exit_cause(logs) do
+    case Regex.run(~r/owner_exit_cause=([a-z_]+)/, logs) do
+      [_, cause] -> cause
+      nil -> nil
+    end
   end
 
   defp auth_context do
@@ -829,9 +7558,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   defp put_owner_idle_timeout(timeout) do
     settings = OperationalSettings.current()
 
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: %{settings | websocket_owner_idle_timeout_ms: timeout}
-    )
+    Application.put_env(:codex_pooler, OperationalSettings, settings: %{settings | websocket_owner_idle_timeout_ms: timeout})
   end
 
   defp restore_operational_settings(nil),
@@ -839,17 +7566,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
   defp restore_operational_settings(previous_settings),
     do: Application.put_env(:codex_pooler, OperationalSettings, previous_settings)
-
-  defp restore_owner_forwarding(nil),
-    do: Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-
-  defp restore_owner_forwarding(previous_forwarding),
-    do:
-      Application.put_env(
-        :codex_pooler,
-        :websocket_owner_forwarding_enabled,
-        previous_forwarding
-      )
 
   defp db_owner_context do
     %{user: owner} = bootstrap_owner_fixture()
@@ -880,6 +7596,21 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     )
   end
 
+  # Milliseconds left on the session's active owner lease by the database clock
+  # that wrote its deadline.
+  defp lease_left_ms!(session_id) do
+    %{rows: [[%DateTime{} = now]]} = Repo.query!("SELECT clock_timestamp()")
+    DateTime.diff(active_lease!(session_id).expires_at, now, :millisecond)
+  end
+
+  defp released_lease!(session_id) do
+    Repo.one!(
+      from lease in BridgeOwnerLease,
+        where: lease.codex_session_id == ^session_id and lease.status == "released",
+        limit: 1
+    )
+  end
+
   defp set_owner_lease_expiry!(session_id, expires_at) do
     Repo.get!(CodexSession, session_id)
     |> Ecto.Changeset.change(%{owner_lease_expires_at: expires_at, updated_at: expires_at})
@@ -891,6 +7622,1220 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   end
 
   defp downstream_target(correlation_id), do: %{pid: self(), correlation_id: correlation_id}
+
+  defp websocket_request do
+    %UpstreamWebsocketSession.Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "request-frame",
+      timeouts: %{},
+      writer: fn _frame -> :ok end
+    }
+    |> ProviderCreditsDispatchSupport.wire_request!()
+  end
+
+  # An owner with a forwarded native compaction admission armed in
+  # `pending_compact` after one ordinary success, bound to an attached
+  # downstream (this test process).
+  defp armed_admission!(context, opts \\ []) do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    {owner, seed_url} = start_seeded_owner(context, upstream, opts)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("admission-clear-reason"))
+
+    {binding, receipt} = OrdinarySuccessTestSeed.request(owner, downstream, forwarded_binding(context, downstream), seed_url)
+
+    assert {:ok, pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, downstream,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: System.system_time(:millisecond) + 30_000
+               )
+             )
+
+    assert NativeCompactionAdmission.phase(pending) == :pending_compact
+    %{owner: owner, downstream: downstream, binding: binding}
+  end
+
+  # Forwards the lifecycle `:clear` observations of one admission (its
+  # lifecycle id is unique to the test) to the test process.
+  defp attach_admission_clear_observer(lifecycle_id) do
+    handler_id = "admission-clear-reason-#{System.unique_integer([:positive])}"
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :gateway, :native_compaction, :lifecycle],
+        &__MODULE__.forward_admission_clear/4,
+        %{test: self(), lifecycle_id: lifecycle_id}
+      )
+  end
+
+  @doc false
+  def forward_admission_clear(_event, _measurements, %{operation: :clear, native_lifecycle_id: lifecycle_id} = observation, %{test: test, lifecycle_id: lifecycle_id}),
+    do: send(test, {:admission_clear, observation})
+
+  def forward_admission_clear(_event, _measurements, _observation, _config), do: :ok
+
+  defp start_physical_owner(context) do
+    terminal = CodexPooler.JSON.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_physical_capability", "status" => "completed"}})
+    {:ok, upstream} = FakeUpstream.start_link(FakeUpstream.websocket_text_frames([terminal]))
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    assert {:ok, owner} = start_owner(context, [])
+    {owner, upstream, FakeUpstream.url(upstream)}
+  end
+
+  defp start_seeded_owner(context, upstream, opts \\ []) do
+    {boundary, url} = OrdinarySuccessTestSeed.boundary(upstream)
+    {extra, opts} = Keyword.pop(opts, :upstream_extra, %{})
+    assert {:ok, owner} = start_owner(context, Keyword.put(opts, :upstream, Map.merge(boundary, extra)))
+    {owner, url}
+  end
+
+  defp forwarded_binding(context, downstream) do
+    %NativeCompactionAdmission.Binding{
+      semantic_turn_key: <<1::256>>,
+      window_digest: <<2::256>>,
+      context_digest: <<3::256>>,
+      window_number: 1,
+      previous_response_digest: nil,
+      serving_mode: :full,
+      topology:
+        WebsocketOwnerAdmissionControlV1.forwarded_topology(
+          context.owner_instance_id,
+          context.owner_lease_token,
+          downstream.epoch
+        ),
+      lifecycle_id: Ecto.UUID.generate(),
+      generation: 1
+    }
+  end
+
+  defp admission_control(action, downstream, attrs) do
+    defaults = %{
+      version: 1,
+      action: action,
+      downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+      binding: nil,
+      phase: nil,
+      control_ref: nil,
+      capability: nil,
+      disposition: nil,
+      success?: nil,
+      compaction_item_digest: nil,
+      confirmation: nil,
+      first_compact_collection: nil,
+      expires_at_ms: nil,
+      now_ms: nil
+    }
+
+    {:ok, control} =
+      defaults
+      |> Map.merge(Map.new(attrs))
+      |> WebsocketOwnerAdmissionControlV1.new()
+
+    control
+  end
+
+  defp attach_native_compaction_observer do
+    handler_id = "forwarded-native-compaction-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :gateway, :native_compaction, :authorization_transition],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:native_event, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    fn -> drain_native_compaction_events(%{}) end
+  end
+
+  defp drain_native_compaction_events(counts) do
+    receive do
+      {:native_event, %{transition: transition, topology: :forwarded}} ->
+        drain_native_compaction_events(Map.update(counts, transition, 1, &(&1 + 1)))
+    after
+      0 -> counts
+    end
+  end
+
+  defp reserve_accounted_capability(owner, downstream, binding, receipt, now) do
+    assert {:ok, _pending} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:record_ordinary_success, downstream,
+                 binding: binding,
+                 first_compact_collection: receipt,
+                 expires_at_ms: now + 30_000
+               )
+             )
+
+    assert {:ok, capability} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:reserve, downstream,
+                 binding: binding,
+                 phase: :compact,
+                 control_ref: make_ref(),
+                 now_ms: now
+               )
+             )
+
+    assert {:ok, _accounting} =
+             WebsocketOwnerSession.admission_control(
+               owner,
+               admission_control(:mark_accounting_started, downstream,
+                 capability: capability,
+                 now_ms: now
+               )
+             )
+
+    capability
+  end
+
+  defp native_websocket_request(turn_id) do
+    %{
+      websocket_request()
+      | payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "turn_id" => turn_id}),
+        message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1
+    }
+  end
+
+  defp semantic_turn_key(codex_session_id, turn_id) do
+    :crypto.hash(:sha256, codex_session_id <> <<0>> <> turn_id)
+  end
+
+  defp authorization_binding(codex_session_id) do
+    %{
+      api_key_id: Ecto.UUID.generate(),
+      api_key_runtime_epoch: 0,
+      pool_id: Ecto.UUID.generate(),
+      codex_session_id: codex_session_id,
+      model_identifier: "gpt-test"
+    }
+  end
+
+  defp replay_descriptor(codex_session_id, authorization) do
+    %{
+      semantic_turn_key: semantic_turn_key(codex_session_id, "monitored-active-loss"),
+      replay_claim_digest: <<42::256>>,
+      authorization_snapshot: authorization,
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      model_id: Ecto.UUID.generate(),
+      endpoint: "/backend-api/codex/responses",
+      attempt_id: Ecto.UUID.generate(),
+      replay_generation: 0
+    }
+  end
+
+  defp assert_suspend_failure_outcome(context, failure) do
+    context = replay_owner_context(context, "suspend-#{failure}")
+    release_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: release_ref,
+        messages: ["before-suspend", "after-suspend"]
+      )
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: upstream,
+        persistence: replay_persistence(),
+        replay_suspender: fn _input -> {:error, failure} end
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("suspend-#{failure}"))
+
+    authorization = authorization_binding(context.codex_session_id)
+    descriptor = replay_descriptor(context.codex_session_id, authorization)
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(owner, downstream, descriptor)
+
+    submitter =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(
+          owner,
+          downstream,
+          native_websocket_request("suspend-#{failure}")
+        )
+      end)
+
+    assert_receive {:websocket_owner_harness_barrier, barrier, ^release_ref}
+    detach = Task.async(fn -> WebsocketOwnerSession.detach_downstream(owner, downstream) end)
+
+    if failure == :terminal_won do
+      send(barrier, {:websocket_owner_harness_release, release_ref})
+      assert :ok = Task.await(detach, 15_000)
+      assert :ok = Task.await(submitter, 15_000)
+    else
+      assert :ok = Task.await(detach, 15_000)
+      assert Task.await(submitter, 15_000) == {:error, :client_disconnected}
+    end
+
+    assert %{active_turn: nil, suspended_replay: nil, downstream: nil} = :sys.get_state(owner)
+  end
+
+  defp assert_terminal_suspend_race(context, order) do
+    context = replay_owner_context(context, "terminal-suspend-#{order}")
+    race_ref = make_ref()
+    terminal = terminal_frame("response.completed", "resp_terminal_suspend_#{order}")
+    parent = self()
+
+    replay_suspender = fn _input ->
+      send(parent, {:terminal_suspend_entered, self(), race_ref})
+
+      receive do
+        {:release_terminal_suspend, ^race_ref} ->
+          if order == :terminal_first,
+            do: {:error, :terminal_won},
+            else: {:ok, replay_lifecycle_fixture()}
+      end
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: terminal_race_upstream(parent, race_ref, terminal),
+        persistence: replay_persistence(),
+        replay_suspender: replay_suspender
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(
+        owner,
+        downstream_target("terminal-suspend-#{order}")
+      )
+
+    descriptor =
+      replay_descriptor(context.codex_session_id, authorization_binding(context.codex_session_id))
+
+    assert :ok =
+             WebsocketOwnerSession.prepare_next_replay_descriptor(owner, downstream, descriptor)
+
+    submitter =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(
+          owner,
+          downstream,
+          native_websocket_request("terminal-suspend-#{order}")
+        )
+      end)
+
+    assert_receive {:terminal_race_ready, worker, ^race_ref}
+    worker_monitor = Process.monitor(worker)
+    detach = Task.async(fn -> WebsocketOwnerSession.detach_downstream(owner, downstream) end)
+    assert_receive {:terminal_suspend_entered, ^owner, ^race_ref}
+
+    case order do
+      :terminal_first ->
+        send(worker, {:release_terminal_result, race_ref})
+        assert_receive {:terminal_race_returning, ^worker, ^race_ref}
+        assert_receive {:DOWN, ^worker_monitor, :process, ^worker, :normal}
+        send(owner, {:release_terminal_suspend, race_ref})
+
+        assert :ok = Task.await(detach, 15_000)
+        assert {:ok, %{terminal: "response.completed"}} = Task.await(submitter, 15_000)
+        assert_receive {:websocket_owner_frame, _, _, {:data, ^terminal}}
+        assert_receive {:websocket_owner_frame, _, _, :complete}
+        refute_received {:websocket_owner_frame, _, _, {:error, :client_disconnected, _payload}}
+        refute_received {:websocket_owner_frame, _, _, {:data, ^terminal}}
+        refute_received {:websocket_owner_frame, _, _, :complete}
+
+      :suspend_first ->
+        send(owner, {:release_terminal_suspend, race_ref})
+
+        assert :suspended = Task.await(detach, 15_000)
+        assert {:error, :client_disconnected} = Task.await(submitter, 15_000)
+        assert_receive {:DOWN, ^worker_monitor, :process, ^worker, :killed}
+        refute_received {:websocket_owner_frame, _, _, {:data, ^terminal}}
+    end
+  end
+
+  defp terminal_race_upstream(parent, race_ref, terminal) do
+    %{
+      start: fn ->
+        Agent.start_link(fn -> :open end)
+        |> tap(fn {:ok, upstream_pid} ->
+          send(parent, {:websocket_owner_harness_upstream_started, upstream_pid})
+        end)
+      end,
+      send: fn _upstream_pid, _request, writer ->
+        send(parent, {:terminal_race_ready, self(), race_ref})
+
+        receive do
+          {:release_terminal_result, ^race_ref} -> :ok
+        end
+
+        writer.(terminal, TerminalDiscriminator.classify(terminal))
+        send(parent, {:terminal_race_returning, self(), race_ref})
+        terminal_result(terminal, "response.completed")
+      end,
+      close: fn upstream_pid -> Agent.stop(upstream_pid, :normal) end
+    }
+  end
+
+  defp replay_terminal_after_suspension_upstream(parent, terminal) do
+    upstream = terminal_sequence_upstream(parent, terminal)
+    counter = :counters.new(1, [:atomics])
+
+    %{
+      upstream
+      | send: fn pid, request, writer ->
+          :counters.add(counter, 1, 1)
+
+          if :counters.get(counter, 1) == 1 do
+            send(parent, :terminal_replay_predecessor_started)
+
+            receive do
+              :release_replay_predecessor -> :ok
+            end
+          else
+            upstream.send.(pid, request, writer)
+          end
+        end
+    }
+  end
+
+  defp terminal_sequence_upstream(parent, terminal) do
+    %{
+      start: fn ->
+        Agent.start_link(fn -> :open end)
+        |> tap(fn {:ok, upstream_pid} ->
+          send(parent, {:websocket_owner_harness_upstream_started, upstream_pid})
+        end)
+      end,
+      send: fn _upstream_pid, _request, writer ->
+        writer.(terminal, TerminalDiscriminator.classify(terminal))
+        terminal_result(terminal, "response.completed")
+      end,
+      close: fn upstream_pid -> Agent.stop(upstream_pid, :normal) end
+    }
+  end
+
+  defp replay_failure_upstream(parent, reason) do
+    %{
+      start: fn ->
+        Agent.start_link(fn -> :open end)
+        |> tap(fn {:ok, upstream_pid} ->
+          send(parent, {:websocket_owner_harness_upstream_started, upstream_pid})
+        end)
+      end,
+      send: fn _upstream_pid, _request, _writer -> {:error, %{reason: reason}} end,
+      close: fn upstream_pid -> Agent.stop(upstream_pid, :normal) end
+    }
+  end
+
+  # An owner holding only the armed entitlement of a turn cut before any output,
+  # as `arm_suspended_replay/2` leaves it: task stopped, socket at epoch 1 gone.
+  defp armed_previsible_replay!(context, label, opts \\ []) do
+    context = replay_owner_context(context, label)
+    parent = self()
+    retire_result = Keyword.get(opts, :retire_result, {:ok, :closed})
+
+    retirer = fn lifecycle ->
+      send(parent, {:superseded_replay_retired, lifecycle})
+      retire_result
+    end
+
+    {:ok, owner} =
+      start_owner(context,
+        upstream: WebsocketOwnerNodeHarness.fake_upstream_boundary(self()),
+        persistence: replay_persistence(),
+        replay_retirer: retirer
+      )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    assert {:ok, %{epoch: 1}} = WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+    authorization = authorization_binding(context.codex_session_id)
+    lifecycle = replay_lifecycle_fixture()
+
+    :sys.replace_state(owner, fn state ->
+      state = DownstreamState.demonitor_downstream(state)
+
+      suspended = %{
+        semantic_turn_digest: <<1::256>>,
+        replay_claim_digest: <<2::256>>,
+        authorization_snapshot: authorization,
+        replay_generation: 1,
+        downstream: nil,
+        predecessor_epoch: 1,
+        owner_process_generation: state.process_generation,
+        provisional_token: nil,
+        provisional_status: :armed,
+        deadline_ms: nil,
+        consume_binding: nil,
+        reserve_timeout_ms: nil,
+        reserve_receipt: nil,
+        reserve_receipt_digest: nil,
+        reserve_receipt_used?: false,
+        consume_fence: nil,
+        consume_pid: nil,
+        consume_monitor: nil,
+        reconciliation_timer_ref: nil,
+        reconciliation_token: nil,
+        lifecycle: lifecycle
+      }
+
+      %{state | suspended_replay: suspended, downstream: nil}
+    end)
+
+    %{
+      owner: owner,
+      context: context,
+      authorization: authorization,
+      lifecycle: lifecycle,
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>
+    }
+  end
+
+  # An owner whose attached downstream (this test process, epoch 1) receives a
+  # running native turn: `inherited?` marks the downstream as attached while
+  # that turn ran, as `attach_downstream_now/2` does.
+  defp inherited_turn_owner!(context, label, turn_overrides, inherited?) do
+    context = replay_owner_context(context, label)
+    {:ok, owner} = start_owner(context, upstream: WebsocketOwnerNodeHarness.fake_upstream_boundary(self()), persistence: replay_persistence())
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+    assert {:ok, %{epoch: 1} = downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+    task = spawn(fn -> receive do: (:stop -> :ok) end)
+    on_exit(fn -> send(task, :stop) end)
+
+    active_turn =
+      Map.merge(
+        %{
+          task_pid: task,
+          task_ref: make_ref(),
+          downstream: downstream |> Map.take([:pid, :epoch, :correlation_id]) |> Map.put(:owner_turn_id, task),
+          visible_output?: true,
+          collect?: false,
+          admission_phase: nil,
+          terminal_forwarded?: false,
+          pending_result: nil,
+          output_commit_probe: nil,
+          descriptor: %{kind: :native, semantic_turn_key: <<9::256>>, downstream_status: :attached, visible_output?: true}
+        },
+        turn_overrides
+      )
+
+    :sys.replace_state(owner, fn state ->
+      %{state | active_turn: active_turn, downstream: Map.put(state.downstream, :active_turn_reconnect?, inherited?)}
+    end)
+
+    %{owner: owner, task: task, downstream: Map.take(downstream, [:pid, :epoch, :correlation_id])}
+  end
+
+  defp superseding_control(armed, downstream, semantic_turn_digest, replay_claim_digest) do
+    {:ok, control} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :fresh,
+        codex_session_id: armed.context.codex_session_id,
+        downstream: downstream,
+        semantic_turn_digest: semantic_turn_digest,
+        replay_claim_digest: replay_claim_digest,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: armed.context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: armed.authorization,
+        consume_binding: nil
+      })
+
+    control
+  end
+
+  defp assert_replay_kept!(armed) do
+    refute_received {:superseded_replay_retired, _lifecycle}
+    assert %{suspended_replay: %{provisional_status: :armed}, active_turn: nil, downstream: nil, downstream_epoch: 1} = :sys.get_state(armed.owner)
+  end
+
+  defp replay_lifecycle_fixture do
+    %{
+      entitlement_id: Ecto.UUID.generate(),
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      eligible_attempt_id: Ecto.UUID.generate(),
+      owner_lease_digest: <<3::256>>
+    }
+  end
+
+  defp replay_consume_binding(lifecycle) do
+    %{
+      request_id: lifecycle.request_id,
+      codex_turn_id: lifecycle.codex_turn_id,
+      eligible_attempt_id: lifecycle.eligible_attempt_id,
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      provisional_binding_digest: <<4::256>>,
+      owner_lease_digest: lifecycle.owner_lease_digest
+    }
+  end
+
+  # The owner records the loss when its monitor of the killed downstream
+  # fires, and nothing tells the test when it has: its state is polled on the
+  # monotonic detection deadline, not a count of scheduler yields (findings#270
+  # row 270-162).
+  defp await_lost_owner_state(owner, deadline \\ detection_deadline()) do
+    case :sys.get_state(owner) do
+      %{active_turn: %{descriptor: %{downstream_status: :lost}}} = state ->
+        state
+
+      state ->
+        if poll_again?(deadline),
+          do: await_lost_owner_state(owner, deadline),
+          else: flunk("owner did not record the monitored downstream loss within #{@detection_timeout_ms} ms (downstream_status #{inspect(observed_downstream_status(state))})")
+    end
+  end
+
+  defp observed_downstream_status(%{active_turn: %{descriptor: %{downstream_status: status}}}), do: status
+  defp observed_downstream_status(_state), do: nil
+
+  defp replay_owner_context(context, label) do
+    context = %{
+      context
+      | codex_session_id: Ecto.UUID.generate(),
+        owner_lease_token: Ecto.UUID.generate()
+    }
+
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+    Map.put(context, :replay_label, label)
+  end
+
+  defp monotonic_clock do
+    case Process.get(:replay_monotonic_clock) do
+      nil ->
+        clock = :atomics.new(1, [])
+        :atomics.put(clock, 1, 10_000)
+        Process.put(:replay_monotonic_clock, clock)
+        clock
+
+      clock ->
+        clock
+    end
+  end
+
+  defp replay_persistence do
+    %{
+      renew_owner_token: fn _, token, _ ->
+        {:ok, %{owner_lease_token: token, owner_instance_id: Atom.to_string(node())}}
+      end,
+      release_owner_lease: fn _, _, _, _ -> :ok end,
+      interrupt_codex_session: fn _, _ -> :ok end
+    }
+  end
+
+  defp install_armed_replay(owner, context) do
+    owner_state = :sys.get_state(owner)
+    authorization = authorization_binding(context.codex_session_id)
+
+    lifecycle = %{
+      entitlement_id: Ecto.UUID.generate(),
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      eligible_attempt_id: Ecto.UUID.generate(),
+      owner_lease_digest: <<3::256>>
+    }
+
+    :sys.replace_state(owner, fn state ->
+      suspended = %{
+        semantic_turn_digest: <<1::256>>,
+        replay_claim_digest: <<2::256>>,
+        authorization_snapshot: authorization,
+        replay_generation: 1,
+        downstream: nil,
+        predecessor_epoch: 1,
+        owner_process_generation: owner_state.process_generation,
+        provisional_token: nil,
+        provisional_status: :armed,
+        deadline_ms: nil,
+        consume_binding: nil,
+        reserve_timeout_ms: nil,
+        reserve_receipt: nil,
+        reserve_receipt_digest: nil,
+        lifecycle: lifecycle
+      }
+
+      %{state | suspended_replay: suspended}
+    end)
+
+    {authorization, lifecycle, owner_state.process_generation}
+  end
+
+  defp provisional_controls(context, downstream, authorization) do
+    common = %{
+      version: 2,
+      intent: :suspended_replay,
+      codex_session_id: context.codex_session_id,
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      replay_generation: nil,
+      owner_lease_token: context.owner_lease_token,
+      control_ref: make_ref(),
+      consume_binding: nil
+    }
+
+    {:ok, preflight} =
+      RemoteReconnectControlV2.new(
+        Map.merge(common, %{
+          action: :preflight,
+          downstream: downstream,
+          provisional_token: nil,
+          authorization_binding: authorization
+        })
+      )
+
+    {:ok, reserve} =
+      RemoteReconnectControlV2.new(
+        Map.merge(common, %{
+          action: :provisional_reserve,
+          downstream: downstream,
+          provisional_token: <<0::256>>,
+          replay_generation: 1,
+          authorization_binding: nil
+        })
+      )
+
+    {preflight, reserve}
+  end
+
+  defp fresh_control(context, downstream, semantic, replay, authorization) do
+    {:ok, control} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :fresh,
+        codex_session_id: context.codex_session_id,
+        downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+        semantic_turn_digest: semantic,
+        replay_claim_digest: replay,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: authorization,
+        consume_binding: nil
+      })
+
+    control
+  end
+
+  defp reconnect_control(context, downstream, semantic, replay, authorization, descriptor) do
+    {:ok, control} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :active_reattach,
+        codex_session_id: context.codex_session_id,
+        downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+        semantic_turn_digest: semantic,
+        replay_claim_digest: replay,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: context.owner_lease_token,
+        control_ref: make_ref(),
+        authorization_binding: authorization,
+        consume_binding: %{
+          request_id: descriptor.request_id,
+          codex_turn_id: descriptor.codex_turn_id,
+          eligible_attempt_id: descriptor.attempt_id,
+          replay_attempt_id: nil,
+          replay_generation: descriptor.replay_generation,
+          provisional_binding_digest: nil,
+          owner_lease_digest: <<1::256>>
+        }
+      })
+
+    control
+  end
+
+  defp reconnect_handoff_upstream(parent) do
+    counter = :counters.new(1, [:atomics])
+
+    %{
+      start: fn ->
+        pid =
+          spawn(fn ->
+            receive do
+              :stop -> :ok
+            end
+          end)
+
+        send(parent, {:reconnect_handoff_upstream_started, pid})
+        {:ok, pid}
+      end,
+      send: fn _upstream_pid, _request, _writer ->
+        :ok = :counters.add(counter, 1, 1)
+        count = :counters.get(counter, 1)
+
+        if count == 1 do
+          Process.flag(:trap_exit, true)
+          send(parent, {:reconnect_handoff_first_send, self()})
+
+          receive do
+            {:EXIT, _from, :shutdown} ->
+              receive do
+                :never -> :ok
+              end
+          end
+        else
+          send(parent, {:reconnect_handoff_replacement_send, count})
+          :ok
+        end
+      end,
+      invalidate: fn _upstream_pid ->
+        send(parent, {:reconnect_handoff_invalidated, :counters.get(counter, 1)})
+        :ok
+      end,
+      close: fn pid ->
+        send(pid, :stop)
+        :ok
+      end
+    }
+  end
+
+  defmodule HeldUpstreamSession do
+    @moduledoc false
+    # Serves one call at a time, as UpstreamWebsocketSession does: a request
+    # call is held until its caller dies (the session ends such a request at
+    # once), and an invalidation is answered in its turn.
+    use GenServer
+
+    def start(parent), do: GenServer.start(__MODULE__, parent)
+
+    @impl true
+    def init(parent), do: {:ok, parent}
+
+    @impl true
+    def handle_call({:hold_request, caller}, _from, parent) do
+      monitor = Process.monitor(caller)
+      send(parent, {:held_session_request, caller})
+
+      receive do
+        {:DOWN, ^monitor, :process, ^caller, _reason} -> send(parent, {:held_session_request_ended, caller})
+      end
+
+      {:reply, :ok, parent}
+    end
+
+    def handle_call(:invalidate_connection, _from, parent) do
+      send(parent, :held_session_invalidated)
+      {:reply, :ok, parent}
+    end
+
+    @impl true
+    def handle_info(:stop, parent), do: {:stop, :normal, parent}
+  end
+
+  # A waiting replacement handoff whose predecessor's task either holds the
+  # upstream session in a request call (`:hold_session`) or waits outside it
+  # (`:outside_session`). The owner's invalidation reports whether the
+  # predecessor was still alive when it was sent and what the production
+  # `invalidate_connection/1` answered.
+  defp start_held_session_handoff(context, label, mode) do
+    parent = self()
+    {:ok, predecessor} = Agent.start_link(fn -> nil end)
+
+    upstream = %{
+      start: fn -> HeldUpstreamSession.start(parent) end,
+      send: fn session, _request, _writer ->
+        # The detach of the first downstream cancels the task with a shutdown
+        # it outlives, as a predecessor still streaming would, so the owner
+        # keeps the turn and the replacement waits behind it.
+        Process.flag(:trap_exit, true)
+        task_pid = self()
+        Agent.update(predecessor, fn _pid -> task_pid end)
+
+        case mode do
+          :hold_session ->
+            GenServer.call(session, {:hold_request, self()}, :infinity)
+
+          :outside_session ->
+            send(parent, {:held_session_outside, self()})
+
+            receive do
+              :never -> :ok
+            end
+        end
+      end,
+      invalidate: fn session ->
+        task_pid = Agent.get(predecessor, & &1)
+        predecessor_alive? = is_pid(task_pid) and Process.alive?(task_pid)
+        result = UpstreamWebsocketSession.invalidate_connection(session)
+        send(parent, {:held_session_invalidate, predecessor_alive?, result})
+        result
+      end,
+      close: fn session ->
+        send(session, :stop)
+        :ok
+      end
+    }
+
+    # The test sends the soft timeout itself; the real handoff timers lie
+    # beyond the detection budget so they cannot race it.
+    {:ok, owner} = start_owner(context, upstream: upstream, handoff_soft_timeout_ms: 30_000, handoff_absolute_timeout_ms: 60_000)
+
+    {:ok, first_downstream} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("#{label}-a"))
+
+    submitter =
+      spawn(fn ->
+        _result = WebsocketOwnerSession.submit_request(owner, first_downstream, native_websocket_request("#{label}-turn-a"))
+
+        receive do
+          :release_held_session_submitter -> :ok
+        end
+      end)
+
+    task_pid =
+      receive do
+        {:held_session_request, task_pid} -> task_pid
+        {:held_session_outside, task_pid} -> task_pid
+      after
+        @detection_timeout_ms -> flunk("expected the predecessor turn to reach the upstream session")
+      end
+
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, first_downstream)
+    {:ok, replacement} = WebsocketOwnerSession.attach_downstream(owner, downstream_target("#{label}-b"))
+    ref = make_ref()
+
+    assert {:ok, :replacement_handoff, ^ref} =
+             WebsocketOwnerSession.preflight_reconnect(owner, replacement, semantic_turn_key(context.codex_session_id, "#{label}-turn-b"), ref)
+
+    %{pending_handoff: %{status: :waiting} = pending} = :sys.get_state(owner)
+    %{owner: owner, task_pid: task_pid, pending: pending, submitter: submitter}
+  end
+
+  defp start_waiting_handoff(context, label, owner_opts \\ []) do
+    parent = self()
+    {invalidate, owner_opts} = Keyword.pop(owner_opts, :invalidate)
+    upstream = reconnect_handoff_upstream(parent)
+    upstream = if invalidate, do: Map.put(upstream, :invalidate, invalidate), else: upstream
+    {seed?, owner_opts} = Keyword.pop(owner_opts, :seed_native_admission, false)
+
+    {upstream, seed_url} =
+      if seed?, do: OrdinarySuccessTestSeed.boundary(upstream), else: {upstream, nil}
+
+    {:ok, owner} =
+      start_owner(
+        context,
+        Keyword.merge(owner_opts,
+          upstream: upstream,
+          handoff_soft_timeout_ms: 10_000,
+          handoff_absolute_timeout_ms: 20_000
+        )
+      )
+
+    assert_receive {:reconnect_handoff_upstream_started, _upstream_pid}
+
+    {:ok, first_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("#{label}-a"))
+
+    seeded_admission_phase =
+      if seed? do
+        {binding, receipt} =
+          OrdinarySuccessTestSeed.request(
+            owner,
+            first_downstream,
+            forwarded_binding(context, first_downstream),
+            seed_url
+          )
+
+        assert {:ok, admission} =
+                 WebsocketOwnerSession.admission_control(
+                   owner,
+                   admission_control(:record_ordinary_success, first_downstream,
+                     binding: binding,
+                     first_compact_collection: receipt,
+                     expires_at_ms: System.system_time(:millisecond) + 30_000
+                   )
+                 )
+
+        NativeCompactionAdmission.phase(admission)
+      end
+
+    submitter =
+      spawn(fn ->
+        result =
+          WebsocketOwnerSession.submit_request(
+            owner,
+            first_downstream,
+            native_websocket_request("#{label}-a")
+          )
+
+        send(parent, {:handoff_fixture_old_result, label, result})
+
+        receive do
+          :release_handoff_fixture_submitter -> :ok
+        end
+      end)
+
+    assert_receive {:reconnect_handoff_first_send, task_pid}
+    task_monitor = Process.monitor(task_pid)
+    %{active_turn: predecessor} = :sys.get_state(owner)
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner, first_downstream)
+
+    {:ok, replacement} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("#{label}-b"))
+
+    control_ref = make_ref()
+
+    assert {:ok, :replacement_handoff, ^control_ref} =
+             WebsocketOwnerSession.preflight_reconnect(
+               owner,
+               replacement,
+               semantic_turn_key(context.codex_session_id, "#{label}-b"),
+               control_ref
+             )
+
+    %{pending_handoff: pending} = :sys.get_state(owner)
+
+    %{
+      owner: owner,
+      seeded_admission_phase: seeded_admission_phase,
+      pending: pending,
+      predecessor: predecessor,
+      replacement: replacement,
+      submitter: submitter,
+      task_monitor: task_monitor,
+      task_pid: task_pid
+    }
+  end
+
+  defp start_ready_handoff(context, label, owner_opts \\ []) do
+    waiting = start_waiting_handoff(context, label, owner_opts)
+    pending = waiting.pending
+
+    send(
+      waiting.owner,
+      {:websocket_owner_handoff_soft_timeout, pending.control_ref, pending.soft_token}
+    )
+
+    assert_receive {:reconnect_handoff_invalidated, 1}
+
+    task_monitor = waiting.task_monitor
+    task_pid = waiting.task_pid
+    assert_receive {:DOWN, ^task_monitor, :process, ^task_pid, :killed}
+    assert_receive {:handoff_fixture_old_result, ^label, {:error, :client_disconnected}}
+
+    send(waiting.submitter, :release_handoff_fixture_submitter)
+
+    assert_receive {:websocket_owner_handoff_ready, correlation_id, epoch, _owner_turn_id, _downstream_pid, control_ref}
+
+    assert correlation_id == waiting.replacement.correlation_id
+    assert epoch == waiting.replacement.epoch
+    assert control_ref == pending.control_ref
+    %{waiting | pending: :sys.get_state(waiting.owner).pending_handoff}
+  end
+
+  defp terminal_frame(type, response_id) do
+    response =
+      if type in ["response.completed", "response.done"] do
+        %{"id" => response_id, "status" => "completed"}
+      else
+        %{"id" => response_id, "status" => String.replace_prefix(type, "response.", "")}
+      end
+
+    CodexPooler.JSON.encode!(%{"type" => type, "response" => response})
+  end
+
+  defp terminal_result(terminal_frame, terminal) do
+    {:ok,
+     %{
+       body: "data: #{terminal_frame}\n\n",
+       terminal: terminal,
+       status: 200,
+       headers: [],
+       websocket_frame_headers: %{}
+     }}
+  end
+
+  defp interrupted_upstream(parent, frame) do
+    %{
+      start: fn -> Agent.start_link(fn -> :ready end) end,
+      send: fn _upstream_pid, _request, writer ->
+        send(parent, {:interrupted_upstream_writer, frame})
+        _message = writer.(frame, TerminalDiscriminator.classify(frame))
+        interrupted_result()
+      end,
+      close: fn upstream_pid -> Agent.stop(upstream_pid) end
+    }
+  end
+
+  defp interrupted_result do
+    {:error,
+     %{
+       body: "",
+       forward_error_body?: true,
+       reason: :upstream_stream_error,
+       transport_failure: %{"reason" => "upstream_stream_error"}
+     }}
+  end
+
+  # Monitors the owner and returns once the owner has taken the monitor request. `Process.monitor/1` only queues the
+  # request: the VM parks it until the caller next signals the same process, asks for another monitor or is scheduled
+  # out (erl_proc_sig_queue.c `proc_queue_signal`, erl_process.c `erts_schedule`), so the signal that ends the owner's
+  # upstream, which goes to another process, can overtake it. An owner that is already gone then answers `noproc`
+  # instead of its exit reason, which a test process stalled on a shared CI node saw (findings#303 row 303-8, Drone
+  # 1809). A call sent after the monitor is ordered behind it, and its answer shows the owner and its upstream alive
+  # before the test ends the upstream.
+  defp monitor_owner(owner) do
+    owner_ref = Process.monitor(owner)
+    assert {:ok, %{upstream_alive?: true}} = WebsocketOwnerSession.owner_status(owner)
+    owner_ref
+  end
+
+  defp exit_controlled_upstream(parent, scenario) do
+    start = fn ->
+      {:ok, upstream_pid} = Agent.start_link(fn -> 0 end)
+      send(parent, {:exit_controlled_upstream_started, scenario, upstream_pid})
+      {:ok, upstream_pid}
+    end
+
+    send_request = fn upstream_pid, _request, writer ->
+      send_count = Agent.get_and_update(upstream_pid, fn count -> {count + 1, count + 1} end)
+
+      if scenario == :post_visible do
+        writer.(
+          "visible-before-upstream-exit",
+          %TerminalDiscriminator{terminal: nil}
+        )
+      end
+
+      send(parent, {:exit_controlled_upstream_send, scenario, upstream_pid, send_count})
+      Process.monitor(upstream_pid)
+
+      receive do
+        {:DOWN, _ref, :process, ^upstream_pid, reason} -> {:error, reason}
+      end
+    end
+
+    close = fn upstream_pid ->
+      send(parent, {:exit_controlled_upstream_closed, scenario, upstream_pid})
+      if Process.alive?(upstream_pid), do: Agent.stop(upstream_pid)
+      :ok
+    end
+
+    upstream = %{start: start, send: send_request, close: close}
+    {:ok, upstream_pid} = start.()
+    Process.unlink(upstream_pid)
+
+    wrapped_upstream = %{
+      upstream
+      | start: fn ->
+          Process.link(upstream_pid)
+          {:ok, upstream_pid}
+        end
+    }
+
+    {wrapped_upstream, upstream_pid}
+  end
+
+  defp owner_exit_submitter(parent, owner, downstream, scenario, public? \\ false) do
+    spawn(fn ->
+      downstream = if public?, do: Map.put(downstream, :owner_turn_id, self()), else: downstream
+
+      outcome =
+        try do
+          request = %{
+            websocket_request()
+            | request_id: Ecto.UUID.generate(),
+              attempt_id: Ecto.UUID.generate()
+          }
+
+          {:return, WebsocketOwnerSession.submit_request(owner, downstream, request)}
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      send(parent, {:owner_exit_submitter_outcome, scenario, outcome})
+    end)
+  end
+
+  defp owner_exit_persistence_spy(parent, context) do
+    %{
+      release_owner_lease: fn session_id, lease_token, reason, cause ->
+        send(parent, {:owner_exit_release, session_id, lease_token, reason, cause})
+        :ok
+      end,
+      interrupt_codex_session: fn session_id, %RequestOptions{} = opts ->
+        send(parent, {:owner_exit_interrupt, session_id, opts.runtime.interrupt_reason})
+        {:ok, :interrupted}
+      end,
+      renew_owner_token: fn _session_id, _lease_token, _opts ->
+        {:ok,
+         %{
+           owner_lease_token: context.owner_lease_token,
+           owner_instance_id: context.owner_instance_id
+         }}
+      end
+    }
+  end
+
+  defp assert_owner_exit_persisted_once(context) do
+    assert_receive {:owner_exit_release, session_id, lease_token, "owner_crashed", nil}, @detection_timeout_ms
+    assert session_id == context.codex_session_id
+    assert lease_token == context.owner_lease_token
+    assert_receive {:owner_exit_interrupt, ^session_id, "owner_crashed"}, @detection_timeout_ms
+    refute_received {:owner_exit_release, _session_id, _lease_token, _reason, _cause}
+    refute_received {:owner_exit_interrupt, _session_id, _reason}
+  end
+
+  defp start_output_commit_probe(context, label) do
+    upstream = interrupted_upstream(self(), "visible-#{label}")
+    {:ok, owner} = start_owner(context, upstream: upstream)
+
+    {:ok, stable_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target(label))
+
+    owner_turn_id = self()
+    downstream = Map.put(stable_downstream, :owner_turn_id, owner_turn_id)
+
+    submit_task =
+      Task.async(fn ->
+        WebsocketOwnerSession.submit_request(owner, downstream, websocket_request())
+      end)
+
+    assert_receive {:websocket_owner_frame, ^label, epoch, ^owner_turn_id, {:data, "visible-" <> ^label}}
+
+    assert_receive {:websocket_owner_output_commit_probe, ^label, ^epoch, ^owner_turn_id, active_turn_ref, ^owner, probe_ref}
+
+    %{
+      owner: owner,
+      stable_downstream: stable_downstream,
+      downstream: downstream,
+      owner_turn_id: owner_turn_id,
+      correlation_id: label,
+      epoch: epoch,
+      active_turn_ref: active_turn_ref,
+      probe_ref: probe_ref,
+      submit_task: submit_task
+    }
+  end
+
+  defp receive_probe_messages(parent) do
+    receive do
+      message ->
+        send(parent, {:probe_downstream_message, message})
+        receive_probe_messages(parent)
+    end
+  end
 
   defp collector(parent, label) do
     spawn_link(fn -> collector_loop(parent, label) end)

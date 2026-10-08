@@ -1,0 +1,212 @@
+defmodule CodexPooler.Accounting.RequestReplayCleanupTest do
+  use CodexPooler.DataCase, async: false
+
+  import CodexPooler.RequestReplayFixtures
+
+  alias CodexPooler.Accounting.{LedgerReads, RequestReplay, RequestReplayEntitlement}
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Transports.Streaming.{RuntimeAdmissionProof, StreamProtocol}
+  alias CodexPooler.Gateway.Transports.Websocket.{NativeReplayAdmission, WebsocketOwnerSession}
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
+  alias CodexPooler.Jobs.{RequestReplayCleanupWorker, RuntimeStateCleanupWorker, Schedule}
+  alias CodexPooler.ProviderCreditsDispatchSupport
+
+  test "more than a batch of earlier noops cannot starve later expired replay" do
+    due_at = DateTime.add(DateTime.utc_now(), -60, :second)
+    # The claim is "noops exceeding one batch", so the batch is shrunk to two
+    # rather than filling the 100-row production batch.
+    batch_size = 2
+
+    for _ <- 1..(batch_size + 1) do
+      fixture = replay_fixture(reservation?: true)
+
+      insert_entitlement!(fixture, %{
+        armed_at: DateTime.add(due_at, -30, :second),
+        expires_at: due_at
+      })
+
+      fixture.turn |> Ecto.Changeset.change(status: "failed") |> Repo.update!()
+    end
+
+    last = replay_fixture(reservation?: true)
+    assert LedgerReads.outstanding_reservation_count(last.api_key.id) == 1
+
+    insert_entitlement!(last, %{
+      armed_at: DateTime.add(due_at, -29, :second),
+      expires_at: DateTime.add(due_at, 1, :second)
+    })
+
+    assert {:ok,
+            %{
+              replay_entitlements_selected: ^batch_size,
+              replay_entitlements_noop: ^batch_size,
+              replay_entitlements_closed: 0,
+              replay_cleanup_batch_full: true
+            }} = measured_cleanup("populated-noop-batch", batch_size: batch_size)
+
+    assert {:ok, %{replay_entitlements_selected: ^batch_size, replay_entitlements_closed: 1}} =
+             measured_cleanup("populated-progress-batch", batch_size: batch_size)
+
+    assert Repo.reload!(last.request).last_error_code == "websocket_replay_expired"
+    assert terminal_ledger_count(last.request.id, "settlement") == 1
+    assert LedgerReads.outstanding_reservation_count(last.api_key.id) == 0
+
+    assert Repo.aggregate(
+             from(row in RequestReplayEntitlement,
+               where: not is_nil(row.cleanup_checked_at)
+             ),
+             :count
+           ) == batch_size + 1
+  end
+
+  test "minute worker persists measured bounded summary and generic worker keeps fifteen minutes" do
+    assert {:ok, %{replay_entitlements_selected: 0}} = measured_cleanup("idle")
+    assert {"* * * * *", RequestReplayCleanupWorker} in Schedule.oban_crontab()
+    assert {"*/15 * * * *", RuntimeStateCleanupWorker} in Schedule.oban_crontab()
+    assert RequestReplayCleanupWorker.timeout(%Oban.Job{}) == 45_000
+    changeset = RequestReplayCleanupWorker.new(%{})
+    assert Ecto.Changeset.get_field(changeset, :max_attempts) == 1
+    job = Repo.insert!(changeset)
+    assert :ok = RequestReplayCleanupWorker.perform(job)
+    summary = Repo.reload!(job).meta["replay_cleanup"]
+    assert summary["replay_entitlements_selected"] == 0
+    assert summary["replay_entitlements_closed"] == 0
+    assert summary["replay_entitlements_noop"] == 0
+    assert summary["replay_cleanup_batch_full"] == false
+    assert is_integer(summary["duration_ms"])
+  end
+
+  for cause <- [:revoked, :expired] do
+    test "#{cause} committed replay cannot physically start and compensates exactly once" do
+      fixture = replay_fixture(reservation?: true, physical_upstream?: true)
+
+      assert LedgerReads.outstanding_reservation_count(fixture.api_key.id) == 1
+
+      assert {:ok, armed} = RequestReplay.arm(arm_input(fixture))
+
+      assert {:ok, consumed} =
+               RequestReplay.consume(consume_input(fixture, armed, :crypto.strong_rand_bytes(32)))
+
+      case unquote(cause) do
+        :revoked ->
+          assert {:ok, _key} = CodexPooler.Access.revoke_api_key(fixture.scope, fixture.api_key)
+
+        :expired ->
+          set_replay_db_now!(DateTime.add(consumed.entitlement.abandon_at, 1, :microsecond))
+      end
+
+      assert {:error, :ineligible} = RequestReplay.dispatch_lifecycle(consumed.consume_binding)
+      assert {:error, :binding_mismatch} = RequestReplay.mark_started(consumed.consume_binding)
+      assert is_nil(Repo.reload!(consumed.entitlement).started_at)
+      assert_rejected_owner_send(fixture, consumed)
+
+      assert {:error, :binding_mismatch} =
+               RequestReplay.compensate_no_send(consumed.consume_binding)
+
+      assert terminal_ledger_count(fixture.request.id, "settlement") == 1
+      assert terminal_ledger_count(fixture.request.id, "release") == 1
+      assert Repo.reload!(consumed.entitlement).started_at == nil
+      assert Repo.reload!(consumed.attempt).status == "failed"
+      assert Repo.reload!(consumed.attempt).usage_status == "usage_unknown"
+      assert Repo.reload!(fixture.turn).status == "failed"
+      assert Repo.reload!(fixture.turn).final_attempt_id == consumed.attempt.id
+      assert Repo.reload!(fixture.request).last_error_code == "websocket_replay_abandoned"
+
+      assert LedgerReads.outstanding_reservation_count(fixture.api_key.id) == 0
+    end
+  end
+
+  defp assert_rejected_owner_send(fixture, consumed) do
+    {:ok, owner} = WebsocketOwnerSession.lookup(fixture.session.id)
+    {:ok, upstream} = FakeUpstream.start_link(FakeUpstream.websocket_text_frames([CodexPooler.JSON.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_forbidden_replay", "status" => "completed"}})]))
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    state = :sys.get_state(owner)
+    downstream = Map.put(state.downstream, :active_turn_reconnect?, false)
+
+    binding =
+      struct!(
+        NativeReplayAdmission.Binding,
+        Map.merge(consumed.consume_binding, %{
+          semantic_turn_digest: fixture.semantic_digest,
+          replay_claim_digest: fixture.replay_claim_digest,
+          downstream_epoch: state.downstream.epoch,
+          owner_process_generation: state.process_generation
+        })
+      )
+
+    :sys.replace_state(owner, fn state ->
+      %{
+        state
+        | downstream: downstream,
+          suspended_replay: %{
+            state.suspended_replay
+            | consume_binding: consumed.consume_binding,
+              provisional_status: :committed_not_started
+          }
+      }
+    end)
+
+    request = %Request{
+      url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+      headers: [],
+      payload: CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => fixture.model.upstream_model_id, "input" => []}),
+      timeouts: %{connect_timeout_ms: 5_000, receive_timeout_ms: 5_000},
+      request_id: fixture.request.id,
+      attempt_id: consumed.entitlement.replay_attempt_id,
+      effective_serving_mode: "full",
+      message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1,
+      native_replay_binding: binding,
+      native_replay_proof: RuntimeAdmissionProof.new(self(), make_ref(), make_ref(), <<7::256>>, :native_replay),
+      provisional_token: state.suspended_replay.provisional_token
+    }
+
+    request = ProviderCreditsDispatchSupport.wire_request!(request, identity: fixture.identity, pool: fixture.pool, request_id: fixture.request.id, attempt_id: consumed.entitlement.replay_attempt_id, model: fixture.model.exposed_model_id, upstream_model: fixture.model.upstream_model_id)
+
+    assert {:error, :owner_unavailable} = WebsocketOwnerSession.submit_request(owner, downstream, request)
+    assert FakeUpstream.physical_counts(upstream).websocket_generation == 0
+    assert FakeUpstream.physical_counts(upstream).consume == 0
+    assert Repo.reload!(consumed.entitlement).closed_at
+  end
+
+  defp measured_cleanup(label, opts \\ []) do
+    ref = make_ref()
+    handler = {__MODULE__, ref}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        &__MODULE__.count_query/4,
+        {self(), ref}
+      )
+
+    started_at = System.monotonic_time(:microsecond)
+
+    try do
+      result = RequestReplay.cleanup_due(opts)
+      duration_us = System.monotonic_time(:microsecond) - started_at
+      queries = drain_query_count(ref, 0)
+
+      CodexPooler.TestDiagnostics.puts(CodexPooler.JSON.encode!(%{cleanup: label, duration_us: duration_us, queries: queries}))
+
+      result
+    after
+      :telemetry.detach(handler)
+    end
+  end
+
+  def count_query(_event, _measurements, _metadata, {parent, ref}) do
+    if self() == parent, do: send(parent, {:cleanup_query, ref})
+  end
+
+  defp drain_query_count(ref, count) do
+    receive do
+      {:cleanup_query, ^ref} -> drain_query_count(ref, count + 1)
+    after
+      0 -> count
+    end
+  end
+end

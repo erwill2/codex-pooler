@@ -14,6 +14,8 @@ defmodule CodexPooler.Upstreams do
     Assignments,
     Import,
     OAuth,
+    PreparedAccount,
+    ProviderCreditsPolicy,
     QuotaReconciliationEnqueue,
     SavedResetPolicy,
     SavedResetRedemptionEnqueue,
@@ -21,7 +23,8 @@ defmodule CodexPooler.Upstreams do
     TokenRefreshEnqueue
   }
 
-  alias CodexPooler.Upstreams.Lifecycle.{AccountLifecycle, IdentityLifecycle}
+  alias CodexPooler.Upstreams.Lifecycle.{AccountDeletion, AccountLifecycle, IdentityLifecycle}
+  alias CodexPooler.Upstreams.Reconciliation.UsagePollCooldown
 
   alias CodexPooler.Upstreams.Schemas.{
     EncryptedSecret,
@@ -30,8 +33,11 @@ defmodule CodexPooler.Upstreams do
     UpstreamIdentity
   }
 
-  @deleted UpstreamIdentity.deleted_status()
-  @assignment_deleted PoolUpstreamAssignment.deleted_status()
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
+
+  @deleted IdentityStatus.deleted_status()
+  @assignment_deleted AssignmentStatus.deleted_status()
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type lifecycle_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
   @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
@@ -73,33 +79,68 @@ defmodule CodexPooler.Upstreams do
     end
   end
 
-  @spec list_visible_upstream_identities(Scope.t()) :: [UpstreamIdentity.t()]
-  def list_visible_upstream_identities(%Scope{} = scope) do
-    pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
+  @spec list_visible_upstream_identities(Scope.t(), keyword()) :: [UpstreamIdentity.t()]
+  def list_visible_upstream_identities(scope, opts \\ [])
 
-    case pool_ids do
-      [] ->
-        []
+  def list_visible_upstream_identities(%Scope{} = scope, opts) when is_list(opts) do
+    scope
+    |> visible_upstream_identities_query(opts)
+    |> Repo.all()
+  end
 
-      _ ->
-        Repo.all(
-          from identity in UpstreamIdentity,
-            join: assignment in PoolUpstreamAssignment,
-            on: assignment.upstream_identity_id == identity.id,
-            where: assignment.pool_id in ^pool_ids,
-            where: assignment.status != ^@assignment_deleted,
-            where: identity.status != ^@deleted,
-            distinct: true,
-            order_by: [
-              asc: identity.account_label,
-              asc: identity.chatgpt_account_id,
-              asc: identity.created_at
-            ]
-        )
+  def list_visible_upstream_identities(_scope, _opts), do: []
+
+  @spec get_visible_upstream_identity(Scope.t(), term()) :: UpstreamIdentity.t() | nil
+  def get_visible_upstream_identity(%Scope{} = scope, identity_id) do
+    case Ecto.UUID.cast(identity_id) do
+      {:ok, id} ->
+        scope
+        |> visible_upstream_identities_query([])
+        |> where([identity], identity.id == ^id)
+        |> Repo.one()
+
+      :error ->
+        nil
     end
   end
 
-  def list_visible_upstream_identities(_scope), do: []
+  def get_visible_upstream_identity(_scope, _identity_id), do: nil
+
+  defp visible_upstream_identities_query(scope, opts) do
+    visible_pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
+
+    selected_pool_ids =
+      case Keyword.get(opts, :pool_ids, visible_pool_ids) do
+        pool_ids when is_list(pool_ids) -> pool_ids
+        _invalid -> []
+      end
+
+    pool_ids = Enum.filter(visible_pool_ids, &(&1 in selected_pool_ids))
+    include_unassigned? = Keyword.get(opts, :include_unassigned, true) and Pools.owner?(scope)
+    include_deleted? = Keyword.get(opts, :include_deleted, false) == true
+
+    from identity in UpstreamIdentity,
+      left_join: assignment in PoolUpstreamAssignment,
+      on:
+        assignment.upstream_identity_id == identity.id and
+          (assignment.status != ^@assignment_deleted or
+             (^include_deleted? and identity.status == ^@deleted)),
+      where: ^upstream_visibility_filter(pool_ids, include_unassigned?, include_deleted?),
+      distinct: true,
+      order_by: [
+        asc: identity.account_label,
+        asc: identity.chatgpt_account_id,
+        asc: identity.created_at
+      ]
+  end
+
+  defp upstream_visibility_filter(pool_ids, include_unassigned?, include_deleted?) do
+    dynamic(
+      [identity, assignment],
+      (assignment.pool_id in ^pool_ids or (^include_unassigned? and (is_nil(assignment.id) or (identity.status == ^@deleted and assignment.status == ^@assignment_deleted)))) and
+        (identity.status != ^@deleted or ^include_deleted?)
+    )
+  end
 
   @spec get_upstream_identity(term()) :: UpstreamIdentity.t() | nil
   def get_upstream_identity(id) when is_binary(id), do: Repo.get(UpstreamIdentity, id)
@@ -123,6 +164,31 @@ defmodule CodexPooler.Upstreams do
 
   @spec import_codex_auth_json(term(), term(), binary()) :: import_result()
   defdelegate import_codex_auth_json(scope, pool, content), to: Import
+
+  @spec prepare_codex_auth_json_account(term(), term(), binary()) ::
+          {:ok, PreparedAccount.t()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  defdelegate prepare_codex_auth_json_account(scope, pool, content), to: Import
+
+  @spec import_trusted_account(Scope.t(), Pool.t(), map()) :: import_result()
+  defdelegate import_trusted_account(scope, pool, attrs), to: Import
+  defdelegate prepare_trusted_account(scope, pool, attrs), to: Import
+  defdelegate prepare_bundle_account(scope, pool, attrs), to: Import
+
+  @spec prepare_access_only_bundle_account(Scope.t(), Pool.t(), map()) ::
+          {:ok, PreparedAccount.t()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  defdelegate prepare_access_only_bundle_account(scope, pool, attrs), to: Import
+
+  @spec validate_trusted_account(Scope.t(), Pool.t(), map()) ::
+          {:ok, map()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  defdelegate validate_trusted_account(scope, pool, attrs), to: Import
+
+  @spec import_trusted_account_in_transaction(Scope.t(), Pool.t(), map()) :: import_result()
+  @doc """
+  Imports one trusted account inside the caller's transaction.
+
+  Multi-account callers must prepare the full set and use the batch transaction boundary once.
+  """
+  defdelegate import_trusted_account_in_transaction(scope, pool, attrs), to: Import
 
   @spec start_browser_oauth(Scope.t(), Pool.t(), keyword()) :: oauth_flow_start_result()
   defdelegate start_browser_oauth(scope, pool, opts \\ []), to: OAuth
@@ -170,6 +236,34 @@ defmodule CodexPooler.Upstreams do
           lifecycle_result()
   defdelegate soft_delete_account_for_scope(scope, identity_or_id, attrs), to: AccountLifecycle
 
+  @spec delete_account_for_scope(Scope.t(), identity_ref(), map()) :: AccountDeletion.request_result()
+  defdelegate delete_account_for_scope(scope, identity_or_id, attrs \\ %{}), to: AccountDeletion, as: :request
+
+  @spec authorize_account_deletion(Scope.t(), identity_ref()) :: identity_result()
+  defdelegate authorize_account_deletion(scope, identity_or_id), to: AccountDeletion, as: :authorize
+
+  @spec account_deletion_permissions(Scope.t(), [Ecto.UUID.t()]) :: %{Ecto.UUID.t() => boolean()}
+  defdelegate account_deletion_permissions(scope, identity_ids), to: AccountDeletion, as: :permissions
+
+  @spec account_deletion_states([Ecto.UUID.t()]) :: %{Ecto.UUID.t() => AccountDeletion.state()}
+  defdelegate account_deletion_states(identity_ids), to: AccountDeletion, as: :states
+
+  @spec continue_account_deletion(Ecto.UUID.t(), Ecto.UUID.t() | nil, integer()) :: AccountDeletion.continue_result()
+  defdelegate continue_account_deletion(identity_id, requested_by_user_id, deadline), to: AccountDeletion, as: :continue
+
+  @spec broadcast_account_deletion_failed(Ecto.UUID.t()) :: :ok
+  defdelegate broadcast_account_deletion_failed(identity_id), to: AccountDeletion, as: :broadcast_failed
+
+  @doc """
+  The provider-requested usage polling pauses still running for the provider
+  account this identity's credential belongs to, longest first. An operator projection: the origin is
+  the stored digest, never a URL.
+  """
+  @spec usage_poll_pauses(UpstreamIdentity.t(), DateTime.t()) :: [UsagePollCooldown.active_pause()]
+  def usage_poll_pauses(%UpstreamIdentity{} = identity, %DateTime{} = as_of) do
+    UsagePollCooldown.active_pauses(identity.metadata, UsagePollCooldown.current_scope(identity), as_of)
+  end
+
   @spec enqueue_token_refresh_for_scope(Scope.t(), identity_ref(), keyword()) ::
           {:ok, map()} | {:error, lifecycle_error() | Ecto.Changeset.t()}
   defdelegate enqueue_token_refresh_for_scope(scope, identity_or_id, opts \\ []),
@@ -187,6 +281,15 @@ defmodule CodexPooler.Upstreams do
   defdelegate update_saved_reset_policy_for_scope(scope, identity_or_id, attrs),
     to: SavedResetPolicy,
     as: :update_for_scope
+
+  @spec update_provider_credits_policy_for_scope(Scope.t(), identity_ref(), map()) ::
+          ProviderCreditsPolicy.update_result()
+  defdelegate update_provider_credits_policy_for_scope(scope, identity_or_id, attrs),
+    to: ProviderCreditsPolicy,
+    as: :update_for_scope
+
+  @spec provider_credits_decision(CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot.t(), map() | keyword()) :: ProviderCreditsPolicy.decision()
+  defdelegate provider_credits_decision(snapshot, context), to: ProviderCreditsPolicy, as: :evaluate
 
   @spec enqueue_saved_reset_redemption_for_scope(
           Scope.t(),

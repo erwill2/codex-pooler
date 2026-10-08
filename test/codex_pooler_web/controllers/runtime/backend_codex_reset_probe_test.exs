@@ -2,28 +2,31 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
   use CodexPoolerWeb.ConnCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
 
+  alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.ProviderCreditsFixtures
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias Ecto.Adapters.SQL.Sandbox
+
+  @detection_timeout_ms 15_000
 
   test "successful HTTP JSON response confirms the guarded reset probe", %{conn: conn} do
-    # Auto redemption consumes the saved reset, but the post-consume usage
-    # refresh OMITS the account rate_limit window, so the redemption parks in
-    # consumed_pending_probe and the triggering request is force-routed as the
-    # one-shot guarded probe. Its non-streaming success must flip the phase to
-    # confirmed_by_upstream through the shared finalization side effects.
+    # The provider spends one reset and reports no credits but omits the quota
+    # descriptor. The real current weekly resource remains pending, so only the
+    # bound triggering request may prove non-credit recovery through finalization.
     upstream =
       start_upstream(
         {:path_json,
          %{
            "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
-           "/api/codex/usage" =>
-             {200,
-              %{"plan_type" => "pro", "rate_limit_reset_credits" => %{"available_count" => 0}}},
+           "/api/codex/usage" => {200, post_consume_usage_payload()},
            "/backend-api/codex/responses" =>
              {200,
               %{
@@ -39,7 +42,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
     identity =
       setup.identity
       |> UpstreamIdentity.changeset(%{
-        metadata: saved_reset_metadata(upstream, 1),
+        metadata: Map.merge(setup.identity.metadata || %{}, saved_reset_metadata(upstream, 1)),
         saved_reset_auto_redeem_enabled: true,
         saved_reset_auto_redeem_min_blocked_minutes: 60,
         saved_reset_auto_redeem_keep_credits: 0,
@@ -48,13 +51,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
       |> Repo.update!()
 
     prime_weekly_exhausted_quota!(identity)
+    ProviderCreditsFixtures.persist_usage!(Repo.reload!(identity), ProviderCreditsFixtures.usage_payload(:weekly_credit_only, credits: :none), DateTime.utc_now())
 
     conn =
       conn
       |> auth(setup)
       |> post("/backend-api/codex/responses", %{
         "model" => setup.model.exposed_model_id,
-        "input" => "guarded reset probe",
+        "input" => native_text_input("guarded reset probe"),
         "stream" => false
       })
 
@@ -77,6 +81,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
     redemption = Repo.reload!(identity).metadata["saved_reset_redemption"]
     assert redemption["phase"] == "confirmed_by_upstream"
     assert get_in(redemption, ["result", "code"]) == "reset"
+    assert get_in(redemption, ["probe", "version"]) == 2
+    assert get_in(redemption, ["non_credit_confirmation", "scope", "pool_upstream_assignment_id"]) == setup.assignment.id
+    assert get_in(redemption, ["non_credit_confirmation", "scope", "upstream_identity_id"]) == identity.id
+    assert get_in(redemption, ["non_credit_confirmation", "scope", "transport"]) == "http_json"
+    assert_private_probe_metadata!(request, attempt, redemption["probe"])
   end
 
   test "guarded reset probe model miss stays on the redeemed assignment", %{conn: conn} do
@@ -85,11 +94,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
         {:path_json,
          %{
            "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
-           "/api/codex/usage" =>
-             {200,
-              %{"plan_type" => "pro", "rate_limit_reset_credits" => %{"available_count" => 0}}},
-           "/backend-api/codex/responses" =>
-             {404, %{"error" => %{"code" => "model_not_found", "param" => "model"}}}
+           "/api/codex/usage" => {200, post_consume_usage_payload()},
+           "/backend-api/codex/responses" => {404, %{"error" => %{"code" => "model_not_found", "param" => "model"}}}
          }}
       )
 
@@ -105,17 +111,27 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
     use_deterministic_rotation!(setup.pool, 2)
 
     sibling =
-      gateway_upstream(setup.pool, sibling_upstream, "upstream-token-reset-probe-sibling",
-        compact?: false
-      )
+      gateway_upstream(setup.pool, sibling_upstream, "upstream-token-reset-probe-sibling", compact?: false)
+
+    sibling_identity =
+      sibling.identity
+      |> UpstreamIdentity.changeset(%{
+        saved_reset_auto_redeem_enabled: true,
+        saved_reset_auto_redeem_trigger_mode: "threshold",
+        saved_reset_auto_redeem_quota_threshold_percent: 95,
+        updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      })
+      |> Repo.update!()
 
     assert {:ok, [_window]} =
-             QuotaWindows.upsert_quota_windows(sibling.identity, [
+             QuotaWindows.upsert_quota_windows(sibling_identity, [
                weekly_quota_window_attrs(%{
-                 used_percent: Decimal.new("97"),
+                 used_percent: Decimal.new("100"),
                  source: "codex_usage_api"
                })
              ])
+
+    CodexPooler.SavedResetConfirmationFixtures.confirm_automatic_pressure!(sibling_identity)
 
     _model =
       put_model_source_assignments!(setup.model, [setup.assignment, sibling.assignment])
@@ -123,7 +139,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
     identity =
       setup.identity
       |> UpstreamIdentity.changeset(%{
-        metadata: saved_reset_metadata(probe_upstream, 1),
+        metadata: Map.merge(setup.identity.metadata || %{}, saved_reset_metadata(probe_upstream, 1)),
         saved_reset_auto_redeem_enabled: true,
         saved_reset_auto_redeem_trigger_mode: "threshold",
         saved_reset_auto_redeem_quota_threshold_percent: 95,
@@ -141,6 +157,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
                })
              ])
 
+    ProviderCreditsFixtures.persist_usage!(Repo.reload!(identity), ProviderCreditsFixtures.usage_payload(:included, credits: :none) |> put_in(["rate_limit", "secondary_window", "used_percent"], 96), DateTime.utc_now())
+    CodexPooler.SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
+
     routing_settings = Repo.reload!(CodexPooler.Pools.routing_settings_with_defaults(setup.pool))
     assert routing_settings.routing_strategy == "deterministic_rotation"
     assert routing_settings.bridge_ring_size == 2
@@ -157,7 +176,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
       |> put_req_header("x-request-id", request_id)
       |> post("/backend-api/codex/responses", %{
         "model" => setup.model.exposed_model_id,
-        "input" => "guarded reset probe model miss",
+        "input" => native_text_input("guarded reset probe model miss"),
         "stream" => false
       })
 
@@ -189,5 +208,414 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexResetProbeTest do
     assert attempt.status == "failed"
 
     assert get_in(redemption, ["result", "code"]) == "reset"
+  end
+
+  test "HTTP reset probe failures retain the one-shot claim without sibling fallback", %{
+    conn: conn
+  } do
+    scenarios = [
+      {"quota-shaped 429", quota_exhausted_response(), 429, "upstream_rate_limited", "reblocked"},
+      {"generic 429", FakeUpstream.generic_429(), 429, "upstream_rate_limited", "consumed_pending_probe"},
+      {"5xx", FakeUpstream.generic_5xx(), 503, "upstream_status", "consumed_pending_probe"}
+    ]
+
+    for {label, response_mode, response_status, error_code, expected_phase} <- scenarios do
+      fixture = reset_probe_fixture(response_mode)
+
+      response =
+        conn
+        |> recycle()
+        |> post_reset_probe(fixture, "#{label} reset probe")
+
+      assert response.status == response_status, label
+
+      assert_failure_accounting!(fixture, response_status, error_code)
+      assert_probe_outcome!(fixture, expected_phase)
+      assert_no_replacement_probe!(conn, fixture, label, replacement_status(expected_phase))
+    end
+  end
+
+  # A reblocked identity is exhausted with the reset the provider gave, so the
+  # replacement meets the terminal usage-limit answer; a consumed pending
+  # probe has no known return time and keeps the retryable 503 (findings#206
+  # row 206-508).
+  defp replacement_status("reblocked"), do: 429
+  defp replacement_status(_phase), do: 503
+
+  test "HTTP reset probe connection close retains the one-shot claim", %{conn: conn} do
+    fixture = reset_probe_fixture(FakeUpstream.close_before_headers())
+
+    {response, logs} =
+      with_log([level: :warning], fn ->
+        post_reset_probe(conn, fixture, "connection close reset probe")
+      end)
+
+    assert_upstream_transport_warning!(
+      logs,
+      fixture.setup,
+      "http_json",
+      "closed",
+      ["connection close reset probe"]
+    )
+
+    assert response.status == 502
+    assert_failure_accounting!(fixture, 502, "upstream_network_error")
+    assert_probe_outcome!(fixture, "consumed_pending_probe")
+    assert_no_replacement_probe!(conn, fixture, "connection close", 503)
+  end
+
+  test "HTTP reset probe receive timeout retains the one-shot claim", %{conn: conn} do
+    release_ref = make_ref()
+
+    fixture =
+      reset_probe_fixture(FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref))
+
+    setup_runtime_settings_override(%{
+      OperationalSettings.current()
+      | upstream_receive_timeout_ms: 100
+    })
+
+    parent = self()
+
+    {response, logs} =
+      with_log([level: :warning], fn ->
+        task =
+          Task.async(fn ->
+            Sandbox.allow(Repo, parent, self())
+            post_reset_probe(conn, fixture, "receive timeout reset probe")
+          end)
+
+        assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                       @detection_timeout_ms
+
+        response = Task.await(task, @detection_timeout_ms)
+        send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+        response
+      end)
+
+    assert_upstream_transport_warning!(
+      logs,
+      fixture.setup,
+      "http_json",
+      "timeout",
+      ["receive timeout reset probe"]
+    )
+
+    assert response.status == 502
+    assert_failure_accounting!(fixture, 502, "upstream_network_error")
+    assert_probe_outcome!(fixture, "consumed_pending_probe")
+    assert_no_replacement_probe!(conn, fixture, "receive timeout", 503)
+  end
+
+  test "HTTP reset probe success released after its persisted deadline stays unconfirmed", %{
+    conn: conn
+  } do
+    release_ref = make_ref()
+
+    fixture =
+      reset_probe_fixture(
+        FakeUpstream.barrier_json_response(
+          %{
+            "id" => "resp_reset_probe_late",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        Sandbox.allow(Repo, parent, self())
+        post_reset_probe(conn, fixture, "late reset probe")
+      end)
+
+    assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                   @detection_timeout_ms
+
+    claimed_redemption = redemption(fixture.identity)
+    claimed_probe = claimed_redemption["probe"]
+    assert claimed_redemption["phase"] == "consumed_pending_probe"
+
+    fixture.identity
+    |> Ecto.Changeset.change(%{
+      metadata:
+        put_in(
+          Repo.reload!(fixture.identity).metadata,
+          ["saved_reset_redemption", "deadline_at"],
+          DateTime.utc_now()
+          |> DateTime.add(-1, :second)
+          |> DateTime.truncate(:microsecond)
+          |> DateTime.to_iso8601()
+        )
+    })
+    |> Repo.update!()
+
+    send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+    response = Task.await(task, @detection_timeout_ms)
+
+    assert %{"id" => "resp_reset_probe_late"} = json_response(response, 200)
+
+    assert [request] = requests_for(fixture)
+    assert request.status == "succeeded"
+    assert request.response_status_code == 200
+
+    assert [attempt] = attempts_for(request)
+    assert attempt.status == "succeeded"
+
+    persisted_redemption = redemption(fixture.identity)
+    assert persisted_redemption["phase"] == "consumed_pending_probe"
+    assert persisted_redemption["probe"] == claimed_probe
+    assert_private_probe_metadata!(request, attempt, claimed_probe)
+    assert_probe_outcome!(fixture, "consumed_pending_probe")
+    assert_no_replacement_probe!(conn, fixture, "late success", 503)
+  end
+
+  defp post_consume_usage_payload do
+    %{
+      "plan_type" => "pro",
+      "rate_limit_reset_credits" => %{"available_count" => 0},
+      "credits" => %{"balance" => "0", "has_credits" => false, "unlimited" => false},
+      "spend_control" => %{"reached" => false}
+    }
+  end
+
+  defp reset_probe_fixture(response_mode) do
+    probe_upstream =
+      start_upstream(
+        {:path_json,
+         %{
+           "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+           "/api/codex/usage" => {200, post_consume_usage_payload()},
+           "/backend-api/codex/responses" => response_mode
+         }}
+      )
+
+    sibling_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_reset_probe_sibling_should_not_run",
+          "object" => "response"
+        })
+      )
+
+    setup = gateway_setup(probe_upstream, quota?: false)
+    use_deterministic_rotation!(setup.pool, 2)
+
+    sibling =
+      gateway_upstream(setup.pool, sibling_upstream, "upstream-token-reset-probe-matrix-sibling", compact?: false)
+
+    sibling_identity =
+      sibling.identity
+      |> UpstreamIdentity.changeset(%{
+        saved_reset_auto_redeem_enabled: true,
+        saved_reset_auto_redeem_trigger_mode: "threshold",
+        saved_reset_auto_redeem_quota_threshold_percent: 95,
+        updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      })
+      |> Repo.update!()
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(sibling_identity, [
+               weekly_quota_window_attrs(%{
+                 used_percent: Decimal.new("100"),
+                 source: "codex_usage_api"
+               })
+             ])
+
+    CodexPooler.SavedResetConfirmationFixtures.confirm_automatic_pressure!(sibling_identity)
+
+    model = put_model_source_assignments!(setup.model, [setup.assignment, sibling.assignment])
+
+    identity =
+      setup.identity
+      |> UpstreamIdentity.changeset(%{
+        metadata: Map.merge(setup.identity.metadata || %{}, saved_reset_metadata(probe_upstream, 1)),
+        saved_reset_auto_redeem_enabled: true,
+        saved_reset_auto_redeem_trigger_mode: "threshold",
+        saved_reset_auto_redeem_quota_threshold_percent: 95,
+        saved_reset_auto_redeem_min_blocked_minutes: 60,
+        saved_reset_auto_redeem_keep_credits: 0,
+        updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      })
+      |> Repo.update!()
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               weekly_quota_window_attrs(%{
+                 used_percent: Decimal.new("96"),
+                 source: "codex_usage_api"
+               })
+             ])
+
+    ProviderCreditsFixtures.persist_usage!(Repo.reload!(identity), ProviderCreditsFixtures.usage_payload(:included, credits: :none) |> put_in(["rate_limit", "secondary_window", "used_percent"], 96), DateTime.utc_now())
+    CodexPooler.SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
+
+    %{
+      setup: %{setup | identity: identity, model: model},
+      identity: identity,
+      probe_upstream: probe_upstream,
+      sibling_upstream: sibling_upstream,
+      request_id: deterministic_rotation_seed(2, 1)
+    }
+  end
+
+  defp post_reset_probe(conn, fixture, input) do
+    conn
+    |> put_req_header("x-request-id", fixture.request_id)
+    |> auth(fixture.setup)
+    |> post("/backend-api/codex/responses", %{
+      "model" => fixture.setup.model.exposed_model_id,
+      "input" => native_text_input(input),
+      "stream" => false
+    })
+  end
+
+  defp assert_failure_accounting!(fixture, response_status, error_code) do
+    assert [request] = requests_for(fixture)
+    assert request.status == "failed"
+    assert request.response_status_code == response_status
+    assert request.retry_count == 0
+    assert request.last_error_code == error_code
+    assert get_in(request.request_metadata, ["quota_decision", "routing_state"]) == "reset_probe"
+
+    assert [attempt] = attempts_for(request)
+    assert attempt.pool_upstream_assignment_id == fixture.setup.assignment.id
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == error_code
+
+    assert_private_probe_metadata!(request, attempt, redemption(fixture.identity)["probe"])
+  end
+
+  defp assert_probe_outcome!(fixture, expected_phase) do
+    persisted_redemption = redemption(fixture.identity)
+    assert persisted_redemption["phase"] == expected_phase
+    assert persisted_redemption["result"]["code"] == "reset"
+    assert is_binary(get_in(persisted_redemption, ["probe", "token"]))
+
+    assert Enum.count(
+             FakeUpstream.requests(fixture.probe_upstream),
+             &(&1.path == "/api/codex/rate-limit-reset-credits/consume")
+           ) == 1
+
+    assert Enum.count(
+             FakeUpstream.requests(fixture.probe_upstream),
+             &(&1.path == "/backend-api/codex/responses")
+           ) == 1
+
+    assert FakeUpstream.count(fixture.sibling_upstream) == 0
+  end
+
+  defp assert_no_replacement_probe!(conn, fixture, label, expected_status) do
+    claimed_probe = redemption(fixture.identity)["probe"]
+    initial_probe_paths = Enum.map(FakeUpstream.requests(fixture.probe_upstream), & &1.path)
+    assert [original_request] = requests_for(fixture)
+
+    fixture.setup.model
+    |> put_model_source_assignments!([fixture.setup.assignment])
+
+    FakeUpstream.set_mode(
+      fixture.probe_upstream,
+      FakeUpstream.json_response(%{
+        "id" => "resp_replacement_probe_should_not_run",
+        "object" => "response"
+      })
+    )
+
+    response =
+      conn
+      |> recycle()
+      |> put_req_header("x-request-id", replacement_request_id())
+      |> auth(fixture.setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => fixture.setup.model.exposed_model_id,
+        "input" => native_text_input("replacement probe must not run"),
+        "stream" => false
+      })
+
+    assert Enum.map(FakeUpstream.requests(fixture.probe_upstream), & &1.path) ==
+             initial_probe_paths
+
+    assert response.status == expected_status, label
+
+    assert [replacement_request] =
+             fixture
+             |> requests_for()
+             |> Enum.reject(&(&1.id == original_request.id))
+
+    assert original_request.status in ["failed", "succeeded"]
+    assert replacement_request.status in ["failed", "rejected"]
+    refute Accounting.reservation_outstanding?(replacement_request)
+    assert replacement_request.response_status_code == expected_status
+
+    assert attempts_for(replacement_request) == []
+    assert redemption(fixture.identity)["probe"] == claimed_probe
+    assert FakeUpstream.count(fixture.sibling_upstream) == 0
+  end
+
+  defp replacement_request_id do
+    Enum.find_value(1..500, fn index ->
+      request_id = "reset-probe-replacement-#{index}"
+      if :erlang.phash2(request_id, 2) == 1, do: request_id
+    end)
+  end
+
+  defp assert_private_probe_metadata!(request, attempt, probe) do
+    token = probe["token"]
+    metadata = inspect({request.request_metadata, attempt.response_metadata})
+
+    refute metadata =~ token
+    refute Map.has_key?(request.request_metadata["quota_decision"], "reset_probe")
+    refute Map.has_key?(request.request_metadata["quota_decision"], "probe")
+  end
+
+  defp quota_exhausted_response do
+    reset_at =
+      DateTime.utc_now()
+      |> DateTime.add(3, :day)
+      |> DateTime.truncate(:second)
+      |> DateTime.to_iso8601()
+
+    FakeUpstream.json_response_with_headers(
+      %{
+        "error" => %{
+          "code" => "rate_limit_exceeded",
+          "message" => "synthetic account quota exhausted"
+        }
+      },
+      [
+        {"x-codex-secondary-used-percent", "100"},
+        {"x-codex-secondary-window-minutes", "10080"},
+        {"x-codex-secondary-reset-at", reset_at}
+      ],
+      429
+    )
+  end
+
+  defp requests_for(fixture) do
+    Repo.all(from(r in Request, where: r.pool_id == ^fixture.setup.pool.id))
+  end
+
+  defp attempts_for(request) do
+    Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+  end
+
+  defp redemption(identity) do
+    Repo.reload!(identity).metadata["saved_reset_redemption"]
+  end
+
+  defp setup_runtime_settings_override(%OperationalSettings{} = settings) do
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
+
+    Application.put_env(
+      :codex_pooler,
+      OperationalSettings,
+      previous
+      |> Keyword.put(:settings, settings)
+      |> Keyword.put(:use_instance_settings?, false)
+    )
   end
 end

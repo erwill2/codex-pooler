@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
   @moduledoc false
 
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.BridgeRing
   alias CodexPooler.Pools.RoutingSettings
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -47,15 +48,27 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
           BridgeRing.affinity_context(),
           BridgeRing.demotion_map(),
           BridgeRing.candidate() | nil,
+          map(),
+          RequestOptions.Routing.model_serving_mode_snapshot() | nil,
           map()
         ) :: map()
-  def request_metadata(settings, affinity, demotions, selected, locality \\ %{}) do
+  def request_metadata(
+        settings,
+        affinity,
+        demotions,
+        selected,
+        locality \\ %{},
+        model_serving_mode_snapshot \\ nil,
+        session_preference \\ %{}
+      ) do
     base_metadata(%{
       strategy: settings.routing_strategy,
       bridge_ring_size: max(settings.bridge_ring_size || @default_ring_size, 1),
       affinity: affinity,
       demotions: demotions,
       locality: locality,
+      model_serving_mode_snapshot: model_serving_mode_snapshot,
+      session_preference: session_preference,
       selected_assignment_id: selected && elem(selected, 0).id
     })
   end
@@ -77,10 +90,26 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
       "fallback_reason" => fallback_reason(affinity),
       "demotion_reason" => first_demotion_reason(demotions)
     }
+    |> Map.merge(session_preference_metadata(Map.get(plan, :session_preference)))
     |> Map.merge(locality_metadata(locality))
+    |> Map.merge(model_serving_mode_metadata(Map.get(plan, :model_serving_mode_snapshot)))
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
+
+  defp model_serving_mode_metadata(%{
+         configured_mode: configured_mode,
+         effective_mode: effective_mode,
+         source: source
+       }) do
+    %{
+      "model_serving_mode_configured" => configured_mode,
+      "model_serving_mode" => effective_mode,
+      "model_serving_mode_source" => source
+    }
+  end
+
+  defp model_serving_mode_metadata(_snapshot), do: %{}
 
   defp locality_metadata(%{} = locality) when map_size(locality) > 0 do
     %{
@@ -96,6 +125,17 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
   end
 
   defp locality_metadata(_locality), do: %{}
+
+  # A recreated or pinned session asks the ring for a specific account. Whether
+  # that was honoured is otherwise unreadable from the request row: the planned
+  # preference leaves no trace, and `selected_bridge_candidate_id` names the
+  # last candidate dispatched to rather than the planned head, so it cannot
+  # stand in for this.
+  defp session_preference_metadata(%{kind: kind, status: status}) do
+    %{"session_preference_kind" => kind, "session_preference_status" => status}
+  end
+
+  defp session_preference_metadata(_preference), do: %{}
 
   defp fallback_reason(%{enabled?: true, status: "miss", row: nil}), do: "affinity_not_found"
   defp fallback_reason(%{enabled?: true, status: "hit"}), do: nil
@@ -118,6 +158,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
   defp sanitized_reason_code("upstream_unauthorized"), do: "upstream_unauthorized"
   defp sanitized_reason_code("upstream_5xx"), do: "upstream_5xx"
   defp sanitized_reason_code("upstream_network_error"), do: "upstream_network_error"
+  defp sanitized_reason_code("provider_overloaded"), do: "provider_overloaded"
   defp sanitized_reason_code(code) when is_binary(code), do: String.slice(code, 0, 80)
   defp sanitized_reason_code(code), do: code |> to_string() |> String.slice(0, 80)
 end

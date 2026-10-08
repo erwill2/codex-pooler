@@ -35,20 +35,57 @@ defmodule CodexPooler.Gateway.Contracts do
           optional(:candidate_exclusions) => [map()],
           optional(:continuity_denial) => map(),
           optional(:quota_refresh_attempted) => boolean(),
+          optional(:non_credit_recovery_outcome) => String.t(),
           optional(:route_class) => String.t(),
+          optional(:accounting_disposition) => :zero_work,
+          optional(:internal_reason) => String.t(),
+          optional(:compaction_invalid_reason) => String.t(),
+          optional(:public_compaction_error?) => boolean(),
           optional(:retryable) => boolean(),
           optional(:requires_new_upstream_session) => boolean(),
-          optional(:recovery) => recovery_contract()
+          optional(:recovery) => recovery_contract(),
+          # Set by construction on every Pooler-authored policy denial
+          # (`Denials.policy_error/4`); read only by the `/v1` redaction
+          # exemption, never rendered or persisted (findings#221).
+          optional(:pooler_policy) => true,
+          # Set only by quota routing when every candidate is exhausted with a
+          # known reset (`CandidateEligibility.UsageLimit`); rendered as the
+          # provider's `usage_limit_reached` fields and retry headers, and
+          # exempt from the `/v1` redaction (findings#206 row 206-508).
+          optional(:usage_limit) => usage_limit(),
+          # Set by route filtering on a retryable `503` of a Pool with an
+          # open-circuit candidate (findings#206 row 206-532), and on the `/v1`
+          # relayed `429` whose Pool advice is withheld (row 206-593): seconds
+          # until that circuit admits a probe, 1..60, rendered as `Retry-After`.
+          optional(:circuit_retry_after_seconds) => pos_integer(),
+          optional(:upstream_retry_after) => String.t() | nil
         }
+  @type usage_limit :: %{required(:resets_at) => integer(), required(:resets_in_seconds) => pos_integer()}
   @type body_result :: %{
           required(:status) => pos_integer(),
           optional(:headers) => response_headers(),
-          required(:body) => map()
+          required(:body) => map(),
+          optional(:public_full_rejection) => validation_rejection(),
+          # Full projection markers read by the public senders: an upstream
+          # 404 on an input file reference, and the stream-startup error code.
+          optional(:public_input_file_upstream_404?) => boolean(),
+          optional(:public_stream_startup_error_code) => String.t() | nil
+        }
+  # The structured rejection a public `/v1` sender re-renders through the
+  # caller-facing parameter mapper: carried as `public_validation_rejection`
+  # next to a relayed raw body, and as `public_full_rejection` next to a
+  # rendered Full body (codex-pooler-findings#219).
+  @type validation_rejection :: %{
+          required(:code) => String.t(),
+          required(:param) => String.t() | nil,
+          required(:supported_values) => [String.t()] | nil,
+          required(:supported_values_state) => String.t() | nil
         }
   @type raw_body_result :: %{
           required(:status) => pos_integer(),
           optional(:headers) => response_headers(),
-          required(:raw_body) => binary()
+          required(:raw_body) => binary(),
+          optional(:public_validation_rejection) => validation_rejection()
         }
   @type stream_callback :: (Plug.Conn.t() -> {:ok, Plug.Conn.t()} | {:error, gateway_error()})
   @type stream_result :: %{
@@ -72,6 +109,17 @@ defmodule CodexPooler.Gateway.Contracts do
           | stream_result()
           | websocket_stream_result()
           | websocket_messages_result()
+
+  @doc """
+  The answer to work that met a transient database failure before anything was
+  reserved or sent (`CodexPooler.Platform.TransientDatabaseError`): a
+  retryable `503` that names no database detail. It used to render as a `500`,
+  which the Codex client shows as "high demand" (findings#206 row 206-358).
+  """
+  @spec database_unavailable_error() :: gateway_error()
+  def database_unavailable_error do
+    %{status: 503, code: "service_unavailable", message: "Codex Pooler is temporarily unavailable; retry the request"}
+  end
 
   @spec pinned_continuation_reauth_required_error() :: gateway_error()
   def pinned_continuation_reauth_required_error do
@@ -125,6 +173,145 @@ defmodule CodexPooler.Gateway.Contracts do
       %{}
     end
   end
+
+  @usage_limit_error_type "usage_limit_reached"
+  @usage_limit_retry_ceiling_seconds 60
+  # The `originator` header of the Codex Desktop app, which names its
+  # app-server client (observed from Desktop 26.924.22138, core
+  # 0.158.0-alpha.2.1, on the websocket upgrade and on `GET /models`).
+  @codex_desktop_originator "Codex Desktop"
+  @desktop_usage_limit_code "invalid_prompt"
+
+  @doc """
+  The provider's own fields for an exhausted account on a Pool whose every
+  candidate is exhausted with a known reset: `error.type`
+  `usage_limit_reached`, which the released Codex client maps to its terminal
+  `UsageLimitReached`, plus `resets_at` (epoch seconds) and
+  `resets_in_seconds` (findings#206 row 206-508). No `plan_type`: a Pool has
+  no single plan, and the client parses the field as its own plan enum.
+
+  The TUI and `codex exec` show that answer with the reset time, and the
+  app-server's error notification names it in its message. The Codex Desktop
+  app does not: it answers `UsageLimitReached` with its own usage-limit
+  screen, built from the signed-in ChatGPT account and the app's own usage
+  query, which know nothing of the Pool, so the Pool's reset never reached
+  its user. A native route answers that client the `400` of
+  `native_usage_limit_answer/2` instead, with the same two reset fields and
+  no type (findings#279 point 2).
+  """
+  @spec usage_limit_error_fields(gateway_error() | map()) :: %{optional(String.t()) => String.t() | integer()}
+  def usage_limit_error_fields(%{status: 429, usage_limit: %{resets_at: resets_at, resets_in_seconds: seconds}}),
+    do: %{"type" => @usage_limit_error_type, "resets_at" => resets_at, "resets_in_seconds" => seconds}
+
+  def usage_limit_error_fields(%{status: 400, code: @desktop_usage_limit_code, usage_limit: %{resets_at: resets_at, resets_in_seconds: seconds}}),
+    do: %{"resets_at" => resets_at, "resets_in_seconds" => seconds}
+
+  def usage_limit_error_fields(_error), do: %{}
+
+  @doc """
+  The reset an all-exhausted Pool's terminal answer advised, as it was sent,
+  for the refused row and the log line (findings#206 row 206-553): the two
+  integers only, so the advice a client was told never has to be re-derived
+  from the exclusions under a later rule. The Codex Desktop app's `400`
+  advised the same reset. Empty for every other error.
+  """
+  @spec usage_limit_record(gateway_error() | map()) :: %{optional(String.t()) => integer()}
+  def usage_limit_record(%{status: 429, usage_limit: %{resets_at: resets_at, resets_in_seconds: seconds}})
+      when is_integer(resets_at) and is_integer(seconds),
+      do: %{"resets_at" => resets_at, "resets_in_seconds" => seconds}
+
+  def usage_limit_record(%{status: 400, code: @desktop_usage_limit_code, usage_limit: %{resets_at: resets_at, resets_in_seconds: seconds}})
+      when is_integer(resets_at) and is_integer(seconds),
+      do: %{"resets_at" => resets_at, "resets_in_seconds" => seconds}
+
+  def usage_limit_record(_error), do: %{}
+
+  @doc """
+  The retry advice of the same answer: `Retry-After` in seconds, and
+  `x-should-retry: false` once the wait exceeds a minute, so the OpenAI SDKs
+  (openai-node honours `retry-after` up to 60 s, openai-python up to 120 s)
+  do not resend within seconds a request no shorter wait admits. The same
+  rule as a key policy window (findings#206 row 206-427). The Codex Desktop
+  app's `400` is final to the Codex client whatever its headers; it carries
+  `x-should-retry: false` and no `Retry-After`.
+  """
+  @spec usage_limit_response_headers(gateway_error() | map()) :: response_headers()
+  def usage_limit_response_headers(%{status: 429, usage_limit: %{resets_in_seconds: seconds}})
+      when seconds > @usage_limit_retry_ceiling_seconds,
+      do: [{"retry-after", Integer.to_string(seconds)}, {"x-should-retry", "false"}]
+
+  def usage_limit_response_headers(%{status: 429, usage_limit: %{resets_in_seconds: seconds}}),
+    do: [{"retry-after", Integer.to_string(seconds)}]
+
+  def usage_limit_response_headers(%{status: 400, code: @desktop_usage_limit_code, usage_limit: %{}}),
+    do: [{"x-should-retry", "false"}]
+
+  def usage_limit_response_headers(_error), do: []
+
+  @doc """
+  The Pool-exhausted refusal (`usage_limit_error_fields/1`) as a native
+  Responses route answers the client whose request carried `originator`
+  (findings#279 point 2). The Codex Desktop app gets `400` with `error.code`
+  `invalid_prompt`, the Pool's reset written into the message (its UTC time
+  and how long until then), and the two reset fields: the Desktop shows the
+  message of that refusal as sent, and like the `429` the Codex client ends
+  the turn on it without a retry. The code is a deliberate misnomer, since
+  nothing is wrong with the prompt: it is the final refusal whose message the
+  Desktop app shows unchanged.
+
+  Every other originator, every other error (the retryable `503` without a
+  known reset included) and every `/v1` answer, whose callers never pass an
+  originator, are returned unchanged. Only the answer is rendered this way:
+  the refused row, the attempt, the log lines and settlement keep the `429`
+  refusal and its `quota_exhausted` code.
+  """
+  @spec native_usage_limit_answer(gateway_error() | map(), String.t() | nil) :: gateway_error() | map()
+  def native_usage_limit_answer(%{status: 429, usage_limit: %{resets_at: resets_at, resets_in_seconds: seconds}} = error, @codex_desktop_originator)
+      when is_integer(resets_at) and is_integer(seconds) and seconds > 0,
+      do: Map.merge(error, %{status: 400, code: @desktop_usage_limit_code, message: pool_usage_limit_message(resets_at, seconds), param: nil})
+
+  def native_usage_limit_answer(error, _originator), do: error
+
+  # "The Pool's usage limit is reached. Try again at 01:28 UTC (in about 1 h
+  # 24 min)." Both are rounded up to the minute, so neither names a moment
+  # before the reset; a reset a day or more away names its date too.
+  defp pool_usage_limit_message(resets_at, seconds) do
+    reset = resets_at |> DateTime.from_unix!() |> ceil_minute()
+    minutes = div(seconds + 59, 60)
+    time = Calendar.strftime(reset, "%H:%M")
+    at = if minutes >= 1_440, do: "on #{Date.to_iso8601(reset)} at #{time} UTC", else: "at #{time} UTC"
+    "The Pool's usage limit is reached. Try again #{at} (in about #{wait(minutes)})."
+  end
+
+  defp ceil_minute(%DateTime{second: 0} = time), do: time
+  defp ceil_minute(%DateTime{second: second} = time), do: DateTime.add(time, 60 - second, :second)
+
+  defp wait(minutes) when minutes < 60, do: "#{minutes} min"
+  defp wait(minutes) when minutes < 1_440 and rem(minutes, 60) == 0, do: "#{div(minutes, 60)} h"
+  defp wait(minutes) when minutes < 1_440, do: "#{div(minutes, 60)} h #{rem(minutes, 60)} min"
+
+  defp wait(minutes) do
+    hours = div(minutes + 59, 60)
+
+    case {div(hours, 24), rem(hours, 24)} do
+      {1, 0} -> "1 day"
+      {1, rest} -> "1 day #{rest} h"
+      {days, 0} -> "#{days} days"
+      {days, rest} -> "#{days} days #{rest} h"
+    end
+  end
+
+  @doc """
+  The retry advice of a retryable `503` whose Pool has an open-circuit
+  candidate: `Retry-After` with the seconds until that circuit admits a probe
+  (findings#206 row 206-532). No `x-should-retry`: the state is retryable, and
+  the OpenAI SDKs honour a `Retry-After` of up to a minute.
+  """
+  @spec circuit_retry_response_headers(gateway_error() | map()) :: response_headers()
+  def circuit_retry_response_headers(%{status: status, circuit_retry_after_seconds: seconds}) when status in [429, 503] and is_integer(seconds) and seconds > 0,
+    do: [{"retry-after", Integer.to_string(seconds)}]
+
+  def circuit_retry_response_headers(_error), do: []
 
   @spec recovery_contract() :: recovery_contract()
   def recovery_contract do

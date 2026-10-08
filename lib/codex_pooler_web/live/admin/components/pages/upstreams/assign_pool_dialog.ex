@@ -5,7 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AssignPoolDialog do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
 
-  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+  @upstream_actions_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
 
   attr :account, :map, default: nil
   attr :form, :any, required: true
@@ -24,7 +24,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AssignPoolDialog do
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
             Upstream account
           </p>
+
           <h2 class="mt-1 text-2xl font-bold text-base-content">Assign to Pool</h2>
+
           <p class="mt-2 text-sm leading-6 text-base-content/70">
             Select a target Pool for <strong>{@account.label}</strong>.
           </p>
@@ -70,6 +72,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AssignPoolDialog do
           </:actions>
         </AdminComponents.dialog_footer>
       </div>
+
       <form method="dialog" class="modal-backdrop">
         <button type="button" phx-click="close_assign_pool">close</button>
       </form>

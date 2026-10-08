@@ -1,8 +1,9 @@
 defmodule CodexPoolerWeb.Admin.SystemLive do
   use CodexPoolerWeb, :admin_live_view
 
-  alias CodexPooler.{Catalog, Dev, InstanceSettings, MCP, Pools}
+  alias CodexPooler.{Accounts, Catalog, Dev, InstanceSettings, MCP, Pools}
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.SystemPageComponents
   alias CodexPoolerWeb.Admin.SystemSettingsForm
   alias CodexPoolerWeb.DateTimeDisplay
@@ -24,6 +25,10 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     %{
       id: "gateway",
       label: "Gateway"
+    },
+    %{
+      id: "firewall",
+      label: "Firewall"
     }
   ]
   @development_tab %{id: "development", label: "Development"}
@@ -45,16 +50,26 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
          system_tabs: system_tabs(development_helpers_available?),
          settings: settings,
          development_helpers_available?: development_helpers_available?,
+         impeccable_live_status: CodexPoolerWeb.DevFeatures.impeccable_live_status(),
          mcp_key_count: MCP.count_operator_tokens(),
          form_params: form_params,
          group_snapshots: SystemSettingsForm.group_snapshots(form_params),
          card_statuses: SystemSettingsForm.initial_card_statuses(),
          development_action_status: nil,
-         smtp_test_status: nil
+         smtp_test_status: nil,
+         current_session_ip:
+           Accounts.current_user_session_ip(
+             socket.assigns.current_scope.user,
+             socket.assigns[:user_session_id]
+           )
        )
-       |> assign_forms()}
+       |> assign_forms()
+       |> NotificationCenterHooks.follow_viewer_visibility()}
     else
-      {:ok, assign(socket, page_title: "System", owner_authorized?: false)}
+      {:ok,
+       socket
+       |> assign(page_title: "System", owner_authorized?: false)
+       |> NotificationCenterHooks.follow_viewer_visibility()}
     end
   end
 
@@ -66,8 +81,16 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
       {:noreply,
        socket
        |> assign(:development_helpers_available?, development_helpers_available?)
+       |> assign(:impeccable_live_status, CodexPoolerWeb.DevFeatures.impeccable_live_status())
        |> assign(:system_tabs, system_tabs(development_helpers_available?))
        |> assign(:mcp_key_count, MCP.count_operator_tokens())
+       |> assign(
+         :current_session_ip,
+         Accounts.current_user_session_ip(
+           socket.assigns.current_scope.user,
+           socket.assigns[:user_session_id]
+         )
+       )
        |> assign(:selected_tab, normalize_tab(params["tab"], development_helpers_available?))}
     else
       {:noreply, socket}
@@ -111,6 +134,23 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     save_instance_settings(socket, params, autosave?: true)
   end
 
+  def handle_event("apply_bulkhead_preset", %{"preset" => preset}, socket) do
+    case SystemSettingsForm.apply_bulkhead_preset(socket.assigns.form_params, preset) do
+      {:ok, form_params} ->
+        {:noreply, put_gateway_form_params(socket, form_params)}
+
+      :error ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_event("restore_gateway_group_defaults", %{"group" => group}, socket) do
+    case SystemSettingsForm.restore_gateway_group_defaults(socket.assigns.form_params, group) do
+      {:ok, form_params} -> {:noreply, put_gateway_form_params(socket, form_params)}
+      :error -> {:noreply, socket}
+    end
+  end
+
   def handle_event("test_smtp", _params, socket) do
     params =
       SystemSettingsForm.group_only_params(
@@ -128,8 +168,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
         {:ok, %{code: :smtp_test_email_sent}} ->
           %{
             tone: :success,
-            message:
-              "Test email sent to #{operator_email_for_status(socket.assigns.current_scope)}"
+            message: "Test email sent to #{operator_email_for_status(socket.assigns.current_scope)}"
           }
 
         {:error, %Ecto.Changeset{} = changeset} ->
@@ -160,6 +199,19 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
            |> assign(:development_action_status, %{tone: :error, message: message})
            |> put_flash(:error, "Sample data could not be imported")}
       end
+    else
+      {:noreply, put_flash(socket, :error, "Development helpers are not available")}
+    end
+  end
+
+  def handle_event("recheck_impeccable_live", _params, socket) do
+    if socket.assigns.development_helpers_available? do
+      {:noreply,
+       assign(
+         socket,
+         :impeccable_live_status,
+         CodexPoolerWeb.DevFeatures.impeccable_live_status()
+       )}
     else
       {:noreply, put_flash(socket, :error, "Development helpers are not available")}
     end
@@ -249,6 +301,22 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     end
   end
 
+  # Instance settings belong to owners. A viewer who lost or gained the owner
+  # role reloads the page, which mounts it again with the role it has now: a
+  # demoted owner's settings forms go, a promoted admin's appear. Any other
+  # change of the viewer's Pools leaves an owner's open forms alone (findings#206
+  # row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    if Pools.owner?(socket.assigns.current_scope) == socket.assigns.owner_authorized? do
+      {:noreply, socket}
+    else
+      {:noreply, push_navigate(socket, to: system_path(socket.assigns[:selected_tab]))}
+    end
+  end
+
+  defp system_path(tab) when is_binary(tab), do: ~p"/admin/system?#{%{tab: tab}}"
+  defp system_path(_tab), do: ~p"/admin/system"
+
   @impl true
   def render(assigns) do
     assigns =
@@ -264,12 +332,13 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
       current_scope={@current_scope}
       active_nav={:system}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-system-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="system-page-header"
           title="System"
-          description="Review and adjust instance-wide runtime settings without exposing stored credentials."
+          description="Instance-wide runtime settings, from gateway and ingress behavior to metrics and SMTP delivery."
         />
 
         <AdminComponents.empty_state
@@ -293,7 +362,9 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
             development_action_status={@development_action_status}
             smtp_test_status={@smtp_test_status}
             development_helpers_available?={@development_helpers_available?}
+            impeccable_live_status={@impeccable_live_status}
             datetime_preferences={@datetime_preferences}
+            current_session_ip={@current_session_ip}
           />
         </section>
       </section>
@@ -321,6 +392,26 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     )
   end
 
+  defp put_gateway_form_params(socket, form_params) do
+    changeset =
+      socket.assigns.settings
+      |> SystemSettingsForm.group_changeset(form_params, "gateway")
+      |> Map.put(:action, :validate)
+
+    socket
+    |> assign(:form_params, form_params)
+    |> assign(:smtp_test_status, nil)
+    |> put_card_status(
+      "gateway",
+      SystemSettingsForm.dirty_card_status(
+        form_params,
+        socket.assigns.group_snapshots,
+        "gateway"
+      )
+    )
+    |> put_group_form("gateway", changeset)
+  end
+
   defp save_group_settings(socket, latest_settings, form_params, group, opts \\ []) do
     autosave? = Keyword.get(opts, :autosave?, false)
 
@@ -339,13 +430,16 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
           SystemSettingsForm.refresh_group_snapshots(socket.assigns, saved_params, group)
 
         card_statuses =
-          SystemSettingsForm.saved_card_statuses(form_params, group_snapshots, group)
+          form_params
+          |> SystemSettingsForm.saved_card_statuses(group_snapshots, group)
+          |> maybe_put_clear_card_status(group, params)
 
         {:noreply,
          socket
          |> assign(
            settings: settings,
            development_helpers_available?: CodexPoolerWeb.DevFeatures.enabled?(),
+           impeccable_live_status: CodexPoolerWeb.DevFeatures.impeccable_live_status(),
            form_params: form_params,
            group_snapshots: group_snapshots,
            card_statuses: card_statuses,
@@ -353,7 +447,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
            smtp_test_status: nil
          )
          |> assign_forms()
-         |> maybe_put_save_feedback(group, autosave?)}
+         |> maybe_put_save_feedback(group, autosave?, save_feedback_message(group, params))}
 
       {:error, %Ecto.Changeset{} = changeset} ->
         status =
@@ -398,16 +492,31 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
   defp card_title("metrics"), do: "Metrics bearer token"
   defp card_title("smtp"), do: "SMTP delivery"
 
-  defp maybe_put_save_feedback(socket, group, true) do
+  defp maybe_put_save_feedback(socket, group, true, _message) do
     dismiss_ref = make_ref()
     Process.send_after(self(), {:clear_card_status, group, dismiss_ref}, 2_500)
 
     put_card_status(socket, group, %{tone: :success, message: "Saved", dismiss_ref: dismiss_ref})
   end
 
-  defp maybe_put_save_feedback(socket, group, false) do
-    put_flash(socket, :info, "#{card_title(group)} saved")
+  defp maybe_put_save_feedback(socket, _group, false, message) do
+    put_flash(socket, :info, message)
   end
+
+  defp save_feedback_message("metrics", %{
+         "metrics" => %{"bearer_token_action" => "clear"}
+       }),
+       do: "Metrics bearer token cleared"
+
+  defp save_feedback_message(group, _params), do: "#{card_title(group)} saved"
+
+  defp maybe_put_clear_card_status(card_statuses, "metrics", %{
+         "metrics" => %{"bearer_token_action" => "clear"}
+       }) do
+    Map.put(card_statuses, "metrics", %{tone: :success, message: "Cleared"})
+  end
+
+  defp maybe_put_clear_card_status(card_statuses, _group, _params), do: card_statuses
 
   defp import_sample_data do
     case Dev.seed_full() do
@@ -419,8 +528,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
   defp sample_data_import_status(result) do
     %{
       tone: :success,
-      message:
-        "Sample data imported: #{length(result.pools)} pools, #{length(result.api_keys)} API keys, #{length(result.upstream_identities)} upstream accounts, #{length(result.assignments)} assignments, #{length(result.models)} models, #{length(result.quota_windows)} quota windows, #{length(result.request_logs)} request logs, #{length(result.invites)} invites, #{length(result.audit_events)} audit events, and #{length(result.jobs)} jobs."
+      message: "Sample data imported: #{length(result.pools)} pools, #{length(result.api_keys)} API keys, #{length(result.upstream_identities)} upstream accounts, #{length(result.assignments)} assignments, #{length(result.models)} models, #{length(result.quota_windows)} quota windows, #{length(result.request_logs)} request logs, #{length(result.invites)} invites, #{length(result.audit_events)} audit events, and #{length(result.jobs)} jobs."
     }
   end
 

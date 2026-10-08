@@ -1,8 +1,19 @@
 defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
   @moduledoc false
 
-  alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
+  alias CodexPooler.Gateway.Persistence.CodexTurn
+  alias CodexPooler.Gateway.Transports.Streaming.DeferredStreamRegistry
+  alias CodexPooler.Gateway.Transports.Websocket.{ActivityRegistry, RolloutDrain}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Repo
+
+  # The real owner shutdown path can spend the transport's one-second close
+  # boundary before its drain call returns. Keep the injected budget small
+  # while leaving that boundary inside the coordinator's finish margin.
+  @owner_post_deadline_call_budget_ms 1_000
+  # Failure-detection budget for drain workers to exit after the drain returns;
+  # a green run observes their DOWN at once.
+  @worker_join_timeout_ms 15_000
 
   @type owner_context :: %{
           required(:codex_session_id) => String.t(),
@@ -15,6 +26,14 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
 
     use GenServer
 
+    # A safety net so a test that forgets to release the probe fails instead of
+    # hanging the suite. It must stay well above every drain budget under test,
+    # or a loaded machine lets this fire first and reports a synthetic
+    # `:owner_unavailable` for a drain that was merely slow to be released. A
+    # test that abandons its probe on purpose should pass a short
+    # `:release_timeout_ms` so teardown does not wait out this default.
+    @release_timeout_ms 15_000
+
     @spec child_spec(keyword()) :: Supervisor.child_spec()
     def child_spec(opts) do
       key = Keyword.fetch!(opts, :key)
@@ -30,29 +49,40 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     def start_link(opts) do
       key = Keyword.fetch!(opts, :key)
 
-      GenServer.start_link(__MODULE__, opts,
-        name:
-          {:via, Registry,
-           {CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry, key}}
-      )
+      registry = Keyword.get(opts, :registry, CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry)
+
+      GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, key}})
     end
 
     @impl GenServer
     def init(opts) do
-      {:ok, %{key: Keyword.fetch!(opts, :key), parent: Keyword.fetch!(opts, :parent)}}
+      {:ok,
+       %{
+         key: Keyword.fetch!(opts, :key),
+         parent: Keyword.fetch!(opts, :parent),
+         release_timeout_ms: Keyword.get(opts, :release_timeout_ms, @release_timeout_ms)
+       }}
     end
 
     @impl GenServer
+    def handle_cast(:begin_drain, state), do: {:noreply, state}
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, state) do
+      {:reply, {:ok, %{active_turn?: false}}, state}
+    end
+
     def handle_call(:drain, _from, %{key: key, parent: parent} = state) do
       send(parent, {:rollout_drain_probe_started, key})
 
-      receive do
-        {:release_rollout_drain_probe, ^key} -> :ok
-      after
-        1_000 -> exit(:rollout_drain_probe_timeout)
-      end
+      result =
+        receive do
+          {:release_rollout_drain_probe, ^key} -> :ok
+        after
+          state.release_timeout_ms -> {:error, :owner_unavailable}
+        end
 
-      {:stop, :normal, :ok, state}
+      {:stop, :normal, result, state}
     end
   end
 
@@ -61,6 +91,9 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
 
     use GenServer
 
+    # Safety net only; see the note on `DrainProbeOwner`.
+    @release_timeout_ms 15_000
+
     @spec child_spec(keyword()) :: Supervisor.child_spec()
     def child_spec(opts) do
       key = Keyword.fetch!(opts, :key)
@@ -76,11 +109,9 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     def start_link(opts) do
       key = Keyword.fetch!(opts, :key)
 
-      GenServer.start_link(__MODULE__, opts,
-        name:
-          {:via, Registry,
-           {CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry, key}}
-      )
+      registry = Keyword.get(opts, :registry, CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry)
+
+      GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, key}})
     end
 
     @impl GenServer
@@ -94,6 +125,13 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
     end
 
     @impl GenServer
+    def handle_cast(:begin_drain, state), do: {:noreply, state}
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, state) do
+      {:reply, {:ok, %{active_turn?: false}}, state}
+    end
+
     def handle_call(:drain, _from, %{key: key, parent: parent} = state) do
       drain_calls = state.drain_calls + 1
       send(parent, {:active_shutdown_probe_started, key, drain_calls})
@@ -101,7 +139,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
       receive do
         {:release_active_shutdown_probe, ^key} -> :ok
       after
-        1_000 -> exit(:active_shutdown_probe_timeout)
+        @release_timeout_ms -> exit(:active_shutdown_probe_timeout)
       end
 
       {:reply, :ok, %{state | drain_calls: drain_calls}}
@@ -109,6 +147,355 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
 
     def handle_call(:drain_calls, _from, state) do
       {:reply, state.drain_calls, state}
+    end
+  end
+
+  defmodule VirtualDeadline do
+    @moduledoc false
+
+    use GenServer
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      GenServer.start_link(__MODULE__, opts)
+    end
+
+    @spec now_ms(pid()) :: integer()
+    def now_ms(deadline), do: GenServer.call(deadline, :now_ms)
+
+    @spec schedule_wait(pid(), pid(), reference(), non_neg_integer()) :: reference()
+    def schedule_wait(deadline, recipient, wait_token, wait_ms) do
+      GenServer.call(deadline, {:schedule_wait, recipient, wait_token, wait_ms})
+    end
+
+    @spec cancel_wait(pid(), reference()) :: :ok
+    def cancel_wait(deadline, wait_ref), do: GenServer.call(deadline, {:cancel_wait, wait_ref})
+
+    @spec advance(pid(), non_neg_integer()) :: :ok
+    def advance(deadline, elapsed_ms), do: GenServer.call(deadline, {:advance, elapsed_ms})
+
+    @spec waiter_pids(pid()) :: [pid()]
+    def waiter_pids(deadline), do: GenServer.call(deadline, :waiter_pids)
+
+    @impl GenServer
+    def init(opts) do
+      {:ok,
+       %{
+         now_ms: Keyword.get(opts, :now_ms, 0),
+         parent: Keyword.fetch!(opts, :parent),
+         waiters: %{}
+       }}
+    end
+
+    @impl GenServer
+    def handle_call(:now_ms, _from, state), do: {:reply, state.now_ms, state}
+
+    def handle_call(:waiter_pids, _from, state) do
+      waiters =
+        Map.filter(state.waiters, fn {_wait_ref, waiter} ->
+          Process.alive?(waiter.recipient)
+        end)
+
+      waiter_pids = Enum.map(waiters, fn {_wait_ref, waiter} -> waiter.recipient end)
+      {:reply, waiter_pids, %{state | waiters: waiters}}
+    end
+
+    def handle_call({:schedule_wait, recipient, wait_token, wait_ms}, _from, state) do
+      wait_ref = make_ref()
+      monitor_ref = Process.monitor(recipient)
+      send(state.parent, {:rollout_drain_deadline_wait, self(), wait_ms})
+
+      waiter = %{
+        until_ms: state.now_ms + wait_ms,
+        recipient: recipient,
+        wait_token: wait_token,
+        monitor_ref: monitor_ref
+      }
+
+      {:reply, wait_ref, %{state | waiters: Map.put(state.waiters, wait_ref, waiter)}}
+    end
+
+    def handle_call({:cancel_wait, wait_ref}, _from, state) do
+      {:reply, :ok, remove_waiter(state, wait_ref)}
+    end
+
+    def handle_call({:advance, elapsed_ms}, _from, state) do
+      now_ms = state.now_ms + elapsed_ms
+
+      {ready, waiting} =
+        Map.split_with(state.waiters, fn {_wait_ref, waiter} -> waiter.until_ms <= now_ms end)
+
+      Enum.each(ready, fn {_wait_ref, waiter} ->
+        Process.demonitor(waiter.monitor_ref, [:flush])
+        send(waiter.recipient, {:rollout_drain_wait_elapsed, waiter.wait_token})
+      end)
+
+      {:reply, :ok, %{state | now_ms: now_ms, waiters: waiting}}
+    end
+
+    @impl GenServer
+    def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
+      waiters =
+        Map.reject(state.waiters, fn {_wait_ref, waiter} -> waiter.monitor_ref == monitor_ref end)
+
+      {:noreply, %{state | waiters: waiters}}
+    end
+
+    defp remove_waiter(state, wait_ref) do
+      case Map.pop(state.waiters, wait_ref) do
+        {nil, _waiters} ->
+          state
+
+        {waiter, waiters} ->
+          Process.demonitor(waiter.monitor_ref, [:flush])
+          %{state | waiters: waiters}
+      end
+    end
+  end
+
+  defmodule WaitingOwner do
+    @moduledoc false
+
+    use GenServer
+
+    @spec child_spec(keyword()) :: Supervisor.child_spec()
+    def child_spec(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      %{
+        id: {__MODULE__, key},
+        start: {__MODULE__, :start_link, [opts]},
+        restart: :temporary
+      }
+    end
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      registry = Keyword.get(opts, :registry, CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry)
+
+      GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, key}})
+    end
+
+    @spec complete_turn(pid()) :: :ok
+    def complete_turn(owner), do: GenServer.call(owner, :complete_turn)
+
+    @spec lose_lease(pid()) :: :ok
+    def lose_lease(owner), do: GenServer.call(owner, :lose_lease)
+
+    @impl GenServer
+    def init(opts) do
+      {:ok,
+       %{
+         active_turn?: Keyword.get(opts, :active_turn?, true),
+         begin_drain_calls: 0,
+         drain_calls: 0,
+         key: Keyword.fetch!(opts, :key),
+         parent: Keyword.fetch!(opts, :parent)
+       }}
+    end
+
+    @impl GenServer
+    def handle_cast(:begin_drain, state) do
+      begin_drain_calls = state.begin_drain_calls + 1
+      send(state.parent, {:rollout_drain_begin_wait, state.key, begin_drain_calls})
+      {:noreply, %{state | begin_drain_calls: begin_drain_calls}}
+    end
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, state) do
+      {:reply, {:ok, %{active_turn?: state.active_turn?}}, state}
+    end
+
+    def handle_call(:complete_turn, _from, state) do
+      send(state.parent, {:rollout_drain_terminal_delivered, state.key})
+      {:reply, :ok, %{state | active_turn?: false}}
+    end
+
+    def handle_call(:lose_lease, _from, state) do
+      send(state.parent, {:rollout_drain_lease_lost, state.key})
+      {:stop, {:shutdown, :stale_owner}, :ok, state}
+    end
+
+    def handle_call(:drain, _from, state) do
+      drain_calls = state.drain_calls + 1
+      outcome = if state.active_turn?, do: :aborted, else: :completed
+      send(state.parent, {:rollout_drain_owner_stopped, state.key, outcome, drain_calls})
+      {:stop, :normal, :ok, %{state | drain_calls: drain_calls}}
+    end
+  end
+
+  # A starting owner whose queued turn is active when the drain first asks and
+  # has finished by the drain's next look (the turn completes between the two
+  # status calls of the starting-owner path).
+  defmodule FinishingStartingOwner do
+    @moduledoc false
+
+    use GenServer
+
+    @spec child_spec(keyword()) :: Supervisor.child_spec()
+    def child_spec(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      %{
+        id: {__MODULE__, key},
+        start: {__MODULE__, :start_link, [opts]},
+        restart: :temporary
+      }
+    end
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      registry = Keyword.get(opts, :registry, CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry)
+
+      GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, key, :starting}})
+    end
+
+    @impl GenServer
+    def init(opts), do: {:ok, %{key: Keyword.fetch!(opts, :key), parent: Keyword.fetch!(opts, :parent), status_calls: 0}}
+
+    @impl GenServer
+    def handle_cast(:begin_drain, state), do: {:noreply, state}
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, state) do
+      status_calls = state.status_calls + 1
+      send(state.parent, {:rollout_drain_status_call, state.key, status_calls})
+      {:reply, {:ok, %{active_turn?: status_calls == 1, draining?: true}}, %{state | status_calls: status_calls}}
+    end
+
+    def handle_call(:drain, _from, state) do
+      send(state.parent, {:rollout_drain_owner_stopped, state.key, state.status_calls})
+      {:stop, :normal, :ok, state}
+    end
+  end
+
+  defmodule SlowFinalStatusOwner do
+    @moduledoc false
+
+    use GenServer
+
+    @spec child_spec(keyword()) :: Supervisor.child_spec()
+    def child_spec(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      %{
+        id: {__MODULE__, key},
+        start: {__MODULE__, :start_link, [opts]},
+        restart: :temporary
+      }
+    end
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      registry = Keyword.get(opts, :registry, CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry)
+
+      GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, key}})
+    end
+
+    @impl GenServer
+    def init(opts) do
+      {:ok,
+       %{
+         key: Keyword.fetch!(opts, :key),
+         parent: Keyword.fetch!(opts, :parent),
+         status_calls: 0
+       }}
+    end
+
+    @impl GenServer
+    def handle_cast(:begin_drain, state), do: {:noreply, state}
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, %{status_calls: 0} = state) do
+      {:reply, {:ok, %{active_turn?: true}}, %{state | status_calls: 1}}
+    end
+
+    def handle_call(:owner_status, _from, state) do
+      send(state.parent, {:slow_final_owner_status_started, state.key})
+
+      receive do
+        {:release_slow_final_owner_status, key} when key == state.key -> :ok
+      end
+
+      {:reply, {:ok, %{active_turn?: false}}, %{state | status_calls: state.status_calls + 1}}
+    end
+
+    def handle_call(:drain, _from, state) do
+      send(state.parent, {:slow_final_owner_drain_started, state.key})
+
+      receive do
+        {:release_slow_final_owner_drain, key} when key == state.key -> :ok
+      end
+
+      {:stop, :normal, :ok, state}
+    end
+  end
+
+  defmodule UnresponsiveOwner do
+    @moduledoc false
+
+    use GenServer
+
+    # Receives the drain's calls and never answers them, the way an owner wedged on an upstream
+    # socket behaves. `WebsocketOwnerSession.owner_status/1` and `drain_owner/1` call with
+    # `OwnerDefaults.owner_call_timeout_ms/0`, a compile-time 5 s, so the caller waits that long
+    # unless something else bounds it: with `answer_status?: false` the wait happens on the first
+    # `owner_status`, and with `answer_status?: true` on the post-deadline `:drain`. The owner
+    # reports each call it received so a test can tell the two waits apart.
+
+    @spec child_spec(keyword()) :: Supervisor.child_spec()
+    def child_spec(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      %{
+        id: {__MODULE__, key},
+        start: {__MODULE__, :start_link, [opts]},
+        restart: :temporary
+      }
+    end
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      key = Keyword.fetch!(opts, :key)
+
+      registry = Keyword.get(opts, :registry, CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Registry)
+
+      GenServer.start_link(__MODULE__, opts, name: {:via, Registry, {registry, key}})
+    end
+
+    @impl GenServer
+    def init(opts) do
+      {:ok,
+       %{
+         answer_status?: Keyword.get(opts, :answer_status?, false),
+         key: Keyword.fetch!(opts, :key),
+         parent: Keyword.fetch!(opts, :parent)
+       }}
+    end
+
+    @impl GenServer
+    def handle_cast(:begin_drain, state) do
+      send(state.parent, {:unresponsive_owner_begin_drain, state.key})
+      {:noreply, state}
+    end
+
+    @impl GenServer
+    def handle_call(:owner_status, _from, %{answer_status?: true} = state) do
+      send(state.parent, {:unresponsive_owner_call, state.key, :owner_status, :answered})
+      {:reply, {:ok, %{active_turn?: true}}, state}
+    end
+
+    # No reply and no stop: the call is received and left unanswered, so only the caller's own
+    # timeout or an outer budget ends it.
+    def handle_call(message, _from, state) do
+      send(state.parent, {:unresponsive_owner_call, state.key, message, :unanswered})
+      {:noreply, state}
     end
   end
 
@@ -128,28 +515,384 @@ defmodule CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport do
 
   @spec configure_rollout_drain_server(GenServer.server()) :: :ok
   def configure_rollout_drain_server(drain_name) do
+    # Replaces the whole RolloutDrain config, `config/test.exs`'s shutdown bound included, so it is
+    # put back when the test exits; the stopped harness name must never reach the drain that runs
+    # when the test VM stops.
+    previous = Application.fetch_env(:codex_pooler, RolloutDrain)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      case previous do
+        {:ok, config} -> Application.put_env(:codex_pooler, RolloutDrain, config)
+        :error -> Application.delete_env(:codex_pooler, RolloutDrain)
+      end
+    end)
+
     Application.put_env(:codex_pooler, RolloutDrain, server_name: drain_name)
+  end
+
+  @spec configure_drain_marker!() :: String.t()
+  def configure_drain_marker! do
+    previous_config = Application.get_env(:codex_pooler, CodexPooler.Gateway.OperationalStatus)
+
+    marker_path =
+      Path.join(
+        System.tmp_dir!(),
+        "codex-pooler-drain-marker-#{System.unique_integer([:positive])}"
+      )
+
+    File.write!(marker_path, "draining")
+
+    Application.put_env(:codex_pooler, CodexPooler.Gateway.OperationalStatus, drain_marker_path: marker_path)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      File.rm(marker_path)
+
+      if previous_config do
+        Application.put_env(
+          :codex_pooler,
+          CodexPooler.Gateway.OperationalStatus,
+          previous_config
+        )
+      else
+        Application.delete_env(:codex_pooler, CodexPooler.Gateway.OperationalStatus)
+      end
+    end)
+
+    marker_path
+  end
+
+  @spec start_virtual_deadline(pid(), keyword()) :: pid()
+  def start_virtual_deadline(parent, opts \\ []) when is_pid(parent) do
+    ExUnit.Callbacks.start_supervised!({VirtualDeadline, Keyword.put(opts, :parent, parent)})
+  end
+
+  @spec deadline_options(pid()) :: keyword()
+  def deadline_options(deadline) when is_pid(deadline) do
+    [
+      owner_post_deadline_call_budget_ms: @owner_post_deadline_call_budget_ms,
+      deadline: %{
+        now_ms: fn -> VirtualDeadline.now_ms(deadline) end,
+        schedule_wait: fn recipient, wait_token, wait_ms ->
+          VirtualDeadline.schedule_wait(deadline, recipient, wait_token, wait_ms)
+        end,
+        cancel_wait: fn wait_ref, _wait_token ->
+          VirtualDeadline.cancel_wait(deadline, wait_ref)
+        end
+      }
+    ]
+  end
+
+  @doc "Waits for a sessioned HTTP stream to reach visible output before testing a post-output drain."
+  @spec await_visible_http_turn!(DeferredStreamRegistry.drain_entry(), pos_integer()) :: :ok
+  def await_visible_http_turn!(%{request_id: request_id, pid: pid}, timeout_ms) do
+    await_visible_http_turn(request_id, pid, System.monotonic_time(:millisecond) + timeout_ms)
+  end
+
+  defp await_visible_http_turn(request_id, pid, deadline_ms) do
+    # An upstream write and deferred-stream registration both precede the
+    # relay's visibility mark. Only the exact turn's persisted mark proves
+    # this scenario has passed its pre-output phase.
+    case Repo.get_by(CodexTurn, request_id: request_id) do
+      %CodexTurn{status: "in_progress", first_visible_output_at: %DateTime{}} ->
+        :ok
+
+      _not_yet_visible ->
+        if not Process.alive?(pid) or System.monotonic_time(:millisecond) >= deadline_ms do
+          raise "HTTP stream did not reach visible output before drain"
+        end
+
+        receive do
+        after
+          5 -> await_visible_http_turn(request_id, pid, deadline_ms)
+        end
+    end
+  end
+
+  @doc "Drives a held HTTP request through the cutoff, then observes real settlement."
+  @spec drain_http_request(Task.t(), keyword(), pos_integer()) :: {term(), map()}
+  def drain_http_request(request_task, opts, await_timeout_ms) do
+    deadline = start_virtual_deadline(self())
+    worker_tracker = start_http_drain_worker_tracker(await_timeout_ms)
+    parent = self()
+    completed_ref = make_ref()
+    request_monitor = Process.monitor(request_task.pid)
+    task_supervisor = ExUnit.Callbacks.start_supervised!({Task.Supervisor, []})
+
+    drain_task =
+      Task.Supervisor.async(task_supervisor, fn ->
+        summary =
+          RolloutDrain.start_drain(opts ++ tracked_deadline_options(deadline, worker_tracker))
+
+        send(parent, {:http_drain_completed, completed_ref})
+        summary
+      end)
+
+    drain_monitor = Process.monitor(drain_task.pid)
+
+    receive do
+      {:rollout_drain_deadline_wait, ^deadline, _wait_ms} -> :ok
+    after
+      await_timeout_ms -> raise "HTTP drain did not reach its first deadline wait"
+    end
+
+    # Advance only after the coordinator has published the original cutoff.
+    # The request still owns its real upstream relay and database settlement.
+    cutoff_ms = Keyword.fetch!(opts, :timeout_ms) - Keyword.fetch!(opts, :deadline_margin_ms)
+    VirtualDeadline.advance(deadline, cutoff_ms)
+    response = Task.await(request_task, await_timeout_ms)
+    await_process_down!(request_monitor, request_task.pid, await_timeout_ms)
+
+    await_http_drain_completion!(
+      deadline,
+      completed_ref,
+      System.monotonic_time(:millisecond) + await_timeout_ms
+    )
+
+    summary = Task.await(drain_task, await_timeout_ms)
+    await_process_down!(drain_monitor, drain_task.pid, await_timeout_ms)
+    :ok = await_drain_workers(Keyword.fetch!(opts, :name), worker_tracker)
+    {response, summary}
+  end
+
+  defp start_http_drain_worker_tracker(timeout_ms) do
+    tracker_name = :"http-drain-workers-#{System.unique_integer([:positive])}"
+
+    # RolloutDrain starts unlinked workers. Retain their ownership beyond the
+    # test supervisor so a failed barrier cannot abandon a virtual-clock wait.
+    ExUnit.Callbacks.on_exit(fn ->
+      if tracker = Process.whereis(tracker_name) do
+        stop_http_drain_workers!(tracker, timeout_ms)
+        Agent.stop(tracker)
+      end
+    end)
+
+    {:ok, tracker} = Agent.start(fn -> MapSet.new() end, name: tracker_name)
+    tracker
+  end
+
+  defp stop_http_drain_workers!(tracker, timeout_ms) do
+    workers = Agent.get(tracker, &MapSet.to_list/1)
+    monitors = Enum.map(workers, &{Process.monitor(&1), &1})
+    Enum.each(workers, &Process.exit(&1, :kill))
+
+    Enum.each(monitors, fn {monitor, pid} ->
+      receive do
+        {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+      after
+        timeout_ms -> raise "HTTP drain worker did not stop during cleanup"
+      end
+    end)
+  end
+
+  defp await_http_drain_completion!(deadline, completed_ref, detection_deadline_ms) do
+    remaining_ms = max(detection_deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:http_drain_completed, ^completed_ref} ->
+        :ok
+
+      {:rollout_drain_deadline_wait, ^deadline, wait_ms} ->
+        # A completed request may race the coordinator's next poll registration.
+        # Advance after its registration signal, never after an arbitrary sleep.
+        VirtualDeadline.advance(deadline, wait_ms)
+        await_http_drain_completion!(deadline, completed_ref, detection_deadline_ms)
+    after
+      remaining_ms -> raise "HTTP drain did not observe request settlement"
+    end
+  end
+
+  defp await_process_down!(monitor, pid, timeout_ms) do
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, :normal} -> :ok
+    after
+      timeout_ms -> raise "HTTP drain task did not stop normally"
+    end
+  end
+
+  # A drain enumerates every owner in its owner registry, and the application one also holds the
+  # owners of whatever test ran before (findings#206 row 206-375: a leaked pair turned a single
+  # failing probe owner into `owners_seen: 3`). A test whose owners are probe owners starts its own
+  # registry here, starts them with `registry:` and hands it to the harness as `owner_registry:`,
+  # so its drain counts only its own owners. Real `WebsocketOwnerSession`s always register in the
+  # application registry.
+  @spec start_owner_registry!() :: atom()
+  def start_owner_registry! do
+    registry = :"rollout-drain-owners-#{System.unique_integer([:positive])}"
+    ExUnit.Callbacks.start_supervised!({Registry, keys: :unique, name: registry})
+    registry
+  end
+
+  @spec start_rollout_drain_harness(pid(), keyword()) :: %{
+          activity_registry: atom(),
+          deadline: pid(),
+          name: atom(),
+          stream_registry: atom(),
+          worker_tracker: pid()
+        }
+  def start_rollout_drain_harness(parent, opts \\ []) when is_pid(parent) do
+    deadline = start_virtual_deadline(parent, opts)
+    drain_name = :"rollout-drain-harness-#{System.unique_integer([:positive])}"
+    activity_registry = :"rollout-drain-activity-#{System.unique_integer([:positive])}"
+    stream_registry = :"rollout-drain-streams-#{System.unique_integer([:positive])}"
+    worker_tracker = start_worker_tracker()
+    ExUnit.Callbacks.start_supervised!({ActivityRegistry, name: activity_registry})
+    # A drain flips its registries into draining for good, exactly as a real
+    # shutdown does. Give the harness its own deferred-stream registry so a
+    # drain here can never signal a later test's HTTP SSE stream through the
+    # global one.
+    ExUnit.Callbacks.start_supervised!({DeferredStreamRegistry, name: stream_registry})
+
+    start_opts =
+      [
+        name: drain_name,
+        activity_registry: activity_registry,
+        stream_registry: stream_registry
+      ] ++ Keyword.take(opts, [:owner_registry]) ++ tracked_deadline_options(deadline, worker_tracker)
+
+    {RolloutDrain, start_opts}
+    |> Supervisor.child_spec(id: {RolloutDrain, drain_name})
+    |> ExUnit.Callbacks.start_supervised!()
+
+    ExUnit.Callbacks.on_exit(fn ->
+      case await_drain_workers(drain_name, worker_tracker) do
+        :ok -> :ok
+        {:error, reason} -> raise "rollout drain harness teardown failed: #{inspect(reason)}"
+      end
+    end)
+
+    %{
+      activity_registry: activity_registry,
+      deadline: deadline,
+      name: drain_name,
+      stream_registry: stream_registry,
+      worker_tracker: worker_tracker
+    }
+  end
+
+  @spec await_rollout_drain_harness(%{name: GenServer.server(), worker_tracker: pid()}) ::
+          :ok | {:error, term()}
+  def await_rollout_drain_harness(%{name: drain_name, worker_tracker: worker_tracker}) do
+    await_drain_workers(drain_name, worker_tracker)
+  end
+
+  defp start_worker_tracker do
+    child_spec =
+      Supervisor.child_spec(
+        {Agent, fn -> MapSet.new() end},
+        id: {:rollout_drain_worker_tracker, System.unique_integer([:positive])}
+      )
+
+    ExUnit.Callbacks.start_supervised!(child_spec)
+  end
+
+  defp tracked_deadline_options(deadline, worker_tracker) do
+    options = deadline_options(deadline)
+    policy = Keyword.fetch!(options, :deadline)
+
+    tracked_policy = %{
+      policy
+      | now_ms: fn ->
+          # The named coordinator and stream registry also sample the cutoff.
+          # They are supervised harness resources, not finite drain workers.
+          if Process.info(self(), :registered_name) == {:registered_name, []} do
+            worker = self()
+            Agent.update(worker_tracker, &MapSet.put(&1, worker))
+          end
+
+          policy.now_ms.()
+        end
+    }
+
+    Keyword.put(options, :deadline, tracked_policy)
+  end
+
+  defp await_drain_workers(drain_name, worker_tracker) do
+    deadline_ms = System.monotonic_time(:millisecond) + @worker_join_timeout_ms
+    await_drain_workers_until(drain_name, worker_tracker, deadline_ms)
+  end
+
+  defp await_drain_workers_until(drain_name, worker_tracker, deadline_ms) do
+    active_drain? = active_drain?(drain_name)
+    workers = tracked_workers(worker_tracker)
+    live_workers = Enum.filter(workers, &Process.alive?/1)
+
+    cond do
+      not active_drain? and live_workers == [] ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline_ms ->
+        {:error, %{active_drain?: active_drain?, live_workers: length(live_workers)}}
+
+      live_workers != [] ->
+        monitors = Map.new(live_workers, &{Process.monitor(&1), &1})
+        wait_for_drain_worker(monitors, drain_name, worker_tracker, deadline_ms)
+
+      true ->
+        receive do
+        after
+          1 -> await_drain_workers_until(drain_name, worker_tracker, deadline_ms)
+        end
+    end
+  end
+
+  defp wait_for_drain_worker(monitors, drain_name, worker_tracker, deadline_ms) do
+    timeout_ms = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:DOWN, monitor, :process, _pid, _reason} when is_map_key(monitors, monitor) ->
+        Enum.each(Map.keys(monitors), &Process.demonitor(&1, [:flush]))
+        await_drain_workers_until(drain_name, worker_tracker, deadline_ms)
+    after
+      timeout_ms ->
+        {:error, %{active_drain?: active_drain?(drain_name), live_workers: map_size(monitors)}}
+    end
+  end
+
+  defp active_drain?(drain_name) do
+    match?(%{active_drain: %{}}, :sys.get_state(drain_name))
+  catch
+    :exit, _reason -> false
+  end
+
+  defp tracked_workers(worker_tracker) do
+    Agent.get(worker_tracker, &MapSet.to_list/1)
+  catch
+    :exit, _reason -> []
   end
 
   @spec restore_env(String.t(), String.t() | nil) :: :ok
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 
-  @spec await_active_drain_waiters(GenServer.server(), pos_integer(), non_neg_integer()) ::
+  # Bounded by wall clock rather than by a fixed number of yields: a loaded
+  # machine burns a spin budget long before the second caller has joined the
+  # drain, which turns "the machine was busy" into "the waiters never
+  # registered".
+  @waiter_timeout_ms 5_000
+
+  @spec await_active_drain_waiters(GenServer.server(), pos_integer(), pos_integer()) ::
           :ok | {:error, :timeout}
-  def await_active_drain_waiters(drain_name, expected_count, attempts_left \\ 1_000)
+  def await_active_drain_waiters(drain_name, expected_count, timeout_ms \\ @waiter_timeout_ms) do
+    await_active_drain_waiters_until(
+      drain_name,
+      expected_count,
+      System.monotonic_time(:millisecond) + timeout_ms
+    )
+  end
 
-  def await_active_drain_waiters(_drain_name, _expected_count, 0), do: {:error, :timeout}
-
-  def await_active_drain_waiters(drain_name, expected_count, attempts_left) do
+  defp await_active_drain_waiters_until(drain_name, expected_count, deadline_ms) do
     case :sys.get_state(drain_name) do
       %{active_drain: %{waiters: waiters}} when length(waiters) >= expected_count ->
         :ok
 
       _state ->
-        receive do
-        after
-          0 -> await_active_drain_waiters(drain_name, expected_count, attempts_left - 1)
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          {:error, :timeout}
+        else
+          receive do
+          after
+            1 -> await_active_drain_waiters_until(drain_name, expected_count, deadline_ms)
+          end
         end
     end
   end

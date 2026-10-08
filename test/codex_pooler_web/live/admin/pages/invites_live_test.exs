@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Mailer
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Admin.InvitesPageComponents
 
   setup :owner_session
 
@@ -50,6 +51,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     refute has_element?(view, "#invite-page-create-action")
   end
 
+  @tag :relative_countdown_contract
   test "lists Pool invites and links from the sidebar under operators", %{
     conn: conn,
     scope: scope
@@ -73,6 +75,17 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     assert has_element?(view, "#admin-invites-live")
     assert has_element?(view, "#invite-page-create-action", "Create Pool invite")
     assert has_element?(view, "#admin-nav-invites[aria-current='page'][href='/admin/invites']")
+
+    assert has_element?(
+             view,
+             ~s(#admin-nav-observatory[phx-hook="HoldToLaunch"][target="_blank"][href="/observatory/login"])
+           )
+
+    assert has_element?(
+             view,
+             ~s(#admin-nav-observatory [data-role="admin-nav-hold-ring-fill"])
+           )
+
     assert :binary.match(html, "admin-nav-operators") < :binary.match(html, "admin-nav-invites")
 
     assert :binary.match(html, "admin-nav-invites") <
@@ -99,6 +112,45 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     assert has_element?(view, "#invite-reissue-#{invite.id}", "Reissue")
     assert has_element?(view, "#invite-revoke-open-#{invite.id}", "Revoke")
     refute has_element?(view, "#invite-revoke-#{invite.id}")
+  end
+
+  @tag :relative_countdown_contract
+  test "invite expiry labels preserve fixed future, due, expired, and missing states" do
+    now = ~U[2026-07-31 12:00:00.000000Z]
+
+    base_invite = %{
+      status: "active",
+      pool_name: "Example Pool",
+      invited_email: "invitee@example.com",
+      inviter_email: "operator@example.com",
+      accepted_by_email: nil,
+      accepted_at: nil,
+      revoked_at: nil,
+      email_sent_at: nil,
+      created_at: now
+    }
+
+    invites = %{
+      items: [
+        Map.merge(base_invite, %{id: "future", expires_at: ~U[2026-07-31 12:00:00.999999Z]}),
+        Map.merge(base_invite, %{id: "due", expires_at: now}),
+        Map.merge(base_invite, %{id: "expired", expires_at: DateTime.add(now, -1, :second)}),
+        Map.merge(base_invite, %{id: "missing", expires_at: nil})
+      ]
+    }
+
+    html =
+      render_component(&InvitesPageComponents.invites_table/1,
+        invites: invites,
+        mailer_configured?: false,
+        datetime_preferences: %{datetime_format: "default", timezone: "Etc/UTC"},
+        now: now
+      )
+
+    assert html =~ ~r/id="invite-expires-future"[^>]*>\s*in &lt;1 minute/s
+    assert html =~ ~r/id="invite-expires-due"[^>]*>\s*Expired/s
+    assert html =~ ~r/id="invite-expires-expired"[^>]*>\s*Expired/s
+    assert html =~ ~r/id="invite-expires-missing"[^>]*>\s*No expiry/s
   end
 
   test "renders the invite creation surface on the invites page", %{
@@ -289,7 +341,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
         }
       })
 
-    assert has_element?(view, "#pool-onboarding-invite-ready", "Pool onboarding invite ready")
+    assert has_element?(view, "#pool-onboarding-invite-ready", "Not stored in admin history")
     assert has_element?(view, "#pool-invite-created")
     assert has_element?(view, "#pool-invite-target", "Example Pool")
     refute has_element?(view, "#pool-invite-target", "example-pool")
@@ -487,9 +539,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     refute has_element?(view, "#invite-row-#{first.id}")
 
     view
-    |> element(
-      "#invite-pool-filter [data-role='pool-filter-option'][data-pool-id='#{first_pool.id}']"
-    )
+    |> element("#invite-pool-filter [data-role='pool-filter-option'][data-pool-id='#{first_pool.id}']")
     |> render_click()
 
     assert_patch(view, ~p"/admin/invites?pool_id=#{first_pool.id}&status=revoked")
@@ -509,7 +559,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     |> element("#invite-revoke-open-#{invite.id}")
     |> render_click()
 
-    assert has_element?(view, "#invite-revoke-dialog[open]", "Revoke Pool invite")
+    assert has_element?(view, "#invite-revoke-dialog[open]", "Revoke the invite for")
     assert has_element?(view, "#invite-revoke-dialog", "revoke@example.com")
     assert_admin_dialog_docs_link(view, "invite-revoke-dialog-footer")
 
@@ -587,10 +637,10 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     docs_url =
       case footer_id do
         "invite-revoke-dialog-footer" ->
-          "https://docs.codex-pooler.com/operators/invites/#active-invite-actions"
+          "https://www.codex-pooler.com/docs/operators/invites/#active-invite-actions"
 
         _footer_id ->
-          "https://docs.codex-pooler.com/operators/invites/#create-pool-invite"
+          "https://www.codex-pooler.com/docs/operators/invites/#create-pool-invite"
       end
 
     assert has_element?(

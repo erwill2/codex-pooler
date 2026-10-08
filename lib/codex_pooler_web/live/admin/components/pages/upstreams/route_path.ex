@@ -1,25 +1,34 @@
 defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.RoutePath do
+  alias CodexPooler.Admin.UpstreamCircuitReadiness
+
   @moduledoc """
-  Shared route-path model for an upstream assignment: the three gates a
-  request crosses (assignment → health → quota), each with a readiness flag,
-  tone, and a spoken detail label. Rendered as chevron segments by the
-  upstream index card and the cockpit routing lanes.
+  Shared route-path model for an upstream assignment: the four gates a
+  request crosses (assignment → health → quota → circuit), each with a
+  readiness flag, tone, and a spoken detail label. Rendered as chevron
+  segments by the upstream index card and the cockpit routing lanes.
   """
 
   @type segment :: %{
           key: String.t(),
           label: String.t(),
+          short_label: String.t(),
           detail_label: String.t(),
           ready?: boolean(),
           tone: :success | :warning | :error
         }
 
+  @spec segment_count() :: pos_integer()
+  def segment_count, do: 4
+
   @spec segments(map()) :: [segment()]
   def segments(assignment) do
+    circuit_readiness = Map.get(assignment, :circuit_readiness, UpstreamCircuitReadiness.clear())
+
     [
       %{
         key: "assignment",
         label: "Assignment",
+        short_label: "Assign",
         detail_label: assignment_state_label(Map.get(assignment, :status)),
         ready?: Map.get(assignment, :status) == "active",
         tone: assignment_state_tone(Map.get(assignment, :status))
@@ -27,6 +36,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.RoutePath do
       %{
         key: "health",
         label: "Health",
+        short_label: "Health",
         detail_label: assignment_health_label(Map.get(assignment, :health_status)),
         ready?: Map.get(assignment, :health_status) == "active",
         tone: assignment_health_tone(Map.get(assignment, :health_status))
@@ -34,9 +44,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.RoutePath do
       %{
         key: "quota",
         label: "Quota",
+        short_label: "Quota",
         detail_label: Map.get(assignment, :quota_priming_label) || "Quota unknown",
         ready?: quota_priming_ready?(Map.get(assignment, :quota_priming_status)),
         tone: quota_priming_tone(Map.get(assignment, :quota_priming_status))
+      },
+      %{
+        key: "circuit",
+        label: "Circuit",
+        short_label: "Circuit",
+        detail_label: circuit_readiness.label,
+        ready?: circuit_readiness.ready?,
+        tone: circuit_readiness.tone
       }
     ]
   end

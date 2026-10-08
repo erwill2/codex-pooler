@@ -12,6 +12,7 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection.TransportFailure do
     request
     send_control
     send_payload
+    terminal_delivery
     unexpected_frame
     upstream_close
   )
@@ -120,20 +121,26 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection.TransportFailure do
     Map.get(metadata, "stream_error_code") || Map.get(metadata, "upstream_error_code")
   end
 
-  defp pre_visible_output?(metadata), do: stream_text_frame_count(metadata) == 0
+  # `pre_visible_output` is derived, never assumed: it answers "had the client
+  # seen anything yet", and the only witness is the recorded frame count. When
+  # that count was never recorded the honest projection is absence, so both
+  # keys drop out of the attempt row (findings#165). The previous default
+  # invented a count of 1 and therefore `pre_visible_output: false` -- "the
+  # client had already seen output" -- for every attempt whose count was
+  # missing, which a reader cannot tell from a measured single frame and which
+  # is the opposite of the modal truth among attempts that do record it.
+  defp pre_visible_output?(metadata) do
+    case stream_text_frame_count(metadata) do
+      count when is_integer(count) -> count == 0
+      nil -> nil
+    end
+  end
 
   defp stream_text_frame_count(metadata) do
     metadata
     |> Map.get("stream_text_frame_count")
     |> non_negative_integer()
-    |> case do
-      count when is_integer(count) -> count
-      nil -> default_stream_text_frame_count(metadata)
-    end
   end
-
-  defp default_stream_text_frame_count(%{"error_kind" => "stream_interrupted"}), do: 1
-  defp default_stream_text_frame_count(_metadata), do: 0
 
   defp safe_transport_failure(transport_failure) when is_map(transport_failure) do
     %{}
@@ -152,13 +159,27 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection.TransportFailure do
       transport_failure_value(transport_failure, "pre_visible_output")
     )
     |> put_transport_failure_boolean(
+      :upstream_committed,
+      transport_failure_value(transport_failure, "upstream_committed")
+    )
+    |> put_transport_failure_boolean(
       :terminal_seen,
       transport_failure_value(transport_failure, "terminal_seen")
+    )
+    |> put_transport_failure_boolean(
+      :terminal_forwarded,
+      transport_failure_value(transport_failure, "terminal_forwarded")
     )
     |> put_transport_failure_integer(
       :text_frame_count,
       transport_failure_value(transport_failure, "text_frame_count")
     )
+    |> put_peer_close_code(transport_failure_value(transport_failure, "peer_close_code"))
+    |> put_transport_failure_boolean(
+      :peer_close_reason_present,
+      transport_failure_value(transport_failure, "peer_close_reason_present")
+    )
+    |> put_peer_close_reason_bytes(transport_failure_value(transport_failure, "peer_close_reason_bytes"))
   end
 
   @spec transport_failure_value(map(), String.t()) :: term()
@@ -174,8 +195,13 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection.TransportFailure do
   defp transport_failure_atom_key("reason"), do: :reason
   defp transport_failure_atom_key("phase"), do: :phase
   defp transport_failure_atom_key("pre_visible_output"), do: :pre_visible_output
+  defp transport_failure_atom_key("upstream_committed"), do: :upstream_committed
   defp transport_failure_atom_key("terminal_seen"), do: :terminal_seen
+  defp transport_failure_atom_key("terminal_forwarded"), do: :terminal_forwarded
   defp transport_failure_atom_key("text_frame_count"), do: :text_frame_count
+  defp transport_failure_atom_key("peer_close_code"), do: :peer_close_code
+  defp transport_failure_atom_key("peer_close_reason_present"), do: :peer_close_reason_present
+  defp transport_failure_atom_key("peer_close_reason_bytes"), do: :peer_close_reason_bytes
 
   defp put_transport_failure_text(metadata, key, value) when is_binary(value) do
     value = String.trim(value)
@@ -210,6 +236,17 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection.TransportFailure do
     do: Map.put(metadata, key, value)
 
   defp put_transport_failure_integer(metadata, _key, _value), do: metadata
+
+  defp put_peer_close_code(metadata, value) when is_integer(value) and value in 0..65_535,
+    do: Map.put(metadata, :peer_close_code, value)
+
+  defp put_peer_close_code(metadata, _value), do: metadata
+
+  defp put_peer_close_reason_bytes(metadata, value)
+       when is_integer(value) and value in 0..123,
+       do: Map.put(metadata, :peer_close_reason_bytes, value)
+
+  defp put_peer_close_reason_bytes(metadata, _value), do: metadata
 
   defp safe_transport_failure_text?(value) do
     value != "" and byte_size(value) <= 96 and

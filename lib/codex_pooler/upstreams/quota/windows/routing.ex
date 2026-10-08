@@ -1,9 +1,15 @@
 defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   @moduledoc false
 
-  alias CodexPooler.Quotas.{Evidence, WindowClassifier}
+  alias CodexPooler.Quotas.{Evidence, ModelWeeklyResetSemantics, WindowClassifier}
   alias CodexPooler.Upstreams.Quota
-  alias CodexPooler.Upstreams.Quota.WindowSelector
+
+  alias CodexPooler.Upstreams.Quota.{
+    AccountAvailabilityStore,
+    CapacityFactsStore,
+    RoutingQuotaSnapshot,
+    WindowSelector
+  }
 
   @fresh "fresh"
   @account_quota_key "account"
@@ -12,23 +18,36 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   def selection_data_from_windows(windows, opts \\ []) when is_list(windows) do
     timestamp = Keyword.get(opts, :at, now())
 
-    routing_windows =
-      windows
-      |> Enum.filter(&window_in_model_scope?(&1, opts))
-      |> WindowSelector.logical_windows(timestamp)
-      |> reject_superseded_primary_windows(timestamp)
-      |> select_current_account_primary_variant(timestamp)
+    if reserve_model_request?(opts) do
+      selection_data_for_reserve(windows, timestamp)
+    else
+      routing_windows =
+        windows
+        |> Enum.filter(&window_in_model_scope?(&1, opts))
+        |> reject_dropped_meter_windows(timestamp)
+        |> reject_unrefreshable_stale_meter_windows(timestamp)
+        |> reject_superseded_primary_windows(timestamp)
+        |> WindowSelector.logical_windows(timestamp)
+        |> select_current_account_primary_variant(timestamp)
 
-    %{
-      windows: windows,
-      routing_windows: routing_windows,
-      primary: WindowSelector.best_account_primary_variant(routing_windows, timestamp),
-      secondary:
-        WindowSelector.best_account_window(routing_windows, :weekly_secondary, timestamp),
-      fresh_windows: Enum.filter(routing_windows, &fresh_window?(&1, timestamp)),
-      blocked_windows: Enum.reject(routing_windows, &usable_window?(&1, timestamp)),
-      usable?: Enum.any?(routing_windows, &usable_window?(&1, timestamp))
-    }
+      %{
+        windows: windows,
+        routing_windows: routing_windows,
+        primary: WindowSelector.best_account_primary_variant(routing_windows, timestamp),
+        secondary: WindowSelector.best_account_window(routing_windows, :weekly_secondary, timestamp),
+        fresh_windows: Enum.filter(routing_windows, &fresh_window?(&1, timestamp)),
+        blocked_windows: Enum.reject(routing_windows, &usable_window?(&1, timestamp)),
+        usable?: Enum.any?(routing_windows, &usable_window?(&1, timestamp))
+      }
+      |> then(fn ordinary ->
+        if not routing_quota_eligible?(routing_quota_state(ordinary, timestamp)) and luna_reserve_supported?(opts) do
+          reserve = selection_data_for_reserve(windows, timestamp)
+          if reserve.usable?, do: reserve, else: ordinary
+        else
+          ordinary
+        end
+      end)
+    end
   end
 
   @spec eligibility_from_windows([Quota.AccountQuotaWindow.t()], keyword()) :: map()
@@ -36,6 +55,293 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     windows
     |> selection_data_from_windows(opts)
     |> eligibility_from_selection(opts)
+  end
+
+  @spec eligibility_from_snapshot(RoutingQuotaSnapshot.t(), keyword()) :: map()
+  def eligibility_from_snapshot(%RoutingQuotaSnapshot{} = snapshot, opts \\ [])
+      when is_list(opts) do
+    opts = Keyword.put(opts, :at, snapshot.as_of)
+    raw_windows = RoutingQuotaSnapshot.time_visible_raw_windows(snapshot)
+    ordinary = eligibility_from_windows(raw_windows, opts)
+
+    cond do
+      applicable_model_denial?(ordinary.selection, snapshot.as_of) ->
+        applicable_unusable_exclusion(ordinary.selection, snapshot.as_of)
+
+      independent_spark_permission?(snapshot, ordinary.selection, opts) ->
+        %{ordinary | eligible?: true, routing_state: :provider_available, exclusions: []}
+
+      not reserve_model_request?(opts) and
+          AccountAvailabilityStore.blocked?(
+            snapshot.availability,
+            snapshot.credential_epoch,
+            snapshot.as_of
+          ) ->
+        :blocked |> availability_exclusion(ordinary.selection) |> put_blocked_hint_reset_at(ordinary.selection, snapshot.as_of)
+
+      ordinary.eligible? ->
+        ordinary
+
+      provider_permission_usable?(snapshot, ordinary.selection) ->
+        %{
+          ordinary
+          | eligible?: true,
+            routing_state: :provider_available,
+            exclusions: []
+        }
+
+      true ->
+        availability_fallback(snapshot, raw_windows, ordinary)
+    end
+  end
+
+  @doc "Physical quota view that never counts provider credits as included capacity."
+  @spec included_only_eligibility_from_snapshot(RoutingQuotaSnapshot.t(), keyword()) :: map()
+  def included_only_eligibility_from_snapshot(%RoutingQuotaSnapshot{} = snapshot, opts \\ []) do
+    included_snapshot = %{snapshot | raw_windows: included_only_windows(snapshot.raw_windows)}
+
+    eligibility_from_snapshot(included_snapshot, opts)
+    |> suppress_credit_only_availability(snapshot)
+  end
+
+  @spec included_only_windows([Quota.AccountQuotaWindow.t()]) :: [Quota.AccountQuotaWindow.t()]
+  def included_only_windows(windows) do
+    Enum.map(windows, fn
+      %Quota.AccountQuotaWindow{source: "codex_usage_api", quota_scope: "account"} = window -> %{window | credits: nil, active_limit: nil}
+      %Quota.AccountQuotaWindow{quota_scope: "account", active_limit: 0} = window -> %{window | credits: 0}
+      %Quota.AccountQuotaWindow{} = window -> %{window | credits: nil}
+    end)
+  end
+
+  defp suppress_credit_only_availability(%{routing_state: state} = eligibility, snapshot)
+       when state in [:provider_available, :windowless_provider_available] do
+    facts = snapshot.capacity_facts
+
+    reported? = snapshot.capacity_facts_reported? or snapshot.capacity_blocker_reported? or not is_nil(facts)
+
+    if state == :windowless_provider_available and reported? and
+         not (CapacityFactsStore.fresh?(facts, snapshot.credential_epoch, snapshot.as_of) and
+                facts.included_permission == :available) do
+      %{eligibility | eligible?: false, routing_state: :blocked, exclusions: [%{code: "quota_window_unusable", reason_codes: ["non_credit_capacity_unverified"], quota_key: "account", quota_scope: "account", quota_family: "account"}]}
+    else
+      eligibility
+    end
+  end
+
+  defp suppress_credit_only_availability(eligibility, _snapshot), do: eligibility
+
+  defp applicable_model_denial?(selection, as_of) do
+    Enum.any?(selection.routing_windows, fn window ->
+      window.quota_scope != "account" and fresh_window?(window, as_of) and
+        (window.metadata["rate_limit_allowed"] == false or
+           window.metadata["rate_limit_reached"] == true)
+    end)
+  end
+
+  defp independent_spark_permission?(snapshot, selection, opts) do
+    requested =
+      Keyword.get(opts, :upstream_model) || Keyword.get(opts, :upstream_model_id) ||
+        Keyword.get(opts, :model) || Keyword.get(opts, :requested_model)
+
+    availability = snapshot.availability
+    model_windows = Enum.filter(selection.routing_windows, &(&1.quota_scope != "account"))
+
+    requested == "gpt-5.3-codex-spark" and not Keyword.get(opts, :account_only, false) and
+      AccountAvailabilityStore.blocked?(availability, snapshot.credential_epoch, snapshot.as_of) and
+      model_windows != [] and
+      Enum.all?(model_windows, &supported_spark_window?(&1, snapshot)) and
+      not later_permission_blocker?(snapshot)
+  end
+
+  defp supported_spark_window?(window, snapshot) do
+    current_spark_grant?(window, snapshot.availability, snapshot.as_of) or
+      (percent_only_spark_window?(window, snapshot.as_of) and
+         Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn grant ->
+           current_spark_grant?(grant, snapshot.availability, snapshot.as_of) and
+             grant.quota_key == window.quota_key and grant.window_kind == window.window_kind and
+             grant.window_minutes == window.window_minutes and
+             DateTime.compare(grant.reset_at, window.reset_at) == :eq
+         end))
+  end
+
+  defp percent_only_spark_window?(window, as_of) do
+    window.source in ["codex_response_headers", "codex_rate_limit_event"] and
+      permission_capacity_window?(window, as_of) and
+      window.raw_metered_feature == "codex_bengalfox" and
+      is_nil(window.metadata["rate_limit_allowed"]) and
+      is_nil(window.metadata["rate_limit_reached"]) and
+      is_nil(window.metadata["rate_limit_reached_type"])
+  end
+
+  defp current_spark_grant?(window, availability, as_of) do
+    window.source == "codex_usage_api" and
+      same_spark_permission_observation?(window.metadata, availability.observed_at) and
+      same_permission_instant?(
+        window.metadata["independent_spark_permission_reset_at"],
+        window.reset_at
+      ) and
+      window.raw_metered_feature == "codex_bengalfox" and
+      window.model == "gpt-5.3-codex-spark" and
+      window.metadata["independent_spark_permission"] == true and
+      permission_capacity_window?(window, as_of)
+  end
+
+  defp same_spark_permission_observation?(metadata, observed_at) do
+    same_permission_instant?(metadata["independent_spark_permission_observed_at"], observed_at)
+  end
+
+  defp same_permission_instant?(value, observed_at) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, permission_at, 0} -> DateTime.compare(permission_at, observed_at) == :eq
+      _invalid -> false
+    end
+  end
+
+  defp same_permission_instant?(_value, _observed_at), do: false
+
+  defp permission_capacity_window?(window, as_of) do
+    usable_window?(window, as_of) or
+      (window_reason_codes(window, as_of) == ["exhausted"] and
+         exhausted_by_used_percent?(window) and is_nil(window.active_limit) and
+         is_nil(window.credits))
+  end
+
+  defp later_permission_blocker?(snapshot) do
+    snapshot
+    |> RoutingQuotaSnapshot.time_visible_raw_windows()
+    |> Enum.any?(fn window ->
+      metadata = window.metadata || %{}
+
+      DateTime.compare(window.observed_at, snapshot.availability.observed_at) != :lt and
+        (window.quota_scope == "account" or window.model == "gpt-5.3-codex-spark") and
+        window.source != "codex_usage_api" and
+        (window.source == "codex_rate_limit_error" or
+           not is_nil(metadata["rate_limit_reached_type"]) or
+           metadata["rate_limit_allowed"] == false or metadata["rate_limit_reached"] == true)
+    end)
+  end
+
+  # Preserve the reported percentage. A current full usage observation may
+  # attest account capacity, but cannot override another window's authority.
+  defp provider_permission_usable?(snapshot, selection) do
+    fresh_available?(snapshot) and selection.blocked_windows != [] and
+      Enum.all?(selection.blocked_windows, fn window ->
+        permission_overrides_percent?(window, snapshot) and
+          not competing_permission_blocker?(window, snapshot)
+      end)
+  end
+
+  defp competing_permission_blocker?(window, snapshot) do
+    snapshot
+    |> RoutingQuotaSnapshot.time_visible_raw_windows()
+    |> Enum.any?(fn evidence ->
+      metadata = evidence.metadata || %{}
+
+      same_account_window?(window, evidence) and
+        DateTime.compare(evidence.observed_at, snapshot.availability.observed_at) != :lt and
+        (evidence.source == "codex_rate_limit_error" or
+           not is_nil(metadata["rate_limit_reached_type"]) or
+           metadata["rate_limit_allowed"] == false or metadata["rate_limit_reached"] == true)
+    end)
+  end
+
+  defp permission_overrides_percent?(
+         %Quota.AccountQuotaWindow{
+           quota_scope: "account",
+           source: "codex_usage_api",
+           observed_at: observed_at,
+           metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false}
+         } = window,
+         %RoutingQuotaSnapshot{availability: %{observed_at: availability_at}} = snapshot
+       ) do
+    DateTime.compare(observed_at, availability_at) == :eq and
+      window_reason_codes(window, snapshot.as_of) == ["exhausted"] and
+      exhausted_by_used_percent?(window)
+  end
+
+  defp permission_overrides_percent?(
+         %Quota.AccountQuotaWindow{quota_scope: "account", source: source} = window,
+         snapshot
+       )
+       when source in ["codex_response_headers", "codex_rate_limit_event"] do
+    # Runtime percentage observations outrank usage rows for measurement selection,
+    # but an unchanged percentage is not a revocation of same-cycle permission.
+    percent_only_runtime_window?(window, snapshot.as_of) and
+      Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn evidence ->
+        evidence.source == "codex_usage_api" and same_account_cycle?(window, evidence) and
+          permission_overrides_percent?(evidence, snapshot)
+      end)
+  end
+
+  defp permission_overrides_percent?(_window, _snapshot), do: false
+
+  defp percent_only_runtime_window?(window, as_of) do
+    metadata = window.metadata || %{}
+
+    window_reason_codes(window, as_of) == ["exhausted"] and
+      exhausted_by_used_percent?(window) and is_nil(window.active_limit) and
+      is_nil(window.credits) and is_nil(metadata["rate_limit_reached_type"]) and
+      is_nil(metadata["rate_limit_allowed"]) and is_nil(metadata["rate_limit_reached"])
+  end
+
+  defp same_account_cycle?(left, right) do
+    same_account_window?(left, right) and DateTime.compare(left.reset_at, right.reset_at) == :eq
+  end
+
+  defp same_account_window?(left, right) do
+    right.quota_scope == "account" and left.quota_family == right.quota_family and
+      account_window_kind(left) == account_window_kind(right) and
+      left.window_minutes == right.window_minutes
+  end
+
+  defp account_window_kind(%{window_kind: "primary", window_minutes: 10_080}), do: "secondary"
+  defp account_window_kind(window), do: window.window_kind
+
+  defp availability_fallback(snapshot, raw_windows, ordinary) do
+    windowless_evidence? =
+      windowless_snapshot_evidence?(snapshot, raw_windows, ordinary.selection)
+
+    cond do
+      current_available?(snapshot) and no_raw_account_windows?(raw_windows) and
+          applicable_unusable_windows(ordinary.selection, snapshot.as_of) != [] ->
+        applicable_unusable_exclusion(ordinary.selection, snapshot.as_of)
+
+      windowless_evidence? and fresh_available?(snapshot) ->
+        windowless_available_result(ordinary.selection)
+
+      windowless_evidence? and stale_current_available?(snapshot) ->
+        availability_exclusion(:not_fresh, ordinary.selection)
+
+      true ->
+        ordinary
+    end
+  end
+
+  defp windowless_snapshot_evidence?(snapshot, raw_windows, selection) do
+    windowless_eligible_evidence?(raw_windows, selection, snapshot.as_of) and
+      not account_window_from_availability?(snapshot)
+  end
+
+  defp account_window_from_availability?(%RoutingQuotaSnapshot{
+         raw_windows: windows,
+         availability: %{observed_at: observed_at}
+       }) do
+    Enum.any?(windows, fn window ->
+      window.quota_scope == "account" and window.source == "codex_usage_api" and
+        window.observed_at == observed_at
+    end)
+  end
+
+  defp account_window_from_availability?(_snapshot), do: false
+
+  defp windowless_available_result(selection) do
+    %{
+      eligible?: true,
+      routing_state: :windowless_provider_available,
+      warnings: [],
+      selection: selection,
+      exclusions: []
+    }
   end
 
   @spec eligibility_from_selection(map(), keyword()) :: map()
@@ -69,7 +375,150 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   @spec reject_superseded_primary_windows([Quota.AccountQuotaWindow.t()], DateTime.t()) ::
           [Quota.AccountQuotaWindow.t()]
   def reject_superseded_primary_windows(windows, timestamp \\ now()) when is_list(windows) do
-    Enum.reject(windows, &superseded_primary_window?(&1, windows, timestamp))
+    Enum.reject(windows, fn window ->
+      if superseded_window?(window, windows, timestamp) do
+        :telemetry.execute(
+          [:codex_pooler, :quota, :cycle, :decision],
+          %{count: 1},
+          %{
+            scope: quota_scope(window),
+            decision: :superseded_primary_rejected,
+            source: source_class(window)
+          }
+        )
+
+        true
+      else
+        false
+      end
+    end)
+  end
+
+  @doc """
+  Rejects the windows of an additional meter the provider stopped reporting.
+
+  A meter (the model, upstream-model or feature windows of one quota group) is
+  dropped when every one of its rows carries a reset that has passed, and the
+  identity's account usage reading kept syncing for at least one full
+  freshness TTL after the meter's newest observation: the provider still
+  reports the account and no longer reports the meter, and the meter's last
+  cycle, already ended, says nothing about the running one. Before this an
+  expired meter blocked its model until retention, 30 days after its reset,
+  because a usage refresh only deletes descriptors its payload covers
+  (findings#305 row 498-4). Routing stops reading a dropped meter; its rows
+  stay for retention and for every read surface that lists evidence. A meter
+  with a row still in its cycle, a resetless row, or no account usage reading
+  a full TTL newer keeps blocking as before.
+  """
+  @spec reject_dropped_meter_windows([Quota.AccountQuotaWindow.t()], DateTime.t()) ::
+          [Quota.AccountQuotaWindow.t()]
+  def reject_dropped_meter_windows(windows, timestamp \\ now()) when is_list(windows) do
+    case latest_account_usage_evidence_at(windows, timestamp) do
+      %DateTime{} = usage_synced_at ->
+        dropped =
+          windows
+          |> Enum.filter(&meter_window?/1)
+          |> Enum.group_by(&quota_group_key/1)
+          |> Enum.filter(fn {_group, rows} -> dropped_meter?(rows, usage_synced_at, timestamp) end)
+          |> MapSet.new(fn {group, _rows} -> group end)
+
+        Enum.reject(windows, &(meter_window?(&1) and MapSet.member?(dropped, quota_group_key(&1))))
+
+      nil ->
+        windows
+    end
+  end
+
+  @doc """
+  Rejects the windows of a stale meter that only responses report and whose
+  reading in its running cycle is below its limit.
+
+  The provider's usage read lists no such meter: the rate-limit headers of a
+  response, its `codex.rate_limits` event or a rate-limit error carry it, so
+  only traffic on the account refreshes it. Once its rows are older than the
+  freshness TTL the request's quota refresh reads the account's usage and
+  cannot make them fresh, and while the meter blocked no response could
+  either: the account stayed out of routing until the meter's reset, for its
+  model, or for every model when the meter is unnamed (findings#305 row
+  498-9). A meter group with no fresh row, no row from the usage read and no
+  exhausted row in a cycle still running is ignored by routing; when the
+  meter has run out since, the provider's usage-limit refusal says so and its
+  evidence blocks as usual. An exhausted reading keeps blocking until its
+  reset, and a meter the usage read reports is still refreshed by it. Its rows
+  stay for every read surface that lists evidence.
+  """
+  @spec reject_unrefreshable_stale_meter_windows([Quota.AccountQuotaWindow.t()], DateTime.t()) ::
+          [Quota.AccountQuotaWindow.t()]
+  def reject_unrefreshable_stale_meter_windows(windows, timestamp \\ now()) when is_list(windows) do
+    unrefreshable =
+      windows
+      |> Enum.filter(&meter_window?/1)
+      |> Enum.group_by(&quota_group_key/1)
+      |> Enum.filter(fn {_group, rows} -> unrefreshable_stale_meter?(rows, timestamp) end)
+      |> MapSet.new(fn {group, _rows} -> group end)
+
+    Enum.reject(windows, &(meter_window?(&1) and MapSet.member?(unrefreshable, quota_group_key(&1))))
+  end
+
+  defp unrefreshable_stale_meter?(rows, timestamp) do
+    Enum.all?(rows, &(&1.source != "codex_usage_api" and not fresh_window?(&1, timestamp))) and
+      not Enum.any?(rows, &(meter_reading_exhausted?(&1) and not Evidence.expired?(&1, timestamp)))
+  end
+
+  # A reading at its limit, or one a usage-limit refusal recorded.
+  defp meter_reading_exhausted?(%Quota.AccountQuotaWindow{metadata: metadata} = window),
+    do: exhausted?(window) or (is_map(metadata) and Map.has_key?(metadata, "rate_limit_error_code"))
+
+  defp meter_window?(%Quota.AccountQuotaWindow{quota_scope: scope}), do: scope in ["model", "upstream_model", "feature"]
+
+  defp latest_account_usage_evidence_at(windows, timestamp) do
+    windows
+    |> Enum.filter(&(&1.quota_scope == "account" and &1.source == "codex_usage_api"))
+    |> latest_evidence_at(timestamp)
+  end
+
+  defp dropped_meter?(rows, usage_synced_at, timestamp) do
+    case latest_evidence_at(rows, timestamp) do
+      %DateTime{} = meter_synced_at ->
+        Enum.all?(rows, &(Evidence.reset_bearing?(&1) and Evidence.expired?(&1, timestamp))) and
+          DateTime.diff(usage_synced_at, meter_synced_at, :second) >= Evidence.freshness_ttl_seconds()
+
+      nil ->
+        false
+    end
+  end
+
+  defp latest_evidence_at(windows, timestamp) do
+    windows
+    |> Enum.map(&window_latest_evidence_at(&1, timestamp))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max(DateTime, fn -> nil end)
+  end
+
+  defp quota_scope(%Quota.AccountQuotaWindow{quota_scope: scope})
+       when scope in ["model", "upstream_model"],
+       do: "model"
+
+  defp quota_scope(%Quota.AccountQuotaWindow{}), do: "account"
+
+  defp source_class(%Quota.AccountQuotaWindow{source: "codex_usage_api"}), do: "provider_usage"
+
+  defp source_class(%Quota.AccountQuotaWindow{source: source})
+       when source in [
+              "runtime",
+              "rate_limit",
+              "response_header",
+              "codex_response_headers",
+              "codex_rate_limit_event",
+              "codex_rate_limit_error"
+            ],
+       do: "runtime"
+
+  defp source_class(%Quota.AccountQuotaWindow{}), do: "unknown"
+
+  defp superseded_window?(window, windows, timestamp) do
+    superseded_primary_window?(window, windows, timestamp) or
+      superseded_runtime_window?(window, windows, timestamp)
   end
 
   defp superseded_primary_window?(
@@ -78,14 +527,35 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
          timestamp
        ) do
     (not fresh_window?(window, timestamp) or Evidence.expired?(window, timestamp)) and
-      Enum.any?(windows, &newer_quota_group_sibling?(&1, window))
+      Enum.any?(windows, &newer_quota_group_sibling?(&1, window, timestamp))
   end
 
   defp superseded_primary_window?(_window, _windows, _timestamp), do: false
 
-  defp newer_quota_group_sibling?(sibling, window) do
+  defp superseded_runtime_window?(
+         %Quota.AccountQuotaWindow{source: source} = window,
+         windows,
+         timestamp
+       )
+       when source in [
+              "codex_response_headers",
+              "codex_rate_limit_event",
+              "codex_rate_limit_error"
+            ] do
+    (not fresh_window?(window, timestamp) or Evidence.expired?(window, timestamp)) and
+      Enum.any?(windows, fn other ->
+        quota_group_key(other) == quota_group_key(window) and
+          other.source == "codex_usage_api" and fresh_window?(other, timestamp) and
+          match?(%DateTime{}, other.observed_at) and match?(%DateTime{}, window.observed_at) and
+          DateTime.compare(other.observed_at, window.observed_at) == :gt
+      end)
+  end
+
+  defp superseded_runtime_window?(_window, _windows, _timestamp), do: false
+
+  defp newer_quota_group_sibling?(sibling, window, timestamp) do
     sibling != window and quota_group_key(sibling) == quota_group_key(window) and
-      sync_gap_at_least_freshness_ttl?(sibling, window)
+      sync_gap_at_least_freshness_ttl?(sibling, window, timestamp)
   end
 
   defp quota_group_key(%Quota.AccountQuotaWindow{} = window) do
@@ -95,9 +565,9 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     {scope, family, model, upstream_model, quota_key}
   end
 
-  defp sync_gap_at_least_freshness_ttl?(sibling, window) do
-    with %DateTime{} = sibling_synced_at <- window_latest_evidence_at(sibling),
-         %DateTime{} = window_synced_at <- window_latest_evidence_at(window) do
+  defp sync_gap_at_least_freshness_ttl?(sibling, window, timestamp) do
+    with %DateTime{} = sibling_synced_at <- window_latest_evidence_at(sibling, timestamp),
+         %DateTime{} = window_synced_at <- window_latest_evidence_at(window, timestamp) do
       DateTime.diff(sibling_synced_at, window_synced_at, :second) >=
         Evidence.freshness_ttl_seconds()
     else
@@ -105,24 +575,11 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     end
   end
 
-  defp window_latest_evidence_at(%Quota.AccountQuotaWindow{
-         observed_at: %DateTime{} = observed_at,
-         last_sync_at: %DateTime{} = last_sync_at
-       }) do
-    if DateTime.compare(last_sync_at, observed_at) == :gt, do: last_sync_at, else: observed_at
+  defp window_latest_evidence_at(%Quota.AccountQuotaWindow{} = window, timestamp) do
+    [window.observed_at, window.last_sync_at]
+    |> Enum.filter(&(match?(%DateTime{}, &1) and DateTime.compare(&1, timestamp) != :gt))
+    |> Enum.max(DateTime, fn -> nil end)
   end
-
-  defp window_latest_evidence_at(%Quota.AccountQuotaWindow{
-         observed_at: %DateTime{} = observed_at
-       }),
-       do: observed_at
-
-  defp window_latest_evidence_at(%Quota.AccountQuotaWindow{
-         last_sync_at: %DateTime{} = last_sync_at
-       }),
-       do: last_sync_at
-
-  defp window_latest_evidence_at(_window), do: nil
 
   @spec fresh_window?(Quota.AccountQuotaWindow.t(), DateTime.t()) :: boolean()
   def fresh_window?(%Quota.AccountQuotaWindow{} = window, timestamp \\ now()) do
@@ -175,6 +632,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     end
   end
 
+  defp routing_quota_state(%{reserve_mode?: true, usable?: true}, _timestamp),
+    do: :weekly_only_probe
+
+  defp routing_quota_state(%{reserve_mode?: true}, _timestamp),
+    do: :blocked
+
   defp routing_quota_state(
          %{primary: %Quota.AccountQuotaWindow{}, blocked_windows: []},
          _timestamp
@@ -194,6 +657,121 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
        do: true
 
   defp routing_quota_eligible?(_state), do: false
+
+  defp windowless_eligible_evidence?(raw_windows, selection, timestamp) do
+    no_raw_account_windows?(raw_windows) and
+      applicable_unusable_windows(selection, timestamp) == []
+  end
+
+  defp no_raw_account_windows?(raw_windows),
+    do: not Enum.any?(raw_windows, &account_scoped_window?/1)
+
+  defp applicable_unusable_windows(selection, timestamp) do
+    Enum.reject(selection.routing_windows, &usable_window?(&1, timestamp))
+  end
+
+  defp account_scoped_window?(%Quota.AccountQuotaWindow{quota_scope: "account"}), do: true
+  defp account_scoped_window?(%Quota.AccountQuotaWindow{}), do: false
+
+  defp stale_current_available?(%RoutingQuotaSnapshot{
+         availability: %AccountAvailabilityStore.Snapshot{
+           state: :available,
+           credential_epoch: epoch,
+           observed_at: observed_at
+         },
+         credential_epoch: epoch,
+         as_of: as_of
+       }) do
+    DateTime.compare(observed_at, as_of) != :gt and
+      DateTime.compare(
+        as_of,
+        DateTime.add(observed_at, Evidence.freshness_ttl_seconds(), :second)
+      ) == :gt
+  end
+
+  defp stale_current_available?(%RoutingQuotaSnapshot{}), do: false
+
+  defp current_available?(%RoutingQuotaSnapshot{
+         availability: %AccountAvailabilityStore.Snapshot{
+           state: :available,
+           credential_epoch: epoch
+         },
+         credential_epoch: epoch
+       }),
+       do: true
+
+  defp current_available?(%RoutingQuotaSnapshot{}), do: false
+
+  defp fresh_available?(%RoutingQuotaSnapshot{} = snapshot) do
+    AccountAvailabilityStore.available?(
+      snapshot.availability,
+      snapshot.credential_epoch,
+      snapshot.as_of
+    )
+  end
+
+  defp applicable_unusable_exclusion(selection, timestamp) do
+    %{
+      eligible?: false,
+      routing_state: :blocked,
+      warnings: [],
+      selection: selection,
+      exclusions:
+        Enum.map(
+          applicable_unusable_windows(selection, timestamp),
+          &window_exclusion(&1, timestamp)
+        )
+    }
+  end
+
+  # The provider refused the account (`allowed: false`) without naming the
+  # window that binds, so this exclusion has no `reset_at` of its own; its
+  # `hint_reset_at` is retry advice only, read by the terminal usage-limit
+  # answer of an all-exhausted Pool (findings#206 row 206-508): the soonest
+  # future reset among the account's fresh exhausted windows, or among all its
+  # fresh account windows when none reads exhausted (a credit or spend block
+  # below 100%). It never makes the account routable and nothing else reads
+  # it; without a fresh reset-bearing account window there is no hint.
+  defp put_blocked_hint_reset_at(%{exclusions: [exclusion]} = result, selection, timestamp) do
+    windows = Enum.filter(selection.routing_windows, &fresh_account_reset_ahead?(&1, timestamp))
+
+    hint =
+      case Enum.filter(windows, &exhausted?/1) do
+        [] -> earliest_reset(windows)
+        exhausted -> earliest_reset(exhausted)
+      end
+
+    if hint, do: %{result | exclusions: [Map.put(exclusion, :hint_reset_at, iso8601_or_nil(hint))]}, else: result
+  end
+
+  defp fresh_account_reset_ahead?(%Quota.AccountQuotaWindow{quota_scope: "account", reset_at: %DateTime{} = reset_at} = window, timestamp),
+    do: DateTime.compare(reset_at, timestamp) == :gt and fresh_window?(window, timestamp)
+
+  defp fresh_account_reset_ahead?(%Quota.AccountQuotaWindow{}, _timestamp), do: false
+
+  defp earliest_reset([]), do: nil
+  defp earliest_reset(windows), do: windows |> Enum.map(& &1.reset_at) |> Enum.min(DateTime)
+
+  defp availability_exclusion(reason, selection) when reason in [:blocked, :not_fresh] do
+    reason_code = if reason == :blocked, do: "exhausted", else: "not_fresh"
+
+    %{
+      eligible?: false,
+      routing_state: :blocked,
+      warnings: [],
+      selection: selection,
+      exclusions: [
+        %{
+          code: "quota_window_unusable",
+          message: "recorded quota evidence is not usable for routing",
+          reason_codes: [reason_code],
+          quota_key: "account",
+          quota_scope: "account",
+          quota_family: "account"
+        }
+      ]
+    }
+  end
 
   defp credit_backed_probe_selection?(
          %{secondary: %Quota.AccountQuotaWindow{} = secondary, blocked_windows: blocked_windows},
@@ -279,14 +857,15 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     end
   end
 
+  defp quota_routing_warnings(%{reserve_mode?: true}, _timestamp, _state), do: []
+
   defp quota_routing_warnings(selection, _timestamp, :weekly_only_probe) do
     secondary = selection.secondary
 
     [
       %{
         code: "quota_account_primary_unknown",
-        message:
-          "weekly quota is usable, but upstream has not supplied account primary 5h quota evidence",
+        message: "weekly quota is usable, but upstream has not supplied account primary 5h quota evidence",
         quota_key: secondary.quota_key,
         window_kind: secondary.window_kind,
         quota_scope: secondary.quota_scope,
@@ -302,6 +881,23 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
   defp quota_routing_warnings(_selection, _timestamp, _state), do: []
 
   defp quota_routing_exclusions(_selection, _timestamp, true), do: []
+
+  defp quota_routing_exclusions(%{reserve_mode?: true, secondary: nil}, _timestamp, false) do
+    [
+      %{
+        code: "quota_reserve_missing",
+        message: "upstream account does not have gpt-reserve quota"
+      }
+    ]
+  end
+
+  defp quota_routing_exclusions(
+         %{reserve_mode?: true, secondary: %Quota.AccountQuotaWindow{} = secondary},
+         timestamp,
+         false
+       ) do
+    [quota_exhausted_exclusion(secondary, timestamp)]
+  end
 
   defp quota_routing_exclusions(%{windows: []}, _timestamp, false) do
     [
@@ -371,30 +967,137 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     })
   end
 
-  defp window_in_model_scope?(%Quota.AccountQuotaWindow{quota_scope: "model"} = window, opts) do
-    case model_candidates(opts) do
-      [] ->
-        true
-
-      candidates ->
-        Enum.any?(candidates, fn candidate ->
-          same_optional_token?(candidate, window.model) or
-            same_optional_token?(candidate, window.upstream_model)
-        end)
+  defp window_in_model_scope?(%Quota.AccountQuotaWindow{} = window, opts) do
+    if Keyword.get(opts, :account_only, false) do
+      window.quota_scope == "account"
+    else
+      window_in_requested_scope?(window, opts)
     end
   end
 
-  defp window_in_model_scope?(
+  defp window_in_requested_scope?(
+         %Quota.AccountQuotaWindow{quota_scope: "model"} = window,
+         opts
+       ) do
+    if reserve_model_request?(opts) do
+      reserve_window?(window)
+    else
+      case model_candidates(opts) do
+        [] ->
+          true
+
+        candidates ->
+          Enum.any?(candidates, fn candidate ->
+            same_optional_token?(candidate, window.model) or
+              same_optional_token?(candidate, window.upstream_model)
+          end)
+      end
+    end
+  end
+
+  defp window_in_requested_scope?(
          %Quota.AccountQuotaWindow{quota_scope: "upstream_model"} = window,
          opts
        ) do
-    case upstream_model_candidates(opts) do
-      [] -> true
-      candidates -> Enum.any?(candidates, &same_optional_token?(&1, window.upstream_model))
+    if reserve_model_request?(opts) do
+      false
+    else
+      case upstream_model_candidates(opts) do
+        [] -> true
+        candidates -> Enum.any?(candidates, &same_optional_token?(&1, window.upstream_model))
+      end
     end
   end
 
-  defp window_in_model_scope?(%Quota.AccountQuotaWindow{}, _opts), do: true
+  defp window_in_requested_scope?(%Quota.AccountQuotaWindow{} = window, opts) do
+    if reserve_model_request?(opts) do
+      reserve_window?(window)
+    else
+      true
+    end
+  end
+
+  defp selection_data_for_reserve(windows, timestamp) do
+    reserve_windows =
+      windows
+      |> Enum.filter(&reserve_window?/1)
+      |> WindowSelector.logical_windows(timestamp)
+
+    best_reserve =
+      reserve_windows
+      |> Enum.sort_by(
+        fn w ->
+          {
+            if(fresh_window?(w, timestamp), do: 1, else: 0),
+            if(reserve_usable_window?(w, timestamp), do: 1, else: 0),
+            DateTime.to_unix(w.reset_at || ~U[1970-01-01 00:00:00Z])
+          }
+        end,
+        :desc
+      )
+      |> List.first()
+
+    usable? = best_reserve != nil and reserve_usable_window?(best_reserve, timestamp)
+
+    blocked_windows =
+      case best_reserve do
+        nil -> []
+        w -> if usable?, do: [], else: [w]
+      end
+
+    %{
+      windows: windows,
+      routing_windows: if(best_reserve, do: [best_reserve], else: []),
+      primary: nil,
+      secondary: best_reserve,
+      fresh_windows: if(best_reserve && fresh_window?(best_reserve, timestamp), do: [best_reserve], else: []),
+      blocked_windows: blocked_windows,
+      usable?: usable?,
+      reserve_mode?: true
+    }
+  end
+
+  defp reserve_usable_window?(
+         %Quota.AccountQuotaWindow{source_precision: source_precision} = window,
+         timestamp
+       )
+       when source_precision in ["observed", "authoritative"] do
+    Evidence.reset_bearing?(window) and not exhausted?(window) and
+      reserve_window_valid_timing?(window, timestamp)
+  end
+
+  defp reserve_usable_window?(%Quota.AccountQuotaWindow{} = window, timestamp) do
+    not exhausted?(window) and reserve_window_valid_timing?(window, timestamp)
+  end
+
+  defp reserve_window_valid_timing?(window, timestamp) do
+    not Evidence.expired?(window, timestamp) or
+      ModelWeeklyResetSemantics.classify(window) == :floating or
+      zero_used_reserve_window?(window)
+  end
+
+  defp zero_used_reserve_window?(%Quota.AccountQuotaWindow{used_percent: %Decimal{} = percent}) do
+    Decimal.compare(percent, Decimal.new(0)) == :eq
+  end
+
+  defp zero_used_reserve_window?(_), do: false
+
+  defp reserve_window?(%Quota.AccountQuotaWindow{} = window) do
+    window.quota_key in ["gpt_reserve", "gpt-reserve"] or
+      window.model in ["gpt-reserve", "gpt_reserve"] or
+      (window.quota_family == "codex_model" and window.quota_key == "gpt_reserve")
+  end
+
+  defp reserve_window?(_), do: false
+
+  defp reserve_model_request?(opts) do
+    Keyword.get(opts, :reserve_mode?, false) or
+      Enum.any?(model_candidates(opts), &(&1 in ["gpt-reserve", "gpt_reserve"]))
+  end
+
+  defp luna_reserve_supported?(opts) do
+    Keyword.get(opts, :reserve_fallback?, false)
+  end
 
   defp model_candidates(opts) do
     opts
@@ -440,6 +1143,24 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     do: credits > 0
 
   defp positive_credits?(_window), do: false
+
+  # Whether a window may be routed to at all. `WindowSelector` has its own
+  # narrower predicate, `used_percent_exhausted?/1`, which asks only whether
+  # the percentage is spent and is used to rank candidates this one has already
+  # admitted; the carve-out below for a credit-backed monthly primary is
+  # exactly where they part company. Keep both: `select_current_account_primary_variant/2`
+  # filters with this one and ranks with that one, on purpose.
+  defp exhausted?(%Quota.AccountQuotaWindow{
+         quota_scope: scope,
+         metadata: %{"rate_limit_allowed" => false}
+       })
+       when scope in ["model", "upstream_model"], do: true
+
+  defp exhausted?(%Quota.AccountQuotaWindow{
+         quota_scope: scope,
+         metadata: %{"rate_limit_reached" => true}
+       })
+       when scope in ["model", "upstream_model"], do: true
 
   defp exhausted?(%Quota.AccountQuotaWindow{credits: credits} = window)
        when is_integer(credits) and credits > 0 do

@@ -5,25 +5,29 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPoolerWeb.RelativeTime
+
   attr :flash, :map, required: true
   attr :current_scope, :any, required: true
   attr :contract, :any, required: true
   attr :device_authorization, :any, required: true
-  attr :device_polling?, :boolean, required: true
   attr :device_poll_status, :string, required: true
   attr :completed_onboarding, :any, required: true
   attr :invite_state, :atom, required: true
   attr :error_message, :any, required: true
+  attr :now, :any, default: nil
 
   def invite_page(assigns) do
+    assigns = assign(assigns, :now, assigns.now || DateTime.utc_now())
+
     ~H"""
     <Layouts.app flash={@flash} current_scope={@current_scope} chrome={:invite}>
       <section class="mx-auto grid min-h-[calc(100svh-4rem)] w-full max-w-6xl items-center px-4 py-8 sm:px-6 lg:px-8">
         <div
           id="invite-page"
-          class="grid overflow-hidden rounded-box border border-base-300 bg-base-100 shadow-sm lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]"
+          class="grid overflow-hidden rounded-box border border-base-300 bg-base-100 shadow-sm lg:grid-cols-[minmax(18rem,0.72fr)_minmax(0,1.28fr)]"
         >
-          <div class="grid content-between gap-8 border-b border-base-300 bg-base-200/60 p-6 sm:p-8 lg:border-b-0 lg:border-r">
+          <div class="grid gap-8 border-b border-base-300 bg-base-200/60 p-6 sm:p-8 lg:border-b-0 lg:border-r">
             <div class="space-y-4">
               <p class="font-mono text-xs font-semibold uppercase tracking-[0.2em] text-primary">
                 device onboarding
@@ -38,7 +42,11 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
           </div>
 
           <div class="p-6 sm:p-8">
-            <div :if={@contract} id="invite-metadata" class="grid gap-6">
+            <div
+              :if={@invite_state in [:ready, :device_pending, :device_error]}
+              id="invite-metadata"
+              class="grid gap-6"
+            >
               <div id="invite-contract" class="contents">
                 <div class="space-y-2">
                   <h2 class="text-xl font-semibold text-base-content">Invite details</h2>
@@ -47,33 +55,42 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                   </p>
                 </div>
 
-                <div class="rounded-box border border-base-300 bg-base-200/40 p-4">
+                <div class="min-w-0 rounded-box border border-base-300 bg-base-200/40 p-4">
                   <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
                     Target Pool
                   </p>
-                  <p id="invite-pool-name" class="mt-1 text-lg font-semibold text-base-content">
+                  <p
+                    id="invite-pool-name"
+                    class="mt-1 min-w-0 [overflow-wrap:anywhere] text-lg font-semibold text-base-content"
+                  >
                     {@contract.pool_name}
                   </p>
                 </div>
 
-                <dl class="grid gap-3 sm:grid-cols-2">
-                  <div class="rounded-box border border-base-300 bg-base-100 p-4">
+                <dl class="grid min-w-0 gap-3 sm:grid-cols-2">
+                  <div class="min-w-0 rounded-box border border-base-300 bg-base-100 p-4">
                     <dt class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
                       Invited by
                     </dt>
-                    <dd id="invite-inviter" class="mt-2 font-semibold text-base-content">
+                    <dd
+                      id="invite-inviter"
+                      class="mt-2 min-w-0 [overflow-wrap:anywhere] font-semibold text-base-content"
+                    >
                       {@contract.inviter_label}
                     </dd>
                   </div>
-                  <div class="rounded-box border border-base-300 bg-base-100 p-4">
+                  <div class="min-w-0 rounded-box border border-base-300 bg-base-100 p-4">
                     <dt class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
                       Invited email
                     </dt>
-                    <dd id="invite-invited-email" class="mt-2 font-semibold text-base-content">
+                    <dd
+                      id="invite-invited-email"
+                      class="mt-2 min-w-0 [overflow-wrap:anywhere] font-semibold text-base-content"
+                    >
                       {invited_email_label(@contract.invited_email)}
                     </dd>
                   </div>
-                  <div class="rounded-box border border-base-300 bg-base-100 p-4">
+                  <div class="min-w-0 rounded-box border border-base-300 bg-base-100 p-4">
                     <dt class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
                       Invite status
                     </dt>
@@ -81,17 +98,21 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                       {invite_status_label(@contract.status)}
                     </dd>
                   </div>
-                  <div class="rounded-box border border-base-300 bg-base-100 p-4">
+                  <div class="min-w-0 rounded-box border border-base-300 bg-base-100 p-4">
                     <dt class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
                       Expires
                     </dt>
                     <dd id="invite-expiry-countdown" class="mt-2 font-semibold text-base-content">
-                      {expiry_countdown(@contract.expires_at)}
+                      {expiry_countdown(@contract.expires_at, @now)}
                     </dd>
                   </div>
                 </dl>
 
-                <div id="onboarding-actions" class="grid gap-3">
+                <div
+                  :if={@invite_state in [:ready, :device_error]}
+                  id="onboarding-actions"
+                  class="grid gap-3"
+                >
                   <button
                     id="device-onboarding-button"
                     type="button"
@@ -100,7 +121,11 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                     phx-disable-with="Starting device approval..."
                   >
                     <.icon name="hero-device-phone-mobile" class="size-4" />
-                    <span>Start device approval</span>
+                    <span>
+                      {if @invite_state == :device_error,
+                        do: "Try device approval again",
+                        else: "Start device approval"}
+                    </span>
                   </button>
                   <p class="text-sm leading-6 text-base-content/65">
                     Keep this page open after entering the code. It will continue automatically when approval is complete.
@@ -108,7 +133,7 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                 </div>
 
                 <div
-                  :if={@device_authorization}
+                  :if={@invite_state == :device_pending}
                   id="device-authorization"
                   class="rounded-box border border-base-300 bg-base-100 p-4"
                 >
@@ -159,7 +184,6 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                       aria-live="polite"
                     >
                       <span
-                        :if={@device_polling?}
                         id="device-poll-spinner"
                         class="loading loading-spinner loading-sm shrink-0 text-primary"
                         aria-hidden="true"
@@ -168,11 +192,22 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                     </div>
                   </div>
                 </div>
+
+                <div
+                  :if={@invite_state == :device_error}
+                  id="device-poll-status"
+                  class="flex min-h-12 items-center gap-3 rounded-box border border-error/30 bg-error/10 px-3 py-2 text-sm text-base-content/75"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <.icon name="hero-exclamation-triangle" class="size-4 shrink-0 text-error" />
+                  <span>{@device_poll_status}</span>
+                </div>
               </div>
             </div>
 
             <div
-              :if={@completed_onboarding}
+              :if={@invite_state == :accepted}
               id="invite-accepted"
               class="grid gap-5 rounded-box border border-success/30 bg-success/10 p-5 text-base-content shadow-sm"
             >
@@ -218,6 +253,9 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
                   id="invite-config-toml"
                   class="mt-4 overflow-x-auto rounded-box bg-base-200 p-3 text-xs leading-5 text-base-content"
                 ><code>{@completed_onboarding.config_text}</code></pre>
+                <p id="invite-config-features-hint" class="mt-3 text-xs text-base-content/65">
+                  If your config.toml already has a <code>[features]</code> table, add <code>api_key_model_discovery = true</code> to it instead of starting a second one.
+                </p>
               </div>
             </div>
 
@@ -235,7 +273,11 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
               </div>
             </div>
 
-            <div :if={@error_message} id="invite-error" class="alert alert-error items-start">
+            <div
+              :if={@invite_state == :invalid}
+              id="invite-error"
+              class="alert alert-error items-start"
+            >
               <.icon name="hero-exclamation-triangle" class="mt-0.5 size-5" />
               <div>
                 <p class="font-semibold">Invite unavailable</p>
@@ -256,20 +298,20 @@ defmodule CodexPoolerWeb.OnboardingLive.Invite.Components do
   defp invite_status_label(status) when is_binary(status), do: String.capitalize(status)
   defp invite_status_label(_status), do: "Unknown"
 
-  defp expiry_countdown(nil), do: "No expiry date"
+  defp expiry_countdown(nil, _now), do: "No expiry date"
 
-  defp expiry_countdown(expires_at) when is_binary(expires_at) do
+  defp expiry_countdown(expires_at, now) when is_binary(expires_at) do
     case DateTime.from_iso8601(expires_at) do
-      {:ok, expires_at, _offset} -> expiry_countdown(expires_at)
+      {:ok, expires_at, _offset} -> expiry_countdown(expires_at, now)
       _error -> "Expiry unavailable"
     end
   end
 
-  defp expiry_countdown(%DateTime{} = expires_at) do
-    seconds = DateTime.diff(expires_at, DateTime.utc_now(), :second)
+  defp expiry_countdown(%DateTime{} = expires_at, %DateTime{} = now) do
+    seconds = RelativeTime.seconds_until(expires_at, now)
 
     cond do
-      seconds <= 0 -> "Expired"
+      DateTime.compare(expires_at, now) != :gt -> "Expired"
       seconds < 60 -> "Expires in under 1 minute"
       seconds < 3_600 -> "Expires in #{ceil_div(seconds, 60)} minutes"
       seconds < 86_400 -> "Expires in #{ceil_div(seconds, 3_600)} hours"

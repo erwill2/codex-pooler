@@ -1,0 +1,818 @@
+defmodule CodexPooler.MixTasks.DevServerLifecycleTest do
+  use CodexPooler.UnixIntegrationCase,
+    async: false,
+    tools: ~w(make ps kill curl lsof perl /usr/bin/python3)
+
+  @script Path.expand("../../../dev_support/bin/dev-server-lifecycle", __DIR__)
+
+  test "make -j dev serializes owned stop, preparation, and replacement start" do
+    fixture = parallel_make_fixture!()
+
+    {output, code} =
+      System.cmd(
+        "make",
+        [
+          "-j4",
+          "DEV_SERVER_LIFECYCLE=#{fixture.lifecycle_path}",
+          "POSTGRES_PORT=#{fixture.postgres_port}",
+          "dev"
+        ],
+        cd: fixture.root,
+        env: [
+          {"CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING", nil},
+          {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"},
+          {"DEV_SERVER_STATE_DIR", fixture.state_dir},
+          {"DEV_SERVER_LOG", fixture.log_path},
+          {"DEV_SERVER_EVENT_LOG", fixture.event_log}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert code == 0, output
+
+    assert File.read!(fixture.event_log) |> String.split("\n", trim: true) == [
+             "stop_started",
+             "stop_completed",
+             "db_up",
+             "db_exec",
+             "compile",
+             "assets_setup",
+             "assets_build",
+             "docs_deps",
+             "create",
+             "migrate",
+             "pricing",
+             "start_owner_forwarding=absent"
+           ]
+  end
+
+  test "make dev refuses to start with a failed locked asset installation" do
+    fixture = parallel_make_fixture!()
+
+    {output, code} = System.cmd("make", ["-j4", "DEV_SERVER_LIFECYCLE=#{fixture.lifecycle_path}", "POSTGRES_PORT=#{fixture.postgres_port}", "dev"], cd: fixture.root, env: [{"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}, {"DEV_SERVER_EVENT_LOG", fixture.event_log}, {"DEV_SERVER_ASSET_SETUP_FAIL", "1"}], stderr_to_stdout: true)
+
+    assert code != 0
+    assert output =~ "asset installation failed"
+    assert File.read!(fixture.event_log) |> String.split("\n", trim: true) == ["stop_started", "stop_completed", "db_up", "db_exec", "compile"]
+  end
+
+  test "make dev refuses to start with a failed locked docs dependency installation" do
+    fixture = parallel_make_fixture!()
+
+    {output, code} = System.cmd("make", ["-j4", "DEV_SERVER_LIFECYCLE=#{fixture.lifecycle_path}", "POSTGRES_PORT=#{fixture.postgres_port}", "dev"], cd: fixture.root, env: [{"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}, {"DEV_SERVER_EVENT_LOG", fixture.event_log}, {"DEV_SERVER_DOCS_DEPS_FAIL", "1"}], stderr_to_stdout: true)
+
+    assert code != 0
+    assert output =~ "docs dependency installation failed"
+    assert File.read!(fixture.event_log) |> String.split("\n", trim: true) == ["stop_started", "stop_completed", "db_up", "db_exec", "compile", "assets_setup", "assets_build"]
+  end
+
+  test "make dev imports websocket owner forwarding from the repository environment" do
+    fixture = parallel_make_fixture!()
+    File.write!(Path.join(fixture.root, ".env"), "CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING=true\n")
+
+    {output, code} =
+      System.cmd(
+        "make",
+        [
+          "-j4",
+          "DEV_SERVER_LIFECYCLE=#{fixture.lifecycle_path}",
+          "POSTGRES_PORT=#{fixture.postgres_port}",
+          "dev"
+        ],
+        cd: fixture.root,
+        env: [
+          {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"},
+          {"DEV_SERVER_STATE_DIR", fixture.state_dir},
+          {"DEV_SERVER_LOG", fixture.log_path},
+          {"DEV_SERVER_EVENT_LOG", fixture.event_log}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert code == 0, output
+
+    assert File.read!(fixture.event_log) |> String.split("\n", trim: true) |> List.last() ==
+             "start_owner_forwarding=true"
+  end
+
+  test "start accepts the Makefile PORT assignment command and records the owned process" do
+    fixture = mix_server_fixture!()
+    login_home = temp_dir!("login-home")
+    File.write!(Path.join(login_home, ".bash_profile"), "PATH=/usr/bin:/bin\nexport PATH\n")
+
+    {output, code} =
+      lifecycle("start", fixture, [
+        {"HOME", login_home},
+        {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+      ])
+
+    log = File.read!(fixture.log_path)
+    assert code == 0, "lifecycle start failed: #{output}#{log}"
+    assert output =~ "owned dev server started"
+
+    active_run = fixture.state_dir |> Path.join("active") |> File.read!() |> String.trim()
+    receipt_path = Path.join(fixture.state_dir, "#{active_run}.receipt")
+    receipt = File.read!(receipt_path)
+    assert receipt =~ ~r/^pid\t[1-9][0-9]*$/m
+    assert receipt =~ ~r/^start_signature\t.+$/m
+    assert receipt =~ "command\t"
+    assert receipt =~ "mix phx.server"
+    assert receipt =~ "cwd\t#{File.cwd!()}"
+    assert receipt =~ "port\t#{fixture.port}"
+
+    [pid_string] = Regex.run(~r/^pid\t([1-9][0-9]*)$/m, receipt, capture: :all_but_first)
+    pid = String.to_integer(pid_string)
+    assert process_alive?(pid)
+    assert process_group(pid) == pid
+
+    assert {status_output, 0} =
+             lifecycle("status", fixture, [
+               {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+             ])
+
+    assert status_output =~ "healthz ok"
+
+    assert {stop_output, 0} =
+             lifecycle("stop", fixture, [
+               {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+             ])
+
+    assert stop_output =~ "owned dev server stopped"
+    refute process_alive?(pid)
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+    refute File.exists?(receipt_path)
+  end
+
+  test "start refuses unrelated healthy and non-healthy listeners without stopping them" do
+    for healthy? <- [true, false] do
+      fixture = server_fixture!(healthy?: healthy?, cwd: temp_dir!("unrelated"))
+
+      assert {output, code} = lifecycle("start", fixture)
+      assert code != 0
+      assert output =~ "refusing occupied port"
+      assert process_alive?(fixture.listener_pid)
+
+      stop_fixture(fixture)
+    end
+  end
+
+  test "start refuses a healthy server from another checkout" do
+    other_checkout = temp_dir!("other-checkout")
+    fixture = server_fixture!(healthy?: true, cwd: other_checkout)
+
+    assert {output, code} = lifecycle("start", fixture)
+    assert code != 0
+    assert output =~ "refusing occupied port"
+    assert process_alive?(fixture.listener_pid)
+
+    stop_fixture(fixture)
+  end
+
+  test "stop clears a stale legacy pidfile without requiring an ownership receipt" do
+    fixture = server_fixture!(start?: false, cwd: File.cwd!())
+    File.mkdir_p!(fixture.state_dir)
+    legacy_pid_path = Path.join(fixture.state_dir, "legacy.pid")
+    File.write!(legacy_pid_path, "999999\n")
+
+    assert {output, 0} = lifecycle("stop", fixture)
+    assert output =~ "removed stale legacy PID file"
+    refute File.exists?(legacy_pid_path)
+  end
+
+  test "stop succeeds when no lifecycle state exists" do
+    fixture = server_fixture!(start?: false, cwd: File.cwd!())
+
+    assert {output, 0} = lifecycle("stop", fixture)
+    assert output =~ "no owned dev server to stop"
+  end
+
+  test "stop adopts and stops a verified legacy listener without requiring an ownership receipt" do
+    fixture = server_fixture!(healthy?: true, cwd: File.cwd!())
+    File.mkdir_p!(fixture.state_dir)
+    legacy_pid_path = Path.join(fixture.state_dir, "legacy.pid")
+    File.write!(legacy_pid_path, "#{fixture.listener_pid}\n")
+
+    assert {output, 0} = lifecycle("stop", fixture)
+    assert output =~ "adopted verified legacy dev server"
+    assert output =~ "owned dev server stopped"
+    refute process_alive?(fixture.listener_pid)
+    refute File.exists?(legacy_pid_path)
+  end
+
+  test "stop refuses a legacy listener from another checkout" do
+    fixture = server_fixture!(healthy?: true, cwd: temp_dir!("legacy-other-checkout"))
+    File.mkdir_p!(fixture.state_dir)
+    legacy_pid_path = Path.join(fixture.state_dir, "legacy.pid")
+    File.write!(legacy_pid_path, "#{fixture.listener_pid}\n")
+
+    assert {output, code} = lifecycle("stop", fixture)
+    assert code != 0
+    assert output =~ "refusing legacy PID from another checkout"
+    assert process_alive?(fixture.listener_pid)
+
+    stop_fixture(fixture)
+  end
+
+  test "stop refuses a broken ownership pointer and cleans a reused-pid receipt without stopping that process" do
+    fixture = server_fixture!(healthy?: false, cwd: File.cwd!())
+    File.mkdir_p!(fixture.state_dir)
+
+    File.write!(Path.join(fixture.state_dir, "active"), "missing-run\n")
+
+    assert {output, code} = lifecycle("stop", fixture)
+    assert code != 0
+    assert output =~ "refusing"
+    assert process_alive?(fixture.listener_pid)
+
+    reused_run = "0123456789abcdef01234567"
+    File.write!(Path.join(fixture.state_dir, "active"), "#{reused_run}\n")
+
+    reused_receipt_path = Path.join(fixture.state_dir, "#{reused_run}.receipt")
+
+    File.write!(reused_receipt_path, """
+    version\t1
+    state\trunning
+    pid\t#{fixture.listener_pid}
+    start_signature\tnot-the-current-start
+    command\tmix phx.server
+    cwd\t#{File.cwd!()}
+    port\t#{fixture.port}
+    """)
+
+    # The recorded start signature proves the owned process is gone and the
+    # pid now belongs to someone else: the receipt is cleaned, the reused
+    # process is never signalled.
+    assert {output, 0} = lifecycle("stop", fixture)
+    assert output =~ "cleared stale ownership receipt"
+    assert output =~ "no live owned dev server to stop"
+    assert process_alive?(fixture.listener_pid)
+    refute File.exists?(reused_receipt_path)
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+
+    stop_fixture(fixture)
+  end
+
+  test "status reports a stale ownership receipt for a dead owned pid" do
+    fixture = server_fixture!(start?: false, cwd: File.cwd!())
+    write_stale_receipt!(fixture, pid: 999_999)
+
+    assert {output, code} = lifecycle("status", fixture)
+    assert code != 0
+    assert output =~ "stale ownership receipt"
+    assert output =~ "999999"
+    assert output =~ "no longer exists"
+    assert output =~ "start or stop will clean it"
+  end
+
+  test "an interrupted starting receipt gives a recovery hint without signalling an unproved process" do
+    fixture = server_fixture!(healthy?: false, cwd: File.cwd!())
+    %{receipt_path: receipt_path} = write_stale_receipt!(fixture, pid: fixture.listener_pid)
+    File.write!(receipt_path, File.read!(receipt_path) |> String.replace("state\trunning", "state\tstarting"))
+
+    for action <- ["status", "stop"] do
+      {output, code} = lifecycle(action, fixture)
+      assert code != 0
+      assert output =~ "ownership receipt that is not running"
+      assert output =~ "next:"
+      assert output =~ receipt_path
+      assert process_alive?(fixture.listener_pid)
+      assert File.exists?(receipt_path)
+    end
+  end
+
+  test "stop cleans a stale dead-pid receipt without touching other processes" do
+    sentinel = server_fixture!(healthy?: false, cwd: temp_dir!("stale-sentinel"))
+    fixture = server_fixture!(start?: false, cwd: File.cwd!())
+    %{receipt_path: receipt_path} = write_stale_receipt!(fixture, pid: 999_999)
+
+    assert {output, 0} = lifecycle("stop", fixture)
+    assert output =~ "cleared stale ownership receipt"
+    assert output =~ "no live owned dev server to stop"
+    refute File.exists?(receipt_path)
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+    assert process_alive?(sentinel.listener_pid)
+
+    stop_fixture(sentinel)
+  end
+
+  test "start recovers from a stale dead-pid receipt and then stops cleanly" do
+    fixture = mix_server_fixture!()
+    login_home = temp_dir!("stale-login-home")
+    File.write!(Path.join(login_home, ".bash_profile"), "PATH=/usr/bin:/bin\nexport PATH\n")
+    %{receipt_path: receipt_path, run_id: stale_run} = write_stale_receipt!(fixture, pid: 999_999)
+
+    {output, code} =
+      lifecycle("start", fixture, [
+        {"HOME", login_home},
+        {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+      ])
+
+    assert code == 0, "lifecycle start failed: #{output}"
+    assert output =~ "cleared stale ownership receipt"
+    assert output =~ "owned dev server started"
+    refute File.exists?(receipt_path)
+
+    active_run = fixture.state_dir |> Path.join("active") |> File.read!() |> String.trim()
+    refute active_run == stale_run
+
+    assert {stop_output, 0} =
+             lifecycle("stop", fixture, [
+               {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+             ])
+
+    assert stop_output =~ "owned dev server stopped"
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+  end
+
+  test "start recovers a stale receipt written through a symlinked path to this checkout" do
+    fixture = mix_server_fixture!()
+    login_home = temp_dir!("symlinked-receipt-login-home")
+    checkout_alias = Path.join(temp_dir!("checkout-alias"), "codex-pooler")
+    File.write!(Path.join(login_home, ".bash_profile"), "PATH=/usr/bin:/bin\nexport PATH\n")
+    File.ln_s!(File.cwd!(), checkout_alias)
+
+    %{receipt_path: receipt_path} =
+      write_stale_receipt!(fixture, pid: 999_999, cwd: checkout_alias)
+
+    {output, code} =
+      lifecycle("start", fixture, [
+        {"HOME", login_home},
+        {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+      ])
+
+    assert code == 0, "lifecycle start failed: #{output}"
+    assert output =~ "cleared stale ownership receipt"
+    assert output =~ "owned dev server started"
+    refute File.exists?(receipt_path)
+
+    assert {stop_output, 0} =
+             lifecycle("stop", fixture, [
+               {"PATH", "#{fixture.bin_dir}:#{System.fetch_env!("PATH")}"}
+             ])
+
+    assert stop_output =~ "owned dev server stopped"
+  end
+
+  test "start explains a stale receipt recorded by another checkout without changing it" do
+    fixture = server_fixture!(start?: false, cwd: File.cwd!())
+    foreign_checkout = temp_dir!("foreign-checkout")
+
+    %{receipt_path: receipt_path} =
+      write_stale_receipt!(fixture, pid: 999_999, cwd: foreign_checkout)
+
+    assert {output, code} = lifecycle("start", fixture)
+    assert code != 0
+    assert output =~ "another checkout"
+    assert output =~ "ownership receipt=#{receipt_path}"
+    assert output =~ "recorded state=running pid=999999 alive=no listener=no port=#{fixture.port}"
+    assert output =~ "recorded checkout=#{foreign_checkout}"
+    assert output =~ "current checkout=#{File.cwd!()} requested port=#{fixture.port}"
+    assert output =~ "no process was stopped and no lifecycle state was changed"
+    assert output =~ "run make dev-status from the recorded checkout"
+    assert File.exists?(Path.join(fixture.state_dir, "active"))
+    assert File.exists?(receipt_path)
+  end
+
+  test "stop explains a stale receipt recorded by another checkout without changing it" do
+    fixture = server_fixture!(start?: false, cwd: File.cwd!())
+    foreign_checkout = temp_dir!("foreign-checkout")
+
+    %{receipt_path: receipt_path} =
+      write_stale_receipt!(fixture, pid: 999_999, cwd: foreign_checkout)
+
+    assert {output, code} = lifecycle("stop", fixture)
+    assert code != 0
+    assert output =~ "another checkout"
+    assert output =~ "ownership receipt=#{receipt_path}"
+    assert output =~ "recorded checkout=#{foreign_checkout}"
+    assert output =~ "no process was stopped and no lifecycle state was changed"
+    assert File.exists?(Path.join(fixture.state_dir, "active"))
+    assert File.exists?(receipt_path)
+  end
+
+  test "start reports listener and health diagnostics when a new server never becomes ready" do
+    fixture = server_fixture!(start?: false, healthy?: false, cwd: File.cwd!())
+
+    assert {output, code} = lifecycle("start", fixture, [{"DEV_SERVER_START_ATTEMPTS", "2"}])
+    assert code != 0
+    assert output =~ "startup diagnostics: pid="
+
+    # A server that never becomes ready has no deterministic listener state: by
+    # the time diagnostics are collected the port may or may not still be bound,
+    # and CI has observed both. `alive` and `health` are fixed by construction —
+    # the process is kept alive and the fixture never reports healthy — so those
+    # are asserted exactly, and the listener field is asserted to be reported
+    # rather than to hold a particular value. The test's subject is that the
+    # diagnostics are emitted, not that the listener survived.
+    assert output =~ ~r/alive=yes listener=(?:yes|no) health=failed/
+    assert output =~ "health url=http://127.0.0.1:#{fixture.port}/healthz"
+    assert output =~ "server log=#{fixture.log_path}"
+    assert output =~ "inspect the log, correct the reported boot failure, then rerun make dev"
+    assert output =~ "server did not become ready; owned process was cleaned"
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+  end
+
+  test "start records ownership and stop terminates only the revalidated owned listener" do
+    fixture = server_fixture!(start?: false, healthy?: true, cwd: File.cwd!(), long?: true)
+    unrelated = server_fixture!(healthy?: false, cwd: temp_dir!("sentinel"))
+
+    assert {output, 0} = lifecycle("start", fixture)
+    assert output =~ "owned dev server started"
+
+    active_run = fixture.state_dir |> Path.join("active") |> File.read!() |> String.trim()
+    receipt = File.read!(Path.join(fixture.state_dir, "#{active_run}.receipt"))
+    assert receipt =~ "start_signature\t"
+    assert receipt =~ "command\t"
+    assert receipt =~ "cwd\t#{File.cwd!()}"
+    assert receipt =~ "port\t#{fixture.port}"
+
+    assert {output, 0} = lifecycle("stop", fixture)
+    assert output =~ "owned dev server stopped"
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+    assert process_alive?(unrelated.listener_pid)
+
+    stop_fixture(unrelated)
+  end
+
+  test "stop escalates a hung owned process after TERM" do
+    fixture = server_fixture!(start?: false, healthy?: true, cwd: File.cwd!(), ignore_term?: true)
+
+    assert {_output, 0} = lifecycle("start", fixture)
+    assert {output, 0} = lifecycle("stop", fixture, [{"DEV_SERVER_TERM_ATTEMPTS", "2"}])
+    assert output =~ "escalating to KILL"
+  end
+
+  test "stop succeeds when the owned process exits while KILL is delivered" do
+    fixture = server_fixture!(start?: false, healthy?: true, cwd: File.cwd!(), ignore_term?: true)
+    bash_env = Path.join(Path.dirname(fixture.log_path), "kill-race.bash")
+    race_marker = Path.join(Path.dirname(fixture.log_path), "kill-race-observed")
+
+    File.write!(bash_env, """
+    kill() {
+      if [ "${1:-}" = "-KILL" ] && [ ! -e "$DEV_SERVER_KILL_RACE_MARKER" ]; then
+        : > "$DEV_SERVER_KILL_RACE_MARKER"
+        builtin kill "$@" >/dev/null 2>&1 || true
+        return 1
+      fi
+
+      builtin kill "$@"
+    }
+    """)
+
+    assert {_output, 0} = lifecycle("start", fixture)
+
+    assert {output, 0} =
+             lifecycle("stop", fixture, [
+               {"BASH_ENV", bash_env},
+               {"DEV_SERVER_KILL_RACE_MARKER", race_marker},
+               {"DEV_SERVER_TERM_ATTEMPTS", "2"}
+             ])
+
+    assert output =~ "escalating to KILL"
+    assert output =~ "owned dev server stopped"
+    assert File.exists?(race_marker)
+  end
+
+  test "start rejects malformed commands before creating ownership state" do
+    fixture = server_fixture!(start?: false, healthy?: true, cwd: File.cwd!())
+    fixture = %{fixture | command: "mix\nphx.server"}
+
+    assert {output, code} = lifecycle("start", fixture)
+    assert code != 0
+    assert output =~ "invalid server command"
+    refute File.exists?(Path.join(fixture.state_dir, "active"))
+  end
+
+  defp write_stale_receipt!(fixture, opts) do
+    pid = Keyword.fetch!(opts, :pid)
+    cwd = Keyword.get(opts, :cwd, File.cwd!())
+    run_id = "feedfacefeedfacefeedface"
+    File.mkdir_p!(fixture.state_dir)
+    File.chmod!(fixture.state_dir, 0o700)
+    receipt_path = Path.join(fixture.state_dir, "#{run_id}.receipt")
+
+    File.write!(receipt_path, """
+    version\t1
+    state\trunning
+    pid\t#{pid}
+    start_signature\tTue Aug 11 14:51:05 2026
+    command\tmix phx.server
+    cwd\t#{cwd}
+    port\t#{fixture.port}
+    """)
+
+    File.write!(Path.join(fixture.state_dir, "active"), "#{run_id}\n")
+    %{receipt_path: receipt_path, run_id: run_id}
+  end
+
+  defp parallel_make_fixture! do
+    {:ok, postgres_listener} =
+      :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+
+    {:ok, postgres_port} = :inet.port(postgres_listener)
+    on_exit(fn -> :gen_tcp.close(postgres_listener) end)
+
+    root = temp_dir!("parallel-make")
+    File.cp!(Path.expand("../../../Makefile", __DIR__), Path.join(root, "Makefile"))
+    bin_dir = Path.join(root, "bin")
+    event_log = Path.join(root, "events.log")
+    lifecycle_path = Path.join(root, "lifecycle")
+    state_dir = Path.join(root, "state")
+    log_path = Path.join(root, "server.log")
+    File.mkdir_p!(bin_dir)
+
+    File.write!(lifecycle_path, """
+    #!/bin/bash
+    set -euo pipefail
+    case "$1" in
+      stop)
+        printf 'stop_started\n' >> "$DEV_SERVER_EVENT_LOG"
+        sleep 0.4
+        printf 'stop_completed\n' >> "$DEV_SERVER_EVENT_LOG"
+        ;;
+      start)
+        grep -qx 'pricing' "$DEV_SERVER_EVENT_LOG"
+        grep -qx 'docs_deps' "$DEV_SERVER_EVENT_LOG"
+        printf 'start_owner_forwarding=%s\n' "${CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING:-absent}" >> "$DEV_SERVER_EVENT_LOG"
+        ;;
+      *) exit 2 ;;
+    esac
+    """)
+
+    File.write!(Path.join(bin_dir, "docker"), """
+    #!/bin/bash
+    set -euo pipefail
+    grep -qx 'stop_completed' "$DEV_SERVER_EVENT_LOG"
+    case " $* " in
+      *' up '*) printf 'db_up\n' >> "$DEV_SERVER_EVENT_LOG" ;;
+      *' exec '*) printf 'db_exec\n' >> "$DEV_SERVER_EVENT_LOG" ;;
+    esac
+    """)
+
+    # The Makefile routes every Mix call through `mise x --` when mise is on
+    # PATH, which resolves `mix` from the pinned toolchain and so walks straight
+    # past the stub below. That made this fixture depend on the host: green in
+    # CI, where the elixir image has no mise, and red locally with a real `mix`
+    # running in a directory that has no mix.exs. Stubbing mise too makes the
+    # fixture deterministic either way, since `command -v mise` finds this first.
+    File.write!(Path.join(bin_dir, "mise"), """
+    #!/bin/bash
+    set -euo pipefail
+    if [ "${1:-}" = "x" ] || [ "${1:-}" = "exec" ]; then
+      shift
+      [ "${1:-}" = "--" ] && shift
+    fi
+    exec "$@"
+    """)
+
+    File.write!(Path.join(bin_dir, "npm"), """
+    #!/bin/bash
+    set -euo pipefail
+    [ "$*" = 'ci --prefix docs-site' ]
+    grep -qx 'assets_build' "$DEV_SERVER_EVENT_LOG"
+    if [ "${DEV_SERVER_DOCS_DEPS_FAIL:-0}" = 1 ]; then
+      printf 'docs dependency installation failed\n' >&2
+      exit 1
+    fi
+    printf 'docs_deps\n' >> "$DEV_SERVER_EVENT_LOG"
+    """)
+
+    File.write!(Path.join(bin_dir, "mix"), """
+    #!/bin/bash
+    set -euo pipefail
+    grep -qx 'stop_completed' "$DEV_SERVER_EVENT_LOG"
+    case "$1 ${2:-}" in
+      'compile --force') grep -qx 'db_exec' "$DEV_SERVER_EVENT_LOG"; event=compile ;;
+      'assets.setup ')
+        grep -qx 'compile' "$DEV_SERVER_EVENT_LOG"
+        if [ "${DEV_SERVER_ASSET_SETUP_FAIL:-0}" = 1 ]; then
+          printf 'asset installation failed\n' >&2
+          exit 1
+        fi
+        event=assets_setup
+        ;;
+      'assets.build ') grep -qx 'assets_setup' "$DEV_SERVER_EVENT_LOG"; event=assets_build ;;
+      'ecto.create --quiet') grep -qx 'docs_deps' "$DEV_SERVER_EVENT_LOG"; event=create ;;
+      'run --no-start')
+        [ "$#" -eq 4 ]
+        [ "$3" = '-e' ]
+        [ "$4" = 'CodexPooler.Release.migrate()' ]
+        grep -qx 'create' "$DEV_SERVER_EVENT_LOG"
+        event=migrate
+        ;;
+      'pricing.import_openai ') grep -qx 'migrate' "$DEV_SERVER_EVENT_LOG"; event=pricing ;;
+      *) exit 2 ;;
+    esac
+    printf '%s\n' "$event" >> "$DEV_SERVER_EVENT_LOG"
+    """)
+
+    Enum.each(
+      [
+        lifecycle_path,
+        Path.join(bin_dir, "docker"),
+        Path.join(bin_dir, "mix"),
+        Path.join(bin_dir, "mise"),
+        Path.join(bin_dir, "npm")
+      ],
+      &File.chmod!(&1, 0o700)
+    )
+
+    %{
+      root: root,
+      bin_dir: bin_dir,
+      event_log: event_log,
+      lifecycle_path: lifecycle_path,
+      postgres_port: postgres_port,
+      state_dir: state_dir,
+      log_path: log_path
+    }
+  end
+
+  defp lifecycle(action, fixture, extra_env \\ []) do
+    System.cmd(@script, [action],
+      cd: File.cwd!(),
+      env:
+        [
+          {"DEV_SERVER_PORT", Integer.to_string(fixture.port)},
+          {"DEV_SERVER_STATE_DIR", fixture.state_dir},
+          {"DEV_SERVER_LEGACY_PID", Path.join(fixture.state_dir, "legacy.pid")},
+          {"DEV_SERVER_LOG", fixture.log_path},
+          {"DEV_SERVER_CWD", File.cwd!()},
+          {"DEV_SERVER_COMMAND", fixture.command},
+          {"DEV_SERVER_HEALTH_URL", "http://127.0.0.1:#{fixture.port}/healthz"},
+          {"DEV_SERVER_START_ATTEMPTS", "100"},
+          {"DEV_SERVER_POLL_SECONDS", "0.02"}
+        ] ++ extra_env,
+      stderr_to_stdout: true
+    )
+  end
+
+  defp server_fixture!(opts) do
+    port = unused_port!()
+    directory = temp_dir!("server")
+    state_dir = Path.join(directory, "state")
+    log_path = Path.join(directory, "server.log")
+    script = Path.join(directory, "fixture_server.py")
+    healthy = if Keyword.get(opts, :healthy?, false), do: "true", else: "false"
+    ignore_term = if Keyword.get(opts, :ignore_term?, false), do: "true", else: "false"
+    padding = if Keyword.get(opts, :long?, false), do: String.duplicate("x", 600), else: "short"
+
+    File.write!(script, """
+    #!/usr/bin/python3
+    import http.server, signal, socketserver, sys
+    healthy = sys.argv[2] == "true"
+    if sys.argv[3] == "true": signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    class Handler(http.server.BaseHTTPRequestHandler):
+      def do_GET(self):
+        status = 200 if healthy and self.path == "/healthz" else 503
+        body = b'{"status":"ok"}' if status == 200 else b'no'
+        self.send_response(status); self.end_headers(); self.wfile.write(body)
+      def log_message(self, *_args): pass
+    with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), Handler) as server: server.serve_forever()
+    """)
+
+    File.chmod!(script, 0o700)
+
+    command = "#{script} #{port} #{healthy} #{ignore_term} mix phx.server #{padding}"
+    fixture = %{port: port, state_dir: state_dir, log_path: log_path, command: command}
+
+    if Keyword.get(opts, :start?, true) do
+      port_handle =
+        Port.open({:spawn_executable, script}, [
+          :binary,
+          :exit_status,
+          args: [Integer.to_string(port), healthy, ignore_term, "mix", "phx.server", padding],
+          cd: Keyword.fetch!(opts, :cwd)
+        ])
+
+      {:os_pid, pid} = Port.info(port_handle, :os_pid)
+      await_listener!(port)
+      on_exit(fn -> stop_os_pid(pid) end)
+      Map.merge(fixture, %{listener_pid: pid, port_handle: port_handle})
+    else
+      fixture
+    end
+  end
+
+  defp mix_server_fixture! do
+    port = unused_port!()
+    directory = temp_dir!("makefile-command")
+    bin_dir = Path.join(directory, "bin")
+    state_dir = Path.join(directory, "state")
+    log_path = Path.join(directory, "server.log")
+    mix_path = Path.join(bin_dir, "mix")
+
+    File.mkdir_p!(bin_dir)
+
+    File.write!(mix_path, """
+    #!/usr/bin/python3
+    import http.server
+    import os
+    import sys
+
+    if sys.argv[1:] != ["phx.server"]:
+        raise SystemExit(2)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            status = 200 if self.path == "/healthz" else 404
+            body = b'{"status":"ok"}' if status == 200 else b'not found'
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", int(os.environ["PORT"])), Handler) as server:
+        server.serve_forever()
+    """)
+
+    File.chmod!(mix_path, 0o700)
+
+    %{
+      port: port,
+      bin_dir: bin_dir,
+      state_dir: state_dir,
+      log_path: log_path,
+      command: "PORT=#{port} mix phx.server"
+    }
+  end
+
+  defp stop_fixture(%{listener_pid: pid, port_handle: port_handle}) do
+    stop_os_pid(pid)
+    Port.close(port_handle)
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp stop_fixture(_fixture), do: :ok
+
+  defp process_alive?(pid) do
+    {_output, code} = signal_os_pid(pid, "-0")
+
+    code == 0
+  end
+
+  defp process_group(pid) do
+    {output, 0} =
+      System.cmd("ps", ["-o", "pgid=", "-p", Integer.to_string(pid)], stderr_to_stdout: true)
+
+    output |> String.trim() |> String.to_integer()
+  end
+
+  defp stop_os_pid(pid) do
+    if process_alive?(pid) do
+      _ = signal_os_pid(pid, "-TERM")
+    end
+
+    await_process_exit(pid, 100)
+  end
+
+  defp await_process_exit(_pid, 0), do: :ok
+
+  defp await_process_exit(pid, attempts) do
+    if process_alive?(pid) do
+      Process.sleep(10)
+      await_process_exit(pid, attempts - 1)
+    else
+      :ok
+    end
+  end
+
+  defp signal_os_pid(pid, signal) do
+    executable = System.find_executable("kill") || raise "missing kill executable"
+    System.cmd(executable, [signal, Integer.to_string(pid)], stderr_to_stdout: true)
+  end
+
+  defp await_listener!(port, attempts \\ 100)
+  defp await_listener!(_port, 0), do: flunk("listener did not start")
+
+  defp await_listener!(port, attempts) do
+    case :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 20) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+
+      {:error, _reason} ->
+        Process.sleep(10)
+        await_listener!(port, attempts - 1)
+    end
+  end
+
+  defp unused_port! do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp temp_dir!(label) do
+    path =
+      Path.join(System.tmp_dir!(), "codex-pooler-#{label}-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(path)
+    on_exit(fn -> File.rm_rf!(path) end)
+    path
+  end
+end

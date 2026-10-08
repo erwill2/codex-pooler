@@ -1,5 +1,17 @@
 SHELL := /bin/bash
 
+# Use mise for the repository-pinned Elixir/Erlang toolchain when installed,
+# and launch npm through the same environment; Node/npm are not pinned here.
+# Without mise, fall back to the commands on PATH.
+MISE := $(shell command -v mise 2>/dev/null)
+ifeq ($(MISE),)
+MIX := mix
+NPM := npm
+else
+MIX := $(MISE) x -- mix
+NPM := $(MISE) x -- npm
+endif
+
 PORT ?= 4000
 POSTGRES_PORT ?= 5433
 POSTGRES_WAIT_TIMEOUT ?= 60
@@ -7,20 +19,30 @@ POSTGRES_WAIT_ATTEMPTS ?= 30
 DEV_POSTGRES_DB := codex_pooler_dev
 DEV_POSTGRES_USER := postgres
 DEV_POSTGRES_PASSWORD := postgres
-DEV_PID := tmp/dev-server.pid
 DEV_LOG := tmp/dev-server.log
+DEV_SERVER_STATE_DIR ?= tmp/dev-server
+DEV_SERVER_LIFECYCLE := dev_support/bin/dev-server-lifecycle
 DEV_COMPOSE := POSTGRES_PORT=$(POSTGRES_PORT) docker compose -f docker-compose.dev.yml
 DEV_DB_ENV := POSTGRES_HOST=localhost POSTGRES_PORT=$(POSTGRES_PORT) POSTGRES_DB=$(DEV_POSTGRES_DB) POSTGRES_USER=$(DEV_POSTGRES_USER) POSTGRES_PASSWORD=$(DEV_POSTGRES_PASSWORD)
-DEV_SECRET_ENV := if [ -f .env ]; then while IFS= read -r line; do case "$$line" in CODEX_POOLER_UPSTREAM_SECRET_KEY=*|CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION=*) export "$$line";; esac; done < .env; fi;
+DEV_SECRET_ENV := if [ -f .env ]; then while IFS= read -r line; do case "$$line" in CODEX_POOLER_UPSTREAM_SECRET_KEY=*|CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION=*|CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING=*) export "$$line";; esac; done < .env; fi;
+N ?= 4
+# Test-only shell acceptance overrides. Normal runs must use the default commands.
+TEST_FAST_COMMAND ?= $(MIX) test.product
+TEST_FAST_DROP_COMMAND ?= $(MIX) ecto.drop --quiet
 
-.PHONY: dev dev-db dev-compile dev-migrate dev-pricing dev-stop dev-status dev-logs precommit smoke
+.PHONY: dev dev-prepare dev-db dev-compile dev-assets dev-docs-deps dev-migrate dev-pricing dev-stop dev-status dev-logs precommit smoke test-db-prune test-fast
 
-dev: dev-db dev-compile dev-migrate dev-pricing dev-stop
-	@mkdir -p tmp
-	@echo "starting Phoenix dev server on http://localhost:$(PORT)"
-	@$(DEV_SECRET_ENV) PORT=$(PORT) $(DEV_DB_ENV) nohup mix phx.server > $(DEV_LOG) 2>&1 < /dev/null & echo $$! > $(DEV_PID)
-	@sleep 2
-	@$(MAKE) --no-print-directory dev-status
+dev: dev-prepare
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) DEV_SERVER_PORT=$(PORT) DEV_SERVER_STATE_DIR=$(DEV_SERVER_STATE_DIR) DEV_SERVER_LOG=$(DEV_LOG) DEV_SERVER_CWD=$(CURDIR) DEV_SERVER_COMMAND='PORT=$(PORT) $(MIX) phx.server' $(DEV_SERVER_LIFECYCLE) start
+
+dev-prepare:
+	@$(MAKE) --no-print-directory dev-stop
+	@$(MAKE) --no-print-directory dev-db
+	@$(MAKE) --no-print-directory dev-compile
+	@$(MAKE) --no-print-directory dev-assets
+	@$(MAKE) --no-print-directory dev-docs-deps
+	@$(MAKE) --no-print-directory dev-migrate
+	@$(MAKE) --no-print-directory dev-pricing
 
 dev-db:
 	@$(DEV_COMPOSE) up -d --wait --wait-timeout $(POSTGRES_WAIT_TIMEOUT) db
@@ -42,49 +64,251 @@ dev-db:
 	exit 1
 
 dev-compile:
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix compile --force
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) compile --force
+
+dev-assets:
+	@$(MIX) assets.setup
+	@$(MIX) assets.build
+
+dev-docs-deps:
+	@$(NPM) ci --prefix docs-site
 
 dev-migrate:
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix ecto.create --quiet
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix ecto.migrate
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) ecto.create --quiet
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) run --no-start -e 'CodexPooler.Release.migrate()'
 
 dev-pricing:
-	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) mix pricing.import_openai
+	@$(DEV_SECRET_ENV) $(DEV_DB_ENV) $(MIX) pricing.import_openai
 
 dev-stop:
-	@if [ -f $(DEV_PID) ]; then \
-		pid=$$(cat $(DEV_PID)); \
-		if kill -0 $$pid >/dev/null 2>&1; then \
-			echo "stopping Phoenix dev server pid $$pid"; \
-			kill $$pid; \
-			for _ in 1 2 3 4 5; do \
-				kill -0 $$pid >/dev/null 2>&1 || break; \
-				sleep 1; \
-			done; \
-			kill -9 $$pid >/dev/null 2>&1 || true; \
-		fi; \
-		rm -f $(DEV_PID); \
-	fi
-	@for pid in $$(lsof -tiTCP:$(PORT) -sTCP:LISTEN 2>/dev/null); do \
-		echo "stopping process listening on port $(PORT): $$pid"; \
-		kill $$pid >/dev/null 2>&1 || true; \
-	done
+	@DEV_SERVER_PORT=$(PORT) DEV_SERVER_STATE_DIR=$(DEV_SERVER_STATE_DIR) DEV_SERVER_LOG=$(DEV_LOG) DEV_SERVER_CWD=$(CURDIR) $(DEV_SERVER_LIFECYCLE) stop
 
 dev-status:
-	@if [ -f $(DEV_PID) ] && kill -0 $$(cat $(DEV_PID)) >/dev/null 2>&1; then \
-		echo "Phoenix dev server running pid $$(cat $(DEV_PID))"; \
-		curl -fsS "http://localhost:$(PORT)/healthz" >/dev/null && echo "healthz ok"; \
-	else \
-		echo "Phoenix dev server is not running"; \
-		if [ -f $(DEV_LOG) ]; then tail -n 80 $(DEV_LOG); fi; \
-		exit 1; \
-	fi
+	@DEV_SERVER_PORT=$(PORT) DEV_SERVER_STATE_DIR=$(DEV_SERVER_STATE_DIR) DEV_SERVER_LOG=$(DEV_LOG) DEV_SERVER_CWD=$(CURDIR) $(DEV_SERVER_LIFECYCLE) status
 
 dev-logs:
 	@tail -f $(DEV_LOG)
 
 precommit:
-	@mix precommit
+	@$(MIX) precommit
 
-smoke:
-	@scripts/dev/codex-smoke.sh
+# Drops the run-scoped test databases that killed or crashed runs left behind. A database any
+# session is connected to, or a running test holds, is kept.
+test-db-prune:
+	@MIX_ENV=test $(MIX) codex_pooler.test.prune_databases
+
+# Every partition VM starts with `+hmbs 1000000`, a minimum binary virtual heap of one million words (the VM default is 46,422), and
+# the caller's ERL_FLAGS follow it, so they can override it. With the default, the compile of a large test file (the 17 KB file that
+# expands one body 72 times, a 12,500-line controller test) spends most of its time in garbage collections forced by the virtual
+# binary heap: the compile cycle of the partitions that hold such files is 27-41% shorter with the flag. Test VMs only.
+# Each partition writes the wall time of every test file it ran to its own file (CodexPooler.TestFileDurations).
+# With TEST_FAST_PRINT_FILE_DURATIONS=1 a passing run prints those files after the partition results, which is how
+# a saved CI log carries the duration of every test file: mix test.partition_weights turns such a log into the
+# weights mix test.product and mix test.tooling deal their partitions by (test/partition_weights.tsv).
+test-fast:
+	@partitions="$(N)"; \
+	if [[ ! "$$partitions" =~ ^[0-9]+$$ ]] || (( 10#$$partitions < 1 || 10#$$partitions > 4 )); then \
+		echo "test-fast: N must be an integer from 1 to 4 (got '$$partitions')"; \
+		exit 2; \
+	fi; \
+	partitions=$$((10#$$partitions)); \
+	logical_cpus="$${TEST_FAST_LOGICAL_CPUS:-}"; \
+	if [ -n "$$logical_cpus" ]; then \
+		if [[ ! "$$logical_cpus" =~ ^[0-9]+$$ ]] || (( 10#$$logical_cpus < 1 )); then \
+			echo "test-fast: TEST_FAST_LOGICAL_CPUS must be a positive integer (got '$$logical_cpus')"; \
+			exit 2; \
+		fi; \
+	else \
+		logical_cpus=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || true); \
+		if [[ ! "$$logical_cpus" =~ ^[0-9]+$$ ]] || (( 10#$$logical_cpus < 1 )); then \
+			logical_cpus=$$(nproc 2>/dev/null || true); \
+		fi; \
+		if [[ ! "$$logical_cpus" =~ ^[0-9]+$$ ]] || (( 10#$$logical_cpus < 1 )); then \
+			logical_cpus=$$(sysctl -n hw.logicalcpu 2>/dev/null || true); \
+		fi; \
+		if [[ ! "$$logical_cpus" =~ ^[0-9]+$$ ]] || (( 10#$$logical_cpus < 1 )); then \
+			echo "test-fast: failed to detect the host logical CPU count"; \
+			exit 1; \
+		fi; \
+	fi; \
+	logical_cpus=$$((10#$$logical_cpus)); \
+	schedulers_per_partition=$$((logical_cpus / partitions)); \
+	if [ "$$schedulers_per_partition" -lt 1 ]; then schedulers_per_partition=1; fi; \
+	partition_erl_flags="+hmbs 1000000 $${ERL_FLAGS:+$${ERL_FLAGS} }+S $$schedulers_per_partition:$$schedulers_per_partition"; \
+	echo "test-fast: scheduler budget $$logical_cpus logical CPUs, $$schedulers_per_partition per partition"; \
+	run_namespace=$$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n'); \
+	if [[ ! "$$run_namespace" =~ ^[0-9a-f]{16}$$ ]]; then \
+		echo "test-fast: failed to generate invocation namespace"; \
+		exit 1; \
+	fi; \
+	if ! epmd -daemon >/dev/null 2>&1; then \
+		echo "test-fast: failed to start EPMD"; \
+		exit 1; \
+	fi; \
+	epmd_ready=0; \
+	for _ in $$(seq 1 200); do \
+		if epmd -names >/dev/null 2>&1; then epmd_ready=1; break; fi; \
+		sleep 0.01; \
+	done; \
+	if [ "$$epmd_ready" -ne 1 ]; then \
+		echo "test-fast: EPMD did not become ready"; \
+		exit 1; \
+	fi; \
+	log_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/codex-pooler-test-fast.XXXXXX"); \
+	pids=(); \
+	logs=(); \
+	results=(); \
+	child_running() { \
+		local pid="$$1" state; \
+		[ -n "$$pid" ] || return 1; \
+		kill -0 "$$pid" >/dev/null 2>&1 || return 1; \
+		state=$$(ps -o stat= -p "$$pid" 2>/dev/null || true); \
+		[[ "$$state" != *Z* ]]; \
+	}; \
+	terminate_children() { \
+		local pid attempt; \
+		for pid in "$${pids[@]}"; do \
+			[ -z "$$pid" ] || kill -TERM "$$pid" >/dev/null 2>&1 || true; \
+		done; \
+		for attempt in $$(seq 1 20); do \
+			local running=0; \
+			for pid in "$${pids[@]}"; do \
+				if child_running "$$pid"; then running=1; fi; \
+			done; \
+			[ "$$running" -eq 0 ] && break; \
+			sleep 0.1; \
+		done; \
+		for pid in "$${pids[@]}"; do \
+			if child_running "$$pid"; then kill -KILL "$$pid" >/dev/null 2>&1 || true; fi; \
+			done; \
+		for pid in "$${pids[@]}"; do \
+			[ -z "$$pid" ] || wait "$$pid" 2>/dev/null || true; \
+		done; \
+	}; \
+	cleanup_databases() { \
+		local partition cleanup_failures=0; \
+		for partition in $$(seq 1 "$$partitions"); do \
+			if ! MIX_ENV=test CODEX_POOLER_TEST_RUN_NAMESPACE="$$run_namespace" MIX_TEST_PARTITION="$$partition" $(TEST_FAST_DROP_COMMAND) >/dev/null 2>&1; then \
+				echo "test-fast: failed to drop invocation database for partition $$partition/$$partitions"; \
+				cleanup_failures=$$((cleanup_failures + 1)); \
+			fi; \
+		done; \
+		[ "$$cleanup_failures" -eq 0 ]; \
+	}; \
+	cleanup_logs() { \
+		case "$$log_dir" in \
+			"$${TMPDIR:-/tmp}"/codex-pooler-test-fast.*) rm -rf -- "$$log_dir" ;; \
+			*) echo "test-fast: refusing unsafe temporary log cleanup target"; return 1 ;; \
+		esac; \
+	}; \
+	finalize() { \
+		local rc="$$?" cleanup_rc=0; \
+		trap - EXIT INT TERM; \
+		terminate_children; \
+		cleanup_databases || cleanup_rc=1; \
+		cleanup_logs || cleanup_rc=1; \
+		if [ "$$rc" -eq 0 ] && [ "$$cleanup_rc" -ne 0 ]; then rc=1; fi; \
+		exit "$$rc"; \
+	}; \
+	interrupt() { \
+		local rc="$$1"; \
+		echo "test-fast: interrupted; stopping partitions"; \
+		exit "$$rc"; \
+	}; \
+	duration_locations() { \
+		cat "$$@" 2>/dev/null | cut -f1 | sort -u; \
+	}; \
+	duration_report() { \
+		local total; \
+		total=$$(awk '/^test duration report: [0-9]+ tests / { sum += $$4 } END { print sum + 0 }' "$$@" 2>/dev/null); \
+		[ "$${total:-0}" -eq 0 ] && return 0; \
+		echo "test-fast: duration report: $$total tests over the normal limit without @tag slow beside the other partitions (not a failure), longest first:"; \
+		awk '/^test duration report: / { block = 1; next } block && /^  [0-9]+\.[0-9]ms / { print; next } { block = 0 }' "$$@" 2>/dev/null | sort -rn | head -n 20; \
+		if [ "$$total" -gt 20 ]; then echo "  ... and $$((total - 20)) more"; fi; \
+		return 0; \
+	}; \
+	file_duration_report() { \
+		local partition file; \
+		[ "$${TEST_FAST_PRINT_FILE_DURATIONS:-}" = "1" ] || return 0; \
+		for partition in $$(seq 1 "$$partitions"); do \
+			file="$$log_dir/files-$$partition.tsv"; \
+			if [ -s "$$file" ]; then \
+				awk -F '\t' -v partition="$$partition" -v total="$$partitions" 'NR == 1 { header = $$0; sub(/^# codex-pooler test file durations /, "", header); print "test-fast: file durations partition " partition "/" total " " header " (sync_ms async_ms path)"; next } { print "  " $$2 " " $$3 " " $$1 }' "$$file"; \
+			else \
+				echo "test-fast: file durations partition $$partition/$$partitions none recorded"; \
+			fi; \
+		done; \
+		return 0; \
+	}; \
+	confirm_durations() { \
+		local round rc total locations; \
+		locations=($$(duration_locations "$$log_dir"/duration-*.tsv)); \
+		total=$${#locations[@]}; \
+		[ "$$total" -eq 0 ] && return 0; \
+		echo "test-fast: $$total tests exceeded the duration limits beside the other partitions; re-measuring them alone"; \
+		for round in 1 2 3; do \
+			(ERL_FLAGS="$$partition_erl_flags" CODEX_POOLER_TEST_RUN_NAMESPACE="$$run_namespace" MIX_TEST_PARTITION=1 CODEX_POOLER_TEST_DURATION_CANDIDATES="$$log_dir/confirm-$$round.tsv" $(TEST_FAST_COMMAND) "$${locations[@]}") > "$$log_dir/confirm-$$round.log" 2>&1 & \
+			pids[1]=$$!; \
+			while child_running "$${pids[1]}"; do sleep 0.1; done; \
+			if wait "$${pids[1]}"; then rc=0; else rc=$$?; fi; \
+			pids[1]=""; \
+			if [ "$$rc" -ne 0 ]; then \
+				echo "test-fast: FAIL (duration re-measurement $$round/3 exited $$rc)"; \
+				cat "$$log_dir/confirm-$$round.log"; \
+				return 1; \
+			fi; \
+			locations=($$(duration_locations "$$log_dir/confirm-$$round.tsv")); \
+			if [ "$${#locations[@]}" -eq 0 ]; then \
+				echo "test-fast: all $$total re-measured within the duration limits ($$round/3 runs)"; \
+				return 0; \
+			fi; \
+		done; \
+		echo "test-fast: FAIL (duration: $${#locations[@]} of $$total tests exceeded the limits in 3 runs on their own)"; \
+		tr '\t' ' ' < "$$log_dir/confirm-3.tsv"; \
+		return 1; \
+	}; \
+	trap finalize EXIT; \
+	trap 'interrupt 130' INT; \
+	trap 'interrupt 143' TERM; \
+	for partition in $$(seq 1 "$$partitions"); do \
+		logs[$$partition]="$$log_dir/partition-$$partition.log"; \
+		(ERL_FLAGS="$$partition_erl_flags" CODEX_POOLER_TEST_RUN_NAMESPACE="$$run_namespace" MIX_TEST_PARTITION="$$partition" CODEX_POOLER_TEST_DURATION_CANDIDATES="$$log_dir/duration-$$partition.tsv" CODEX_POOLER_TEST_FILE_DURATIONS="$$log_dir/files-$$partition.tsv" $(TEST_FAST_COMMAND) --partitions $$partitions) > "$${logs[$$partition]}" 2>&1 & \
+		pids[$$partition]=$$!; \
+	done; \
+	failures=0; \
+	for partition in $$(seq 1 "$$partitions"); do \
+		pid=$${pids[$$partition]}; \
+		while child_running "$$pid"; do sleep 0.1; done; \
+		if wait "$$pid"; then \
+			if awk '/^Result: / { result=$$0 } END { exit !(result ~ /^Result: [1-9][0-9]* passed( \([^)]*\))?(, [0-9]+ (skipped|excluded))*$$/) }' "$${logs[$$partition]}"; then \
+				results[$$partition]=0; \
+				echo "test-fast: partition $$partition/$$partitions PASS"; \
+				awk '/^Finished in / || /^Result: / { print "test-fast: partition " partition "/" total ": " $$0 }' partition="$$partition" total="$$partitions" "$${logs[$$partition]}"; \
+			else \
+				results[$$partition]=1; \
+				failures=$$((failures + 1)); \
+				echo "test-fast: partition $$partition/$$partitions FAIL (no successful nonempty test result)"; \
+			fi; \
+		else \
+			rc=$$?; \
+			results[$$partition]=$$rc; \
+			failures=$$((failures + 1)); \
+			echo "test-fast: partition $$partition/$$partitions FAIL (exit $$rc)"; \
+		fi; \
+		pids[$$partition]=""; \
+	done; \
+	if [ "$$failures" -eq 0 ]; then \
+		duration_report "$${logs[@]}"; \
+		file_duration_report; \
+		confirm_durations || exit 1; \
+		echo "test-fast: PASS ($$partitions/$$partitions partitions)"; \
+		exit 0; \
+	fi; \
+	echo "test-fast: FAIL ($$failures/$$partitions partitions)"; \
+	for partition in $$(seq 1 "$$partitions"); do \
+		if [ "$${results[$$partition]}" -ne 0 ]; then \
+			echo "--- test-fast partition $$partition log ---"; \
+			cat "$${logs[$$partition]}"; \
+		fi; \
+	done; \
+	exit 1

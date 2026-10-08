@@ -9,6 +9,18 @@ defmodule CodexPooler.AccountingTestSupport do
   import CodexPooler.PoolerFixtures
 
   def accounting_setup(pricing_attrs \\ %{}) do
+    # Every setup gets its own upstream model identifier and price version, so nothing it
+    # commits can collide with, hide, or be hidden by another setup's pricing row. The exposed
+    # model id stays stable because it is per pool and tests name it in payloads.
+    #
+    # The shared identifier used to be load-bearing in two opposite directions at once:
+    # `pricing_snapshots_version_uq` made a second setup raise while one row was live (which is
+    # how a single leaked unboxed row became a run-wide cascade), and the tests that unprice a
+    # model with `Repo.delete!(setup.pricing)` silently depended on that row being the only one
+    # for the identifier. Both go away when the identifier is per setup.
+    upstream_model_id =
+      "provider-gpt-accounting-mini-#{System.unique_integer([:positive, :monotonic])}"
+
     %{pool: pool, api_key: api_key} =
       key =
       active_api_key_fixture(pool_fixture(), %{
@@ -20,8 +32,8 @@ defmodule CodexPooler.AccountingTestSupport do
     model =
       model_fixture(pool, %{
         exposed_model_id: "gpt-accounting-mini",
-        upstream_model_id: "provider-gpt-accounting-mini",
-        pricing_ref: "provider-gpt-accounting-mini"
+        upstream_model_id: upstream_model_id,
+        pricing_ref: upstream_model_id
       })
 
     %{identity: identity, assignment: assignment} =
@@ -36,13 +48,12 @@ defmodule CodexPooler.AccountingTestSupport do
 
     pricing =
       %PricingSnapshot{
-        model_identifier: "provider-gpt-accounting-mini",
-        price_version: "test-v1",
+        model_identifier: upstream_model_id,
+        price_version: Map.get_lazy(pricing_attrs, :price_version, &unique_price_version/0),
         currency_code: "USD",
         billing_unit: "token",
         input_token_micros: Map.get(pricing_attrs, :input_token_micros, Decimal.new(10)),
-        cached_input_token_micros:
-          Map.get(pricing_attrs, :cached_input_token_micros, Decimal.new(1)),
+        cached_input_token_micros: Map.get(pricing_attrs, :cached_input_token_micros, Decimal.new(1)),
         cache_write_token_micros: Map.get(pricing_attrs, :cache_write_token_micros),
         output_token_micros: Map.get(pricing_attrs, :output_token_micros, Decimal.new(20)),
         reasoning_token_micros: Map.get(pricing_attrs, :reasoning_token_micros, Decimal.new(30)),
@@ -54,13 +65,24 @@ defmodule CodexPooler.AccountingTestSupport do
       |> Repo.insert!()
 
     Map.merge(key, %{
-      auth: %{pool: pool, api_key: api_key, key_prefix: api_key.key_prefix},
+      auth: %{
+        pool: pool,
+        api_key: api_key,
+        pool_id: pool.id,
+        api_key_id: api_key.id,
+        key_prefix: api_key.key_prefix
+      },
       model: model,
       identity: identity,
       assignment: assignment,
       pricing: pricing
     })
   end
+
+  # Kept private: `client_retry_postgres_test.exs` defines its own `unique_price_version/0`, and
+  # exporting this one would conflict with that import. The `test-v` prefix cannot collide with
+  # `pricing_snapshot_fixture/2`'s `test-` prefix, which is followed by a digit.
+  defp unique_price_version, do: "test-v#{System.unique_integer([:positive, :monotonic])}"
 
   def pricing_snapshot_fixture(%PricingSnapshot{} = base, attrs) do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
@@ -71,13 +93,10 @@ defmodule CodexPooler.AccountingTestSupport do
       currency_code: Map.get(attrs, :currency_code, base.currency_code),
       billing_unit: Map.get(attrs, :billing_unit, base.billing_unit),
       input_token_micros: Map.get(attrs, :input_token_micros, base.input_token_micros),
-      cached_input_token_micros:
-        Map.get(attrs, :cached_input_token_micros, base.cached_input_token_micros),
-      cache_write_token_micros:
-        Map.get(attrs, :cache_write_token_micros, base.cache_write_token_micros),
+      cached_input_token_micros: Map.get(attrs, :cached_input_token_micros, base.cached_input_token_micros),
+      cache_write_token_micros: Map.get(attrs, :cache_write_token_micros, base.cache_write_token_micros),
       output_token_micros: Map.get(attrs, :output_token_micros, base.output_token_micros),
-      reasoning_token_micros:
-        Map.get(attrs, :reasoning_token_micros, base.reasoning_token_micros),
+      reasoning_token_micros: Map.get(attrs, :reasoning_token_micros, base.reasoning_token_micros),
       request_base_micros: Map.get(attrs, :request_base_micros, base.request_base_micros),
       effective_at: Map.get(attrs, :effective_at, DateTime.add(now, -60, :second)),
       captured_at: Map.get(attrs, :captured_at, now),
@@ -93,26 +112,47 @@ defmodule CodexPooler.AccountingTestSupport do
         "accounting-pricing-#{System.unique_integer([:positive])}.json"
       )
 
+    prices = Map.new(prices, fn {key, value} -> {key, json_number(value)} end)
+
     File.write!(
       path,
-      Jason.encode!(%{
+      CodexPooler.JSON.encode!(%{
         "generated_at" => DateTime.to_iso8601(generated_at),
         "models" => %{
           model_identifier => %{
+            "categories" => ["language_model"],
+            "category" => "language_model",
             "model" => model_identifier,
             "pricing_type" => "per_1m_tokens",
+            "pricing_types" => ["per_1m_tokens"],
             "prices" => %{
               "standard" => %{
                 "default" => prices
               }
-            }
+            },
+            "timestamp" => DateTime.to_iso8601(generated_at)
           }
-        }
+        },
+        "models_count" => 1,
+        "source" => "synthetic",
+        "source_url" => "https://example.com/pricing.json",
+        "tools" => %{
+          "sample-tool" => %{
+            "details" => "Synthetic tool",
+            "price" => 0,
+            "pricing" => "$0",
+            "tool" => "Sample Tool"
+          }
+        },
+        "tools_count" => 1
       })
     )
 
     path
   end
+
+  defp json_number(%Decimal{} = value), do: Decimal.to_float(value)
+  defp json_number(value), do: value
 
   def pricing_config(overrides) do
     Map.merge(
@@ -154,6 +194,53 @@ defmodule CodexPooler.AccountingTestSupport do
         }
         |> Repo.insert!()
     end
+  end
+
+  # An earlier request of the key, still in flight: its reservation of
+  # `output_tokens` output tokens counts in the key's token windows until it
+  # settles, so a daily or weekly max of `output_tokens` is exhausted for a
+  # later request whose own estimate fits under that max. A max below the
+  # request's own estimate is a per-request refusal instead (findings#206 row
+  # 206-448).
+  def hold_key_reservation!(authorization, model, output_tokens, correlation_prefix \\ "key-reservation-holder") do
+    {:ok, auth} = CodexPooler.Access.authenticate_authorization_header(authorization)
+
+    {:ok, %{request: holder}} =
+      CodexPooler.Accounting.reserve(auth, model, %{"model" => model.exposed_model_id, "max_output_tokens" => output_tokens}, %{
+        correlation_id: "#{correlation_prefix}-#{System.unique_integer([:positive])}"
+      })
+
+    holder
+  end
+
+  def release_key_reservation!(holder) do
+    {:ok, _settled} =
+      CodexPooler.Accounting.finalize_reserved_request_failure(holder, %{
+        request_status: "failed",
+        response_status_code: 499,
+        last_error_code: "client_disconnected",
+        usage_status: "not_applicable"
+      })
+
+    :ok
+  end
+
+  # What one request adds to its API key's usage buckets: its ledger entries
+  # read through the production projection `public.api_key_usage_events/1`,
+  # whose provisional tokens count toward the key's effective token windows.
+  def key_usage_events(request_id) when is_binary(request_id) do
+    %{rows: [[known, provisional, admissions]]} =
+      Repo.query!(
+        """
+        SELECT COALESCE(sum(v.known_total_tokens), 0)::bigint, COALESCE(sum(v.provisional_total_tokens), 0)::bigint,
+          COALESCE(sum(v.admission_count), 0)::bigint
+        FROM (SELECT array_agg(e) AS entries FROM public.ledger_entries e WHERE e.request_id = $1) h
+        CROSS JOIN LATERAL public.api_key_usage_events(h.entries) v
+        """,
+        [Ecto.UUID.dump!(request_id)]
+      )
+
+    %{known: known, provisional: provisional, admissions: admissions}
   end
 
   def update_default_policy!(api_key, attrs) do

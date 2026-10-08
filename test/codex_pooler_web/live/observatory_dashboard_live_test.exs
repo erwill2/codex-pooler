@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting.Usage.Observatory
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.ObservatoryControllerTestHelpers
   alias CodexPoolerWeb.ObservatoryLive
 
   @login_path "/observatory/login"
@@ -21,25 +22,6 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
     def read(_principal, _window) do
       {:error, %{kind: :backend_failure, detail: @backend_detail_marker}}
     end
-  end
-
-  test "observatory shell defaults and narrow-phone rules stay scoped" do
-    root_source = File.read!("lib/codex_pooler_web/components/layouts/root.html.heex")
-    css_source = File.read!("assets/css/app.css")
-    [_, toolbar_rules] = Regex.run(~r/\.observatory-toolbar \{(.*?)\n\}/s, css_source)
-
-    assert root_source =~ "const storedTheme = localStorage.getItem(\"phx:theme\");"
-    assert root_source =~ "window.location.pathname === \"/observatory\""
-    assert root_source =~ "window.location.pathname.startsWith(\"/observatory/\")"
-    assert root_source =~ "document.documentElement.setAttribute(\"data-theme\", \"dark\")"
-    assert root_source =~ "setTheme(\"system\")"
-    assert root_source =~ "if (storedTheme) {\n            setTheme(storedTheme);"
-    assert root_source =~ "phx:set-theme"
-    assert toolbar_rules =~ "background: var(--color-base-100);"
-    refute toolbar_rules =~ "backdrop-filter"
-    refute toolbar_rules =~ "blur("
-    assert css_source =~ "@media (width <= 23.4375rem)"
-    assert css_source =~ ".observatory-wordmark small {\n    display: none;"
   end
 
   test "disconnected mount keeps the loading state before the initial read" do
@@ -118,7 +100,7 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
     expected_total_label = "160 tokens · $1.25"
     state = :sys.get_state(view.pid)
     traffic = state.socket.assigns.observatory_report.traffic
-    chart_series = Jason.decode!(traffic.chart.series)
+    chart_series = CodexPooler.JSON.decode!(traffic.chart.series)
     fallback_rows = traffic.fallback.rows
 
     assert :ready == state.socket.assigns.observatory_state
@@ -164,7 +146,7 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
 
     for window <- ~w(1h 5h 24h 7d) do
       render_click(view, "select-window", %{"window" => window})
-      render_async(view)
+      ObservatoryControllerTestHelpers.await_async(view)
       assert has_element?(view, "#observatory-window-#{window}[aria-pressed='true']")
     end
 
@@ -176,7 +158,7 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
     assert has_element?(view, "#observatory-resume[aria-label='Resume auto-refresh']")
 
     render_click(view, "resume-refresh")
-    render_async(view)
+    ObservatoryControllerTestHelpers.await_async(view)
     assert has_element?(view, "#observatory-widgets")
     refute has_element?(view, "#observatory-state-stale")
     assert has_element?(view, "#observatory-pause[aria-label='Pause auto-refresh']")
@@ -215,7 +197,7 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
 
   defp activate_initial_refresh(view) do
     render_hook(view, "observatory-refresh", %{"reason" => "initial"})
-    render_async(view)
+    ObservatoryControllerTestHelpers.await_async(view)
   end
 
   defp authenticated_conn(conn, pool \\ nil) do

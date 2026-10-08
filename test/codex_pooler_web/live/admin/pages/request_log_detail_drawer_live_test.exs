@@ -1,6 +1,10 @@
 defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
   use CodexPoolerWeb.ConnCase, async: false
 
+  # Failure-detection budget for an asynchronous load the test awaits: a green
+  # run returns as soon as the view has settled.
+  @detection_timeout_ms 15_000
+
   import Phoenix.LiveViewTest
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
@@ -15,6 +19,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     request_log_fixture(pool, %{correlation_id: "req-closed-drawer"})
 
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    _ = await_request_logs(view)
 
     assert has_element?(view, "#request-log-detail-drawer-root")
     assert has_element?(view, "#request-log-detail-sidebar[role='dialog']")
@@ -56,6 +61,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}&status=failed")
+    _ = await_request_logs(view)
 
     render_click(element(view, "#request-log-#{request.id}-open-details"))
 
@@ -91,6 +97,76 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     refute has_element?(view, "#request-log-detail-request-id")
   end
 
+  test "reasoning rows say what was not set and when the backend chose the model default", %{
+    conn: conn,
+    scope: scope
+  } do
+    pool = create_pool!(scope, %{slug: "drawer-reasoning-default", name: "Drawer Reasoning"})
+
+    %{request: default_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-model-default",
+        requested_model: "gpt-6-luna",
+        attempt_response_metadata: %{"reasoning" => %{"policy_mode" => "unrestricted"}}
+      })
+
+    %{request: legacy_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-legacy-effort",
+        requested_model: "gpt-6-sol",
+        reasoning_effort: "high"
+      })
+
+    %{request: failed_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-failed-no-effort",
+        requested_model: "gpt-6-luna",
+        status: "failed",
+        attempt_status: "failed",
+        last_error_code: "upstream_network_error"
+      })
+
+    %{request: transcription_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-transcription",
+        requested_model: "gpt-4o-transcribe",
+        endpoint: "/backend-api/transcribe",
+        transport: "http_multipart"
+      })
+
+    view = open_selected_request(conn, pool, default_request)
+
+    assert has_element?(view, "#request-log-detail-requested-reasoning", "Not set")
+    assert has_element?(view, "#request-log-detail-applied-reasoning", "Not set")
+
+    assert has_element?(
+             view,
+             "#request-log-detail-upstream-reasoning",
+             "Not sent (backend model default)"
+           )
+
+    # A request that carried an effort before the attempt snapshot existed must
+    # not be reported as having sent nothing upstream.
+    view = open_selected_request(conn, pool, legacy_request)
+
+    assert has_element?(view, "#request-log-detail-requested-reasoning", "high")
+    refute has_element?(view, "#request-log-detail-applied-reasoning")
+    refute has_element?(view, "#request-log-detail-upstream-reasoning")
+
+    view = open_selected_request(conn, pool, failed_request)
+
+    assert has_element?(view, "#request-log-detail-requested-reasoning", "Not set")
+    refute has_element?(view, "#request-log-detail-applied-reasoning")
+    refute has_element?(view, "#request-log-detail-upstream-reasoning")
+
+    view = open_selected_request(conn, pool, transcription_request)
+
+    assert has_element?(view, "#request-log-detail-request-id", transcription_request.id)
+    refute has_element?(view, "#request-log-detail-requested-reasoning")
+    refute has_element?(view, "#request-log-detail-applied-reasoning")
+    refute has_element?(view, "#request-log-detail-upstream-reasoning")
+  end
+
   test "selected request detail remains visible after refresh removes row from table", %{
     conn: conn,
     scope: scope
@@ -99,12 +175,14 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
 
     older_at = DateTime.add(DateTime.utc_now(), -2, :hour)
 
-    %{request: selected_request} =
+    selected =
       request_log_fixture(pool, %{
         correlation_id: "req-refresh-selected",
         requested_model: "gpt-refresh-selected",
         admitted_at: older_at
       })
+
+    selected_request = selected.request
 
     {:ok, view, _html} =
       live(
@@ -112,20 +190,25 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
         ~p"/admin/request-logs?pool_id=#{pool.id}&selected_request_id=#{selected_request.id}"
       )
 
+    _ = await_request_logs(view)
+
     assert has_element?(view, "#request-log-detail-drawer[checked]")
     assert has_element?(view, "#request-log-detail-correlation-id", "req-refresh-selected")
     assert has_element?(view, "#request-log-row-#{selected_request.id}")
 
-    for index <- 1..50 do
-      request_log_fixture(pool, %{
-        correlation_id: "req-refresh-newer-#{index}",
-        requested_model: "gpt-refresh-newer-#{index}"
-      })
-    end
+    # Pagination needs fifty newer requests, not fifty independent keys and upstreams.
+    newer_requests =
+      for index <- 1..50 do
+        insert_request_log_fixture(selected, %{
+          correlation_id: "req-refresh-newer-#{index}",
+          requested_model: "gpt-refresh-newer-#{index}"
+        }).request
+      end
 
     send(view.pid, :refresh_request_logs_from_events)
-    _ = :sys.get_state(view.pid)
+    _ = await_request_logs(view)
 
+    assert has_element?(view, "#request-log-row-#{List.last(newer_requests).id}")
     refute has_element?(view, "#request-log-row-#{selected_request.id}")
     assert has_element?(view, "#request-log-detail-drawer[checked]")
     assert has_element?(view, "#request-log-detail-correlation-id", "req-refresh-selected")
@@ -148,15 +231,22 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
 
     %{conn: admin_conn} = assigned_admin_conn(owner_scope, visible_pool, unique_user_email())
 
-    assert {:error, {:live_redirect, %{to: "/admin/request-logs"}}} =
-             live(admin_conn, ~p"/admin/request-logs?selected_request_id=#{hidden_request.id}")
+    {:ok, hidden_view, _html} =
+      live(admin_conn, ~p"/admin/request-logs?selected_request_id=#{hidden_request.id}")
+
+    _ = await_request_logs(hidden_view)
+    assert_patch(hidden_view, ~p"/admin/request-logs")
 
     missing_request_id = Ecto.UUID.generate()
 
-    assert {:error, {:live_redirect, %{to: "/admin/request-logs"}}} =
-             live(owner_conn, ~p"/admin/request-logs?selected_request_id=#{missing_request_id}")
+    {:ok, missing_view, _html} =
+      live(owner_conn, ~p"/admin/request-logs?selected_request_id=#{missing_request_id}")
+
+    _ = await_request_logs(missing_view)
+    assert_patch(missing_view, ~p"/admin/request-logs")
 
     {:ok, view, _html} = live(owner_conn, ~p"/admin/request-logs")
+    _ = await_request_logs(view)
 
     refute has_element?(view, "#request-log-detail-drawer[checked]")
     refute has_element?(view, "#request-log-detail-correlation-id", "req-hidden-drawer")
@@ -206,6 +296,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
 
     {:ok, view, _html} =
       live(conn, ~p"/admin/request-logs?selected_request_id=#{request.id}")
+
+    _ = await_request_logs(view)
 
     assert has_element?(view, "#request-log-detail-drawer[checked]")
     assert has_element?(view, "#request-log-detail-transport-failure-1", "Mint.TransportError")
@@ -277,6 +369,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     ]
 
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    _ = await_request_logs(view)
 
     list_html = render(view)
     assert has_element?(view, "#request-log-row-#{valid_request.id}")
@@ -311,6 +404,266 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     end
   end
 
+  test "renders the downstream delivery receipt only for attempts that recorded one",
+       %{conn: conn, scope: scope} do
+    pool = create_pool!(scope, %{slug: "drawer-downstream-delivery", name: "Drawer Delivery"})
+    pushed_at = "2026-09-10T23:27:46.108Z"
+
+    %{request: receipt_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-delivery-receipt",
+        requested_model: "gpt-drawer-delivery-receipt",
+        transport: "websocket",
+        attempt_response_metadata: %{
+          "downstream_delivery" => %{
+            "outcome" => "delivered",
+            "terminal_class" => "response.completed",
+            "pushed_at" => pushed_at,
+            "frames_after_visible" => 3,
+            "transport" => "websocket"
+          }
+        }
+      })
+
+    %{request: absent_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-delivery-absent",
+        requested_model: "gpt-drawer-delivery-absent",
+        attempt_response_metadata: %{"transport" => "http_sse"}
+      })
+
+    row_id = "#request-log-detail-attempt-1-downstream-delivery"
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    _ = await_request_logs(view)
+
+    assert has_element?(view, "#request-log-row-#{receipt_request.id}")
+    refute has_element?(view, row_id)
+    refute render(view) =~ "Downstream delivery"
+
+    render_click(element(view, "#request-log-#{receipt_request.id}-open-details"))
+    assert_patch(view)
+
+    assert has_element?(view, row_id, "Downstream delivery")
+    assert has_element?(view, row_id, "delivered")
+    assert has_element?(view, row_id, "response.completed")
+    assert has_element?(view, row_id, "3 frames after visible")
+    assert has_element?(view, row_id, pushed_at)
+    assert has_element?(view, row_id, "websocket")
+    # A receipt without a frame class (HTTP SSE, rows recorded before it) keeps
+    # the line without one.
+    refute has_element?(view, row_id, "highest frame")
+
+    attempt_html = view |> element("#request-log-detail-attempt-1") |> render()
+    refute attempt_html =~ "downstream_delivery"
+    refute attempt_html =~ "frames_after_visible"
+
+    render_click(element(view, "#request-log-detail-sidebar-close"))
+    assert_patch(view)
+
+    render_click(element(view, "#request-log-#{absent_request.id}-open-details"))
+    assert_patch(view)
+
+    assert has_element?(view, "#request-log-detail-attempt-1")
+    refute has_element?(view, row_id)
+    refute view |> element("#request-log-detail-attempt-1") |> render() =~ "Downstream delivery"
+  end
+
+  test "renders validated serving-mode labels from request and attempt routing metadata",
+       %{conn: conn, scope: scope} do
+    pool = create_pool!(scope, %{slug: "drawer-serving-modes", name: "Drawer Serving Modes"})
+
+    request_mode = %{
+      "model_serving_mode_configured" => "auto",
+      "model_serving_mode" => "lite",
+      "model_serving_mode_source" => "catalog"
+    }
+
+    attempt_mode = %{
+      "model_serving_mode_configured" => "full",
+      "model_serving_mode" => "full",
+      "model_serving_mode_source" => "override"
+    }
+
+    %{request: valid_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-serving-modes-valid",
+        requested_model: "gpt-drawer-serving-modes-valid",
+        request_metadata: %{
+          "routing" => request_mode,
+          "body" => %{"model_serving_mode" => "body-mode-must-not-render"}
+        },
+        attempt_response_metadata: %{"routing" => attempt_mode}
+      })
+
+    %{request: invalid_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-serving-modes-invalid",
+        requested_model: "gpt-drawer-serving-modes-invalid",
+        request_metadata: %{
+          "routing" => %{
+            "model_serving_mode_configured" => "auto",
+            "model_serving_mode" => "lite",
+            "model_serving_mode_source" => "untrusted"
+          }
+        },
+        attempt_response_metadata: %{
+          "routing" => %{
+            "model_serving_mode_configured" => "auto",
+            "model_serving_mode" => "turbo",
+            "model_serving_mode_source" => "untrusted"
+          }
+        }
+      })
+
+    request_row_ids = [
+      "#request-log-detail-model-serving-mode-configured",
+      "#request-log-detail-model-serving-mode",
+      "#request-log-detail-model-serving-mode-source"
+    ]
+
+    attempt_row_ids = [
+      "#request-log-detail-attempt-1-model-serving-mode-configured",
+      "#request-log-detail-attempt-1-model-serving-mode",
+      "#request-log-detail-attempt-1-model-serving-mode-source"
+    ]
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    _ = await_request_logs(view)
+
+    render_click(element(view, "#request-log-#{valid_request.id}-open-details"))
+    assert_patch(view)
+
+    assert has_element?(view, "#request-log-detail-model-serving-mode-configured", "auto")
+    assert has_element?(view, "#request-log-detail-model-serving-mode", "lite")
+    assert has_element?(view, "#request-log-detail-model-serving-mode-source", "catalog")
+
+    assert has_element?(
+             view,
+             "#request-log-detail-attempt-1-model-serving-mode-configured",
+             "full"
+           )
+
+    assert has_element?(view, "#request-log-detail-attempt-1-model-serving-mode", "full")
+
+    assert has_element?(
+             view,
+             "#request-log-detail-attempt-1-model-serving-mode-source",
+             "override"
+           )
+
+    drawer_html = view |> element("#request-log-detail-sidebar") |> render()
+    refute drawer_html =~ "body-mode-must-not-render"
+
+    render_click(element(view, "#request-log-detail-sidebar-close"))
+    assert_patch(view)
+
+    render_click(element(view, "#request-log-#{invalid_request.id}-open-details"))
+    assert_patch(view)
+
+    refute Enum.any?(request_row_ids, &has_element?(view, &1))
+    refute Enum.any?(attempt_row_ids, &has_element?(view, &1))
+  end
+
+  test "renders bounded compaction bridge diagnostics only in the selected drawer",
+       %{conn: conn, scope: scope} do
+    pool =
+      create_pool!(scope, %{
+        slug: "drawer-compaction-bridge",
+        name: "Drawer Compaction Bridge"
+      })
+
+    sensitive_marker = "drawer-compaction-bridge-sensitive-value"
+
+    %{request: buffered_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-compaction-bridge-buffered",
+        requested_model: "gpt-drawer-compaction-bridge-buffered",
+        request_metadata: %{
+          "compaction_bridge" => %{"applied" => true, "result_transport" => "buffered"}
+        }
+      })
+
+    %{request: sse_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-compaction-bridge-sse",
+        requested_model: "gpt-drawer-compaction-bridge-sse",
+        request_metadata: %{
+          "compaction_bridge" => %{"applied" => true, "result_transport" => "sse"}
+        }
+      })
+
+    %{request: absent_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-compaction-bridge-absent",
+        requested_model: "gpt-drawer-compaction-bridge-absent"
+      })
+
+    %{request: malformed_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-compaction-bridge-malformed",
+        requested_model: "gpt-drawer-compaction-bridge-malformed",
+        request_metadata: %{
+          "compaction_bridge" => %{"applied" => true, "result_transport" => "websocket"}
+        }
+      })
+
+    %{request: sentinel_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-drawer-compaction-bridge-sentinel",
+        requested_model: "gpt-drawer-compaction-bridge-sentinel",
+        request_metadata: %{
+          "compaction_bridge" => %{
+            "applied" => true,
+            "result_transport" => "sse",
+            "raw_payload" => sensitive_marker
+          }
+        }
+      })
+
+    row_ids = [
+      "#request-log-detail-compaction-bridge-applied",
+      "#request-log-detail-compaction-result-transport"
+    ]
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    _ = await_request_logs(view)
+
+    list_html = render(view)
+    refute Enum.any?(row_ids, &has_element?(view, &1))
+    refute list_html =~ sensitive_marker
+
+    for {request, result_transport} <- [{buffered_request, "buffered"}, {sse_request, "sse"}] do
+      render_click(element(view, "#request-log-#{request.id}-open-details"))
+      assert_patch(view)
+
+      assert has_element?(view, "#request-log-detail-compaction-bridge-applied", "applied")
+
+      assert has_element?(
+               view,
+               "#request-log-detail-compaction-result-transport",
+               result_transport
+             )
+
+      assert Enum.count(row_ids, &has_element?(view, &1)) == 2
+
+      render_click(element(view, "#request-log-detail-sidebar-close"))
+      assert_patch(view)
+    end
+
+    for request <- [absent_request, malformed_request, sentinel_request] do
+      render_click(element(view, "#request-log-#{request.id}-open-details"))
+      assert_patch(view)
+
+      drawer_html = view |> element("#request-log-detail-sidebar") |> render()
+      refute Enum.any?(row_ids, &has_element?(view, &1))
+      refute drawer_html =~ sensitive_marker
+
+      render_click(element(view, "#request-log-detail-sidebar-close"))
+      assert_patch(view)
+    end
+  end
+
   defp create_pool!(scope, attrs) do
     {:ok, pool} = Pools.create_pool(scope, attrs)
     pool
@@ -328,13 +681,16 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
         assignment_label: Map.get(attrs, :assignment_label, "Request log assignment")
       })
 
+    insert_request_log_fixture(%{pool: pool, api_key: api_key, identity: identity, assignment: assignment}, attrs)
+  end
+
+  defp insert_request_log_fixture(%{pool: pool, api_key: api_key, identity: identity, assignment: assignment} = context, attrs) do
     request =
       request_fixture(%{pool: pool, api_key: api_key}, %{
         requested_model: Map.get(attrs, :requested_model, "gpt-request-log"),
         endpoint: Map.get(attrs, :endpoint, "/backend-api/codex/responses"),
         status: Map.get(attrs, :status, "succeeded"),
-        correlation_id:
-          Map.get(attrs, :correlation_id, "req-live-#{System.unique_integer([:positive])}"),
+        correlation_id: Map.get(attrs, :correlation_id, "req-live-#{System.unique_integer([:positive])}"),
         transport: Map.get(attrs, :transport, "http_json"),
         request_metadata: Map.get(attrs, :request_metadata, %{}),
         last_error_code: Map.get(attrs, :last_error_code),
@@ -355,11 +711,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
     attempt =
       attempt_fixture(request, assignment, %{
         status: Map.get(attrs, :attempt_status, "succeeded"),
-        usage_status:
-          Map.get(attrs, :attempt_usage_status, Map.get(attrs, :usage_status, "usage_known")),
+        usage_status: Map.get(attrs, :attempt_usage_status, Map.get(attrs, :usage_status, "usage_known")),
         upstream_status_code: Map.get(attrs, :response_status_code, 200),
-        network_error_code:
-          Map.get(attrs, :attempt_network_error_code, Map.get(attrs, :last_error_code)),
+        network_error_code: Map.get(attrs, :attempt_network_error_code, Map.get(attrs, :last_error_code)),
         response_metadata: Map.get(attrs, :attempt_response_metadata, %{})
       })
 
@@ -372,12 +726,40 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawerLiveTest do
       output_tokens: Map.get(attrs, :output_tokens, 1),
       total_tokens: Map.get(attrs, :total_tokens, 2),
       settled_cost_micros: Map.get(attrs, :settled_cost_micros, 0),
-      usage_status:
-        Map.get(attrs, :settlement_usage_status, Map.get(attrs, :usage_status, "usage_known")),
+      usage_status: Map.get(attrs, :settlement_usage_status, Map.get(attrs, :usage_status, "usage_known")),
       details: Map.get(attrs, :settlement_details, %{})
     })
 
-    %{request: request, attempt: attempt, identity: identity, assignment: assignment}
+    Map.merge(context, %{request: request, attempt: attempt})
+  end
+
+  defp open_selected_request(conn, pool, request) do
+    {:ok, view, _html} =
+      live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}&selected_request_id=#{request.id}")
+
+    _ = await_request_logs(view)
+    assert has_element?(view, "#request-log-detail-request-id", request.id)
+    view
+  end
+
+  defp await_request_logs(view),
+    do: await_request_logs(view, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+
+  defp await_request_logs(view, deadline) do
+    _ = render_async(view)
+    state = :sys.get_state(view.pid)
+
+    if state.socket.assigns.request_logs_loading? or
+         state.socket.assigns.request_logs_running? do
+      if System.monotonic_time(:millisecond) >= deadline, do: flunk("request logs did not finish loading: #{inspect(:sys.get_state(view.pid))}")
+
+      receive do
+      after
+        1 -> await_request_logs(view, deadline)
+      end
+    else
+      state
+    end
   end
 
   defp assigned_admin_conn(scope, pool, email) do

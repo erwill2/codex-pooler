@@ -3,8 +3,9 @@ defmodule CodexPooler.Admin.Stats.Kpis do
 
   alias CodexPooler.Admin.Stats.Aggregates
 
-  @succeeded "succeeded"
-  @failed_statuses ~w(failed rejected interrupted cancelled)
+  # A turn has no rejected or cancelled status (`codex_turns_status_check`): a
+  # failed turn is a failed or an interrupted one.
+  @failed_turn_statuses ~w(failed interrupted)
 
   @type cache_rate_kpi :: %{
           value: float() | nil,
@@ -21,21 +22,24 @@ defmodule CodexPooler.Admin.Stats.Kpis do
         }
 
   @spec request_kpi([map()]) :: map()
-  def request_kpi(requests) do
+  def request_kpi(request_buckets) do
     %{
-      value: length(requests),
-      succeeded: Enum.count(requests, &(&1.status == @succeeded)),
-      failed: Enum.count(requests, &(&1.status in @failed_statuses)),
-      in_progress: Enum.count(requests, &(&1.status == "in_progress"))
+      value: Aggregates.sum_integer(request_buckets, :requests),
+      succeeded: Aggregates.sum_integer(request_buckets, :succeeded),
+      failed: Aggregates.sum_integer(request_buckets, :failed),
+      client_cancelled: Aggregates.sum_integer(request_buckets, :client_cancelled),
+      in_progress: Aggregates.sum_integer(request_buckets, :in_progress)
     }
   end
 
+  # A request the client cancelled is neither a success nor a failure, so it
+  # leaves the rate's base as well (`RequestOutcome`).
   @spec success_rate_kpi([map()]) :: map()
-  def success_rate_kpi([]), do: %{value: nil, unit: "percent"}
+  def success_rate_kpi([]), do: %{value: nil, unit: "percent", client_cancelled: 0}
 
-  def success_rate_kpi(requests) do
-    succeeded = Enum.count(requests, &(&1.status == @succeeded))
-    %{value: Aggregates.percentage(succeeded, length(requests)), unit: "percent"}
+  def success_rate_kpi(request_buckets) do
+    requests = request_kpi(request_buckets)
+    %{value: Aggregates.percentage(requests.succeeded, requests.value - requests.client_cancelled), unit: "percent", client_cancelled: requests.client_cancelled}
   end
 
   @spec token_kpi([map()]) :: map()
@@ -103,10 +107,12 @@ defmodule CodexPooler.Admin.Stats.Kpis do
   @spec turn_kpi([map()]) :: map()
   def turn_kpi(turns) do
     %{
-      value: length(turns),
-      succeeded: Enum.count(turns, &(&1.status == @succeeded)),
-      failed: Enum.count(turns, &(&1.status in @failed_statuses)),
-      in_progress: Enum.count(turns, &(&1.status == "in_progress"))
+      value: Enum.sum(Enum.map(turns, & &1.count)),
+      succeeded: turn_count(turns, ["succeeded"]),
+      failed: turn_count(turns, @failed_turn_statuses),
+      in_progress: turn_count(turns, ["in_progress"])
     }
   end
+
+  defp turn_count(turns, statuses), do: turns |> Enum.filter(&(&1.status in statuses)) |> Enum.reduce(0, &(&1.count + &2))
 end

@@ -3,23 +3,27 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   import Ecto.Query
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.Payloads.ReasoningEffort
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.CandidateEligibility.Quota
   alias CodexPooler.Gateway.Routing.{CircuitState, ModelMetadata}
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
-  alias CodexPooler.RouteClass
-  alias CodexPooler.Upstreams.Lifecycle.IdentityRouting
+  alias CodexPooler.ServiceTier
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
   defmodule FilterInput do
     @moduledoc false
 
     alias CodexPooler.Catalog.Model
     alias CodexPooler.Gateway.Payloads.RequestOptions
+    alias CodexPooler.Gateway.Routing.CandidateEligibility
     alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
     @type auth :: CodexPooler.Access.auth_context()
@@ -29,6 +33,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
       :model,
       :endpoint,
       :payload,
+      :has_input_image?,
       :request_options,
       :candidates,
       :route_class
@@ -39,6 +44,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
             required(:model) => Model.t(),
             required(:endpoint) => String.t(),
             required(:payload) => payload(),
+            optional(:has_input_image?) => boolean(),
             required(:request_options) => RequestOptions.t(),
             required(:candidates) => [candidate()],
             optional(:auth) => auth()
@@ -49,6 +55,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
             model: Model.t(),
             endpoint: String.t(),
             payload: payload(),
+            has_input_image?: boolean(),
             request_options: RequestOptions.t(),
             candidates: [candidate()],
             route_class: String.t()
@@ -65,6 +72,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
         model: Map.fetch!(attrs, :model),
         endpoint: endpoint,
         payload: payload,
+        has_input_image?:
+          Map.get_lazy(attrs, :has_input_image?, fn ->
+            CandidateEligibility.payload_has_input_image?(payload)
+          end),
         request_options: request_options,
         candidates: Map.fetch!(attrs, :candidates),
         route_class: request_options.transport.route_class
@@ -91,13 +102,13 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   @compact_support_key "supports_compact_responses"
-  @active_model_status "active"
+  @routable_model_statuses ~w(active stale)
   @health_excluded [
-    PoolUpstreamAssignment.cooldown_health_status(),
-    PoolUpstreamAssignment.disabled_health_status(),
-    PoolUpstreamAssignment.errored_health_status()
+    AssignmentStatus.cooldown_health_status(),
+    AssignmentStatus.disabled_health_status(),
+    AssignmentStatus.errored_health_status()
   ]
-  @visible_identity_statuses IdentityRouting.model_routable_statuses()
+  @visible_identity_statuses IdentityStatus.model_routable_statuses()
 
   @type candidate :: {PoolUpstreamAssignment.t(), UpstreamIdentity.t()}
   @type gateway_error :: Contracts.gateway_error()
@@ -118,13 +129,16 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
           required(:candidates_by_model_id) => %{optional(Ecto.UUID.t()) => [candidate()]},
           required(:visible_candidates_by_model_id) => %{optional(Ecto.UUID.t()) => [candidate()]},
           required(:candidate_snapshots) => [candidate()],
+          optional(:selected_partition_assignment_ids) => [Ecto.UUID.t()],
+          optional(:valid_canonical_assignment_ids) => [Ecto.UUID.t()],
           required(:hydrated_at) => DateTime.t()
         }
   @type quota_refresh_plan :: %{
           required(:filter_input) => FilterInput.t(),
           required(:candidate_exclusions) => [map()],
           required(:refreshable_candidates) => [candidate()],
-          optional(:route_state) => RouteState.t()
+          optional(:route_state) => RouteState.t(),
+          optional(:capacity_band) => :non_credit
         }
   @type quota_filter_result ::
           {:ok, [candidate()], quota_decision()}
@@ -144,7 +158,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
     %{}
     |> Map.put(:visible_candidates_by_model_id, candidates_by_model_id(models, candidates))
-    |> Map.put(:candidates_by_model_id, routable_candidates_by_model_id(models, candidates))
+    |> Map.put(
+      :candidates_by_model_id,
+      routable_candidates_by_model_id(models, candidates, timestamp)
+    )
     |> Map.put(:hydrated_at, timestamp)
     |> then(fn hydration ->
       Map.put(hydration, :visible_models, visible_models(models, hydration))
@@ -172,6 +189,21 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   def visible_model_context(_pool_or_id, _requested_model), do: nil
+
+  @spec catalog_model_present?(pool_ref(), String.t()) :: boolean()
+  def catalog_model_present?(pool_or_id, model_identifier) when is_binary(model_identifier) do
+    canonical_identifier = model_identifier |> String.trim() |> String.downcase()
+
+    canonical_identifier != "" and
+      Repo.exists?(
+        from model in Model,
+          where:
+            model.pool_id == ^pool_id(pool_or_id) and
+              fragment("lower(btrim(?))", model.exposed_model_id) == ^canonical_identifier
+      )
+  end
+
+  def catalog_model_present?(_pool_or_id, _model_identifier), do: false
 
   @spec policy_visible_models([Model.t()], map()) :: [Model.t()]
   def policy_visible_models(visible_models, policy) when is_list(visible_models) do
@@ -225,6 +257,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
       model: model,
       endpoint: endpoint,
       payload: payload,
+      has_input_image?: has_input_image?,
       request_options: request_options,
       candidates: candidates
     } = input
@@ -241,7 +274,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
           payload,
           request_options,
           assignment,
-          enforce_service_tier?
+          enforce_service_tier?,
+          has_input_image?
         )
       end)
 
@@ -256,6 +290,31 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     else
       {:ok, candidates}
     end
+  end
+
+  @spec filter_allowed_canonical_candidates(
+          [candidate()],
+          [Ecto.UUID.t()],
+          [Ecto.UUID.t()]
+        ) :: {:ok, [candidate()]}
+  def filter_allowed_canonical_candidates(
+        candidates,
+        allowed_canonical_assignment_ids,
+        pinned_assignment_ids
+      )
+      when is_list(candidates) and is_list(allowed_canonical_assignment_ids) and
+             is_list(pinned_assignment_ids) do
+    allowed_assignment_ids =
+      allowed_canonical_assignment_ids
+      |> Kernel.++(pinned_assignment_ids)
+      |> MapSet.new()
+
+    candidates =
+      Enum.filter(candidates, fn {assignment, _identity} ->
+        MapSet.member?(allowed_assignment_ids, assignment.id)
+      end)
+
+    {:ok, candidates}
   end
 
   @spec maybe_filter_compact(String.t(), [candidate()]) :: {:ok, [candidate()]}
@@ -273,6 +332,74 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   def maybe_filter_compact(_endpoint, candidates), do: {:ok, candidates}
+
+  @doc """
+  Narrow the candidates to the assignments whose own catalog advertises the
+  reasoning effort this turn will send upstream.
+
+  The Pool-wide union (`ModelMetadata.catalog_reasoning_levels/1`) is the right
+  authority for admission and for `/backend-api/codex/models`: it answers
+  "can some assignment in this Pool serve this effort". It is the wrong
+  authority for routing. Dispatching an explicit `max` to an assignment whose
+  own catalog stops at `xhigh` is a backend 400 for a level this Pool
+  advertises, while a sibling assignment would have served it (findings#221).
+
+  Preference, not admission: hard continuation pinning and quota/circuit
+  eligibility first determine the effective candidate set. When no remaining
+  assignment advertises the effort the Pool never promised it, so the upstream
+  refusal is the honest answer and every candidate is kept. Narrowing to an
+  empty set there would turn that 400 into a 503 `no_compatible_backend`.
+  """
+  @spec prefer_reasoning_effort_candidates(Model.t(), RequestOptions.t(), [candidate()]) ::
+          {:ok, [candidate()]}
+  def prefer_reasoning_effort_candidates(
+        %Model{} = model,
+        %RequestOptions{} = request_options,
+        candidates
+      )
+      when is_list(candidates) do
+    case upstream_reasoning_effort(request_options) do
+      nil -> {:ok, candidates}
+      effort -> {:ok, prefer_effort_candidates(model, effort, candidates)}
+    end
+  end
+
+  # The level the upstream actually receives: the policy-applied effort after
+  # the two rewrites `PayloadNormalizer` performs. `ultra` is answered with nil
+  # because `ReasoningEffort.rewrite_backend_upstream/2` lands it on a level the
+  # *selected* assignment advertises, so every candidate can serve it.
+  defp upstream_reasoning_effort(%RequestOptions{
+         routing: %{reasoning_effort_decision: %Decision{applied_effort: effort}}
+       }) do
+    case ReasoningEffort.normalize_known(effort) do
+      "ultra" -> nil
+      "minimal" -> ReasoningEffort.rewrite_client_upstream("minimal")
+      known -> known
+    end
+  end
+
+  defp upstream_reasoning_effort(%RequestOptions{}), do: nil
+
+  defp prefer_effort_candidates(model, effort, candidates) do
+    advertising =
+      Enum.filter(candidates, fn {assignment, _identity} ->
+        model
+        |> source_assignment_model_metadata(assignment)
+        |> assignment_advertises_effort?(effort)
+      end)
+
+    case advertising do
+      [] -> candidates
+      [_ | _] -> advertising
+    end
+  end
+
+  # An assignment that advertises no reasoning levels at all makes no claim
+  # either way, so it never outranks one that names the level.
+  defp assignment_advertises_effort?(%{} = metadata, effort),
+    do: effort in ModelMetadata.metadata_reasoning_levels(metadata)
+
+  defp assignment_advertises_effort?(_metadata, _effort), do: false
 
   @spec filter_quota_eligible_candidates(FilterInput.t()) :: quota_filter_result()
   defdelegate filter_quota_eligible_candidates(input), to: Quota
@@ -297,8 +424,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     } = input
 
     {eligible, exclusions} =
-      Enum.reduce(candidates, {[], []}, fn {assignment, identity} = candidate,
-                                           {eligible, excluded} ->
+      Enum.reduce(candidates, {[], []}, fn {assignment, identity} = candidate, {eligible, excluded} ->
         if CircuitState.eligible?(auth, model, assignment, route_class) do
           {[candidate | eligible], excluded}
         else
@@ -336,8 +462,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     %{candidates: candidates, route_class: route_class} = input
 
     {eligible, exclusions} =
-      Enum.reduce(candidates, {[], []}, fn {assignment, identity} = candidate,
-                                           {eligible, excluded} ->
+      Enum.reduce(candidates, {[], []}, fn {assignment, identity} = candidate, {eligible, excluded} ->
         if RouteState.circuit_eligible?(route_state, assignment.id) do
           {[candidate | eligible], excluded}
         else
@@ -383,12 +508,12 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   defp list_active_models(pool_id) do
     Repo.all(
       from model in Model,
-        where: model.pool_id == ^pool_id and model.status == ^@active_model_status,
+        where: model.pool_id == ^pool_id and model.status in ^@routable_model_statuses,
         order_by: [asc: model.exposed_model_id]
     )
   end
 
-  defp list_visible_candidate_rows(models, timestamp) when is_list(models) do
+  defp list_visible_candidate_rows(models, _timestamp) when is_list(models) do
     assignment_ids = models |> Enum.flat_map(&source_assignment_ids/1) |> Enum.uniq()
 
     if assignment_ids == [] do
@@ -405,8 +530,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
             assignment.id in ^assignment_ids and assignment.status == ^assignment_active_status and
               assignment.eligibility_status == ^assignment_eligible_status and
               assignment.health_status not in ^@health_excluded and
-              identity.status in ^@visible_identity_statuses and
-              (is_nil(assignment.cooldown_until) or assignment.cooldown_until <= ^timestamp),
+              identity.status in ^@visible_identity_statuses,
           order_by: [asc: assignment.created_at, asc: assignment.id],
           select: {assignment, identity}
       )
@@ -426,14 +550,15 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     end)
   end
 
-  defp routable_candidates_by_model_id(models, candidates) do
+  defp routable_candidates_by_model_id(models, candidates, timestamp) do
     active_health_status = PoolUpstreamAssignment.active_health_status()
 
     candidates_by_model_id(models, candidates)
     |> Map.new(fn {model_id, model_candidates} ->
       {model_id,
        Enum.filter(model_candidates, fn {assignment, _identity} ->
-         assignment.health_status == active_health_status
+         assignment.health_status == active_health_status and
+           cooldown_expired?(assignment.cooldown_until, timestamp)
        end)}
     end)
   end
@@ -449,6 +574,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp routable_candidates_by_source_ids(%{} = hydration, %Model{} = model) do
     active_health_status = PoolUpstreamAssignment.active_health_status()
+    timestamp = Map.get(hydration, :hydrated_at, DateTime.utc_now())
     source_ids = MapSet.new(source_assignment_ids(model))
 
     hydration
@@ -458,13 +584,20 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     |> Enum.uniq_by(fn {assignment, _identity} -> assignment.id end)
     |> Enum.filter(fn {assignment, _identity} ->
       assignment.health_status == active_health_status and
+        cooldown_expired?(assignment.cooldown_until, timestamp) and
         MapSet.member?(source_ids, assignment.id)
     end)
   end
 
+  defp cooldown_expired?(nil, _timestamp), do: true
+
+  defp cooldown_expired?(%DateTime{} = cooldown_until, %DateTime{} = timestamp) do
+    DateTime.compare(cooldown_until, timestamp) != :gt
+  end
+
   defp visible_models(models, %{visible_candidates_by_model_id: visible_candidates}) do
     Enum.filter(models, fn %Model{} = model ->
-      Map.get(visible_candidates, model.id, []) != []
+      source_assignment_ids(model) != [] or Map.get(visible_candidates, model.id, []) != []
     end)
   end
 
@@ -481,8 +614,11 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     normalized in allowed
   end
 
+  # Chronological, not structural: structural DateTime comparison orders struct
+  # fields alphabetically (day before month before year), which inverts ranks
+  # across month boundaries.
   defp model_source_rank({%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity}) do
-    {model_source_plan_rank(identity), assignment.created_at, assignment.id}
+    {model_source_plan_rank(identity), DateTime.to_unix(assignment.created_at, :microsecond), assignment.id}
   end
 
   defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
@@ -510,13 +646,15 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
          payload,
          request_options,
          assignment,
-         enforce_service_tier?
+         enforce_service_tier?,
+         has_input_image?
        ) do
     case source_assignment_model_metadata(model, assignment) do
       %{} = metadata ->
         endpoint_compatible?(endpoint, metadata, request_options) and
-          streaming_compatible?(payload, metadata) and
-          image_input_compatible?(payload, metadata) and tools_compatible?(payload, metadata) and
+          streaming_compatible?(payload, request_options, metadata) and
+          image_input_compatible?(has_input_image?, metadata) and
+          tools_compatible?(payload, metadata) and
           reasoning_compatible?(payload, metadata) and
           service_tier_compatible?(payload, request_options, metadata, enforce_service_tier?)
 
@@ -526,7 +664,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   defp source_assignment_model_metadata(%Model{} = model, assignment) do
-    get_in(model.metadata || %{}, ["source_assignment_models", assignment.id])
+    case Map.get(model.metadata || %{}, "source_assignment_models") do
+      source_models when is_map(source_models) -> Map.get(source_models, assignment.id)
+      _absent_or_malformed -> nil
+    end
   end
 
   defp endpoint_compatible?(
@@ -548,13 +689,13 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     ])
   end
 
-  defp streaming_compatible?(payload, metadata) do
-    not RouteClass.streaming?(payload) or
+  defp streaming_compatible?(payload, request_options, metadata) do
+    not RequestOptions.upstream_streaming?(request_options, payload) or
       not ModelMetadata.streaming_explicitly_unsupported?(metadata)
   end
 
-  defp image_input_compatible?(payload, metadata) do
-    not payload_has_input_image?(payload) or not ModelMetadata.has_capability_evidence?(metadata) or
+  defp image_input_compatible?(has_input_image?, metadata) do
+    not has_input_image? or not ModelMetadata.has_capability_evidence?(metadata) or
       ModelMetadata.supports_image_input?(metadata)
   end
 
@@ -590,7 +731,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   defp service_tier_supported?(metadata, tier) do
-    tier = ModelMetadata.normalize_capability_value(tier)
+    tier = comparable_service_tier(tier)
 
     if tier in ["auto", "default"] do
       true
@@ -600,7 +741,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   defp service_tier_requires_explicit_support?(tier) when is_binary(tier) do
-    tier = ModelMetadata.normalize_capability_value(tier)
+    tier = comparable_service_tier(tier)
     tier not in ["", "auto", "default"]
   end
 
@@ -612,14 +753,20 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
       |> ModelMetadata.list_metadata("service_tiers")
       |> Enum.map(&service_tier_id/1)
       |> Enum.reject(&is_nil/1)
-      |> Enum.map(&ModelMetadata.normalize_capability_value/1)
+      |> Enum.map(&comparable_service_tier/1)
 
     speed_tiers =
       metadata
       |> ModelMetadata.list_metadata("additional_speed_tiers")
-      |> Enum.map(&ModelMetadata.normalize_capability_value/1)
+      |> Enum.map(&comparable_service_tier/1)
 
-    tier in service_tiers or tier in speed_tiers
+    comparable_service_tier(tier) in service_tiers or comparable_service_tier(tier) in speed_tiers
+  end
+
+  defp comparable_service_tier(tier) do
+    tier
+    |> ModelMetadata.normalize_capability_value()
+    |> ServiceTier.canonicalize()
   end
 
   defp service_tier_id(%{"id" => id}) when is_binary(id), do: id
@@ -641,16 +788,25 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   defp has_input_image?(%{} = value) do
-    value = Map.new(value, fn {key, item_value} -> {to_string(key), item_value} end)
+    type =
+      case Map.fetch(value, "type") do
+        {:ok, type} -> type
+        :error -> Map.get(value, :type)
+      end
 
-    case value do
-      %{"type" => "input_image"} -> true
-      _value -> value |> Map.values() |> Enum.any?(&has_input_image?/1)
-    end
+    type == "input_image" or
+      Enum.any?(value, fn {key, item_value} ->
+        not shadowed_atom_key?(value, key) and has_input_image?(item_value)
+      end)
   end
 
   defp has_input_image?(values) when is_list(values), do: Enum.any?(values, &has_input_image?/1)
   defp has_input_image?(_value), do: false
+
+  defp shadowed_atom_key?(value, key) when is_atom(key),
+    do: Map.has_key?(value, Atom.to_string(key))
+
+  defp shadowed_atom_key?(_value, _key), do: false
 
   defp metadata_bool?(metadata, key), do: Map.get(metadata || %{}, key) == true
 

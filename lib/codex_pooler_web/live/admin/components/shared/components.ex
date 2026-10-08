@@ -5,10 +5,40 @@ defmodule CodexPoolerWeb.Admin.Components do
   use CodexPoolerWeb, :html
 
   alias CodexPoolerWeb.Admin.Components.Shell
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: RelativeTime
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetOperation
 
   def admin_shell(assigns), do: Shell.admin_shell(assigns)
 
-  @docs_url "https://docs.codex-pooler.com/operators/admin-ui/"
+  attr :id, :string, required: true
+  attr :in_flight, :boolean, default: false
+  attr :class, :any, default: nil
+
+  @spec saved_reset_connection_notice(map()) :: Phoenix.LiveView.Rendered.t()
+  def saved_reset_connection_notice(assigns), do: SavedResetOperation.saved_reset_connection_notice(assigns)
+
+  attr :identity_id, :string, required: true
+  attr :surface, :atom, required: true, values: [:list, :bank, :cockpit]
+  attr :operation, :map, required: true
+  attr :refreshing, :boolean, default: false
+  attr :status_view_disabled, :boolean, default: false
+
+  @spec saved_reset_operation(map()) :: Phoenix.LiveView.Rendered.t()
+  def saved_reset_operation(assigns), do: SavedResetOperation.saved_reset_operation(assigns)
+
+  attr :identity_id, :string, required: true
+  attr :surface, :atom, required: true, values: [:list, :bank, :cockpit]
+  attr :id, :string, default: nil
+  attr :confirm_id, :string, default: nil
+  attr :cancel_id, :string, default: nil
+  attr :confirm_event, :any, default: "redeem_saved_reset"
+  attr :cancel_event, :any, default: "cancel_saved_reset_redemption"
+  attr :disabled, :boolean, default: false
+
+  @spec saved_reset_confirmation(map()) :: Phoenix.LiveView.Rendered.t()
+  def saved_reset_confirmation(assigns), do: SavedResetOperation.saved_reset_confirmation(assigns)
+
+  @docs_url "https://www.codex-pooler.com/docs/operators/admin-ui/"
 
   attr :id, :string, required: true
   attr :eyebrow, :string, default: "Admin"
@@ -89,8 +119,6 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :tone, :atom, default: :neutral, values: [:neutral, :primary, :success, :warning, :error]
   attr :compact_mobile, :boolean, default: false
 
-  slot :breakdown
-
   def metric_card(assigns) do
     ~H"""
     <article
@@ -121,7 +149,6 @@ defmodule CodexPoolerWeb.Admin.Components do
       >
         {@value}
       </p>
-      {render_slot(@breakdown)}
       <p
         :if={@description}
         class={[
@@ -189,11 +216,159 @@ defmodule CodexPoolerWeb.Admin.Components do
   defp admin_surface_overflow_class(:visible), do: "overflow-visible"
   defp admin_surface_overflow_class(_overflow), do: "overflow-hidden"
 
+  @doc """
+  Footer band of labeled facts that closes an admin card.
+
+  Renders the shared footer band and an evenly divided `dl` of facts. Divider
+  padding comes from each fact's position, so call sites never hand-roll
+  `pr-3` / `px-3` / `pl-3`.
+
+  Each `:fact` renders its own `dt` and `dd`; use `card_fact_label/1` and
+  `card_fact_value/1` so the micro-label and value typography stay identical
+  across cards. Mark a fact `interactive` when the cell doubles as a panel
+  toggle: the cell becomes the positioning context (`group relative isolate`)
+  for an overlay `button` rendered inside the slot.
+
+      <.card_fact_strip
+        id="job-worker-1-schedule"
+        facts_role="worker-schedule-grid"
+        data-role="worker-schedule-facts"
+      >
+        <:fact role="next-run-group">
+          <.card_fact_label>Next run</.card_fact_label>
+          <.card_fact_value class="tabular-nums">In 4 minutes</.card_fact_value>
+        </:fact>
+      </.card_fact_strip>
+  """
+  attr :id, :string, default: nil, doc: "id for the facts `dl`"
+  attr :facts_role, :string, default: nil, doc: "`data-role` for the facts `dl`"
+  attr :class, :any, default: nil, doc: "extra classes for the footer band"
+  attr :rest, :global, doc: "attributes for the footer band"
+
+  slot :fact, required: true do
+    attr :role, :string
+    attr :class, :any
+    attr :interactive, :boolean
+  end
+
+  def card_fact_strip(assigns) do
+    ~H"""
+    <footer class={["border-t border-base-300 bg-base-200/20 px-4 py-2.5", @class]} {@rest}>
+      <dl
+        id={@id}
+        data-role={@facts_role}
+        class={[
+          "grid min-w-0 divide-x divide-base-300/70 text-xs leading-5",
+          card_fact_columns_class(length(@fact))
+        ]}
+      >
+        <div
+          :for={{fact, index} <- Enum.with_index(@fact)}
+          data-role={fact[:role]}
+          class={[
+            "min-w-0",
+            card_fact_padding_class(index, length(@fact)),
+            fact[:interactive] && "group relative isolate",
+            fact[:class]
+          ]}
+        >
+          {render_slot(fact)}
+        </div>
+      </dl>
+    </footer>
+    """
+  end
+
+  defp card_fact_columns_class(2), do: "grid-cols-2"
+  defp card_fact_columns_class(4), do: "grid-cols-4"
+  defp card_fact_columns_class(_count), do: "grid-cols-3"
+
+  defp card_fact_padding_class(0, 1), do: nil
+  defp card_fact_padding_class(0, _count), do: "pr-3"
+  defp card_fact_padding_class(index, count) when index == count - 1, do: "pl-3"
+  defp card_fact_padding_class(_index, _count), do: "px-3"
+
+  @doc """
+  Empty row for a `table` body.
+
+  Sits as the first child of the `tbody` and shows only when no record row
+  rendered (`hidden only:table-row`), so the column header stays put instead of
+  the table being swapped for a block. Use `empty_state/1` instead when the
+  whole surface is empty.
+
+      <.table_empty_row id="operator-empty-row" columns={6}>
+        No operators match the current filters.
+      </.table_empty_row>
+  """
+  attr :id, :string, required: true
+  attr :columns, :integer, required: true
+
+  slot :inner_block, required: true
+
+  def table_empty_row(assigns) do
+    ~H"""
+    <tr id={@id} class="hidden only:table-row">
+      <td colspan={@columns} class="py-8 text-center text-sm text-base-content/60">
+        {render_slot(@inner_block)}
+      </td>
+    </tr>
+    """
+  end
+
+  @doc """
+  The type an admin card names a fact with.
+
+  One definition rather than a string repeated per card, because "the same as
+  the operator panel" is a claim that has to survive the next edit. Callers that
+  cannot render a `dt` — a fact outside a `dl` — take the class directly.
+  """
+  @spec card_fact_label_class() :: String.t()
+  def card_fact_label_class, do: "text-[0.62rem] font-semibold uppercase tracking-[0.08em]"
+
+  @doc """
+  Micro label for one `card_fact_strip/1` fact.
+
+  Pass `tone_class` to replace the resting colour (interactive cells swap it on
+  hover and while their panel is open); `class` only adds to the base.
+  """
+  attr :tone_class, :any, default: "text-base-content/35"
+  attr :class, :any, default: nil
+  attr :rest, :global
+
+  slot :inner_block, required: true
+
+  def card_fact_label(assigns) do
+    ~H"""
+    <dt class={[card_fact_label_class(), @tone_class, @class]} {@rest}>
+      {render_slot(@inner_block)}
+    </dt>
+    """
+  end
+
+  @doc """
+  Value for one `card_fact_strip/1` fact.
+
+  Truncates by default. Pass `tone_class` to replace the resting colour and
+  `class` to add treatments such as `tabular-nums`.
+  """
+  attr :tone_class, :any, default: "text-base-content/60"
+  attr :class, :any, default: nil
+  attr :rest, :global
+
+  slot :inner_block, required: true
+
+  def card_fact_value(assigns) do
+    ~H"""
+    <dd class={["truncate", @tone_class, @class]} {@rest}>{render_slot(@inner_block)}</dd>
+    """
+  end
+
   attr :id, :string, required: true
 
-  attr :class, :any,
-    default:
-      "modal-action mt-0 w-full shrink-0 border-t border-base-300 bg-base-200/80 px-4 py-2.5 sm:px-5"
+  # `sticky bottom-0` because `.modal-box` is itself the scroll container: on a
+  # bottom sheet the body runs past the fold and an unpinned footer takes the
+  # actions with it. The policy-editor shell pins its own footer the same way.
+  attr :class, :any, default: "modal-action sticky bottom-0 mt-0 w-full shrink-0 border-t border-base-300 bg-base-200/80 px-5 py-2.5 sm:px-6"
 
   attr :docs_link_role, :string, default: "admin-dialog-docs-link"
   attr :docs_link_id, :string, default: nil
@@ -208,11 +383,12 @@ defmodule CodexPoolerWeb.Admin.Components do
       |> assign(:resolved_docs_link_id, assigns.docs_link_id || "#{assigns.id}-docs-link")
 
     ~H"""
-    <footer id={@id} class={@class}>
-      <div class="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <footer id={@id} data-role="admin-dialog-footer" class={@class}>
+      <div class="flex w-full flex-row flex-wrap items-center justify-between gap-3">
         <a
           id={@resolved_docs_link_id}
           data-role={@docs_link_role}
+          data-admin-dialog-docs
           href={@docs_url}
           target="_blank"
           rel="noopener noreferrer"
@@ -228,7 +404,7 @@ defmodule CodexPoolerWeb.Admin.Components do
           </span>
           <span class="leading-none">Docs</span>
         </a>
-        <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+        <div class="flex flex-row flex-wrap justify-end gap-2">
           {render_slot(@actions)}
         </div>
       </div>
@@ -317,6 +493,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :mobile_single_column, :boolean, default: false
   attr :single_row, :boolean, default: false
   attr :control_size, :atom, default: :compact, values: [:compact, :default]
+  attr :fields_class, :any, default: nil, doc: "extra classes for the filter fields grid"
   attr :rest, :global, include: ~w(phx-change phx-submit phx-target method action autocomplete)
 
   slot :inner_block, required: true
@@ -334,7 +511,10 @@ defmodule CodexPoolerWeb.Admin.Components do
     >
       <div class={filter_form_layout_class(@compact)}>
         <div
-          class={filter_fields_class(@compact, @mobile_single_column, @single_row, @control_size)}
+          class={[
+            filter_fields_class(@compact, @mobile_single_column, @single_row, @control_size),
+            @fields_class
+          ]}
           data-role="filter-fields"
           data-layout={if(@single_row, do: "single-row")}
         >
@@ -372,6 +552,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :field, Phoenix.HTML.FormField, required: true
   attr :label, :string, required: true
   attr :inline_label, :boolean, default: true
+  attr :timezone, :string, required: true
 
   def cally_date_filter(assigns) do
     assigns =
@@ -395,6 +576,7 @@ defmodule CodexPoolerWeb.Admin.Components do
         type="button"
         class="input input-sm flex w-full items-center justify-between gap-2 text-left"
         aria-label={@label}
+        title={"#{@label} (#{@timezone})"}
         popovertarget={"#{@id}-popover"}
         style={"anchor-name: #{@anchor_name};"}
       >
@@ -415,7 +597,7 @@ defmodule CodexPoolerWeb.Admin.Components do
         class="dropdown rounded-box border border-base-300 bg-base-100 p-3 text-base-content shadow-xl"
         style={"position-anchor: #{@anchor_name};"}
       >
-        <calendar-date class="cally" value={@value} locale="en-GB" data-role="cally-calendar">
+        <calendar-date class="cally admin-calendar" value={@value} locale="en-GB" data-role="cally-calendar">
           <svg
             aria-label="Previous"
             class="size-4 fill-current"
@@ -453,6 +635,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :title, :string, required: true
   attr :description, :string, default: nil
   attr :icon, :string, default: "hero-inbox"
+  attr :loading?, :boolean, default: false
 
   slot :actions
 
@@ -462,7 +645,10 @@ defmodule CodexPoolerWeb.Admin.Components do
       id={@id}
       class="grid place-items-center gap-3 rounded-box border border-dashed border-base-300 bg-base-100 p-8 text-center"
     >
-      <.icon name={@icon} class="size-8 text-base-content/40" />
+      <.icon
+        name={@icon}
+        class={["size-8 text-base-content/40", @loading? && "admin-loading-icon"]}
+      />
       <div class="grid gap-1">
         <p class="font-semibold text-base-content">{@title}</p>
         <p :if={@description} class="max-w-md text-sm text-base-content/70">{@description}</p>
@@ -531,12 +717,292 @@ defmodule CodexPoolerWeb.Admin.Components do
     do: "dropdown dropdown-hover dropdown-right inline-flex"
 
   defp diagnostic_popover_content_class(:end),
-    do:
-      "dropdown-content z-50 mt-2 grid w-72 gap-1 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl"
+    do: "dropdown-content z-50 mt-2 grid w-72 gap-1 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl"
 
   defp diagnostic_popover_content_class(_placement),
-    do:
-      "dropdown-content z-20 ml-2 grid w-72 gap-1 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl"
+    do: "dropdown-content z-20 ml-2 grid w-72 gap-1 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl"
+
+  attr :id, :string, required: true
+  attr :model_id, :string, required: true
+  attr :info, :map, required: true
+  attr :trigger, :atom, default: :icon, values: [:icon, :label]
+  attr :placement, :atom, default: :start, values: [:start, :end]
+  attr :class, :any, default: nil
+  attr :trigger_class, :any, default: nil
+
+  def model_info_popover(assigns) do
+    assigns =
+      assigns
+      |> assign(:anchor_name, model_info_anchor_name(assigns.id))
+      |> assign(:description, model_info_description(assigns.info))
+      |> assign(:context_rows, model_info_context_rows(assigns.info))
+      |> assign(:facts, model_info_facts(assigns.info))
+      |> assign(:content_class, model_info_content_class(assigns.placement))
+
+    ~H"""
+    <span
+      id={@id}
+      data-role="model-info-popover"
+      class={["inline-flex min-w-0", @class]}
+    >
+      <button
+        :if={@trigger == :icon}
+        id={"#{@id}-trigger"}
+        type="button"
+        data-role="model-info-trigger"
+        class={[
+          "btn btn-ghost btn-xs btn-circle size-6 min-h-6 shrink-0 text-base-content/45 transition-colors hover:bg-base-200 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+          @trigger_class
+        ]}
+        aria-label={"About #{@model_id}"}
+        aria-controls={"#{@id}-content"}
+        aria-describedby={"#{@id}-content"}
+        popovertarget={"#{@id}-content"}
+        style={"anchor-name: #{@anchor_name};"}
+      >
+        <.icon name="hero-information-circle" class="size-4" />
+        <span class="sr-only">About {@model_id}</span>
+      </button>
+
+      <button
+        :if={@trigger == :label}
+        id={"#{@id}-trigger"}
+        type="button"
+        data-role="model-info-trigger"
+        class={[
+          "min-w-0 truncate rounded-sm text-left text-[11px] font-semibold leading-4 text-base-content underline decoration-dotted decoration-base-content/35 underline-offset-2 transition-colors hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+          @trigger_class
+        ]}
+        title={@model_id}
+        aria-label={"About #{@model_id}"}
+        aria-controls={"#{@id}-content"}
+        aria-describedby={"#{@id}-content"}
+        popovertarget={"#{@id}-content"}
+        style={"anchor-name: #{@anchor_name};"}
+      >
+        {@model_id}
+      </button>
+
+      <div
+        id={"#{@id}-content"}
+        popover
+        role="tooltip"
+        tabindex="0"
+        data-role="model-info-content"
+        class={@content_class}
+        style={"position-anchor: #{@anchor_name};"}
+      >
+        <div class="grid gap-1 p-3">
+          <p
+            data-role="model-info-title"
+            class="font-mono text-[0.62rem] font-semibold uppercase leading-4 tracking-[0.18em] text-primary"
+          >
+            Model info
+          </p>
+          <p
+            data-role="model-info-model-id"
+            class="break-words text-xs font-semibold leading-5 text-base-content"
+          >
+            {@model_id}
+          </p>
+          <p
+            data-role="model-info-description"
+            class="text-xs font-normal leading-5 text-base-content/70"
+          >
+            {@description}
+          </p>
+          <div
+            :if={@context_rows != []}
+            data-role="model-info-context"
+            class="mt-1"
+          >
+            <dl class="grid gap-1 text-[11px] leading-4">
+              <div
+                :for={{label, value} <- @context_rows}
+                class="grid grid-cols-[auto_minmax(0,1fr)] gap-2"
+              >
+                <dt class="text-base-content/50">{label}</dt>
+                <dd class="min-w-0 text-right font-medium tabular-nums text-base-content/75">
+                  {value}
+                </dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+
+        <div
+          :if={@facts != []}
+          data-role="model-info-facts"
+          class="grid gap-1.5 border-t border-base-300 bg-base-200/35 px-3 py-2"
+        >
+          <p
+            :for={fact <- @facts}
+            class="flex min-w-0 items-start gap-1.5 text-[11px] leading-4 text-base-content/65"
+            title={fact.title}
+          >
+            <.icon name={fact.icon} class="mt-px size-3.5 shrink-0" />
+            <span>{fact.text}</span>
+          </p>
+        </div>
+      </div>
+    </span>
+    """
+  end
+
+  defp model_info_anchor_name(id) do
+    token = String.replace(id, ~r/[^a-zA-Z0-9_-]+/, "-")
+    "--#{token}-anchor"
+  end
+
+  defp model_info_description(%{description_state: :available, description: description})
+       when is_binary(description),
+       do: description
+
+  defp model_info_description(%{description_state: :conflicting}),
+    do: "Descriptions differ across the current upstreams."
+
+  defp model_info_description(_info),
+    do: "No description was reported by the current upstreams."
+
+  defp model_info_context_rows(%{context_profiles: profiles}) when is_list(profiles) do
+    profiles
+    |> Enum.flat_map(&context_profile_bounds/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> context_summary_row()
+  end
+
+  defp model_info_context_rows(_info), do: []
+
+  defp context_profile_bounds(%{raw_window: default, raw_max_window: maximum})
+       when is_integer(default) and default > 0 and is_integer(maximum) and maximum > 0 do
+    [{default, maximum}]
+  end
+
+  defp context_profile_bounds(_profile), do: []
+
+  defp context_summary_row([]), do: []
+
+  defp context_summary_row([{window, window}]),
+    do: [{"Context", "#{format_token_count(window)} tokens"}]
+
+  defp context_summary_row([{default, maximum}]),
+    do: [
+      {"Context", "#{format_token_count(default)} default · up to #{format_token_count(maximum)}"}
+    ]
+
+  defp context_summary_row(profiles) do
+    defaults = Enum.map(profiles, &elem(&1, 0))
+    maximums = Enum.map(profiles, &elem(&1, 1))
+
+    default = format_token_range(defaults)
+    maximum = maximums |> Enum.max() |> format_token_count()
+
+    [{"Context", "#{default} default · up to #{maximum} · varies by upstream"}]
+  end
+
+  defp format_token_range(values) do
+    values = values |> Enum.uniq() |> Enum.sort()
+
+    case values do
+      [value] -> format_token_count(value)
+      values -> "#{format_token_count(hd(values))}-#{format_token_count(List.last(values))}"
+    end
+  end
+
+  defp format_token_count(value) when value >= 1_000_000,
+    do: format_scaled_token_count(value, 1_000_000, 2, "m")
+
+  defp format_token_count(value) when value >= 1_000,
+    do: format_scaled_token_count(value, 1_000, 1, "k")
+
+  defp format_token_count(value), do: Integer.to_string(value)
+
+  defp format_scaled_token_count(value, divisor, decimals, suffix) do
+    value
+    |> Kernel./(divisor)
+    |> :erlang.float_to_binary(decimals: decimals)
+    |> String.trim_trailing("0")
+    |> String.trim_trailing(".")
+    |> Kernel.<>(suffix)
+  end
+
+  # The icon follows the state, not the field: a barred eye where the answer is
+  # settled and closed, opposing arrows where it depends on which upstream the
+  # request lands on. The sentence already says whether it is about visibility
+  # or the API, so the icon is free to carry the thing the sentence buries — and
+  # "it varies" is the one an operator has to read differently, because it makes
+  # the outcome a routing question rather than a property of the model.
+  defp model_info_facts(info) do
+    []
+    |> append_model_info_fact(
+      Map.get(info, :visibility),
+      :hidden,
+      {"hero-eye-slash", "Hidden upstream alias"}
+    )
+    |> append_model_info_fact(
+      Map.get(info, :visibility),
+      :mixed,
+      {"hero-arrows-right-left", "Visibility differs across upstreams"}
+    )
+    |> append_model_info_fact(
+      Map.get(info, :api_support),
+      :unsupported,
+      {"hero-eye-slash", "Not exposed by the public API"}
+    )
+    |> append_model_info_fact(
+      Map.get(info, :api_support),
+      :mixed,
+      {"hero-arrows-right-left", "API support differs across upstreams"}
+    )
+    |> append_minimal_client_version_fact(Map.get(info, :minimal_client_versions, []))
+    |> append_catalog_updated_at_fact(Map.get(info, :catalog_updated_at))
+  end
+
+  defp append_model_info_fact(facts, value, value, {icon, text}),
+    do: facts ++ [%{icon: icon, text: text, title: nil}]
+
+  defp append_model_info_fact(facts, _value, _expected, _fact), do: facts
+
+  defp append_minimal_client_version_fact(facts, []), do: facts
+
+  defp append_minimal_client_version_fact(facts, [version]),
+    do: facts ++ [%{icon: "hero-command-line", text: "Min Codex #{version}", title: nil}]
+
+  defp append_minimal_client_version_fact(facts, versions) do
+    first = hd(versions)
+    last = List.last(versions)
+
+    facts ++
+      [
+        %{
+          icon: "hero-command-line",
+          text: "Min Codex #{first}-#{last} · varies by upstream",
+          title: nil
+        }
+      ]
+  end
+
+  defp append_catalog_updated_at_fact(facts, %DateTime{} = updated_at) do
+    absolute_timestamp = Calendar.strftime(updated_at, "%Y-%m-%d %H:%M UTC")
+
+    facts ++
+      [
+        %{
+          icon: "hero-clock",
+          text: "Catalog checked #{RelativeTime.relative_time_label(updated_at)}",
+          title: "Catalog checked #{absolute_timestamp}"
+        }
+      ]
+  end
+
+  defp append_catalog_updated_at_fact(facts, _updated_at), do: facts
+
+  defp model_info_content_class(:end),
+    do: "dropdown dropdown-end dropdown-bottom w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-box border border-base-300 bg-base-100 p-0 text-left text-base-content shadow-2xl"
+
+  defp model_info_content_class(_placement),
+    do: "dropdown dropdown-start dropdown-bottom w-80 max-w-[calc(100vw-2rem)] overflow-hidden rounded-box border border-base-300 bg-base-100 p-0 text-left text-base-content shadow-2xl"
 
   attr :id, :string, required: true
   attr :icon, :string, default: "hero-information-circle"
@@ -544,18 +1010,140 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :description, :string, required: true
   attr :tone, :atom, default: :info, values: [:info, :success, :warning, :error]
   attr :role, :string, default: "status"
+  attr :loading?, :boolean, default: false
 
   def extended_notice(assigns) do
     assigns = assign(assigns, :class, extended_notice_class(assigns.tone))
 
     ~H"""
     <div id={@id} class={@class} role={@role}>
-      <.icon name={@icon} class="size-5" />
+      <.icon name={@icon} class={["size-5", @loading? && "admin-loading-icon"]} />
       <div class="grid gap-1">
         <p class="font-semibold">{@title}</p>
         <p class="text-sm leading-5">{@description}</p>
       </div>
     </div>
+    """
+  end
+
+  attr :id, :string, required: true
+  attr :title, :string, required: true
+  attr :description, :string, required: true
+  attr :role, :string, default: "note"
+
+  @doc """
+  Quiet, permanent instructional callout.
+
+  Use for guidance copy that always accompanies a control. Transient state
+  communication (loading, errors, stale data) belongs to `extended_notice/1`.
+  """
+  def guidance_notice(assigns) do
+    ~H"""
+    <div
+      id={@id}
+      role={@role}
+      class="flex min-w-0 items-start gap-2.5 rounded-box border border-base-300 border-l-[3px] border-l-primary bg-primary/5 px-3 py-2 text-xs leading-5"
+    >
+      <span
+        aria-hidden="true"
+        class="mt-0.5 grid size-4 flex-none place-items-center rounded-full border-[1.5px] border-primary text-[0.6rem] font-bold text-primary"
+      >
+        !
+      </span>
+      <p class="min-w-0 text-base-content/70">
+        <strong class="font-semibold text-base-content">{@title}.</strong> {@description}
+      </p>
+    </div>
+    """
+  end
+
+  attr :value, :string, required: true
+  attr :value_id, :string, required: true
+  attr :copy_id, :string, required: true
+  attr :copy_label, :string, required: true
+  attr :copy_aria_label, :string, required: true
+
+  @doc """
+  The one-time secret block: a raw credential shown once, with its copy action.
+
+  Three dialogs reveal a secret exactly once - the API key, the MCP token, the
+  operator's temporary password - and each had its own copy of this markup,
+  identical class for class. Sharing it is the point: these are the screens
+  where a credential is lost if the layout misleads, so they must not drift.
+
+  It is the value and its copy action, and nothing else. The wrapper card and
+  the "one-time api key" caption it used to carry made a third box around a
+  string that already sat in a bordered field inside a bordered alert, and the
+  caption restated a title one line above it. Whatever names the secret belongs
+  in the dialog header, said once.
+
+  The layout is the OAuth handoff row: value and action share one line from `sm`
+  and stack below it. A credential is long and unbreakable, so on a phone it
+  takes the full width and the action drops under it - squeezed beside the
+  button it wrapped three deep - while on a desktop it fits inline and an action
+  parked on its own row reads as detached from what it copies.
+
+  The type is `text-xs`: 14px mono reads much larger than the 14px Roboto
+  Condensed beside it, the same call made on the OAuth handoff field. The copy
+  label has to say what it copies - `clipboard_button/1` treats the bare word
+  "Copy" as the icon-only case and hides the label from sight.
+
+  `admin-secret-value` is the hook the touch-target floor keys to: the value is
+  a `<code>`, so none of the daisyUI component selectors reach it, and without
+  it the field stays 32px beside a 44px button on a tablet.
+  """
+  def one_time_secret(assigns) do
+    ~H"""
+    <div class="grid min-w-0 items-start gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+      <code
+        id={@value_id}
+        class="admin-secret-value grid min-h-8 min-w-0 items-center break-all rounded-field border border-base-300 bg-base-200/60 px-2.5 py-1 font-mono text-xs leading-5 text-base-content"
+      >
+        {@value}
+      </code>
+      <.clipboard_button
+        id={@copy_id}
+        copy_text={@value}
+        label={@copy_label}
+        aria_label={@copy_aria_label}
+        class="btn btn-secondary btn-sm h-8 min-h-8 w-full shrink-0 gap-1.5 sm:w-auto"
+        icon_class="size-3.5"
+      />
+    </div>
+    """
+  end
+
+  attr :id, :string, required: true
+  attr :copy_text, :string, required: true
+  attr :aria_label, :string, required: true
+  attr :label, :string, default: "Copy"
+  attr :class, :any, default: "btn btn-square size-10 shrink-0"
+  attr :icon_class, :any, default: "size-4"
+
+  def clipboard_button(assigns) do
+    ~H"""
+    <button
+      id={@id}
+      type="button"
+      class={@class}
+      phx-hook="ClipboardCopy"
+      phx-update="ignore"
+      data-copy-text={@copy_text}
+      data-copy-label={@label}
+      data-copied-label="Copied"
+      aria-label={@aria_label}
+      title={@aria_label}
+    >
+      <.icon name="hero-clipboard-document" class={["copy-icon", @icon_class]} />
+      <span
+        data-copy-label
+        class={@label == "Copy" && "sr-only"}
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {@label}
+      </span>
+    </button>
     """
   end
 
@@ -566,9 +1154,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :variant, :atom, default: :secondary, values: [:primary, :secondary, :danger, :ghost]
   attr :size, :atom, default: :sm, values: [:sm, :md]
 
-  attr :rest, :global,
-    include:
-      ~w(href navigate patch method disabled form phx-click phx-disable-with phx-value-id phx-value-pool-id phx-value-step)
+  attr :rest, :global, include: ~w(href navigate patch method disabled form phx-click phx-disable-with phx-value-id phx-value-pool-id phx-value-step)
 
   def action_button(assigns) do
     assigns = assign(assigns, :class, action_button_class(assigns.variant, assigns.size))
@@ -596,9 +1182,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :variant, :atom, default: :secondary, values: [:secondary, :danger, :positive, :warning]
   attr :copy_feedback?, :boolean, default: false
 
-  attr :rest, :global,
-    include:
-      ~w(href navigate patch disabled phx-click phx-hook phx-update phx-value-id phx-value-pool-id title aria-label data-copy-text data-copy-label data-copied-label)
+  attr :rest, :global, include: ~w(href navigate patch disabled phx-click phx-hook phx-update phx-value-id phx-value-pool-id title aria-label data-copy-text data-copy-label data-copied-label)
 
   def dropdown_action_item(assigns) do
     assigns =
@@ -644,20 +1228,16 @@ defmodule CodexPoolerWeb.Admin.Components do
   end
 
   defp status_badge_class(:ok),
-    do:
-      "inline-flex items-center rounded-box bg-success/15 px-2 py-1 text-xs font-semibold text-success"
+    do: "inline-flex items-center rounded-box bg-success/15 px-2 py-1 text-xs font-semibold text-success"
 
   defp status_badge_class(:warning),
-    do:
-      "inline-flex items-center rounded-box bg-warning/15 px-2 py-1 text-xs font-semibold text-warning"
+    do: "inline-flex items-center rounded-box bg-warning/15 px-2 py-1 text-xs font-semibold text-warning"
 
   defp status_badge_class(:error),
-    do:
-      "inline-flex items-center rounded-box bg-error/15 px-2 py-1 text-xs font-semibold text-error"
+    do: "inline-flex items-center rounded-box bg-error/15 px-2 py-1 text-xs font-semibold text-error"
 
   defp status_badge_class(_status),
-    do:
-      "inline-flex items-center rounded-box bg-base-200 px-2 py-1 text-xs font-semibold text-base-content/70"
+    do: "inline-flex items-center rounded-box bg-base-200 px-2 py-1 text-xs font-semibold text-base-content/70"
 
   defp status_badge_label(:ok), do: "ok"
   defp status_badge_label(:warning), do: "attention needed"
@@ -672,7 +1252,12 @@ defmodule CodexPoolerWeb.Admin.Components do
   defp action_button_class(:primary, :md), do: "btn btn-primary w-full gap-2 px-5 sm:w-auto"
   defp action_button_class(:primary, :sm), do: "btn btn-primary btn-sm gap-2"
 
-  defp action_button_class(:danger, _size), do: "btn btn-error btn-outline btn-sm gap-2"
+  # Filled, not outlined. A destructive confirm is the one action its dialog
+  # exists for, and an outline reads as the quieter of the two buttons next to a
+  # ghost Cancel - the wrong way round. This is the only `:danger` recipe, so
+  # all 17 destructive confirms move together rather than splitting into two
+  # vocabularies.
+  defp action_button_class(:danger, _size), do: "btn btn-error btn-sm gap-2"
 
   defp action_button_class(:ghost, _size),
     do: "btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"

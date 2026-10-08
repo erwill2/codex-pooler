@@ -17,6 +17,20 @@ defmodule CodexPooler.Upstreams.CloudflareCookies do
   )
   @exact_chatgpt_hosts ~w(chatgpt.com chat.openai.com chatgpt-staging.com)
   @chatgpt_subdomain_suffixes ~w(.chatgpt.com .chatgpt-staging.com)
+  @http_date_months %{
+    "jan" => 1,
+    "feb" => 2,
+    "mar" => 3,
+    "apr" => 4,
+    "may" => 5,
+    "jun" => 6,
+    "jul" => 7,
+    "aug" => 8,
+    "sep" => 9,
+    "oct" => 10,
+    "nov" => 11,
+    "dec" => 12
+  }
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -272,20 +286,107 @@ defmodule CodexPooler.Upstreams.CloudflareCookies do
   end
 
   defp http_date_to_ms(value) do
-    case value |> String.to_charlist() |> :httpd_util.convert_request_date() do
-      {{year, month, day}, {hour, minute, second}} ->
-        with {:ok, naive} <- NaiveDateTime.new(year, month, day, hour, minute, second),
-             {:ok, datetime} <- DateTime.from_naive(naive, "Etc/UTC") do
-          DateTime.to_unix(datetime, :millisecond)
-        else
-          _invalid -> :session
-        end
+    with {:ok, {year, month, day}, {hour, minute, second}} <- parse_http_date(value),
+         {:ok, naive} <- NaiveDateTime.new(year, month, day, hour, minute, second),
+         {:ok, datetime} <- DateTime.from_naive(naive, "Etc/UTC") do
+      DateTime.to_unix(datetime, :millisecond)
+    else
+      _invalid -> :session
+    end
+  end
+
+  defp parse_http_date(value) do
+    value
+    |> String.split(~r/\s+/, trim: true)
+    |> parse_http_date_parts()
+  end
+
+  defp parse_http_date_parts([weekday, day, month, year, time | _timezone]) do
+    parse_http_date_with_weekday(weekday, day, month, year, time)
+  end
+
+  defp parse_http_date_parts([weekday, date, time | _timezone]) do
+    parse_rfc850_http_date(weekday, date, time)
+  end
+
+  defp parse_http_date_parts(_parts), do: :error
+
+  defp parse_http_date_with_weekday(weekday, day, month, year, time)
+       when byte_size(weekday) == 4 do
+    if String.ends_with?(weekday, ",") do
+      parse_http_date_components(day, month, year, time, [2])
+    else
+      :error
+    end
+  end
+
+  defp parse_http_date_with_weekday(weekday, day, month, year, time)
+       when byte_size(weekday) == 3 do
+    parse_http_date_components(month, day, time, year, [1, 2])
+  end
+
+  defp parse_http_date_with_weekday(_weekday, _day, _month, _year, _time), do: :error
+
+  defp parse_rfc850_http_date(weekday, date, time) do
+    with true <- String.ends_with?(weekday, ","),
+         {:ok, day, month, year} <- parse_rfc850_date(date) do
+      parse_http_date_components(day, month, "20" <> year, time, [2])
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp parse_rfc850_date(date) do
+    case String.split(date, "-", parts: 3) do
+      [day, month, year]
+      when byte_size(day) == 2 and byte_size(month) == 3 and byte_size(year) == 2 ->
+        {:ok, day, month, year}
 
       _invalid ->
-        :session
+        :error
     end
-  rescue
-    _error -> :session
+  end
+
+  defp parse_http_date_components(day, month, year, time, day_lengths) do
+    if byte_size(month) == 3 and byte_size(year) == 4 and byte_size(time) == 8 and
+         byte_size(day) in day_lengths do
+      with {:ok, day} <- parse_http_date_number(day),
+           {:ok, month} <- Map.fetch(@http_date_months, String.downcase(month)),
+           {:ok, year} <- parse_http_date_number(year),
+           {:ok, hour, minute, second} <- parse_http_date_time(time) do
+        {:ok, {year, month, day}, {hour, minute, second}}
+      else
+        _invalid -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp parse_http_date_time(value) do
+    value
+    |> String.split(":", parts: 3)
+    |> parse_http_time_parts()
+  end
+
+  defp parse_http_time_parts([hour, minute, second])
+       when byte_size(hour) == 2 and byte_size(minute) == 2 and byte_size(second) == 2 do
+    with {:ok, hour} <- parse_http_date_number(hour),
+         {:ok, minute} <- parse_http_date_number(minute),
+         {:ok, second} <- parse_http_date_number(second) do
+      {:ok, hour, minute, second}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp parse_http_time_parts(_parts), do: :error
+
+  defp parse_http_date_number(value) do
+    case Integer.parse(value) do
+      {number, ""} -> {:ok, number}
+      _invalid -> :error
+    end
   end
 
   defp expired?(:session, _now_ms), do: false

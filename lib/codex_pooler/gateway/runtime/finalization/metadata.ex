@@ -1,13 +1,33 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   @moduledoc false
 
+  alias CodexPooler.Accounting.Metadata, as: AccountingMetadata
   alias CodexPooler.Gateway.Payloads.DebugPayloadSummary
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Finalization.ProviderRefusalMessage
   alias CodexPooler.Gateway.Runtime.Streaming.DownstreamStream
+  alias CodexPooler.Gateway.Runtime.Streaming.StreamTiming
   alias CodexPooler.Gateway.Transports.BoundedResponseBody
+  alias CodexPooler.Gateway.Transports.NativeCodexResponseControl
+  alias CodexPooler.Gateway.Transports.RejectionBody
+  alias CodexPooler.Gateway.Transports.RetryAfter
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
+  alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
   alias CodexPooler.Quotas.Evidence.CodexParsers.RateLimitReachedType
 
   @canonical_uuid_byte_size 36
+  @rejection_body_max_bytes 65_536
+  @rejection_token_max_bytes 80
+  @rejection_token_pattern ~r/\A[A-Za-z0-9_.-]+\z/
+  @rejection_detail_classes %{"Stream must be set to true" => "stream_must_be_true"}
+  @unsupported_parameter_code "unsupported_parameter"
+  @invalid_request_error_type "invalid_request_error"
+  @previous_response_not_found_code "previous_response_not_found"
+  @rejection_param_max_bytes 160
+  @rejection_param_pattern ~r/\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]{0,3})\])*\z/
   @upstream_websocket_connection_atom_keys [
     :lifecycle_id,
     :generation,
@@ -23,6 +43,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   @backend_turn_state_relay_endpoints [
     "/backend-api/codex/responses",
     "/backend-api/codex/responses/compact"
+  ]
+  @ordinary_responses_endpoints [
+    "/backend-api/codex/responses",
+    "/backend-api/codex/v1/responses",
+    "/backend-api/codex/v1/chat/completions",
+    "/v1/responses",
+    "/v1/chat/completions"
+  ]
+  @compact_responses_endpoints [
+    "/backend-api/codex/responses/compact",
+    "/backend-api/codex/v1/responses/compact"
   ]
 
   @public_openai_responses_stream_keys ~w(
@@ -59,25 +90,132 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   def response_metadata(response, error_kind, opts) do
     metadata =
       %{
-        "content_type" => header(response, "content-type"),
+        "content_type" => bounded_content_type(header(response, "content-type")),
         "status_code" => response.status,
         "rate_limit_reached_type" => RateLimitReachedType.parse_header(response.headers),
-        "upstream_request_id" =>
-          header(response, "x-request-id") || header(response, "openai-request-id")
+        "upstream_request_id" => upstream_request_id(response)
       }
       |> compact_metadata()
 
     metadata = if error_kind, do: Map.put(metadata, "error_kind", error_kind), else: metadata
     metadata = Map.merge(metadata, response_body_limit_metadata(response))
+    metadata = Map.merge(metadata, rejection_metadata(response))
+
+    metadata =
+      Map.merge(metadata, upstream_websocket_connection_attempt_metadata(Req.Response.get_private(response, :upstream_websocket_connection)))
+
+    metadata = Map.merge(metadata, continuation_guard_attempt_metadata(response))
 
     opts
     |> route_attempt_metadata()
     |> Map.merge(gateway_debug_attempt_metadata(opts))
-    |> Map.merge(payload_compression_attempt_metadata(opts))
     |> Map.merge(reasoning_effort_attempt_metadata(opts))
+    |> Map.merge(RequestOptions.prompt_cache_controls_attempt_metadata(opts))
     |> Map.merge(upstream_websocket_bridge_attempt_metadata(opts))
     |> Map.merge(metadata)
   end
+
+  @doc """
+  Classifies a terminal upstream status for accounting and request logs.
+
+  Serving mode is deliberately absent. A non-429 4xx under an explicit Full
+  override used to be classified `full_upstream_rejection` instead of
+  `upstream_status`, which made the same provider rejection carry two codes
+  depending on a Pool setting (codex-pooler-findings#173): an operator
+  filtering request logs on `full_upstream_rejection` silently missed every
+  non-Full provider rejection, because nothing in that name says it is
+  mode-scoped.
+
+  It was narrower still: `explicit_full_ordinary_responses?/1` also gates on
+  `ordinary_responses_route?/1`, so a Full-override rejection on the compact
+  route never earned the code either. Over 30 days on one production
+  installation the code covered 62 of 496 non-429 4xx failures; the 434 it
+  missed were Full-mode compact rejections, not Lite ones.
+
+  The code encoded no fact of its own. `explicit_full_ordinary_responses?/1`
+  is true exactly when the serving-mode snapshot is
+  `{configured: "full", effective: "full", source: "override"}`, which
+  `RequestOptions.Routing.put_model_serving_mode/2` validates at set time and
+  `Accounting.Metadata` accepts verbatim, so whenever the code fired the
+  request and attempt already carried `model_serving_mode`,
+  `model_serving_mode_configured` and `model_serving_mode_source` under
+  `routing`. That is where mode belongs and where the request-log drawer
+  already reads it, independently of this code.
+
+  What operators actually query for — "the provider refused this request" — is
+  `upstream_status` plus a 4xx `upstream_status_code`, which is persisted on
+  the request, the attempt and the request-log fact. Recovering the old,
+  mode-scoped set costs one more clause on `routing` and is now explicit about
+  being mode-scoped.
+  """
+  @spec upstream_status_error_code(integer(), RequestOptions.t() | term()) :: String.t()
+  def upstream_status_error_code(429, %RequestOptions{}), do: "upstream_rate_limited"
+
+  def upstream_status_error_code(_status, _request_options), do: "upstream_status"
+
+  @doc """
+  True for a refusal that says the provider cannot resolve the request's
+  `previous_response_id` on this connection: the Codex backend's codeless
+  `invalid_request_error` whose message is exactly
+  `Invalid \`previous_response_id\`.` (a websocket connection that did not
+  produce the response, a fresh one included; findings#232 row 232-277, live
+  probe 2026-09-23, and the same refusal `UpstreamWebsocketSession` answers
+  locally for a fresh connection), or an explicit `previous_response_not_found`
+  code. Only that fixed text is compared; no provider text is kept.
+  """
+  @spec previous_response_miss?(Req.Response.t()) :: boolean()
+  def previous_response_miss?(%Req.Response{} = response) do
+    with body when is_binary(body) and byte_size(body) <= @rejection_body_max_bytes <- rejection_body(response),
+         {:ok, %{"error" => %{"type" => @invalid_request_error_type} = error}} <- CodexPooler.JSON.decode(body) do
+      previous_response_miss_error?(error)
+    else
+      _other -> false
+    end
+  end
+
+  defp previous_response_miss_error?(%{"code" => @previous_response_not_found_code}), do: true
+
+  defp previous_response_miss_error?(%{"message" => message} = error) when is_binary(message),
+    do: message == ErrorCodes.invalid_previous_response_id_message() and is_nil(Map.get(error, "code"))
+
+  defp previous_response_miss_error?(_error), do: false
+
+  defp rejection_message_class(message) when is_binary(message) do
+    cond do
+      message == ErrorCodes.invalid_previous_response_id_message() -> "invalid_previous_response_id"
+      match?({:ok, _param}, unsupported_parameter_detail(message)) -> @unsupported_parameter_code
+      true -> nil
+    end
+  end
+
+  defp rejection_message_class(_message), do: nil
+
+  @spec rejection_error(Req.Response.t()) :: map()
+  def rejection_error(%Req.Response{} = response) do
+    response
+    |> rejection_body()
+    |> decode_rejection_error()
+  end
+
+  @doc """
+  True for a bridged `/v1` refusal that the connection-bound guard answered
+  before anything was sent upstream: the response carries the guard's exact
+  metadata (`WebsocketBridge.rejection_response/4`), the only proof that the
+  provider never received the request. The provider's own refusal of the same
+  anchor carries none.
+  """
+  @spec undispatched_refusal?(Req.Response.t()) :: boolean()
+  def undispatched_refusal?(%Req.Response{} = response), do: map_size(continuation_guard(response)) > 0
+
+  defp continuation_guard_attempt_metadata(response) do
+    case continuation_guard(response) do
+      guard when map_size(guard) > 0 -> %{"transport_failure" => guard}
+      _none -> %{}
+    end
+  end
+
+  defp continuation_guard(response),
+    do: TransportFailureReason.sanitize_continuation_generation_guard_metadata(Req.Response.get_private(response, :transport_failure))
 
   defp upstream_websocket_bridge_attempt_metadata(%RequestOptions{
          transport: %{upstream_websocket_bridge?: true}
@@ -86,6 +224,236 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   end
 
   defp upstream_websocket_bridge_attempt_metadata(_opts), do: %{}
+
+  @doc """
+  True for the statuses whose sanitized rejection code/type/param are recorded
+  as attempt metadata.
+
+  Callers that relay those bounded facts back to the client must gate on the
+  same predicate, so the relayed window can never drift away from the
+  persisted one.
+  """
+  @spec rejection_metadata_status?(term()) :: boolean()
+  def rejection_metadata_status?(status) when is_integer(status),
+    do: status in 400..499 and status != 429
+
+  def rejection_metadata_status?(_status), do: false
+
+  @doc """
+  The sanitized rejection facts (`rejection_error_code`/`type`/`param`, message
+  presence and size, or a `{"detail": ...}` class) of a refused response, empty
+  outside `rejection_metadata_status?/1`. The websocket finalizer feeds it the
+  provider's wrapped error frame as the equivalent HTTP response, so both
+  transports record the same fields (findings#254 row 254-15).
+  """
+  @spec rejection_metadata(Req.Response.t()) :: map()
+  def rejection_metadata(%Req.Response{status: status} = response) do
+    if rejection_metadata_status?(status) do
+      response
+      |> rejection_body()
+      |> decode_rejection_metadata()
+    else
+      %{}
+    end
+  end
+
+  @spec rejection_body(Req.Response.t()) :: binary()
+  def rejection_body(%Req.Response{} = response) do
+    case RejectionBody.fetch(response) do
+      body when is_binary(body) -> body
+      _absent -> response_body(response)
+    end
+  end
+
+  defp decode_rejection_metadata(body)
+       when is_binary(body) and byte_size(body) <= @rejection_body_max_bytes do
+    case CodexPooler.JSON.decode(body) do
+      {:ok, %{"error" => error}} when is_map(error) ->
+        reading = message_reading(error)
+
+        %{}
+        |> maybe_put_rejection_value("rejection_error_code", valid_rejection_token(error["code"]))
+        |> maybe_put_rejection_value("rejection_error_type", valid_rejection_token(error["type"]))
+        |> maybe_put_rejection_value("rejection_error_param", valid_rejection_param(error["param"]) || reading_field(reading, :param))
+        |> put_rejection_message_metadata(error["message"])
+        |> maybe_put_rejection_value("rejection_message_class", rejection_message_class(error["message"]) || reading_field(reading, :class))
+        |> maybe_put_rejection_value("rejection_message_value", reading_field(reading, :value))
+
+      {:ok, %{"detail" => detail}} ->
+        detail_rejection_metadata(detail)
+
+      _other ->
+        %{}
+    end
+  end
+
+  defp decode_rejection_metadata(_body), do: %{}
+
+  # `{"detail": ...}` rejection bodies carry free provider text that may echo
+  # request content. Only a fixed class, an identifier-shaped value, or a
+  # 12-character fingerprint is recorded, next to the bounded message size.
+  defp detail_rejection_metadata(detail) when is_binary(detail) do
+    metadata =
+      case ProviderRefusalMessage.read_detail(detail) do
+        {:ok, %{class: @unsupported_parameter_code, param: param}} ->
+          %{"rejection_detail_class" => @unsupported_parameter_code, "rejection_error_param" => param}
+
+        {:ok, %{class: class, value: value}} ->
+          maybe_put_rejection_value(%{"rejection_detail_class" => class}, "rejection_message_value", value)
+
+        :error ->
+          %{"rejection_detail_class" => rejection_detail_class(detail)}
+      end
+
+    put_rejection_message_metadata(metadata, detail)
+  end
+
+  defp detail_rejection_metadata(_detail) do
+    put_rejection_message_metadata(%{"rejection_detail_class" => "non_string_detail"}, nil)
+  end
+
+  defp rejection_detail_class(""), do: "empty_detail"
+
+  defp rejection_detail_class(detail) do
+    case Map.fetch(@rejection_detail_classes, detail) do
+      {:ok, class} -> class
+      :error -> DiagnosticTaxonomy.identifier(detail)
+    end
+  end
+
+  defp decode_rejection_error(body)
+       when is_binary(body) and byte_size(body) <= @rejection_body_max_bytes do
+    case CodexPooler.JSON.decode(body) do
+      {:ok, %{"error" => error}} when is_map(error) ->
+        case message_reading(error) do
+          %{code: code, param: param} when is_binary(code) ->
+            maybe_put_rejection_value(%{code: code, type: @invalid_request_error_type}, :param, param)
+
+          _unread ->
+            %{}
+            |> maybe_put_rejection_value(:code, valid_rejection_token(error["code"]))
+            |> maybe_put_rejection_value(:type, valid_rejection_token(error["type"]))
+            |> maybe_put_rejection_value(:param, valid_rejection_param(error["param"]))
+        end
+
+      {:ok, %{"detail" => detail}} when is_binary(detail) ->
+        case unsupported_parameter_detail(detail) do
+          {:ok, param} -> %{code: @unsupported_parameter_code, type: @invalid_request_error_type, param: param}
+          :error -> %{}
+        end
+
+      _other ->
+        %{}
+    end
+  end
+
+  defp decode_rejection_error(_body), do: %{}
+
+  # The ChatGPT Codex backend answers a top-level parameter it does not accept
+  # on HTTP with `400 {"detail": "Unsupported parameter: <name>"}` instead of
+  # an `"error"` object: every HTTP request anchored on `previous_response_id`
+  # gets it, because the backend resolves that anchor only on the websocket
+  # connection that produced the response (findings#232 row 232-275). The text
+  # is the OpenAI `unsupported_parameter` message, so a detail that is exactly
+  # that prefix and a bounded field path is read as that code and param. Only
+  # the field path is taken from the provider text; any other detail keeps the
+  # fixed-class or fingerprint projection and relays nothing.
+  defp unsupported_parameter_detail(detail) do
+    case ProviderRefusalMessage.read_detail(detail) do
+      {:ok, %{class: @unsupported_parameter_code, param: param}} -> {:ok, param}
+      _other -> :error
+    end
+  end
+
+  # The Codex backend's websocket carries a refusal it answers over HTTP with a
+  # coded error object as a wrapped error object that has the HTTP message as
+  # text and no code and no param (`{"type": "error", "status": 400, "error":
+  # {"type": "invalid_request_error", "code": null, "param": null, "message":
+  # "..."}}`; direct probes 2026-10-06 and 2026-10-07, findings#333 and #336,
+  # Full and Lite). `ProviderRefusalMessage` reads the code, and the field path
+  # where the text names one, from the templates it was measured on, so the
+  # websocket relays and records the refusal the HTTP answer of the same fault
+  # does, instead of the redacted `upstream_status`. Only a codeless, paramless
+  # `invalid_request_error` qualifies, so a provider code or param is never
+  # overridden.
+  defp message_reading(%{"type" => @invalid_request_error_type, "message" => message} = error) when is_binary(message) do
+    with nil <- error["code"],
+         nil <- error["param"],
+         {:ok, reading} <- ProviderRefusalMessage.read(message) do
+      reading
+    else
+      _other -> nil
+    end
+  end
+
+  defp message_reading(_error), do: nil
+
+  defp reading_field(nil, _field), do: nil
+  defp reading_field(reading, field), do: Map.fetch!(reading, field)
+
+  defp maybe_put_rejection_value(metadata, _key, nil), do: metadata
+  defp maybe_put_rejection_value(metadata, key, value), do: Map.put(metadata, key, value)
+
+  defp valid_rejection_token(value) when is_binary(value) do
+    if byte_size(value) in 1..@rejection_token_max_bytes and
+         Regex.match?(@rejection_token_pattern, value),
+       do: value,
+       else: nil
+  end
+
+  defp valid_rejection_token(_value), do: nil
+
+  defp valid_rejection_param(value) when is_binary(value) do
+    if byte_size(value) in 1..@rejection_param_max_bytes and
+         Regex.match?(@rejection_param_pattern, value),
+       do: value,
+       else: nil
+  end
+
+  defp valid_rejection_param(_value), do: nil
+
+  defp put_rejection_message_metadata(metadata, message)
+       when is_binary(message) and message != "" do
+    metadata
+    |> Map.put("rejection_message_present", true)
+    |> Map.put("rejection_message_bytes", min(byte_size(message), 1_024))
+  end
+
+  defp put_rejection_message_metadata(metadata, _message) do
+    metadata
+    |> Map.put("rejection_message_present", false)
+    |> Map.put("rejection_message_bytes", 0)
+  end
+
+  @spec explicit_full_ordinary_responses?(RequestOptions.t() | term()) :: boolean()
+  def explicit_full_ordinary_responses?(%RequestOptions{} = request_options) do
+    RequestOptions.model_serving_mode_snapshot(request_options) == %{
+      configured_mode: "full",
+      effective_mode: "full",
+      source: "override"
+    } and ordinary_responses_route?(request_options)
+  end
+
+  def explicit_full_ordinary_responses?(_request_options), do: false
+
+  @spec ordinary_responses_route?(RequestOptions.t() | term()) :: boolean()
+  def ordinary_responses_route?(%RequestOptions{} = request_options) do
+    ordinary_responses_endpoint?(request_options) and
+      not request_options.payload_context.compaction_trigger_bridge?
+  end
+
+  def ordinary_responses_route?(_request_options), do: false
+
+  defp ordinary_responses_endpoint?(%RequestOptions{} = request_options) do
+    upstream_endpoint = request_options.transport.upstream_endpoint
+
+    source_endpoint =
+      request_options.openai_compatibility.source_endpoint ||
+        upstream_endpoint
+
+    upstream_endpoint not in @compact_responses_endpoints and
+      source_endpoint in @ordinary_responses_endpoints
+  end
 
   @spec response_body_limit_exceeded?(Req.Response.t()) :: boolean()
   def response_body_limit_exceeded?(%Req.Response{} = response),
@@ -114,8 +482,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
       %{
         "content_type" => "application/json",
         "status_code" => 200,
-        "upstream_request_id" =>
-          header(headers, "x-request-id") || header(headers, "openai-request-id"),
+        "upstream_request_id" => upstream_request_id(headers),
         "rate_limit_reached_type" => RateLimitReachedType.parse_header(headers),
         "upstream_transport" => "websocket"
       }
@@ -126,8 +493,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
     opts
     |> route_attempt_metadata()
     |> Map.merge(gateway_debug_attempt_metadata(opts))
-    |> Map.merge(payload_compression_attempt_metadata(opts))
     |> Map.merge(reasoning_effort_attempt_metadata(opts))
+    |> Map.merge(RequestOptions.prompt_cache_controls_attempt_metadata(opts))
     |> Map.merge(metadata)
     |> maybe_put_websocket_frame_headers(websocket_frame_headers)
   end
@@ -169,9 +536,6 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
 
   def upstream_websocket_connection_attempt_metadata(_connection), do: %{}
 
-  @spec request_metadata(RequestOptions.t() | map() | term()) :: map()
-  def request_metadata(opts), do: RequestOptions.payload_compression_request_metadata(opts)
-
   @spec first_event_stream_metadata(Req.Response.t(), map(), String.t(), RequestOptions.t()) ::
           map()
   def first_event_stream_metadata(response, failure, error_kind, opts) do
@@ -182,11 +546,22 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
     |> Map.put("stream_failure_stage", "first_event")
     |> Map.put("stream_terminal_type", failure.event_type)
     |> Map.put("stream_error_code", failure.code)
+    |> maybe_put_quota_rejection_proof(failure)
+    |> Map.merge(StreamTiming.failure_metadata(failure))
   end
+
+  defp maybe_put_quota_rejection_proof(metadata, %{quota_rejection_before_output?: true}),
+    do: Map.put(metadata, "quota_rejection_before_output", true)
+
+  defp maybe_put_quota_rejection_proof(metadata, _failure), do: metadata
 
   @spec merge_stream_state_metadata(map(), term()) :: map()
   def merge_stream_state_metadata(metadata, state) when is_map(metadata) do
-    Map.merge(metadata, public_openai_responses_stream_metadata(state))
+    metadata
+    |> Map.merge(public_openai_responses_stream_metadata(state))
+    |> Map.merge(DownstreamStream.native_http_progress_metadata(state))
+    |> Map.merge(DownstreamStream.native_http_tool_metadata(state))
+    |> Map.merge(StreamTiming.metadata(state))
   end
 
   def merge_stream_state_metadata(metadata, _state), do: metadata
@@ -202,9 +577,11 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   def maybe_put_masked_error_metadata(metadata, _upstream_code, _code), do: metadata
 
   @spec maybe_put_upstream_error_param(map(), term()) :: map()
-  def maybe_put_upstream_error_param(metadata, %{upstream_error_param: value})
-      when is_binary(value) and value != "" do
-    Map.put(metadata, "upstream_error_param", value)
+  def maybe_put_upstream_error_param(metadata, %{upstream_error_param: value}) do
+    case UpstreamErrorParam.sanitize(value) do
+      sanitized when is_binary(sanitized) -> Map.put(metadata, "upstream_error_param", sanitized)
+      nil -> metadata
+    end
   end
 
   def maybe_put_upstream_error_param(metadata, _failure), do: metadata
@@ -231,7 +608,16 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
 
     headers = [{"content-type", content_type}]
 
-    headers = maybe_put_backend_turn_state_response_header(headers, response, request_options)
+    headers =
+      case RetryAfter.header(response) do
+        nil -> headers
+        value -> [{"retry-after", value} | headers]
+      end
+
+    headers =
+      headers
+      |> maybe_put_backend_turn_state_response_header(response, request_options)
+      |> maybe_put_native_response_control_headers(response, request_options)
 
     if streaming?, do: [{"cache-control", "no-cache"} | headers], else: headers
   end
@@ -279,10 +665,6 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   end
 
   defp gateway_debug_attempt_metadata(opts), do: DebugPayloadSummary.attempt_metadata(opts)
-
-  defp payload_compression_attempt_metadata(opts) do
-    RequestOptions.payload_compression_attempt_metadata(opts)
-  end
 
   defp reasoning_effort_attempt_metadata(opts) do
     RequestOptions.reasoning_effort_attempt_metadata(opts)
@@ -335,23 +717,52 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
     end
   end
 
+  # Frame-carried header values are persisted under the request-id bound:
+  # every allowlisted name carries an id, a marker, a number or a timestamp,
+  # all within `[A-Za-z0-9_.:-]`. The allowlist admits wildcard quota names,
+  # so the persisted map is also capped at @max_persisted_frame_headers
+  # entries, kept by sorted name so the persisted subset is deterministic;
+  # the cap fits the request id, the reached-type marker, the six
+  # x-ratelimit names, the account window pair and two per-model window
+  # sets. Quota evidence reads the in-memory map, never this copy, so no
+  # window is lost by bounding here (findings#238).
+  @max_persisted_frame_headers 32
+
   defp maybe_put_websocket_frame_headers(metadata, headers) when map_size(headers) > 0 do
-    Map.put(metadata, "websocket_frame_headers", headers)
+    case bounded_frame_headers(headers) do
+      bounded when map_size(bounded) > 0 -> Map.put(metadata, "websocket_frame_headers", bounded)
+      _blank -> metadata
+    end
   end
 
   defp maybe_put_websocket_frame_headers(metadata, _headers), do: metadata
 
-  defp public_openai_responses_stream_metadata(state) do
-    case DownstreamStream.public_openai_responses_stream_metadata(state) do
-      %{"public_openai_responses_stream" => summary} when is_map(summary) ->
-        %{
-          "public_openai_responses_stream" =>
-            Map.take(summary, @public_openai_responses_stream_keys)
-        }
+  defp bounded_frame_headers(headers) do
+    headers
+    |> Enum.sort_by(fn {name, _value} -> name end)
+    |> Enum.take(@max_persisted_frame_headers)
+    |> Enum.flat_map(fn {name, value} ->
+      case bounded_request_id(value) do
+        nil -> []
+        bounded -> [{name, bounded}]
+      end
+    end)
+    |> Map.new()
+  end
 
-      _metadata ->
-        %{}
-    end
+  defp public_openai_responses_stream_metadata(state) do
+    stream_metadata =
+      case DownstreamStream.public_openai_responses_stream_metadata(state) do
+        %{"public_openai_responses_stream" => summary} when is_map(summary) ->
+          %{
+            "public_openai_responses_stream" => Map.take(summary, @public_openai_responses_stream_keys)
+          }
+
+        _metadata ->
+          %{}
+      end
+
+    Map.merge(stream_metadata, DownstreamStream.bridge_commitment_metadata(state))
   end
 
   @spec maybe_put_backend_turn_state_response_header(
@@ -376,6 +787,63 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
 
   defp maybe_put_backend_turn_state_response_header(headers, _response, _request_options),
     do: headers
+
+  defp maybe_put_native_response_control_headers(
+         headers,
+         response,
+         %RequestOptions{
+           transport: %{
+             transport: transport,
+             upstream_endpoint: "/backend-api/codex/responses",
+             websocket_writer: nil
+           },
+           openai_compatibility: %{source_endpoint: nil, openai_chat_payload: nil}
+         }
+       )
+       when transport in ["http_json", "http_sse"] do
+    NativeCodexResponseControl.http_headers(Req.Response.to_map(response).headers) ++ headers
+  end
+
+  defp maybe_put_native_response_control_headers(headers, _response, _request_options),
+    do: headers
+
+  # The Codex backend names its server-assigned request id `x-oai-request-id`
+  # (observed directly against the provider); `x-request-id` and
+  # `openai-request-id` are the names other OpenAI surfaces use. The names and
+  # their order live in `StreamProtocol.upstream_request_id_header_names/0`
+  # (`x-request-id` first, like the released Codex client), which is also the
+  # websocket error-frame allowlist, so the id the Pooler stores is the one a
+  # user reads in their Codex log when both are present. Reading only the last
+  # two names had left every attempt without a provider id. A blank value is
+  # absent; a value outside the request-id bound is fingerprinted, never
+  # erased, so a non-identifier first choice still wins over a later name.
+  defp upstream_request_id(response_or_headers) do
+    Enum.find_value(StreamProtocol.upstream_request_id_header_names(), fn name ->
+      response_or_headers
+      |> header(name)
+      |> bounded_request_id()
+    end)
+  end
+
+  # A provider request id is an opaque UUID-like token (`req_…` prefixes, hex
+  # UUIDs, `.`/`:`-joined segments); 128 bytes is generous for every observed
+  # shape and small enough that a body-sized header cannot land in jsonb
+  # (findings#238).
+  @request_id_pattern ~r/\A[A-Za-z0-9_.:-]+\z/
+  @request_id_max_bytes 128
+
+  defp bounded_request_id(value),
+    do: AccountingMetadata.bounded_string(value, @request_id_pattern, @request_id_max_bytes)
+
+  # A media type is `type/subtype` followed by `;`-separated parameters such
+  # as `charset=utf-8` (RFC 7231 token characters plus the space after `;`);
+  # 120 bytes covers every real content type with its parameters, and a
+  # quoted parameter value or anything longer is fingerprinted (findings#238).
+  @content_type_pattern ~r/\A[A-Za-z0-9!#$&^_.+\/;= -]+\z/
+  @content_type_max_bytes 120
+
+  defp bounded_content_type(value),
+    do: AccountingMetadata.bounded_string(value, @content_type_pattern, @content_type_max_bytes)
 
   defp header(%Req.Response{headers: headers}, key) do
     headers

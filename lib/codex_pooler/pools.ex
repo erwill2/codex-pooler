@@ -8,12 +8,16 @@ defmodule CodexPooler.Pools do
   alias CodexPooler.Access.DashboardSessions
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Accounts.User
+  alias CodexPooler.Alerts
   alias CodexPooler.Audit
   alias CodexPooler.Events
+  alias CodexPooler.Jobs.DeletionDeadline
 
   alias CodexPooler.Pools.{
     Authorization,
+    Deletion,
     Membership,
+    ModelServingModes,
     OperatorPoolAssignment,
     Pool,
     Routing,
@@ -113,12 +117,34 @@ defmodule CodexPooler.Pools do
   def list_pools_for_management(_scope),
     do: {:error, access_error(:invalid_request, "user scope is required")}
 
+  @spec model_serving_modes_snapshot(Scope.t(), pool_ref()) ::
+          {:ok, ModelServingModes.snapshot()} | {:error, access_error()}
+  defdelegate model_serving_modes_snapshot(scope, pool_or_id),
+    to: ModelServingModes,
+    as: :snapshot
+
+  @spec model_serving_modes_by_pool_ids([Ecto.UUID.t() | nil]) :: map()
+  defdelegate model_serving_modes_by_pool_ids(pool_ids), to: ModelServingModes, as: :by_pool_ids
+
+  @spec update_model_serving_modes(Scope.t(), pool_ref(), [map()], String.t()) ::
+          {:ok, ModelServingModes.update_result()} | {:error, access_error()}
+  defdelegate update_model_serving_modes(scope, pool_or_id, submitted_rows, expected_revision),
+    to: ModelServingModes,
+    as: :update
+
   @spec can_manage_pools?(Scope.t()) :: boolean()
   def can_manage_pools?(%Scope{} = scope) do
     match?({:ok, _decision}, require_capability(scope, capability(:pool_manage)))
   end
 
   def can_manage_pools?(_scope), do: false
+
+  @spec can_operate_pools?(Scope.t()) :: boolean()
+  def can_operate_pools?(%Scope{} = scope) do
+    match?({:ok, _pools}, list_pools(scope))
+  end
+
+  def can_operate_pools?(_scope), do: false
 
   @spec owner?(term()) :: boolean()
   defdelegate owner?(scope), to: Authorization
@@ -129,8 +155,8 @@ defmodule CodexPooler.Pools do
   @spec list_assigned_pool_ids(term()) :: [Ecto.UUID.t()]
   defdelegate list_assigned_pool_ids(scope), to: Authorization
 
-  @spec scope_assigned_pool_ids(term()) :: [Ecto.UUID.t()]
-  defdelegate scope_assigned_pool_ids(scope), to: Scope, as: :assigned_pool_ids
+  @spec list_pool_operator_ids(pool_ref()) :: [Ecto.UUID.t()]
+  defdelegate list_pool_operator_ids(pool_or_id), to: Authorization
 
   @spec list_active_pools() :: [Pool.t()]
   def list_active_pools do
@@ -156,6 +182,12 @@ defmodule CodexPooler.Pools do
 
   @spec v1_compatibility_enabled?(pool_ref()) :: boolean()
   defdelegate v1_compatibility_enabled?(pool_or_id), to: Routing
+
+  @spec allow_image_generation?(pool_ref()) :: boolean()
+  defdelegate allow_image_generation?(pool_or_id), to: Routing
+
+  @spec allow_audio_transcription?(pool_ref()) :: boolean()
+  defdelegate allow_audio_transcription?(pool_or_id), to: Routing
 
   @spec ensure_routing_settings(pool_ref()) :: RoutingSettings.t() | nil
   defdelegate ensure_routing_settings(pool_or_id), to: Routing
@@ -191,6 +223,7 @@ defmodule CodexPooler.Pools do
           record_pool_audit_event(scope, "pool.create", pool)
 
           maybe_broadcast_pool_change(opts, pool, "pool_created")
+          maybe_invalidate_notifications_after_status_change(opts, nil, pool)
 
         _result ->
           :ok
@@ -199,14 +232,6 @@ defmodule CodexPooler.Pools do
   end
 
   def create_pool(_scope, _attrs, _opts),
-    do: {:error, access_error(:invalid_request, "user scope is required")}
-
-  @spec delete_pool(Scope.t(), pool_ref()) :: pool_result()
-  def delete_pool(%Scope{} = scope, pool_or_id) do
-    delete_archived_pool(scope, pool_or_id, nil)
-  end
-
-  def delete_pool(_scope, _pool_or_id),
     do: {:error, access_error(:invalid_request, "user scope is required")}
 
   @spec update_pool(Scope.t(), pool_ref(), map(), keyword()) :: pool_result()
@@ -218,6 +243,7 @@ defmodule CodexPooler.Pools do
          {:ok, update_attrs} <- pool_update_attrs(attrs),
          {:ok, _decision} <- require_pool_update_capability(scope, pool, update_attrs) do
       now = now()
+      previous_status = pool.status
 
       update_pool_and_revoke_archived_assignments(
         pool,
@@ -233,6 +259,7 @@ defmodule CodexPooler.Pools do
           })
 
           maybe_broadcast_pool_change(opts, pool, "pool_updated")
+          maybe_invalidate_notifications_after_status_change(opts, previous_status, pool)
 
         _result ->
           :ok
@@ -275,6 +302,8 @@ defmodule CodexPooler.Pools do
             status: pool.status
           })
 
+          invalidate_notifications_after_status_change(previous_status, pool)
+
         _result ->
           :ok
       end)
@@ -287,25 +316,31 @@ defmodule CodexPooler.Pools do
   def change_pool_status(_scope, _pool_or_id, _status),
     do: {:error, access_error(:invalid_request, "user scope is required")}
 
-  @spec delete_archived_pool(Scope.t(), pool_ref(), String.t() | nil) :: pool_result()
+  @doc """
+  Deletes an archived Pool after an exact slug confirmation. A Pool with little history is deleted
+  at once (`{:ok, pool}`); a larger one is handed to a background deletion job (`{:deleting, pool}`)
+  and disappears when its history is gone. Either way the `pool.delete` audit event is written in
+  the transaction that deletes the Pool row (findings#206 rows 206-550 and 206-551).
+  """
+  @spec delete_archived_pool(Scope.t(), pool_ref(), String.t() | nil) ::
+          pool_result() | {:deleting, Pool.t()}
   def delete_archived_pool(%Scope{} = scope, pool_or_id, confirmation_slug) do
     with {:ok, _decision} <- require_capability(scope, capability(:pool_manage)),
          %Pool{} = pool <- normalize_pool(pool_or_id),
          :ok <- ensure_archived_pool(pool),
          :ok <- ensure_confirmation_slug(pool, confirmation_slug) do
-      record_pool_audit_event(scope, "pool.delete", pool)
-
-      Repo.delete(pool)
-      |> tap(fn
+      request_deletion(scope, pool)
+      |> case do
         {:ok, deleted_pool} ->
-          Events.broadcast_pools(deleted_pool.id, "pool_deleted", %{
-            pool_id: deleted_pool.id,
-            status: deleted_pool.status
-          })
+          {:ok, deleted_pool}
 
-        _result ->
-          :ok
-      end)
+        {:error, {:deleting, pool}} ->
+          Events.broadcast_pools(pool.id, "pool_deletion_started", %{pool_id: pool.id})
+          {:deleting, pool}
+
+        {:error, _reason} = error ->
+          error
+      end
     else
       nil -> {:error, access_error(:pool_not_found, "pool was not found")}
       {:error, _reason} = error -> error
@@ -314,6 +349,98 @@ defmodule CodexPooler.Pools do
 
   def delete_archived_pool(_scope, _pool_or_id, _confirmation_slug),
     do: {:error, access_error(:invalid_request, "user scope is required")}
+
+  # Final deletion queues its invalidations in the same transaction as the row.
+  defp request_deletion(scope, pool) do
+    case Deletion.request(scope_user(scope), pool) do
+      {:deleting, pool} -> {:error, {:deleting, pool}}
+      {:error, reason} -> {:error, deletion_error(reason)}
+      {:ok, _deleted} = deleted -> deleted
+    end
+  end
+
+  @doc """
+  Continues a scheduled Pool deletion for `CodexPooler.Jobs.PoolDeletionWorker`: deletes history
+  batches until `deadline` (monotonic milliseconds), then the Pool row with its audit event.
+  Returns `:more` while history is left, `:deleted` when the Pool is gone, `:gone` when there was
+  nothing to delete, `{:cancel, reason}` when the Pool is no longer archived.
+  """
+  @spec continue_pool_deletion(Ecto.UUID.t(), Ecto.UUID.t() | nil, integer()) ::
+          :more | :deleted | :gone | {:cancel, :pool_not_archived} | {:error, term()}
+  def continue_pool_deletion(pool_id, requested_by_user_id, deadline) when is_binary(pool_id) do
+    DeletionDeadline.run(deadline, fn ->
+      do_continue_pool_deletion(pool_id, requested_by_user_id, deadline)
+    end)
+  end
+
+  defp do_continue_pool_deletion(pool_id, requested_by_user_id, deadline) do
+    case Repo.get(Pool, pool_id) do
+      nil ->
+        :gone
+
+      %Pool{status: @status_archived} ->
+        with :done <- Deletion.purge_history(pool_id, deadline) do
+          finish_pool_deletion(pool_id, requested_by_user_id)
+        end
+
+      %Pool{} ->
+        {:cancel, :pool_not_archived}
+    end
+  rescue
+    error in [Postgrex.Error, DBConnection.ConnectionError] -> {:error, error}
+  end
+
+  defp finish_pool_deletion(pool_id, requested_by_user_id) do
+    case Deletion.finish(pool_id, requested_by_user_id) do
+      {:ok, _deleted_pool} ->
+        :deleted
+
+      {:error, :pool_not_found} ->
+        :gone
+
+      {:error, :pool_not_archived} ->
+        {:cancel, :pool_not_archived}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @doc "Tells open admin pages that a Pool's deletion job gave up; the Pool stays archived."
+  @spec broadcast_pool_deletion_failed(Ecto.UUID.t()) :: term()
+  def broadcast_pool_deletion_failed(pool_id) when is_binary(pool_id),
+    do: Events.broadcast_pools(pool_id, "pool_deletion_failed", %{pool_id: pool_id})
+
+  @doc """
+  The deletion state of each listed Pool that has one: `:in_progress` while a deletion job owns
+  it, `:failed` when its last deletion job gave up and the Pool is still archived.
+  """
+  @spec pool_deletion_states([Ecto.UUID.t()]) :: %{Ecto.UUID.t() => Deletion.state()}
+  defdelegate pool_deletion_states(pool_ids), to: Deletion, as: :states
+
+  defp scope_user(%Scope{user: %User{} = user}), do: user
+  defp scope_user(%Scope{}), do: nil
+
+  defp deletion_error(:pool_not_found), do: access_error(:pool_not_found, "pool was not found")
+  defp deletion_error(:pool_not_archived), do: access_error(:pool_not_archived, "pool must be archived before deletion")
+  defp deletion_error(reason), do: reason
+
+  @doc """
+  Invalidates the notification centers after a committed Pool status change,
+  and does nothing when the status did not change: a notification center shows
+  only active Pools' incidents, so a status change changes which ones a viewer
+  sees (findings#206 row 206-308). A created Pool had no status (`nil`): its
+  operators' open pages subscribe to it, or its first incident would miss them.
+  A workflow that creates or updates a Pool with `broadcast?: false` inside
+  its transaction calls this after the commit.
+  """
+  @spec invalidate_notifications_after_status_change(String.t() | nil, Pool.t()) :: :ok
+  def invalidate_notifications_after_status_change(status, %Pool{status: status}), do: :ok
+
+  def invalidate_notifications_after_status_change(_previous_status, %Pool{id: pool_id}) do
+    _ = Alerts.invalidate_notifications_after_pool_status_change(pool_id)
+    :ok
+  end
 
   @spec create_membership(Scope.t(), map()) :: membership_result()
   def create_membership(%Scope{} = scope, attrs) when is_map(attrs) do
@@ -363,28 +490,6 @@ defmodule CodexPooler.Pools do
   def create_instance_owner_membership(_actor, _user),
     do: {:error, access_error(:invalid_request, "user scope is required")}
 
-  @spec change_membership_role(Scope.t(), Membership.t() | Ecto.UUID.t(), String.t()) ::
-          membership_result()
-  def change_membership_role(%Scope{} = scope, membership_or_id, role) when is_binary(role) do
-    with {:ok, _decision} <- require_capability(scope, capability(:pool_manage)),
-         {:ok, role} <- normalize_membership_role(role) do
-      change_membership_role_transaction(scope, membership_or_id, role)
-    end
-  end
-
-  def change_membership_role(_scope, _membership_or_id, _role),
-    do: {:error, access_error(:invalid_request, "user scope is required")}
-
-  @spec revoke_membership(Scope.t(), Membership.t() | Ecto.UUID.t()) :: membership_result()
-  def revoke_membership(%Scope{} = scope, membership_or_id) do
-    with {:ok, _decision} <- require_capability(scope, capability(:pool_manage)) do
-      revoke_membership_transaction(scope, membership_or_id)
-    end
-  end
-
-  def revoke_membership(_scope, _membership_or_id),
-    do: {:error, access_error(:invalid_request, "user scope is required")}
-
   @spec list_active_memberships_for_user(term()) :: [Membership.t()]
   def list_active_memberships_for_user(user_id) when is_binary(user_id) do
     Repo.all(
@@ -405,136 +510,6 @@ defmodule CodexPooler.Pools do
 
   @spec access_error(atom(), String.t()) :: access_error()
   defdelegate access_error(code, message), to: Authorization
-
-  defp change_membership_role_transaction(scope, membership_or_id, role) do
-    Repo.transaction(fn ->
-      with {:ok, membership} <- lock_membership(membership_or_id),
-           :ok <- ensure_owner_authority_remains(membership, role: role),
-           previous_role = membership.role,
-           {:ok, membership} <-
-             membership
-             |> Membership.changeset(%{role: role})
-             |> Repo.update(),
-           {:ok, _audit} <-
-             record_membership_audit_event(scope, "membership.role_update", membership, %{
-               previous_role: previous_role,
-               role: membership.role,
-               status: membership.status
-             }) do
-        membership
-      else
-        error -> rollback_transaction_error(error)
-      end
-    end)
-    |> normalize_transaction_error()
-  end
-
-  defp revoke_membership_transaction(scope, membership_or_id) do
-    Repo.transaction(fn ->
-      with {:ok, membership} <- lock_membership(membership_or_id),
-           :ok <- ensure_owner_authority_remains(membership, status: @status_revoked),
-           now = now(),
-           previous_status = membership.status,
-           {:ok, membership} <-
-             membership
-             |> Membership.changeset(%{status: @status_revoked, revoked_at: now})
-             |> Repo.update(),
-           {:ok, _audit} <-
-             record_membership_audit_event(scope, "membership.revoke", membership, %{
-               previous_status: previous_status,
-               status: membership.status,
-               role: membership.role
-             }) do
-        membership
-      else
-        error -> rollback_transaction_error(error)
-      end
-    end)
-    |> normalize_transaction_error()
-  end
-
-  defp lock_membership(%Membership{id: id}), do: lock_membership(id)
-
-  defp lock_membership(id) when is_binary(id) do
-    case Repo.one(from membership in Membership, where: membership.id == ^id, lock: "FOR UPDATE") do
-      %Membership{} = membership -> {:ok, membership}
-      nil -> {:error, access_error(:membership_not_found, "membership was not found")}
-    end
-  end
-
-  defp lock_membership(_membership_or_id),
-    do: {:error, access_error(:membership_not_found, "membership was not found")}
-
-  defp normalize_membership_role(role) when is_binary(role) do
-    if role in Authorization.role_values() do
-      {:ok, role}
-    else
-      {:error, access_error(:invalid_role, "role must be instance_owner or instance_admin")}
-    end
-  end
-
-  defp ensure_owner_authority_remains(
-         %Membership{status: @status_active} = membership,
-         role: replacement_role
-       ) do
-    owner_role = Authorization.role(:instance_owner)
-
-    if membership.role == owner_role and replacement_role != owner_role do
-      ensure_not_final_active_owner(membership)
-    else
-      :ok
-    end
-  end
-
-  defp ensure_owner_authority_remains(
-         %Membership{status: @status_active} = membership,
-         status: @status_revoked
-       ) do
-    if membership.role == Authorization.role(:instance_owner) do
-      ensure_not_final_active_owner(membership)
-    else
-      :ok
-    end
-  end
-
-  defp ensure_owner_authority_remains(_membership, _attrs), do: :ok
-
-  defp ensure_not_final_active_owner(%Membership{user_id: user_id}) do
-    owner_role = Authorization.role(:instance_owner)
-
-    active_owner_user_ids =
-      Repo.all(
-        from membership in Membership,
-          join: user in User,
-          on: user.id == membership.user_id,
-          where:
-            membership.role == ^owner_role and membership.status == ^@status_active and
-              user.status == ^@status_active and is_nil(user.deleted_at),
-          order_by: [asc: membership.user_id],
-          lock: "FOR UPDATE",
-          select: membership.user_id
-      )
-      |> Enum.map(&normalize_uuid/1)
-      |> Enum.uniq()
-
-    if active_owner_user_ids == [user_id], do: {:error, :last_active_owner}, else: :ok
-  end
-
-  defp normalize_uuid(<<_::128>> = raw_uuid), do: Ecto.UUID.load!(raw_uuid)
-  defp normalize_uuid(uuid), do: uuid
-
-  defp rollback_transaction_error({:error, %Ecto.Changeset{} = changeset}),
-    do: Repo.rollback(changeset)
-
-  defp rollback_transaction_error({:error, reason}), do: Repo.rollback(reason)
-  defp rollback_transaction_error(reason), do: Repo.rollback(reason)
-
-  defp normalize_transaction_error({:ok, value}), do: {:ok, value}
-
-  defp normalize_transaction_error({:error, %Ecto.Changeset{} = changeset}),
-    do: {:error, changeset}
-
-  defp normalize_transaction_error({:error, reason}), do: {:error, reason}
 
   defp normalize_pool(%Pool{} = pool), do: pool
 
@@ -587,7 +562,8 @@ defmodule CodexPooler.Pools do
           pool_result()
   defp update_pool_and_revoke_archived_assignments(%Pool{} = pool, attrs, now) do
     Repo.transaction(fn ->
-      with {:ok, pool} <-
+      with :ok <- ensure_not_being_deleted(pool, Map.get(attrs, :status)),
+           {:ok, pool} <-
              pool
              |> Pool.changeset(attrs)
              |> Repo.update(),
@@ -602,6 +578,19 @@ defmodule CodexPooler.Pools do
     end)
     |> normalize_pool_lifecycle_transaction()
   end
+
+  # A deletion job removes an archived Pool's history in batches; the Pool must not come back
+  # half-deleted. The Pool row lock orders this check against `Deletion.schedule/2`.
+  defp ensure_not_being_deleted(%Pool{id: pool_id, status: @status_archived}, status)
+       when is_binary(status) and status != @status_archived do
+    _locked = Repo.one(from pool in Pool, where: pool.id == ^pool_id, lock: "FOR UPDATE", select: pool.id)
+
+    if Deletion.pending?(pool_id),
+      do: {:error, access_error(:pool_deletion_in_progress, "the Pool is being deleted")},
+      else: :ok
+  end
+
+  defp ensure_not_being_deleted(%Pool{}, _status), do: :ok
 
   defp delete_dashboard_sessions_for_inactive_pool(%Pool{}, nil), do: []
   defp delete_dashboard_sessions_for_inactive_pool(%Pool{}, @status_active), do: []
@@ -618,8 +607,7 @@ defmodule CodexPooler.Pools do
     {:ok, pool}
   end
 
-  defp normalize_pool_lifecycle_transaction({:error, reason}),
-    do: normalize_transaction_error({:error, reason})
+  defp normalize_pool_lifecycle_transaction({:error, reason}), do: {:error, reason}
 
   @spec revoke_active_operator_pool_assignments(Pool.t(), String.t() | nil, DateTime.t()) ::
           {:ok, non_neg_integer()}
@@ -645,12 +633,19 @@ defmodule CodexPooler.Pools do
   defp ensure_confirmation_slug(%Pool{slug: slug}, slug), do: :ok
 
   defp ensure_confirmation_slug(%Pool{}, _confirmation_slug),
-    do:
-      {:error, access_error(:confirmation_mismatch, "confirmation slug did not match pool slug")}
+    do: {:error, access_error(:confirmation_mismatch, "confirmation slug did not match pool slug")}
 
   defp maybe_put(map, _key, nil), do: map
 
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  # A caller that passes `broadcast?: false` runs inside its own transaction
+  # and invalidates after the commit.
+  defp maybe_invalidate_notifications_after_status_change(opts, previous_status, %Pool{} = pool) do
+    if Keyword.get(opts, :broadcast?, true),
+      do: invalidate_notifications_after_status_change(previous_status, pool),
+      else: :ok
+  end
 
   defp maybe_broadcast_pool_change(opts, %Pool{} = pool, reason) do
     if Keyword.get(opts, :broadcast?, true) do
@@ -679,24 +674,6 @@ defmodule CodexPooler.Pools do
   end
 
   defp record_pool_audit_event(_scope, _action, _pool, _details), do: :ok
-
-  defp record_membership_audit_event(%Scope{user: %User{} = user}, action, membership, details) do
-    Audit.record_user_event(user, %{
-      action: action,
-      target_type: "membership",
-      target_id: membership.id,
-      details:
-        Map.merge(
-          %{
-            membership_id: membership.id,
-            user_id: membership.user_id
-          },
-          details
-        )
-    })
-  end
-
-  defp record_membership_audit_event(_scope, _action, _membership, _details), do: {:ok, nil}
 
   defp pool_audit_details(%Pool{} = pool) do
     %{

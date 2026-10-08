@@ -1,11 +1,12 @@
 defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @moduledoc false
 
-  import Ecto.Query
-
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Accounting.PreAttemptRelease
   alias CodexPooler.Accounting.PricingResolution
+  alias CodexPooler.Accounting.RequestLifecycle.ReferenceLocks
+  alias CodexPooler.Accounting.RequestLifecycle.WindowUsage
   alias CodexPooler.Repo
 
   @entry_reservation "reservation"
@@ -14,11 +15,17 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @amount_recorded "recorded"
   @amount_voided "voided"
   @usage_pending "usage_pending"
-  @usage_known "usage_known"
-  @source_event_conflict_target {:unsafe_fragment,
-                                 "(source_event_id) WHERE source_event_id IS NOT NULL"}
+  @usage_not_applicable "not_applicable"
+  @source_event_conflict_target {:unsafe_fragment, "(source_event_id) WHERE source_event_id IS NOT NULL"}
 
   @type cost :: Decimal.t() | nil
+  @type reservation_auth :: %{
+          required(:pool) => CodexPooler.Pools.Pool.t(),
+          required(:api_key) => APIKey.t(),
+          optional(:pool_id) => Ecto.UUID.t(),
+          optional(:api_key_id) => Ecto.UUID.t(),
+          optional(:key_prefix) => String.t()
+        }
   @type estimate :: %{
           required(:input_tokens) => non_neg_integer() | nil,
           required(:cached_input_tokens) => non_neg_integer() | nil,
@@ -31,7 +38,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @type ledger_attrs :: %{
           required(:request_id) => Ecto.UUID.t(),
           required(:pool_id) => Ecto.UUID.t(),
-          required(:api_key_id) => Ecto.UUID.t(),
+          required(:api_key_id) => Ecto.UUID.t() | nil,
           required(:model_id) => Ecto.UUID.t() | nil,
           required(:entry_kind) => String.t(),
           required(:amount_status) => String.t(),
@@ -56,7 +63,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @type usage :: %{
           required(:status) => String.t(),
           required(:input_tokens) => non_neg_integer(),
-          required(:cached_input_tokens) => non_neg_integer(),
+          required(:cached_input_tokens) => non_neg_integer() | nil,
           required(:output_tokens) => non_neg_integer(),
           required(:reasoning_tokens) => non_neg_integer(),
           required(:total_tokens) => non_neg_integer(),
@@ -76,12 +83,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           required(:timestamp) => DateTime.t()
         }
   @type create_status :: :inserted | :existing
-  @type usage_window :: atom()
-  @type window_usage :: %{
-          required(:effective_request_count) => integer(),
-          required(:effective_total_tokens) => integer(),
-          required(:effective_cost_micros) => Decimal.t()
-        }
+  @type usage_window :: WindowUsage.usage_window()
+  @type window_usage :: WindowUsage.window_usage()
 
   @spec create_or_get!(map()) :: LedgerEntry.t()
   def create_or_get!(attrs) do
@@ -94,6 +97,11 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   def create_or_get_with_status!(attrs) do
     source_event_id = attrs.source_event_id
     attrs = Map.put_new(attrs, :id, Ecto.UUID.generate())
+
+    ReferenceLocks.lock_and_validate!(
+      Map.get(attrs, :upstream_identity_id),
+      Map.get(attrs, :pool_upstream_assignment_id)
+    )
 
     case Repo.insert_all(LedgerEntry, [attrs],
            on_conflict: :nothing,
@@ -119,6 +127,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
 
     attrs
     |> Map.put(:correction_of_entry_id, existing.id)
+    |> Map.put(:occurred_at, existing.occurred_at)
     |> Map.put(
       :source_event_id,
       reconciled_settlement_source_event_id(Map.fetch!(attrs, :request_id))
@@ -130,96 +139,15 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           %{
             usage_window() => window_usage()
           }
-  def window_usages(api_key_id, windows) do
-    windows = normalize_windows(windows)
+  defdelegate window_usages(api_key_id, windows), to: WindowUsage
 
-    windows
-    |> Enum.reject(fn {_window, since} -> is_nil(since) end)
-    |> Map.new(fn {window, since} -> {window, window_usage(api_key_id, since)} end)
-  end
-
-  defp window_usage(api_key_id, since) do
-    Repo.one(
-      from e in LedgerEntry,
-        where:
-          e.api_key_id == ^api_key_id and e.amount_status == @amount_recorded and
-            e.occurred_at >= ^since,
-        select: %{
-          effective_request_count:
-            type(
-              fragment(
-                "COALESCE(SUM(CASE WHEN ? = ? THEN -COALESCE(?, 0) ELSE COALESCE(?, 0) END), 0)::bigint",
-                e.entry_kind,
-                ^@entry_release,
-                e.request_count,
-                e.request_count
-              ),
-              :integer
-            ),
-          effective_total_tokens:
-            type(
-              fragment(
-                """
-                COALESCE(
-                  SUM(
-                    CASE
-                      WHEN ? = ? THEN -COALESCE(?, 0)
-                      WHEN ? = ? AND ? = ? THEN COALESCE(?, 0)
-                      WHEN ? = ? THEN 0
-                      ELSE COALESCE(?, 0)
-                    END
-                  ),
-                  0
-                )::bigint
-                """,
-                e.entry_kind,
-                ^@entry_release,
-                e.total_tokens,
-                e.entry_kind,
-                ^@entry_settlement,
-                e.usage_status,
-                ^@usage_known,
-                e.total_tokens,
-                e.entry_kind,
-                ^@entry_settlement,
-                e.total_tokens
-              ),
-              :integer
-            ),
-          effective_cost_micros:
-            fragment(
-              """
-              COALESCE(
-                SUM(
-                  CASE
-                    WHEN ? = ? THEN -COALESCE(?, 0)
-                    WHEN ? = ? AND ? = ? THEN COALESCE(?, 0)
-                    WHEN ? = ? THEN 0
-                    ELSE COALESCE(?, 0)
-                  END
-                ),
-                0
-              )
-              """,
-              e.entry_kind,
-              ^@entry_release,
-              e.estimated_cost_micros,
-              e.entry_kind,
-              ^@entry_settlement,
-              e.usage_status,
-              ^@usage_known,
-              e.settled_cost_micros,
-              e.entry_kind,
-              ^@entry_settlement,
-              e.estimated_cost_micros
-            )
-        }
-    ) || empty_window_usage()
-  end
+  @spec window_usages(Ecto.UUID.t(), WindowUsage.windows(), DateTime.t()) ::
+          %{usage_window() => window_usage()}
+  defdelegate window_usages(api_key_id, windows, as_of), to: WindowUsage
 
   @spec reservation_attrs(
           Request.t(),
-          CodexPooler.Access.auth_context(),
+          reservation_auth(),
           APIKey.t(),
           pricing(),
           estimate(),
@@ -281,13 +209,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       transport: request.transport,
       currency_code: (snapshot && snapshot.currency_code) || reservation.currency_code,
       input_tokens: positive_or_nil(state.usage.input_tokens),
-      cached_input_tokens: positive_or_nil(state.usage.cached_input_tokens),
+      cached_input_tokens: known_cached_input_tokens(state.usage),
       cache_write_tokens: known_cache_write_tokens(state.usage),
       output_tokens: positive_or_nil(state.usage.output_tokens),
       reasoning_tokens: positive_or_nil(state.usage.reasoning_tokens),
       total_tokens: positive_or_nil(state.usage.total_tokens),
       request_count: 1,
-      estimated_cost_micros: reservation.estimated_cost_micros,
+      estimated_cost_micros: settlement_estimated_cost(state.usage, reservation),
       settled_cost_micros: ledger_cost_value(settled_cost),
       source_event_id: settlement_source_event_id(request.id),
       occurred_at: state.usage.recorded_at,
@@ -333,17 +261,22 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           LedgerEntry.t(),
           String.t(),
           String.t() | nil,
-          DateTime.t()
+          String.t() | nil,
+          DateTime.t(),
+          Attempt.t() | nil
         ) :: ledger_attrs()
   def reservation_failure_release_attrs(
         request,
         reservation,
         usage_status,
         last_error_code,
-        timestamp
+        pre_attempt_phase,
+        timestamp,
+        released_after_attempt \\ nil
       ) do
     %{
       request_id: request.id,
+      attempt_id: released_after_attempt && released_after_attempt.id,
       pricing_snapshot_id: reservation.pricing_snapshot_id,
       pool_id: request.pool_id,
       api_key_id: request.api_key_id,
@@ -364,7 +297,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       source_event_id: release_source_event_id(request.id),
       occurred_at: timestamp,
       created_at: timestamp,
-      details: reservation_failure_release_details(request, last_error_code)
+      details:
+        reservation_failure_release_details(
+          request,
+          last_error_code,
+          pre_attempt_phase,
+          released_after_attempt
+        )
     }
   end
 
@@ -387,7 +326,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       "attempt_status" => attempt.status,
       "response_status_code" => Map.fetch!(context, :response_status_code),
       "retry_count" => Map.fetch!(context, :retry_count),
-      "estimated_from_reserve" => usage.status != "usage_known",
+      "estimated_from_reserve" => usage.status not in ["usage_known", @usage_not_applicable],
       "settled_cost_micros" => context |> Map.fetch!(:settled_cost) |> decimal_string_or_nil(),
       "cached_input_cost_micros" => cached_input_cost_micros(usage, pricing),
       "cache_write_rate_status" => cache_write_rate_status(usage, pricing),
@@ -406,7 +345,24 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
     |> Map.merge(PricingResolution.details(pricing))
   end
 
-  defp reservation_failure_release_details(request, last_error_code) do
+  # `request_status` is the status this same write just set, so it says nothing
+  # about the phase the reservation was released from. `pre_attempt_phase` is
+  # the field that does, and it is written for every reservation-failure
+  # release — an explicit `unrecorded` when the caller declared nothing, never
+  # an absent key, so the absent key keeps meaning "not a pre-attempt release,
+  # or older than this field".
+  defp reservation_failure_release_details(request, last_error_code, pre_attempt_phase, nil) do
+    %{
+      "reservation_source_event_id" => reservation_source_event_id(request.id),
+      "release_reason" => last_error_code,
+      "request_status" => request.status,
+      PreAttemptRelease.detail_key() => PreAttemptRelease.phase(pre_attempt_phase)
+    }
+  end
+
+  # Released after a terminal attempt: the attempt id on the entry says so,
+  # and the pre-attempt phase key stays absent (findings#221).
+  defp reservation_failure_release_details(request, last_error_code, _phase, _attempt) do
     %{
       "reservation_source_event_id" => reservation_source_event_id(request.id),
       "release_reason" => last_error_code,
@@ -414,9 +370,20 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
     }
   end
 
+  # A settlement whose usage does not apply did no provider work, so it
+  # carries no estimate either: the reservation's estimated cost would read as
+  # the request's cost wherever usage is not known and priced.
+  defp settlement_estimated_cost(%{status: @usage_not_applicable}, _reservation), do: Decimal.new(0)
+  defp settlement_estimated_cost(_usage, reservation), do: reservation.estimated_cost_micros
+
   defp positive_or_nil(value), do: if(value && value > 0, do: value, else: nil)
   defp nonnegative_or_nil(value) when is_integer(value) and value >= 0, do: value
   defp nonnegative_or_nil(_value), do: nil
+
+  defp known_cached_input_tokens(%{status: "usage_known", cached_input_tokens: value}),
+    do: nonnegative_or_nil(value)
+
+  defp known_cached_input_tokens(_usage), do: nil
 
   defp known_cache_write_tokens(%{status: "usage_known", cache_write_tokens: value}),
     do: nonnegative_or_nil(value)
@@ -429,7 +396,11 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   defp decimal_string_or_nil(value), do: to_string(value)
 
   defp cached_input_cost_micros(
-         %{input_tokens: input_tokens, cached_input_tokens: cached_input_tokens},
+         %{
+           status: "usage_known",
+           input_tokens: input_tokens,
+           cached_input_tokens: cached_input_tokens
+         },
          %{snapshot: %{cached_input_token_micros: %Decimal{} = token_micros}}
        )
        when is_integer(input_tokens) and is_integer(cached_input_tokens) do
@@ -462,14 +433,14 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   defp cache_write_token_micros(_usage, _pricing), do: nil
 
   defp cache_write_cost_micros(
-         %{cache_write_tokens: tokens},
+         %{status: "usage_known", cache_write_tokens: tokens},
          %{status: "priced", snapshot: %{cache_write_token_micros: %Decimal{} = rate}}
        )
        when is_integer(tokens) and tokens >= 0 do
     tokens |> Decimal.new() |> Decimal.mult(rate) |> decimal_string_or_nil()
   end
 
-  defp cache_write_cost_micros(%{cache_write_tokens: 0}, _pricing), do: "0"
+  defp cache_write_cost_micros(%{status: "usage_known", cache_write_tokens: 0}, _pricing), do: "0"
 
   defp cache_write_cost_micros(_usage, _pricing), do: nil
 
@@ -477,15 +448,4 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
     do: Map.get(config, "importer_format_revision")
 
   defp pricing_importer_revision(_pricing), do: nil
-
-  defp normalize_windows(windows) when is_list(windows), do: Map.new(windows)
-  defp normalize_windows(windows) when is_map(windows), do: windows
-
-  defp empty_window_usage do
-    %{
-      effective_request_count: 0,
-      effective_total_tokens: 0,
-      effective_cost_micros: Decimal.new(0)
-    }
-  end
 end

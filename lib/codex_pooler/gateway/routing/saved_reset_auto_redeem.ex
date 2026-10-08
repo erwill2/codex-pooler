@@ -3,10 +3,18 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
 
   require Logger
 
+  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
+  alias CodexPooler.Gateway.Persistence.RoutingCircuitState
   alias CodexPooler.Gateway.Routing.CandidateEligibility
+  alias CodexPooler.Gateway.Routing.ProviderCredits
   alias CodexPooler.Gateway.Routing.QuotaRefresh.{Executor, Plan}
+  alias CodexPooler.Gateway.Routing.SavedResetAutoRedeem.ExpiryPriority
+  alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
-  alias CodexPooler.Upstreams.Quota.Windows
+  alias CodexPooler.Quotas.WindowClassifier
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Quota.{CapacityAssessment, RoutingQuotaSnapshot, Windows}
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
@@ -14,97 +22,287 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
-  @spec maybe_redeem_after_quota_exhaustion(term(), map(), :required | :optional) :: term()
-  def maybe_redeem_after_quota_exhaustion(result, refresh_plan, quota_mode)
+  @type refilter_clock :: (-> DateTime.t())
+  @type refilter_option :: {:refilter_clock, refilter_clock()}
+  @type refilter_options :: [refilter_option()]
 
+  @type non_credit_recovery_input :: %{candidate_exclusions: [map()], result: term()}
+  @type recovery_outcome :: :confirmed | :pending | :disabled | :unavailable | :not_applied | :failed
+
+  @spec recovery_outcome(term()) :: recovery_outcome()
+  def recovery_outcome({:error, error}), do: decode_recovery_outcome(Map.get(error, :non_credit_recovery_outcome))
+  def recovery_outcome({:ok, _candidates, decision}), do: decode_recovery_outcome(decision["non_credit_recovery_outcome"])
+  def recovery_outcome({:ok, _candidates, decision, _state}), do: decode_recovery_outcome(decision["non_credit_recovery_outcome"])
+  def recovery_outcome(_result), do: :unavailable
+  @doc "Attempts existing reset recovery from actual included-only exclusions, never a policy-created pressure error."
+  @spec recover_non_credit_exhaustion(non_credit_recovery_input(), map(), :required | :optional, DateTime.t(), refilter_options()) :: term()
+  def recover_non_credit_exhaustion(%{candidate_exclusions: exclusions, result: result}, plan, :required, timestamp, opts) do
+    candidates = long_window_exhausted_candidates(%{candidate_exclusions: exclusions}, plan)
+    maybe_claim_probe_or_redeem_candidate(candidates, result, plan, :blocked_weekly_exhaustion, timestamp, opts)
+  end
+
+  def recover_non_credit_exhaustion(%{result: result}, _plan, _mode, _timestamp, _opts), do: result
+
+  @spec maybe_redeem_after_quota_exhaustion(term(), map(), :required | :optional) :: term()
+  def maybe_redeem_after_quota_exhaustion(result, refresh_plan, quota_mode) do
+    # Compatibility entry point for callers outside RouteFiltering's explicit
+    # candidate scan. The routed cycle always calls /4 with its owned timestamp.
+    maybe_redeem_after_quota_exhaustion(result, refresh_plan, quota_mode, now())
+  end
+
+  @spec maybe_redeem_after_quota_exhaustion(
+          term(),
+          map(),
+          :required | :optional,
+          DateTime.t()
+        ) :: term()
+  def maybe_redeem_after_quota_exhaustion(
+        result,
+        refresh_plan,
+        quota_mode,
+        %DateTime{} = timestamp
+      ) do
+    maybe_redeem_after_quota_exhaustion(result, refresh_plan, quota_mode, timestamp, [])
+  end
+
+  @doc false
+  @spec maybe_redeem_after_quota_exhaustion(
+          term(),
+          map(),
+          :required | :optional,
+          DateTime.t(),
+          refilter_options()
+        ) :: term()
   def maybe_redeem_after_quota_exhaustion(
         {:error, %{code: code} = error} = result,
         refresh_plan,
-        :required
+        :required,
+        %DateTime{} = timestamp,
+        opts
       )
-      when code in ["quota_exhausted", :quota_exhausted] and is_map(refresh_plan) do
-    if all_candidates_excluded_only_by_weekly_exhaustion?(error, refresh_plan) do
-      maybe_redeem_candidate(result, refresh_plan, :blocked_weekly_exhaustion)
-    else
-      result
-    end
+      when code in ["quota_exhausted", :quota_exhausted] and is_map(refresh_plan) and
+             is_list(opts) do
+    candidates = long_window_exhausted_candidates(error, refresh_plan)
+    maybe_claim_probe_or_redeem_candidate(candidates, result, refresh_plan, :blocked_weekly_exhaustion, timestamp, opts)
   end
 
-  def maybe_redeem_after_quota_exhaustion(result, _refresh_plan, _quota_mode), do: result
+  def maybe_redeem_after_quota_exhaustion(
+        result,
+        _refresh_plan,
+        _quota_mode,
+        %DateTime{},
+        opts
+      )
+      when is_list(opts),
+      do: result
 
   @spec maybe_redeem_before_quota_exhaustion(term(), map(), :required | :optional) :: term()
-  def maybe_redeem_before_quota_exhaustion(result, refresh_plan, quota_mode)
+  def maybe_redeem_before_quota_exhaustion(result, refresh_plan, quota_mode) do
+    # Compatibility entry point for callers outside RouteFiltering's explicit
+    # candidate scan. The routed cycle always calls /4 with its owned timestamp.
+    maybe_redeem_before_quota_exhaustion(result, refresh_plan, quota_mode, now())
+  end
 
+  @spec maybe_redeem_before_quota_exhaustion(
+          term(),
+          map(),
+          :required | :optional,
+          DateTime.t()
+        ) :: term()
+  def maybe_redeem_before_quota_exhaustion(
+        result,
+        refresh_plan,
+        quota_mode,
+        %DateTime{} = timestamp
+      ) do
+    maybe_redeem_before_quota_exhaustion(result, refresh_plan, quota_mode, timestamp, [])
+  end
+
+  @doc false
+  @spec maybe_redeem_before_quota_exhaustion(
+          term(),
+          map(),
+          :required | :optional,
+          DateTime.t(),
+          refilter_options()
+        ) :: term()
   def maybe_redeem_before_quota_exhaustion(
         {:ok, _candidates, _decision} = result,
         refresh_plan,
-        :required
+        :required,
+        %DateTime{} = timestamp,
+        opts
       )
-      when is_map(refresh_plan) do
-    maybe_redeem_threshold_candidate(result, refresh_plan)
+      when is_map(refresh_plan) and is_list(opts) do
+    maybe_redeem_threshold_candidate(result, refresh_plan, timestamp, opts)
   end
 
   def maybe_redeem_before_quota_exhaustion(
         {:ok, _candidates, _decision, %RouteState{}} = result,
         refresh_plan,
-        :required
+        :required,
+        %DateTime{} = timestamp,
+        opts
       )
-      when is_map(refresh_plan) do
-    maybe_redeem_threshold_candidate(result, refresh_plan)
+      when is_map(refresh_plan) and is_list(opts) do
+    maybe_redeem_threshold_candidate(result, refresh_plan, timestamp, opts)
   end
 
-  def maybe_redeem_before_quota_exhaustion(result, _refresh_plan, _quota_mode), do: result
+  def maybe_redeem_before_quota_exhaustion(
+        result,
+        _refresh_plan,
+        _quota_mode,
+        %DateTime{},
+        opts
+      )
+      when is_list(opts),
+      do: result
 
-  defp maybe_redeem_candidate(result, refresh_plan, trigger) do
-    refresh_plan
-    |> candidate_order()
-    |> Enum.find(&redeemable_candidate?/1)
-    |> case do
+  defp maybe_claim_probe_or_redeem_candidate(candidates, result, refresh_plan, trigger, timestamp, opts) do
+    case Enum.find_value(candidates, &probe_claimable_candidate(&1, timestamp)) do
       {assignment, identity} ->
-        redeem_and_refilter(result, refresh_plan, assignment, identity, trigger)
+        case claim_probe(refresh_plan, assignment, identity) do
+          {:ok, probe} -> force_probe_route(refresh_plan, assignment, identity, probe)
+          {:error, _reason} -> maybe_redeem_candidate(candidates, result, refresh_plan, trigger, timestamp, opts)
+        end
 
       nil ->
-        result
+        maybe_redeem_candidate(candidates, result, refresh_plan, trigger, timestamp, opts)
     end
   end
 
-  defp maybe_redeem_threshold_candidate(result, refresh_plan) do
+  defp probe_claimable_candidate({%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity}, timestamp) do
+    redemption = (identity.metadata || %{})["saved_reset_redemption"] || %{}
+
+    case Repo.get(UpstreamIdentity, identity.id) do
+      %UpstreamIdentity{metadata: %{"saved_reset_redemption" => persisted}} = current
+      when is_map(persisted) ->
+        if RedemptionLifecycle.probe_claimable?(persisted, timestamp), do: {assignment, current}
+
+      _other ->
+        if RedemptionLifecycle.probe_claimable?(redemption, timestamp), do: {assignment, identity}
+    end
+  rescue
+    _exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] -> nil
+  end
+
+  defp probe_claimable_candidate(_candidate, _timestamp), do: nil
+
+  defp maybe_redeem_candidate(candidates, result, refresh_plan, trigger, timestamp, opts) do
+    candidates
+    |> Enum.with_index()
+    |> Enum.filter(fn {candidate, _index} ->
+      # Short-circuit: the window read runs only for a candidate the policy and bank accept,
+      # and only an `UpstreamIdentity` candidate can pass `redeemable_candidate?/2`.
+      redeemable_candidate?(candidate, timestamp) and resettable_candidate?(candidate, refresh_plan, timestamp)
+    end)
+    |> ExpiryPriority.order(timestamp)
+    |> List.first()
+    |> case do
+      {assignment, identity} ->
+        redeem_and_refilter(result, refresh_plan, assignment, identity, trigger, timestamp, opts)
+
+      nil ->
+        put_recovery_outcome(result, unattempted_recovery_outcome(candidates, refresh_plan))
+    end
+  end
+
+  defp resettable_candidate?({_assignment, identity}, refresh_plan, timestamp),
+    do: AutoEligibility.target_windows_resettable?(identity, quota_scope(refresh_plan), timestamp)
+
+  defp maybe_redeem_threshold_candidate(result, refresh_plan, timestamp, opts) do
     candidates = candidate_order(refresh_plan)
 
     candidates
-    |> Enum.find_value(&early_redeemable_candidate(&1, candidates))
+    |> Enum.find_value(&early_redeemable_candidate(&1, candidates, timestamp))
     |> case do
       {{assignment, identity}, trigger} ->
-        redeem_and_refilter(result, refresh_plan, assignment, identity, trigger)
+        if whole_model_capacity_available?(refresh_plan, assignment, identity, trigger, timestamp) do
+          log_redemption(
+            assignment,
+            identity,
+            "gateway_auto",
+            trigger_detail(trigger),
+            "gateway_auto_sibling_usable_capacity",
+            false
+          )
+
+          result
+        else
+          redeem_and_refilter(
+            result,
+            refresh_plan,
+            assignment,
+            identity,
+            trigger,
+            timestamp,
+            opts
+          )
+        end
 
       nil ->
         result
     end
   end
 
-  defp redeem_and_refilter(result, refresh_plan, assignment, identity, trigger) do
+  defp redeem_and_refilter(
+         result,
+         refresh_plan,
+         assignment,
+         identity,
+         trigger,
+         scan_timestamp,
+         opts
+       ) do
+    trigger_detail = trigger_detail(trigger)
+
     case SavedResetRedemption.redeem(assignment,
            trigger_kind: "gateway_auto",
-           gateway_auto_context:
-             gateway_auto_context(refresh_plan, assignment, identity, trigger),
+           started_at: scan_timestamp,
+           gateway_auto_context: gateway_auto_context(refresh_plan, assignment, identity, trigger, scan_timestamp),
            receive_timeout: 15_000
          ) do
       {:ok, %{applied?: true, code: code} = redeem_result} ->
-        log_redemption(assignment, identity, "gateway_auto", code, true)
-        route_after_redemption(result, refresh_plan, assignment, redeem_result)
+        log_redemption(assignment, identity, "gateway_auto", trigger_detail, code, true)
+
+        route_after_redemption(
+          result,
+          refresh_plan,
+          assignment,
+          redeem_result,
+          scan_timestamp,
+          opts
+        )
+        |> put_recovery_outcome(if(pending_probe?(redeem_result), do: :pending, else: :confirmed))
 
       {:ok, %{applied?: applied?, code: code}} ->
-        log_redemption(assignment, identity, "gateway_auto", code, applied?)
-        result
+        log_redemption(assignment, identity, "gateway_auto", trigger_detail, code, applied?)
+        put_recovery_outcome(result, if(code in ["no_credit", "nothing_to_reset"], do: :not_applied, else: :failed))
 
       {:error, reason} ->
-        log_redemption(assignment, identity, "gateway_auto", safe_reason(reason), false)
-        result
+        log_redemption(
+          assignment,
+          identity,
+          "gateway_auto",
+          trigger_detail,
+          safe_reason(reason),
+          false
+        )
+
+        put_recovery_outcome(result, :failed)
     end
   rescue
     exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
-      log_redemption(assignment, identity, "gateway_auto", safe_reason(exception), false)
-      result
+      log_redemption(
+        assignment,
+        identity,
+        "gateway_auto",
+        trigger_detail(trigger),
+        safe_reason(exception),
+        false
+      )
+
+      put_recovery_outcome(result, :failed)
   end
 
   # A confirmed redemption (fresh usable quota) can route through the normal
@@ -112,16 +310,26 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   # reads exhausted — so the one triggering request claims the irreversible probe
   # and force-routes to the redeemed identity. If the probe was already claimed
   # (another node/request), fall back to the normal refilter.
-  defp route_after_redemption(result, refresh_plan, assignment, redeem_result) do
+  defp route_after_redemption(
+         result,
+         refresh_plan,
+         assignment,
+         redeem_result,
+         scan_timestamp,
+         opts
+       ) do
     identity = redeem_result.identity
 
     if pending_probe?(redeem_result) do
-      case claim_probe(identity) do
-        {:ok, token} -> force_probe_route(refresh_plan, assignment, identity, token)
-        {:error, _reason} -> refilter_after_redemption(result, refresh_plan)
+      case claim_probe(refresh_plan, assignment, identity) do
+        {:ok, probe} ->
+          force_probe_route(refresh_plan, assignment, identity, probe)
+
+        {:error, _reason} ->
+          refilter_after_redemption(result, refresh_plan, scan_timestamp, opts)
       end
     else
-      refilter_after_redemption(result, refresh_plan)
+      refilter_after_redemption(result, refresh_plan, scan_timestamp, opts)
     end
   end
 
@@ -130,56 +338,87 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
 
   defp pending_probe?(_redeem_result), do: false
 
-  defp claim_probe(%UpstreamIdentity{} = identity) do
+  defp claim_probe(refresh_plan, assignment, %UpstreamIdentity{} = identity) do
     redemption = (identity.metadata || %{})["saved_reset_redemption"] || %{}
-    token = Ecto.UUID.generate()
 
-    case ProbeLease.claim(
-           identity,
-           redemption["generation"],
-           redemption["attempt_id"],
-           token
-         ) do
-      {:ok, :claimed} -> {:ok, token}
+    snapshot = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], now())[identity.id]
+
+    with true <- CapacityAssessment.guarded_probe_permitted?(snapshot, quota_scope(refresh_plan) || %{}),
+         %ResetProbe{} = probe <- reset_probe(refresh_plan),
+         {:ok, bound_probe} <-
+           ResetProbe.bind(
+             probe,
+             assignment.id,
+             identity.id,
+             effective_model(refresh_plan),
+             route_class(refresh_plan)
+           ),
+         {:ok, :claimed} <-
+           ProbeLease.claim(
+             identity,
+             redemption["generation"],
+             redemption["attempt_id"],
+             bound_probe
+           ) do
+      {:ok, bound_probe}
+    else
       {:error, reason} -> {:error, reason}
+      _missing_probe -> {:error, :invalid_scope}
     end
   end
 
-  defp force_probe_route(refresh_plan, assignment, identity, token) do
+  defp force_probe_route(refresh_plan, assignment, identity, %ResetProbe{} = probe) do
     candidate = {assignment, identity}
-    decision = reset_probe_decision(identity, token)
+    decision = reset_probe_decision()
 
     case Map.get(refresh_plan, :route_state) do
       %RouteState{} = route_state ->
-        {:ok, [candidate], decision, RouteState.put_candidates(route_state, [candidate])}
+        route_state =
+          route_state
+          |> RouteState.put_candidates([candidate])
+          |> RouteState.put_reset_probe(probe)
+
+        {:ok, [candidate], decision, route_state}
 
       _no_route_state ->
-        {:ok, [candidate], decision}
+        {:ok, [candidate], decision, probe}
     end
   end
 
-  defp reset_probe_decision(%UpstreamIdentity{} = identity, token) do
+  defp reset_probe_decision do
     %{
       "allowed" => true,
       "routing_state" => "reset_probe",
-      "summary" => "guarded probe after saved reset pending confirmation",
+      "summary" => "guarded non-credit probe after saved reset pending confirmation",
       "reset_probe_candidate_count" => 1,
-      "reset_probe" => %{
-        "token" => token,
-        "upstream_identity_id" => identity.id
-      }
+      "eligible_candidate_count" => 1,
+      "capacity_basis" => "recovered_included",
+      "non_credit_guarded_probe" => true
     }
   end
 
+  defp reset_probe(%{filter_input: %{request_options: request_options}}),
+    do: request_options.routing.reset_probe || ResetProbe.new()
+
+  defp reset_probe(_refresh_plan), do: ResetProbe.new()
+
+  defp effective_model(%{filter_input: %{request_options: request_options, model: model}}),
+    do: request_options.routing.effective_model || model.exposed_model_id
+
   defp refilter_after_redemption(
-         result,
-         %{filter_input: %CandidateEligibility.FilterInput{} = input} = plan
+         _result,
+         %{filter_input: %CandidateEligibility.FilterInput{} = input} = plan,
+         scan_timestamp,
+         opts
        ) do
+    refilter_timestamp = refilter_timestamp(scan_timestamp, opts)
+
     case Map.get(plan, :route_state) do
       %RouteState{} = route_state ->
-        refreshed_route_state = RouteState.refresh_quota_window_snapshots(route_state)
+        refreshed_route_state =
+          refresh_route_state_quota(route_state, refilter_timestamp)
 
-        case Plan.filter_eligible_candidates(input, refreshed_route_state) do
+        case filter_recovery_band(input, refreshed_route_state, plan) do
           {:refreshable_quota, remaining_plan} ->
             Executor.refresh_stale_candidates(remaining_plan)
 
@@ -188,28 +427,66 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
         end
 
       _no_route_state ->
-        case Plan.filter_eligible_candidates(input) do
+        refreshed_route_state =
+          RouteState.new(%{
+            visible_model: input.model,
+            candidates: input.candidates
+          })
+          |> refresh_route_state_quota(refilter_timestamp)
+
+        case filter_recovery_band(input, refreshed_route_state, plan) do
           {:refreshable_quota, remaining_plan} ->
-            Executor.refresh_stale_candidates(remaining_plan)
+            remaining_plan
+            |> Executor.refresh_stale_candidates()
+            |> without_refreshed_route_state()
 
           {:ok, candidates, decision} ->
             {:ok, candidates, decision}
         end
     end
-  rescue
-    exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
-      Logger.warning("saved reset quota refilter failed reason=#{safe_reason(exception)}")
-
-      result
   end
 
-  defp all_candidates_excluded_only_by_weekly_exhaustion?(error, refresh_plan)
+  defp filter_recovery_band(input, state, %{capacity_band: :non_credit}), do: Plan.filter_non_credit_candidates(input, state)
+  defp filter_recovery_band(input, state, _plan), do: Plan.filter_eligible_candidates(input, state)
+
+  defp put_recovery_outcome({:error, error}, outcome), do: {:error, Map.put(error, :non_credit_recovery_outcome, Atom.to_string(outcome))}
+  defp put_recovery_outcome({:ok, candidates, decision}, outcome), do: {:ok, candidates, Map.put(decision, "non_credit_recovery_outcome", Atom.to_string(outcome))}
+  defp put_recovery_outcome({:ok, candidates, decision, state}, outcome), do: {:ok, candidates, Map.put(decision, "non_credit_recovery_outcome", Atom.to_string(outcome)), state}
+  defp put_recovery_outcome(result, _outcome), do: result
+
+  defp decode_recovery_outcome("confirmed"), do: :confirmed
+  defp decode_recovery_outcome("pending"), do: :pending
+  defp decode_recovery_outcome("disabled"), do: :disabled
+  defp decode_recovery_outcome("not_applied"), do: :not_applied
+  defp decode_recovery_outcome("failed"), do: :failed
+  defp decode_recovery_outcome(_value), do: :unavailable
+
+  defp unattempted_recovery_outcome(candidates, plan) do
+    snapshots =
+      case Map.get(plan, :route_state) do
+        %RouteState{quota_snapshots: snapshots} -> Map.values(snapshots)
+        _missing -> []
+      end
+
+    cond do
+      Enum.any?(snapshots, &CapacityAssessment.recovery_pending?/1) -> :pending
+      candidates != [] and Enum.all?(candidates, fn {_assignment, identity} -> not SavedResets.auto_policy(identity).enabled? end) -> :disabled
+      true -> :unavailable
+    end
+  end
+
+  defp without_refreshed_route_state({:ok, candidates, decision, %RouteState{}}),
+    do: {:ok, candidates, decision}
+
+  defp without_refreshed_route_state(other), do: other
+
+  defp long_window_exhausted_candidates(error, refresh_plan)
        when is_map(error) do
     exclusions = Map.get(error, :candidate_exclusions) || Map.get(error, "candidate_exclusions")
+    candidates = candidate_order(refresh_plan)
 
     candidate_keys =
-      refresh_plan
-      |> candidate_order()
+      candidates
       |> Enum.map(&candidate_key/1)
       |> Enum.reject(&is_nil/1)
       |> MapSet.new()
@@ -221,8 +498,56 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
       |> Enum.reject(&is_nil/1)
       |> MapSet.new()
 
-    MapSet.size(candidate_keys) > 0 and MapSet.equal?(candidate_keys, exclusion_keys) and
-      Enum.all?(List.wrap(exclusions), &weekly_account_exhaustion_exclusion?/1)
+    if is_list(exclusions) and MapSet.size(candidate_keys) > 0 and
+         MapSet.equal?(candidate_keys, exclusion_keys) and
+         Enum.all?(List.wrap(exclusions), &(exclusion_key(&1) != nil)) do
+      exclusions_by_candidate = Enum.group_by(exclusions, &exclusion_key/1)
+
+      # A reset repairs its target's supported long account window. Other
+      # excluded candidates may have unrelated blockers; retain their complete
+      # cohort/capacity context for the locked spend fences.
+      Enum.filter(candidates, fn {_assignment, identity} = candidate ->
+        exclusions_by_candidate
+        |> Map.get(candidate_key(candidate))
+        |> account_exhaustion_exclusions?(identity)
+      end)
+    else
+      []
+    end
+  end
+
+  # A reset restores the account's long window, the weekly secondary or the monthly primary, so the scan opens on an
+  # exhaustion of that window or on the provider-blocked account availability, which names no window. The 5-hour primary
+  # takes no part: its exhaustion alone never opens the scan, and next to an exhausted long window it does not keep it
+  # closed. A window of any other shape keeps the scan closed. The scan only opens: every spend fence still decides.
+  defp account_exhaustion_exclusions?([_ | _] = exclusions, identity) do
+    if Enum.all?(exclusions, &account_exhaustion_exclusion?/1) do
+      windows = Windows.list_quota_windows(identity)
+      roles = for exclusion <- exclusions, reason <- reason_token(exclusion, :reasons), do: exhaustion_window_role(reason, windows)
+
+      :other not in roles and :long_window in roles
+    else
+      false
+    end
+  end
+
+  defp account_exhaustion_exclusions?(_missing, _identity), do: false
+
+  defp exhaustion_window_role(reason, windows) do
+    case reason_token(reason, :window_kind) do
+      nil -> :long_window
+      "secondary" -> if Enum.any?(windows, &WindowClassifier.weekly_secondary?/1), do: :long_window, else: :other
+      "primary" -> primary_window_role(windows)
+      _other_kind -> :other
+    end
+  end
+
+  defp primary_window_role(windows) do
+    cond do
+      Enum.any?(windows, &WindowClassifier.monthly_primary?/1) -> :long_window
+      Enum.any?(windows, &WindowClassifier.primary_5h?/1) -> :five_hour
+      true -> :other
+    end
   end
 
   defp candidate_order(%{filter_input: %{candidates: candidates}}) when is_list(candidates),
@@ -233,16 +558,30 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
 
   defp candidate_order(_refresh_plan), do: []
 
-  defp candidate_key(
-         {%PoolUpstreamAssignment{id: assignment_id}, %UpstreamIdentity{id: identity_id}}
-       )
+  defp candidate_key({%PoolUpstreamAssignment{id: assignment_id}, %UpstreamIdentity{id: identity_id}})
        when is_binary(assignment_id) and is_binary(identity_id),
        do: {assignment_id, identity_id}
 
   defp candidate_key(_candidate), do: nil
 
-  defp gateway_auto_context(refresh_plan, assignment, identity, trigger) do
+  @doc false
+  @spec gateway_auto_context(
+          map(),
+          PoolUpstreamAssignment.t(),
+          UpstreamIdentity.t(),
+          AutoEligibility.trigger(),
+          DateTime.t()
+        ) :: map()
+  def gateway_auto_context(refresh_plan, assignment, identity, trigger, timestamp \\ now()) do
     candidates = candidate_order(refresh_plan)
+    capacity = capacity_order(refresh_plan)
+    routable = routable_order(refresh_plan)
+    cohort = cohort_order(refresh_plan)
+
+    candidate_identity_ids =
+      Enum.map(candidates, fn {_candidate_assignment, candidate_identity} ->
+        candidate_identity.id
+      end)
 
     %{
       trigger: trigger,
@@ -252,13 +591,129 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
         Enum.map(candidates, fn {candidate_assignment, _candidate_identity} ->
           candidate_assignment.id
         end),
-      candidate_identity_ids:
-        Enum.map(candidates, fn {_candidate_assignment, candidate_identity} ->
+      candidate_identity_ids: candidate_identity_ids,
+      capacity_assignment_ids:
+        Enum.map(capacity, fn {capacity_assignment, _capacity_identity} ->
+          capacity_assignment.id
+        end),
+      capacity_identity_ids:
+        Enum.map(capacity, fn {_capacity_assignment, capacity_identity} ->
+          capacity_identity.id
+        end),
+      cohort_identity_ids:
+        Enum.map(cohort, fn {_candidate_assignment, candidate_identity} ->
           candidate_identity.id
         end),
-      route_class: route_class(refresh_plan)
+      routable_assignment_ids:
+        Enum.map(routable, fn {routable_assignment, _routable_identity} ->
+          routable_assignment.id
+        end),
+      routable_identity_ids:
+        Enum.map(routable, fn {_candidate_assignment, candidate_identity} ->
+          candidate_identity.id
+        end),
+      route_class: route_class(refresh_plan),
+      transient_circuit_exclusions: transient_circuit_exclusions(refresh_plan),
+      automatic_confirmation_refs: AutoEligibility.confirmation_refs(trigger, identity, candidate_identity_ids, timestamp),
+      quota_scope: quota_scope(refresh_plan),
+      credit_request_contexts: credit_request_contexts(refresh_plan, candidates),
+      hard_pinned_continuity?: hard_pinned_continuity?(refresh_plan)
     }
   end
+
+  defp credit_request_contexts(%{filter_input: %{model: model, request_options: options}}, candidates) do
+    Map.new(candidates, fn {assignment, _identity} ->
+      {assignment.id, ProviderCredits.request_context(model, options, assignment.id)}
+    end)
+  end
+
+  defp credit_request_contexts(_plan, _candidates), do: %{}
+
+  defp transient_circuit_exclusions(%{route_state: %RouteState{} = route_state} = refresh_plan) do
+    routable_assignment_ids =
+      refresh_plan
+      |> routable_order()
+      |> MapSet.new(fn {assignment, _identity} -> assignment.id end)
+
+    refresh_plan
+    |> cohort_order()
+    |> Enum.reject(fn {assignment, _identity} -> assignment.id in routable_assignment_ids end)
+    |> Enum.flat_map(fn {assignment, _identity} ->
+      case RouteState.circuit_snapshot(route_state, assignment.id) do
+        %{
+          eligible?: false,
+          state: %RoutingCircuitState{
+            id: circuit_id,
+            upstream_identity_id: identity_id,
+            pool_upstream_assignment_id: assignment_id,
+            model_identifier: model_identifier,
+            route_class: route_class
+          }
+        } ->
+          [
+            %{
+              upstream_identity_id: identity_id,
+              pool_upstream_assignment_id: assignment_id,
+              routing_circuit_state_id: circuit_id,
+              model_identifier: model_identifier,
+              route_class: route_class
+            }
+          ]
+
+        _eligible_or_unkeyed_snapshot ->
+          []
+      end
+    end)
+  end
+
+  defp transient_circuit_exclusions(_refresh_plan), do: []
+
+  defp quota_scope(%{filter_input: %{model: model}}) do
+    %{
+      requested_model: model.exposed_model_id,
+      catalog_model: model.exposed_model_id,
+      exposed_model_id: model.exposed_model_id,
+      upstream_model: model.upstream_model_id,
+      upstream_model_id: model.upstream_model_id
+    }
+  end
+
+  defp quota_scope(_refresh_plan), do: nil
+
+  # Only a hard-pinned continuation with a genuinely resolved target may
+  # bypass the threshold sibling usable-capacity protection. Classification is
+  # owned by the routing continuity authority: a newly created Codex session,
+  # session header, accepted turn state, or an unresolved previous-response
+  # anchor is soft preference, not a pin, so a first turn never bypasses.
+  defp hard_pinned_continuity?(%{
+         filter_input: %{request_options: request_options, model: %Model{} = model}
+       }) do
+    SessionContinuity.hard_pinned_continuity?(request_options, model)
+  end
+
+  defp hard_pinned_continuity?(_refresh_plan), do: false
+
+  defp cohort_order(%{route_state: %RouteState{saved_reset_auto_cohort: cohort}})
+       when is_list(cohort),
+       do: cohort
+
+  defp cohort_order(refresh_plan), do: candidate_order(refresh_plan)
+
+  defp capacity_order(%{route_state: %RouteState{saved_reset_auto_capacity: capacity}})
+       when is_list(capacity) and capacity != [],
+       do: capacity
+
+  defp capacity_order(refresh_plan), do: candidate_order(refresh_plan)
+
+  defp routable_order(%{route_state: %RouteState{} = route_state} = refresh_plan) do
+    refresh_plan
+    |> capacity_order()
+    |> Enum.filter(fn {assignment, _identity} ->
+      RouteState.circuit_eligible?(route_state, assignment.id)
+    end)
+  end
+
+  defp routable_order(refresh_plan), do: candidate_order(refresh_plan)
 
   defp route_class(%{filter_input: %{route_class: route_class}})
        when is_binary(route_class) and route_class != "",
@@ -282,27 +737,39 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
 
   defp exclusion_key(_exclusion), do: nil
 
-  defp weekly_account_exhaustion_exclusion?(exclusion) when is_map(exclusion) do
+  defp account_exhaustion_exclusion?(exclusion) when is_map(exclusion) do
     reasons = Map.get(exclusion, :reasons) || Map.get(exclusion, "reasons")
 
     is_list(reasons) and reasons != [] and
-      Enum.all?(reasons, &weekly_account_exhaustion_reason?/1)
+      Enum.all?(reasons, &account_exhaustion_reason?/1)
   end
 
-  defp weekly_account_exhaustion_exclusion?(_exclusion), do: false
+  defp account_exhaustion_exclusion?(_exclusion), do: false
 
-  defp weekly_account_exhaustion_reason?(reason) when is_map(reason) do
+  # Routing can report a weekly secondary, monthly primary, or provider-blocked
+  # account availability exclusion. These only open the scan: a supported
+  # corroborated long window and every locked fence remain required.
+  defp account_exhaustion_reason?(reason) when is_map(reason) do
     reason_code = Map.get(reason, :reason_codes) || Map.get(reason, "reason_codes")
 
-    reason_token(reason, :code) == "quota_weekly_exhausted" and
-      reason_token(reason, :quota_key) == "account" and
-      reason_token(reason, :window_kind) == "secondary" and
+    reason_token(reason, :quota_key) == "account" and
       reason_token(reason, :quota_scope) == "account" and
       reason_token(reason, :quota_family) == "account" and
-      exhausted_only_reason_codes?(reason_code)
+      exhausted_only_reason_codes?(reason_code) and
+      exhausted_account_exclusion_shape?(reason)
   end
 
-  defp weekly_account_exhaustion_reason?(_reason), do: false
+  defp account_exhaustion_reason?(_reason), do: false
+
+  defp exhausted_account_exclusion_shape?(reason) do
+    case {reason_token(reason, :code), reason_token(reason, :window_kind)} do
+      {"quota_weekly_exhausted", "secondary"} -> true
+      {"quota_window_unusable", "primary"} -> true
+      {"quota_window_unusable", "secondary"} -> true
+      {"quota_window_unusable", nil} -> true
+      _other -> false
+    end
+  end
 
   defp exhausted_only_reason_codes?(reason_codes) when is_list(reason_codes),
     do: reason_codes != [] and Enum.all?(reason_codes, &(&1 == "exhausted"))
@@ -312,107 +779,190 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   defp reason_token(reason, key), do: Map.get(reason, key) || Map.get(reason, Atom.to_string(key))
 
   defp redeemable_candidate?(
-         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity} = candidate
+         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity} = candidate,
+         timestamp
        ) do
     policy = SavedResets.auto_policy(identity)
 
-    saved_reset_available?(identity, policy) and redeemable_weekly_window?(candidate, policy)
+    saved_reset_available?(identity, policy, timestamp) and
+      redeemable_long_window?(candidate, policy, timestamp)
   end
 
-  defp redeemable_candidate?(_candidate), do: false
+  defp redeemable_candidate?(_candidate, _timestamp), do: false
 
-  defp early_redeemable_candidate(candidate, candidates) when is_list(candidates) do
-    cond do
-      threshold_redeemable_candidate?(candidate, candidates) ->
-        {candidate, :threshold_pressure}
-
-      expiring_redeemable_candidate?(candidate) ->
-        {candidate, :expiring_reset}
-
-      true ->
-        nil
-    end
+  defp early_redeemable_candidate(candidate, candidates, timestamp) when is_list(candidates) do
+    if threshold_redeemable_candidate?(candidate, candidates, timestamp),
+      do: {candidate, :threshold_pressure}
   end
 
   defp threshold_redeemable_candidate?(
          {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity},
-         candidates
+         candidates,
+         timestamp
        )
        when is_list(candidates) do
     policy = SavedResets.auto_policy(identity)
 
-    saved_reset_available?(identity, policy) and policy.trigger_mode == "threshold" and
-      all_candidates_at_threshold?(candidates, policy)
+    saved_reset_available?(identity, policy, timestamp) and policy.trigger_mode == "threshold" and
+      all_candidates_at_threshold?(identity, candidates, timestamp)
   end
 
-  defp threshold_redeemable_candidate?(_candidate, _candidates), do: false
+  defp threshold_redeemable_candidate?(_candidate, _candidates, _timestamp), do: false
 
-  defp expiring_redeemable_candidate?(
-         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity} = candidate
+  defp whole_model_capacity_available?(
+         refresh_plan,
+         %PoolUpstreamAssignment{} = assignment,
+         %UpstreamIdentity{} = target_identity,
+         :threshold_pressure,
+         timestamp
        ) do
-    policy = SavedResets.auto_policy(identity)
-    timestamp = now()
-
-    saved_reset_available?(identity, policy) and SavedResets.expires_soon?(identity, timestamp) and
-      redeemable_expiring_weekly_window?(candidate, policy, timestamp)
+    with {:ok, context} <-
+           refresh_plan
+           |> gateway_auto_context(assignment, target_identity, :threshold_pressure, timestamp)
+           |> AutoEligibility.normalize_context(),
+         false <- context.hard_pinned_continuity? do
+      Enum.any?(routable_order(refresh_plan), fn {_assignment, sibling} ->
+        sibling.id != target_identity.id and
+          AutoEligibility.locked_sibling_usable_capacity?(sibling, context, timestamp)
+      end)
+    else
+      _invalid_or_durable_pin -> false
+    end
   end
 
-  defp expiring_redeemable_candidate?(_candidate), do: false
+  defp whole_model_capacity_available?(
+         _refresh_plan,
+         _assignment,
+         _identity,
+         _trigger,
+         _timestamp
+       ),
+       do: false
 
-  defp saved_reset_available?(%UpstreamIdentity{} = identity, policy) do
-    AutoEligibility.saved_reset_available?(identity, policy)
+  defp saved_reset_available?(%UpstreamIdentity{} = identity, policy, timestamp) do
+    AutoEligibility.gateway_auto_ready?(identity, policy, timestamp)
   end
 
-  defp redeemable_weekly_window?(
-         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity},
-         policy
-       ) do
-    identity
-    |> Windows.list_quota_windows()
-    |> AutoEligibility.blocked_weekly_exhaustion?(policy, now())
-  end
-
-  defp redeemable_expiring_weekly_window?(
+  defp redeemable_long_window?(
          {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity},
          policy,
          timestamp
        ) do
-    AutoEligibility.expiring_reset?(
-      identity,
-      Windows.list_quota_windows(identity),
-      policy,
-      timestamp
-    )
+    [identity.id]
+    |> AutoEligibility.trigger_windows_by_identity_ids(identity, timestamp)
+    |> Map.get(identity.id, [])
+    |> AutoEligibility.corroborated_blocked_exhaustion?(identity, policy, timestamp)
   end
 
-  defp all_candidates_at_threshold?([], _policy), do: false
+  defp all_candidates_at_threshold?(_target_identity, [], _timestamp), do: false
 
-  defp all_candidates_at_threshold?(candidates, policy) when is_list(candidates) do
-    candidate_identity_ids =
+  # Every non-latched candidate must carry corroborated pressure. The target
+  # identity is threaded through so only its own windows are held to the bank
+  # requirement; sibling members prove sustained pressure, not spendability.
+  defp all_candidates_at_threshold?(%UpstreamIdentity{} = target_identity, candidates, timestamp)
+       when is_list(candidates) do
+    latched_identity_ids =
       candidates
+      |> Enum.filter(fn {_assignment, identity} ->
+        match?(%UpstreamIdentity{}, identity) and
+          AutoEligibility.identity_consume_latch(identity, timestamp) != :clear
+      end)
+      |> MapSet.new(fn {_assignment, identity} -> identity.id end)
+
+    active_candidates =
+      Enum.reject(candidates, fn {_assignment, identity} ->
+        identity.id in latched_identity_ids
+      end)
+
+    windows_by_identity_id =
+      active_candidates
       |> Enum.map(fn {_assignment, identity} -> identity.id end)
-      |> Enum.reject(&is_nil/1)
+      |> AutoEligibility.trigger_windows_by_identity_ids(target_identity, timestamp)
 
-    windows_by_identity_id = Windows.list_quota_windows_by_identity_ids(candidate_identity_ids)
-
-    AutoEligibility.threshold_pressure?(
-      candidate_identity_ids,
-      policy,
-      windows_by_identity_id,
-      now()
-    )
+    active_candidates != [] and
+      Enum.all?(active_candidates, fn {_assignment, identity} ->
+        AutoEligibility.corroborated_threshold_pressure?(
+          [identity.id],
+          target_identity,
+          SavedResets.auto_policy(identity),
+          windows_by_identity_id,
+          MapSet.new(),
+          timestamp
+        )
+      end)
   end
 
-  defp log_redemption(assignment, identity, trigger_kind, code, applied?) do
+  defp refresh_route_state_quota(%RouteState{} = route_state, timestamp) do
+    snapshots =
+      (route_state.saved_reset_auto_capacity ++ route_state.candidates)
+      |> Enum.uniq_by(fn {assignment, identity} -> {assignment.id, identity.id} end)
+      |> Enum.map(fn {_assignment, identity} -> identity.id end)
+      |> Enum.uniq()
+      |> Windows.load_routing_quota_snapshots(timestamp)
+
+    RouteState.put_quota_snapshots(route_state, snapshots)
+  end
+
+  defp newer_timestamp(%DateTime{} = previous_timestamp) do
+    ensure_newer_timestamp(now(), previous_timestamp)
+  end
+
+  defp newer_timestamp(%DateTime{} = previous_timestamp, refilter_clock)
+       when is_function(refilter_clock, 0) do
+    refilter_clock
+    |> refilter_clock_timestamp!()
+    |> ensure_newer_timestamp(previous_timestamp)
+  end
+
+  defp refilter_timestamp(previous_timestamp, []) do
+    newer_timestamp(previous_timestamp)
+  end
+
+  defp refilter_timestamp(previous_timestamp, opts) when is_list(opts) do
+    newer_timestamp(previous_timestamp, refilter_clock!(opts))
+  end
+
+  defp refilter_clock!(opts) do
+    case Keyword.get(opts, :refilter_clock, &now/0) do
+      clock when is_function(clock, 0) ->
+        clock
+
+      _invalid_clock ->
+        raise ArgumentError, "refilter_clock must be a zero-arity function"
+    end
+  end
+
+  defp refilter_clock_timestamp!(refilter_clock) do
+    case refilter_clock.() do
+      %DateTime{} = timestamp ->
+        DateTime.truncate(timestamp, :microsecond)
+
+      _invalid_timestamp ->
+        raise ArgumentError, "refilter_clock must return a DateTime"
+    end
+  end
+
+  defp ensure_newer_timestamp(timestamp, previous_timestamp) do
+    case DateTime.compare(timestamp, previous_timestamp) do
+      :gt -> timestamp
+      _not_newer -> DateTime.add(previous_timestamp, 1, :microsecond)
+    end
+  end
+
+  defp log_redemption(assignment, identity, trigger_kind, trigger_detail, code, applied?) do
     Logger.info(
       "saved reset auto redemption result " <>
         "pool_upstream_assignment_id=#{assignment.id} " <>
         "upstream_identity_id=#{identity.id} " <>
         "trigger_kind=#{trigger_kind} " <>
+        "trigger_detail=#{trigger_detail} " <>
         "result_code=#{code} " <>
         "applied=#{applied?}"
     )
   end
+
+  defp trigger_detail(:blocked_weekly_exhaustion), do: "exhausted"
+  defp trigger_detail(:threshold_pressure), do: "threshold"
 
   defp safe_reason(%{code: code}) when is_atom(code), do: Atom.to_string(code)
   defp safe_reason(%{code: code}) when is_binary(code), do: sanitize_token(code)

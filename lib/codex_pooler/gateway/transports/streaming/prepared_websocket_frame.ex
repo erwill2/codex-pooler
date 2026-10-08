@@ -1,0 +1,79 @@
+defmodule CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame do
+  @moduledoc """
+  A validated websocket frame ready for local handling or gateway execution.
+
+  Native turn identity is represented only by the opaque keys already stored in
+  `RequestOptions`; raw client identity never crosses this boundary.
+
+  Its capability is owned by the process that prepared the frame and is
+  addressable through its distributed pid. A proxy socket can therefore retain
+  one pending frame across a remote-owner handoff without sending the frame or
+  capability through the data-only owner control protocol. Owner exit
+  invalidates pending execution; so does the capability's reclaim timer, unless
+  the socket has parked the capability because the frame is legitimately waiting
+  in socket state.
+  """
+
+  alias __MODULE__.Capability
+  alias CodexPooler.Accounting.ClientRetry.OriginalWitness
+  alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+
+  defmodule ValidationClaim do
+    @moduledoc false
+
+    @enforce_keys [:version, :completed, :token]
+    defstruct [:version, :completed, :token]
+
+    @type family :: :strict_schema | :input_shape | :payload
+    @type t :: %__MODULE__{
+            version: pos_integer(),
+            completed: [family()],
+            token: binary()
+          }
+  end
+
+  @type variant ::
+          :native_response_create
+          | :public_response_create
+          | :prewarm
+          | :response_processed
+
+  @type gateway_call_result ::
+          {:ok, Contracts.gateway_result()} | {:error, Contracts.gateway_error()}
+
+  @enforce_keys [:variant, :endpoint, :payload, :request_options]
+  defstruct [
+    :variant,
+    :endpoint,
+    :payload,
+    :request_options,
+    :semantic_turn_key,
+    :turn_claim_key,
+    :replay_claim_digest,
+    :native_replay_binding,
+    :native_client_retry_witness,
+    :result_adapter,
+    :provenance
+  ]
+
+  @type t :: %__MODULE__{
+          variant: variant(),
+          endpoint: String.t(),
+          payload: map(),
+          request_options: RequestOptions.t(),
+          semantic_turn_key: <<_::256>> | nil,
+          turn_claim_key: String.t() | nil,
+          replay_claim_digest: <<_::256>> | nil,
+          native_replay_binding: CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission.Binding.t() | nil,
+          native_client_retry_witness: OriginalWitness.t() | nil,
+          result_adapter: (gateway_call_result() -> gateway_call_result()) | nil,
+          provenance:
+            %{
+              required(:frame) => binary(),
+              required(:validation) => ValidationClaim.t(),
+              required(:capability) => Capability.t()
+            }
+            | nil
+        }
+end

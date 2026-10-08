@@ -26,7 +26,7 @@ defmodule CodexPooler.MCP.PoolsToolsTest do
     assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(owner, true)
 
     assert {:ok, %{raw_token: raw_token}} =
-             MCP.create_operator_token(owner, %{label: "Task 7 MCP"})
+             MCP.create_operator_token(owner, %{label: "MCP operator"})
 
     assert {:ok, auth} = MCP.authenticate_token(raw_token)
 
@@ -34,9 +34,9 @@ defmodule CodexPooler.MCP.PoolsToolsTest do
   end
 
   test "lists bounded Pool metadata with counts and no Pool API key material", %{auth: auth} do
-    pool = pool_fixture(%{name: "Task 7 Pool"})
+    pool = pool_fixture(%{name: "MCP test pool"})
     %{raw_key: raw_key, api_key: api_key} = active_api_key_fixture(pool)
-    active_upstream_assignment_fixture(pool, %{account_label: "Task 7 upstream"})
+    active_upstream_assignment_fixture(pool, %{account_label: "MCP test upstream"})
 
     assert {:ok, result} =
              ToolDispatch.call(
@@ -50,7 +50,7 @@ defmodule CodexPooler.MCP.PoolsToolsTest do
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
     assert text =~ "1 Pool metadata records returned"
-    assert text =~ "name=Task 7 Pool"
+    assert text =~ "name=MCP test pool"
     assert text =~ "slug=#{pool.slug}"
     assert text =~ "status=active"
     assert text =~ "upstreams=1"
@@ -214,7 +214,7 @@ defmodule CodexPooler.MCP.PoolsToolsTest do
     assert list_result["isError"] == false
     assert list_result["structuredContent"]["items"] == []
     assert list_result["structuredContent"]["count"] == 0
-    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_pool.id
+    refute CodexPooler.JSON.encode!(list_result["structuredContent"]) =~ hidden_pool.id
 
     assert {:ok, get_result} =
              ToolDispatch.call("codex_pooler_get_pool", %{"selector" => hidden_pool.id}, %{
@@ -255,7 +255,7 @@ defmodule CodexPooler.MCP.PoolsToolsTest do
     assert list_result["isError"] == false
     assert [%{"id" => visible_id}] = list_result["structuredContent"]["items"]
     assert visible_id == visible_pool.id
-    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_pool.id
+    refute CodexPooler.JSON.encode!(list_result["structuredContent"]) =~ hidden_pool.id
 
     assert {:ok, hidden_result} =
              ToolDispatch.call("codex_pooler_get_pool", %{"selector" => hidden_pool.id}, %{

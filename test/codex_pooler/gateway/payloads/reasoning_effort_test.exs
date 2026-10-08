@@ -6,6 +6,22 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffortTest do
   @backend_endpoint "/backend-api/codex/responses"
 
   describe "extract/2" do
+    test "native unsigned budgets preserve type and precedence while public effort remains string-only" do
+      for effort <- [0, 64, 18_446_744_073_709_551_615] do
+        payload = %{"reasoning" => %{"effort" => effort}, "reasoning_effort" => "high"}
+        native = RequestOptions.build(%{}, @backend_endpoint, payload)
+        public = RequestOptions.build(%{openai_source_endpoint: "/v1/responses"}, @backend_endpoint, payload)
+        assert ReasoningEffort.extract(payload, native) === effort
+        assert ReasoningEffort.extract(payload, public) == nil
+        assert ReasoningEffort.extract_native(%{"reasoning_effort" => effort}) === effort
+        assert ReasoningEffort.extract_native(%{"reasoningEffort" => effort}) === effort
+      end
+
+      for effort <- [-1, 18_446_744_073_709_551_616, 64.0, true, [], %{}] do
+        assert ReasoningEffort.extract_native(%{"reasoning" => %{"effort" => effort}, "reasoning_effort" => "high"}) == nil
+      end
+    end
+
     test "uses native backend alias precedence without changing custom tokens" do
       cases = [
         {%{
@@ -32,11 +48,11 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffortTest do
 
     test "does not fall through present malformed native winners" do
       cases = [
-        {%{"reasoning" => %{"effort" => 42}, "reasoning_effort" => "high"}, nil},
+        {%{"reasoning" => %{"effort" => -1}, "reasoning_effort" => "high"}, nil},
         {%{"reasoning" => %{"effort" => "  "}, "reasoning_effort" => "high"}, nil},
         {%{"reasoning_effort" => %{"invalid" => true}, "reasoningEffort" => "high"}, nil},
         {%{"reasoning_effort" => "  ", "reasoningEffort" => "high"}, nil},
-        {%{"reasoningEffort" => 42, "thinking" => "high"}, nil},
+        {%{"reasoningEffort" => -1, "thinking" => "high"}, nil},
         {%{"reasoningEffort" => " ", "thinking" => "high"}, nil},
         {%{"thinking" => 42, "enable_thinking" => true}, nil},
         {%{"thinking" => " ", "enable_thinking" => true}, nil}
@@ -104,6 +120,7 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffortTest do
   test "normalizes known tokens for comparison without accepting custom tokens" do
     assert ReasoningEffort.normalize_known("  XHIGH ") == "xhigh"
     assert ReasoningEffort.normalize_known("minimal") == "minimal"
+    assert ReasoningEffort.normalize_known("persistent") == "persistent"
     assert ReasoningEffort.normalize_known("custom-effort") == nil
     assert ReasoningEffort.normalize_known(:high) == nil
   end
@@ -137,5 +154,42 @@ defmodule CodexPooler.Gateway.Payloads.ReasoningEffortTest do
     assert ReasoningEffort.rewrite_backend_upstream(" ULTRA ") == "max"
     assert ReasoningEffort.rewrite_backend_upstream("minimal") == "minimal"
     assert ReasoningEffort.rewrite_backend_upstream("Custom-Effort") == "Custom-Effort"
+  end
+
+  describe "rewrite_backend_upstream/2" do
+    test "keeps max as the ultra alias when catalog levels are unknown or include max" do
+      for levels <- [
+            nil,
+            [],
+            ["custom-level"],
+            ~w(low medium high xhigh max ultra),
+            [" MAX ", "low"]
+          ] do
+        assert ReasoningEffort.rewrite_backend_upstream("ultra", levels) == "max"
+      end
+    end
+
+    test "rewrites ultra to the highest listed level when the catalog excludes max" do
+      cases = [
+        {~w(low medium high xhigh), "xhigh"},
+        {~w(xhigh low high), "xhigh"},
+        {~w(low medium high ultra), "high"},
+        {[" Medium ", "LOW", "custom-level"], "medium"}
+      ]
+
+      for {levels, expected} <- cases do
+        assert ReasoningEffort.rewrite_backend_upstream(" Ultra ", levels) == expected
+      end
+    end
+
+    test "never targets none or minimal and leaves every other value unchanged" do
+      assert ReasoningEffort.rewrite_backend_upstream("ultra", ~w(none minimal)) == "max"
+      assert ReasoningEffort.rewrite_backend_upstream("ultra", ~w(none minimal low)) == "low"
+
+      for effort <- ["none", "minimal", "max", "xhigh", "custom-effort", 42, nil] do
+        assert ReasoningEffort.rewrite_backend_upstream(effort, ~w(low medium high xhigh)) ==
+                 effort
+      end
+    end
   end
 end

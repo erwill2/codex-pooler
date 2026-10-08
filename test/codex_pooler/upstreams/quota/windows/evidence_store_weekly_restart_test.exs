@@ -2,11 +2,14 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.PoolerFixtures
+  import ExUnit.CaptureLog
 
+  alias CodexPooler.Accounting.UsageResponses
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows
+  alias CodexPooler.Upstreams.Quota.Windows.CycleConfirmation
   alias CodexPooler.Upstreams.Quota.Windows.EvidenceStore
   alias CodexPooler.Upstreams.Quota.Windows.Routing
 
@@ -19,8 +22,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
   @window_seconds 10_080 * 60
 
-  defp identity! do
-    %{identity: identity} = active_upstream_assignment_fixture(pool_fixture(), %{})
+  defp identity!(attrs \\ %{}) do
+    %{identity: identity} = active_upstream_assignment_fixture(pool_fixture(), attrs)
     identity
   end
 
@@ -31,6 +34,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
   defp used_row!(identity, observed_at, used_percent, opts \\ []) do
     reset_at = Keyword.get(opts, :reset_at, DateTime.add(observed_at, 5, :day))
     metadata = Keyword.get(opts, :metadata, %{})
+    active_limit = Keyword.get(opts, :active_limit)
+    credits = Keyword.get(opts, :credits)
 
     EvidenceStore.record_evidence(
       identity,
@@ -46,6 +51,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
         source_precision: "observed",
         quota_scope: "account",
         quota_family: "account",
+        active_limit: active_limit,
+        credits: credits,
         freshness_state: "fresh",
         metadata: metadata
       },
@@ -57,6 +64,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
   defp floating_zero(observed_at, opts \\ []) do
     reset_at = Keyword.get(opts, :reset_at, DateTime.add(observed_at, @window_seconds, :second))
     reset_after_seconds = Keyword.get(opts, :reset_after_seconds, @window_seconds)
+    metadata = Keyword.get(opts, :metadata, %{})
 
     %{
       quota_key: "account",
@@ -71,8 +79,17 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
       quota_scope: "account",
       quota_family: "account",
       freshness_state: "fresh",
-      metadata: %{"reset_after_seconds" => reset_after_seconds}
+      metadata: Map.put(metadata, "reset_after_seconds", reset_after_seconds)
     }
+  end
+
+  defp safe_same_cycle_used(observed_at, reset_at, used_percent) do
+    floating_zero(observed_at,
+      reset_at: reset_at,
+      reset_after_seconds: DateTime.diff(reset_at, observed_at, :second),
+      metadata: safe_status()
+    )
+    |> Map.put(:used_percent, Decimal.new(used_percent))
   end
 
   defp account_row(identity) do
@@ -122,6 +139,49 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     assert DateTime.compare(row.observed_at, t2) == :eq
   end
 
+  test "quota cycle decision logs keep candidate and confirmation diagnostics identifier-free" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    account_label = "Example account label #{System.unique_integer([:positive])}"
+    assignment_label = "Example assignment label #{System.unique_integer([:positive])}"
+
+    identity =
+      identity!(%{account_label: account_label, assignment_label: assignment_label})
+
+    assert {:ok, _row} = exhausted_row!(identity, t0)
+
+    {log, events} =
+      capture_quota_cycle_events(fn ->
+        capture_info_log(fn ->
+          t1 = DateTime.add(t0, 300, :second)
+          assert {:ok, _row} = Windows.record_evidence(identity, floating_zero(t1), t1)
+
+          t2 = DateTime.add(t1, 180, :second)
+          assert {:ok, _row} = Windows.record_evidence(identity, floating_zero(t2), t2)
+        end)
+      end)
+
+    assert events == [
+             {%{count: 1}, %{scope: "account", decision: :candidate, source: "provider_usage"}},
+             {%{count: 1}, %{scope: "account", decision: :anchored_confirmed, source: "provider_usage"}}
+           ]
+
+    assert log =~ "quota_cycle_decision decision=candidate reason=candidate_restarted"
+    assert log =~ "quota_cycle_decision decision=anchored_confirmed reason=confirmation"
+    assert log =~ "scope=account source=provider_usage"
+    assert log =~ "candidate_age_s=180"
+    refute log =~ "upstream_identity_id"
+    refute log =~ account_label
+    refute log =~ assignment_label
+    refute log =~ identity.id
+    refute log =~ ~r/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/
+
+    event_output = inspect(events)
+    refute event_output =~ account_label
+    refute event_output =~ assignment_label
+    refute event_output =~ identity.id
+    refute event_output =~ "upstream_identity_id"
+  end
+
   test "a cached same-cycle body never clears the exhausted row" do
     t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
     identity = identity!()
@@ -144,6 +204,701 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
     row = account_row(identity)
     assert Decimal.compare(row.used_percent, Decimal.new("100")) == :eq
+  end
+
+  test "two safe lower same-cycle Usage API observations converge a retained exhausted measurement" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+
+    assert {:ok, _row} =
+             exhausted_row!(identity, t0,
+               reset_at: fixed_anchor,
+               metadata: %{"reset_after_seconds" => DateTime.diff(fixed_anchor, t0, :second)}
+             )
+
+    candidate_at = DateTime.add(t0, 1, :minute)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_same_cycle_used(candidate_at, fixed_anchor, "32"),
+               candidate_at,
+               candidate_at
+             )
+
+    pending = account_row(identity)
+    assert Decimal.equal?(pending.used_percent, Decimal.new("100"))
+    assert {:ok, candidate} = EvidenceStore.parse_candidate(pending.metadata)
+    assert Decimal.equal?(candidate.used_percent, Decimal.new("32"))
+    assert EvidenceStore.candidate_provider_status_safe?(pending.metadata)
+
+    confirmed_at = DateTime.add(candidate_at, 1, :minute)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_same_cycle_used(confirmed_at, fixed_anchor, "32"),
+               confirmed_at,
+               confirmed_at
+             )
+
+    confirmed = account_row(identity)
+    assert Decimal.equal?(confirmed.used_percent, Decimal.new("32"))
+    assert DateTime.compare(confirmed.observed_at, confirmed_at) == :eq
+    refute Map.has_key?(confirmed.metadata, "__quota_confirmed_candidate_v1")
+    refute Map.has_key?(confirmed.metadata, "__quota_candidate_provider_status_v1")
+
+    assert %{
+             eligible?: true,
+             routing_state: :weekly_only_probe,
+             exclusions: [],
+             selection: %{blocked_windows: []}
+           } = Windows.routing_quota_eligibility(identity, at: confirmed_at)
+  end
+
+  test "safe fixed same-anchor observations confirm an exhausted weekly restart" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+
+    assert {:ok, _row} =
+             exhausted_row!(identity, t0,
+               reset_at: fixed_anchor,
+               active_limit: 243,
+               credits: 0
+             )
+
+    candidate_at = DateTime.add(t0, 5, :minute)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_fixed_zero(candidate_at, fixed_anchor),
+               candidate_at,
+               candidate_at
+             )
+
+    pending = account_row(identity)
+    assert Decimal.equal?(pending.used_percent, Decimal.new("100"))
+    assert pending.active_limit == 243
+    assert pending.credits == 0
+    assert_exhausted_quota_truth(identity, pending, candidate_at)
+
+    assert {:ok, %{observed_at: ^candidate_at}} =
+             EvidenceStore.parse_candidate(pending.metadata)
+
+    inside_span_at = DateTime.add(candidate_at, 60, :second)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_fixed_zero(inside_span_at, fixed_anchor),
+               inside_span_at,
+               inside_span_at
+             )
+
+    still_pending = account_row(identity)
+    assert Decimal.equal?(still_pending.used_percent, Decimal.new("100"))
+
+    assert {:ok, %{observed_at: ^candidate_at}} =
+             EvidenceStore.parse_candidate(still_pending.metadata)
+
+    assert {:ok, %{observed_at: ^candidate_at}} =
+             EvidenceStore.parse_candidate_provider_status(still_pending.metadata)
+
+    confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_fixed_zero(confirmed_at, fixed_anchor),
+               confirmed_at,
+               confirmed_at
+             )
+
+    confirmed = account_row(identity)
+    assert Decimal.equal?(confirmed.used_percent, Decimal.new("0"))
+    assert confirmed.active_limit == nil
+    assert confirmed.credits == nil
+    assert DateTime.compare(confirmed.reset_at, fixed_anchor) == :eq
+    assert DateTime.compare(confirmed.observed_at, confirmed_at) == :eq
+    assert DateTime.compare(confirmed.last_sync_at, confirmed_at) == :eq
+    assert confirmed.metadata["__quota_relative_liveness_v1"] == DateTime.to_iso8601(confirmed_at)
+    refute Map.has_key?(confirmed.metadata, "__quota_confirmed_candidate_v1")
+    refute Map.has_key?(confirmed.metadata, "__quota_candidate_provider_status_v1")
+    assert {:ok, _marker} = CycleConfirmation.valid_marker(confirmed)
+    assert CycleConfirmation.selector_valid?(confirmed, confirmed_at)
+    assert_reset_quota_truth(identity, confirmed, confirmed_at)
+  end
+
+  test "same-anchor confirmation retains exact positive incoming capacity" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+    candidate_at = DateTime.add(t0, 5, :minute)
+    confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+    assert {:ok, _row} =
+             exhausted_row!(identity, t0,
+               reset_at: fixed_anchor,
+               active_limit: 243,
+               credits: 0
+             )
+
+    for observed_at <- [candidate_at, confirmed_at] do
+      evidence =
+        observed_at
+        |> safe_fixed_zero(fixed_anchor)
+        |> Map.merge(%{active_limit: 300, credits: 300})
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(identity, evidence, observed_at, observed_at)
+    end
+
+    confirmed = account_row(identity)
+    assert Decimal.equal?(confirmed.used_percent, Decimal.new("0"))
+    assert confirmed.active_limit == 300
+    assert confirmed.credits == 300
+    assert CycleConfirmation.selector_valid?(confirmed, confirmed_at)
+  end
+
+  test "fresh matching runtime evidence immediately corroborates a safe same-anchor restart" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+
+    assert {:ok, canonical} =
+             exhausted_row!(identity, t0,
+               reset_at: fixed_anchor,
+               active_limit: 243,
+               credits: 0
+             )
+
+    runtime_at = DateTime.add(t0, 4, :minute)
+    runtime_weekly_row!(identity, runtime_at, "0", fixed_anchor)
+    accepted_at = DateTime.add(runtime_at, 60, :second)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_fixed_zero(accepted_at, fixed_anchor),
+               accepted_at,
+               accepted_at
+             )
+
+    accepted = Repo.get!(AccountQuotaWindow, canonical.id)
+    assert Decimal.equal?(accepted.used_percent, Decimal.new("0"))
+    assert accepted.active_limit == nil
+    assert accepted.credits == nil
+    assert DateTime.compare(accepted.reset_at, fixed_anchor) == :eq
+    assert DateTime.compare(accepted.observed_at, accepted_at) == :eq
+    assert DateTime.compare(accepted.last_sync_at, accepted_at) == :eq
+    assert accepted.metadata["__quota_relative_liveness_v1"] == DateTime.to_iso8601(accepted_at)
+    assert accepted.metadata["reset_state"] == "anchored"
+    refute Map.has_key?(accepted.metadata, "__quota_confirmed_candidate_v1")
+    refute Map.has_key?(accepted.metadata, "__quota_candidate_provider_status_v1")
+    assert CycleConfirmation.selector_valid?(accepted, accepted_at)
+  end
+
+  test "runtime corroboration cannot clear capacity for unsafe or replayed provider evidence" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    fixed_anchor = DateTime.add(t0, 5, :day)
+
+    cases = [
+      {:unsafe,
+       fn accepted_at ->
+         fixed_zero(
+           accepted_at,
+           fixed_anchor,
+           %{"rate_limit_allowed" => false, "rate_limit_reached" => true}
+         )
+       end},
+      {:replayed,
+       fn accepted_at ->
+         safe_fixed_zero(accepted_at, fixed_anchor, provider_at: t0)
+       end}
+    ]
+
+    for {_name, evidence_for} <- cases do
+      identity = identity!()
+
+      assert {:ok, canonical} =
+               exhausted_row!(identity, t0,
+                 reset_at: fixed_anchor,
+                 active_limit: 243,
+                 credits: 0
+               )
+
+      runtime_at = DateTime.add(t0, 4, :minute)
+      runtime_weekly_row!(identity, runtime_at, "0", fixed_anchor)
+      accepted_at = DateTime.add(runtime_at, 60, :second)
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 evidence_for.(accepted_at),
+                 accepted_at,
+                 accepted_at
+               )
+
+      unchanged = Repo.get!(AccountQuotaWindow, canonical.id)
+      assert Decimal.equal?(unchanged.used_percent, Decimal.new("100"))
+      assert unchanged.active_limit == 243
+      assert unchanged.credits == 0
+      refute CycleConfirmation.selector_valid?(unchanged, accepted_at)
+      assert_exhausted_quota_truth(identity, unchanged, accepted_at)
+    end
+  end
+
+  test "non-restart same-cycle weak snapshots preserve known capacity" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+
+    assert {:ok, canonical} =
+             used_row!(identity, t0, "0",
+               reset_at: fixed_anchor,
+               active_limit: 243,
+               credits: 243,
+               metadata: %{"reset_after_seconds" => DateTime.diff(fixed_anchor, t0, :second)}
+             )
+
+    refreshed_at = DateTime.add(t0, 60, :second)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               floating_zero(refreshed_at,
+                 reset_at: fixed_anchor,
+                 reset_after_seconds: DateTime.diff(fixed_anchor, refreshed_at, :second)
+               ),
+               refreshed_at,
+               refreshed_at
+             )
+
+    refreshed = Repo.get!(AccountQuotaWindow, canonical.id)
+    assert Decimal.equal?(refreshed.used_percent, Decimal.new("0"))
+    assert refreshed.active_limit == 243
+    assert refreshed.credits == 243
+    assert DateTime.compare(refreshed.observed_at, refreshed_at) == :eq
+    refute Map.has_key?(refreshed.metadata, "__quota_cycle_confirmation_v1")
+  end
+
+  test "same-anchor confirmation keeps anchored telemetry and uses a bounded reason" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+    candidate_at = DateTime.add(t0, 5, :minute)
+    confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+    assert {:ok, _row} = exhausted_row!(identity, t0, reset_at: fixed_anchor)
+
+    {_log, events} =
+      capture_quota_cycle_events(fn ->
+        capture_info_log(fn ->
+          assert {:ok, _row} =
+                   EvidenceStore.record_evidence(
+                     identity,
+                     safe_fixed_zero(candidate_at, fixed_anchor),
+                     candidate_at,
+                     candidate_at
+                   )
+        end)
+      end)
+
+    {log, confirmation_events} =
+      capture_quota_cycle_events(fn ->
+        capture_info_log(fn ->
+          assert {:ok, _row} =
+                   EvidenceStore.record_evidence(
+                     identity,
+                     safe_fixed_zero(confirmed_at, fixed_anchor),
+                     confirmed_at,
+                     confirmed_at
+                   )
+        end)
+      end)
+
+    assert events == [
+             {%{count: 1}, %{scope: "account", decision: :candidate, source: "provider_usage"}}
+           ]
+
+    assert confirmation_events == [
+             {%{count: 1}, %{scope: "account", decision: :anchored_confirmed, source: "provider_usage"}}
+           ]
+
+    assert log =~ "reason=same_anchor_allowed_confirmation"
+    refute log =~ identity.id
+  end
+
+  test "same-anchor confirmation requires safe provider status on both observations" do
+    statuses = [
+      {:missing, %{}},
+      {:unsafe_false_false, %{"rate_limit_allowed" => false, "rate_limit_reached" => false}},
+      {:limit_reached, %{"rate_limit_allowed" => false, "rate_limit_reached" => true}},
+      {:contradictory, %{"rate_limit_allowed" => true, "rate_limit_reached" => true}}
+    ]
+
+    for {_name, unsafe_status} <- statuses,
+        unsafe_observation <- [:candidate, :confirmation] do
+      t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+      identity = identity!()
+      fixed_anchor = DateTime.add(t0, 5, :day)
+      candidate_at = DateTime.add(t0, 5, :minute)
+      confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+      assert {:ok, canonical} =
+               exhausted_row!(identity, t0,
+                 reset_at: fixed_anchor,
+                 active_limit: 243,
+                 credits: 0
+               )
+
+      candidate_status =
+        if unsafe_observation == :candidate, do: unsafe_status, else: safe_status()
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 fixed_zero(candidate_at, fixed_anchor, candidate_status),
+                 candidate_at,
+                 candidate_at
+               )
+
+      confirmation_status =
+        if unsafe_observation == :confirmation, do: unsafe_status, else: safe_status()
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 fixed_zero(confirmed_at, fixed_anchor, confirmation_status),
+                 confirmed_at,
+                 confirmed_at
+               )
+
+      persisted = Repo.get!(AccountQuotaWindow, canonical.id)
+      assert Decimal.equal?(persisted.used_percent, Decimal.new("100"))
+      assert persisted.active_limit == 243
+      assert persisted.credits == 0
+      refute CycleConfirmation.selector_valid?(persisted, confirmed_at)
+      assert_exhausted_quota_truth(identity, persisted, confirmed_at)
+    end
+  end
+
+  test "same-anchor confirmation rejects replayed, stale, future, and out-of-order evidence" do
+    cases = [
+      {:replayed_provider_time,
+       fn candidate_at, confirmed_at, fixed_anchor ->
+         safe_fixed_zero(confirmed_at, fixed_anchor, provider_at: candidate_at)
+       end},
+      {:stale_provider_time,
+       fn candidate_at, confirmed_at, fixed_anchor ->
+         safe_fixed_zero(confirmed_at, fixed_anchor, provider_at: DateTime.add(candidate_at, -20, :minute))
+       end},
+      {:future_provider_time,
+       fn _candidate_at, confirmed_at, fixed_anchor ->
+         safe_fixed_zero(confirmed_at, fixed_anchor, provider_at: DateTime.add(confirmed_at, 1, :second))
+       end},
+      {:future_event_time,
+       fn _candidate_at, confirmed_at, fixed_anchor ->
+         safe_fixed_zero(DateTime.add(confirmed_at, 1, :second), fixed_anchor, provider_at: confirmed_at)
+       end},
+      {:out_of_order_event,
+       fn candidate_at, _confirmed_at, fixed_anchor ->
+         safe_fixed_zero(candidate_at, fixed_anchor)
+       end},
+      {:stale_evidence,
+       fn _candidate_at, confirmed_at, fixed_anchor ->
+         confirmed_at
+         |> safe_fixed_zero(fixed_anchor)
+         |> Map.put(:freshness_state, "stale")
+       end}
+    ]
+
+    for {_name, confirmation_for} <- cases do
+      t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+      identity = identity!()
+      fixed_anchor = DateTime.add(t0, 5, :day)
+      candidate_at = DateTime.add(t0, 5, :minute)
+      confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+      assert {:ok, canonical} =
+               exhausted_row!(identity, t0,
+                 reset_at: fixed_anchor,
+                 active_limit: 243,
+                 credits: 0
+               )
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 safe_fixed_zero(candidate_at, fixed_anchor),
+                 candidate_at,
+                 candidate_at
+               )
+
+      confirmation = confirmation_for.(candidate_at, confirmed_at, fixed_anchor)
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 confirmation,
+                 confirmation.observed_at,
+                 confirmed_at
+               )
+
+      persisted = Repo.get!(AccountQuotaWindow, canonical.id)
+      assert Decimal.equal?(persisted.used_percent, Decimal.new("100"))
+      assert persisted.active_limit == 243
+      assert persisted.credits == 0
+      refute CycleConfirmation.selector_valid?(persisted, confirmed_at)
+    end
+  end
+
+  test "same-anchor confirmation rejects reset, identity, source, and window mismatches" do
+    cases = [
+      {:reset, fn evidence -> Map.put(evidence, :reset_at, DateTime.add(evidence.reset_at, 301)) end},
+      {:identity, fn evidence -> Map.put(evidence, :quota_key, "other_account") end},
+      {:source, fn evidence -> Map.put(evidence, :source, "codex_response_headers") end},
+      {:window, fn evidence -> Map.put(evidence, :window_kind, "primary") end}
+    ]
+
+    for {_name, mismatch} <- cases do
+      t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+      identity = identity!()
+      fixed_anchor = DateTime.add(t0, 5, :day)
+      candidate_at = DateTime.add(t0, 5, :minute)
+      confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+      assert {:ok, canonical} = exhausted_row!(identity, t0, reset_at: fixed_anchor)
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 safe_fixed_zero(candidate_at, fixed_anchor),
+                 candidate_at,
+                 candidate_at
+               )
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 confirmed_at |> safe_fixed_zero(fixed_anchor) |> mismatch.(),
+                 confirmed_at,
+                 confirmed_at
+               )
+
+      persisted = Repo.get!(AccountQuotaWindow, canonical.id)
+      assert Decimal.equal?(persisted.used_percent, Decimal.new("100"))
+      refute CycleConfirmation.selector_valid?(persisted, confirmed_at)
+    end
+  end
+
+  test "same-anchor confirmation cannot clear newer positive or partial pressure" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    fixed_anchor = DateTime.add(t0, 5, :day)
+    candidate_at = DateTime.add(t0, 5, :minute)
+    confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+    identity = identity!()
+    assert {:ok, _row} = exhausted_row!(identity, t0, reset_at: fixed_anchor)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_fixed_zero(candidate_at, fixed_anchor),
+               candidate_at,
+               candidate_at
+             )
+
+    positive_at = DateTime.add(candidate_at, 60, :second)
+    assert {:ok, _row} = used_row!(identity, positive_at, "100", reset_at: fixed_anchor)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               safe_fixed_zero(confirmed_at, fixed_anchor),
+               confirmed_at,
+               confirmed_at
+             )
+
+    assert Decimal.equal?(account_row(identity).used_percent, Decimal.new("100"))
+
+    partial_identity = identity!()
+    assert {:ok, _row} = used_row!(partial_identity, t0, "31", reset_at: fixed_anchor)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               partial_identity,
+               safe_fixed_zero(candidate_at, fixed_anchor),
+               candidate_at,
+               candidate_at
+             )
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               partial_identity,
+               safe_fixed_zero(confirmed_at, fixed_anchor),
+               confirmed_at,
+               confirmed_at
+             )
+
+    assert Decimal.equal?(account_row(partial_identity).used_percent, Decimal.new("31"))
+  end
+
+  test "matching model weekly rows cannot enter same-anchor account restart admission" do
+    assert_scoped_same_anchor_restart_rejected("model", nil)
+  end
+
+  test "matching upstream-model weekly rows cannot enter same-anchor account restart admission" do
+    assert_scoped_same_anchor_restart_rejected("upstream_model", "example-upstream-model")
+  end
+
+  test "a safe restart candidate status survives reload without changing the v1 candidate shape" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    assert {:ok, _row} = exhausted_row!(identity, t0)
+
+    t1 = DateTime.add(t0, 300, :second)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               floating_zero(t1,
+                 metadata: %{
+                   "rate_limit_allowed" => true,
+                   "rate_limit_reached" => false,
+                   "reset_after_seconds" => @window_seconds
+                 }
+               ),
+               t1,
+               t1
+             )
+
+    row = account_row(identity)
+    candidate = row.metadata["__quota_confirmed_candidate_v1"]
+
+    assert map_size(candidate) == 5
+
+    assert row.metadata["__quota_candidate_provider_status_v1"] == %{
+             "version" => 1,
+             "allowed" => true,
+             "limit_reached" => false,
+             "observed_at" => DateTime.to_iso8601(t1)
+           }
+
+    reloaded = Repo.get!(AccountQuotaWindow, row.id)
+
+    assert {:ok, %{allowed: true, limit_reached: false, observed_at: ^t1}} =
+             EvidenceStore.parse_candidate_provider_status(reloaded.metadata)
+
+    assert EvidenceStore.candidate_provider_status_safe?(reloaded.metadata)
+  end
+
+  test "candidate provider status rejects legacy, orphaned, malformed, mismatched, and unsafe state" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+
+    cases = [
+      {:legacy_candidate_without_status, fn metadata, _observed_at -> metadata end},
+      {:orphan_status,
+       fn metadata, observed_at ->
+         metadata
+         |> Map.delete("__quota_confirmed_candidate_v1")
+         |> Map.put("__quota_candidate_provider_status_v1", safe_candidate_status(observed_at))
+       end},
+      {:malformed_status,
+       fn metadata, observed_at ->
+         Map.put(metadata, "__quota_candidate_provider_status_v1", %{
+           "version" => 1,
+           "allowed" => true,
+           "limit_reached" => false,
+           "observed_at" => DateTime.to_iso8601(observed_at),
+           "extra" => true
+         })
+       end},
+      {:timestamp_mismatch,
+       fn metadata, observed_at ->
+         Map.put(
+           metadata,
+           "__quota_candidate_provider_status_v1",
+           safe_candidate_status(DateTime.add(observed_at, 1, :second))
+         )
+       end},
+      {:non_boolean_status,
+       fn metadata, observed_at ->
+         Map.put(metadata, "__quota_candidate_provider_status_v1", %{
+           "version" => 1,
+           "allowed" => "true",
+           "limit_reached" => false,
+           "observed_at" => DateTime.to_iso8601(observed_at)
+         })
+       end},
+      {:contradictory_status,
+       fn metadata, observed_at ->
+         Map.put(metadata, "__quota_candidate_provider_status_v1", %{
+           "version" => 1,
+           "allowed" => true,
+           "limit_reached" => true,
+           "observed_at" => DateTime.to_iso8601(observed_at)
+         })
+       end}
+    ]
+
+    for {_case_name, metadata_for} <- cases do
+      identity = identity!()
+      assert {:ok, _row} = exhausted_row!(identity, t0)
+      candidate_at = DateTime.add(t0, 300, :second)
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(
+                 identity,
+                 floating_zero(candidate_at),
+                 candidate_at,
+                 candidate_at
+               )
+
+      row = account_row(identity)
+
+      row
+      |> Ecto.Changeset.change(metadata: metadata_for.(row.metadata, candidate_at))
+      |> Repo.update!()
+
+      reloaded = Repo.get!(AccountQuotaWindow, row.id)
+      assert :none = EvidenceStore.parse_candidate_provider_status(reloaded.metadata)
+      refute EvidenceStore.candidate_provider_status_safe?(reloaded.metadata)
+    end
+  end
+
+  test "a later accepted positive observation clears candidate and provider status state" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    canonical_reset = DateTime.add(t0, 5, :day)
+
+    assert {:ok, _row} = exhausted_row!(identity, t0, reset_at: canonical_reset)
+
+    candidate_at = DateTime.add(t0, 300, :second)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               floating_zero(candidate_at,
+                 metadata: %{
+                   "rate_limit_allowed" => true,
+                   "rate_limit_reached" => false,
+                   "reset_after_seconds" => @window_seconds
+                 }
+               ),
+               candidate_at,
+               candidate_at
+             )
+
+    assert {:ok, _row} =
+             used_row!(identity, DateTime.add(candidate_at, 60, :second), "100", reset_at: canonical_reset)
+
+    row = account_row(identity)
+    refute Map.has_key?(row.metadata, "__quota_confirmed_candidate_v1")
+    refute Map.has_key?(row.metadata, "__quota_candidate_provider_status_v1")
   end
 
   test "a zero inside the confirmation span keeps waiting without resetting the clock" do
@@ -464,77 +1219,105 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
              Routing.eligibility_from_windows([row], at: row.observed_at)
   end
 
-  test "a live idle zero tolerates small forward reset drift without starving stale" do
-    t0 = DateTime.utc_now() |> DateTime.add(-30, :minute) |> DateTime.truncate(:microsecond)
+  test "a bounded idle zero reanchor requires a strictly later provider observation" do
+    t0 = DateTime.utc_now() |> DateTime.add(-12, :minute) |> DateTime.truncate(:microsecond)
     identity = identity!()
     canonical_reset = DateTime.add(t0, 5, :day)
+    canonical_reset_after = DateTime.diff(canonical_reset, t0, :second)
 
     assert {:ok, _row} =
-             used_row!(identity, t0, "0",
-               reset_at: canonical_reset,
-               metadata: %{
-                 "reset_after_seconds" => DateTime.diff(canonical_reset, t0, :second)
-               }
-             )
-
-    live_at = DateTime.add(t0, 20, :minute)
-    drifted_reset = DateTime.add(canonical_reset, 301, :second)
-    remaining_seconds = DateTime.diff(drifted_reset, live_at, :second)
-    candidate_at = DateTime.add(live_at, -4, :minute)
-
-    account_row(identity)
-    |> Ecto.Changeset.change(
-      metadata: %{
-        "reset_after_seconds" => DateTime.diff(canonical_reset, t0, :second),
-        "__quota_confirmed_candidate_v1" => %{
-          "version" => 1,
-          "used_percent" => "0",
-          "reset_at" => DateTime.to_iso8601(drifted_reset),
-          "observed_at" => DateTime.to_iso8601(candidate_at),
-          "count" => 1
-        },
-        "__quota_relative_candidate_liveness_v1" => DateTime.to_iso8601(candidate_at)
-      }
-    )
-    |> Repo.update!()
-
-    assert {:ok, _row} =
-             EvidenceStore.record_evidence(
+             Windows.record_evidence(
                identity,
-               floating_zero(live_at,
-                 reset_at: drifted_reset,
-                 reset_after_seconds: remaining_seconds
+               floating_zero(t0,
+                 reset_at: canonical_reset,
+                 reset_after_seconds: canonical_reset_after
                ),
-               live_at,
-               live_at
+               t0
              )
 
-    row = account_row(identity)
-    assert Decimal.equal?(row.used_percent, Decimal.new("0"))
-    assert DateTime.compare(row.observed_at, live_at) == :eq
-    assert DateTime.compare(row.reset_at, drifted_reset) == :eq
-    refute Map.has_key?(row.metadata, "__quota_confirmed_candidate_v1")
-    refute Map.has_key?(row.metadata, "__quota_relative_candidate_liveness_v1")
-
-    assert %{eligible?: true, routing_state: :weekly_only_probe} =
-             Routing.eligibility_from_windows([row], at: live_at)
-
-    replayed_at = DateTime.add(live_at, 16, :minute)
+    candidate_at = DateTime.add(t0, 5, :minute)
+    drifted_reset = DateTime.add(canonical_reset, 301, :second)
+    candidate_reset_after = DateTime.diff(drifted_reset, candidate_at, :second)
 
     assert {:ok, _row} =
-             EvidenceStore.record_evidence(
+             Windows.record_evidence(
+               identity,
+               floating_zero(candidate_at,
+                 reset_at: drifted_reset,
+                 reset_after_seconds: candidate_reset_after
+               ),
+               candidate_at
+             )
+
+    equal_provider_at = DateTime.add(candidate_at, 4, :minute)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
+               identity,
+               floating_zero(equal_provider_at,
+                 reset_at: drifted_reset,
+                 reset_after_seconds: candidate_reset_after
+               ),
+               equal_provider_at
+             )
+
+    pending = account_row(identity)
+    assert DateTime.compare(pending.reset_at, canonical_reset) == :eq
+    assert DateTime.compare(pending.observed_at, t0) == :eq
+
+    advanced_at = DateTime.add(equal_provider_at, 1, :second)
+    advanced_reset_after = candidate_reset_after - 1
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
+               identity,
+               floating_zero(advanced_at,
+                 reset_at: drifted_reset,
+                 reset_after_seconds: advanced_reset_after
+               ),
+               advanced_at
+             )
+
+    confirmed = account_row(identity)
+    assert Decimal.equal?(confirmed.used_percent, Decimal.new("0"))
+    assert DateTime.compare(confirmed.reset_at, drifted_reset) == :eq
+    assert DateTime.compare(confirmed.observed_at, advanced_at) == :eq
+
+    replayed_at = DateTime.add(advanced_at, 1, :minute)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
                identity,
                floating_zero(replayed_at,
                  reset_at: drifted_reset,
-                 reset_after_seconds: remaining_seconds
+                 reset_after_seconds: advanced_reset_after
                ),
-               replayed_at,
                replayed_at
              )
 
     replayed = account_row(identity)
-    assert DateTime.compare(replayed.observed_at, live_at) == :eq
-    assert Evidence.current_freshness_state(replayed, replayed_at) == "stale"
+    assert DateTime.compare(replayed.reset_at, drifted_reset) == :eq
+    assert DateTime.compare(replayed.observed_at, advanced_at) == :eq
+
+    stale_at = DateTime.add(t0, -20, :minute)
+
+    stale_exhausted = %{
+      replayed
+      | id: Ecto.UUID.generate(),
+        used_percent: Decimal.new("100"),
+        reset_at: canonical_reset,
+        observed_at: stale_at,
+        last_sync_at: stale_at,
+        freshness_state: "stale",
+        metadata: %{}
+    }
+
+    result = Routing.eligibility_from_windows([stale_exhausted, replayed], at: replayed_at)
+
+    assert result.eligible?
+    assert result.routing_state == :weekly_only_probe
+    assert result.selection.secondary == replayed
+    refute result.selection.secondary.id == stale_exhausted.id
   end
 
   test "a cached superseded reset cannot keep an accepted weekly zero fresh" do
@@ -1380,9 +2163,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     legacy_row = account_row(identity)
 
     legacy_row
-    |> Ecto.Changeset.change(
-      metadata: Map.delete(legacy_row.metadata, "__quota_relative_liveness_v1")
-    )
+    |> Ecto.Changeset.change(metadata: Map.delete(legacy_row.metadata, "__quota_relative_liveness_v1"))
     |> Repo.update!()
 
     cached_positive_at = DateTime.add(base, 7, :minute)
@@ -1426,14 +2207,14 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
              DateTime.to_iso8601(legacy_provider_at)
   end
 
-  test "provider-time freshness and future-skew boundaries are inclusive" do
+  test "provider proof is non-future while generic evidence freshness keeps its skew allowance" do
     timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     cases = [
       {-Evidence.freshness_ttl_seconds(), true},
-      {Evidence.future_observed_skew_seconds(), true},
+      {0, true},
       {-Evidence.freshness_ttl_seconds() - 1, false},
-      {Evidence.future_observed_skew_seconds() + 1, false}
+      {1, false}
     ]
 
     for {provider_delta, candidate?} <- cases do
@@ -1458,6 +2239,21 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
         refute Map.has_key?(account_row(identity).metadata, "__quota_confirmed_candidate_v1")
       end
     end
+
+    future_within_skew = %{
+      freshness_state: "fresh",
+      observed_at: DateTime.add(timestamp, Evidence.future_observed_skew_seconds(), :second),
+      reset_at: DateTime.add(timestamp, 1, :day)
+    }
+
+    assert Evidence.current_freshness_state(future_within_skew, timestamp) == "fresh"
+
+    future_beyond_skew = %{
+      future_within_skew
+      | observed_at: DateTime.add(timestamp, Evidence.future_observed_skew_seconds() + 1, :second)
+    }
+
+    assert Evidence.current_freshness_state(future_beyond_skew, timestamp) == "stale"
   end
 
   test "a resetless weekly zero cannot crash or clear a partially-used observation" do
@@ -1486,5 +2282,211 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     row = account_row(identity)
     assert Decimal.compare(row.used_percent, Decimal.new("31")) == :eq
     assert DateTime.compare(row.observed_at, t0) == :eq
+  end
+
+  defp capture_info_log(fun) when is_function(fun, 0) do
+    previous_level = Logger.level()
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+    Logger.configure(level: :info)
+
+    try do
+      capture_log([level: :info], fun)
+    after
+      Logger.configure(level: previous_level)
+    end
+  end
+
+  defp safe_candidate_status(observed_at) do
+    %{
+      "version" => 1,
+      "allowed" => true,
+      "limit_reached" => false,
+      "observed_at" => DateTime.to_iso8601(observed_at)
+    }
+  end
+
+  defp assert_exhausted_quota_truth(identity, persisted, as_of) do
+    assert Decimal.equal?(persisted.used_percent, Decimal.new("100"))
+
+    assert %{
+             eligible?: false,
+             routing_state: :blocked,
+             exclusions: [%{code: "quota_weekly_exhausted", reason_codes: ["exhausted"]}],
+             selection: %{
+               secondary: %AccountQuotaWindow{id: persisted_id},
+               blocked_windows: [%AccountQuotaWindow{id: blocked_id}]
+             }
+           } = Windows.routing_quota_eligibility(identity, at: as_of)
+
+    assert persisted_id == persisted.id
+    assert blocked_id == persisted.id
+
+    assert %{allowed: false, limit_reached: true, secondary_window: %{used_percent: 100}} =
+             codex_rate_limit(identity, as_of)
+  end
+
+  defp assert_reset_quota_truth(identity, persisted, as_of) do
+    assert Decimal.equal?(persisted.used_percent, Decimal.new("0"))
+
+    assert %{
+             eligible?: true,
+             routing_state: :weekly_only_probe,
+             exclusions: [],
+             selection: %{
+               secondary: %AccountQuotaWindow{id: persisted_id},
+               blocked_windows: []
+             }
+           } = Windows.routing_quota_eligibility(identity, at: as_of)
+
+    assert persisted_id == persisted.id
+
+    assert %{allowed: true, limit_reached: false, secondary_window: %{used_percent: 0}} =
+             codex_rate_limit(identity, as_of)
+  end
+
+  defp codex_rate_limit(identity, as_of) do
+    identity
+    |> Windows.list_quota_windows(as_of)
+    |> UsageResponses.account_usage_windows(as_of)
+    |> then(fn {primary, secondary} -> UsageResponses.codex_rate_limit(primary, secondary) end)
+  end
+
+  defp safe_status do
+    %{
+      "rate_limit_allowed" => true,
+      "rate_limit_reached" => false
+    }
+  end
+
+  defp fixed_zero(observed_at, fixed_anchor, status, opts \\ []) do
+    provider_at = Keyword.get(opts, :provider_at, observed_at)
+
+    floating_zero(observed_at,
+      reset_at: fixed_anchor,
+      reset_after_seconds: DateTime.diff(fixed_anchor, provider_at, :second),
+      metadata: status
+    )
+  end
+
+  defp safe_fixed_zero(observed_at, fixed_anchor, opts \\ []),
+    do: fixed_zero(observed_at, fixed_anchor, safe_status(), opts)
+
+  defp runtime_weekly_row!(identity, observed_at, used_percent, reset_at) do
+    attrs = %{
+      quota_key: "account",
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      used_percent: Decimal.new(used_percent),
+      reset_at: reset_at,
+      observed_at: observed_at,
+      last_sync_at: observed_at,
+      source: "codex_rate_limit_event",
+      source_precision: "observed",
+      quota_scope: "account",
+      quota_family: "account",
+      freshness_state: "fresh",
+      metadata: %{}
+    }
+
+    assert {:ok, row} =
+             EvidenceStore.record_evidence(identity, attrs, observed_at, observed_at)
+
+    row
+  end
+
+  defp assert_scoped_same_anchor_restart_rejected(scope, upstream_model) do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_anchor = DateTime.add(t0, 5, :day)
+    candidate_at = DateTime.add(t0, 5, :minute)
+    confirmed_at = DateTime.add(candidate_at, 180, :second)
+
+    scoped_base =
+      t0
+      |> safe_fixed_zero(fixed_anchor)
+      |> Map.merge(%{
+        quota_key: "example_model_weekly",
+        quota_scope: scope,
+        quota_family: "example_model_weekly",
+        model: "example-model",
+        upstream_model: upstream_model,
+        active_limit: 243,
+        credits: 0,
+        used_percent: Decimal.new("100"),
+        metadata: %{
+          "reset_after_seconds" => DateTime.diff(fixed_anchor, t0, :second)
+        }
+      })
+
+    assert {:ok, canonical} = EvidenceStore.record_evidence(identity, scoped_base, t0, t0)
+    assert canonical.quota_scope == scope
+    assert canonical.upstream_model == upstream_model
+    assert Decimal.equal?(canonical.used_percent, Decimal.new("100"))
+
+    for observed_at <- [candidate_at, confirmed_at] do
+      scoped_zero = %{
+        scoped_base
+        | used_percent: Decimal.new("0"),
+          active_limit: nil,
+          credits: nil,
+          observed_at: observed_at,
+          last_sync_at: observed_at,
+          metadata:
+            Map.put(
+              safe_status(),
+              "reset_after_seconds",
+              DateTime.diff(fixed_anchor, observed_at, :second)
+            )
+      }
+
+      assert {:ok, _row} =
+               EvidenceStore.record_evidence(identity, scoped_zero, observed_at, observed_at)
+    end
+
+    persisted = Repo.get!(AccountQuotaWindow, canonical.id)
+    assert Decimal.equal?(persisted.used_percent, Decimal.new("100"))
+    assert persisted.active_limit == 243
+    assert persisted.credits == 0
+    assert DateTime.compare(persisted.observed_at, t0) == :eq
+    assert DateTime.compare(persisted.reset_at, fixed_anchor) == :eq
+    assert {:ok, _candidate} = EvidenceStore.parse_candidate(persisted.metadata)
+    assert persisted.metadata["reset_state"] == "anchored"
+    refute Map.has_key?(persisted.metadata, "__quota_cycle_confirmation_v1")
+    refute CycleConfirmation.selector_valid?(persisted, confirmed_at)
+  end
+
+  defp capture_quota_cycle_events(fun) when is_function(fun, 0) do
+    parent = self()
+    handler_id = "weekly-restart-quota-cycle-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :quota, :cycle, :decision],
+        fn _event, measurements, metadata, _config ->
+          send(parent, {handler_id, measurements, metadata})
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_quota_cycle_events(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_quota_cycle_events(handler_id, events) do
+    receive do
+      {^handler_id, measurements, metadata} ->
+        drain_quota_cycle_events(handler_id, [{measurements, metadata} | events])
+    after
+      0 -> Enum.reverse(events)
+    end
   end
 end

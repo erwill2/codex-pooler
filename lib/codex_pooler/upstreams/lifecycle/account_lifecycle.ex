@@ -2,9 +2,11 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   @moduledoc false
 
   import Ecto.Query
+  require Logger
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Events
+  alias CodexPooler.Jobs
   alias CodexPooler.Pools
   alias CodexPooler.Repo
 
@@ -12,24 +14,26 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   alias CodexPooler.Upstreams.Secrets
 
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
-  @active UpstreamIdentity.active_status()
-  @paused UpstreamIdentity.paused_status()
-  @refresh_due UpstreamIdentity.refresh_due_status()
-  @refreshing UpstreamIdentity.refreshing_status()
-  @refresh_failed UpstreamIdentity.refresh_failed_status()
-  @reauth_required UpstreamIdentity.reauth_required_status()
-  @deleted UpstreamIdentity.deleted_status()
-  @assignment_pending PoolUpstreamAssignment.pending_status()
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @assignment_paused PoolUpstreamAssignment.paused_status()
-  @assignment_refresh_due PoolUpstreamAssignment.refresh_due_status()
-  @assignment_refresh_failed PoolUpstreamAssignment.refresh_failed_status()
-  @assignment_deleted PoolUpstreamAssignment.deleted_status()
-  @eligible PoolUpstreamAssignment.eligible_status()
-  @ineligible PoolUpstreamAssignment.ineligible_status()
-  @health_active PoolUpstreamAssignment.active_health_status()
-  @health_disabled PoolUpstreamAssignment.disabled_health_status()
+  @active IdentityStatus.active_status()
+  @paused IdentityStatus.paused_status()
+  @refresh_due IdentityStatus.refresh_due_status()
+  @refreshing IdentityStatus.refreshing_status()
+  @refresh_failed IdentityStatus.refresh_failed_status()
+  @reauth_required IdentityStatus.reauth_required_status()
+  @deleted IdentityStatus.deleted_status()
+  @assignment_active AssignmentStatus.active_status()
+  @assignment_pending AssignmentStatus.pending_status()
+  @assignment_paused AssignmentStatus.paused_status()
+  @assignment_refresh_due AssignmentStatus.refresh_due_status()
+  @assignment_refresh_failed AssignmentStatus.refresh_failed_status()
+  @assignment_deleted AssignmentStatus.deleted_status()
+  @eligible AssignmentStatus.eligible_status()
+  @ineligible AssignmentStatus.ineligible_status()
+  @health_active AssignmentStatus.active_health_status()
+  @health_disabled AssignmentStatus.disabled_health_status()
   @reactivatable_statuses [@active, @paused, @refresh_due, @refresh_failed]
   @reactivatable_assignment_statuses [
     @assignment_pending,
@@ -89,6 +93,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
 
         Repo.transaction(fn ->
           locked_identity = CredentialFencing.lock_credential_replacement(identity.id)
+          validate_lifecycle_epoch!(locked_identity)
 
           paused_identity =
             locked_identity
@@ -98,7 +103,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
               updated_at: timestamp,
               metadata:
                 locked_identity
-                |> CredentialFencing.advance_credential_epoch()
+                |> CredentialFencing.advance_credential_epoch_preserving_expiry()
                 |> lifecycle_metadata("paused", attrs, timestamp)
             })
             |> Repo.update!()
@@ -124,9 +129,8 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   def pause_account_for_scope(%Scope{} = scope, identity_or_id, attrs) when is_map(attrs) do
     with {:ok, identity} <- authorize(scope, identity_or_id) do
       pause_account(identity, attrs)
-      |> AccountAudit.record_change(scope, "upstream_account.pause",
-        previous_status: identity.status
-      )
+      |> AccountAudit.record_change_strict(scope, "upstream_account.pause", previous_status: identity.status)
+      |> enqueue_lifecycle_catalog_sync()
     end
   end
 
@@ -155,6 +159,8 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
          :ok <- ensure_reactivatable_identity(identity),
          :ok <- ensure_reactivation_secret(identity),
          [_ | _] = assignments <- reactivatable_assignments(identity) do
+      validate_lifecycle_epoch!(identity)
+
       active_identity =
         identity
         |> UpstreamIdentity.changeset(%{
@@ -165,7 +171,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
           updated_at: timestamp,
           metadata:
             identity
-            |> CredentialFencing.advance_credential_epoch()
+            |> CredentialFencing.advance_credential_epoch_preserving_expiry()
             |> lifecycle_metadata("reactivated", attrs, timestamp)
         })
         |> Repo.update!()
@@ -187,9 +193,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
       lifecycle_result(:active, active_identity)
     else
       nil ->
-        Repo.rollback(
-          lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")
-        )
+        Repo.rollback(lifecycle_error(:upstream_identity_not_found, "upstream identity was not found"))
 
       [] ->
         Repo.rollback(
@@ -204,14 +208,20 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
     end
   end
 
+  defp validate_lifecycle_epoch!(identity) do
+    case CredentialFencing.validate_current_credential_epoch(identity) do
+      {:ok, _epoch} -> :ok
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
   @spec reactivate_account_for_scope(Scope.t(), identity_ref(), map()) ::
           lifecycle_result()
   def reactivate_account_for_scope(%Scope{} = scope, identity_or_id, attrs) when is_map(attrs) do
     with {:ok, identity} <- authorize(scope, identity_or_id) do
       reactivate_account(identity, attrs)
-      |> AccountAudit.record_change(scope, "upstream_account.reactivate",
-        previous_status: identity.status
-      )
+      |> AccountAudit.record_change_strict(scope, "upstream_account.reactivate", previous_status: identity.status)
+      |> enqueue_lifecycle_catalog_sync()
     end
   end
 
@@ -260,9 +270,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   def soft_delete_account_for_scope(%Scope{} = scope, identity_or_id, attrs) when is_map(attrs) do
     with {:ok, identity} <- authorize(scope, identity_or_id) do
       soft_delete_account(identity, attrs)
-      |> AccountAudit.record_change(scope, "upstream_account.delete",
-        previous_status: identity.status
-      )
+      |> AccountAudit.record_change(scope, "upstream_account.delete", previous_status: identity.status)
     end
   end
 
@@ -272,10 +280,21 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   @spec authorize(Scope.t(), identity_ref()) ::
           {:ok, UpstreamIdentity.t()} | {:error, lifecycle_error()}
   def authorize(%Scope{} = scope, identity_or_id) do
+    with {:ok, identity, _assignments} <- authorize_assignments(scope, identity_or_id), do: {:ok, identity}
+  end
+
+  @doc """
+  Authorizes like `authorize/2` and also returns the live assignments the decision was made on,
+  oldest first. A caller that acts on one assignment picks it from this list, so the target and the
+  Pool authorization come from the same read: an assignment created after it cannot be targeted.
+  """
+  @spec authorize_assignments(Scope.t(), identity_ref()) ::
+          {:ok, UpstreamIdentity.t(), [PoolUpstreamAssignment.t()]} | {:error, lifecycle_error()}
+  def authorize_assignments(%Scope{} = scope, identity_or_id) do
     with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
-         {:ok, pool_ids} <- lifecycle_pool_ids(identity),
-         :ok <- require_lifecycle_pool_access(scope, pool_ids) do
-      {:ok, identity}
+         {:ok, assignments} <- lifecycle_assignments(identity),
+         :ok <- require_lifecycle_pool_access(scope, assignments |> Enum.map(& &1.pool_id) |> Enum.uniq()) do
+      {:ok, identity, assignments}
     else
       nil ->
         {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
@@ -313,17 +332,51 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
     Map.put(metadata, "last_lifecycle_transition", lifecycle)
   end
 
-  defp lifecycle_pool_ids(%UpstreamIdentity{} = identity) do
-    pool_ids =
-      identity.id
-      |> assignments_for_identity()
-      |> Enum.reject(&(&1.status == @deleted))
-      |> Enum.map(& &1.pool_id)
-      |> Enum.uniq()
-
-    case pool_ids do
+  defp lifecycle_assignments(%UpstreamIdentity{} = identity) do
+    case identity.id |> assignments_for_identity() |> Enum.reject(&(&1.status == @deleted)) do
       [] -> {:error, lifecycle_error(:pool_assignment_not_found, "pool assignment was not found")}
-      pool_ids -> {:ok, pool_ids}
+      assignments -> {:ok, assignments}
+    end
+  end
+
+  defp enqueue_lifecycle_catalog_sync({:ok, %{status: status, assignments: assignments}} = result)
+       when status in [:paused, :active] and is_list(assignments) do
+    assignment_status =
+      case status do
+        :paused -> @assignment_paused
+        :active -> @assignment_active
+      end
+
+    affected_pool_ids =
+      assignments
+      |> Enum.filter(&match?(%PoolUpstreamAssignment{status: ^assignment_status}, &1))
+      |> MapSet.new(& &1.pool_id)
+
+    Pools.list_active_pools()
+    |> Enum.filter(&MapSet.member?(affected_pool_ids, &1.id))
+    |> Enum.each(fn pool ->
+      case Jobs.enqueue_catalog_sync(pool, trigger_kind: "manual") do
+        {:ok, _job} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "upstream lifecycle catalog sync enqueue failed pool_id=#{pool.id} " <>
+              "trigger_kind=manual reason=#{catalog_sync_failure_code(reason)}"
+          )
+      end
+    end)
+
+    result
+  end
+
+  defp enqueue_lifecycle_catalog_sync(result), do: result
+
+  defp catalog_sync_failure_code(reason) do
+    cond do
+      match?(%Ecto.Changeset{}, reason) -> "invalid_job"
+      is_atom(reason) -> Atom.to_string(reason)
+      true -> "unknown"
     end
   end
 

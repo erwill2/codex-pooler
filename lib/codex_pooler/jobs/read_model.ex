@@ -24,7 +24,6 @@ defmodule CodexPooler.Jobs.ReadModel do
   @type explorer_filters :: %{
           optional(:state) => String.t() | nil,
           optional(:worker) => String.t() | nil,
-          optional(:queue) => String.t() | nil,
           optional(:attention) => String.t() | nil,
           optional(:target_kind) => String.t() | nil,
           optional(:target_id) => String.t() | nil,
@@ -38,8 +37,7 @@ defmodule CodexPooler.Jobs.ReadModel do
           required(:offset) => non_neg_integer()
         }
   @type explorer_filter_values :: %{
-          required(:workers) => [String.t()],
-          required(:queues) => [String.t()]
+          required(:workers) => [String.t()]
         }
   @type overview_status :: :attention_required | :healthy | :empty
   @type overview_bucket :: %{
@@ -174,8 +172,7 @@ defmodule CodexPooler.Jobs.ReadModel do
             job.worker == ^Query.worker_name(TokenRefreshWorker) and
               fragment("?->>?", job.args, "upstream_identity_id") == ^identity_id,
           order_by: [
-            desc:
-              fragment("COALESCE(?, ?, ?)", job.attempted_at, job.scheduled_at, job.inserted_at)
+            desc: fragment("COALESCE(?, ?, ?)", job.attempted_at, job.scheduled_at, job.inserted_at)
           ],
           limit: ^limit,
           select: %{
@@ -210,8 +207,7 @@ defmodule CodexPooler.Jobs.ReadModel do
             job.worker == ^Query.worker_name(AccountReconciliationWorker) and
               fragment("?->>?", job.args, "pool_id") == ^pool_id,
           order_by: [
-            desc:
-              fragment("COALESCE(?, ?, ?)", job.attempted_at, job.scheduled_at, job.inserted_at)
+            desc: fragment("COALESCE(?, ?, ?)", job.attempted_at, job.scheduled_at, job.inserted_at)
           ],
           limit: ^limit,
           select: %{

@@ -4,15 +4,19 @@ defmodule CodexPooler.Access.APIKey do
 
   import Ecto.Changeset
 
+  alias CodexPooler.ServiceTier
+
   @derive {Inspect, except: [:key_hash]}
-  @reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
-  @service_tiers ~w(auto default flex priority scale)
+  @reasoning_efforts ~w(none minimal low medium high xhigh max ultra persistent)
+  @service_tiers ~w(auto default flex priority scale ultrafast)
 
   @type reasoning_effort :: String.t()
   @type t :: %__MODULE__{
           dashboard_access: boolean(),
+          max_active_requests: pos_integer() | nil,
           enforced_reasoning_effort: reasoning_effort() | nil,
-          maximum_reasoning_effort: reasoning_effort() | nil
+          maximum_reasoning_effort: reasoning_effort() | nil,
+          runtime_revocation_epoch: non_neg_integer()
         }
   @type attrs :: map()
 
@@ -22,7 +26,9 @@ defmodule CodexPooler.Access.APIKey do
     field :key_prefix, :string
     field :key_hash, :binary
     field :status, :string
+    field :runtime_revocation_epoch, :integer, default: 0
     field :dashboard_access, :boolean, default: false
+    field :max_active_requests, :integer
     field :expires_at, :utc_datetime_usec
     field :last_used_at, :utc_datetime_usec
     field :allowed_model_identifiers, {:array, :string}
@@ -46,6 +52,7 @@ defmodule CodexPooler.Access.APIKey do
       :key_hash,
       :status,
       :dashboard_access,
+      :max_active_requests,
       :expires_at,
       :last_used_at,
       :allowed_model_identifiers,
@@ -61,6 +68,7 @@ defmodule CodexPooler.Access.APIKey do
     |> update_change(:display_name, &String.trim/1)
     |> update_change(:allowed_model_identifiers, &normalize_model_identifiers/1)
     |> update_change(:enforced_model_identifier, &normalize_model_identifier/1)
+    |> update_change(:enforced_service_tier, &canonicalize_service_tier/1)
     |> update_change(:metadata, &normalize_metadata/1)
     |> validate_required([
       :pool_id,
@@ -71,6 +79,11 @@ defmodule CodexPooler.Access.APIKey do
       :dashboard_access
     ])
     |> validate_inclusion(:status, ["active", "paused", "revoked"])
+    |> validate_number(:max_active_requests,
+      greater_than: 0,
+      less_than_or_equal_to: 2_147_483_647
+    )
+    |> check_constraint(:max_active_requests, name: :api_keys_max_active_requests_positive)
     |> validate_string_list(:allowed_model_identifiers)
     |> validate_model_identifier(:enforced_model_identifier)
     |> validate_inclusion(:enforced_reasoning_effort, @reasoning_efforts)
@@ -110,6 +123,13 @@ defmodule CodexPooler.Access.APIKey do
   end
 
   defp normalize_model_identifier(value), do: value
+
+  defp canonicalize_service_tier(nil), do: nil
+
+  defp canonicalize_service_tier(value) when is_binary(value),
+    do: ServiceTier.canonicalize(value) || value
+
+  defp canonicalize_service_tier(value), do: value
 
   defp normalize_metadata(metadata) when is_map(metadata), do: metadata
   defp normalize_metadata(_metadata), do: %{}
@@ -159,9 +179,7 @@ defmodule CodexPooler.Access.APIKey do
         not metadata_labels_valid?(Map.get(metadata, "labels", Map.get(metadata, :labels, []))) ->
           [metadata: "labels must be a list of strings"]
 
-        not metadata_notes_valid?(
-          Map.get(metadata, "operator_notes", Map.get(metadata, :operator_notes))
-        ) ->
+        not metadata_notes_valid?(Map.get(metadata, "operator_notes", Map.get(metadata, :operator_notes))) ->
           [metadata: "operator_notes must be a string"]
 
         true ->

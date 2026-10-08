@@ -13,6 +13,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
   alias CodexPooler.Jobs.RuntimeStateCleanupWorker
   alias CodexPooler.Jobs.TokenRefreshWorker
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Admin.JobsPresentation
   alias CodexPoolerWeb.Admin.JobsReadModel
 
   test "redirects unauthenticated operators to login" do
@@ -217,7 +218,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert has_element?(view, "#admin-jobs-page")
     assert has_element?(view, "#admin-jobs-page-header", "System Jobs")
-    assert has_element?(view, "#admin-jobs-page-header", "Monitor background work")
+    assert has_element?(view, "#admin-jobs-page-header", "Background jobs across the instance")
     assert has_element?(view, "#admin-jobs-worker-grid")
     assert has_element?(view, worker_card_selector(:runtime_cleanup), "Runtime cleanup")
 
@@ -290,20 +291,19 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert has_element?(view, "#admin-jobs-explorer")
     assert has_element?(view, "#admin-jobs-explorer-total", "1 job")
-    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-1 of 1")
+    assert has_element?(view, "#admin-jobs-explorer-pagination-range", "Showing 1-1 of 1")
     assert has_element?(view, "#admin-jobs-explorer-table")
-    assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{job.id}")
-    assert has_element?(view, "#job-#{job.id}", "RuntimeStateCleanupWorker")
+    assert has_element?(view, "#admin-jobs-explorer-rows #job-#{job.id}")
+    assert has_element?(view, "#job-#{job.id}", "Runtime state cleanup")
     assert has_element?(view, state_label_selector(job), "Completed")
     refute has_element?(view, "#job-#{job.id} [data-role='state-icon']")
     refute has_element?(view, "#job-#{job.id} [data-role='state-chip']")
-    assert has_element?(view, "#job-#{job.id} [data-role='queue']", "Queue jobs")
     assert has_element?(view, "#job-#{job.id} [data-role='job-target-empty']", "-")
 
     assert has_element?(
              view,
              "#job-#{job.id} [data-role='worker']",
-             "RuntimeStateCleanupWorker"
+             "Runtime state cleanup"
            )
 
     assert has_element?(view, "#job-#{job.id} [data-role='job-event-label']", "Completed")
@@ -319,6 +319,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     refute rendered =~ "authorization-bearer-value"
   end
 
+  @tag :relative_countdown_contract
   test "renders absolute job timestamps with operator preferences while keeping relative next run",
        %{
          conn: conn,
@@ -387,6 +388,61 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(view, "#job-detail-attempted-at", "2026-05-04 12:01")
     assert has_element?(view, "#job-detail-completed-at", "2026-05-04 12:02")
     refute render(view) =~ "10:02:00 UTC"
+  end
+
+  @tag :relative_countdown_contract
+  test "scheduled, retry, and cron next-run labels preserve instant-based due rounding" do
+    now = ~U[2026-07-31 12:00:30Z]
+    preferences = %{datetime_format: "short", timezone: "Europe/Rome"}
+
+    scheduled =
+      worker_card_for(:token_refresh, now, preferences, %{
+        state: "scheduled",
+        attempt: 0,
+        max_attempts: 3,
+        inserted_at: now,
+        scheduled_at: now
+      })
+
+    retry =
+      worker_card_for(:token_refresh, now, preferences, %{
+        state: "retryable",
+        attempt: 1,
+        max_attempts: 3,
+        inserted_at: now,
+        attempted_at: now,
+        scheduled_at: DateTime.add(now, 61, :second)
+      })
+
+    subsecond_future =
+      worker_card_for(:token_refresh, now, preferences, %{
+        state: "scheduled",
+        attempt: 0,
+        max_attempts: 3,
+        inserted_at: now,
+        scheduled_at: ~U[2026-07-31 12:00:30.999999Z]
+      })
+
+    expired =
+      worker_card_for(:token_refresh, now, preferences, %{
+        state: "scheduled",
+        attempt: 0,
+        max_attempts: 3,
+        inserted_at: DateTime.add(now, -1, :second),
+        scheduled_at: DateTime.add(now, -1, :second)
+      })
+
+    cron =
+      JobsPresentation.worker_cards(%{}, preferences, now)
+      |> Enum.find(&(&1.key == :account_reconciliation))
+
+    assert scheduled.next_run == "Due now"
+    assert subsecond_future.next_run == "in <1m"
+    assert expired.next_run == "Due now"
+    assert retry.next_run == "in 2m"
+    assert retry.next_run_title == "2026-07-31 14:01"
+    assert cron.next_run == "in <1m"
+    assert cron.next_run_title == "2026-07-31 14:01"
   end
 
   test "jobs read model owns admin jobs page state" do
@@ -596,19 +652,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert has_element?(view, "#filters_worker[value='']")
 
-    assert has_element?(view, "#job-queue-filter [data-role='queue-filter-trigger']", "Any queue")
-
-    assert has_element?(
-             view,
-             "#job-queue-filter [data-role='queue-filter-option'][data-queue='jobs']"
-           )
-
-    assert has_element?(
-             view,
-             "#job-queue-filter [data-role='queue-filter-option'][data-queue='critical']"
-           )
-
-    assert has_element?(view, "#filters_queue[value='']")
+    refute has_element?(view, "#job-queue-filter")
 
     assert has_element?(
              view,
@@ -638,9 +682,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(view, "#filters_show_completed[value='false']")
     refute has_element?(view, "#job-filter-clear")
 
-    render_click(
-      element(view, "#job-state-filter [data-role='state-filter-option'][data-state='retryable']")
-    )
+    render_click(element(view, "#job-state-filter [data-role='state-filter-option'][data-state='retryable']"))
 
     assert_patch(view, ~p"/admin/jobs?state=retryable")
     assert has_element?(view, "#filters_state[value='retryable']")
@@ -653,7 +695,6 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
         "attention" => "retry_pressure",
         "state" => "retryable",
         "worker" => worker,
-        "queue" => "jobs",
         "target_kind" => "pool",
         "target_id" => pool.id,
         "show_completed" => "true",
@@ -667,7 +708,6 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert query == %{
              "attention" => "retry_pressure",
-             "queue" => "jobs",
              "show_completed" => "true",
              "state" => "retryable",
              "target_id" => pool.id,
@@ -677,7 +717,6 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert has_element?(view, "#filters_attention[value='retry_pressure']")
     assert has_element?(view, "#filters_worker[value='#{worker}']")
-    assert has_element?(view, "#filters_queue[value='jobs']")
     assert has_element?(view, "#filters_target_kind[value='pool']")
     assert has_element?(view, "#filters_target_id[value='#{pool.id}']")
     assert has_element?(view, "#filters_show_completed[value='true']")
@@ -693,18 +732,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     {:ok, view, _html} =
       live(
         conn,
-        ~p"/admin/jobs?attention=old_attention&page=0&queue=bad/queue&show_completed=maybe&state=completed&target_id=not-a-uuid&target_kind=pool&worker=bad worker"
+        ~p"/admin/jobs?attention=old_attention&page=0&show_completed=maybe&state=completed&target_id=not-a-uuid&target_kind=pool&worker=bad worker"
       )
 
     assert has_element?(view, "#job-filter-errors", "Some filters were ignored")
     assert has_element?(view, "#job-filter-errors", "Attention filter is not supported")
     assert has_element?(view, "#job-filter-errors", "Page must be a positive integer")
-
-    assert has_element?(
-             view,
-             "#job-filter-errors",
-             "Queue filter contains unsupported characters"
-           )
 
     assert has_element?(view, "#job-filter-errors", "Show completed must be true or false")
     assert has_element?(view, "#job-filter-errors", "Completed jobs require show_completed=true")
@@ -734,8 +767,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
              "Any worker"
            )
 
-    assert has_element?(view, "#filters_queue[value='']")
-    assert has_element?(view, "#job-queue-filter [data-role='queue-filter-trigger']", "Any queue")
+    refute has_element?(view, "#job-queue-filter")
     assert has_element?(view, "#filters_target_kind[value='']")
     assert has_element?(view, "#filters_target_id[value='']")
     assert has_element?(view, "#filters_page[value='1']")
@@ -745,7 +777,6 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert state.socket.assigns.filters.attention == nil
     assert state.socket.assigns.filters.state == nil
     assert state.socket.assigns.filters.worker == nil
-    assert state.socket.assigns.filters.queue == nil
     assert state.socket.assigns.filters.target_kind == nil
     assert state.socket.assigns.filters.target_id == nil
     assert state.socket.assigns.filters.page == 1
@@ -831,8 +862,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
           %{
             "attempt" => 1,
             "kind" => "RuntimeError",
-            "error" =>
-              "upstream timeout\nauthorization=Bearer drawer-error-bearer\tprompt=drawer-error-prompt cookie=drawer-error-cookie access_token=drawer-error-access refresh_token=drawer-error-refresh password=drawer-error-password secret=drawer-error-secret"
+            "error" => "upstream timeout\nauthorization=Bearer drawer-error-bearer\tprompt=drawer-error-prompt cookie=drawer-error-cookie access_token=drawer-error-access refresh_token=drawer-error-refresh password=drawer-error-password secret=drawer-error-secret"
           }
         ]
       )
@@ -932,6 +962,33 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
   defp worker_card_selector(worker_group) do
     "#job-worker-card-#{String.replace(Atom.to_string(worker_group), "_", "-")}"
+  end
+
+  defp worker_card_for(group, now, preferences, pending_job) do
+    pending_job =
+      Map.merge(
+        %{
+          attempted_at: nil,
+          cancelled_at: nil,
+          completed_at: nil,
+          discarded_at: nil,
+          errors: [],
+          worker: "CodexPooler.Jobs.TokenRefreshWorker"
+        },
+        pending_job
+      )
+
+    summary = %{
+      latest: pending_job,
+      latest_success: nil,
+      latest_failure: nil,
+      pending: pending_job,
+      open: [],
+      unresolved_failures: []
+    }
+
+    JobsPresentation.worker_cards(%{group => summary}, preferences, now)
+    |> Enum.find(&(&1.key == group))
   end
 
   defp maybe_put_worker_name(updates) do

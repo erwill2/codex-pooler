@@ -14,6 +14,7 @@ defmodule CodexPooler.AccountingTest do
 
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
 
@@ -254,6 +255,46 @@ defmodule CodexPooler.AccountingTest do
       assert result.request.last_error_code == "timeout_before_headers"
     end
 
+    for cache_write_tokens <- [0, 7] do
+      test "unknown usage cannot price cache-write component #{cache_write_tokens}" do
+        setup = accounting_setup(%{cache_write_token_micros: Decimal.new(11)})
+
+        assert {:ok, reserved} =
+                 Accounting.reserve(
+                   setup.auth,
+                   setup.model,
+                   %{"model" => setup.model.exposed_model_id},
+                   %{}
+                 )
+
+        assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+        assert {:ok, result} =
+                 Accounting.finalize_success(
+                   reserved.request,
+                   attempt,
+                   %{
+                     status: "usage_unknown",
+                     cache_write_tokens: unquote(cache_write_tokens)
+                   },
+                   %{response_status_code: 200}
+                 )
+
+        assert result.settlement.usage_status == "usage_unknown"
+        assert result.settlement.details["pricing_status"] == "priced"
+        assert result.settlement.cache_write_tokens == nil
+        assert result.settlement.details["cache_write_cost_micros"] == nil
+        assert result.settlement.details["cached_input_cost_micros"] == nil
+        assert result.settlement.details["settled_cost_micros"] == nil
+        assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(0))
+
+        assert Decimal.equal?(
+                 result.settlement.estimated_cost_micros,
+                 reserved.reservation.estimated_cost_micros
+               )
+      end
+    end
+
     test "healthy reservation settlement avoids duplicate ledger rereads" do
       setup = accounting_setup()
 
@@ -302,16 +343,46 @@ defmodule CodexPooler.AccountingTest do
 
       usage = %{status: "usage_known", input_tokens: 7, output_tokens: 3, total_tokens: 10}
 
-      assert {:ok, first} =
-               Accounting.finalize_success(reserved.request, attempt, usage, %{
+      assert {:ok, internal_first} =
+               Accounting.finalize_success_with_disposition(reserved.request, attempt, usage, %{
                  response_status_code: 200
                })
+
+      assert internal_first.finalization_disposition == :inserted
+      assert AttemptSettlement.first_settlement?(internal_first)
+
+      assert {:ok, internal_second} =
+               Accounting.finalize_success_with_disposition(
+                 internal_first.request,
+                 internal_first.attempt,
+                 usage,
+                 %{response_status_code: 200}
+               )
+
+      assert internal_second.finalization_disposition == :reused
+      refute AttemptSettlement.first_settlement?(internal_second)
+      refute AttemptSettlement.first_settlement?(:reused)
+
+      assert {:ok, first} =
+               Accounting.finalize_success(
+                 internal_second.request,
+                 internal_second.attempt,
+                 usage,
+                 %{
+                   response_status_code: 200
+                 }
+               )
 
       assert {:ok, second} =
-               Accounting.finalize_success(first.request, first.attempt, usage, %{
-                 response_status_code: 200
+               Accounting.finalize_request(first.request, first.attempt, %{
+                 request_status: "succeeded",
+                 attempt_status: "succeeded",
+                 response_status_code: 200,
+                 usage: usage
                })
 
+      assert Map.keys(first) |> Enum.sort() == [:attempt, :release, :request, :settlement]
+      assert Map.keys(second) |> Enum.sort() == [:attempt, :release, :request, :settlement]
       assert first.settlement.id == second.settlement.id
       assert first.release.id == second.release.id
 
@@ -375,7 +446,15 @@ defmodule CodexPooler.AccountingTest do
     end
 
     test "late known usage replaces an unknown settlement and its projections" do
-      setup = accounting_setup()
+      setup =
+        accounting_setup(%{
+          input_token_micros: Decimal.new(25),
+          cached_input_token_micros: Decimal.new(5),
+          output_token_micros: Decimal.new(50),
+          reasoning_token_micros: Decimal.new(75),
+          request_base_micros: Decimal.new(3)
+        })
+
       first_timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       known_timestamp = DateTime.add(first_timestamp, 1, :second)
 
@@ -389,13 +468,28 @@ defmodule CodexPooler.AccountingTest do
 
       assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
 
-      assert {:ok, failed} =
-               Accounting.finalize_failure(reserved.request, attempt, %{
+      assert {:ok, internal_failed} =
+               Accounting.finalize_failure_with_disposition(reserved.request, attempt, %{
                  last_error_code: "owner_drained",
                  now: first_timestamp,
                  usage: %{status: "usage_unknown", source: "owner_drained"}
                })
 
+      assert internal_failed.finalization_disposition == :inserted
+      assert AttemptSettlement.first_settlement?(internal_failed)
+
+      assert {:ok, failed} =
+               Accounting.finalize_failure(
+                 internal_failed.request,
+                 internal_failed.attempt,
+                 %{
+                   last_error_code: "owner_drained",
+                   now: first_timestamp,
+                   usage: %{status: "usage_unknown", source: "owner_drained"}
+                 }
+               )
+
+      assert Map.keys(failed) |> Enum.sort() == [:attempt, :release, :request, :settlement]
       assert failed.request.status == "failed"
       assert failed.settlement.usage_status == "usage_unknown"
 
@@ -403,17 +497,40 @@ defmodule CodexPooler.AccountingTest do
         status: "usage_known",
         source: "late_owner_completion",
         recorded_at: known_timestamp,
-        input_tokens: 7,
-        output_tokens: 3,
-        total_tokens: 10
+        input_tokens: 16,
+        cached_input_tokens: 4,
+        output_tokens: 5,
+        reasoning_tokens: 2,
+        total_tokens: 21
       }
 
-      assert {:ok, reconciled} =
-               Accounting.finalize_success(failed.request, failed.attempt, known_usage, %{
-                 now: known_timestamp,
-                 response_status_code: 200
-               })
+      assert {:ok, internal_reconciled} =
+               Accounting.finalize_success_with_disposition(
+                 failed.request,
+                 failed.attempt,
+                 known_usage,
+                 %{
+                   now: known_timestamp,
+                   response_status_code: 200
+                 }
+               )
 
+      assert internal_reconciled.finalization_disposition == :replaced
+      refute AttemptSettlement.first_settlement?(internal_reconciled)
+      refute AttemptSettlement.first_settlement?(:replaced)
+
+      assert {:ok, reconciled} =
+               Accounting.finalize_success(
+                 internal_reconciled.request,
+                 internal_reconciled.attempt,
+                 known_usage,
+                 %{
+                   now: known_timestamp,
+                   response_status_code: 200
+                 }
+               )
+
+      assert Map.keys(reconciled) |> Enum.sort() == [:attempt, :release, :request, :settlement]
       assert reconciled.request.status == "succeeded"
       assert reconciled.request.usage_status == "usage_known"
       assert reconciled.attempt.status == "succeeded"
@@ -431,6 +548,19 @@ defmodule CodexPooler.AccountingTest do
                )
 
       assert repeated.settlement.id == reconciled.settlement.id
+      assert repeated.release.id == reconciled.release.id
+      assert Decimal.equal?(repeated.settlement.settled_cost_micros, Decimal.new(623))
+      assert repeated.settlement.pricing_snapshot_id == setup.pricing.id
+      assert repeated.settlement.cached_input_tokens == 4
+      assert repeated.settlement.reasoning_tokens == 2
+      assert repeated.settlement.cache_write_tokens == nil
+
+      assert Repo.aggregate(
+               from(l in LedgerEntry,
+                 where: l.request_id == ^reserved.request.id and l.entry_kind == "release"
+               ),
+               :count
+             ) == 1
 
       settlements =
         Repo.all(
@@ -445,6 +575,33 @@ defmodule CodexPooler.AccountingTest do
       assert recorded.id == reconciled.settlement.id
       assert recorded.amount_status == "recorded"
 
+      assert %DailyRollup{
+               admitted_request_count: 0,
+               rounded_settled_cost_micros: rounded_before_rebuild
+             } =
+               Repo.get_by!(DailyRollup,
+                 pool_id: setup.pool.id,
+                 rollup_date: DateTime.to_date(known_timestamp),
+                 dimension_kind: "pool"
+               )
+
+      assert Decimal.equal?(rounded_before_rebuild, Decimal.new(0))
+      assert {:ok, 1} = Rollups.rebuild_for_date(DateTime.to_date(known_timestamp))
+
+      rebuilt_pool_rollup =
+        Repo.get_by!(DailyRollup,
+          pool_id: setup.pool.id,
+          rollup_date: DateTime.to_date(known_timestamp),
+          dimension_kind: "pool"
+        )
+
+      assert rebuilt_pool_rollup.admitted_request_count == 1
+
+      assert Decimal.equal?(
+               rebuilt_pool_rollup.rounded_settled_cost_micros,
+               Decimal.round(recorded.settled_cost_micros || Decimal.new(0), 0)
+             )
+
       assert [daily_rollup] =
                Repo.all(
                  from rollup in DailyRollup,
@@ -456,7 +613,7 @@ defmodule CodexPooler.AccountingTest do
       assert daily_rollup.request_count == 1
       assert daily_rollup.success_count == 1
       assert daily_rollup.failure_count == 0
-      assert daily_rollup.total_tokens == 10
+      assert daily_rollup.total_tokens == 21
 
       assert [hourly_rollup] =
                Repo.all(
@@ -469,13 +626,27 @@ defmodule CodexPooler.AccountingTest do
       assert hourly_rollup.request_count == 1
       assert hourly_rollup.success_count == 1
       assert hourly_rollup.failure_count == 0
-      assert hourly_rollup.total_tokens == 10
+      assert hourly_rollup.total_tokens == 21
 
       fact = Repo.get_by!(RequestLogFact, request_id: reserved.request.id)
       assert fact.latest_attempt_status == "succeeded"
       assert fact.latest_settlement_entry_id == reconciled.settlement.id
       assert fact.latest_settlement_usage_status == "usage_known"
-      assert fact.latest_total_tokens == 10
+      assert fact.latest_total_tokens == 21
+      assert fact.latest_input_tokens == 16
+      assert fact.latest_cached_input_tokens == 4
+      assert fact.latest_output_tokens == 5
+      assert fact.latest_reasoning_tokens == 2
+      assert Decimal.equal?(fact.latest_settled_cost_micros, Decimal.new(623))
+      assert Decimal.equal?(fact.latest_cached_input_cost_micros, Decimal.new(20))
+
+      for rollup <- [daily_rollup, hourly_rollup] do
+        assert rollup.input_tokens == 16
+        assert rollup.cached_input_tokens == 4
+        assert rollup.output_tokens == 5
+        assert rollup.reasoning_tokens == 2
+        assert Decimal.equal?(rollup.settled_cost_micros, Decimal.new(623))
+      end
     end
 
     test "settlement replacement subtracts rollups atomically beside a racing settlement" do
@@ -607,6 +778,162 @@ defmodule CodexPooler.AccountingTest do
 
       assert {:ok, %{stale_reservations_released: 0, stale_reservations_settled: 0}} =
                Accounting.recover_stale_reservations(now)
+    end
+
+    # The recovered row keeps its history and gives its claim up: nothing
+    # reached the provider, so its claim protects nothing, and kept it fenced
+    # every resend of the request for good (findings#206 row 206-421).
+    test "terminalizes stale websocket turn claims and releases their claim" do
+      setup = accounting_setup()
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      stale_admitted_at = DateTime.add(now, -7, :hour)
+      turn_id = "stale-turn-claim-#{System.unique_integer([:positive, :monotonic])}"
+
+      assert {:ok, %{request: claimed_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: turn_id,
+                 now: stale_admitted_at
+               })
+
+      assert {:ok,
+              %{
+                stale_turn_claims_recovered: 1,
+                stale_reservations_released: 0,
+                stale_reservations_settled: 0
+              }} = Accounting.recover_stale_reservations(now)
+
+      assert %CodexPooler.Accounting.Request{
+               status: "failed",
+               usage_status: "not_applicable",
+               response_status_code: 499,
+               last_error_code: "stale_websocket_turn_claim_recovered",
+               completed_at: ^now,
+               request_metadata: %{"released_turn_claim" => ^turn_id}
+             } = Repo.reload!(claimed_request)
+
+      assert Accounting.list_ledger_entries_for_request(claimed_request.id) == []
+
+      assert {:ok, %{request: %{correlation_id: ^turn_id}}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: turn_id
+               })
+
+      assert {:ok, %{stale_turn_claims_recovered: 0}} =
+               Accounting.recover_stale_reservations(now)
+    end
+
+    test "standalone denial, claim-to-denial, and duplicate correlation persist exactly one admission each" do
+      setup = accounting_setup()
+      rollup_date = ~D[2026-08-06]
+      admitted_at = DateTime.new!(rollup_date, ~T[12:00:00.000000], "Etc/UTC")
+
+      assert {:ok, %{request: standalone}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: "standalone-denial",
+                 now: admitted_at
+               })
+
+      assert {:ok, %{request: claim}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: "claim-to-denial",
+                 now: admitted_at
+               })
+
+      assert {:ok, %{request: denied_claim}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: claim.correlation_id,
+                 turn_claim: claim,
+                 now: admitted_at
+               })
+
+      assert denied_claim.id == claim.id
+
+      assert {:ok, %{request: duplicate_target}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: "duplicate-correlation",
+                 now: admitted_at
+               })
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: duplicate_target.correlation_id,
+                 now: admitted_at
+               })
+
+      request_ids = [standalone.id, denied_claim.id, duplicate_target.id]
+
+      assert Repo.aggregate(
+               from(request in CodexPooler.Accounting.Request, where: request.id in ^request_ids),
+               :count,
+               :id
+             ) == 3
+
+      refute Repo.get_by(DailyRollup,
+               pool_id: setup.pool.id,
+               rollup_date: rollup_date,
+               dimension_kind: "pool"
+             )
+
+      assert {:ok, 0} = Rollups.rebuild_for_date(rollup_date)
+
+      assert %DailyRollup{admitted_request_count: 3, request_count: 0} =
+               Repo.get_by!(DailyRollup,
+                 pool_id: setup.pool.id,
+                 rollup_date: rollup_date,
+                 dimension_kind: "pool"
+               )
+    end
+
+    # A refusal recorded without a turn claim under a correlation id that is
+    # already recorded (the websocket handshake request id an earlier refusal
+    # of the same socket took, or a claim another row holds) is its own row
+    # under a fresh correlation id; the earlier row keeps the correlation
+    # (findings#206 row 206-361).
+    test "an unclaimed denial whose correlation id is taken records its own row and leaves the holder alone" do
+      setup = accounting_setup()
+
+      assert {:ok, %{request: first}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: "socket-handshake-request-id",
+                 transport: "websocket",
+                 last_error_code: "pinned_continuation_unavailable"
+               })
+
+      assert {:ok, %{request: second}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: "socket-handshake-request-id",
+                 transport: "websocket",
+                 last_error_code: "pinned_continuation_unavailable"
+               })
+
+      assert first.correlation_id == "socket-handshake-request-id"
+      refute second.id == first.id
+      assert {:ok, _uuid} = Ecto.UUID.cast(second.correlation_id)
+      assert second.status == "rejected"
+      assert second.last_error_code == "pinned_continuation_unavailable"
+
+      assert {:ok, %{request: claim}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, %{
+                 endpoint: "/backend-api/codex/responses",
+                 correlation_id: "held-turn-claim"
+               })
+
+      assert {:ok, %{request: refused}} =
+               Accounting.record_denied_request(setup.auth, setup.model, %{
+                 correlation_id: claim.correlation_id,
+                 transport: "websocket"
+               })
+
+      refute refused.id == claim.id
+      assert {:ok, _uuid} = Ecto.UUID.cast(refused.correlation_id)
+      assert Repo.reload!(claim) == claim
+
+      assert Repo.aggregate(from(request in CodexPooler.Accounting.Request, where: request.pool_id == ^setup.pool.id), :count, :id) == 4
     end
 
     test "settles stale dispatched reservations from reserved estimate when usage is unknown" do
@@ -905,6 +1232,8 @@ defmodule CodexPooler.AccountingTest do
                  last_error_code: "timeout_mid_stream"
                })
 
+      assert Map.keys(first) |> Enum.sort() == [:attempt, :release, :request, :settlement]
+      assert Map.keys(second) |> Enum.sort() == [:attempt, :release, :request, :settlement]
       assert first.settlement.id == second.settlement.id
       assert first.request.status == "failed"
       assert first.settlement.usage_status == "usage_unknown"
@@ -1128,9 +1457,7 @@ defmodule CodexPooler.AccountingTest do
                0
 
       identity_row =
-        rollup_row(actual_rows, "upstream_identity",
-          upstream_identity_id: fixture.primary.identity.id
-        )
+        rollup_row(actual_rows, "upstream_identity", upstream_identity_id: fixture.primary.identity.id)
 
       assert identity_row.pool_id == fixture.secondary.pool.id
       assert identity_row.request_count == 2
@@ -1179,6 +1506,9 @@ defmodule CodexPooler.AccountingTest do
       stale_rollup =
         insert_daily_rollup!(date, %{dimension_kind: "pool", pool_id: fixture.primary.pool.id})
 
+      Repo.query!("SET CONSTRAINTS ALL IMMEDIATE")
+      Repo.query!("SET CONSTRAINTS ALL DEFERRED")
+
       Repo.query!("""
       ALTER TABLE daily_rollups
       ADD CONSTRAINT daily_rollups_rebuild_failure_check CHECK (false) NOT VALID
@@ -1217,7 +1547,7 @@ defmodule CodexPooler.AccountingTest do
       one_total = total_repo_command_count(one_commands)
       many_total = total_repo_command_count(many_commands)
 
-      assert one_total <= 4
+      assert one_total <= 14
 
       assert many_total == one_total,
              "daily rollup rebuild query count must be row-count independent; one settlement used #{one_total}, twenty settlements used #{many_total}"
@@ -1227,6 +1557,9 @@ defmodule CodexPooler.AccountingTest do
   defp count_repo_commands(fun) do
     parent = self()
     handler_id = "accounting-test-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

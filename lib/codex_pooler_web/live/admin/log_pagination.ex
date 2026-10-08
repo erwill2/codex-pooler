@@ -43,6 +43,7 @@ defmodule CodexPoolerWeb.Admin.LogPagination do
         <p data-role="pagination-status" class="text-base-content/60">
           Page {@current_page} of {@total_pages}
         </p>
+
         <p
           id={@range_id}
           data-role={@range_role}
@@ -50,6 +51,7 @@ defmodule CodexPoolerWeb.Admin.LogPagination do
         >
           {@range}
         </p>
+
         <div class="join">
           <.pagination_link
             id={"#{@id_prefix}-prev"}
@@ -85,6 +87,7 @@ defmodule CodexPoolerWeb.Admin.LogPagination do
     >
       {@label}
     </.link>
+
     <span
       :if={!@enabled}
       id={@id}
@@ -109,6 +112,10 @@ defmodule CodexPoolerWeb.Admin.LogPagination do
   def offset(page, page_size) when page > 0 and page_size > 0, do: (page - 1) * page_size
 
   @spec clamp_page(pos_integer(), page_projection()) :: pos_integer()
+  @spec last_page(page_projection()) :: pos_integer()
+  def last_page(%{total: total, limit: limit}) when is_integer(total) and total >= 0 and is_integer(limit) and limit > 0,
+    do: total_pages(total, limit)
+
   def clamp_page(page, %{total: total, limit: limit})
       when is_integer(page) and page > 0 and is_integer(total) and total >= 0 and
              is_integer(limit) and limit > 0 do

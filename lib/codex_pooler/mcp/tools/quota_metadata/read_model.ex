@@ -8,6 +8,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @default_limit 50
@@ -47,6 +48,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
   @source_precisions ~w(authoritative observed inferred unknown)
 
   @type list_opts :: keyword() | map()
+  @type capacity_decision :: %{capacity_basis: CodexPooler.Upstreams.Quota.CapacityAssessment.capacity_basis(), qualification: :established | :provider_attested | :supported | :unverified | :legacy_attested | :not_applicable, routing_usable: boolean(), reason_codes: [String.t()], scope: String.t()}
 
   @spec list_accounts(term(), list_opts()) :: map()
   def list_accounts(scope, opts \\ [])
@@ -59,10 +61,16 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
 
     visible_pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
 
+    identities = Upstreams.list_visible_upstream_identities(scope)
+
+    snapshots =
+      identities
+      |> Enum.map(& &1.id)
+      |> RoutingQuotaSnapshot.load_by_identity_ids(timestamp)
+
     accounts =
-      scope
-      |> Upstreams.list_visible_upstream_identities()
-      |> Enum.map(&account_summary(&1, timestamp, visible_pool_ids))
+      identities
+      |> Enum.map(&account_summary(&1, timestamp, visible_pool_ids, snapshots))
       |> Enum.sort_by(&account_sort_key/1)
 
     %{
@@ -87,19 +95,28 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
   end
 
   defp account_summary(%UpstreamIdentity{} = identity, timestamp, visible_pool_ids) do
+    snapshots = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], timestamp)
+    account_summary(identity, timestamp, visible_pool_ids, snapshots)
+  end
+
+  defp account_summary(%UpstreamIdentity{} = identity, timestamp, visible_pool_ids, snapshots) do
     # the effective window view must be computed at the same timestamp the
     # serialization and usability checks below use: a historical `at` must
     # neither see future evidence nor select rows that only became effective
     # after that instant
+    snapshot = Map.fetch!(snapshots, identity.id)
+
     all_windows =
-      identity
-      |> Quota.Windows.list_quota_windows(timestamp)
+      snapshot
+      |> RoutingQuotaSnapshot.effective_windows()
       |> Enum.map(&quota_window(&1, timestamp))
       |> Enum.sort_by(&window_sort_key/1)
 
     returned_windows = Enum.take(all_windows, @max_windows_per_account)
 
     %{
+      allow_provider_credits: snapshot.allow_provider_credits,
+      capacity_decision: PrivacyMatrix.project!(:upstream_quotas, %{capacity_decision: capacity_decision(snapshot)}).capacity_decision,
       id: identity.id,
       label: safe_label(identity.account_label),
       stored_account_id: present_string(identity.chatgpt_account_id),
@@ -108,7 +125,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
       status: identity.status,
       plan_family: present_string(identity.plan_family),
       assignment_summary: assignment_summary(identity, visible_pool_ids),
-      quota_summary: quota_summary(all_windows),
+      quota_summary: quota_summary(snapshot, all_windows),
       quota_windows: returned_windows
     }
   end
@@ -128,7 +145,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
       upstream_model: sanitized_string(window.upstream_model),
       window_minutes: integer_or_nil(window.window_minutes),
       active_limit: integer_or_nil(window.active_limit),
-      remaining_value: integer_or_nil(window.credits),
+      remaining_value: remaining_value(window),
       credits: integer_or_nil(window.credits),
       used_percent: rounded_percent(window.used_percent),
       reset_at: timestamp(window.reset_at),
@@ -168,25 +185,26 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
     }
   end
 
-  defp quota_summary([]) do
-    %{
-      window_count: 0,
-      truncated: false,
-      freshness_status: @freshness_unknown,
-      routing_usable: false,
-      has_unknown: true,
-      has_stale: false
-    }
+  @spec capacity_decision(RoutingQuotaSnapshot.t()) :: capacity_decision()
+  def capacity_decision(snapshot) do
+    decision = Upstreams.provider_credits_decision(snapshot, %{account_only: true})
+    %{capacity_basis: decision.capacity_basis, qualification: decision.qualification.status, routing_usable: decision.eligible?, reason_codes: decision.reason_codes, scope: "account"}
   end
 
-  defp quota_summary(windows) do
-    has_stale = Enum.any?(windows, &(&1.freshness_status == @freshness_stale))
-    has_unknown = Enum.any?(windows, &(&1.freshness_status == @freshness_unknown))
+  defp quota_summary(snapshot, windows) do
+    decision = Upstreams.provider_credits_decision(snapshot, %{account_only: true})
+    eligibility = decision.eligibility
+
+    account_windows = Enum.filter(windows, &(&1.quota_scope == "account"))
+    has_stale = Enum.any?(account_windows, &(&1.freshness_status == @freshness_stale))
+    has_unknown = Enum.any?(account_windows, &(&1.freshness_status == @freshness_unknown))
 
     freshness_status =
       cond do
         has_stale -> @freshness_stale
         has_unknown -> @freshness_unknown
+        eligibility.routing_state == :windowless_provider_available -> @freshness_fresh
+        account_windows == [] -> @freshness_unknown
         true -> @freshness_fresh
       end
 
@@ -194,8 +212,8 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
       window_count: length(windows),
       truncated: length(windows) > @max_windows_per_account,
       freshness_status: freshness_status,
-      routing_usable: Enum.any?(windows, & &1.routing_usable),
-      has_unknown: has_unknown,
+      routing_usable: decision.eligible?,
+      has_unknown: has_unknown or (account_windows == [] and not decision.eligible?),
       has_stale: has_stale
     }
   end
@@ -309,6 +327,33 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
 
   defp integer_or_nil(value) when is_integer(value), do: value
   defp integer_or_nil(_value), do: nil
+
+  # This is intentionally narrower in purpose than the admin credit-meter
+  # predicate: MCP suppresses a remaining claim only when a below-full percent
+  # conflicts with credits that have no positive capacity; the UI's meter
+  # presentation remains independent.
+  defp remaining_value(%Quota.AccountQuotaWindow{} = window) do
+    if non_remainder_credit_balance?(window), do: nil, else: integer_or_nil(window.credits)
+  end
+
+  defp non_remainder_credit_balance?(%Quota.AccountQuotaWindow{
+         credits: credits,
+         active_limit: active_limit,
+         used_percent: used_percent
+       })
+       when is_integer(credits) and (is_nil(active_limit) or active_limit <= 0) do
+    used_percent_below_full?(used_percent)
+  end
+
+  defp non_remainder_credit_balance?(_window), do: false
+
+  defp used_percent_below_full?(%Decimal{} = used_percent),
+    do: Decimal.compare(used_percent, Decimal.new(100)) == :lt
+
+  defp used_percent_below_full?(used_percent) when is_number(used_percent),
+    do: used_percent < 100
+
+  defp used_percent_below_full?(_used_percent), do: false
 
   defp rounded_percent(nil), do: nil
 

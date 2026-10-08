@@ -1,0 +1,351 @@
+defmodule CodexPooler.Dev.MCPFixtureTest do
+  use CodexPooler.DataCase, async: false
+
+  import CodexPooler.AccountsFixtures
+
+  alias CodexPooler.Accounts.{PlatformBootstrapState, User}
+  alias CodexPooler.Dev.MCPFixture
+  alias CodexPooler.InstanceSettings
+  alias CodexPooler.MCP
+  alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings}
+  alias CodexPooler.Pools.Membership
+  alias CodexPooler.Repo
+  alias Mix.Tasks.Dev.McpFixture, as: MCPFixtureTask
+
+  setup do
+    Repo.delete_all(OperatorMCPKey)
+    Repo.delete_all(OperatorMCPSettings)
+    Repo.delete_all(CodexPooler.InstanceSettings.Settings)
+    InstanceSettings.reset_cache_for_test()
+
+    on_exit(fn ->
+      InstanceSettings.reset_cache_for_test()
+    end)
+
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner = owner |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+    settings = InstanceSettings.ensure_singleton!()
+
+    {:ok, _settings} =
+      InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => false}})
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "codex-pooler-mcp-fixture-#{System.unique_integer([:positive])}"
+      )
+
+    path = Path.join(root, "setup.json")
+
+    on_exit(fn -> File.rm_rf(root) end)
+
+    %{owner: owner, path: path, options: fixture_options(path)}
+  end
+
+  test "reference-counted acquire enables gates and final release restores exact absence", %{
+    owner: owner,
+    path: path,
+    options: options
+  } do
+    assert {:ok, %{status: "ready", leases: 1}} = MCPFixture.acquire(options)
+    assert {:ok, receipt} = path |> File.read!() |> CodexPooler.JSON.decode()
+    raw_token = receipt["mcp_token"]
+    token_id = receipt["token_id"]
+
+    assert is_binary(raw_token)
+    assert %File.Stat{mode: receipt_mode} = File.stat!(path)
+    assert Bitwise.band(receipt_mode, 0o777) == 0o600
+    assert %File.Stat{mode: root_mode} = File.stat!(Path.dirname(path))
+    assert Bitwise.band(root_mode, 0o777) == 0o700
+    assert %OperatorMCPKey{operator_id: operator_id} = Repo.get(OperatorMCPKey, token_id)
+    assert operator_id == owner.id
+    assert %OperatorMCPSettings{enabled: true} = Repo.get(OperatorMCPSettings, owner.id)
+    assert InstanceSettings.current().mcp.enabled
+    assert {:ok, %{operator: %{id: operator_id}}} = MCP.authenticate_token(raw_token)
+    assert operator_id == owner.id
+
+    assert {:ok, %{status: "ready", leases: 2}} = MCPFixture.acquire(options)
+    assert Repo.aggregate(OperatorMCPKey, :count) == 1
+
+    assert {:ok, %{status: "ready", leases: 1}} = MCPFixture.release(options)
+    assert {:ok, _auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, %{status: "released", leases: 0}} = MCPFixture.release(options)
+    refute File.exists?(path)
+    refute Repo.get(OperatorMCPKey, token_id)
+    refute Repo.get(OperatorMCPSettings, owner.id)
+    refute InstanceSettings.current().mcp.enabled
+    assert {:error, %{code: :mcp_service_disabled}} = MCP.authenticate_token(raw_token)
+  end
+
+  test "final release restores a pre-existing disabled operator setting", %{
+    owner: owner,
+    options: options
+  } do
+    original =
+      %OperatorMCPSettings{operator_id: owner.id}
+      |> OperatorMCPSettings.changeset(%{operator_id: owner.id, enabled: false})
+      |> Repo.insert!()
+
+    assert {:ok, %{status: "ready", leases: 1}} = MCPFixture.acquire(options)
+    assert Repo.get!(OperatorMCPSettings, owner.id).enabled
+    assert {:ok, %{status: "released", leases: 0}} = MCPFixture.release(options)
+
+    restored = Repo.get!(OperatorMCPSettings, owner.id)
+    refute restored.enabled
+    assert restored.inserted_at == original.inserted_at
+    assert restored.updated_at == original.updated_at
+  end
+
+  test "acquire binds the key and settings lifecycle to the canonical bootstrap owner", %{
+    owner: owner,
+    path: path,
+    options: options
+  } do
+    canonical_setting = insert_operator_setting!(owner, false)
+    noncanonical_owner = insert_active_owner!("canonical-binding")
+    noncanonical_setting = insert_operator_setting!(noncanonical_owner, false)
+
+    assert {:ok, %{status: "ready", leases: 1}} = MCPFixture.acquire(options)
+    receipt = path |> File.read!() |> CodexPooler.JSON.decode!()
+    raw_token = receipt["mcp_token"]
+
+    assert %OperatorMCPKey{operator_id: operator_id} =
+             Repo.get!(OperatorMCPKey, receipt["token_id"])
+
+    assert operator_id == owner.id
+    assert Repo.get!(OperatorMCPSettings, owner.id).enabled
+    assert Repo.get!(OperatorMCPSettings, noncanonical_owner.id) == noncanonical_setting
+    assert {:ok, %{operator: %{id: operator_id}}} = MCP.authenticate_token(raw_token)
+    assert operator_id == owner.id
+
+    assert {:ok, %{status: "released", leases: 0}} = MCPFixture.release(options)
+    assert Repo.get!(OperatorMCPSettings, owner.id) == canonical_setting
+    assert Repo.get!(OperatorMCPSettings, noncanonical_owner.id) == noncanonical_setting
+    refute Repo.get(OperatorMCPKey, receipt["token_id"])
+  end
+
+  test "acquire fails closed while the canonical bootstrap is pending", %{
+    owner: owner,
+    path: path,
+    options: options
+  } do
+    noncanonical_owner = insert_active_owner!("pending-fallback")
+    noncanonical_setting = insert_operator_setting!(noncanonical_owner, false)
+
+    PlatformBootstrapState
+    |> Repo.get!(true)
+    |> Ecto.Changeset.change(status: "pending", owner_user_id: nil, completed_at: nil)
+    |> Repo.update!()
+
+    assert {:error, "MCP fixture requires a completed platform bootstrap with a canonical owner"} =
+             MCPFixture.acquire(options)
+
+    refute File.exists?(path)
+    assert Repo.aggregate(OperatorMCPKey, :count) == 0
+    refute Repo.get(OperatorMCPSettings, owner.id)
+    assert Repo.get!(OperatorMCPSettings, noncanonical_owner.id) == noncanonical_setting
+    refute InstanceSettings.current().mcp.enabled
+  end
+
+  test "acquire fails closed when the canonical bootstrap state is missing", %{
+    owner: owner,
+    path: path,
+    options: options
+  } do
+    noncanonical_owner = insert_active_owner!("missing-bootstrap-fallback")
+    noncanonical_setting = insert_operator_setting!(noncanonical_owner, false)
+    Repo.delete_all(PlatformBootstrapState)
+
+    assert {:error, "MCP fixture requires a completed platform bootstrap with a canonical owner"} =
+             MCPFixture.acquire(options)
+
+    refute File.exists?(path)
+    assert Repo.aggregate(OperatorMCPKey, :count) == 0
+    refute Repo.get(OperatorMCPSettings, owner.id)
+    assert Repo.get!(OperatorMCPSettings, noncanonical_owner.id) == noncanonical_setting
+    refute InstanceSettings.current().mcp.enabled
+  end
+
+  test "acquire fails closed when the canonical owner requires a password change", %{
+    owner: owner,
+    path: path,
+    options: options
+  } do
+    owner
+    |> Ecto.Changeset.change(password_change_required: true)
+    |> Repo.update!()
+
+    noncanonical_owner = insert_active_owner!("unusable-fallback")
+    noncanonical_setting = insert_operator_setting!(noncanonical_owner, false)
+
+    assert {:error, "MCP fixture canonical bootstrap owner is not usable: expected active, undeleted, password-ready instance owner"} =
+             MCPFixture.acquire(options)
+
+    refute File.exists?(path)
+    assert Repo.aggregate(OperatorMCPKey, :count) == 0
+    refute Repo.get(OperatorMCPSettings, owner.id)
+    assert Repo.get!(OperatorMCPSettings, noncanonical_owner.id) == noncanonical_setting
+    refute InstanceSettings.current().mcp.enabled
+  end
+
+  test "status never exposes the raw token", %{path: path, options: options} do
+    assert {:ok, %{status: "absent", leases: 0}} = MCPFixture.status(options)
+    assert {:ok, status} = MCPFixture.acquire(options)
+    raw_token = path |> File.read!() |> CodexPooler.JSON.decode!() |> Map.fetch!("mcp_token")
+
+    refute inspect(status) =~ raw_token
+    refute Map.has_key?(status, :mcp_token)
+    assert {:ok, released} = MCPFixture.release(options)
+    refute inspect(released) =~ raw_token
+  end
+
+  test "refuses non-development use without the explicit test allowance", %{path: path} do
+    assert {:error, "MCP fixture runs only with MIX_ENV=dev"} =
+             MCPFixture.acquire(environment: :test, receipt_path: path)
+  end
+
+  test "allows only an explicitly authorized isolated loopback QA database in development" do
+    isolated = "codex_pooler_relqa_fixture_12345678"
+
+    assert :ok =
+             MCPFixture.validate_environment(
+               environment: :dev,
+               repo_config: [database: "codex_pooler_dev", hostname: "localhost"]
+             )
+
+    for hostname <- ["127.0.0.1", "localhost", "::1"] do
+      assert :ok =
+               MCPFixture.validate_environment(
+                 environment: :dev,
+                 allow_isolated_dev_database: true,
+                 repo_config: [database: isolated, hostname: hostname]
+               )
+    end
+
+    refused = [
+      {false, [database: isolated, hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_relqa_short", hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_relqa_upper_CASE_12345678", hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_relqa_../escape_12345678", hostname: "127.0.0.1"]},
+      {true, [database: "codex_pooler_prod", hostname: "127.0.0.1"]},
+      {true, [database: isolated, hostname: "db.example.com"]},
+      {true, [database: isolated, hostname: "10.0.0.5"]},
+      {true, [database: isolated]},
+      {true, [database: isolated, hostname: "127.0.0.1", url: "ecto://user:pass@db.example.com/#{isolated}"]},
+      {true, [database: isolated, hostname: "127.0.0.1", socket_dir: "/var/run/postgresql"]}
+    ]
+
+    for {allow?, repo_config} <- refused do
+      assert {:error, "MCP fixture requires database codex_pooler_dev"} =
+               MCPFixture.validate_environment(environment: :dev, allow_isolated_dev_database: allow?, repo_config: repo_config)
+    end
+
+    assert {:error, "MCP fixture runs only with MIX_ENV=dev"} =
+             MCPFixture.validate_environment(
+               environment: :test,
+               allow_isolated_dev_database: true,
+               repo_config: [database: isolated, hostname: "127.0.0.1"]
+             )
+  end
+
+  test "an isolated database scopes the receipt so a development lease is never reused" do
+    isolated = "codex_pooler_relqa_fixture_#{System.unique_integer([:positive])}_abcdefgh"
+    options = [environment: :dev, allow_isolated_dev_database: true, repo_config: [database: isolated, hostname: "127.0.0.1"]]
+    scoped_root = Path.join([File.cwd!(), "tmp", "mcp-fixture", isolated])
+    on_exit(fn -> File.rm_rf(scoped_root) end)
+
+    assert {:ok, %{status: "absent", leases: 0, receipt_path: scoped}} = MCPFixture.status(options)
+    assert scoped == Path.join(scoped_root, "setup.json")
+    refute scoped == MCPFixture.receipt_path()
+    refute File.exists?(scoped_root)
+
+    assert {:ok, %{receipt_path: default}} = MCPFixture.status(environment: :dev, repo_config: [database: "codex_pooler_dev", hostname: "localhost"])
+    assert default == MCPFixture.receipt_path()
+
+    assert {:error, "MCP fixture requires database codex_pooler_dev"} =
+             MCPFixture.status(Keyword.put(options, :repo_config, database: isolated, hostname: "db.example.com"))
+  end
+
+  test "default absence is scoped to its receipt and cannot release another target", context do
+    root = Path.dirname(context.path)
+    File.mkdir_p!(root)
+    target = "codex_pooler_replica_test"
+    options = [environment: :dev, target_database: target, repo_config: [database: target, hostname: "localhost"]]
+
+    File.cd!(root, fn ->
+      assert {:ok, %{status: "ready", receipt_path: scoped}} = MCPFixture.acquire(options)
+      assert String.ends_with?(scoped, "/target-#{target}/setup.json")
+      assert {:ok, %{status: "absent", receipt_path: default, other_receipts: [^scoped]}} = MCPFixture.status()
+      assert default != scoped
+      assert {:ok, %{status: "absent", receipt_path: ^default, other_receipts: [^scoped]}} = MCPFixture.release(environment: :dev, repo_config: [database: "codex_pooler_dev"])
+      assert {:ok, %{status: "ready", leases: 1, receipt_path: ^scoped}} = MCPFixture.status(options)
+      assert InstanceSettings.current().mcp.enabled
+      assert {:ok, %{status: "released", receipt_path: ^scoped}} = MCPFixture.release(options)
+      refute InstanceSettings.current().mcp.enabled
+      assert Repo.aggregate(OperatorMCPKey, :count) == 0
+    end)
+  end
+
+  test "the Mix task accepts the isolated database flag and still applies the environment guard" do
+    assert_raise Mix.Error, "MCP fixture runs only with MIX_ENV=dev", fn ->
+      MCPFixtureTask.run(["status", "--allow-isolated-dev-database"])
+    end
+
+    assert_raise Mix.Error, ~r/use acquire, release, or status/, fn ->
+      MCPFixtureTask.run(["status", "--allow-isolated-dev-database", "extra"])
+    end
+  end
+
+  # The fixture VM boots the application only to write its lease; it must not
+  # also start Oban queues, plugins or the stager against the database it
+  # leases (232-24). `status` never boots the application.
+  test "the Mix task disables background jobs before it boots the application for acquire and release" do
+    CodexPooler.TestAppEnv.restore_on_exit(Oban)
+
+    for action <- ["acquire", "release"] do
+      enabled = Keyword.merge(Application.fetch_env!(:codex_pooler, Oban), queues: [default: 1], plugins: [Oban.Pruner], stager: [interval: 1_000])
+      Application.put_env(:codex_pooler, Oban, enabled)
+
+      assert_raise Mix.Error, "MCP fixture runs only with MIX_ENV=dev", fn -> MCPFixtureTask.run([action]) end
+
+      config = Application.fetch_env!(:codex_pooler, Oban)
+      assert {config[:queues], config[:plugins], config[:stager]} == {false, false, false}, action
+    end
+
+    enabled = Keyword.merge(Application.fetch_env!(:codex_pooler, Oban), queues: [default: 1], plugins: [Oban.Pruner], stager: [interval: 1_000])
+    Application.put_env(:codex_pooler, Oban, enabled)
+
+    assert_raise Mix.Error, "MCP fixture runs only with MIX_ENV=dev", fn -> MCPFixtureTask.run(["status", "--allow-isolated-dev-database"]) end
+    assert Application.fetch_env!(:codex_pooler, Oban) == enabled
+  end
+
+  defp fixture_options(path) do
+    [environment: :test, allow_test_database: true, receipt_path: path]
+  end
+
+  defp insert_active_owner!(label) do
+    email = "000-#{label}-#{System.unique_integer([:positive])}@example.com"
+
+    user =
+      %User{}
+      |> User.bootstrap_changeset(valid_bootstrap_attributes(%{"email" => email}))
+      |> Repo.insert!()
+
+    %Membership{}
+    |> Membership.changeset(%{
+      user_id: user.id,
+      role: "instance_owner",
+      status: "active"
+    })
+    |> Repo.insert!()
+
+    user
+  end
+
+  defp insert_operator_setting!(operator, enabled) do
+    %OperatorMCPSettings{operator_id: operator.id}
+    |> OperatorMCPSettings.changeset(%{operator_id: operator.id, enabled: enabled})
+    |> Repo.insert!()
+  end
+end

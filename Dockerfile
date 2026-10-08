@@ -1,7 +1,7 @@
 ARG DEBIAN_MIRROR=
 ARG DEBIAN_SECURITY_MIRROR=
 
-FROM node:26.5.0-slim AS assets_deps
+FROM node:26.10.0-slim AS assets_deps
 
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 
@@ -10,7 +10,7 @@ WORKDIR /app
 COPY assets/package.json assets/package-lock.json ./assets/
 RUN npm ci --prefix assets
 
-FROM elixir:1.20.1-otp-28-slim AS builder
+FROM elixir:1.20.4-otp-29-slim AS builder
 
 ARG DEBIAN_MIRROR
 ARG DEBIAN_SECURITY_MIRROR
@@ -46,13 +46,19 @@ RUN mix local.hex --force && mix local.rebar --force
 COPY mix.exs mix.lock ./
 COPY config config
 RUN mix deps.get --only prod && mix deps.compile
+RUN for attempt in 1 2 3; do \
+    mix tailwind.install && exit 0; \
+    if [ "${attempt}" -eq 3 ]; then exit 1; fi; \
+    sleep "$((attempt * 2))"; \
+  done
 
 COPY --from=assets_deps /app/assets/node_modules ./assets/node_modules
 COPY assets assets
 COPY lib lib
 COPY priv priv
 
-RUN mix compile \
+RUN mix compile --warnings-as-errors \
+  && mix quality.xref \
   && mix assets.deploy \
   && mix release
 
@@ -86,7 +92,7 @@ RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do
     fi; \
   done \
   && apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates libncurses6 libstdc++6 openssl tzdata \
+  && apt-get install -y --no-install-recommends ca-certificates libncurses6 libsctp1 libstdc++6 openssl tzdata \
   && rm -rf /var/lib/apt/lists/* \
   && groupadd --system codex_pooler \
   && useradd --system --gid codex_pooler --home-dir /app --shell /usr/sbin/nologin codex_pooler

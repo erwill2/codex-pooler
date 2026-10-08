@@ -1,0 +1,577 @@
+defmodule CodexPooler.Gateway.Routing.BridgeRingLockingTest do
+  # Reproduces an observed production 40P01 schedule proven by the database's
+  # deadlock DETAIL and an Oban job: reconciliation-style guards take the
+  # identity row FOR UPDATE and then every assignment FOR UPDATE
+  # (CredentialFencing.lock_credential_replacement), while post-turn routing
+  # side effects insert rows whose FK checks lock the same pair through
+  # statement-implicit order. The routing writers must take the canonical
+  # identity-first reference locks so no cycle can form.
+  use CodexPooler.DataCase, async: false
+
+  alias Ecto.Adapters.SQL
+  alias Ecto.Adapters.SQL.Sandbox
+
+  alias CodexPooler.Access.APIKey
+  alias CodexPooler.Accounting.RequestLifecycle.ReferenceLocks
+  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.Persistence.{BridgeAffinity, BridgeDemotion, RoutingCircuitState}
+  alias CodexPooler.Gateway.Routing.{BridgeRing, CircuitState}
+  alias CodexPooler.Pools.Pool
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+
+  import CodexPooler.AccountingTestSupport
+  import CodexPooler.UnboxedFixture
+  import ExUnit.CaptureLog
+
+  @actor_timeout 15_000
+  @barrier_timeout 5_000
+  @observer_deadline_ms 5_000
+
+  test "completed work skips affinity after its API key is deleted without aborting finalization" do
+    fixture = committed_routing_fixture!()
+
+    run_unboxed(fn -> Repo.delete!(Repo.get!(APIKey, fixture.api_key.id)) end)
+
+    assert {:ok, :finalized} =
+             run_unboxed(fn ->
+               Repo.transaction(fn ->
+                 assert :ok =
+                          BridgeRing.record_success(
+                            fixture.plan,
+                            fixture.assignment,
+                            fixture.identity
+                          )
+
+                 assert %{rows: [[1]]} = SQL.query!(Repo, "SELECT 1", [])
+                 :finalized
+               end)
+             end)
+
+    assert pool_rows(BridgeAffinity, fixture) == []
+  end
+
+  test "affinity finalization waits for concurrent key deletion and leaves no hint" do
+    fixture = committed_routing_fixture!()
+
+    %{fencing: fencing, routing: routing} =
+      run_schedule(fixture, :key_delete, fn ->
+        BridgeRing.record_success(fixture.plan, fixture.assignment, fixture.identity)
+      end)
+
+    assert fencing == :ok
+    assert routing == :ok
+    assert pool_rows(BridgeAffinity, fixture) == []
+  end
+
+  test "record_success takes the canonical identity lock before touching the assignment" do
+    fixture = committed_routing_fixture!()
+
+    %{fencing: fencing, routing: routing, held_relations: held_relations} =
+      run_schedule(fixture, :identity_first, fn ->
+        BridgeRing.record_success(fixture.plan, fixture.assignment, fixture.identity)
+      end)
+
+    assert fencing == :ok
+    assert routing == :ok
+
+    refute "bridge_affinities" in held_relations
+    refute_assignment_locks(held_relations)
+
+    assert [%BridgeAffinity{} = affinity] = pool_rows(BridgeAffinity, fixture)
+    assert affinity.pool_upstream_assignment_id == fixture.assignment.id
+    assert affinity.upstream_identity_id == fixture.identity.id
+  end
+
+  test "record_failure takes the canonical identity lock before touching the assignment" do
+    fixture = committed_routing_fixture!()
+
+    %{fencing: fencing, routing: routing, held_relations: held_relations} =
+      run_schedule(fixture, :identity_first, fn ->
+        BridgeRing.record_failure(
+          fixture.plan,
+          fixture.assignment,
+          fixture.identity,
+          "upstream_5xx"
+        )
+      end)
+
+    assert fencing == :ok
+    assert routing == "upstream_5xx"
+
+    refute "bridge_demotions" in held_relations
+    refute_assignment_locks(held_relations)
+
+    assert [%BridgeDemotion{} = demotion] = pool_rows(BridgeDemotion, fixture)
+    assert demotion.pool_upstream_assignment_id == fixture.assignment.id
+    assert demotion.upstream_identity_id == fixture.identity.id
+  end
+
+  test "circuit first-failure insert takes the canonical identity lock first" do
+    fixture = committed_routing_fixture!()
+
+    %{fencing: fencing, routing: routing, held_relations: held_relations} =
+      run_schedule(fixture, :identity_first, fn ->
+        CircuitState.record_failure(
+          fixture.auth,
+          fixture.model,
+          fixture.assignment,
+          "proxy_stream",
+          "upstream_5xx"
+        )
+      end)
+
+    assert fencing == :ok
+    assert {:ok, %RoutingCircuitState{}} = routing
+
+    # latest_for_update legitimately read-locks the circuit table before the
+    # reference locks; the canonical contract only forbids holding any
+    # assignment lock while waiting for the identity row.
+    refute_assignment_locks(held_relations)
+
+    assert [%RoutingCircuitState{} = state] = pool_rows(RoutingCircuitState, fixture)
+    assert state.pool_upstream_assignment_id == fixture.assignment.id
+  end
+
+  @tag slow: "reproduces an inverted assignment-first PostgreSQL lock schedule"
+  test "record_success converges without raising against an inverted assignment-first holder" do
+    fixture = committed_routing_fixture!()
+
+    %{fencing: fencing, routing: routing, held_relations: _held} =
+      run_schedule(fixture, :assignment_first, fn ->
+        BridgeRing.record_success(fixture.plan, fixture.assignment, fixture.identity)
+      end)
+
+    assert routing == :ok
+    assert fencing in [:ok, {:deadlock, :deadlock_detected}]
+
+    assert [%BridgeAffinity{} = affinity] = pool_rows(BridgeAffinity, fixture)
+    assert affinity.pool_upstream_assignment_id == fixture.assignment.id
+  end
+
+  test "deadlock retry barrier waits for the assignment holder without locking the identity" do
+    fixture = committed_routing_fixture!()
+    parent = self()
+    release_ref = make_ref()
+
+    holder_task =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          identity_id = Ecto.UUID.dump!(fixture.identity.id)
+
+          Repo.transaction(fn ->
+            %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+            lock_assignments!(identity_id)
+            send(parent, {:assignment_holder_ready, release_ref, backend_pid})
+
+            receive do
+              {:assignment_holder_release, ^release_ref} -> :ok
+            after
+              @actor_timeout -> raise "assignment holder release timed out"
+            end
+
+            lock_identity!(identity_id)
+            :ok
+          end)
+        end)
+      end)
+
+    waiter_holder = {__MODULE__, make_ref()}
+
+    try do
+      assert_receive {:assignment_holder_ready, ^release_ref, holder_backend_pid},
+                     @barrier_timeout
+
+      waiter_ref = make_ref()
+
+      waiter_task =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.checkout(fn ->
+              %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+              send(parent, {:assignment_waiter_ready, waiter_ref, backend_pid})
+              ReferenceLocks.await_assignment_lock_release(fixture.assignment.id)
+            end)
+          end)
+        end)
+
+      Process.put(waiter_holder, waiter_task)
+
+      assert_receive {:assignment_waiter_ready, ^waiter_ref, waiter_backend_pid}, @barrier_timeout
+
+      held_relations = await_lock_waiter!(waiter_backend_pid, holder_backend_pid)
+      refute "upstream_identities" in held_relations
+
+      send(holder_task.pid, {:assignment_holder_release, release_ref})
+
+      assert {:ok, :ok} = Task.await(holder_task, @actor_timeout)
+      assert :ok = Task.await(waiter_task, @actor_timeout)
+    after
+      shutdown_task(holder_task)
+      shutdown_task(Process.delete(waiter_holder))
+    end
+  end
+
+  describe "degrade-to-skip contract for missing reference pairs" do
+    test "record_success skips with a logged warning and no affinity row" do
+      {plan, assignment, identity} = missing_reference_pair()
+
+      log =
+        capture_log(fn ->
+          assert BridgeRing.record_success(plan, assignment, identity) == :ok
+        end)
+
+      assert log =~ "routing side effect skipped"
+      assert log =~ "side_effect=affinity_upsert"
+      assert log =~ "upstream_identity_not_found"
+      assert Repo.aggregate(BridgeAffinity, :count) == 0
+    end
+
+    # findings#221: a `before_finalize` callback runs inside the finalization
+    # transaction; a skipped side effect there must not roll back the caller.
+    test "record_success skips under its own savepoint inside a caller-owned transaction" do
+      {plan, assignment, identity} = missing_reference_pair()
+
+      {result, log} =
+        with_log(fn ->
+          Repo.transaction(fn ->
+            assert BridgeRing.record_success(plan, assignment, identity) == :ok
+            # The enclosing work continues on a healthy transaction.
+            %{rows: [[1]]} = Repo.query!("SELECT 1")
+            :finalized
+          end)
+        end)
+
+      assert result == {:ok, :finalized}
+      assert log =~ "routing side effect skipped"
+      assert log =~ "upstream_identity_not_found"
+      assert Repo.aggregate(BridgeAffinity, :count) == 0
+    end
+
+    test "record_failure still returns the reason code, skips, and logs" do
+      {plan, assignment, identity} = missing_reference_pair()
+
+      log =
+        capture_log(fn ->
+          assert BridgeRing.record_failure(plan, assignment, identity, "upstream_5xx") ==
+                   "upstream_5xx"
+        end)
+
+      assert log =~ "routing side effect skipped"
+      assert log =~ "side_effect=demotion_upsert"
+      assert Repo.aggregate(BridgeDemotion, :count) == 0
+    end
+
+    test "circuit first-failure insert skips instead of failing the turn" do
+      {_plan, assignment, _identity} = missing_reference_pair()
+
+      auth = %{
+        pool: %Pool{id: Ecto.UUID.generate()},
+        api_key: %APIKey{id: Ecto.UUID.generate()}
+      }
+
+      model = %Model{id: Ecto.UUID.generate(), exposed_model_id: "missing-model"}
+
+      log =
+        capture_log(fn ->
+          assert {:ok, :skipped} =
+                   CircuitState.record_failure(
+                     auth,
+                     model,
+                     assignment,
+                     "proxy_stream",
+                     "upstream_5xx"
+                   )
+        end)
+
+      assert log =~ "routing side effect skipped"
+      assert log =~ "side_effect=circuit_failure"
+      assert Repo.aggregate(RoutingCircuitState, :count) == 0
+    end
+  end
+
+  defp missing_reference_pair do
+    identity_id = Ecto.UUID.generate()
+
+    plan = %{
+      affinity: %{
+        enabled?: true,
+        status: "miss",
+        row: nil,
+        kind: "codex_session",
+        key_hash: :crypto.hash(:sha256, "missing-reference-pair"),
+        pool_id: Ecto.UUID.generate(),
+        api_key_id: Ecto.UUID.generate(),
+        model_identifier: "missing-model"
+      }
+    }
+
+    assignment = %PoolUpstreamAssignment{
+      id: Ecto.UUID.generate(),
+      upstream_identity_id: identity_id
+    }
+
+    identity = %UpstreamIdentity{id: identity_id}
+
+    {plan, assignment, identity}
+  end
+
+  defp run_schedule(fixture, fencing_order, routing_fun) do
+    parent = self()
+    release_ref = make_ref()
+
+    fencing_task =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          fencing_transaction(fixture, fencing_order, parent, release_ref)
+        end)
+      end)
+
+    routing_task_holder = {__MODULE__, make_ref()}
+
+    try do
+      assert_receive {:fencing_first_lock_held, ^release_ref, fencing_backend_pid},
+                     @barrier_timeout
+
+      routing_ref = make_ref()
+
+      routing_task =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            # Hold one pooled connection for the whole operation so the
+            # backend pid reported here is the pid that blocks.
+            Repo.checkout(fn ->
+              %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+              send(parent, {:routing_backend, routing_ref, backend_pid})
+
+              try do
+                routing_fun.()
+              rescue
+                error in Postgrex.Error -> {:deadlock, error.postgres[:code]}
+              end
+            end)
+          end)
+        end)
+
+      Process.put(routing_task_holder, routing_task)
+
+      assert_receive {:routing_backend, ^routing_ref, routing_backend_pid}, @barrier_timeout
+
+      held_relations = await_lock_waiter!(routing_backend_pid, fencing_backend_pid)
+
+      send(fencing_task.pid, {:fencing_release, release_ref})
+
+      fencing_result = Task.await(fencing_task, @actor_timeout)
+      routing_result = Task.await(routing_task, @actor_timeout)
+
+      %{fencing: fencing_result, routing: routing_result, held_relations: held_relations}
+    after
+      shutdown_task(fencing_task)
+      shutdown_task(Process.delete(routing_task_holder))
+    end
+  end
+
+  defp shutdown_task(%Task{pid: pid} = task) when is_pid(pid) do
+    if Process.alive?(pid), do: Task.shutdown(task, :brutal_kill)
+  end
+
+  defp shutdown_task(_task), do: :ok
+
+  defp refute_assignment_locks(held_relations) do
+    refute Enum.any?(held_relations, &String.starts_with?(&1, "pool_upstream_assignments")),
+           "waiter already holds assignment locks: #{inspect(held_relations)}"
+  end
+
+  # The same statements CredentialFencing.lock_credential_replacement issues,
+  # sequenced explicitly so the second lock is requested only after the routing
+  # writer is observed waiting. :assignment_first simulates a not-yet-audited
+  # writer holding the pair in the inverted order.
+  defp fencing_transaction(fixture, :key_delete, parent, release_ref) do
+    {:ok, :ok} =
+      Repo.transaction(fn ->
+        %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+        Repo.delete!(Repo.get!(APIKey, fixture.api_key.id))
+        send(parent, {:fencing_first_lock_held, release_ref, backend_pid})
+
+        receive do
+          {:fencing_release, ^release_ref} -> :ok
+        after
+          @actor_timeout -> raise "key deletion release timed out"
+        end
+      end)
+
+    :ok
+  end
+
+  defp fencing_transaction(fixture, order, parent, release_ref) do
+    identity_id = Ecto.UUID.dump!(fixture.identity.id)
+
+    {first, second} =
+      case order do
+        :identity_first -> {&lock_identity!/1, &lock_assignments!/1}
+        :assignment_first -> {&lock_assignments!/1, &lock_identity!/1}
+      end
+
+    Repo.transaction(fn ->
+      %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+      first.(identity_id)
+      send(parent, {:fencing_first_lock_held, release_ref, backend_pid})
+
+      receive do
+        {:fencing_release, ^release_ref} -> :ok
+      after
+        @actor_timeout -> raise "fencing release timed out"
+      end
+
+      second.(identity_id)
+      :ok
+    end)
+    |> case do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error in Postgrex.Error -> {:deadlock, error.postgres[:code]}
+  end
+
+  defp lock_identity!(identity_id) do
+    SQL.query!(
+      Repo,
+      "SELECT id FROM upstream_identities WHERE id = $1 FOR UPDATE",
+      [identity_id]
+    )
+  end
+
+  defp lock_assignments!(identity_id) do
+    SQL.query!(
+      Repo,
+      "SELECT id FROM pool_upstream_assignments " <>
+        "WHERE upstream_identity_id = $1 AND status != 'deleted' ORDER BY id FOR UPDATE",
+      [identity_id]
+    )
+  end
+
+  # Postgrex can pipeline BEGIN with the first statement, leaving the blocked
+  # backend reported as `idle in transaction` with query `BEGIN`, so the
+  # waiter is identified by its pinned backend pid and lock wait alone, its
+  # blocker is asserted to be the fencing backend, and the acquisition order
+  # is proven from the locks it already holds.
+  defp await_lock_waiter!(routing_backend_pid, fencing_backend_pid, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + @observer_deadline_ms
+
+    %{rows: rows} =
+      SQL.query!(
+        Repo,
+        "SELECT pg_blocking_pids($1) FROM pg_stat_activity " <>
+          "WHERE pid = $1 AND wait_event_type = 'Lock'",
+        [routing_backend_pid]
+      )
+
+    case rows do
+      [[blocking_pids]] ->
+        assert fencing_backend_pid in blocking_pids,
+               "routing backend is lock-blocked by #{inspect(blocking_pids)}, " <>
+                 "not the fencing backend #{fencing_backend_pid}"
+
+        %{rows: held} =
+          SQL.query!(
+            Repo,
+            "SELECT relation::regclass::text FROM pg_locks " <>
+              "WHERE pid = $1 AND granted AND relation IS NOT NULL",
+            [routing_backend_pid]
+          )
+
+        Enum.map(held, fn [relation] -> relation end)
+
+      [] ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          %{rows: snapshot} =
+            SQL.query!(
+              Repo,
+              "SELECT pid, state, wait_event_type, wait_event, left(query, 90) " <>
+                "FROM pg_stat_activity WHERE datname = current_database() " <>
+                "AND pid <> pg_backend_pid() AND state <> 'idle'",
+              []
+            )
+
+          flunk(
+            "routing backend #{routing_backend_pid} did not enter a lock wait " <>
+              "within #{@observer_deadline_ms}ms; non-idle activity: " <>
+              inspect(snapshot, printable_limit: 800)
+          )
+        else
+          receive do
+          after
+            20 -> :ok
+          end
+
+          await_lock_waiter!(routing_backend_pid, fencing_backend_pid, deadline)
+        end
+    end
+  end
+
+  # The cleanup is registered, never scoped. An assertion that fails inside a `run_unboxed/1`
+  # block raises in the linked task, whose exit signal kills the test process before any
+  # enclosing `after` can run; ExUnit's own teardown runs regardless of how the test died.
+  defp committed_routing_fixture! do
+    fixture = build_committed_routing_fixture!()
+
+    owners =
+      run_unboxed(fn -> CodexPooler.PoolerFixtures.api_key_creator_ids([fixture.pool.id]) end)
+
+    register_unboxed_cleanup!(fn -> delete_committed_fixture!(fixture, owners) end)
+    fixture
+  end
+
+  defp build_committed_routing_fixture! do
+    run_unboxed(fn ->
+      unique = System.unique_integer([:positive])
+
+      setup =
+        accounting_setup(%{
+          account_label: "Bridge ring locking #{unique}"
+        })
+
+      plan = %{
+        affinity: %{
+          enabled?: true,
+          status: "miss",
+          row: nil,
+          kind: "codex_session",
+          key_hash: :crypto.hash(:sha256, "bridge-ring-locking-#{unique}"),
+          pool_id: setup.pool.id,
+          api_key_id: setup.api_key.id,
+          model_identifier: setup.model.exposed_model_id
+        }
+      }
+
+      Map.put(setup, :plan, plan)
+    end)
+  end
+
+  defp delete_committed_fixture!(fixture, owners) do
+    for schema <- [BridgeAffinity, BridgeDemotion, RoutingCircuitState] do
+      Repo.delete_all(from row in schema, where: row.pool_id == ^fixture.pool.id)
+    end
+
+    CodexPooler.PoolerFixtures.delete_committed_pools!([fixture.pool.id], owners)
+
+    Repo.delete_all(
+      from identity in CodexPooler.Upstreams.Schemas.UpstreamIdentity,
+        where: identity.id == ^fixture.identity.id
+    )
+
+    Repo.delete_all(
+      from pricing in CodexPooler.Catalog.PricingSnapshot,
+        where: pricing.id == ^fixture.pricing.id
+    )
+
+    :ok
+  end
+
+  defp pool_rows(schema, fixture) do
+    run_unboxed(fn ->
+      Repo.all(from row in schema, where: row.pool_id == ^fixture.pool.id)
+    end)
+  end
+end

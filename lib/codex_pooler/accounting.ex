@@ -15,6 +15,8 @@ defmodule CodexPooler.Accounting do
     Request,
     RequestLifecycle,
     RequestLogs,
+    RequestReplay,
+    RequestReplayEntitlement,
     Rollups,
     UsageReadModel
   }
@@ -24,15 +26,151 @@ defmodule CodexPooler.Accounting do
 
   @type auth :: CodexPooler.Access.auth_context()
   @type model_ref :: Model.t() | Ecto.UUID.t() | String.t() | nil
-  @type accounting_error :: %{required(:code) => atom(), required(:message) => String.t()}
+  @type accounting_error :: %{
+          required(:code) => atom(),
+          required(:message) => String.t(),
+          optional(:limit_scope) => :window | :request,
+          optional(:retry_after_seconds) => pos_integer()
+        }
   @type request_result_row :: %{required(:request) => Request.t(), optional(atom()) => term()}
   @type request_result :: {:ok, request_result_row()} | {:error, accounting_error()}
+  @type finalization_disposition :: :inserted | :replaced | :reused
+
+  @type internal_request_result_row :: %{
+          required(:request) => Request.t(),
+          required(:finalization_disposition) => finalization_disposition(),
+          optional(atom()) => term()
+        }
+
+  @type internal_request_result ::
+          {:ok, internal_request_result_row()} | {:error, accounting_error()}
 
   @spec reserve(auth(), model_ref(), map(), map()) :: request_result()
   defdelegate reserve(auth, model_or_id, payload, opts \\ %{}), to: RequestLifecycle
 
+  @spec claim_websocket_turn(auth(), model_ref(), map()) :: request_result()
+  defdelegate claim_websocket_turn(auth, model_or_id, opts), to: RequestLifecycle
+
+  @doc """
+  Releases a websocket turn claim whose reservation rolled back, while the row
+  is still nothing but that claim; any other row is kept (findings#206 row
+  206-331).
+  """
+  @spec release_websocket_turn_claim(Request.t()) :: {:ok, :released | :kept} | {:error, term()}
+  defdelegate release_websocket_turn_claim(request), to: RequestLifecycle
+
+  @spec claim_client_retry_successor(auth(), model_ref(), map(), map()) ::
+          {:ok, CodexPooler.Accounting.ClientRetry.SuccessorClaim.t()} | {:error, atom() | map()}
+  defdelegate claim_client_retry_successor(auth, model_or_id, payload, opts),
+    to: RequestLifecycle
+
+  @spec claim_compaction_retry_successor(auth(), model_ref(), map(), map()) ::
+          {:ok, CodexPooler.Accounting.ClientRetry.SuccessorClaim.t()} | {:error, atom() | map()}
+  defdelegate claim_compaction_retry_successor(auth, model_or_id, payload, opts),
+    to: RequestLifecycle
+
+  @spec client_retry_preflight_snapshot(
+          CodexPooler.Gateway.Persistence.CodexSession.t(),
+          CodexPooler.Access.APIKey.t(),
+          Model.t(),
+          map()
+        ) :: :none | {:ok, map()} | {:error, atom()}
+  defdelegate client_retry_preflight_snapshot(session, api_key, model, input),
+    to: CodexPooler.Accounting.ClientRetry,
+    as: :preflight_snapshot
+
+  @spec final_refusal_predecessor(CodexPooler.Gateway.Persistence.CodexSession.t(), map()) :: {:ok, map()} | :none
+  defdelegate final_refusal_predecessor(session, input), to: CodexPooler.Accounting.ClientRetry
+
   @spec record_denied_request(auth(), model_ref(), map()) :: request_result()
   defdelegate record_denied_request(auth, model_or_id, opts \\ %{}), to: RequestLifecycle
+
+  @spec replay_preflight_snapshot(RequestReplay.preflight_input()) ::
+          :none
+          | :recoverable_generation_zero
+          | {:active_generation_zero, map()}
+          | {:armed_generation_one, map()}
+          | {:error, atom()}
+  defdelegate replay_preflight_snapshot(input), to: RequestReplay, as: :preflight_snapshot
+
+  @spec replay_semantic_turn_in_flight?(map()) :: boolean()
+  defdelegate replay_semantic_turn_in_flight?(input), to: RequestReplay, as: :semantic_turn_in_flight?
+
+  @doc """
+  The full-history position recorded by the row holding a native turn claim, or
+  `nil` when it recorded none (findings#206 rows 206-412/206-423).
+  """
+  @spec native_turn_recorded_position(String.t()) :: CodexPooler.Accounting.NativeTurnProgress.position() | nil
+  defdelegate native_turn_recorded_position(claim), to: CodexPooler.Accounting.NativeTurnProgress, as: :recorded_position_for_claim
+
+  @spec native_turn_progress_advances?(CodexPooler.Accounting.NativeTurnProgress.position() | nil, CodexPooler.Accounting.NativeTurnProgress.position() | nil) :: boolean()
+  defdelegate native_turn_progress_advances?(recorded, position), to: CodexPooler.Accounting.NativeTurnProgress, as: :advances?
+
+  @spec replay_provisional_binding_status(RequestReplay.provisional_reference()) ::
+          :armed
+          | {:consumed, map(), atom(), DateTime.t()}
+          | :terminal
+          | :absent
+          | {:error, atom()}
+  defdelegate replay_provisional_binding_status(reference),
+    to: RequestReplay,
+    as: :provisional_binding_status
+
+  @spec replay_provisional_token_status(map()) :: term()
+  defdelegate replay_provisional_token_status(reference),
+    to: RequestReplay,
+    as: :provisional_token_status
+
+  @spec arm_request_replay(RequestReplay.arm_input()) :: {:ok, map()} | {:error, term()}
+  defdelegate arm_request_replay(input), to: RequestReplay, as: :arm
+
+  @spec consume_request_replay(RequestReplay.consume_input()) :: {:ok, map()} | {:error, term()}
+  defdelegate consume_request_replay(input), to: RequestReplay, as: :consume
+
+  @spec mark_request_replay_started(RequestReplay.provisional_reference()) ::
+          {:ok, RequestReplayEntitlement.t()} | {:error, term()}
+  defdelegate mark_request_replay_started(reference), to: RequestReplay, as: :mark_started
+
+  @spec compensate_request_replay_no_send(RequestReplay.provisional_reference()) ::
+          {:ok, map()} | {:error, term()}
+  defdelegate compensate_request_replay_no_send(reference),
+    to: RequestReplay,
+    as: :compensate_no_send
+
+  @spec request_replay_dispatch_lifecycle(RequestReplay.provisional_reference()) ::
+          {:ok, map()} | {:error, term()}
+  defdelegate request_replay_dispatch_lifecycle(reference),
+    to: RequestReplay,
+    as: :dispatch_lifecycle
+
+  @spec touch_request_replay_liveness(RequestReplay.provisional_reference()) ::
+          {:ok, RequestReplayEntitlement.t()} | {:error, term()}
+  defdelegate touch_request_replay_liveness(reference), to: RequestReplay, as: :touch_liveness
+
+  @spec cleanup_request_replays() :: {:ok, map()} | {:error, term()}
+  defdelegate cleanup_request_replays(), to: RequestReplay, as: :cleanup_due
+
+  @spec close_request_replays_for_session(
+          Ecto.UUID.t(),
+          Ecto.UUID.t() | RequestReplay.owner_snapshot(),
+          RequestReplay.close_reason()
+        ) ::
+          {:ok, map() | :stale_owner} | {:error, term()}
+  defdelegate close_request_replays_for_session(session_id, owner_lease_token, reason),
+    to: RequestReplay,
+    as: :close_for_session
+
+  @spec request_replay_ids_for_api_key(Ecto.UUID.t()) :: [Ecto.UUID.t()]
+  defdelegate request_replay_ids_for_api_key(api_key_id),
+    to: RequestReplay,
+    as: :request_ids_for_api_key
+
+  @spec close_request_replay(Ecto.UUID.t(), RequestReplay.close_reason()) ::
+          {:ok, :closed | :noop} | {:error, term()}
+  defdelegate close_request_replay(request_id, reason), to: RequestReplay, as: :close
+
+  @spec supersede_request_replay(map()) :: {:ok, :closed | :noop} | {:error, term()}
+  defdelegate supersede_request_replay(lifecycle), to: RequestReplay, as: :supersede
 
   @spec record_metadata_request(auth(), map()) :: request_result()
   defdelegate record_metadata_request(auth, attrs \\ %{}), to: Metadata
@@ -51,6 +189,37 @@ defmodule CodexPooler.Accounting do
           {:ok, Request.t()} | {:error, term()}
   defdelegate merge_request_metadata(request, metadata, opts \\ []), to: Metadata
 
+  @spec bind_websocket_owner(
+          auth(),
+          Request.t(),
+          Attempt.t(),
+          CodexPooler.Gateway.Payloads.RequestOptions.t()
+        ) ::
+          {:ok, Request.t()} | {:error, term()}
+  defdelegate bind_websocket_owner(auth, request, attempt, options),
+    to: CodexPooler.Accounting.WebsocketOwnerBinding,
+    as: :bind
+
+  @spec bind_websocket_owner_bridge(
+          auth(),
+          Request.t(),
+          Attempt.t(),
+          CodexPooler.Gateway.Payloads.RequestOptions.t()
+        ) :: {:ok, %{request: Request.t(), attempt: Attempt.t()}} | {:error, term()}
+  defdelegate bind_websocket_owner_bridge(auth, request, attempt, options),
+    to: CodexPooler.Accounting.WebsocketOwnerBinding,
+    as: :bind_bridge
+
+  @spec restore_websocket_owner_http_fallback(
+          auth(),
+          Request.t(),
+          Attempt.t(),
+          CodexPooler.Gateway.Payloads.RequestOptions.t()
+        ) :: {:ok, %{request: Request.t(), attempt: Attempt.t()}} | {:error, term()}
+  defdelegate restore_websocket_owner_http_fallback(auth, request, attempt, options),
+    to: CodexPooler.Accounting.WebsocketOwnerBinding,
+    as: :restore_http_fallback
+
   @spec latest_success_by_assignment_ids([Ecto.UUID.t()]) :: %{
           optional(Ecto.UUID.t()) => DateTime.t() | nil
         }
@@ -60,9 +229,24 @@ defmodule CodexPooler.Accounting do
           {:ok, Attempt.t()} | {:error, Ecto.Changeset.t() | accounting_error()}
   defdelegate create_attempt(request, assignment, attrs \\ %{}), to: RequestLifecycle
 
+  @spec create_client_retry_dispatch_attempt(
+          Request.t(),
+          PoolUpstreamAssignment.t(),
+          CodexPooler.Accounting.ClientRetry.DispatchAuthority.t(),
+          map()
+        ) :: {:ok, Attempt.t()} | {:error, Ecto.Changeset.t() | accounting_error()}
+  defdelegate create_client_retry_dispatch_attempt(request, assignment, authority, attrs \\ %{}),
+    to: RequestLifecycle
+
   @spec record_retryable_attempt_failure(Attempt.t(), map()) ::
           {:ok, Attempt.t()} | {:error, Ecto.Changeset.t() | accounting_error()}
   defdelegate record_retryable_attempt_failure(attempt, attrs \\ %{}), to: RequestLifecycle
+
+  @doc false
+  @spec with_current_replay_generation(Request.t(), Attempt.t(), (-> result)) ::
+          {:ok, result} | {:error, :stale_generation}
+        when result: term()
+  defdelegate with_current_replay_generation(request, attempt, callback), to: RequestLifecycle
 
   @spec mark_attempt_upstream_transport(Attempt.t(), String.t()) ::
           {:ok, Attempt.t()} | {:error, Ecto.Changeset.t()}
@@ -75,8 +259,29 @@ defmodule CodexPooler.Accounting do
   defdelegate recover_stale_reservations(now \\ DateTime.utc_now(), opts \\ []),
     to: RequestLifecycle
 
+  @spec recover_absent_instance_attempts(DateTime.t(), keyword()) ::
+          {:ok, map()} | {:error, term(), map()}
+  defdelegate recover_absent_instance_attempts(now \\ DateTime.utc_now(), opts \\ []),
+    to: RequestLifecycle
+
+  @spec recover_dead_execution_attempts(DateTime.t(), keyword()) ::
+          {:ok, map()} | {:error, term(), map()}
+  defdelegate recover_dead_execution_attempts(now \\ DateTime.utc_now(), opts \\ []),
+    to: RequestLifecycle
+
+  @spec recover_admission_executions(DateTime.t(), keyword()) ::
+          {:ok, map()} | {:error, term(), map()}
+  defdelegate recover_admission_executions(now \\ DateTime.utc_now(), opts \\ []),
+    to: RequestLifecycle
+
   @spec finalize_request(Request.t(), Attempt.t(), map()) :: request_result()
   defdelegate finalize_request(request, attempt, attrs \\ %{}), to: RequestLifecycle
+
+  @doc false
+  @spec finalize_request_with_disposition(Request.t(), Attempt.t(), map()) ::
+          internal_request_result()
+  defdelegate finalize_request_with_disposition(request, attempt, attrs \\ %{}),
+    to: RequestLifecycle
 
   @spec finalize_success(Request.t(), Attempt.t(), map(), map()) :: request_result()
   def finalize_success(%Request{} = request, %Attempt{} = attempt, usage, opts \\ %{}) do
@@ -87,6 +292,28 @@ defmodule CodexPooler.Accounting do
 
     finalize_request(request, attempt, opts)
   end
+
+  @doc false
+  @spec finalize_success_with_disposition(Request.t(), Attempt.t(), map(), map()) ::
+          internal_request_result()
+  def finalize_success_with_disposition(
+        %Request{} = request,
+        %Attempt{} = attempt,
+        usage,
+        opts \\ %{}
+      ) do
+    opts =
+      opts
+      |> Map.new()
+      |> Map.merge(%{request_status: "succeeded", attempt_status: "succeeded", usage: usage})
+
+    finalize_request_with_disposition(request, attempt, opts)
+  end
+
+  @spec revoke_armed_replay_entitlement!(Ecto.UUID.t(), Attempt.t() | nil, DateTime.t()) ::
+          :revoked | :noop
+  defdelegate revoke_armed_replay_entitlement!(request_id, attempt, timestamp),
+    to: RequestLifecycle
 
   @spec finalize_reservation_failure(Request.t(), map()) :: request_result()
   def finalize_reservation_failure(%Request{} = request, opts \\ %{}) do
@@ -114,6 +341,21 @@ defmodule CodexPooler.Accounting do
     finalize_request(request, attempt, opts)
   end
 
+  @doc false
+  @spec finalize_failure_with_disposition(Request.t(), Attempt.t(), map()) ::
+          internal_request_result()
+  def finalize_failure_with_disposition(%Request{} = request, %Attempt{} = attempt, opts \\ %{}) do
+    opts = Map.new(opts)
+
+    opts =
+      Map.merge(opts, %{
+        request_status: "failed",
+        attempt_status: Map.get(opts, :attempt_status, "failed")
+      })
+
+    finalize_request_with_disposition(request, attempt, opts)
+  end
+
   @spec finalize_partial_stream_failure(Request.t(), Attempt.t(), map(), map()) ::
           request_result()
   def finalize_partial_stream_failure(
@@ -128,16 +370,44 @@ defmodule CodexPooler.Accounting do
       Map.merge(opts, %{
         request_status: "failed",
         attempt_status: "failed",
-        usage:
-          Map.merge(%{status: "usage_unknown", source: "partial_stream_failure"}, Map.new(usage)),
+        usage: Map.merge(%{status: "usage_unknown", source: "partial_stream_failure"}, Map.new(usage)),
         last_error_code: Map.get(opts, :last_error_code, "stream_interrupted")
       })
 
     finalize_request(request, attempt, opts)
   end
 
+  @doc false
+  @spec finalize_partial_stream_failure_with_disposition(
+          Request.t(),
+          Attempt.t(),
+          map(),
+          map()
+        ) :: internal_request_result()
+  def finalize_partial_stream_failure_with_disposition(
+        %Request{} = request,
+        %Attempt{} = attempt,
+        usage \\ %{},
+        opts \\ %{}
+      ) do
+    opts = Map.new(opts)
+
+    opts =
+      Map.merge(opts, %{
+        request_status: "failed",
+        attempt_status: "failed",
+        usage: Map.merge(%{status: "usage_unknown", source: "partial_stream_failure"}, Map.new(usage)),
+        last_error_code: Map.get(opts, :last_error_code, "stream_interrupted")
+      })
+
+    finalize_request_with_disposition(request, attempt, opts)
+  end
+
   @spec list_ledger_entries_for_request(Request.t() | Ecto.UUID.t()) :: [term()]
   defdelegate list_ledger_entries_for_request(request), to: LedgerReads
+
+  @spec reservation_outstanding?(Request.t() | Ecto.UUID.t()) :: boolean()
+  defdelegate reservation_outstanding?(request), to: LedgerReads
 
   @spec token_totals_by_upstream_identity_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: %{
           optional(Ecto.UUID.t()) => non_neg_integer()
@@ -145,17 +415,22 @@ defmodule CodexPooler.Accounting do
   defdelegate token_totals_by_upstream_identity_ids(upstream_identity_ids, started_at, ended_at),
     to: Reporting
 
-  @spec token_totals_by_upstream_identity_and_model_ids(
+  @spec token_totals_by_upstream_identity_pool_and_model_ids(
           [Ecto.UUID.t()],
           DateTime.t(),
           DateTime.t()
         ) :: %{optional(Ecto.UUID.t()) => [Reporting.model_usage_total()]}
-  defdelegate token_totals_by_upstream_identity_and_model_ids(
+  defdelegate token_totals_by_upstream_identity_pool_and_model_ids(
                 upstream_identity_ids,
                 started_at,
                 ended_at
               ),
               to: Reporting
+
+  @spec daily_rollup_coverage_statuses([Date.t()]) :: %{
+          optional(Date.t()) => Reporting.daily_rollup_coverage_status()
+        }
+  defdelegate daily_rollup_coverage_statuses(dates), to: Reporting
 
   @spec build_api_key_self_usage(term(), term(), keyword()) ::
           {:ok, map()} | {:error, accounting_error()}
@@ -194,6 +469,9 @@ defmodule CodexPooler.Accounting do
   @spec list_request_logs(term(), keyword()) :: map()
   defdelegate list_request_logs(pool_or_id, opts \\ []), to: RequestLogs, as: :list
 
+  @spec model_declaration_history(CodexPooler.Accounts.Scope.t(), map(), keyword()) :: CodexPooler.Accounting.RequestLogs.ModelHistory.result()
+  defdelegate model_declaration_history(scope, params \\ %{}, opts \\ []), to: CodexPooler.Accounting.RequestLogs.ModelHistory, as: :for_scope
+
   @spec list_request_logs_for_scope(CodexPooler.Accounts.Scope.t(), keyword()) :: map()
   defdelegate list_request_logs_for_scope(scope, opts \\ []), to: RequestLogs, as: :list_for_scope
 
@@ -213,6 +491,9 @@ defmodule CodexPooler.Accounting do
 
   @spec rebuild_daily_rollups_for_date(Date.t()) :: {:ok, non_neg_integer()} | {:error, term()}
   defdelegate rebuild_daily_rollups_for_date(date), to: Rollups, as: :rebuild_for_date
+
+  @spec daily_rollup_dates_needing_rebuild(keyword()) :: [Date.t()]
+  defdelegate daily_rollup_dates_needing_rebuild(opts \\ []), to: Rollups, as: :dates_needing_rebuild
 
   @spec sanitize_metadata(term()) :: term()
   defdelegate sanitize_metadata(value), to: Metadata

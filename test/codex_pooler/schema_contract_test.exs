@@ -17,24 +17,37 @@ defmodule CodexPooler.SchemaContractTest do
     AlertRuleChannel
   }
 
-  alias CodexPooler.Accounting.{DailyRollup, HourlyModelUsageRollup, LedgerEntry, RequestLogFact}
+  alias CodexPooler.Accounting.{
+    Attempt,
+    DailyRollup,
+    DailyRollupCoverage,
+    HourlyModelUsageRollup,
+    LedgerEntry,
+    Request,
+    RequestLogFact,
+    RequestReplayEntitlement
+  }
+
+  alias CodexPooler.Admin.PoolTrafficGate
   alias CodexPooler.Catalog.{Model, PricingSnapshot}
   alias CodexPooler.Files.FileRecord
-  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, RoutingCircuitState}
+  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexTurn, RoutingCircuitState}
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.Pools.{OperatorPoolAssignment, RoutingSettings}
   alias CodexPooler.Repo
+  alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Schemas.{OAuthFlow, UpstreamIdentity}
 
   @expected_tables ~w(
-    account_quota_windows alert_channels alert_delivery_attempts alert_incident_receipts alert_incident_targets alert_incidents
+    account_quota_windows admin_pool_traffic_gates alert_channels alert_delivery_attempts alert_incident_receipts alert_incident_targets alert_incidents
     alert_rule_channels alert_rules api_key_policy_bindings api_keys attempts audit_events bridge_owner_leases
-    bridge_session_aliases codex_files codex_sessions codex_turns daily_rollups hourly_model_usage_rollups
-    encrypted_secrets gateway_idempotency_keys instance_settings invite_acceptances invites ledger_entries memberships
+    bridge_session_aliases codex_files codex_sessions codex_turns daily_rollup_coverages daily_rollups hourly_model_usage_rollups
+    encrypted_secrets gateway_idempotency_keys instance_settings invite_acceptances invites ledger_entries memberships request_replay_entitlements
     models operator_pool_assignments platform_bootstrap_state pricing_snapshots recovery_codes request_log_facts requests routing_circuit_states
     sessions sync_runs pools pool_routing_settings pool_upstream_assignments totp_settings
     upstream_identities upstream_oauth_flows users
+    openai_status_feed_states openai_status_incidents openai_status_dismissals
   )
 
   @schema_modules [
@@ -43,6 +56,7 @@ defmodule CodexPooler.SchemaContractTest do
     CodexPooler.Accounts.Session,
     CodexPooler.Accounts.TOTPSetting,
     CodexPooler.Accounts.User,
+    PoolTrafficGate,
     APIKey,
     APIKeyPolicyBinding,
     CodexPooler.Access.Invite,
@@ -55,22 +69,24 @@ defmodule CodexPooler.SchemaContractTest do
     AlertRule,
     AlertRuleChannel,
     DailyRollup,
+    DailyRollupCoverage,
     HourlyModelUsageRollup,
     LedgerEntry,
+    RequestReplayEntitlement,
     RequestLogFact,
     CodexPooler.Audit.AuditEvent,
     Model,
     PricingSnapshot,
     CodexPooler.Catalog.SyncRun,
     CodexPooler.Files.FileRecord,
-    CodexPooler.Accounting.Attempt,
+    Attempt,
     CodexPooler.Gateway.Persistence.BridgeOwnerLease,
     CodexPooler.Gateway.Persistence.BridgeSessionAlias,
     CodexPooler.Gateway.Persistence.CodexSession,
-    CodexPooler.Gateway.Persistence.CodexTurn,
+    CodexTurn,
     CodexPooler.Gateway.Persistence.IdempotencyKey,
     Settings,
-    CodexPooler.Accounting.Request,
+    Request,
     CodexPooler.Gateway.Persistence.RoutingCircuitState,
     CodexPooler.Pools.Membership,
     OperatorPoolAssignment,
@@ -80,7 +96,10 @@ defmodule CodexPooler.SchemaContractTest do
     CodexPooler.Upstreams.Schemas.EncryptedSecret,
     OAuthFlow,
     CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment,
-    UpstreamIdentity
+    UpstreamIdentity,
+    CodexPooler.Status.Schemas.FeedState,
+    CodexPooler.Status.Schemas.Incident,
+    CodexPooler.Status.Schemas.Dismissal
   ]
 
   test "creates the final source table inventory with pgcrypto enabled" do
@@ -97,8 +116,31 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert [[1]] =
              Repo.query!("SELECT COUNT(*) FROM pg_extension WHERE extname = 'pgcrypto'").rows
+  end
 
-    assert [["pending"]] = Repo.query!("SELECT status FROM platform_bootstrap_state").rows
+  @tag :shared_pool_traffic_gate
+  test "stores the operator-scoped Pool traffic gate with fenced lease and cascade cleanup" do
+    columns = table_columns("admin_pool_traffic_gates")
+
+    assert columns == %{
+             "operator_id" => {"uuid", "NO"},
+             "owner_token" => {"uuid", "YES"},
+             "lease_expires_at" => {"timestamp without time zone", "YES"},
+             "cooldown_until" => {"timestamp without time zone", "NO"},
+             "inserted_at" => {"timestamp without time zone", "NO"},
+             "updated_at" => {"timestamp without time zone", "NO"}
+           }
+
+    constraints = constraint_definitions()
+
+    assert constraints["admin_pool_traffic_gates_owner_lease_pair_check"] =~
+             "(owner_token IS NULL) = (lease_expires_at IS NULL)"
+
+    assert fk_action("admin_pool_traffic_gates_operator_id_fkey") == {"c", "a"}
+    assert PoolTrafficGate.__schema__(:primary_key) == [:operator_id]
+    assert PoolTrafficGate.__schema__(:type, :owner_token) == :binary_id
+    assert PoolTrafficGate.__schema__(:type, :lease_expires_at) == :utc_datetime_usec
+    assert PoolTrafficGate.__schema__(:type, :cooldown_until) == :utc_datetime_usec
   end
 
   test "preserves required unique, partial, and functional indexes" do
@@ -112,6 +154,7 @@ defmodule CodexPooler.SchemaContractTest do
 
     for name <- [
           "users_email_active_uq",
+          "admin_pool_traffic_gates_pkey",
           "pools_slug_uq",
           "operator_pool_assignments_user_pool_active_uq",
           "api_key_policy_default_active_uq",
@@ -124,16 +167,18 @@ defmodule CodexPooler.SchemaContractTest do
           "gateway_idempotency_keys_active_key_uq",
           "routing_circuit_states_active_assignment_uq",
           "models_pool_exposed_uq",
+          "attempts_open_execution_index",
           "ledger_entries_settlement_request_uq",
           "ledger_entries_api_key_recorded_occurred_idx",
           "request_log_facts_latest_upstream_identity_request_idx",
           "requests_admitted_id_idx",
+          "daily_rollup_coverages_pkey",
           "daily_rollups_api_key_uq",
           "daily_rollups_pool_uq",
           "hourly_model_usage_rollups_bucket_pool_model_code_uq",
           "hourly_model_usage_rollups_pool_bucket_model_idx",
           "hourly_model_usage_rollups_model_bucket_pool_idx",
-          "codex_sessions_pool_session_key_uq",
+          "codex_sessions_pool_api_key_session_key_uq",
           "codex_turns_session_sequence_uq",
           "invite_acceptances_invite_id_uq",
           "alert_incidents_unresolved_dedupe_key_uq",
@@ -148,12 +193,51 @@ defmodule CodexPooler.SchemaContractTest do
           "upstream_oauth_flows_state_token_hash_uq",
           "upstream_oauth_flows_pool_status_expires_idx",
           "upstream_oauth_flows_identity_status_expires_idx",
-          "upstream_oauth_flows_requested_status_inserted_idx"
+          "upstream_oauth_flows_requested_status_inserted_idx",
+          "openai_status_incidents_guid_uq",
+          "openai_status_incidents_retention_idx",
+          "openai_status_incidents_active_idx",
+          "openai_status_dismissals_operator_incident_revision_uq",
+          "openai_status_dismissals_operator_idx",
+          "ledger_entries_api_key_known_settlement_occurred_idx",
+          "attempts_open_started_idx",
+          "attempts_model_history_started_idx",
+          "codex_sessions_retirement_idx",
+          "codex_turns_started_idx",
+          "account_quota_windows_expired_reset_idx"
         ] do
       assert Map.has_key?(indexes, name)
     end
 
     refute Map.has_key?(indexes, "memberships_single_instance_owner_active_uq")
+    refute Map.has_key?(indexes, "requests_api_key_idempotency_uq")
+
+    assert indexes["attempts_model_history_started_idx"] ==
+             "CREATE INDEX attempts_model_history_started_idx ON public.attempts USING btree (started_at, id) WHERE (status <> ALL (ARRAY['queued'::text, 'in_progress'::text]))"
+
+    assert indexes["codex_sessions_retirement_idx"] ==
+             "CREATE INDEX codex_sessions_retirement_idx ON public.codex_sessions USING btree (COALESCE(owner_lease_expires_at, updated_at), id) WHERE (status = ANY (ARRAY['active'::text, 'interrupted'::text]))"
+
+    assert indexes["codex_turns_started_idx"] ==
+             "CREATE INDEX codex_turns_started_idx ON public.codex_turns USING btree (started_at)"
+
+    assert indexes["account_quota_windows_expired_reset_idx"] ==
+             "CREATE INDEX account_quota_windows_expired_reset_idx ON public.account_quota_windows USING btree (reset_at, id) WHERE (reset_at IS NOT NULL)"
+
+    # Nothing sets `conversation_key`, and its Pool-wide uniqueness would have
+    # collided across API keys the moment anything did (findings#255).
+    refute Map.has_key?(indexes, "codex_sessions_pool_conversation_key_uq")
+
+    assert indexes["ledger_entries_api_key_known_settlement_occurred_idx"] ==
+             "CREATE INDEX ledger_entries_api_key_known_settlement_occurred_idx ON " <>
+               "public.ledger_entries USING btree (api_key_id, occurred_at) " <>
+               "WHERE ((entry_kind = 'settlement'::text) AND " <>
+               "(usage_status = 'usage_known'::text))"
+
+    assert indexes["attempts_open_started_idx"] ==
+             "CREATE INDEX attempts_open_started_idx ON public.attempts USING btree " <>
+               "(started_at, id) WHERE (status = ANY (ARRAY['queued'::text, " <>
+               "'in_progress'::text]))"
 
     assert indexes["users_email_active_uq"] =~ "lower(email)"
     assert indexes["users_email_active_uq"] =~ "WHERE (deleted_at IS NULL)"
@@ -163,6 +247,13 @@ defmodule CodexPooler.SchemaContractTest do
              "WHERE (status = 'active'::text)"
 
     assert indexes["api_key_policy_model_active_uq"] =~ "lower(model_identifier)"
+
+    assert indexes["attempts_open_execution_index"] =~
+             "COALESCE(owner_execution_checked_at, started_at)"
+
+    assert indexes["attempts_open_execution_index"] =~
+             "WHERE ((status = ANY (ARRAY['queued'::text, 'in_progress'::text])) AND (owner_execution_id IS NOT NULL))"
+
     assert indexes["ledger_entries_settlement_request_uq"] =~ "entry_kind = 'settlement'"
     assert indexes["ledger_entries_api_key_recorded_occurred_idx"] =~ "api_key_id"
     assert indexes["ledger_entries_api_key_recorded_occurred_idx"] =~ "occurred_at DESC"
@@ -182,6 +273,8 @@ defmodule CodexPooler.SchemaContractTest do
     assert indexes["daily_rollups_api_key_uq"] =~
              "WHERE (dimension_kind = 'api_key'::text)"
 
+    assert indexes["daily_rollup_coverages_pkey"] =~ "(rollup_date)"
+
     assert indexes["hourly_model_usage_rollups_bucket_pool_model_code_uq"] =~
              "(bucket_started_at, pool_id, model_code)"
 
@@ -197,6 +290,7 @@ defmodule CodexPooler.SchemaContractTest do
     assert indexes["requests_api_key_admitted_idx"] =~ "id DESC"
 
     assert indexes["requests_admitted_id_idx"] =~ "(admitted_at DESC, id DESC)"
+    assert indexes["requests_api_key_live_idx"] =~ "(api_key_id) WHERE (status = ANY (ARRAY['accepted'::text, 'in_progress'::text]))"
 
     assert indexes["account_quota_windows_evidence_identity_uq"] =~
              "COALESCE(lower(model), ''::text)"
@@ -218,6 +312,18 @@ defmodule CodexPooler.SchemaContractTest do
 
   test "preserves check constraints for statuses, endpoints, transports, and quota windows" do
     constraints = constraint_definitions()
+
+    assert constraints["daily_rollups_admitted_request_count_check"] ==
+             "CHECK ((admitted_request_count >= 0))"
+
+    assert constraints["daily_rollups_rounded_settled_cost_micros_check"] ==
+             "CHECK ((rounded_settled_cost_micros >= (0)::numeric))"
+
+    assert constraints["daily_rollup_coverages_contract_version_check"] ==
+             "CHECK ((contract_version > 0))"
+
+    assert constraints["daily_rollup_coverages_mutation_version_check"] ==
+             "CHECK ((mutation_version >= 0))"
 
     assert constraints["api_keys_status_check"] =~ "'paused'"
     refute constraints["api_keys_status_check"] =~ "'disabled'"
@@ -303,7 +409,8 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["api_keys_enforced_service_tier_check"] =~ "'auto'"
     assert constraints["api_keys_enforced_service_tier_check"] =~ "'priority'"
     assert constraints["api_keys_enforced_service_tier_check"] =~ "'scale'"
-    refute constraints["api_keys_enforced_service_tier_check"] =~ "'ultrafast'"
+    refute constraints["api_keys_enforced_service_tier_check"] =~ "'fast'"
+    assert constraints["api_keys_enforced_service_tier_check"] =~ "'ultrafast'"
 
     assert constraints["api_key_policy_bindings_max_tokens_per_week_check"] =~
              "max_tokens_per_week > 0"
@@ -324,6 +431,17 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["alert_rules_cooldown_minutes_check"] =~ "cooldown_minutes <= 1440"
     assert constraints["alert_rules_state_check"] =~ "'active'"
     assert constraints["alert_rules_state_check"] =~ "'disabled'"
+
+    route_class_values =
+      ~r/'([^']+)'/
+      |> Regex.scan(constraints["alert_rules_route_class_check"], capture: :all_but_first)
+      |> List.flatten()
+      |> MapSet.new()
+
+    assert route_class_values ==
+             MapSet.new(AlertRule.route_class_rule_kinds() ++ RouteClass.all())
+
+    assert AlertRule.route_classes() == RouteClass.all()
     assert constraints["alert_rules_target_state_check"] =~ "'missing_evidence'"
     assert constraints["alert_rules_window_selector_check"] =~ "'model_secondary'"
     assert constraints["alert_channels_channel_type_check"] =~ "'email'"
@@ -423,12 +541,20 @@ defmodule CodexPooler.SchemaContractTest do
     assert column_type("pricing_snapshots", "request_base_micros") == "numeric(30,9)"
     assert column_type("ledger_entries", "estimated_cost_micros") == "numeric(30,9)"
     assert column_type("daily_rollups", "settled_cost_micros") == "numeric(30,9)"
+    assert column_type("daily_rollups", "rounded_settled_cost_micros") == "numeric(30,0)"
     assert column_type("hourly_model_usage_rollups", "estimated_cost_micros") == "numeric(30,9)"
     assert column_type("hourly_model_usage_rollups", "settled_cost_micros") == "numeric(30,9)"
     assert column_type("account_quota_windows", "used_percent") == "numeric(6,3)"
 
     assert column_type("ledger_entries", "input_tokens") == "bigint"
     assert column_type("ledger_entries", "total_tokens") == "bigint"
+    assert column_type("attempts", "owner_process_id") == "character varying(64)"
+    assert column_type("attempts", "owner_execution_id") == "uuid"
+
+    assert column_type("attempts", "owner_execution_checked_at") ==
+             "timestamp with time zone"
+
+    assert column_type("daily_rollups", "admitted_request_count") == "bigint"
     assert column_type("hourly_model_usage_rollups", "request_count") == "bigint"
     assert column_type("hourly_model_usage_rollups", "total_tokens") == "bigint"
     assert column_type("request_log_facts", "latest_input_tokens") == "bigint"
@@ -473,12 +599,19 @@ defmodule CodexPooler.SchemaContractTest do
     assert column_type("alert_delivery_attempts", "retryable") == "boolean"
   end
 
+  test "requests keep only a rolling-upgrade compatibility column for raw idempotency keys" do
+    refute :idempotency_key in Request.__schema__(:fields)
+    assert table_columns("requests")["idempotency_key"] == {"text", "YES"}
+  end
+
   test "preserves final foreign key actions including cascades and set-null behavior" do
     assert fk_action("sessions_user_id_fkey") == {"c", "a"}
     assert fk_action("api_keys_pool_id_fkey") == {"c", "a"}
-    assert fk_action("attempts_pool_upstream_assignment_id_fkey") == {"c", "a"}
+    assert fk_action("attempts_pool_upstream_assignment_id_fkey") == {"n", "a"}
     assert fk_action("attempts_upstream_identity_id_fkey") == {"n", "a"}
-    assert fk_action("codex_sessions_pool_upstream_assignment_id_fkey") == {"c", "a"}
+    assert fk_action("codex_sessions_pool_upstream_assignment_id_fkey") == {"n", "a"}
+    assert table_columns("attempts")["pool_upstream_assignment_id"] == {"uuid", "YES"}
+    assert table_columns("codex_sessions")["pool_upstream_assignment_id"] == {"uuid", "YES"}
     assert fk_action("ledger_entries_pool_upstream_assignment_id_fkey") == {"n", "a"}
     assert fk_action("ledger_entries_upstream_identity_id_fkey") == {"n", "a"}
     assert fk_action("request_log_facts_request_id_fkey") == {"c", "a"}
@@ -857,6 +990,87 @@ defmodule CodexPooler.SchemaContractTest do
     end
   end
 
+  test "daily Pool rollups and date coverage preserve exact usage storage" do
+    daily_rollup_columns = table_columns("daily_rollups")
+
+    assert daily_rollup_columns["admitted_request_count"] == {"bigint", "NO"}
+    assert daily_rollup_columns["rounded_settled_cost_micros"] == {"numeric", "NO"}
+
+    assert [["0"]] =
+             Repo.query!("""
+             SELECT column_default
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'daily_rollups'
+               AND column_name = 'admitted_request_count'
+             """).rows
+
+    assert [["0"]] =
+             Repo.query!("""
+             SELECT column_default
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'daily_rollups'
+               AND column_name = 'rounded_settled_cost_micros'
+             """).rows
+
+    assert table_columns("daily_rollup_coverages") == %{
+             "rollup_date" => {"date", "NO"},
+             "contract_version" => {"integer", "NO"},
+             "completed_at" => {"timestamp without time zone", "YES"},
+             "mutation_version" => {"bigint", "NO"},
+             "created_at" => {"timestamp without time zone", "NO"},
+             "updated_at" => {"timestamp without time zone", "NO"}
+           }
+
+    assert DailyRollupCoverage.__schema__(:source) == "daily_rollup_coverages"
+    assert DailyRollupCoverage.__schema__(:primary_key) == [:rollup_date]
+    assert DailyRollupCoverage.__schema__(:type, :rollup_date) == :date
+    assert DailyRollupCoverage.__schema__(:type, :contract_version) == :integer
+    assert DailyRollupCoverage.__schema__(:type, :completed_at) == :utc_datetime_usec
+    assert DailyRollupCoverage.__schema__(:type, :mutation_version) == :integer
+
+    assert trigger_names("requests") =~ "requests_track_pool_daily_rollup_mutation"
+    assert trigger_names("ledger_entries") =~ "ledger_entries_track_pool_daily_rollup_mutation"
+    assert trigger_names("daily_rollups") =~ "daily_rollups_track_pool_daily_rollup_mutation"
+
+    assert trigger_names("daily_rollup_coverages") =~
+             "daily_rollup_coverages_guard_contract"
+
+    deferred_triggers =
+      trigger_contracts([
+        "requests_track_pool_daily_rollup_mutation",
+        "ledger_entries_track_pool_daily_rollup_mutation",
+        "daily_rollups_track_pool_daily_rollup_mutation"
+      ])
+
+    assert Enum.all?(deferred_triggers, fn {_name, constraint_oid, deferrable, initially_deferred} ->
+             constraint_oid != 0 and deferrable and initially_deferred
+           end)
+
+    assert [
+             {"daily_rollup_coverages_guard_contract", 0, false, false}
+           ] = trigger_contracts(["daily_rollup_coverages_guard_contract"])
+
+    assert function_search_paths([
+             "guard_pool_daily_rollup_coverage_contract",
+             "mark_pool_daily_rollup_dates_mutated",
+             "track_daily_rollup_pool_mutation",
+             "track_ledger_pool_daily_rollup_mutation",
+             "track_request_pool_daily_rollup_mutation"
+           ]) ==
+             Map.new(
+               [
+                 "guard_pool_daily_rollup_coverage_contract",
+                 "mark_pool_daily_rollup_dates_mutated",
+                 "track_daily_rollup_pool_mutation",
+                 "track_ledger_pool_daily_rollup_mutation",
+                 "track_request_pool_daily_rollup_mutation"
+               ],
+               &{&1, ["search_path=pg_catalog, public"]}
+             )
+  end
+
   test "operator pool assignments preserve the scoped admin grant storage contract" do
     columns = table_columns("operator_pool_assignments")
 
@@ -946,7 +1160,7 @@ defmodule CodexPooler.SchemaContractTest do
     end
   end
 
-  test "pool routing settings expose feature flags as non-null boolean storage" do
+  test "pool routing settings retain inert legacy column and its default" do
     columns = table_columns("pool_routing_settings")
 
     assert columns["prompt_cache_affinity_enabled"] == {"boolean", "NO"}
@@ -971,6 +1185,13 @@ defmodule CodexPooler.SchemaContractTest do
              """).rows
   end
 
+  test "audio transcription permission is a required default-on routing column" do
+    assert table_columns("pool_routing_settings")["allow_audio_transcription"] == {"boolean", "NO"}
+    assert :allow_audio_transcription in RoutingSettings.__schema__(:fields)
+    assert %RoutingSettings{}.allow_audio_transcription == true
+    assert [["true"]] = Repo.query!("SELECT column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'pool_routing_settings' AND column_name = 'allow_audio_transcription'").rows
+  end
+
   test "pool routing settings omit removed analytics forwarding storage" do
     columns = table_columns("pool_routing_settings")
     removed_column = "control_plane" <> "_analytics_forwarding_enabled"
@@ -978,6 +1199,285 @@ defmodule CodexPooler.SchemaContractTest do
 
     refute Map.has_key?(columns, removed_column)
     refute removed_column in schema_field_names
+  end
+
+  @tag :replay_schema
+  test "replay entitlement schema exposes only immutable metadata and strict lifecycle types" do
+    columns = table_columns("request_replay_entitlements")
+
+    assert Map.take(columns, [
+             "request_id",
+             "codex_turn_id",
+             "eligible_attempt_id",
+             "replay_attempt_id",
+             "api_key_runtime_epoch",
+             "model_identifier",
+             "semantic_turn_digest",
+             "replay_claim_digest",
+             "provisional_binding_digest",
+             "replay_generation",
+             "owner_lease_digest",
+             "owner_lease_key_version",
+             "predecessor_epoch",
+             "status",
+             "armed_at",
+             "expires_at",
+             "consumed_at",
+             "started_at",
+             "last_liveness_at",
+             "abandon_at",
+             "terminal_at",
+             "closed_at",
+             "cleanup_checked_at"
+           ]) == %{
+             "request_id" => {"uuid", "NO"},
+             "codex_turn_id" => {"uuid", "NO"},
+             "eligible_attempt_id" => {"uuid", "NO"},
+             "replay_attempt_id" => {"uuid", "YES"},
+             "api_key_runtime_epoch" => {"bigint", "NO"},
+             "model_identifier" => {"text", "NO"},
+             "semantic_turn_digest" => {"bytea", "NO"},
+             "replay_claim_digest" => {"bytea", "NO"},
+             "provisional_binding_digest" => {"bytea", "YES"},
+             "replay_generation" => {"integer", "NO"},
+             "owner_lease_digest" => {"bytea", "NO"},
+             "owner_lease_key_version" => {"text", "NO"},
+             "predecessor_epoch" => {"bigint", "NO"},
+             "status" => {"text", "NO"},
+             "armed_at" => {"timestamp with time zone", "NO"},
+             "expires_at" => {"timestamp with time zone", "NO"},
+             "consumed_at" => {"timestamp with time zone", "YES"},
+             "started_at" => {"timestamp with time zone", "YES"},
+             "last_liveness_at" => {"timestamp with time zone", "YES"},
+             "abandon_at" => {"timestamp with time zone", "YES"},
+             "terminal_at" => {"timestamp with time zone", "YES"},
+             "closed_at" => {"timestamp with time zone", "YES"},
+             "cleanup_checked_at" => {"timestamp with time zone", "YES"}
+           }
+
+    assert RequestReplayEntitlement.statuses() == ~w(armed consumed expired revoked)
+    assert RequestReplayEntitlement.__schema__(:type, :semantic_turn_digest) == :binary
+    assert RequestReplayEntitlement.__schema__(:type, :armed_at) == :utc_datetime_usec
+    assert RequestReplayEntitlement.__schema__(:type, :cleanup_checked_at) == :utc_datetime_usec
+    assert Attempt.__schema__(:type, :replay_generation) == :integer
+
+    assert CodexTurn.__schema__(
+             :type,
+             :semantic_turn_digest
+           ) == :binary
+
+    constraints = constraint_definitions()
+    assert constraints["codex_turns_semantic_turn_digest_shape_check"] =~ "octet_length"
+    assert constraints["attempts_replay_generation_check"] =~ "replay_generation >= 0"
+    assert constraints["request_replay_entitlements_lifecycle_tuple_check"] =~ "consumed"
+
+    for {name, expected_action} <- replay_foreign_key_actions() do
+      assert fk_action(name) == expected_action
+    end
+
+    indexes = index_definitions()
+    assert indexes["codex_turns_id_request_id_uq"] =~ "UNIQUE INDEX"
+    assert indexes["codex_turns_active_semantic_turn_uq"] =~ "status = 'in_progress'"
+    assert indexes["request_replay_entitlements_request_id_uq"] =~ "UNIQUE INDEX"
+
+    assert indexes["request_replay_entitlements_cleanup_due_idx"] =~
+             "cleanup_checked_at NULLS FIRST"
+
+    assert indexes["request_replay_entitlements_cleanup_due_idx"] =~ "expires_at, abandon_at, id"
+    assert indexes["request_replay_entitlements_cleanup_due_idx"] =~ "WHERE (closed_at IS NULL)"
+
+    assert [["0"]] = column_default("attempts", "replay_generation")
+    assert [["1"]] = column_default("request_replay_entitlements", "replay_generation")
+
+    assert [["request_replay_db_now", "v"]] =
+             Repo.query!("""
+             SELECT proname, provolatile::text
+             FROM pg_proc
+             WHERE pronamespace = 'public'::regnamespace
+               AND proname = 'request_replay_db_now'
+             """).rows
+
+    assert replay_function_contracts() == %{
+             "enforce_request_replay_entitlement_update" => {"v", "u", ["search_path=pg_catalog"]},
+             "enforce_request_replay_request_storage" => {"v", "u", ["search_path=pg_catalog"]},
+             "enforce_request_replay_turn_snapshot" => {"v", "u", ["search_path=pg_catalog"]},
+             "request_replay_db_now" => {"v", "s", ["search_path=pg_catalog"]}
+           }
+
+    assert replay_trigger_names() == [
+             "request_replay_codex_turns_snapshot_guard",
+             "request_replay_entitlements_insert_guard",
+             "request_replay_entitlements_update_guard",
+             "request_replay_requests_storage_guard"
+           ]
+  end
+
+  @tag :replay_schema
+  test "replay entitlement changeset rejects malformed tuples before persistence" do
+    now = ~U[2026-09-02 00:00:00.000000Z]
+
+    attrs = %{
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      eligible_attempt_id: Ecto.UUID.generate(),
+      api_key_id: Ecto.UUID.generate(),
+      api_key_runtime_epoch: 0,
+      pool_id: Ecto.UUID.generate(),
+      model_id: Ecto.UUID.generate(),
+      model_identifier: "gpt-example",
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      replay_generation: 1,
+      owner_lease_digest: <<3::256>>,
+      owner_lease_key_version: "v1",
+      predecessor_epoch: 1,
+      status: "armed",
+      armed_at: now,
+      expires_at: DateTime.add(now, 30, :second)
+    }
+
+    assert RequestReplayEntitlement.changeset(%RequestReplayEntitlement{}, attrs).valid?
+
+    malformed =
+      RequestReplayEntitlement.changeset(%RequestReplayEntitlement{}, %{
+        attrs
+        | semantic_turn_digest: <<1>>,
+          replay_generation: 0,
+          status: "consumed"
+      })
+
+    refute malformed.valid?
+    assert "must be exactly 32 bytes" in errors_on(malformed).semantic_turn_digest
+    assert "must be equal to 1" in errors_on(malformed).replay_generation
+    assert "has an invalid replay lifecycle tuple" in errors_on(malformed).status
+
+    for {field, value, expected_error} <- [
+          {:model_identifier, " \t\n", "can't be blank"},
+          {:owner_lease_key_version, " \t\n", "can't be blank"},
+          {:replay_claim_digest, <<1>>, "must be exactly 32 bytes"},
+          {:owner_lease_digest, <<1>>, "must be exactly 32 bytes"},
+          {:predecessor_epoch, 0, "must be greater than or equal to 1"}
+        ] do
+      invalid =
+        RequestReplayEntitlement.changeset(
+          %RequestReplayEntitlement{},
+          Map.put(attrs, field, value)
+        )
+
+      refute invalid.valid?
+      assert expected_error in Map.fetch!(errors_on(invalid), field)
+    end
+
+    consumed =
+      Map.merge(attrs, %{
+        status: "consumed",
+        replay_attempt_id: Ecto.UUID.generate(),
+        provisional_binding_digest: <<4::256>>,
+        consumed_at: DateTime.add(now, 1, :second),
+        abandon_at: DateTime.add(now, 10, :second)
+      })
+
+    assert RequestReplayEntitlement.changeset(%RequestReplayEntitlement{}, consumed).valid?
+
+    invalid_started = Map.put(consumed, :started_at, DateTime.add(now, 2, :second))
+    refute RequestReplayEntitlement.changeset(%RequestReplayEntitlement{}, invalid_started).valid?
+  end
+
+  @tag :replay_schema
+  test "replay HMAC contracts use configured shared crypto and fail closed" do
+    previous = CodexPooler.TestAppEnv.restore_on_exit(CodexPooler.Upstreams)
+
+    key = :binary.copy(<<7>>, 32)
+
+    Application.put_env(
+      :codex_pooler,
+      CodexPooler.Upstreams,
+      Keyword.merge(previous, upstream_secret_key: key, upstream_secret_key_version: "v-test")
+    )
+
+    owner_lease_uuid = "01234567-89ab-4cde-8fab-0123456789ab"
+    raw_token = :binary.copy(<<9>>, 32)
+
+    expected_owner =
+      :crypto.mac(
+        :hmac,
+        :sha256,
+        key,
+        :erlang.term_to_binary(
+          {"codex_pooler.owner_lease_digest", 1, "v-test", owner_lease_uuid},
+          [:deterministic]
+        )
+      )
+
+    assert Base.encode16(expected_owner, case: :lower) ==
+             "87cbfe70696722f98f8d6302e5e7191c0f224ece33c651bf8e7d2f97bcf9600b"
+
+    expected_provisional =
+      :crypto.mac(
+        :hmac,
+        :sha256,
+        key,
+        :erlang.term_to_binary(
+          {"codex_pooler.replay_provisional_binding", 1, "v-test", raw_token},
+          [:deterministic]
+        )
+      )
+
+    assert Base.encode16(expected_provisional, case: :lower) ==
+             "9003e48808b3400d5037c3e100183901d4f44728e4795b158e0cecaf0c753549"
+
+    assert {:ok, ^expected_owner} = RequestReplayEntitlement.owner_lease_digest(owner_lease_uuid)
+
+    assert RequestReplayEntitlement.verify_owner_lease_digest(
+             owner_lease_uuid,
+             "v-test",
+             expected_owner
+           )
+
+    assert {:ok, ^expected_provisional} =
+             RequestReplayEntitlement.provisional_binding_digest(raw_token)
+
+    assert RequestReplayEntitlement.verify_provisional_binding(
+             raw_token,
+             "v-test",
+             expected_provisional
+           )
+
+    refute RequestReplayEntitlement.verify_owner_lease_digest(
+             owner_lease_uuid,
+             "v-other",
+             expected_owner
+           )
+
+    refute RequestReplayEntitlement.verify_provisional_binding(
+             raw_token,
+             "v-other",
+             expected_provisional
+           )
+
+    assert {:error, :invalid_owner_lease_uuid} =
+             RequestReplayEntitlement.owner_lease_digest(String.upcase(owner_lease_uuid))
+
+    assert {:error, :invalid_provisional_token} =
+             RequestReplayEntitlement.provisional_binding_digest(<<1>>)
+
+    Application.put_env(
+      :codex_pooler,
+      CodexPooler.Upstreams,
+      Keyword.merge(previous,
+        upstream_secret_key: "invalid",
+        upstream_secret_key_version: "v-test"
+      )
+    )
+
+    assert {:error, %{code: :app_secret_key_invalid}} =
+             RequestReplayEntitlement.owner_lease_digest(owner_lease_uuid)
+
+    refute RequestReplayEntitlement.verify_owner_lease_digest(
+             owner_lease_uuid,
+             "v-test",
+             expected_owner
+           )
   end
 
   test "codex files expose bridge metadata columns without upload table dependency" do
@@ -1020,6 +1520,7 @@ defmodule CodexPooler.SchemaContractTest do
              :decimal
 
     assert DailyRollup.__schema__(:type, :settled_cost_micros) == :decimal
+    assert DailyRollup.__schema__(:type, :rounded_settled_cost_micros) == :decimal
     assert Quota.AccountQuotaWindow.__schema__(:type, :used_percent) == :decimal
 
     assert Quota.AccountQuotaWindow.__schema__(:type, :observed_at) ==
@@ -1030,6 +1531,7 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert LedgerEntry.__schema__(:type, :input_tokens) == :integer
     assert DailyRollup.__schema__(:type, :total_tokens) == :integer
+    assert DailyRollup.__schema__(:type, :admitted_request_count) == :integer
     assert HourlyModelUsageRollup.__schema__(:type, :total_tokens) == :integer
 
     assert APIKeyPolicyBinding.__schema__(:type, :max_tokens_per_day) ==
@@ -1048,8 +1550,7 @@ defmodule CodexPooler.SchemaContractTest do
     assert RoutingSettings.__schema__(:type, :prompt_cache_affinity_enabled) ==
              :boolean
 
-    assert RoutingSettings.__schema__(:type, :request_compression_enabled) ==
-             :boolean
+    refute :request_compression_enabled in RoutingSettings.__schema__(:fields)
 
     assert Model.__schema__(:type, :metadata) == :map
     assert FileRecord.__schema__(:type, :byte_size) == :integer
@@ -1058,11 +1559,25 @@ defmodule CodexPooler.SchemaContractTest do
   end
 
   test "phoenix filter parameters keep instance setting secret fields redacted" do
-    config_source = File.read!(Path.expand("../../config/config.exs", __DIR__))
+    sensitive_keys = [
+      "token",
+      "password",
+      "bearer_token",
+      "bearer_token_action",
+      "password_action"
+    ]
 
-    for key <- ["token", "password", "bearer_token", "bearer_token_action", "password_action"] do
-      assert config_source =~ ~s("#{key}")
+    filtered =
+      sensitive_keys
+      |> Map.new(&{&1, "synthetic-secret"})
+      |> Map.put("safe", "visible")
+      |> Phoenix.Logger.filter_values()
+
+    for key <- sensitive_keys do
+      assert filtered[key] == "[FILTERED]"
     end
+
+    assert filtered["safe"] == "visible"
   end
 
   test "quota evidence identity records are deterministic duplicates" do
@@ -1124,6 +1639,84 @@ defmodule CodexPooler.SchemaContractTest do
     |> Map.new(fn [name, definition] -> {name, definition} end)
   end
 
+  defp index_definitions do
+    Repo.query!("""
+    SELECT indexname, indexdef
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    """).rows
+    |> Map.new(fn [name, definition] -> {name, definition} end)
+  end
+
+  defp replay_foreign_key_actions do
+    [
+      {"request_replay_entitlements_request_id_fkey", {"c", "a"}},
+      {"request_replay_entitlements_api_key_id_fkey", {"c", "a"}},
+      {"request_replay_entitlements_codex_turn_request_fkey", {"a", "a"}},
+      {"request_replay_entitlements_eligible_attempt_request_fkey", {"a", "a"}},
+      {"request_replay_entitlements_replay_attempt_request_fkey", {"a", "a"}},
+      {"request_replay_entitlements_pool_id_fkey", {"a", "a"}},
+      {"request_replay_entitlements_model_id_fkey", {"a", "a"}}
+    ]
+  end
+
+  defp replay_function_contracts do
+    Repo.query!(
+      """
+      SELECT proname, provolatile::text, proparallel::text, proconfig
+      FROM pg_proc
+      WHERE pronamespace = 'public'::regnamespace
+        AND proname = ANY($1::text[])
+      ORDER BY proname
+      """,
+      [
+        [
+          "request_replay_db_now",
+          "enforce_request_replay_entitlement_update",
+          "enforce_request_replay_request_storage",
+          "enforce_request_replay_turn_snapshot"
+        ]
+      ]
+    ).rows
+    |> Map.new(fn [name, volatility, parallel, config] ->
+      {name, {volatility, parallel, config}}
+    end)
+  end
+
+  defp replay_trigger_names do
+    Repo.query!(
+      """
+      SELECT tgname
+      FROM pg_trigger
+      WHERE NOT tgisinternal
+        AND tgname = ANY($1::text[])
+      ORDER BY tgname
+      """,
+      [
+        [
+          "request_replay_entitlements_update_guard",
+          "request_replay_entitlements_insert_guard",
+          "request_replay_requests_storage_guard",
+          "request_replay_codex_turns_snapshot_guard"
+        ]
+      ]
+    ).rows
+    |> Enum.map(&List.first/1)
+  end
+
+  defp column_default(table_name, column_name) do
+    Repo.query!(
+      """
+      SELECT column_default
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      """,
+      [table_name, column_name]
+    ).rows
+  end
+
   defp public_tables do
     Repo.query!("""
     SELECT tablename
@@ -1145,6 +1738,49 @@ defmodule CodexPooler.SchemaContractTest do
       [table_name]
     ).rows
     |> Map.new(fn [name, type, nullable] -> {name, {type, nullable}} end)
+  end
+
+  defp trigger_names(table_name) do
+    Repo.query!(
+      """
+      SELECT tgname
+      FROM pg_trigger
+      WHERE tgrelid = ('public.' || $1)::regclass
+        AND NOT tgisinternal
+      ORDER BY tgname
+      """,
+      [table_name]
+    ).rows
+    |> Enum.map_join(" ", &List.first/1)
+  end
+
+  defp trigger_contracts(names) do
+    Repo.query!(
+      """
+      SELECT tgname, tgconstraint, tgdeferrable, tginitdeferred
+      FROM pg_trigger
+      WHERE tgname = ANY($1::text[])
+      ORDER BY tgname
+      """,
+      [names]
+    ).rows
+    |> Enum.map(fn [name, constraint_oid, deferrable, initially_deferred] ->
+      {name, constraint_oid, deferrable, initially_deferred}
+    end)
+  end
+
+  defp function_search_paths(names) do
+    Repo.query!(
+      """
+      SELECT proname, proconfig
+      FROM pg_proc
+      WHERE pronamespace = 'public'::regnamespace
+        AND proname = ANY($1::text[])
+      ORDER BY proname
+      """,
+      [names]
+    ).rows
+    |> Map.new(fn [name, config] -> {name, config} end)
   end
 
   defp constraint_containing?(constraints, text) do

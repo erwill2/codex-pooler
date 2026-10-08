@@ -12,7 +12,6 @@ defmodule CodexPoolerWeb.Admin.JobFilterFormTest do
     params = %{
       "state" => " retryable ",
       "worker" => " CodexPooler.Jobs.TokenRefreshWorker ",
-      "queue" => " jobs ",
       "attention" => "active_failure",
       "target_kind" => "upstream_identity",
       "target_id" => " #{@identity_id} ",
@@ -26,7 +25,6 @@ defmodule CodexPoolerWeb.Admin.JobFilterFormTest do
     assert filters == %{
              state: "retryable",
              worker: "CodexPooler.Jobs.TokenRefreshWorker",
-             queue: "jobs",
              attention: "active_failure",
              target_kind: "upstream_identity",
              target_id: @identity_id,
@@ -38,7 +36,6 @@ defmodule CodexPoolerWeb.Admin.JobFilterFormTest do
     assert form_values == %{
              "state" => "retryable",
              "worker" => "CodexPooler.Jobs.TokenRefreshWorker",
-             "queue" => "jobs",
              "attention" => "active_failure",
              "target_kind" => "upstream_identity",
              "target_id" => @identity_id,
@@ -51,7 +48,6 @@ defmodule CodexPoolerWeb.Admin.JobFilterFormTest do
              "attention" => "active_failure",
              "job_id" => "42",
              "page" => "3",
-             "queue" => "jobs",
              "show_completed" => "true",
              "state" => "retryable",
              "target_id" => @identity_id,
@@ -143,16 +139,11 @@ defmodule CodexPoolerWeb.Admin.JobFilterFormTest do
 
   test "warns for invalid target combinations without applying unsafe target filters" do
     invalid_cases = [
-      {%{"target_id" => @pool_id}, :target_kind,
-       "Target kind is required when target id is present"},
-      {%{"target_kind" => "tenant", "target_id" => @pool_id}, :target_kind,
-       "Target kind filter is not supported"},
-      {%{"target_kind" => "pool", "target_id" => "not-a-uuid"}, :target_id,
-       "Target id must be a valid UUID for the selected target kind"},
-      {%{"target_kind" => "rollup_date", "target_id" => "2026-99-99"}, :target_id,
-       "Target id must be a valid ISO date for rollup_date"},
-      {%{"target_kind" => "system", "target_id" => @pool_id}, :target_id,
-       "Target id must be blank for system jobs"}
+      {%{"target_id" => @pool_id}, :target_kind, "Target kind is required when target id is present"},
+      {%{"target_kind" => "tenant", "target_id" => @pool_id}, :target_kind, "Target kind filter is not supported"},
+      {%{"target_kind" => "pool", "target_id" => "not-a-uuid"}, :target_id, "Target id must be a valid UUID for the selected target kind"},
+      {%{"target_kind" => "rollup_date", "target_id" => "2026-99-99"}, :target_id, "Target id must be a valid ISO date for rollup_date"},
+      {%{"target_kind" => "system", "target_id" => @pool_id}, :target_id, "Target id must be blank for system jobs"}
     ]
 
     for {params, field, message} <- invalid_cases do

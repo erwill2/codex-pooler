@@ -6,8 +6,10 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   alias CodexPooler.Jobs
   alias CodexPooler.Jobs.Schedule
   alias CodexPoolerWeb.Admin.AvatarComponents
+  alias CodexPoolerWeb.Admin.BadgeComponents
   alias CodexPoolerWeb.Admin.JobsPresentation.{State, Targets}
   alias CodexPoolerWeb.DateTimeDisplay
+  alias CodexPoolerWeb.RelativeTime
   alias Oban.Cron.Expression
 
   @visible_open_marker_limit 8
@@ -75,9 +77,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   def format_job_timestamp(nil, _datetime_preferences), do: "No observed run"
 
   def format_job_timestamp(%DateTime{} = datetime, datetime_preferences) do
-    DateTimeDisplay.format_datetime(datetime, datetime_preferences,
-      missing_label: "No observed run"
-    )
+    DateTimeDisplay.format_datetime(datetime, datetime_preferences, missing_label: "No observed run")
   end
 
   @spec timestamp_line(String.t(), DateTime.t() | nil, DateTimeDisplay.preferences()) ::
@@ -94,11 +94,60 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   @spec job_state_icon_class(String.t() | nil) :: String.t()
   defdelegate job_state_icon_class(state), to: State, as: :icon_class
 
-  @spec job_state_badge_class(String.t() | nil) :: String.t()
-  defdelegate job_state_badge_class(state), to: State, as: :badge_class
+  @doc """
+  Chip classes for a job state, from the shared badge vocabulary.
+
+  Always a complete chip; a tone on its own has no shape and paints a band
+  across whatever box it lands in.
+  """
+  @spec job_state_chip_class(String.t() | nil) :: String.t()
+  def job_state_chip_class(state), do: BadgeComponents.metadata_chip_class(State.tone(state))
+
+  @doc """
+  Text-only variant of the state, for rows that name the state inline.
+  """
+  @spec job_state_text_class(String.t() | nil) :: String.t()
+  def job_state_text_class(state), do: "font-semibold #{state_text_tone(State.tone(state))}"
+
+  defp state_text_tone(:success), do: "text-success"
+  defp state_text_tone(:warning), do: "text-warning"
+  defp state_text_tone(:error), do: "text-error"
+  defp state_text_tone(:info), do: "text-info"
+  defp state_text_tone(_tone), do: "text-base-content/70"
 
   @spec job_state_label(String.t() | nil) :: String.t()
   defdelegate job_state_label(state), to: State, as: :label
+
+  @spec job_state_tone(String.t() | nil) :: atom()
+  defdelegate job_state_tone(state), to: State, as: :tone
+
+  @doc """
+  Operator-facing name for a worker module.
+
+  `CodexPooler.Jobs.AccountReconciliationWorker` reads as
+  "Account reconciliation". The module itself stays available for the title
+  attribute and the drawer, which is where the exact value matters.
+  """
+  @spec job_worker_label(term()) :: String.t()
+  def job_worker_label(worker) when is_binary(worker) and worker != "" do
+    worker
+    |> String.split(".")
+    |> List.last()
+    |> String.replace_suffix("Worker", "")
+    |> humanize_module_segment()
+  end
+
+  def job_worker_label(_worker), do: "Unnamed job"
+
+  defp humanize_module_segment(segment) do
+    case Regex.scan(~r/[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+/, segment) do
+      [] ->
+        segment
+
+      [[first] | rest] ->
+        Enum.map_join([first | Enum.map(rest, fn [word] -> String.downcase(word) end)], " ", & &1)
+    end
+  end
 
   defp worker_groups, do: Schedule.worker_groups()
 
@@ -134,8 +183,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       visible_open_markers: Enum.take(open_markers, @visible_open_marker_limit),
       open_marker_overflow_count: marker_overflow_count(open_markers, @visible_open_marker_limit),
       visible_failure_markers: Enum.take(failure_markers, @visible_failure_marker_limit),
-      failure_marker_overflow_count:
-        marker_overflow_count(failure_markers, @visible_failure_marker_limit),
+      failure_marker_overflow_count: marker_overflow_count(failure_markers, @visible_failure_marker_limit),
       latest_failure: latest_failure_summary(latest_unresolved_failure),
       activity_label: activity_label(open_markers, failure_markers),
       last_seen_at: job_event_timestamp(latest_job),
@@ -568,10 +616,10 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   defp relative_time(nil, _now), do: "Unknown"
 
   defp relative_time(%DateTime{} = datetime, %DateTime{} = now) do
-    diff_seconds = DateTime.diff(datetime, now, :second)
+    diff_seconds = RelativeTime.seconds_until(datetime, now)
 
     cond do
-      diff_seconds <= 0 ->
+      DateTime.compare(datetime, now) != :gt ->
         "Due now"
 
       diff_seconds < 60 ->

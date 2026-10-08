@@ -8,39 +8,74 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     InputShape,
     RequestOptions,
     StrictSchema,
+    ToolResultShape,
     ToolSchemaLowering
   }
 
+  alias CodexPooler.ServiceTier
+
   @reasoning_contexts ~w(auto current_turn all_turns)
   @reasoning_summaries ~w(auto concise detailed)
-  @service_tiers ~w(auto default flex priority scale)
+  @service_tiers ~w(auto default flex priority scale ultrafast)
   @truncation_modes ~w(auto disabled)
+  # The type-only built-ins an `allowed_tools` choice may name (Full only). `programmatic_tool_calling` and
+  # `web_search_preview` left on 2026-10-06: the Codex backend refuses both tool types on a Full request (findings#333).
+  @allowed_tools_builtin_types ~w(web_search image_generation)
   @locally_unsupported_fields ~w(background context_management conversation max_tool_calls prompt top_logprobs user)
+
+  # The hosted `web_search` tool keys the provider accepts, in Full and in the Lite manifest alike (direct probe,
+  # 2026-10-06: every other key, `zz_probe_unknown_key` and the pre-0.144.0 Codex spelling `index_gated_web_access`
+  # included, is refused `400 unknown_parameter`). Released Codex serializes exactly these since 0.144.0
+  # (`indexed_web_access` replaced `index_gated_web_access` there), and the vocabularies below are the provider's own.
+  @web_search_keys ~w(type external_web_access indexed_web_access filters user_location search_context_size search_content_types)
+  @web_search_user_location_keys ~w(type country region city timezone)
+  @web_search_context_sizes ~w(low medium high)
+  @web_search_content_types ~w(text image)
+  @tool_search_keys ~w(type execution description parameters)
+  # The public API's `metadata` contract (raw probe 2026-10-06, findings#333): an object of at most 16 properties, names
+  # of at most 64 characters, string values of at most 512 characters, or null; the codes are the public API's.
+  @metadata_max_properties 16
+  @metadata_max_name_length 64
+  @metadata_max_value_length 512
+  @tool_search_executions ~w(server client)
 
   @endpoint "/backend-api/codex/responses"
 
   @spec validate(term()) :: {:ok, map()} | {:error, Error.reason()}
-  def validate(payload) do
+  def validate(payload), do: validate(payload, [])
+
+  @spec validate(term(), map() | keyword()) :: {:ok, map()} | {:error, Error.reason()}
+  def validate(payload, opts) do
+    surface = surface(opts)
+
     with {:ok, payload} <- Validation.normalize_payload(payload),
          :ok <- Validation.reject_high_impact_fields(payload),
          :ok <- Validation.reject_unsupported_fields(payload, :responses),
          :ok <- Validation.require_model(payload),
          :ok <- reject_locally_unsupported_fields(payload),
+         :ok <- validate_metadata(payload),
+         :ok <- validate_access_programs(payload),
          :ok <- validate_prompt_cache_options(payload),
+         {:ok, payload} <- Input.drop_public_call_id_item_ids(payload),
          {:ok, payload} <- Input.normalize_recoverable_opencode_replay_call_ids(payload),
          {:ok, payload} <- Input.normalize_list_input(payload),
+         payload = normalize_optional_function_tool_booleans(payload),
          payload = ToolSchemaLowering.lower_non_strict_function_tools(payload),
-         :ok <- Input.validate_input(payload),
-         :ok <- Input.validate_previous_response_continuation(payload),
+         has_tool_result? = ToolResultShape.any?(Map.get(payload, "input")),
+         :ok <- Input.validate_input(payload, has_tool_result?),
+         :ok <- Input.validate_previous_response_continuation(payload, has_tool_result?),
          :ok <- validate_tools(payload),
-         :ok <- validate_tool_choice(payload),
+         :ok <- StrictSchema.validate_public_type_vocabulary(payload),
+         :ok <- StrictSchema.validate_public_root_contract(payload),
+         {:ok, payload} <- maybe_repair_direct_responses_function_tools(payload, surface),
+         :ok <- validate_tool_choice(payload, surface),
          :ok <- validate_max_output_tokens(payload),
          :ok <- validate_reasoning(payload),
          :ok <- validate_moderation(payload),
          :ok <- validate_service_tier(payload),
          :ok <- validate_truncation(payload),
          :ok <- validate_stream_options(payload),
-         :ok <- StrictSchema.validate(payload),
+         :ok <- StrictSchema.validate_public(payload),
          :ok <- InputShape.validate(payload) do
       Input.normalize_audio_input(payload)
     end
@@ -50,22 +85,124 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
           {:ok, %{endpoint: String.t(), payload: map(), request_options: RequestOptions.t()}}
           | {:error, Error.reason()}
   def coerce(payload, opts \\ %{}) do
-    with {:ok, payload} <- validate(payload),
+    original_input = if is_map(payload), do: Map.get(payload, "input")
+
+    with {:ok, payload} <- validate(payload, opts),
          {:ok, payload} <-
            payload
            |> Map.take(Matrix.forwarded_fields(:responses))
            |> normalize_forwarded_enums()
-           |> Input.normalize_input() do
+           |> Input.finalize_normalized_input() do
       payload =
         maybe_force_backend_streaming(payload, opts)
 
-      request_options = RequestOptions.build(opts, @endpoint, payload)
+      request_options =
+        opts
+        |> drop_surface()
+        |> RequestOptions.build(@endpoint, payload)
+        |> RequestOptions.put_openai_compatibility(custom_tool_namespaces: custom_tool_namespaces(payload))
+        |> preserve_client_input_coordinates(original_input, Map.get(payload, "input"))
+
       {:ok, %{endpoint: @endpoint, payload: payload, request_options: request_options}}
     end
   end
 
-  @spec response_from_sse(binary()) :: {:ok, map()} | {:error, Error.reason()}
-  def response_from_sse(body) when is_binary(body), do: SSE.response_from_sse(body)
+  # Adapter removals can occur at any position (reasoning replay and lifted
+  # instruction messages). The upstream length proof cannot reconstruct those
+  # client coordinates: keep the field path, but do not guess its item index.
+  defp preserve_client_input_coordinates(options, original, normalized)
+       when is_list(original) and is_list(normalized) do
+    if length(original) == length(normalized) and not Enum.any?(original, &expands_input_positions?/1),
+      do: options,
+      else: RequestOptions.put_runtime_context(options, upstream_input_index_map: :unknown)
+  end
+
+  defp preserve_client_input_coordinates(options, _original, _normalized), do: options
+
+  defp expands_input_positions?(%{"role" => "assistant", "tool_calls" => calls}) when is_list(calls), do: length(calls) != 1
+  defp expands_input_positions?(_item), do: false
+
+  defp validate_access_programs(%{"access_programs" => programs}) when is_map(programs) do
+    cond do
+      Map.keys(programs) -- ["cyber"] != [] ->
+        {:error, Error.invalid_request("access_programs contains unsupported fields", "access_programs")}
+
+      not Map.has_key?(programs, "cyber") or programs["cyber"] in ~w(standard daybreak_blue daybreak_red) ->
+        :ok
+
+      true ->
+        {:error, Error.invalid_request("access_programs.cyber is not supported", "access_programs.cyber")}
+    end
+  end
+
+  defp validate_access_programs(%{"access_programs" => _value}),
+    do: {:error, Error.invalid_request("access_programs must be an object", "access_programs")}
+
+  defp validate_access_programs(_payload), do: :ok
+
+  # `metadata` is accepted with the public API's shape and never reaches the Codex backend, which refuses the
+  # parameter (`PayloadNormalizer` strips it with the other upstream-unsupported controls, findings#333). The
+  # refusals carry the public API's codes on `metadata`, without echoing a client key or value.
+  defp validate_metadata(%{"metadata" => nil}), do: :ok
+
+  defp validate_metadata(%{"metadata" => metadata}) when is_map(metadata) do
+    cond do
+      map_size(metadata) > @metadata_max_properties ->
+        {:error, Error.reason(400, "object_above_max_properties", "metadata must have at most #{@metadata_max_properties} properties", "metadata")}
+
+      Enum.any?(metadata, fn {name, _value} -> not within_length?(name, @metadata_max_name_length) end) ->
+        {:error, Error.reason(400, "property_name_above_max_length", "metadata property names must be at most #{@metadata_max_name_length} characters", "metadata")}
+
+      Enum.any?(metadata, fn {_name, value} -> not is_binary(value) end) ->
+        {:error, Error.reason(400, "invalid_type", "metadata values must be strings", "metadata")}
+
+      Enum.any?(metadata, fn {_name, value} -> not within_length?(value, @metadata_max_value_length) end) ->
+        {:error, Error.reason(400, "string_above_max_length", "metadata values must be at most #{@metadata_max_value_length} characters", "metadata")}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_metadata(%{"metadata" => _metadata}),
+    do: {:error, Error.reason(400, "invalid_type", "metadata must be an object", "metadata")}
+
+  defp validate_metadata(_payload), do: :ok
+
+  # A length in characters (code points), bounded before counting: at most 4 bytes encode one.
+  defp within_length?(value, max) when is_binary(value) and byte_size(value) <= max, do: true
+  defp within_length?(value, max) when is_binary(value) and byte_size(value) > max * 4, do: false
+  defp within_length?(value, max) when is_binary(value), do: value |> String.codepoints() |> length() <= max
+  defp within_length?(_value, _max), do: false
+
+  defp surface(opts) when is_list(opts), do: Keyword.get(opts, :surface, :responses)
+  defp surface(%RequestOptions{}), do: :responses
+  defp surface(opts) when is_map(opts), do: Map.get(opts, :surface, :responses)
+
+  defp maybe_repair_direct_responses_function_tools(payload, :responses),
+    do: StrictSchema.repair_direct_responses_function_tools(payload)
+
+  defp maybe_repair_direct_responses_function_tools(payload, :chat), do: {:ok, payload}
+
+  defp drop_surface(opts) when is_list(opts), do: Keyword.delete(opts, :surface)
+  defp drop_surface(%RequestOptions{} = opts), do: opts
+  defp drop_surface(opts) when is_map(opts), do: Map.delete(opts, :surface)
+
+  @spec response_from_sse(binary(), RequestOptions.t() | map()) ::
+          {:ok, map()} | {:error, Error.reason()}
+  def response_from_sse(body, request_options \\ %{}) when is_binary(body) do
+    SSE.response_from_sse(body, custom_tool_namespaces(request_options))
+  end
+
+  @spec restore_custom_tool_call_namespaces(map(), map()) :: map()
+  def restore_custom_tool_call_namespaces(%{} = value, custom_tool_namespaces)
+      when is_map(custom_tool_namespaces) do
+    value
+    |> restore_nested_response(custom_tool_namespaces)
+    |> restore_nested_item(custom_tool_namespaces)
+    |> restore_output_items(custom_tool_namespaces)
+    |> restore_custom_tool_call_namespace(custom_tool_namespaces)
+  end
 
   defp maybe_force_backend_streaming(payload, opts) do
     if backend_streaming_required?(opts) do
@@ -96,7 +233,88 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   defp backend_streaming_required?(opts) when is_list(opts),
     do: backend_streaming_required?(Map.new(opts))
 
-  defp backend_streaming_required?(_opts), do: false
+  defp custom_tool_namespaces(%RequestOptions{
+         openai_compatibility: %{custom_tool_namespaces: custom_tool_namespaces}
+       })
+       when is_map(custom_tool_namespaces),
+       do: custom_tool_namespaces
+
+  defp custom_tool_namespaces(%{"tools" => tools}) when is_list(tools),
+    do: custom_tool_namespaces_from_tools(tools)
+
+  defp custom_tool_namespaces(%{tools: tools}) when is_list(tools),
+    do: custom_tool_namespaces_from_tools(tools)
+
+  defp custom_tool_namespaces(_value), do: %{}
+
+  defp custom_tool_namespaces_from_tools(tools) do
+    Enum.reduce(tools, %{}, fn
+      %{"type" => "namespace", "name" => namespace, "tools" => children}, acc
+      when is_binary(namespace) and is_list(children) ->
+        Enum.reduce(children, acc, fn
+          %{"type" => "custom", "name" => name}, child_acc when is_binary(name) ->
+            Map.put(child_acc, name, namespace)
+
+          _child, child_acc ->
+            child_acc
+        end)
+
+      _tool, acc ->
+        acc
+    end)
+  end
+
+  defp restore_nested_response(%{"response" => %{} = response} = value, namespaces) do
+    Map.put(value, "response", restore_custom_tool_call_namespaces(response, namespaces))
+  end
+
+  defp restore_nested_response(value, _namespaces), do: value
+
+  defp restore_nested_item(%{"item" => %{} = item} = value, namespaces) do
+    Map.put(value, "item", restore_custom_tool_call_namespaces(item, namespaces))
+  end
+
+  defp restore_nested_item(value, _namespaces), do: value
+
+  defp restore_output_items(%{"output" => output} = value, namespaces) when is_list(output) do
+    output =
+      Enum.map(output, fn
+        %{} = item -> restore_custom_tool_call_namespaces(item, namespaces)
+        item -> item
+      end)
+
+    Map.put(value, "output", output)
+  end
+
+  defp restore_output_items(value, _namespaces), do: value
+
+  defp restore_custom_tool_call_namespace(
+         %{"type" => "custom_tool_call", "name" => name} = item,
+         namespaces
+       )
+       when is_binary(name) do
+    case {Map.get(item, "namespace"), Map.fetch(namespaces, name)} do
+      {nil, {:ok, namespace}} -> Map.put(item, "namespace", namespace)
+      {_provider_namespace, _mapping} -> item
+    end
+  end
+
+  defp restore_custom_tool_call_namespace(value, _namespaces), do: value
+
+  defp normalize_optional_function_tool_booleans(%{"tools" => tools} = payload)
+       when is_list(tools) do
+    Map.put(payload, "tools", Enum.map(tools, &normalize_optional_function_tool_booleans/1))
+  end
+
+  defp normalize_optional_function_tool_booleans(%{"type" => "function", "strict" => nil} = tool),
+    do: Map.delete(tool, "strict")
+
+  defp normalize_optional_function_tool_booleans(%{"type" => "namespace", "tools" => tools} = tool)
+       when is_list(tools) do
+    Map.put(tool, "tools", Enum.map(tools, &normalize_optional_function_tool_booleans/1))
+  end
+
+  defp normalize_optional_function_tool_booleans(value), do: value
 
   defp validate_prompt_cache_options(%{"prompt_cache_options" => options})
        when is_map(options) do
@@ -109,9 +327,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   end
 
   defp validate_prompt_cache_options(%{"prompt_cache_options" => _options}),
-    do:
-      {:error,
-       Error.invalid_request("prompt_cache_options must be an object", "prompt_cache_options")}
+    do: {:error, Error.invalid_request("prompt_cache_options must be an object", "prompt_cache_options")}
 
   defp validate_prompt_cache_options(_payload), do: :ok
 
@@ -177,9 +393,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
        do: :ok
 
   defp validate_max_output_tokens(%{"max_output_tokens" => _value}),
-    do:
-      {:error,
-       Error.invalid_request("max_output_tokens must be a positive integer", "max_output_tokens")}
+    do: {:error, Error.invalid_request("max_output_tokens must be a positive integer", "max_output_tokens")}
 
   defp validate_max_output_tokens(_payload), do: :ok
 
@@ -264,7 +478,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   end
 
   defp validate_service_tier(%{"service_tier" => tier}) when is_binary(tier) do
-    normalized = tier |> String.trim() |> String.downcase()
+    normalized = ServiceTier.canonicalize(tier)
 
     if normalized in @service_tiers do
       :ok
@@ -323,16 +537,20 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
         :ok
 
       [key | _rest] ->
-        {:error,
-         Error.invalid_request("stream_options field is not supported", "stream_options." <> key)}
+        {:error, Error.invalid_request("stream_options field is not supported", "stream_options." <> key)}
     end
   end
 
   defp normalize_forwarded_enums(payload) do
     payload
-    |> normalize_string_field("service_tier")
+    |> normalize_service_tier()
     |> normalize_reasoning_fields()
   end
+
+  defp normalize_service_tier(%{"service_tier" => tier} = payload) when is_binary(tier),
+    do: Map.put(payload, "service_tier", ServiceTier.canonicalize(tier))
+
+  defp normalize_service_tier(payload), do: payload
 
   defp normalize_string_field(payload, field) do
     case Map.fetch(payload, field) do
@@ -357,6 +575,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     do: value |> String.trim() |> String.downcase()
 
   defp validate_tools(%{"tools" => tools}) when is_list(tools) do
+    with :ok <- validate_each_tool(tools) do
+      validate_unique_tool_names(tools)
+    end
+  end
+
+  defp validate_tools(%{"tools" => _tools}),
+    do: {:error, Error.invalid_request("tools must be an array", "tools")}
+
+  defp validate_tools(_payload), do: :ok
+
+  defp validate_each_tool(tools) do
     Enum.reduce_while(tools, :ok, fn tool, _acc ->
       case validate_tool(tool) do
         :ok -> {:cont, :ok}
@@ -365,10 +594,36 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     end)
   end
 
-  defp validate_tools(%{"tools" => _tools}),
-    do: {:error, Error.invalid_request("tools must be an array", "tools")}
+  defp validate_unique_tool_names(tools) do
+    executable_names = executable_tool_names(tools)
+    namespace_names = namespace_tool_names(tools)
 
-  defp validate_tools(_payload), do: :ok
+    if duplicate_name?(executable_names) or duplicate_name?(namespace_names),
+      do: {:error, Error.invalid_request("tool names must be unique", "tools")},
+      else: :ok
+  end
+
+  defp executable_tool_names(tools) do
+    Enum.flat_map(tools, fn
+      %{"type" => type, "name" => name} when type in ["function", "custom"] ->
+        [name]
+
+      %{"type" => "namespace", "tools" => namespace_tools} ->
+        Enum.map(namespace_tools, &Map.fetch!(&1, "name"))
+
+      _tool ->
+        []
+    end)
+  end
+
+  defp namespace_tool_names(tools) do
+    Enum.flat_map(tools, fn
+      %{"type" => "namespace", "name" => name} -> [name]
+      _tool -> []
+    end)
+  end
+
+  defp duplicate_name?(names), do: length(names) != MapSet.size(MapSet.new(names))
 
   defp validate_tool(%{"type" => "namespace"} = tool) do
     with :ok <- validate_exact_tool_keys(tool, ["type", "name", "description", "tools"]),
@@ -393,30 +648,29 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   defp validate_tool(%{"deferred" => _deferred}),
     do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
 
-  defp validate_tool(%{"type" => "function", "name" => name, "parameters" => parameters})
-       when is_binary(name) and is_map(parameters) do
-    if String.trim(name) == "",
-      do: {:error, Error.invalid_request("function tool requires a non-empty name", "tools")},
-      else: :ok
-  end
+  defp validate_tool(%{"type" => "function"} = tool), do: validate_function_tool(tool)
 
-  defp validate_tool(%{"type" => "function"}),
-    do:
-      {:error, Error.invalid_request("function tool requires flat name and parameters", "tools")}
+  defp validate_tool(%{"type" => "custom"} = tool), do: validate_custom_tool(tool)
 
-  defp validate_tool(%{"type" => "web_search_preview"} = tool),
+  defp validate_tool(%{"type" => "programmatic_tool_calling"} = tool),
     do: validate_exact_builtin_tool(tool, ["type"])
 
+  # The Codex backend refuses `web_search_preview` on a Full request (`Unsupported tool type: web_search_preview`) and,
+  # in a Lite manifest, on some requests and not others while the refusal rolls out (6 of 9 samples, HTTP and
+  # websocket; direct probe 2026-10-06, findings#333). It is refused here on every serving mode, never rewritten to
+  # `web_search`, which the backend accepts.
+  defp validate_tool(%{"type" => "web_search_preview"}),
+    do: {:error, Error.invalid_request("web_search_preview tools are not supported; declare web_search", "tools")}
+
   defp validate_tool(%{"type" => "web_search"} = tool) do
-    with :ok <-
-           validate_exact_builtin_tool(tool, [
-             "type",
-             "external_web_access",
-             "index_gated_web_access"
-           ]),
-         :ok <- validate_required_boolean_tool_field(tool, "external_web_access"),
-         :ok <- validate_optional_boolean_tool_field(tool, "index_gated_web_access") do
-      validate_index_gated_web_access(tool)
+    with :ok <- validate_exact_builtin_tool(tool, @web_search_keys),
+         :ok <- validate_optional_boolean_tool_field(tool, "external_web_access"),
+         :ok <- validate_optional_boolean_tool_field(tool, "indexed_web_access"),
+         :ok <- validate_optional_web_search_filters(tool),
+         :ok <- validate_optional_web_search_user_location(tool),
+         :ok <- validate_optional_web_search_context_size(tool),
+         :ok <- validate_optional_web_search_content_types(tool) do
+      validate_indexed_web_access(tool)
     end
   end
 
@@ -424,27 +678,66 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          %{"type" => "image_generation", "model" => model, "size" => size, "quality" => quality} =
            tool
        )
-       when is_binary(model) and is_binary(size) and is_binary(quality),
-       do:
-         validate_exact_builtin_tool(tool, [
-           "type",
-           "model",
-           "size",
-           "quality",
-           "background",
-           "input_fidelity",
-           "output_format"
-         ])
+       when is_binary(model) and is_binary(size) and is_binary(quality) do
+    with :ok <- validate_image_mask(tool) do
+      validate_exact_builtin_tool(tool, [
+        "type",
+        "model",
+        "size",
+        "quality",
+        "background",
+        "input_fidelity",
+        "input_image_mask",
+        "output_format"
+      ])
+    end
+  end
 
   defp validate_tool(%{"type" => "image_generation"} = tool),
     do: validate_exact_builtin_tool(tool, ["type"])
 
+  # The provider's `tool_search` tool, which loads deferred tools (`defer_loading: true`) on demand (findings#313,
+  # direct probe on `gpt-6-luna`, Codex backend, Full shape and Lite manifest): `execution` is `server` (the provider
+  # searches) or `client` (the client does, described by its own `description` and `parameters`); any other key is
+  # refused `unknown_parameter` and any other `execution` `invalid_value`, so both are refused here before dispatch.
+  # The pairing rules (a deferred tool needs a `tool_search`, a `tool_search` needs a deferred tool, a client-executed
+  # search needs a description) are the provider's own: Full refuses them with the param the relay names, and a Lite
+  # manifest, where the search does not run, does not enforce them, so they are not repeated here.
+  defp validate_tool(%{"type" => "tool_search"} = tool) do
+    with :ok <- validate_exact_builtin_tool(tool, @tool_search_keys),
+         :ok <- validate_optional_tool_search_execution(tool),
+         :ok <- validate_optional_nullable_tool_field(tool, "description", &is_binary/1) do
+      validate_optional_nullable_tool_field(tool, "parameters", &is_map/1)
+    end
+  end
+
   defp validate_tool(_tool),
     do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
 
+  defp validate_optional_tool_search_execution(%{"execution" => execution}) when execution in @tool_search_executions, do: :ok
+  defp validate_optional_tool_search_execution(%{"execution" => _execution}), do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+  defp validate_optional_tool_search_execution(_tool), do: :ok
+
+  defp validate_optional_nullable_tool_field(tool, field, valid?) do
+    case Map.fetch(tool, field) do
+      :error -> :ok
+      {:ok, nil} -> :ok
+      {:ok, value} -> if valid?.(value), do: :ok, else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+    end
+  end
+
+  defp validate_image_mask(%{"input_image_mask" => %{"image_url" => url} = mask})
+       when is_binary(url) and byte_size(url) > 0 and map_size(mask) == 1,
+       do: :ok
+
+  defp validate_image_mask(%{"input_image_mask" => _}),
+    do: {:error, Error.invalid_request("image mask requires an image_url", "tools")}
+
+  defp validate_image_mask(_), do: :ok
+
   defp validate_namespace_tools(tools) when is_list(tools) and tools != [] do
     Enum.reduce_while(tools, :ok, fn tool, _acc ->
-      case validate_namespace_function_tool(tool) do
+      case validate_namespace_tool(tool) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -452,11 +745,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   end
 
   defp validate_namespace_tools(_tools),
-    do: {:error, Error.invalid_request("namespace tool requires function tools", "tools")}
+    do: {:error, Error.invalid_request("namespace tool requires function or custom tools", "tools")}
 
-  defp validate_namespace_function_tool(
-         %{"type" => "function", "name" => name, "parameters" => parameters} = tool
-       )
+  defp validate_namespace_tool(%{"type" => "function", "name" => name, "parameters" => parameters} = tool)
+       when is_binary(name) and is_map(parameters) do
+    validate_function_tool(tool)
+  end
+
+  defp validate_namespace_tool(%{"type" => "custom"} = tool), do: validate_custom_tool(tool)
+
+  defp validate_namespace_tool(_tool),
+    do: {:error, Error.invalid_request("namespace tool requires function or custom tools", "tools")}
+
+  defp validate_function_tool(%{"type" => "function", "name" => name, "parameters" => parameters} = tool)
        when is_binary(name) and is_map(parameters) do
     with :ok <-
            validate_exact_tool_keys(tool, [
@@ -465,17 +766,40 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
              "description",
              "parameters",
              "strict",
-             "defer_loading"
+             "defer_loading",
+             "allowed_callers",
+             "output_schema"
            ]),
          :ok <-
            validate_nonblank_tool_field(tool, "name", "function tool requires a non-empty name"),
-         :ok <- validate_optional_boolean_tool_field(tool, "strict") do
-      validate_optional_boolean_tool_field(tool, "defer_loading")
+         :ok <- validate_optional_boolean_tool_field(tool, "strict"),
+         :ok <- validate_optional_boolean_tool_field(tool, "defer_loading"),
+         :ok <- validate_optional_allowed_callers(tool) do
+      validate_optional_output_schema(tool)
     end
   end
 
-  defp validate_namespace_function_tool(_tool),
-    do: {:error, Error.invalid_request("namespace tool requires function tools", "tools")}
+  defp validate_function_tool(_tool),
+    do: {:error, Error.invalid_request("function tool requires flat name and parameters", "tools")}
+
+  defp validate_custom_tool(tool) do
+    with :ok <-
+           validate_exact_tool_keys(tool, [
+             "type",
+             "name",
+             "description",
+             "defer_loading",
+             "allowed_callers",
+             "format"
+           ]),
+         :ok <-
+           validate_nonblank_tool_field(tool, "name", "custom tool requires a non-empty name"),
+         :ok <- validate_optional_string_tool_field(tool, "description"),
+         :ok <- validate_optional_boolean_tool_field(tool, "defer_loading"),
+         :ok <- validate_optional_custom_allowed_callers(tool) do
+      validate_optional_custom_format(tool)
+    end
+  end
 
   defp validate_nonblank_tool_field(tool, field, message) do
     case Map.get(tool, field) do
@@ -497,26 +821,173 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     end
   end
 
-  defp validate_required_boolean_tool_field(tool, field) do
+  defp validate_optional_string_tool_field(tool, field) do
     case Map.fetch(tool, field) do
-      {:ok, value} when is_boolean(value) -> :ok
+      {:ok, value} when is_binary(value) -> :ok
       {:ok, _value} -> {:error, Error.invalid_request("tool shape is not translatable", "tools")}
-      :error -> {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+      :error -> :ok
     end
   end
 
-  defp validate_index_gated_web_access(%{"index_gated_web_access" => false}) do
+  defp validate_optional_custom_allowed_callers(%{"allowed_callers" => nil}), do: :ok
+
+  defp validate_optional_custom_allowed_callers(%{"allowed_callers" => allowed_callers})
+       when is_list(allowed_callers) do
+    if Enum.all?(allowed_callers, &(&1 in ["direct", "programmatic"])),
+      do: :ok,
+      else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+  end
+
+  defp validate_optional_custom_allowed_callers(%{"allowed_callers" => _allowed_callers}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_custom_allowed_callers(_tool), do: :ok
+
+  defp validate_optional_custom_format(%{"format" => %{"type" => "text"} = format}),
+    do: validate_exact_tool_keys(format, ["type"])
+
+  defp validate_optional_custom_format(%{
+         "format" =>
+           %{
+             "type" => "grammar",
+             "definition" => definition,
+             "syntax" => syntax
+           } = format
+       })
+       when is_binary(definition) and syntax in ["lark", "regex"] do
+    with :ok <- validate_exact_tool_keys(format, ["type", "definition", "syntax"]) do
+      if String.trim(definition) == "",
+        do: {:error, Error.invalid_request("tool shape is not translatable", "tools")},
+        else: :ok
+    end
+  end
+
+  defp validate_optional_custom_format(%{"format" => _format}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_custom_format(_tool), do: :ok
+
+  defp validate_optional_web_search_filters(%{"filters" => filters})
+       when is_map(filters) and map_size(filters) > 0 do
+    with :ok <- validate_exact_tool_keys(filters, ["allowed_domains", "blocked_domains"]),
+         :ok <- validate_optional_web_search_domain_list(filters, "allowed_domains") do
+      validate_optional_web_search_domain_list(filters, "blocked_domains")
+    end
+  end
+
+  defp validate_optional_web_search_filters(%{"filters" => _filters}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_web_search_filters(_tool), do: :ok
+
+  defp validate_optional_web_search_domain_list(filters, field) do
+    case Map.fetch(filters, field) do
+      {:ok, domains} when is_list(domains) and domains != [] and length(domains) <= 100 ->
+        if Enum.all?(domains, &valid_web_search_domain?/1),
+          do: :ok,
+          else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+      {:ok, _domains} ->
+        {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp valid_web_search_domain?(domain) when is_binary(domain) do
+    trimmed_domain = String.trim(domain)
+    downcased_domain = String.downcase(trimmed_domain)
+
+    trimmed_domain != "" and not String.starts_with?(downcased_domain, "http://") and
+      not String.starts_with?(downcased_domain, "https://")
+  end
+
+  defp valid_web_search_domain?(_domain), do: false
+
+  defp validate_optional_web_search_user_location(%{"user_location" => %{} = location}) do
+    with :ok <- validate_exact_tool_keys(location, @web_search_user_location_keys),
+         :ok <- validate_web_search_location_type(location) do
+      if location |> Map.delete("type") |> Map.values() |> Enum.all?(&nonblank_string?/1),
+        do: :ok,
+        else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+    end
+  end
+
+  defp validate_optional_web_search_user_location(%{"user_location" => _location}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_web_search_user_location(_tool), do: :ok
+
+  # The provider requires `type` once `user_location` is present (`missing_required_parameter` on
+  # `tools[0].user_location.type`) and knows only `approximate`; a location of `type` alone is accepted.
+  defp validate_web_search_location_type(%{"type" => "approximate"}), do: :ok
+
+  defp validate_web_search_location_type(_location),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp nonblank_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp nonblank_string?(_value), do: false
+
+  defp validate_optional_web_search_context_size(%{"search_context_size" => size})
+       when size in @web_search_context_sizes,
+       do: :ok
+
+  defp validate_optional_web_search_context_size(%{"search_context_size" => _size}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_web_search_context_size(_tool), do: :ok
+
+  defp validate_optional_web_search_content_types(%{"search_content_types" => [_type | _rest] = types}) do
+    if Enum.all?(types, &(&1 in @web_search_content_types)),
+      do: :ok,
+      else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+  end
+
+  defp validate_optional_web_search_content_types(%{"search_content_types" => _types}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_web_search_content_types(_tool), do: :ok
+
+  defp validate_optional_allowed_callers(%{"allowed_callers" => allowed_callers})
+       when is_list(allowed_callers) do
+    if Enum.all?(allowed_callers, &(&1 in ["direct", "programmatic"])),
+      do: :ok,
+      else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+  end
+
+  defp validate_optional_allowed_callers(%{"allowed_callers" => _allowed_callers}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_allowed_callers(_tool), do: :ok
+
+  defp validate_optional_output_schema(%{"output_schema" => output_schema})
+       when is_map(output_schema),
+       do: :ok
+
+  defp validate_optional_output_schema(%{"output_schema" => _output_schema}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_optional_output_schema(_tool), do: :ok
+
+  defp validate_indexed_web_access(%{"indexed_web_access" => false}) do
     {:error, Error.invalid_request("tool shape is not translatable", "tools")}
   end
 
-  defp validate_index_gated_web_access(%{
+  defp validate_indexed_web_access(%{
          "external_web_access" => false,
-         "index_gated_web_access" => true
+         "indexed_web_access" => true
        }) do
     {:error, Error.invalid_request("tool shape is not translatable", "tools")}
   end
 
-  defp validate_index_gated_web_access(_tool), do: :ok
+  defp validate_indexed_web_access(%{"indexed_web_access" => true} = tool) do
+    if Map.has_key?(tool, "external_web_access"),
+      do: :ok,
+      else: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+  end
+
+  defp validate_indexed_web_access(_tool), do: :ok
 
   defp validate_exact_builtin_tool(tool, allowed_keys) do
     validate_exact_tool_keys(tool, allowed_keys)
@@ -529,41 +1000,120 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     end
   end
 
-  defp validate_tool_choice(%{"tool_choice" => choice})
+  defp validate_tool_choice(%{"tool_choice" => choice}, _surface)
        when choice in ["auto", "none", "required"],
        do: :ok
 
-  defp validate_tool_choice(%{"tool_choice" => %{"type" => "function", "name" => name}} = payload)
-       when is_binary(name) do
-    validate_named_tool_choice(payload, name)
+  defp validate_tool_choice(%{"tool_choice" => %{"type" => "allowed_tools"}}, :chat),
+    do: invalid_tool_choice_shape()
+
+  defp validate_tool_choice(
+         %{"tool_choice" => %{"type" => "allowed_tools"} = choice} = payload,
+         :responses
+       ) do
+    if valid_allowed_tools_choice?(choice, payload),
+      do: :ok,
+      else: invalid_tool_choice_shape()
   end
 
-  defp validate_tool_choice(%{"tool_choice" => %{"type" => "image_generation"}}), do: :ok
+  defp validate_tool_choice(
+         %{"tool_choice" => %{"type" => "function", "name" => name}} = payload,
+         _surface
+       )
+       when is_binary(name) do
+    with :ok <- validate_exact_tool_choice_keys(Map.get(payload, "tool_choice"), ["type", "name"]) do
+      validate_named_tool_choice(payload, "function", name)
+    end
+  end
 
-  defp validate_tool_choice(%{"tool_choice" => %{"type" => "function"}}),
-    do:
-      {:error,
-       Error.invalid_request("tool_choice function requires a non-empty name", "tool_choice")}
+  defp validate_tool_choice(
+         %{"tool_choice" => %{"type" => "custom", "name" => name}} = payload,
+         _surface
+       )
+       when is_binary(name) do
+    with :ok <- validate_exact_tool_choice_keys(Map.get(payload, "tool_choice"), ["type", "name"]) do
+      validate_named_tool_choice(payload, "custom", name)
+    end
+  end
 
-  defp validate_tool_choice(%{"tool_choice" => _choice}),
-    do: {:error, Error.invalid_request("tool_choice shape is not translatable", "tool_choice")}
+  defp validate_tool_choice(
+         %{"tool_choice" => %{"type" => "image_generation"} = choice},
+         _surface
+       ),
+       do: validate_exact_tool_choice_keys(choice, ["type"])
 
-  defp validate_tool_choice(_payload), do: :ok
+  defp validate_tool_choice(%{"tool_choice" => %{"type" => "function"}}, _surface),
+    do: {:error, Error.invalid_request("tool_choice function requires a non-empty name", "tool_choice")}
 
-  defp validate_named_tool_choice(payload, name) do
+  defp validate_tool_choice(%{"tool_choice" => %{"type" => "custom"}}, _surface),
+    do: {:error, Error.invalid_request("tool_choice custom requires a non-empty name", "tool_choice")}
+
+  defp validate_tool_choice(%{"tool_choice" => _choice}, _surface),
+    do: invalid_tool_choice_shape()
+
+  defp validate_tool_choice(_payload, _surface), do: :ok
+
+  defp validate_exact_tool_choice_keys(choice, allowed_keys) do
+    case choice |> Map.keys() |> Enum.reject(&(&1 in allowed_keys)) do
+      [] ->
+        :ok
+
+      [_key | _rest] ->
+        {:error, Error.invalid_request("tool_choice shape is not translatable", "tool_choice")}
+    end
+  end
+
+  defp valid_allowed_tools_choice?(choice, payload) do
+    case choice do
+      %{"mode" => mode, "tools" => allowed_tools}
+      when mode in ["auto", "required"] and is_list(allowed_tools) and allowed_tools != [] ->
+        Map.keys(choice) |> MapSet.new() == MapSet.new(["type", "mode", "tools"]) and
+          Enum.all?(allowed_tools, &allowed_tool_declared?(&1, payload))
+
+      _choice ->
+        false
+    end
+  end
+
+  defp allowed_tool_declared?(%{"type" => type, "name" => name} = allowed_tool, payload)
+       when type in ["function", "custom"] and is_binary(name) do
+    map_size(allowed_tool) == 2 and String.trim(name) != "" and
+      Enum.any?(Map.get(payload, "tools", []), fn
+        %{"type" => ^type, "name" => ^name} = declared_tool ->
+          Map.get(declared_tool, "defer_loading", false) == false
+
+        _declared_tool ->
+          false
+      end)
+  end
+
+  defp allowed_tool_declared?(%{"type" => type} = allowed_tool, payload)
+       when type in @allowed_tools_builtin_types do
+    map_size(allowed_tool) == 1 and
+      Enum.any?(Map.get(payload, "tools", []), &match?(%{"type" => ^type}, &1))
+  end
+
+  defp allowed_tool_declared?(_allowed_tool, _payload), do: false
+
+  defp invalid_tool_choice_shape do
+    {:error, Error.invalid_request("tool_choice shape is not translatable", "tool_choice")}
+  end
+
+  defp validate_named_tool_choice(payload, type, name) do
     cond do
       String.trim(name) == "" ->
-        {:error,
-         Error.invalid_request("tool_choice function requires a non-empty name", "tool_choice")}
+        {:error, Error.invalid_request("tool_choice #{type} requires a non-empty name", "tool_choice")}
 
-      name in function_tool_names(payload) ->
+      name in named_tool_names(payload, type) ->
         :ok
 
       true ->
-        {:error,
-         Error.invalid_request("tool_choice references unknown function tool", "tool_choice")}
+        {:error, Error.invalid_request("tool_choice references unknown #{type} tool", "tool_choice")}
     end
   end
+
+  defp named_tool_names(payload, "function"), do: function_tool_names(payload)
+  defp named_tool_names(payload, "custom"), do: custom_tool_names(payload)
 
   defp function_tool_names(%{"tools" => tools}) when is_list(tools) do
     Enum.flat_map(tools, fn
@@ -582,4 +1132,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   end
 
   defp function_tool_names(_payload), do: []
+
+  defp custom_tool_names(%{"tools" => tools}) when is_list(tools) do
+    Enum.flat_map(tools, fn
+      %{"type" => "custom", "name" => name} when is_binary(name) ->
+        [name]
+
+      %{"type" => "namespace", "tools" => namespace_tools} when is_list(namespace_tools) ->
+        custom_tool_names(%{"tools" => namespace_tools})
+
+      _tool ->
+        []
+    end)
+  end
+
+  defp custom_tool_names(_payload), do: []
 end

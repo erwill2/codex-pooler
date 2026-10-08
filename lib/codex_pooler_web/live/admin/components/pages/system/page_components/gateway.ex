@@ -3,7 +3,15 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
 
   use CodexPoolerWeb, :html
 
-  alias CodexPoolerWeb.Admin.SystemPageComponents.FormControls
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
+
+  alias CodexPoolerWeb.Admin.SystemPageComponents.{
+    BulkheadEditor,
+    FormControls,
+    GatewaySettingsMatrix
+  }
+
+  alias CodexPoolerWeb.Admin.SystemSettingsForm
 
   attr :selected_tab, :string, required: true
   attr :forms, :map, required: true
@@ -20,152 +28,60 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
       status={@card_statuses["gateway"]}
     >
       <.inputs_for :let={gateway_form} field={@forms["gateway"][:gateway]}>
-        <FormControls.settings_group
-          id="instance-settings-gateway"
-          eyebrow="Gateway"
-          title="Gateway controls"
-          description="Admission, timeout, continuity, routing, and circuit guardrails for new gateway work."
-          hint="Most values reload through the settings cache for new work; existing in-flight work keeps the runtime values it started with."
-        >
-          <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <FormControls.scalar_controls form={gateway_form} controls={gateway_scalar_controls()} />
-          </div>
-          <div class="grid gap-4 lg:grid-cols-2">
-            <FormControls.json_textarea
-              id="instance-settings-bulkheads"
-              name="instance_settings[gateway][bulkheads]"
-              label="Route-class bulkheads"
-              value={
-                param_json_value(@form_params, "gateway", "bulkheads", @settings.gateway.bulkheads)
-              }
-              hint="Per route-class concurrency, queue length, and queue timeout policy as JSON."
-            />
-            <FormControls.json_textarea
-              id="instance-settings-model-context-window-overrides"
-              name="instance_settings[gateway][model_context_window_overrides]"
-              label="Model context window overrides"
-              value={
-                param_json_value(
-                  @form_params,
-                  "gateway",
-                  "model_context_window_overrides",
-                  @settings.gateway.model_context_window_overrides
-                )
-              }
-              hint="Model-specific context window sizes used when upstream metadata is missing or needs correction."
-            />
-          </div>
-        </FormControls.settings_group>
-      </.inputs_for>
-    </FormControls.settings_card>
-
-    <FormControls.settings_card
-      :if={@selected_tab == "gateway"}
-      group="ingress"
-      form={@forms["ingress"]}
-      status={@card_statuses["ingress"]}
-    >
-      <.inputs_for :let={ingress_form} field={@forms["ingress"][:ingress]}>
-        <FormControls.settings_group
-          id="instance-settings-ingress"
-          eyebrow="Ingress"
-          title="Runtime ingress"
-          description="Firewall, trusted proxy, and compressed-body controls for compatibility routes."
-          hint="Evaluated for new requests; keep proxy lists metadata-only and CIDR based."
-        >
-          <div class="grid gap-4 lg:grid-cols-2">
-            <FormControls.list_textarea
-              id="instance-settings-firewall-allowlist"
-              name="instance_settings[ingress][firewall_allowlist]"
-              label="Firewall allowlist"
-              placeholder={firewall_allowlist_placeholder()}
-              value={
-                param_list_value(
-                  @form_params,
-                  "ingress",
-                  "firewall_allowlist",
-                  @settings.ingress.firewall_allowlist
-                )
-              }
-            />
-            <FormControls.list_textarea
-              id="instance-settings-trusted-proxies"
-              name="instance_settings[ingress][trusted_proxies]"
-              label="Trusted proxies"
-              placeholder={trusted_proxies_placeholder()}
-              value={
-                param_list_value(
-                  @form_params,
-                  "ingress",
-                  "trusted_proxies",
-                  @settings.ingress.trusted_proxies
-                )
-              }
-            />
-            <div class="lg:col-span-2">
-              <FormControls.compressed_json_encoding_checkboxes
-                id="instance-settings-decompression-algorithms"
-                name="instance_settings[ingress][decompression_algorithms]"
-                values={
-                  param_array_value(
-                    @form_params,
-                    "ingress",
-                    "decompression_algorithms",
-                    @settings.ingress.decompression_algorithms
-                  )
-                }
-              />
-            </div>
-          </div>
-          <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-            <FormControls.scalar_controls form={ingress_form} controls={ingress_scalar_controls()} />
-          </div>
-        </FormControls.settings_group>
-      </.inputs_for>
-    </FormControls.settings_card>
-
-    <FormControls.settings_card
-      :if={@selected_tab == "gateway"}
-      group="files"
-      form={@forms["files"]}
-      status={@card_statuses["files"]}
-    >
-      <.inputs_for :let={files_form} field={@forms["files"][:files]}>
-        <FormControls.settings_group
-          id="instance-settings-files"
-          eyebrow="Files"
-          title="File bridge limits"
-          description="Upload size, metadata TTL, and cleanup cadence for upstream-backed file payloads."
-          hint="Applies to new uploads and cleanup jobs; stored file metadata remains metadata-only."
-        >
-          <div class="grid gap-4 md:grid-cols-3">
-            <FormControls.scalar_controls form={files_form} controls={files_scalar_controls()} />
-          </div>
-        </FormControls.settings_group>
-      </.inputs_for>
-    </FormControls.settings_card>
-
-    <FormControls.settings_card
-      :if={@selected_tab == "gateway"}
-      group="transcription"
-      form={@forms["transcription"]}
-      status={@card_statuses["transcription"]}
-    >
-      <.inputs_for :let={transcription_form} field={@forms["transcription"][:transcription]}>
-        <FormControls.settings_group
-          id="instance-settings-transcription"
-          eyebrow="Transcription"
-          title="Audio upload limit"
-          description="Runtime limit for new audio transcription multipart uploads."
-          hint="Reloads live for new requests and keeps audio bytes out of admin surfaces."
-        >
-          <div class="max-w-md">
-            <FormControls.scalar_controls
-              form={transcription_form}
-              controls={transcription_scalar_controls()}
-            />
-          </div>
-        </FormControls.settings_group>
+        <.inputs_for :let={files_form} field={@forms["gateway"][:files]}>
+          <.inputs_for :let={transcription_form} field={@forms["gateway"][:transcription]}>
+            <FormControls.settings_group
+              id="instance-settings-gateway"
+              eyebrow="Gateway"
+              title="Gateway controls"
+              description="Admission, timeout, continuity, routing, file, and audio guardrails for new gateway work."
+            >
+              <div id="instance-settings-gateway-debug-region" class="max-w-xl">
+                <FormControls.scalar_controls
+                  form={gateway_form}
+                  controls={gateway_debug_controls()}
+                />
+                <FormControls.scalar_controls
+                  form={gateway_form}
+                  controls={[
+                    %{
+                      type: :toggle,
+                      id: "instance-settings-upstream-token-refresh-proactive-enabled",
+                      field: :upstream_token_refresh_proactive_enabled,
+                      label: "Proactive credential refresh",
+                      hint: "Refresh active accounts near token expiry, including busy accounts. Disabling this leaves manual refresh, recovery, and refresh after authentication failure enabled."
+                    }
+                  ]}
+                />
+              </div>
+              <GatewaySettingsMatrix.matrix groups={gateway_setting_groups(gateway_form, files_form, transcription_form)} />
+              <div class="grid gap-4">
+                <BulkheadEditor.editor
+                  bulkheads={bulkhead_values(@form_params, @settings.gateway.bulkheads)}
+                  active_preset={
+                    @form_params
+                    |> bulkhead_values(@settings.gateway.bulkheads)
+                    |> SystemSettingsForm.bulkhead_preset()
+                  }
+                />
+                <FormControls.json_textarea
+                  id="instance-settings-model-context-window-overrides"
+                  name="instance_settings[gateway][model_context_window_overrides]"
+                  label="Model context window overrides"
+                  value={
+                    param_json_value(
+                      @form_params,
+                      "gateway",
+                      "model_context_window_overrides",
+                      @settings.gateway.model_context_window_overrides
+                    )
+                  }
+                  hint="Model-specific raw native context windows used when upstream metadata is missing or needs correction. Codex applies the advertised effective percentage once; /v1/models publishes the flattened value."
+                />
+              </div>
+            </FormControls.settings_group>
+          </.inputs_for>
+        </.inputs_for>
       </.inputs_for>
     </FormControls.settings_card>
 
@@ -192,6 +108,20 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
               placeholder="https://codex-pooler.example.com"
             />
           </div>
+        </FormControls.settings_group>
+        <FormControls.settings_group
+          id="instance-settings-openai-status"
+          eyebrow="Status feed"
+          title="OpenAI status polling"
+          description="Check status.openai.com every five minutes for provider incident updates."
+          hint="Disable polling when outbound access is restricted. Existing incident history is retained."
+        >
+          <.input
+            id="instance-settings-openai-status-polling-enabled"
+            field={operator_form[:openai_status_polling_enabled]}
+            type="checkbox"
+            label="Enable OpenAI status polling"
+          />
         </FormControls.settings_group>
       </.inputs_for>
     </FormControls.settings_card>
@@ -225,216 +155,253 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
     """
   end
 
-  defp firewall_allowlist_placeholder do
-    Enum.join(["198.51.100.10/32", "203.0.113.0/24", "2001:db8::/32"], "\n")
-  end
-
-  defp trusted_proxies_placeholder do
-    Enum.join(["10.0.0.0/8", "172.16.0.0/12", "2001:db8:10::/48"], "\n")
-  end
-
-  defp gateway_scalar_controls do
+  defp gateway_debug_controls do
     [
       %{
         type: :toggle,
         id: "instance-settings-gateway-debug",
         field: :gateway_debug,
-        label: "Gateway debug metadata",
-        hint: "Records sanitized request/attempt routing metadata for new gateway requests."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-sse-keepalive-interval-ms",
-        field: :sse_keepalive_interval_ms,
-        label: "SSE keepalive (ms)",
-        hint: "Interval for downstream SSE heartbeat events; 0 disables heartbeats."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-websocket-idle-timeout-ms",
-        field: :websocket_idle_timeout_ms,
-        label: "Websocket idle timeout (ms)",
-        hint: "Bounded downstream websocket idle window for new upgrades."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-websocket-owner-idle-timeout-ms",
-        field: :websocket_owner_idle_timeout_ms,
-        label: "Websocket owner post-detach retention (ms)",
-        hint:
-          "Post-detach retention for websocket owners. Running owners keep the value captured when they were created. This is separate from the downstream websocket idle timeout."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-upstream-connect-timeout-ms",
-        field: :upstream_connect_timeout_ms,
-        label: "Connect timeout (ms)",
-        hint: "Maximum time allowed to establish a connection to an upstream account."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-upstream-pool-timeout-ms",
-        field: :upstream_pool_timeout_ms,
-        label: "Pool timeout (ms)",
-        hint: "Maximum time a gateway request may wait for an available pooled connection."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-upstream-receive-timeout-ms",
-        field: :upstream_receive_timeout_ms,
-        label: "Receive timeout (ms)",
-        hint: "Maximum idle receive window while waiting for upstream response data."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-expired-alias-ttl-seconds",
-        field: :expired_alias_ttl_seconds,
-        label: "Expired alias TTL (s)",
-        hint: "How long expired response aliases stay available for continuity lookups."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-bridge-owner-lease-ttl-seconds",
-        field: :bridge_owner_lease_ttl_seconds,
-        label: "Owner lease TTL (s)",
-        hint: "How long a bridge owner lease remains valid without renewal."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-bridge-owner-lease-renewal-seconds",
-        field: :bridge_owner_lease_renewal_seconds,
-        label: "Owner lease renewal (s)",
-        hint: "How often active bridge owners renew their lease while work is running."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-circuit-failure-threshold",
-        field: :circuit_failure_threshold,
-        label: "Circuit failure threshold",
-        hint: "Consecutive failed attempts needed before opening an upstream circuit."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-circuit-open-seconds",
-        field: :circuit_open_seconds,
-        label: "Circuit open window (s)",
-        hint: "How long an opened circuit stays closed to normal traffic before probing."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-circuit-half-open-probe-limit",
-        field: :circuit_half_open_probe_limit,
-        label: "Half-open probe limit",
-        hint: "Concurrent probe attempts allowed while testing a half-open circuit."
-      },
-      %{
-        type: :number,
-        id: "instance-settings-circuit-success-threshold",
-        field: :circuit_success_threshold,
-        label: "Circuit close successes",
-        hint: "Successful probes required before closing a previously opened circuit."
+        label: "Gateway debug logging",
+        hint: "Adds sanitized request and routing details to gateway logs and attempt metadata for temporary troubleshooting. It increases log and stored-data volume; keep it disabled during normal production operation to minimize overhead."
       }
     ]
   end
 
-  defp ingress_scalar_controls do
+  defp gateway_setting_groups(gateway_form, files_form, transcription_form) do
     [
       %{
-        type: :number,
-        id: "instance-settings-max-compressed-body-bytes",
-        field: :max_compressed_body_bytes,
-        label: "Max compressed bytes"
+        id: "streaming",
+        label: "Streaming",
+        description: "Bounds heartbeat and socket lifetime independently of route-class capacity.",
+        form: gateway_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-sse-keepalive-interval-ms",
+            field: :sse_keepalive_interval_ms,
+            label: "SSE keepalive (ms)",
+            hint: "Interval for downstream SSE heartbeat events; 0 disables heartbeats.",
+            minimum: 0,
+            unit: "ms"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-websocket-idle-timeout-ms",
+            field: :websocket_idle_timeout_ms,
+            label: "Websocket idle timeout (ms)",
+            hint: "Bounded downstream websocket idle window for new upgrades.",
+            minimum: 60_000,
+            maximum: 3_600_000,
+            unit: "ms"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-websocket-owner-idle-timeout-ms",
+            field: :websocket_owner_idle_timeout_ms,
+            label: "Websocket owner post-detach retention (ms)",
+            hint: "Post-detach retention for websocket owners. Running owners keep the value captured when they were created.",
+            minimum: 60_000,
+            maximum: 3_600_000,
+            unit: "ms"
+          })
+        ]
       },
       %{
-        type: :number,
-        id: "instance-settings-max-decompressed-body-bytes",
-        field: :max_decompressed_body_bytes,
-        label: "Max decompressed bytes"
+        id: "upstream",
+        label: "Upstream timing",
+        description: "Controls how long requests can acquire, connect to, and wait on upstream work.",
+        form: gateway_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-upstream-connect-timeout-ms",
+            field: :upstream_connect_timeout_ms,
+            label: "Connect timeout (ms)",
+            hint: "Maximum time allowed to establish a connection to an upstream account.",
+            minimum: 1,
+            unit: "ms"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-upstream-pool-timeout-ms",
+            field: :upstream_pool_timeout_ms,
+            label: "Pool timeout (ms)",
+            hint: "Maximum time a gateway request may wait for an available pooled connection.",
+            minimum: 1,
+            unit: "ms"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-upstream-receive-timeout-ms",
+            field: :upstream_receive_timeout_ms,
+            label: "Receive timeout (ms)",
+            hint: "Maximum idle receive window while waiting for upstream response data.",
+            minimum: 1,
+            unit: "ms"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-upstream-conn-max-idle-time-ms",
+            field: :upstream_conn_max_idle_time_ms,
+            label: "Connection idle bound (ms)",
+            hint: "Pooled upstream connections idle longer than this are replaced on their next use. Checked only when a connection is taken, so it never interrupts an in-flight or streaming request. Keep it below the idle timeout of any NAT, load balancer, or proxy on the egress path.",
+            minimum: 1_000,
+            maximum: 3_600_000,
+            unit: "ms"
+          })
+        ]
       },
       %{
-        type: :number,
-        id: "instance-settings-max-decompression-ratio",
-        field: :max_decompression_ratio,
-        label: "Max ratio"
+        id: "token_refresh",
+        label: "Credential refresh",
+        description: "Controls how early scheduled recovery refreshes upstream credentials based on expiry, including busy accounts.",
+        form: gateway_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-upstream-token-refresh-margin-seconds",
+            field: :upstream_token_refresh_margin_seconds,
+            label: "Proactive refresh margin (s)",
+            hint: "Scheduled recovery refreshes an active account once its access token is this close to expiring, so an account with no traffic cannot age into required re-authentication. Accounts already inside the margin are retried on a bounded cooldown, not on every recovery pass.",
+            minimum: 3_600,
+            maximum: 1_209_600,
+            unit: "s"
+          })
+        ]
       },
       %{
-        type: :number,
-        id: "instance-settings-decompression-timeout-ms",
-        field: :decompression_timeout_ms,
-        label: "Timeout (ms)"
+        id: "continuity",
+        label: "Continuity",
+        description: "Keeps response aliases and bridge ownership available while work moves between requests.",
+        form: gateway_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-expired-alias-ttl-seconds",
+            field: :expired_alias_ttl_seconds,
+            label: "Expired alias TTL (s)",
+            hint: "How long expired response aliases stay available for continuity lookups.",
+            minimum: 1,
+            unit: "s"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-bridge-owner-lease-ttl-seconds",
+            field: :bridge_owner_lease_ttl_seconds,
+            label: "Owner lease TTL (s)",
+            hint: "How long a bridge owner lease remains valid without renewal. At least #{OwnerRenewalSchedule.minimum_lease_ttl_seconds()} s, so a request's lease outlives its pre-dispatch work; a lower stored value is raised to it.",
+            minimum: OwnerRenewalSchedule.minimum_lease_ttl_seconds(),
+            unit: "s"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-bridge-owner-lease-renewal-seconds",
+            field: :bridge_owner_lease_renewal_seconds,
+            label: "Owner lease renewal (s)",
+            hint: "How often active bridge owners renew their lease while work is running. At most a third of the owner lease TTL, so an owner renews well before its lease expires; a higher stored value is lowered to it.",
+            minimum: 1,
+            unit: "s"
+          })
+        ]
+      },
+      %{
+        id: "circuit",
+        label: "Circuit recovery",
+        description: "Controls when failing upstreams leave normal routing and become eligible again.",
+        form: gateway_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-circuit-failure-threshold",
+            field: :circuit_failure_threshold,
+            label: "Circuit failure threshold",
+            hint: "Consecutive failed attempts needed before opening an upstream circuit.",
+            minimum: 1,
+            unit: "failures"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-circuit-open-seconds",
+            field: :circuit_open_seconds,
+            label: "Circuit open window (s)",
+            hint: "How long an opened circuit stays closed to normal traffic before probing.",
+            minimum: 1,
+            unit: "s"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-circuit-half-open-probe-limit",
+            field: :circuit_half_open_probe_limit,
+            label: "Half-open probe limit",
+            hint: "Concurrent probe attempts allowed while testing a half-open circuit.",
+            minimum: 1,
+            unit: "probes"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-circuit-success-threshold",
+            field: :circuit_success_threshold,
+            label: "Circuit close successes",
+            hint: "Successful probes required before closing a previously opened circuit.",
+            minimum: 1,
+            unit: "successes"
+          })
+        ]
+      },
+      %{
+        id: "files",
+        label: "File bridge",
+        description: "Controls upload size, metadata lifetime, and abandoned-upload cleanup.",
+        form: files_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-file-max-size-bytes",
+            field: :max_size_bytes,
+            label: "File upload limit",
+            hint: "Maximum size accepted for new upstream-backed file uploads.",
+            minimum: 1,
+            unit: "bytes"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-upload-ttl-seconds",
+            field: :upload_ttl_seconds,
+            label: "File metadata TTL (s)",
+            hint: "How long upload metadata remains available before expiry.",
+            minimum: 1,
+            unit: "s"
+          }),
+          gateway_setting(%{
+            id: "instance-settings-abandoned-upload-cleanup-interval-seconds",
+            field: :abandoned_upload_cleanup_interval_seconds,
+            label: "Abandoned upload cleanup interval (s)",
+            hint: "How often cleanup scans run for abandoned file uploads.",
+            minimum: 1,
+            unit: "s"
+          })
+        ]
+      },
+      %{
+        id: "transcription",
+        label: "Audio transcription",
+        description: "Limits new audio transcription multipart uploads.",
+        form: transcription_form,
+        settings: [
+          gateway_setting(%{
+            id: "instance-settings-transcription-max-upload-bytes",
+            field: :max_upload_bytes,
+            label: "Audio upload limit",
+            hint: "Maximum size accepted for new audio transcription multipart uploads.",
+            minimum: 1,
+            unit: "bytes"
+          })
+        ]
       }
     ]
   end
 
-  defp files_scalar_controls do
-    [
-      %{
-        type: :number,
-        id: "instance-settings-file-max-size-bytes",
-        field: :max_size_bytes,
-        label: "Max size bytes"
-      },
-      %{
-        type: :number,
-        id: "instance-settings-upload-ttl-seconds",
-        field: :upload_ttl_seconds,
-        label: "Upload TTL seconds"
-      },
-      %{
-        type: :number,
-        id: "instance-settings-abandoned-upload-cleanup-interval-seconds",
-        field: :abandoned_upload_cleanup_interval_seconds,
-        label: "Cleanup interval seconds"
-      }
-    ]
-  end
-
-  defp transcription_scalar_controls do
-    [
-      %{
-        type: :number,
-        id: "instance-settings-transcription-max-upload-bytes",
-        field: :max_upload_bytes,
-        label: "Max upload bytes"
-      }
-    ]
-  end
-
-  defp split_list(value) do
-    value
-    |> String.split(["\n", ","], trim: true)
-    |> normalize_list_values()
-  end
-
-  defp normalize_list_values(values) do
-    values
-    |> Enum.map(&to_string/1)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.uniq()
-  end
-
-  defp param_list_value(params, group, field, fallback) do
-    case get_in(params, [group, field]) do
-      value when is_binary(value) -> value
-      value when is_list(value) -> Enum.join(value, "\n")
-      _missing -> Enum.join(fallback || [], "\n")
-    end
-  end
-
-  defp param_array_value(params, group, field, fallback) do
-    case get_in(params, [group, field]) do
-      value when is_binary(value) -> split_list(value)
-      value when is_list(value) -> normalize_list_values(value)
-      _missing -> fallback || []
-    end
+  defp gateway_setting(setting) do
+    setting
+    |> Map.put_new(:maximum, nil)
+    |> Map.put(:dom_id, setting.id |> String.replace_prefix("instance-settings-", ""))
   end
 
   defp param_json_value(params, group, field, fallback) do
     case get_in(params, [group, field]) do
       value when is_binary(value) -> value
-      value when is_map(value) -> Jason.encode!(value, pretty: true)
-      _missing -> Jason.encode!(fallback || %{}, pretty: true)
+      value when is_map(value) -> CodexPooler.JSON.encode!(value, pretty: true)
+      _missing -> CodexPooler.JSON.encode!(fallback || %{}, pretty: true)
+    end
+  end
+
+  defp bulkhead_values(form_params, fallback) do
+    case get_in(form_params, ["gateway", "bulkheads"]) do
+      %{} = value -> value
+      _missing_or_invalid -> fallback
     end
   end
 end

@@ -1,24 +1,34 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   @moduledoc false
 
+  require Logger
+
+  alias CodexPooler.Accounting.NativeContentFilterRetry
+  alias CodexPooler.Gateway.Routing.ModelMetadata
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
-  alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
 
   alias CodexPooler.Gateway.Runtime.Finalization.{
     AttemptSettlement,
+    InterruptionOutcome,
     Metadata,
     ResponseUsage,
     SettlementAttrs,
     SideEffects
   }
 
-  alias CodexPooler.Gateway.Routing.ModelMetadata
   alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
+  alias CodexPooler.Gateway.Runtime.Streaming.{DownstreamStream, StreamUsageObserver}
+  alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
+  alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
   alias CodexPooler.Gateway.Transports.ModelUnavailability
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
   alias CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream
   alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
+  alias CodexPooler.Platform.TransientDatabaseError
   alias CodexPooler.Quotas.Evidence.CodexParsers.RateLimitReachedType
 
   @type callbacks :: %{
@@ -28,6 +38,14 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   @type stream_failure :: StreamProtocol.terminal_failure()
   @type finalization_result :: AttemptSettlement.settlement_result()
   @type health_result :: DispatchLifecycle.success_result()
+
+  # The bridge reasons unwrapped as our own loss of the turn's owner or client:
+  # the interrupted vocabulary, as atoms, so the SSE bridge cannot drift from
+  # the websocket surface (findings#228).
+  @interrupted_bridge_reasons Enum.map(
+                                InterruptionOutcome.interrupted_error_codes(),
+                                &String.to_atom/1
+                              )
 
   @spec finalize_success(binary(), ResponseContext.t(), callbacks()) ::
           finalization_result()
@@ -39,6 +57,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
         callbacks,
         stream_state \\ nil
       ) do
+    attempt_metadata = upstream_websocket_attempt_metadata(response_context)
+    receipt = Map.get(attempt_metadata, :provider_credits_admission) || Req.Response.get_private(response, :provider_credits_admission)
+    context = %{context | provider_credits_admission: receipt}
+
     %{
       reserved: reserved,
       attempt: attempt,
@@ -47,26 +69,49 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
       request_options: request_options
     } = context
 
+    usage = stream_usage(body, stream_state) |> merge_model_observation(attempt_metadata)
+    upstream_websocket_connection = attempt_metadata.upstream_websocket_connection
+    transports = resolved_transports(response_context, attempt_metadata)
+
     case AttemptSettlement.finalize_success(
            reserved.request,
            attempt,
-           ResponseUsage.from_sse(body),
+           usage,
            SettlementAttrs.success(
              context,
              response.status,
              response
              |> Metadata.response_metadata(nil, request_options)
              |> Metadata.merge_stream_state_metadata(stream_state)
-             |> merge_upstream_websocket_connection(response_context),
-             started: started
-           )
+             |> merge_usage_observation(stream_state)
+             |> merge_upstream_websocket_connection(upstream_websocket_connection)
+             |> NativeContentFilterRetry.observation_metadata(stream_state)
+             |> NativeContentFilterRetry.terminal_metadata(if(is_map(stream_state), do: Map.get(stream_state, :native_content_filter_outcome), else: StreamProtocol.terminal_outcome(body)), context),
+             started: started,
+             before_finalize: fn ->
+               SideEffects.observe_stream_response(context, response, body, stream_state)
+               SideEffects.before_finalize_success(context, request_options)
+             end
+           ),
+           request_options.runtime.session_owner_witness
          ) do
+      {:stale_generation, finalized} ->
+        {:ok, finalized}
+
       {:ok, _finalized} = result ->
+        emit_stream_finalization(
+          usage,
+          transports.downstream_transport,
+          transports.upstream_transport
+        )
+
+        emit_settlement_outcome(result, "succeeded", transports)
         SideEffects.record_success(context, payload, body, request_options, callbacks)
 
         result
 
       {:error, _gateway_error} = error ->
+        emit_settlement_failure(error, transports)
         error
     end
   end
@@ -88,86 +133,185 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     health_code = stream_health_code(failure, code)
     failure = %{failure | code: code}
 
-    health_result =
-      cond do
-        compact_assignment_model_miss?(failure, context) ->
-          :ok
+    websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
 
-        Keyword.get(opts, :record_health?, true) ->
-          record_health_failure(health_code, health_code, context)
+    attrs = %{
+      response_status_code: response.status,
+      last_error_code: code,
+      error_message: "upstream stream returned retryable first event #{code}",
+      latency_ms: elapsed_ms(context.started),
+      usage_status: ResponseUsage.from_sse(body)[:status] || "usage_unknown",
+      usage: first_event_usage(body, response_context) |> merge_model_observation(websocket_attempt_metadata),
+      attempt_metadata:
+        first_event_attempt_metadata(
+          response_context,
+          websocket_attempt_metadata,
+          failure,
+          "retryable_first_event"
+        ),
+      retry_count: context.retry_count
+    }
+
+    record_health? =
+      not compact_assignment_model_miss?(failure, context) and
+        Keyword.get(opts, :record_health?, true)
+
+    # A caller that classifies the refusal itself (a usage limit, read like its
+    # HTTP twin, findings#325 row 325-5) records that health instead.
+    route_health = Keyword.get(opts, :route_health)
+
+    attrs =
+      cond do
+        is_function(route_health, 0) and not is_nil(context.attempt) ->
+          Map.put(attrs, :before_finalize, fn ->
+            SideEffects.observe_stream_response(context, response, body, nil)
+            route_health.()
+          end)
+
+        record_health? and not is_nil(context.attempt) ->
+          Map.put(attrs, :before_finalize, fn ->
+            SideEffects.observe_stream_response(context, response, body, nil)
+            record_health_failure(health_code, health_code, context)
+          end)
+
+        is_nil(context.attempt) ->
+          attrs
 
         true ->
-          :ok
+          Map.put(attrs, :before_finalize, fn ->
+            SideEffects.observe_stream_response(context, response, body, nil)
+          end)
       end
 
-    with :ok <- health_result do
-      AttemptSettlement.record_retryable_failure(
-        context.reserved.request,
-        context.attempt,
-        %{
-          response_status_code: response.status,
-          last_error_code: code,
-          error_message: "upstream stream returned retryable first event #{code}",
-          latency_ms: elapsed_ms(context.started),
-          usage_status: ResponseUsage.from_sse(body)[:status] || "usage_unknown",
-          attempt_metadata:
-            first_event_attempt_metadata(
-              response_context,
-              failure,
-              "retryable_first_event"
-            ),
-          retry_count: context.retry_count
-        }
-      )
+    with :ok <- maybe_record_retryable_health(context, health_code, record_health?) do
+      AttemptSettlement.record_retryable_failure(context.reserved.request, context.attempt, attrs)
     end
   end
 
-  @spec finalize_first_event_failure(binary(), stream_failure(), ResponseContext.t()) ::
+  defp maybe_record_retryable_health(
+         %SelectedCandidateContext{attempt: nil} = context,
+         code,
+         true
+       ),
+       do: record_health_failure(code, code, context)
+
+  defp maybe_record_retryable_health(%SelectedCandidateContext{}, _code, _record_health?), do: :ok
+
+  @spec finalize_first_event_failure(binary(), stream_failure(), ResponseContext.t(), keyword()) ::
           finalization_result()
+  def finalize_first_event_failure(body, failure, response_context, opts \\ [])
+
+  def finalize_first_event_failure(
+        _body,
+        failure,
+        %ResponseContext{context: %SelectedCandidateContext{attempt: nil} = context},
+        _opts
+      ) do
+    code = stream_failure_code(failure, context)
+
+    case record_attemptless_health_failure(code, context) do
+      {:error, _gateway_error} = error ->
+        error
+
+      :ok ->
+        {:error,
+         %{
+           status: 500,
+           code: "gateway_accounting_failed",
+           message: terminal_failure_message(code, "gateway accounting finalization failed")
+         }}
+    end
+  end
+
   def finalize_first_event_failure(
         body,
         failure,
-        %ResponseContext{context: context, response: response} = response_context
+        %ResponseContext{context: context, response: response} = response_context,
+        opts
       ) do
     code = stream_failure_code(failure, context)
     health_code = stream_health_code(failure, code)
     failure = %{failure | code: code}
+    route_health = Keyword.get(opts, :route_health, fn -> record_terminal_health_failure(health_code, response.headers, context) end)
 
-    health_result =
-      if compact_assignment_model_miss?(failure, context),
-        do: :ok,
-        else: record_terminal_health_failure(health_code, response.headers, context)
+    websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
+    transports = resolved_transports(response_context, websocket_attempt_metadata)
 
-    with :ok <- health_result do
+    result =
       AttemptSettlement.finalize_partial_stream_failure(
         context.reserved.request,
         context.attempt,
-        ResponseUsage.from_sse(body),
+        first_event_usage(body, response_context) |> merge_model_observation(websocket_attempt_metadata),
         SettlementAttrs.partial_stream_failure(
           context,
           response.status,
           code,
-          "upstream stream returned first event #{code}",
+          terminal_failure_message(code, "upstream stream returned first event #{code}"),
           first_event_attempt_metadata(
             response_context,
+            websocket_attempt_metadata,
             failure,
             "first_event_stream_failure"
           )
+          |> terminal_failure_attempt_metadata(code)
         )
+        |> maybe_put_before_finalize(context, fn ->
+          SideEffects.observe_stream_response(context, response, body, nil)
+
+          if compact_assignment_model_miss?(failure, context),
+            do: :ok,
+            else: route_health.()
+        end),
+        context.request_options.runtime.session_owner_witness
       )
-    end
+
+    emit_terminal_outcome(result, code, transports)
+    normalize_stale_generation(result)
   end
 
-  @spec first_event_attempt_metadata(ResponseContext.t(), map(), String.t()) :: map()
+  # Without an attempt there is no settlement to protect and the answer is the
+  # accounting failure either way. The route health recorded here is
+  # best-effort (the next failure records it again), so a transient database
+  # failure drops it with one warning instead of ending the connection
+  # (findings#294). Any other exception still raises.
+  defp record_attemptless_health_failure(code, %SelectedCandidateContext{} = context) do
+    record_terminal_health_failure(code, [], context)
+  rescue
+    error in [DBConnection.ConnectionError, Postgrex.Error] ->
+      if TransientDatabaseError.transient?(error) do
+        Logger.warning(
+          "gateway route health dropped after a transient database failure " <>
+            "stage=first_event_failure request_id=#{attemptless_request_id(context)} reason_class=#{TransientDatabaseError.reason_class(error)}"
+        )
+
+        :ok
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp attemptless_request_id(%SelectedCandidateContext{reserved: %{request: %{id: id}}}) when is_binary(id), do: id
+  defp attemptless_request_id(_context), do: "unknown"
+
+  @spec first_event_attempt_metadata(ResponseContext.t(), map(), map(), String.t()) :: map()
   defp first_event_attempt_metadata(
-         %ResponseContext{context: context, response: response} = response_context,
+         %ResponseContext{context: context, response: response},
+         websocket_attempt_metadata,
          failure,
          error_kind
        ) do
     response
     |> Metadata.first_event_stream_metadata(failure, error_kind, context.request_options)
-    |> merge_upstream_websocket_connection(response_context)
+    |> merge_upstream_websocket_connection(websocket_attempt_metadata.upstream_websocket_connection)
+    |> merge_usage_limit_record(Req.Response.get_private(response, :usage_limit_record))
   end
+
+  # The reset a websocket terminal usage limit advised the client, recorded as
+  # the HTTP twin records it (findings#206 rows 206-553, 206-596).
+  defp merge_usage_limit_record(metadata, %{"resets_at" => _resets_at, "resets_in_seconds" => _seconds} = record),
+    do: Map.put(metadata, "usage_limit", record)
+
+  defp merge_usage_limit_record(metadata, _record), do: metadata
 
   @spec finalize_failure(binary(), term(), ResponseContext.t()) :: finalization_result()
   @spec finalize_failure(binary(), term(), ResponseContext.t(), term()) :: finalization_result()
@@ -177,67 +321,235 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
         %ResponseContext{context: context, response: response} = response_context,
         stream_state \\ nil
       ) do
+    websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
+    terminal_failure = Map.get(websocket_attempt_metadata, :tool_completion_failure) || terminal_failure_reason(reason)
+    reason = if Map.get(websocket_attempt_metadata, :tool_completion_failure), do: {:terminal_stream_failure, terminal_failure}, else: reason
     code = error_code(reason)
-    terminal_failure = terminal_failure_reason(reason)
+    transports = resolved_transports(response_context, websocket_attempt_metadata)
 
-    with :ok <-
-           record_stream_failure_health(reason, code, terminal_failure, response.headers, context) do
-      attempt_metadata =
-        response
-        |> Metadata.response_metadata("stream_interrupted", context.request_options)
-        |> Metadata.merge_stream_state_metadata(stream_state)
-        |> merge_upstream_websocket_connection(response_context)
-        |> Metadata.maybe_put_masked_error_metadata(
-          terminal_failure && terminal_failure.upstream_code,
-          code
-        )
-        |> Metadata.maybe_put_upstream_error_param(terminal_failure)
-        |> TransportFailureReason.maybe_put_upstream_stream_interrupted_metadata(reason, body)
+    attempt_metadata =
+      response
+      |> Metadata.response_metadata("stream_interrupted", context.request_options)
+      |> Metadata.merge_stream_state_metadata(stream_state)
+      |> merge_usage_observation(stream_state)
+      |> merge_upstream_websocket_connection(websocket_attempt_metadata.upstream_websocket_connection)
+      |> Metadata.maybe_put_masked_error_metadata(
+        terminal_failure && terminal_failure.upstream_code,
+        code
+      )
+      |> non_first_event_terminal_attempt_metadata(terminal_failure, code)
+      |> TransportFailureReason.maybe_put_upstream_stream_interrupted_metadata(reason, body)
+      |> merge_websocket_transport_failure(websocket_attempt_metadata.transport_failure)
+      |> correct_transport_failure_visibility(stream_state)
 
+    result =
       AttemptSettlement.finalize_partial_stream_failure(
         context.reserved.request,
         context.attempt,
-        ResponseUsage.from_sse(body),
+        (Map.get(websocket_attempt_metadata, :response_usage) || stream_usage(body, stream_state)) |> merge_model_observation(websocket_attempt_metadata),
         SettlementAttrs.partial_stream_failure(
           context,
-          response.status,
+          failure_response_status(reason, response.status),
           code,
-          Metadata.safe_reason(reason),
+          terminal_failure_message(code, Metadata.safe_reason(reason)),
           attempt_metadata
         )
+        |> Map.put(:upstream_status_code, response.status)
+        |> maybe_put_before_finalize(context, fn ->
+          SideEffects.observe_stream_response(context, response, body, stream_state)
+          record_stream_failure_health(reason, code, terminal_failure, response.headers, context)
+        end),
+        context.request_options.runtime.session_owner_witness
       )
+
+    emit_terminal_outcome(result, code, transports)
+    normalize_stale_generation(result)
+  end
+
+  defp emit_terminal_outcome(result, code, transports) do
+    if AttemptSettlement.stale_generation?(result) do
+      :ok
+    else
+      emit_current_terminal_outcome(result, code, transports)
     end
   end
 
-  defp merge_upstream_websocket_connection(metadata, %ResponseContext{} = response_context) do
-    metadata
-    |> Map.drop(["upstream_websocket_connection", :upstream_websocket_connection])
-    |> Map.merge(
-      Metadata.upstream_websocket_connection_attempt_metadata(
-        upstream_websocket_connection(response_context)
-      )
+  defp emit_current_terminal_outcome(result, code, transports) do
+    outcome = InterruptionOutcome.outcome_for_code(code)
+
+    case result do
+      {:ok, _finalized} -> emit_settlement_outcome(result, outcome, transports)
+      {:error, _gateway_error} -> emit_settlement_failure(result, transports)
+    end
+  end
+
+  defp normalize_stale_generation({:stale_generation, finalized}), do: {:ok, finalized}
+  defp normalize_stale_generation(result), do: result
+
+  defp maybe_put_before_finalize(attrs, %SelectedCandidateContext{attempt: nil}, _callback),
+    do: attrs
+
+  defp maybe_put_before_finalize(attrs, %SelectedCandidateContext{}, callback),
+    do: Map.put(attrs, :before_finalize, callback)
+
+  defp emit_settlement_outcome({:ok, finalized}, outcome, transports) do
+    if AttemptSettlement.first_settlement?(finalized) do
+      if outcome == "interrupted" do
+        InterruptionOutcome.emit(
+          transports.downstream_transport,
+          transports.upstream_transport
+        )
+      else
+        emit_stream_outcome(
+          outcome,
+          transports.downstream_transport,
+          transports.upstream_transport
+        )
+      end
+    end
+  end
+
+  defp emit_settlement_failure(
+         {:error, %{code: "gateway_accounting_failed"}},
+         transports
+       ) do
+    emit_stream_outcome(
+      "settlement_failed",
+      transports.downstream_transport,
+      transports.upstream_transport
     )
   end
 
-  defp upstream_websocket_connection(%ResponseContext{
+  defp emit_settlement_failure({:error, _gateway_error}, _transports), do: :ok
+
+  defp resolved_transports(
+         %ResponseContext{context: context, upstream_transport: transport_override},
+         websocket_attempt_metadata
+       ) do
+    %{
+      downstream_transport: downstream_transport(context.request_options),
+      upstream_transport:
+        upstream_transport(
+          transport_override,
+          websocket_attempt_metadata.upstream_websocket_connection
+        )
+    }
+  end
+
+  defp merge_upstream_websocket_connection(metadata, connection) do
+    metadata
+    |> Map.drop(["upstream_websocket_connection", :upstream_websocket_connection])
+    |> Map.merge(Metadata.upstream_websocket_connection_attempt_metadata(connection))
+  end
+
+  defp upstream_websocket_attempt_metadata(%ResponseContext{
          upstream_websocket_connection: connection
        })
        when not is_nil(connection),
-       do: connection
+       do: %{upstream_websocket_connection: connection, transport_failure: nil}
 
-  defp upstream_websocket_connection(%ResponseContext{
+  defp upstream_websocket_attempt_metadata(%ResponseContext{
          response: %Req.Response{body: %WebsocketBridgeStream{} = stream}
        }) do
-    WebsocketBridgeStream.take_upstream_websocket_connection(stream)
+    WebsocketBridgeStream.take_upstream_websocket_attempt_metadata(stream)
+    |> Map.put_new(:model_usage, %{})
   end
 
-  defp upstream_websocket_connection(%ResponseContext{}), do: nil
+  defp upstream_websocket_attempt_metadata(%ResponseContext{}),
+    do: %{upstream_websocket_connection: nil, transport_failure: nil}
+
+  defp merge_websocket_transport_failure(metadata, transport_failure) do
+    transport_failure =
+      TransportFailureReason.sanitize_transport_failure_metadata(transport_failure)
+
+    if map_size(transport_failure) > 0 do
+      inferred_failure = Map.get(metadata, "transport_failure", %{})
+
+      merged_failure =
+        inferred_failure
+        |> Map.merge(transport_failure)
+        |> preserve_upstream_commitment(inferred_failure, transport_failure)
+
+      Map.put(metadata, "transport_failure", merged_failure)
+    else
+      metadata
+    end
+  end
+
+  # `pre_visible_output` answers "had the client seen anything yet", and the
+  # only witness is the relay's own stream state. The inferred interruption
+  # metadata cannot know: `maybe_put_upstream_stream_interrupted_metadata/3`
+  # writes it from the reason alone as a hardcoded `false`. Correcting it only
+  # when the upstream websocket bridge happened to retain a non-empty
+  # `transport_failure` left an ordinary HTTP SSE interruption — including
+  # every pre-visible drain, which has no retained bridge metadata at all —
+  # persisting the opposite of the truth. Apply the correction to whichever
+  # `transport_failure` map survived the merge instead.
+  defp correct_transport_failure_visibility(
+         %{"transport_failure" => %{} = transport_failure} = metadata,
+         stream_state
+       ) do
+    Map.put(metadata, "transport_failure", put_actual_visibility(transport_failure, stream_state))
+  end
+
+  defp correct_transport_failure_visibility(metadata, _stream_state), do: metadata
+
+  defp put_actual_visibility(transport_failure, stream_state) do
+    case DownstreamStream.public_openai_responses_stream_metadata(stream_state) do
+      %{"public_openai_responses_stream" => %{"visible_seen" => visible_seen}}
+      when is_boolean(visible_seen) ->
+        Map.put(transport_failure, "pre_visible_output", not visible_seen)
+
+      _metadata ->
+        transport_failure
+    end
+  end
+
+  defp preserve_upstream_commitment(merged, inferred, retained) do
+    if inferred["upstream_committed"] == true or retained["upstream_committed"] == true do
+      Map.put(merged, "upstream_committed", true)
+    else
+      merged
+    end
+  end
 
   @spec error_code(term()) :: String.t()
   def error_code({:chunk, :closed}), do: "client_disconnected"
   def error_code({:chunk, _reason}), do: "downstream_stream_error"
   def error_code({:upstream_idle_timeout, _reason}), do: "stream_idle_timeout"
+  # A rollout drain is our own lifecycle event, not an upstream failure. Keep
+  # the drain vocabulary owner-side finalization already writes so request logs
+  # read the same whether the drained work was a websocket turn or a deferred
+  # HTTP SSE stream. The public wire frame is unchanged: the synthetic terminal
+  # is written from the missing-terminal path before this code is chosen.
+  def error_code(:owner_drained), do: "owner_drained"
+  def error_code({:upstream_stream_interrupted, :owner_drained}), do: "owner_drained"
+
+  # A bridged turn reports its failures wrapped in `{:upstream_websocket_bridge,
+  # reason}` (`WebsocketBridgeStream.parse_message/2`), and because a bridge
+  # stream is always downstream-committed the missing-terminal path wraps that
+  # again. Without these two clauses a drain that reached the relay as a bridge
+  # error before the deferred-stream drain signal fell through to
+  # `upstream_stream_error`, which also cost it its 499 and its `interrupted`
+  # turn status (both keyed off this code) and blamed the upstream for our own
+  # rollout. The unwrapped reasons are exactly the interrupted vocabulary: a
+  # drained, lost or crashed owner is our own loss on any downstream transport,
+  # so the bridged HTTP turn records the same code, status and outcome as a
+  # websocket turn cut the same way (findings#228). Every other bridge reason
+  # keeps its existing classification.
+  def error_code({:upstream_websocket_bridge, reason})
+      when reason in @interrupted_bridge_reasons,
+      do: Atom.to_string(reason)
+
+  def error_code({:upstream_stream_interrupted, {:upstream_websocket_bridge, reason}})
+      when reason in @interrupted_bridge_reasons,
+      do: Atom.to_string(reason)
+
   def error_code({:upstream_stream_interrupted, _reason}), do: "upstream_stream_error"
+
+  def error_code({:collected_response_invalid, _status, code}),
+    do: DiagnosticTaxonomy.identifier(code) || "upstream_response_missing"
+
   def error_code(:upstream_websocket_receive_timeout), do: "stream_idle_timeout"
   def error_code({:terminal_stream_failure, %{code: code}}) when is_binary(code), do: code
   def error_code(:upstream_unauthorized), do: "upstream_unauthorized"
@@ -248,7 +560,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
 
   def record_health_failure(_reason, code, %SelectedCandidateContext{} = context)
       when is_binary(code) do
-    if health_neutral_error_code?(code) do
+    if ErrorCodes.health_neutral_error_code?(code) do
       DispatchLifecycle.neutral_completion(context)
     else
       route_failure(context, code)
@@ -263,16 +575,65 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
           health_result()
   def record_terminal_health_failure(code, headers, %SelectedCandidateContext{} = context)
       when is_binary(code) do
-    if health_neutral_terminal_failure?(code, headers) do
-      DispatchLifecycle.neutral_completion(context)
-    else
-      record_health_failure(code, code, context)
+    cond do
+      ErrorCodes.provider_overload_error_code?(code) ->
+        DispatchLifecycle.overload_completion(context)
+
+      health_neutral_terminal_failure?(code, headers) ->
+        DispatchLifecycle.neutral_completion(context)
+
+      true ->
+        record_health_failure(code, code, context)
     end
   end
 
   def record_terminal_health_failure(code, _headers, %SelectedCandidateContext{} = context) do
     record_health_failure(code, code, context)
   end
+
+  @doc false
+  @spec health_neutral_terminal_failure?(term(), term()) :: boolean()
+  def health_neutral_terminal_failure?(code, headers),
+    do: do_health_neutral_terminal_failure?(code, headers)
+
+  # Draining for a rollout must not demote the upstream or open its circuit.
+  defp record_stream_failure_health(:owner_drained, _code, nil, _headers, context),
+    do: DispatchLifecycle.neutral_completion(context)
+
+  defp record_stream_failure_health(
+         {:upstream_stream_interrupted, :owner_drained},
+         _code,
+         nil,
+         _headers,
+         context
+       ),
+       do: DispatchLifecycle.neutral_completion(context)
+
+  # A bridged owner loss reaches health classification under the same two
+  # wrapped shapes `error_code/1` unwraps. It used to land here only by way of
+  # the generic `{:upstream_stream_interrupted, _}` + `"upstream_stream_error"`
+  # clause below; now that its code is the owner-loss code, that clause no
+  # longer matches and the loss would otherwise demote the upstream and open
+  # its circuit for our own drain, lease loss or crash.
+  defp record_stream_failure_health(
+         {:upstream_websocket_bridge, reason},
+         _code,
+         nil,
+         _headers,
+         context
+       )
+       when reason in @interrupted_bridge_reasons,
+       do: DispatchLifecycle.neutral_completion(context)
+
+  defp record_stream_failure_health(
+         {:upstream_stream_interrupted, {:upstream_websocket_bridge, reason}},
+         _code,
+         nil,
+         _headers,
+         context
+       )
+       when reason in @interrupted_bridge_reasons,
+       do: DispatchLifecycle.neutral_completion(context)
 
   defp record_stream_failure_health(
          :upstream_stream_interrupted,
@@ -286,6 +647,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   defp record_stream_failure_health(
          {:upstream_stream_interrupted, _reason},
          "upstream_stream_error",
+         nil,
+         _headers,
+         context
+       ),
+       do: DispatchLifecycle.neutral_completion(context)
+
+  defp record_stream_failure_health(
+         {:collected_response_invalid, _status, _code},
+         _error_code,
          nil,
          _headers,
          context
@@ -318,40 +688,108 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     end
   end
 
-  defp health_neutral_error_code?(code) do
-    code in [
-      "context_length_exceeded",
-      "invalid_request",
-      "invalid_request_error",
-      "invalid_previous_response_id",
-      "missing_required_parameter",
-      "overloaded_error",
-      "previous_response_not_found",
-      "server_is_overloaded",
-      "server_error",
-      "unsupported_input_image_format",
-      "unsupported_parameter",
-      "unsupported_value",
-      "usage_limit_exceeded",
-      "usage_limit_reached"
-    ]
+  defp do_health_neutral_terminal_failure?(code, headers) do
+    ErrorCodes.health_neutral_error_code?(code) or
+      workspace_quota_depleted?(code) or
+      workspace_quota_depleted?(RateLimitReachedType.parse_header(headers))
   end
 
-  defp health_neutral_terminal_failure?(code, headers) do
-    health_neutral_error_code?(code) or
-      workspace_usage_limit_reached?(code) or
-      workspace_usage_limit_reached?(RateLimitReachedType.parse_header(headers))
-  end
-
-  defp workspace_usage_limit_reached?(code) do
+  defp workspace_quota_depleted?(code) do
     code in [
+      "workspace_member_credits_depleted",
       "workspace_member_usage_limit_reached",
+      "workspace_owner_credits_depleted",
       "workspace_owner_usage_limit_reached"
     ]
   end
 
+  defp terminal_failure_message(code, default) do
+    if code == MisalignmentPolicyViolation.code(),
+      do: MisalignmentPolicyViolation.fallback_message(),
+      else: default
+  end
+
+  defp terminal_failure_attempt_metadata(metadata, code) do
+    if code == MisalignmentPolicyViolation.code(),
+      do: Map.delete(metadata, "upstream_error_param"),
+      else: metadata
+  end
+
+  defp non_first_event_terminal_attempt_metadata(
+         metadata,
+         %{diagnostic_upstream_code: diagnostic_upstream_code} = failure,
+         code
+       ) do
+    metadata
+    |> maybe_put_compaction_terminal_code(diagnostic_upstream_code)
+    |> maybe_put_compaction_terminal_type(failure.event_type)
+    |> maybe_put_compaction_invalid_reason(failure)
+    |> Map.delete("upstream_error_param")
+    |> Metadata.maybe_put_upstream_error_param(%{
+      upstream_error_param: UpstreamErrorParam.sanitize(failure.upstream_error_param)
+    })
+    |> terminal_failure_attempt_metadata(code)
+  end
+
+  defp non_first_event_terminal_attempt_metadata(metadata, failure, code) do
+    metadata
+    |> Metadata.maybe_put_upstream_error_param(failure)
+    |> maybe_put_compaction_invalid_reason(failure)
+    |> terminal_failure_attempt_metadata(code)
+  end
+
+  # The compact collector's own rejection diagnosis. It is the only field that
+  # separates the six collector failure modes once the attempt row is settled,
+  # so it is persisted as a bounded sanitized identifier from the collector's
+  # closed vocabulary.
+  defp maybe_put_compaction_invalid_reason(metadata, %{compaction_invalid_reason: reason}) do
+    case DiagnosticTaxonomy.identifier(reason) do
+      code when is_binary(code) -> Map.put(metadata, "compaction_invalid_reason", code)
+      nil -> metadata
+    end
+  end
+
+  defp maybe_put_compaction_invalid_reason(metadata, _failure), do: metadata
+
+  defp maybe_put_compaction_terminal_code(metadata, diagnostic_upstream_code) do
+    case DiagnosticTaxonomy.identifier(diagnostic_upstream_code) do
+      code when is_binary(code) -> Map.put(metadata, "upstream_error_code", code)
+      nil -> metadata
+    end
+  end
+
+  defp maybe_put_compaction_terminal_type(metadata, event_type) do
+    case DiagnosticTaxonomy.identifier(event_type) do
+      type when is_binary(type) -> Map.put(metadata, "stream_terminal_type", type)
+      nil -> metadata
+    end
+  end
+
   defp terminal_failure_reason({:terminal_stream_failure, %{} = failure}), do: failure
   defp terminal_failure_reason(_reason), do: nil
+
+  defp failure_response_status({:collected_response_invalid, status, _code}, _upstream_status),
+    do: status
+
+  # The client's stream was cut by us, so the request row carries the same 499
+  # owner-side drain finalization records rather than the upstream's 200.
+  defp failure_response_status(:owner_drained, _upstream_status), do: 499
+
+  defp failure_response_status({:upstream_stream_interrupted, :owner_drained}, _upstream_status),
+    do: 499
+
+  defp failure_response_status({:upstream_websocket_bridge, reason}, _upstream_status)
+       when reason in @interrupted_bridge_reasons,
+       do: 499
+
+  defp failure_response_status(
+         {:upstream_stream_interrupted, {:upstream_websocket_bridge, reason}},
+         _upstream_status
+       )
+       when reason in @interrupted_bridge_reasons,
+       do: 499
+
+  defp failure_response_status(_reason, upstream_status), do: upstream_status
 
   defp stream_failure_code(nil, _context), do: nil
 
@@ -384,4 +822,81 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     do: endpoint == "/backend-api/codex/responses/compact"
 
   defp elapsed_ms(started), do: max(System.monotonic_time(:millisecond) - started, 0)
+
+  defp first_event_usage(_body, %ResponseContext{response_usage: %{} = usage}), do: usage
+  defp first_event_usage(body, %ResponseContext{upstream_transport: :websocket}), do: Map.delete(ResponseUsage.from_sse(body), :model_observation)
+  defp first_event_usage(body, _context), do: ResponseUsage.from_sse(body)
+
+  defp stream_usage(_body, %{response_usage: %{} = usage}), do: usage
+
+  defp stream_usage(_body, %{usage_observer: %{} = usage_state}),
+    do: StreamUsageObserver.result(usage_state)
+
+  defp stream_usage(body, _stream_state), do: ResponseUsage.from_sse(body)
+
+  # A bridge carries normalized public frames. Only its owner observed the
+  # original declarations; an absent field there must erase derived evidence.
+  defp merge_model_observation(usage, %{model_usage: %{} = model_usage}), do: usage |> Map.drop([:served_model, :model_observation]) |> Map.merge(model_usage)
+  defp merge_model_observation(usage, _metadata), do: usage
+
+  defp merge_usage_observation(metadata, %{usage_observer: %{} = observer}) do
+    observation =
+      observer
+      |> StreamUsageObserver.diagnostics()
+      |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
+
+    Map.put(metadata, "usage_observation", observation)
+  end
+
+  defp merge_usage_observation(metadata, _stream_state), do: metadata
+
+  @doc false
+  @spec emit_stream_finalization(map(), String.t(), String.t()) :: :ok
+  def emit_stream_finalization(usage, downstream_transport, upstream_transport) do
+    :telemetry.execute(
+      [:codex_pooler, :gateway, :stream, :finalization],
+      %{count: 1},
+      %{
+        usage_status: usage[:status],
+        usage_source: usage_source_class(usage),
+        downstream_transport: downstream_transport,
+        upstream_transport: upstream_transport
+      }
+    )
+  end
+
+  @doc false
+  @spec emit_stream_outcome(String.t(), String.t(), String.t()) :: :ok
+  def emit_stream_outcome(outcome, downstream_transport, upstream_transport)
+      when outcome in ["succeeded", "failed", "settlement_failed"] do
+    :telemetry.execute(
+      [:codex_pooler, :gateway, :stream, :outcome],
+      %{count: 1},
+      %{
+        outcome: outcome,
+        downstream_transport: downstream_transport,
+        upstream_transport: upstream_transport
+      }
+    )
+  end
+
+  defp usage_source_class(%{status: "usage_known", source: "websocket_upstream_usage"}),
+    do: "websocket_upstream_usage"
+
+  defp usage_source_class(%{status: "usage_known"}), do: "upstream_usage"
+  defp usage_source_class(_usage), do: "unknown"
+
+  @doc false
+  @spec downstream_transport(term()) :: String.t()
+  def downstream_transport(%{transport: %{transport: transport}})
+      when transport in ["http_sse", "websocket"],
+      do: transport
+
+  def downstream_transport(_request_options), do: "unknown"
+
+  @doc false
+  @spec upstream_transport(:websocket | nil, term()) :: String.t()
+  def upstream_transport(:websocket, _connection), do: "websocket"
+  def upstream_transport(nil, nil), do: "http_sse"
+  def upstream_transport(nil, _connection), do: "websocket"
 end

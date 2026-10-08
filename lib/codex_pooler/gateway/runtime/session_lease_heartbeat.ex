@@ -1,0 +1,598 @@
+defmodule CodexPooler.Gateway.Runtime.SessionLeaseHeartbeat do
+  @moduledoc false
+
+  use GenServer
+
+  require Logger
+
+  alias CodexPooler.Gateway.{OperationalSettings, OwnerRenewalSchedule}
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{CodexSession, SessionContinuity}
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
+
+  @call_timeout 1_000
+  # A synchronous renewal may use one bounded renewal interval for database
+  # work, with the ordinary process-call allowance left for its reply. The
+  # database deadline includes checkout, statements, diagnostics and COMMIT;
+  # row acquisition uses only half of it. Neither allowance extends the lease
+  # or replaces the authoritative expiry and presence checks after locking.
+  @http_transports ["http_json", "http_sse", "http_compact_json"]
+
+  defstruct [
+    :session_id,
+    :owner_lease_token,
+    :owner_instance_id,
+    :owner_instance_boot_id,
+    :ttl_seconds,
+    :renewal_interval_ms,
+    :caller_pid,
+    :caller_monitor,
+    :renew,
+    :renewal_delay,
+    :renewal_ref,
+    :renewal_token,
+    :handoff_ref,
+    :handoff_token,
+    :renew_call_timeout_ms,
+    :test_observer
+  ]
+
+  @type result :: {:ok, pid()} | :ignore
+
+  @spec start(RequestOptions.t()) :: result()
+  def start(%RequestOptions{} = request_options), do: start(request_options, [])
+
+  @spec start(RequestOptions.t(), keyword()) :: result()
+  def start(%RequestOptions{} = request_options, opts) when is_list(opts) do
+    case lifecycle(request_options, opts) do
+      {:ok, lifecycle} -> GenServer.start(__MODULE__, lifecycle)
+      :ignore -> :ignore
+    end
+  end
+
+  # A two-argument callback also receives the request options the request must
+  # continue with: when the synchronous renewal took an expired lease over, they
+  # carry the new owner and witness, and the old witness would fail every later
+  # check as `stale_owner`.
+  @spec run(
+          RequestOptions.t(),
+          (-> term()) | (pid() | nil -> term()) | (pid() | nil, RequestOptions.t() -> term())
+        ) ::
+          term() | {:error, :stale_owner | :owner_unavailable}
+  def run(%RequestOptions{} = request_options, callback) when is_function(callback, 0) do
+    run(request_options, fn _heartbeat, _request_options -> callback.() end)
+  end
+
+  def run(%RequestOptions{} = request_options, callback) when is_function(callback, 1) do
+    run(request_options, fn heartbeat, _request_options -> callback.(heartbeat) end)
+  end
+
+  def run(%RequestOptions{} = request_options, callback) when is_function(callback, 2) do
+    start_opts = [schedule?: false] ++ test_start_options()
+    call_timeout_ms = renew_call_timeout_ms(start_opts, request_options)
+    start_opts = Keyword.put(start_opts, :renew_call_timeout_ms, call_timeout_ms)
+
+    case start(request_options, start_opts) do
+      :ignore ->
+        callback.(nil, request_options)
+
+      {:ok, heartbeat} ->
+        renew_and_run(heartbeat, call_timeout_ms, request_options, callback)
+    end
+  end
+
+  defp renew_and_run(heartbeat, call_timeout_ms, request_options, callback) do
+    case renew_now(heartbeat, call_timeout_ms, request_options.continuity.codex_session.id) do
+      {:ok, renewed} ->
+        request_options = adopt_renewed_owner(request_options, renewed)
+        run_callback(heartbeat, fn heartbeat -> callback.(heartbeat, request_options) end)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # The renewal either extended the lease the request holds (same token) or
+  # took an expired one over (new token and owner).
+  defp adopt_renewed_owner(
+         %RequestOptions{continuity: %{codex_session: %CodexSession{} = current}} = request_options,
+         %CodexSession{owner_lease_token: token} = renewed
+       )
+       when token != current.owner_lease_token do
+    session = %{
+      current
+      | owner_instance_id: renewed.owner_instance_id,
+        owner_instance_boot_id: renewed.owner_instance_boot_id,
+        owner_lease_token: renewed.owner_lease_token,
+        owner_lease_expires_at: renewed.owner_lease_expires_at,
+        last_heartbeat_at: renewed.last_heartbeat_at
+    }
+
+    {:ok, witness} = OwnerWitness.new(session)
+
+    request_options
+    |> RequestOptions.put_continuity(codex_session: session)
+    |> RequestOptions.put_session_owner_witness(witness)
+  end
+
+  defp adopt_renewed_owner(%RequestOptions{} = request_options, _renewed), do: request_options
+
+  @spec stop(pid() | nil) :: :ok
+  def stop(nil), do: :ok
+
+  def stop(pid) when is_pid(pid) do
+    if Process.alive?(pid) do
+      try do
+        GenServer.call(pid, :stop, @call_timeout)
+      catch
+        :exit, _reason -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  @spec stream_started(pid() | nil) :: :ok
+  def stream_started(nil), do: :ok
+
+  def stream_started(pid) when is_pid(pid) do
+    if Process.alive?(pid) do
+      try do
+        GenServer.call(pid, :stream_started, @call_timeout)
+      catch
+        :exit, _reason -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  @impl GenServer
+  def init(lifecycle) do
+    caller_monitor = Process.monitor(lifecycle.caller_pid)
+
+    state = %__MODULE__{
+      session_id: lifecycle.session_id,
+      owner_lease_token: lifecycle.owner_lease_token,
+      owner_instance_id: lifecycle.owner_instance_id,
+      owner_instance_boot_id: lifecycle.owner_instance_boot_id,
+      ttl_seconds: lifecycle.ttl_seconds,
+      renewal_interval_ms: lifecycle.renewal_interval_ms,
+      caller_pid: lifecycle.caller_pid,
+      caller_monitor: caller_monitor,
+      renew: lifecycle.renew,
+      renewal_delay: lifecycle.renewal_delay,
+      renew_call_timeout_ms: lifecycle.renew_call_timeout_ms,
+      test_observer: lifecycle.test_observer
+    }
+
+    notify_test_observer(state, :started)
+
+    if lifecycle.schedule? do
+      {:ok, schedule_renewal(state)}
+    else
+      {:ok, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call(:renew_now, _from, state) do
+    case renew(state, :synchronous) do
+      {:ok, %CodexSession{} = renewed} ->
+        state = adopt_renewed_token(state, renewed)
+        {:reply, {:ok, renewed}, schedule_renewal(state)}
+
+      {:error, reason, reason_class} ->
+        {:stop, :normal, {:error, reason, reason_class}, state}
+    end
+  end
+
+  def handle_call(:stream_started, _from, state) do
+    {:reply, :ok, cancel_handoff(state)}
+  end
+
+  def handle_call({:handoff, ttl_ms}, _from, state) when is_integer(ttl_ms) and ttl_ms > 0 do
+    {:reply, :ok, schedule_handoff(state, ttl_ms)}
+  end
+
+  def handle_call(:stop, _from, state), do: {:stop, :normal, :ok, state}
+
+  @impl GenServer
+  def handle_info({:session_lease_heartbeat_renew, token}, %{renewal_token: token} = state) do
+    state = %{state | renewal_ref: nil, renewal_token: nil}
+
+    case renew(state, :scheduled) do
+      {:ok, _renewed} ->
+        {:noreply, schedule_renewal(state)}
+
+      {:error, _reason, reason_class} ->
+        log_renewal_failure(state.session_id, :scheduled, reason_class)
+        {:stop, :normal, state}
+    end
+  end
+
+  def handle_info(
+        {:session_lease_heartbeat_handoff_timeout, token},
+        %{handoff_token: token} = state
+      ),
+      do: {:stop, :normal, %{state | handoff_ref: nil, handoff_token: nil}}
+
+  def handle_info(
+        {:DOWN, monitor, :process, pid, _reason},
+        %{caller_monitor: monitor, caller_pid: pid} = state
+      ),
+      do: {:stop, :normal, state}
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  @impl GenServer
+  def terminate(_reason, state) do
+    _state = state |> cancel_renewal() |> cancel_handoff() |> demonitor_caller()
+    notify_test_observer(state, :stopped)
+    :ok
+  end
+
+  defp run_callback(heartbeat, callback) do
+    result = callback.(heartbeat)
+
+    if deferred_result?(result) do
+      _ = begin_handoff(heartbeat)
+      result
+    else
+      :ok = stop(heartbeat)
+      result
+    end
+  catch
+    kind, reason ->
+      :ok = stop(heartbeat)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp begin_handoff(heartbeat) do
+    GenServer.call(heartbeat, {:handoff, ttl_ms(heartbeat)}, @call_timeout)
+  catch
+    :exit, _reason -> {:error, :owner_unavailable}
+  end
+
+  # The caller logs every synchronous failure exactly once: the heartbeat replies
+  # with its reason class, or is killed after the call bound without logging.
+  defp renew_now(heartbeat, timeout, session_id) do
+    case GenServer.call(heartbeat, :renew_now, timeout) do
+      {:ok, renewed} ->
+        {:ok, renewed}
+
+      {:error, reason, reason_class} ->
+        log_renewal_failure(session_id, :synchronous, reason_class)
+        {:error, reason}
+    end
+  catch
+    :exit, reason ->
+      terminate_after_call_failure(heartbeat)
+      log_renewal_failure(session_id, :synchronous, call_exit_reason_class(reason))
+      {:error, :owner_unavailable}
+  end
+
+  defp call_exit_reason_class({:timeout, _call}), do: :call_timeout
+  defp call_exit_reason_class(_reason), do: :heartbeat_exit
+
+  defp terminate_after_call_failure(heartbeat) do
+    monitor = Process.monitor(heartbeat)
+
+    if Process.alive?(heartbeat) do
+      Process.exit(heartbeat, :kill)
+    end
+
+    receive do
+      {:DOWN, ^monitor, :process, ^heartbeat, _reason} -> :ok
+    after
+      @call_timeout ->
+        Process.demonitor(monitor, [:flush])
+        :ok
+    end
+  end
+
+  defp lifecycle(%RequestOptions{} = request_options, opts) do
+    with %CodexSession{id: session_id} <- request_options.continuity.codex_session,
+         %OwnerWitness{session_id: ^session_id, lease_token: owner_lease_token} <-
+           request_options.runtime.session_owner_witness,
+         transport when transport in @http_transports <- request_options.transport.transport,
+         true <- is_pid(Keyword.get(opts, :caller, self())) do
+      ttl_seconds = ttl_seconds(opts, request_options)
+      renewal_interval_ms = renewal_interval_ms(opts)
+
+      {:ok,
+       %{
+         session_id: session_id,
+         owner_lease_token: owner_lease_token,
+         owner_instance_id: request_options.continuity.owner_instance_id,
+         owner_instance_boot_id: request_options.continuity.owner_instance_boot_id,
+         ttl_seconds: ttl_seconds,
+         renewal_interval_ms: OwnerRenewalSchedule.base_interval_ms(renewal_interval_ms, ttl_seconds * 1_000),
+         caller_pid: Keyword.get(opts, :caller, self()),
+         schedule?: Keyword.get(opts, :schedule?, true) == true,
+         renew: Keyword.get(opts, :renew, &SessionContinuity.renew_owner_token/4),
+         renewal_delay: Keyword.get(opts, :renewal_delay, &OwnerRenewalSchedule.staggered_delay/1),
+         renew_call_timeout_ms: renew_call_timeout_ms(opts, request_options),
+         test_observer: test_observer(request_options)
+       }}
+    else
+      _ineligible -> :ignore
+    end
+  end
+
+  # `:ttl_seconds` renews with a ttl other than the one the request acquired its
+  # lease with; the controller owner-lease tests use it to keep the pre-dispatch
+  # window on a long acquisition ttl while the heartbeat renews a short one.
+  defp ttl_seconds(opts, %RequestOptions{} = request_options) do
+    case Keyword.get(opts, :ttl_seconds) do
+      ttl when is_integer(ttl) and ttl > 0 -> ttl
+      _value -> ttl_seconds(request_options)
+    end
+  end
+
+  defp ttl_seconds(%RequestOptions{} = request_options) do
+    case request_options.continuity.bridge_owner_lease_ttl_seconds do
+      ttl when is_integer(ttl) and ttl > 0 -> ttl
+      _value -> OperationalSettings.current().bridge_owner_lease_ttl_seconds
+    end
+  end
+
+  defp renew_call_timeout_ms(opts, request_options) do
+    case Keyword.get(opts, :renew_call_timeout_ms) do
+      timeout when is_integer(timeout) and timeout > 0 ->
+        timeout
+
+      _value ->
+        OwnerRenewalSchedule.base_interval_ms(
+          renewal_interval_ms(opts),
+          ttl_seconds(opts, request_options) * 1_000
+        ) + @call_timeout
+    end
+  end
+
+  defp renewal_interval_ms(opts) do
+    case Keyword.get(opts, :renewal_interval_ms) do
+      interval when is_integer(interval) and interval > 0 -> interval
+      _value -> OperationalSettings.current().bridge_owner_lease_renewal_seconds * 1_000
+    end
+  end
+
+  defp ttl_ms(heartbeat) do
+    case :sys.get_state(heartbeat) do
+      %__MODULE__{ttl_seconds: ttl_seconds} -> ttl_seconds * 1_000
+    end
+  catch
+    :exit, _reason -> 1
+  end
+
+  defp deferred_result?({:ok, %{stream: stream}}) when is_function(stream), do: true
+  defp deferred_result?(%{stream: stream}) when is_function(stream), do: true
+  defp deferred_result?(_result), do: false
+
+  defp renew(state, phase) do
+    state
+    |> invoke_renew(phase)
+    |> classify_renewal()
+  rescue
+    exception -> {:error, :owner_unavailable, exception_reason_class(exception)}
+  catch
+    kind, _reason -> {:error, :owner_unavailable, caught_reason_class(kind)}
+  end
+
+  defp invoke_renew(%{renew: renew} = state, phase) when is_function(renew, 4) do
+    renew.(
+      state.session_id,
+      state.owner_lease_token,
+      renewal_options(state),
+      renewal_lock_options(state, phase)
+    )
+  end
+
+  defp invoke_renew(%{renew: renew} = state, _phase),
+    do: renew.(state.session_id, state.owner_lease_token, renewal_options(state))
+
+  # Only the synchronous pre-dispatch renewal has a caller waiting on a bound.
+  # A scheduled renewal keeps waiting for the lock: its lease is still live, and
+  # failing it on a transient wait would stop the heartbeat mid-request.
+  defp renewal_lock_options(state, :synchronous) do
+    reply_allowance_ms = min(@call_timeout, max(div(state.renew_call_timeout_ms, 5), 1))
+
+    timeout_ms =
+      min(max(state.renew_call_timeout_ms - reply_allowance_ms, 1), state.renewal_interval_ms)
+
+    [lock_timeout_ms: max(div(timeout_ms, 2), 1), timeout_ms: timeout_ms, take_over_expired: true]
+  end
+
+  defp renewal_lock_options(_state, :scheduled), do: []
+
+  defp classify_renewal({:ok, %CodexSession{} = session}), do: {:ok, session}
+  defp classify_renewal({:error, :stale_owner}), do: {:error, :stale_owner, :stale_owner}
+
+  defp classify_renewal({:error, :owner_unavailable}),
+    do: {:error, :owner_unavailable, :owner_unavailable}
+
+  defp classify_renewal({:error, {:lock_timeout, diagnostics}}),
+    do: {:error, :owner_unavailable, {:lock_timeout, diagnostics}}
+
+  defp classify_renewal({:error, :lock_timeout}),
+    do: {:error, :owner_unavailable, {:lock_timeout, nil}}
+
+  defp classify_renewal(_other), do: {:error, :owner_unavailable, :unexpected_result}
+
+  defp exception_reason_class(%DBConnection.ConnectionError{}), do: :database_unavailable
+  defp exception_reason_class(%Postgrex.Error{}), do: :database_error
+  defp exception_reason_class(_exception), do: :exception
+
+  defp caught_reason_class(:exit), do: :exit
+  defp caught_reason_class(_kind), do: :throw
+
+  # One bounded line per failed renewal: fixed phase and reason vocabularies and
+  # the trusted internal session correlator, never the lease token.
+  defp log_renewal_failure(session_id, phase, reason_class) do
+    Logger.warning(
+      "session lease renewal failed phase=#{phase} #{reason_field(reason_class)} " <>
+        "codex_session_id=#{DiagnosticTaxonomy.safe_correlator(session_id)}" <>
+        lock_wait_fields(reason_class)
+    )
+  end
+
+  defp reason_field({:lock_timeout, _diagnostics}), do: "reason=lock_timeout"
+  defp reason_field(reason_class), do: "reason=#{reason_class}"
+
+  # A lock timeout names the row the renewal waited on and, when the renewal
+  # resolved it, the transaction holding that row: its PostgreSQL state and wait
+  # class, transaction age, application name, a fingerprint of its current
+  # statement (never the text), and the relation it is itself waiting on. The
+  # waiter and blocker backend pids join this line to PostgreSQL lock-wait logs.
+  # Free-text values pass the diagnostic identifier allowlist or fingerprint.
+  defp lock_wait_fields({:lock_timeout, %{relation: relation, blocker: blocker} = diagnostics}),
+    do:
+      " relation=#{relation} waiter_pid=#{backend_pid(Map.get(diagnostics, :waiter_pid))}" <>
+        blocker_fields(blocker)
+
+  defp lock_wait_fields({:lock_timeout, _diagnostics}),
+    do: " relation=unknown blocker=unresolved"
+
+  defp lock_wait_fields(_reason_class), do: ""
+
+  defp blocker_fields(%{} = blocker) do
+    " blocker=resolved blocker_pid=#{backend_pid(Map.get(blocker, :pid))}" <>
+      " blocker_state=#{diagnostic_token(blocker.state)}" <>
+      " blocker_wait_event_type=#{diagnostic_token(blocker.wait_event_type)}" <>
+      " blocker_xact_age_ms=#{transaction_age(blocker.transaction_age_ms)}" <>
+      " blocker_application=#{diagnostic_token(blocker.application_name)}" <>
+      " blocker_query_fingerprint=#{query_fingerprint(blocker.query_fingerprint)}" <>
+      " blocker_waiting_relation=#{diagnostic_token(blocker.waiting_relation)}"
+  end
+
+  defp blocker_fields(_blocker), do: " blocker=unresolved"
+
+  defp diagnostic_token(value) when is_binary(value) and value != "",
+    do: value |> String.replace(" ", "_") |> DiagnosticTaxonomy.identifier()
+
+  defp diagnostic_token(_value), do: "none"
+
+  defp backend_pid(pid) when is_integer(pid) and pid > 0, do: pid
+  defp backend_pid(_pid), do: "none"
+
+  defp transaction_age(age_ms) when is_integer(age_ms) and age_ms >= 0, do: age_ms
+  defp transaction_age(_age_ms), do: "none"
+
+  defp query_fingerprint(<<fingerprint::binary-size(12)>>) do
+    if fingerprint =~ ~r/\A[0-9a-f]{12}\z/, do: fingerprint, else: "none"
+  end
+
+  defp query_fingerprint(_fingerprint), do: "none"
+
+  # The request's own owner identity, so a synchronous takeover mints the new
+  # lease for the VM (or the explicit owner override) the request runs under.
+  defp renewal_options(state) do
+    RequestOptions.build(
+      [
+        bridge_owner_lease_ttl_seconds: state.ttl_seconds,
+        transport: "http_json",
+        owner_instance_id: state.owner_instance_id,
+        owner_instance_boot_id: state.owner_instance_boot_id
+      ],
+      "/backend-api/codex/responses",
+      %{}
+    )
+  end
+
+  # One bounded line when the synchronous renewal took an expired lease over:
+  # the trusted session correlator only, never a token.
+  defp adopt_renewed_token(%{owner_lease_token: token} = state, %CodexSession{owner_lease_token: token}), do: state
+
+  defp adopt_renewed_token(state, %CodexSession{owner_lease_token: token} = renewed) when is_binary(token) do
+    Logger.info(
+      "session lease taken over phase=synchronous reason=expired_unrenewed " <>
+        "codex_session_id=#{DiagnosticTaxonomy.safe_correlator(state.session_id)} " <>
+        "owner_instance_id=#{DiagnosticTaxonomy.safe_correlator(renewed.owner_instance_id)}"
+    )
+
+    %{state | owner_lease_token: token}
+  end
+
+  defp adopt_renewed_token(state, _renewed), do: state
+
+  defp schedule_renewal(state) do
+    state = cancel_renewal(state)
+    token = make_ref()
+
+    delay =
+      state.renewal_interval_ms
+      |> state.renewal_delay.()
+      |> OwnerRenewalSchedule.bounded_delay(state.renewal_interval_ms)
+
+    %{
+      state
+      | renewal_token: token,
+        renewal_ref: Process.send_after(self(), {:session_lease_heartbeat_renew, token}, delay)
+    }
+  end
+
+  defp schedule_handoff(state, ttl_ms) do
+    state = cancel_handoff(state)
+    token = make_ref()
+
+    %{
+      state
+      | handoff_token: token,
+        handoff_ref: Process.send_after(self(), {:session_lease_heartbeat_handoff_timeout, token}, ttl_ms)
+    }
+  end
+
+  defp cancel_renewal(%{renewal_ref: ref} = state) when is_reference(ref) do
+    _ = Process.cancel_timer(ref)
+    %{state | renewal_ref: nil, renewal_token: nil}
+  end
+
+  defp cancel_renewal(state), do: state
+
+  defp cancel_handoff(%{handoff_ref: ref} = state) when is_reference(ref) do
+    _ = Process.cancel_timer(ref)
+    %{state | handoff_ref: nil, handoff_token: nil}
+  end
+
+  defp cancel_handoff(state), do: state
+
+  defp demonitor_caller(%{caller_monitor: ref} = state) when is_reference(ref) do
+    _ = Process.demonitor(ref, [:flush])
+    %{state | caller_monitor: nil}
+  end
+
+  defp demonitor_caller(state), do: state
+
+  if Mix.env() == :test do
+    # Controller tests set this in the request process, the only place a
+    # synchronous renewal's start options can come from on that path.
+    defp test_start_options do
+      [
+        renew: Process.get({__MODULE__, :renew}),
+        renew_call_timeout_ms: Process.get({__MODULE__, :renew_call_timeout_ms}),
+        ttl_seconds: Process.get({__MODULE__, :ttl_seconds})
+      ]
+      |> Enum.filter(&test_start_option?/1)
+    end
+
+    defp test_start_option?({:renew, renew}), do: is_function(renew, 3) or is_function(renew, 4)
+    defp test_start_option?({_key, value}), do: is_integer(value) and value > 0
+
+    defp test_observer(%RequestOptions{extra: %{session_lease_heartbeat_test_observer: observer}})
+         when is_pid(observer),
+         do: observer
+
+    defp test_observer(%RequestOptions{}), do: nil
+
+    defp notify_test_observer(%{test_observer: observer}, event)
+         when is_pid(observer) and event in [:started, :stopped],
+         do: send(observer, {:session_lease_heartbeat, event, self()})
+
+    defp notify_test_observer(_state, _event), do: :ok
+  else
+    defp test_start_options, do: []
+    defp test_observer(%RequestOptions{}), do: nil
+    defp notify_test_observer(_state, _event), do: :ok
+  end
+end

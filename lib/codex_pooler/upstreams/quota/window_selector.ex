@@ -1,8 +1,20 @@
 defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   @moduledoc false
 
-  alias CodexPooler.Quotas.{Evidence, WindowClassifier}
+  alias CodexPooler.Quotas.Evidence.Descriptors
+
+  alias CodexPooler.Quotas.{
+    AdditionalMeterIdentity,
+    Evidence,
+    ModelWeeklyResetSemantics,
+    WindowClassifier
+  }
+
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.Windows.CycleConfirmation
+  alias CodexPooler.Upstreams.Quota.Windows.Retention
+  alias CodexPooler.Upstreams.Quota.Windows.RuntimeCoherence
+  alias CodexPooler.Upstreams.Quota.Windows.UsageCoherence
 
   @fresh "fresh"
 
@@ -36,14 +48,38 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   def logical_windows(windows, %DateTime{} = as_of) when is_list(windows) do
     windows
     |> Enum.reject(&future_observation?(&1, as_of))
+    |> Retention.reject_past_retention(as_of)
     |> Enum.map(&normalize_legacy_weekly_primary/1)
     |> Enum.group_by(&logical_key/1)
-    |> Enum.map(fn {_logical_key, candidates} ->
+    |> Enum.flat_map(fn {_logical_key, candidates} ->
       candidates
-      |> reject_prior_cycle_windows(as_of)
-      |> best_by_score(as_of)
+      |> additional_window_groups()
+      |> Enum.map(fn candidates ->
+        candidates
+        |> reject_prior_cycle_windows(as_of)
+        |> reject_expired_behind_running_cycle(as_of)
+        |> reject_exhaustion_overridden_by_confirmed_usage(as_of)
+        |> best_logical_window(as_of)
+      end)
     end)
     |> Enum.sort_by(&logical_sort_key/1)
+  end
+
+  # Generic observations predate provider meter identity. They remain one
+  # legacy group when no rich observation exists, but cannot compete with or
+  # manufacture a third group beside meter-aware observations for the same
+  # logical window.
+  defp additional_window_groups(candidates) do
+    groups = Enum.group_by(candidates, &AdditionalMeterIdentity.group_key/1)
+
+    metered_groups =
+      for {{:metered, _logical_key, token}, windows} <- groups,
+          do: {token, windows}
+
+    case metered_groups do
+      [] -> [candidates]
+      groups -> groups |> Enum.sort_by(&elem(&1, 0)) |> Enum.map(&elem(&1, 1))
+    end
   end
 
   # A fresh sibling whose reset lies a full margin beyond a STALE row's reset
@@ -52,31 +88,68 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   # their pessimistic pressure keeps winning the merge and masks the restart
   # from operators and routing alike (observed live: a stale rate-limit-event
   # row at 94 percent from the ended cycle displayed as 6 percent remaining
-  # while the account was genuinely unused). Fresh rows are never rejected —
-  # same-cycle resets legitimately drift up to the window's own duration across
-  # provider surfaces — and groups without any fresh reset-bearing row are left
-  # untouched, so an all-stale exhausted group keeps its fail-closed pessimism.
+  # while the account was genuinely unused). Without a confirmed anchor a fresh
+  # row is never rejected — same-cycle resets legitimately drift up to the
+  # window's own duration across provider surfaces. A provider-confirmed reset
+  # outranks that drift, so once `CycleConfirmation` has anchored the running
+  # cycle every row more than a margin behind it is rejected, fresh included
+  # (`reject_fresh?`). Groups with neither a confirmation nor a fresh
+  # reset-bearing row are left untouched, so an all-stale exhausted group keeps
+  # its fail-closed pessimism.
   @prior_cycle_margin_seconds 60 * 60
 
   defp reject_prior_cycle_windows(candidates, as_of) do
+    confirmed_resets =
+      for window <- candidates,
+          CycleConfirmation.selector_valid?(window, as_of),
+          do: window.reset_at
+
     fresh_resets =
       for window <- candidates,
           fresh?(window, as_of),
           match?(%DateTime{}, window.reset_at),
           do: window.reset_at
 
+    case confirmed_resets do
+      [_first | _rest] = resets ->
+        reject_resets_before(candidates, Enum.max(resets, DateTime), true, as_of)
+
+      [] ->
+        reject_stale_prior_cycle_windows(candidates, fresh_resets, as_of)
+    end
+  end
+
+  defp reject_stale_prior_cycle_windows(candidates, fresh_resets, as_of) do
     case fresh_resets do
       [] ->
         candidates
 
       resets ->
-        newest = Enum.max(resets, DateTime)
+        reject_resets_before(candidates, Enum.max(resets, DateTime), false, as_of)
+    end
+  end
 
-        Enum.reject(candidates, fn window ->
-          not fresh?(window, as_of) and
-            match?(%DateTime{}, window.reset_at) and
-            DateTime.diff(newest, window.reset_at, :second) > @prior_cycle_margin_seconds
-        end)
+  defp reject_resets_before(candidates, newest, reject_fresh?, as_of) do
+    Enum.reject(candidates, fn window ->
+      (reject_fresh? or not fresh?(window, as_of)) and match?(%DateTime{}, window.reset_at) and
+        DateTime.diff(newest, window.reset_at, :second) > @prior_cycle_margin_seconds
+    end)
+  end
+
+  # A row whose reset has passed describes a cycle that has ended, so while any
+  # sibling still reports a reset in the future it has nothing left to say
+  # about the running cycle. The prior-cycle filter above only anchors on fresh
+  # or provider-confirmed resets, so when the Usage API poll stops succeeding
+  # and every row ages past the freshness TTL, an expired row at 100% would
+  # otherwise win the merge by pressure and show the ended cycle's exhaustion
+  # as the account's current state. A fresh row never loses to an expired one
+  # anyway (an expired row is never fresh), so this changes the winner only in
+  # that all-stale case. A group whose rows have all expired is left untouched.
+  defp reject_expired_behind_running_cycle(candidates, as_of) do
+    if Enum.any?(candidates, &(reset_bearing?(&1) and not expired?(&1, as_of))) do
+      Enum.reject(candidates, &expired?(&1, as_of))
+    else
+      candidates
     end
   end
 
@@ -85,6 +158,35 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   # rows from its future. This is strictly non-future — the clock-skew
   # tolerance applies to freshness classification, not to existence, so even
   # a row observed one second past `as_of` is excluded.
+  # A fresh exhausted row from response headers, rate-limit events or runtime
+  # evidence normally keeps winning the merge by pressure, and rightly so: one
+  # lower Usage API reading is a suspicion, not a recovery. Once the provider
+  # has reported usable capacity twice for the same cycle after that exhausted
+  # observation (`UsageCoherence`), the exhausted row stops competing so routing
+  # and operators see the confirmed measurement instead of waiting for the
+  # exhausted row to age past the freshness TTL.
+  defp reject_exhaustion_overridden_by_confirmed_usage(candidates, as_of) do
+    candidates
+    |> reject_overridden(UsageCoherence, as_of)
+    |> reject_overridden(RuntimeCoherence, as_of)
+  end
+
+  # Runtime readings (response headers, rate-limit events) confirmed twice in
+  # the same cycle supersede a fresh exhausted Usage API row the same way
+  # (`RuntimeCoherence`), so a provider incident that keeps reporting 100%
+  # through the Usage API while traffic succeeds does not mask the account.
+  defp reject_overridden(candidates, coherence, as_of) do
+    case Enum.filter(candidates, &coherence.confirmed?(&1, as_of)) do
+      [] ->
+        candidates
+
+      confirmed ->
+        Enum.reject(candidates, fn window ->
+          Enum.any?(confirmed, &coherence.overrides?(&1, window, as_of))
+        end)
+    end
+  end
+
   defp future_observation?(
          %Quota.AccountQuotaWindow{observed_at: %DateTime{} = observed_at},
          %DateTime{} = as_of
@@ -101,10 +203,8 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   # so fold them read-side: selection, routing, and operator projections then
   # see a single weekly window regardless of whether the one-shot purge
   # migration has run or been raced by an old writer.
-  defp normalize_legacy_weekly_primary(
-         %Quota.AccountQuotaWindow{window_kind: "primary", window_minutes: 10_080} = window
-       ),
-       do: %{window | window_kind: "secondary"}
+  defp normalize_legacy_weekly_primary(%Quota.AccountQuotaWindow{window_kind: "primary", window_minutes: 10_080} = window),
+    do: %{window | window_kind: "secondary"}
 
   defp normalize_legacy_weekly_primary(window), do: window
 
@@ -113,27 +213,16 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
     window
     |> Evidence.logical_window_key()
     |> normalize_scope_dimensions()
-    |> normalize_spark_alias()
+    |> Descriptors.canonical_logical_window_key()
   end
 
-  defp normalize_scope_dimensions(
-         {"model", family, model, _upstream_model, quota_key, kind, minutes}
-       ),
-       do: {"model", family, model, nil, quota_key, kind, minutes}
+  defp normalize_scope_dimensions({"model", family, model, _upstream_model, quota_key, kind, minutes}),
+    do: {"model", family, model, nil, quota_key, kind, minutes}
 
-  defp normalize_scope_dimensions(
-         {"upstream_model", family, _model, upstream_model, quota_key, kind, minutes}
-       ),
-       do: {"upstream_model", family, nil, upstream_model, quota_key, kind, minutes}
+  defp normalize_scope_dimensions({"upstream_model", family, _model, upstream_model, quota_key, kind, minutes}),
+    do: {"upstream_model", family, nil, upstream_model, quota_key, kind, minutes}
 
   defp normalize_scope_dimensions(logical_key), do: logical_key
-
-  defp normalize_spark_alias({scope, family, model, upstream_model, quota_key, kind, minutes})
-       when quota_key in ["codex_bengalfox", "gpt_5_3_codex_spark"] do
-    {scope, family, model, upstream_model, "codex_spark", kind, minutes}
-  end
-
-  defp normalize_spark_alias(logical_key), do: logical_key
 
   defp best_by_score(windows, as_of, extra_rank \\ fn _window -> 0 end) do
     Enum.max_by(
@@ -141,6 +230,32 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
       &selection_score(&1, as_of, extra_rank),
       fn -> nil end
     )
+  end
+
+  defp best_logical_window(windows, as_of) do
+    Enum.max_by(
+      windows,
+      &logical_selection_score(&1, as_of),
+      fn -> nil end
+    )
+  end
+
+  defp logical_selection_score(%Quota.AccountQuotaWindow{} = window, as_of) do
+    {
+      fresh_rank(window, as_of),
+      measurement_rank(window),
+      pressure_rank(window),
+      usable_rank(window, as_of),
+      reset_rank(window),
+      window |> ModelWeeklyResetSemantics.classify() |> ModelWeeklyResetSemantics.rank(),
+      source_precision_rank(window.source_precision),
+      window.merge_precedence || 0,
+      timestamp_rank(window.observed_at),
+      timestamp_rank(window.last_sync_at),
+      timestamp_rank(window.updated_at),
+      timestamp_rank(window.reset_at),
+      to_string(window.id || "")
+    }
   end
 
   defp selection_score(%Quota.AccountQuotaWindow{} = window, as_of, extra_rank) do
@@ -167,13 +282,12 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   defp pressure_rank(%Quota.AccountQuotaWindow{}), do: Decimal.new(-1)
 
   defp logical_sort_key(%Quota.AccountQuotaWindow{} = window) do
-    {window.quota_key, window.window_kind, window.window_minutes, window.quota_scope,
-     window.quota_family, window.model || "", window.upstream_model || ""}
+    {window.quota_key, window.window_kind, window.window_minutes, window.quota_scope, window.quota_family, window.model || "", window.upstream_model || "", AdditionalMeterIdentity.token(window) || ""}
   end
 
   defp usable_rank(%Quota.AccountQuotaWindow{} = window, as_of) do
     if fresh?(window, as_of) and reset_bearing?(window) and not expired?(window, as_of) and
-         not exhausted?(window) do
+         not used_percent_exhausted?(window) do
       1
     else
       0
@@ -230,9 +344,23 @@ defmodule CodexPooler.Upstreams.Quota.WindowSelector do
   defp reset_bearing?(%Quota.AccountQuotaWindow{} = window), do: Evidence.reset_bearing?(window)
   defp expired?(%Quota.AccountQuotaWindow{} = window, as_of), do: Evidence.expired?(window, as_of)
 
-  defp exhausted?(%Quota.AccountQuotaWindow{used_percent: %Decimal{} = used_percent}) do
+  # Deliberately the percentage alone, and deliberately not the same question
+  # `Windows.Routing.exhausted?/1` answers. That one decides whether a window
+  # may be routed to at all, and forgives a monthly primary at 100% when it
+  # still holds credits, because the provider reports the included percentage
+  # while the credits carry the real capacity. This one only ranks windows that
+  # are already candidates, and there a window with real percentage headroom
+  # should outrank one relying on credits.
+  #
+  # The two are consulted by one call: `Routing.select_current_account_primary_variant/2`
+  # filters with the routing predicate and then ranks with this one. Merging
+  # them breaks one of the two tests that pin the difference --
+  # `upstreams_test.exs` requires a credit-backed monthly at 100% to stay
+  # eligible, `window_selector_test.exs` requires it to lose to a usable 5h
+  # window.
+  defp used_percent_exhausted?(%Quota.AccountQuotaWindow{used_percent: %Decimal{} = used_percent}) do
     Decimal.compare(used_percent, Decimal.new(100)) != :lt
   end
 
-  defp exhausted?(%Quota.AccountQuotaWindow{}), do: false
+  defp used_percent_exhausted?(%Quota.AccountQuotaWindow{}), do: false
 end

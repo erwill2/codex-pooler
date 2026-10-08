@@ -1,7 +1,10 @@
 defmodule CodexPooler.MCP.PrivacyMatrixTest do
   use ExUnit.Case, async: true
 
+  alias CodexPooler.MCP.MetadataSanitizer
   alias CodexPooler.MCP.PrivacyMatrix
+  alias CodexPooler.MCP.Tools.ReadableText
+  alias CodexPooler.Upstreams.Reconciliation.UsagePollCooldown
 
   @entity_families [
     :operators,
@@ -116,6 +119,7 @@ defmodule CodexPooler.MCP.PrivacyMatrixTest do
     assert PrivacyMatrix.field_policy!(:request_logs, :endpoint) == :summarized
     assert PrivacyMatrix.field_policy!(:request_logs, :query) == :omitted
     assert PrivacyMatrix.field_policy!(:request_logs, :debug) == :allowed
+    assert PrivacyMatrix.field_policy!(:request_logs, :compaction_bridge) == :allowed
     assert PrivacyMatrix.field_policy!(:audit_logs, :actor_summary) == :summarized
     assert PrivacyMatrix.field_policy!(:audit_logs, :ip_address) == :masked
     assert PrivacyMatrix.field_policy!(:pool_api_keys, :key_prefix) == :allowed
@@ -161,7 +165,7 @@ defmodule CodexPooler.MCP.PrivacyMatrixTest do
         query: "token=raw-query-secret",
         user_agent: "Codex CLI/1.2.3 extra-details",
         client_ip: "203.0.113.42",
-        correlation_id: "corr-task5-safe",
+        correlation_id: "corr-privacy-safe",
         upstream_account_email: "upstream.account@example.com",
         raw_headers: %{"authorization" => "Bearer raw-header-token"},
         request_body: %{"input" => "raw prompt"},
@@ -174,13 +178,92 @@ defmodule CodexPooler.MCP.PrivacyMatrixTest do
     assert projected.path == "/backend-api/codex/responses"
     assert projected.user_agent == "Codex CLI/1.2.3"
     assert projected.client_ip == "203.0.113.xxx"
-    assert projected.correlation_id == "corr-task5-safe"
+    assert projected.correlation_id == "corr-privacy-safe"
     assert projected.upstream_account_email == "up***@example.com"
     refute Map.has_key?(projected, :query)
     refute inspect(projected) =~ "raw-query-secret"
     refute inspect(projected) =~ "raw-header-token"
     refute inspect(projected) =~ "raw prompt"
     refute inspect(projected) =~ "private-upload-name"
+  end
+
+  test "request log projection omits raw compaction projection evidence" do
+    sentinel = "raw-compaction-projection-evidence"
+
+    projected =
+      PrivacyMatrix.project!(:request_logs, %{
+        id: "req_projection_safe",
+        metadata: %{
+          "compaction_projection" => %{
+            "action" => "changed",
+            "downstream_frame" => %{
+              "state" => "valid",
+              "anchor_fingerprint" => "0123456789abcdef"
+            },
+            "raw_evidence" => sentinel,
+            "previous_response_id" => sentinel,
+            "output" => sentinel
+          }
+        },
+        evidence: sentinel,
+        raw_evidence: sentinel,
+        provider_payload: %{"previous_response_id" => sentinel}
+      })
+
+    projected_metadata = MetadataSanitizer.safe_metadata(projected.metadata)
+
+    refute inspect(projected_metadata) =~ sentinel
+    refute Map.has_key?(projected, :evidence)
+    refute Map.has_key?(projected, :raw_evidence)
+    refute Map.has_key?(projected, :provider_payload)
+  end
+
+  test "metadata sanitizer recursively omits raw compact transport and owner state" do
+    sentinel = "raw-compact-transport-state-must-not-leak"
+
+    projected =
+      PrivacyMatrix.project!(:request_logs, %{
+        id: "req_compact_runtime_safe",
+        metadata: %{
+          "compaction_runtime" => %{
+            "raw_anchor" => sentinel,
+            "connection_id" => sentinel,
+            "websocket_frame" => sentinel,
+            "tool_output" => sentinel,
+            "provider_message" => sentinel,
+            "typed_state" => %{"previous_response_id" => sentinel},
+            "websocket_owner_request_v2" => %{
+              "payload" => sentinel,
+              "headers" => %{"authorization" => "Bearer #{sentinel}"}
+            }
+          }
+        }
+      })
+
+    sanitized_metadata = MetadataSanitizer.safe_metadata(projected.metadata)
+
+    refute inspect(sanitized_metadata) =~ sentinel
+  end
+
+  # codex-pooler#390. The provider-requested polling pause is internal
+  # bookkeeping on the identity, not an operator-facing quota fact, and its
+  # origin digests say which hosts an account is configured against.
+  test "metadata sanitizer omits the internal usage polling cooldown record" do
+    sentinel = "usage-poll-cooldown-origin-must-not-leak"
+
+    sanitized =
+      MetadataSanitizer.safe_metadata(%{
+        "credential_epoch" => 3,
+        UsagePollCooldown.metadata_key() => %{
+          "version" => 1,
+          "credential_epoch" => 3,
+          "origins" => %{sentinel => %{"not_before" => "2026-09-22T13:00:00.000000Z"}}
+        }
+      })
+
+    refute Map.has_key?(sanitized, UsagePollCooldown.metadata_key())
+    refute inspect(sanitized) =~ sentinel
+    assert sanitized["credential_epoch"] == 3
   end
 
   test "quota projections keep DTO fields and omit raw upstream material" do
@@ -236,6 +319,60 @@ defmodule CodexPooler.MCP.PrivacyMatrixTest do
     assert window.source_precision == "observed"
     refute Map.has_key?(window, :evidence)
     refute Map.has_key?(window, :provider_json)
+  end
+
+  @tag credits_negative: true
+  test "credit decision metadata bounds enums and reasons and removes raw facts in structured and text output" do
+    sentinel = "synthetic-capacity-secret"
+
+    for entity <- [:upstreams, :upstream_quotas] do
+      source = %{
+        allow_provider_credits: false,
+        quota_capacity_facts: %{balance: sentinel},
+        quota_capacity_blocker: %{scope: sentinel},
+        capacity_decision: %{
+          capacity_basis: :provider_credits,
+          qualification: :unverified,
+          routing_usable: false,
+          reason_codes: ["provider_credits_disabled", sentinel, "provider_credits_disabled"],
+          scope: %{model: sentinel, transport: sentinel},
+          raw_facts: sentinel,
+          access_token: sentinel
+        }
+      }
+
+      projected = PrivacyMatrix.project!(entity, source)
+      assert projected.allow_provider_credits == false
+      assert projected.capacity_decision == %{capacity_basis: "provider_credits", qualification: "unverified", routing_usable: false, reason_codes: ["provider_credits_disabled"], scope: "account"}
+      text_row = Map.update!(projected.capacity_decision, :reason_codes, &Enum.join(&1, ", "))
+      text = ReadableText.detail("capacity", text_row, [{:capacity_basis, "basis"}, {:qualification, "qualification"}, {:scope, "scope"}, {:reason_codes, "reasons"}])
+      assert text =~ "basis=provider_credits"
+      assert text =~ "reasons=provider_credits_disabled"
+      refute text =~ sentinel
+      refute inspect(projected) =~ sentinel
+      refute Map.has_key?(projected, :quota_capacity_facts)
+      refute Map.has_key?(projected, :quota_capacity_blocker)
+    end
+  end
+
+  test "provider permission and attestation stay bounded without a billing claim" do
+    for basis <- [:windowless_provider_permission, :provider_credits] do
+      projected = PrivacyMatrix.project!(:upstream_quotas, %{capacity_decision: %{capacity_basis: basis, qualification: :provider_attested, routing_usable: true, reason_codes: []}})
+      assert projected.capacity_decision.capacity_basis == Atom.to_string(basis)
+      assert projected.capacity_decision.qualification == "provider_attested"
+      assert projected.capacity_decision.scope == "account"
+      refute Map.has_key?(projected.capacity_decision, :billing_source)
+    end
+  end
+
+  @tag credits_negative: true
+  test "unknown credit decision strings and malformed metadata never pass the privacy allowlist" do
+    projected = PrivacyMatrix.project!(:upstream_quotas, %{allow_provider_credits: "synthetic-secret", capacity_decision: %{capacity_basis: "synthetic-secret", qualification: "synthetic-secret", routing_usable: "true", reason_codes: %{"raw" => "synthetic-secret"}}})
+    assert projected.allow_provider_credits == nil
+    assert projected.capacity_decision == %{capacity_basis: "none", qualification: "unverified", routing_usable: false, reason_codes: [], scope: "account"}
+    refute inspect(projected) =~ "synthetic-secret"
+    sanitized = MetadataSanitizer.safe_metadata(%{"quota_capacity_facts" => %{"balance" => "synthetic-secret"}, "nested" => %{"quota_capacity_blocker" => %{"scope" => "synthetic-secret"}, "status" => "safe"}})
+    assert sanitized == %{"nested" => %{"status" => "safe"}}
   end
 
   test "projection rejects raw domain structs so future tools must present explicit maps" do

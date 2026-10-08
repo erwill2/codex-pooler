@@ -46,18 +46,23 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp overview(requests, tokens, cost, trends) do
     total = non_negative(get(requests, :total))
     succeeded = non_negative(get(requests, :succeeded))
+    cancelled = non_negative(get(requests, :client_cancelled))
     input = non_negative(get(tokens, :input))
     cached = min(non_negative(get(tokens, :cached_input)), input)
     settled = cost(get(cost, :settled), "settled")
     estimated = cost(get(cost, :estimated), "estimated")
+    success_detail = success_detail(succeeded, non_negative(get(requests, :failed)), cancelled)
 
     %{
+      # A request the client cancelled is neither a success nor a failure, so the
+      # rate leaves it out of its base and the detail names it.
       success_rate:
         rate(
           succeeded,
-          total,
-          "#{grouped_integer(succeeded)} succeeded · #{grouped_integer(non_negative(get(requests, :failed)))} failed",
-          Safety.trend(get(trends, :success_rate), :percentage_points)
+          max(total - cancelled, 0),
+          success_detail,
+          Safety.trend(get(trends, :success_rate), :percentage_points),
+          if(cancelled > 0, do: success_detail, else: "not available")
         ),
       cache_rate:
         rate(
@@ -85,17 +90,24 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp cache_detail(cached, input),
     do: "#{token_label(cached)} of #{token_label(input)} input tokens served from cache"
 
-  defp rate(part, total, detail, trend) do
+  defp rate(part, total, detail, trend, unavailable_detail \\ "not available") do
     percent = percentage(part, total)
 
     %{
       percent: percent,
       measure: percent_measure(percent),
-      detail: if(percent, do: detail, else: "not available"),
+      detail: if(percent, do: detail, else: unavailable_detail),
       minibar: percent || 0.0,
       trend: trend
     }
   end
+
+  defp success_detail(succeeded, failed, cancelled) do
+    "#{grouped_integer(succeeded)} succeeded · #{grouped_integer(failed)} failed" <> cancelled_detail(cancelled)
+  end
+
+  defp cancelled_detail(count) when count > 0, do: " · #{grouped_integer(count)} client cancelled"
+  defp cancelled_detail(_count), do: ""
 
   defp percent_measure(nil), do: %{value: "not available", unit: nil}
   defp percent_measure(percent), do: %{value: "#{percent}", unit: "%"}
@@ -142,19 +154,16 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
     token_kinds = List.duplicate("tokens", length(column_series))
 
     Map.new(
-      categories: Jason.encode!(Enum.map(rows, & &1.label)),
-      series:
-        Jason.encode!(
-          column_series ++ [%{"name" => "Cost", "type" => "line", "data" => cost_values}]
-        ),
-      units: Jason.encode!(token_kinds ++ ["USD"]),
-      value_kinds: Jason.encode!(token_kinds ++ ["usd"]),
+      categories: CodexPooler.JSON.encode!(Enum.map(rows, & &1.label)),
+      series: CodexPooler.JSON.encode!(column_series ++ [%{"name" => "Cost", "type" => "line", "data" => cost_values}]),
+      units: CodexPooler.JSON.encode!(token_kinds ++ ["USD"]),
+      value_kinds: CodexPooler.JSON.encode!(token_kinds ++ ["usd"]),
       yaxis:
-        Jason.encode!([
+        CodexPooler.JSON.encode!([
           %{seriesName: series_names, title: "tokens", valueKind: "tokens"},
           %{seriesName: "Cost", title: "cost", opposite: true, valueKind: "usd"}
         ]),
-      colors: Jason.encode!(chart_colors(model_series) ++ [@chart_cost_color])
+      colors: CodexPooler.JSON.encode!(chart_colors(model_series) ++ [@chart_cost_color])
     )
   end
 
@@ -309,6 +318,9 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
     }
   end
 
+  # A client cancellation (`RequestOutcome`) is not a failure: it names no reason.
+  defp status("client_cancelled", _code), do: status("client_cancelled")
+
   defp status(value, code) do
     status = status(value)
     %{status | label: status_label(status.label, code)}
@@ -316,11 +328,12 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
 
   defp status("succeeded"), do: %{data_status: "ok", tone: :success, label: "Succeeded"}
   defp status("failed"), do: %{data_status: "err", tone: :error, label: "Failed"}
+  defp status("rejected"), do: %{data_status: "err", tone: :error, label: "Rejected"}
 
+  defp status("accepted"), do: %{data_status: "warn", tone: :warning, label: "Accepted"}
   defp status("in_progress"), do: %{data_status: "warn", tone: :warning, label: "In progress"}
 
-  defp status("cancelled"),
-    do: %{data_status: "neutral", tone: :neutral, label: "Cancelled"}
+  defp status("client_cancelled"), do: %{data_status: "warn", tone: :warning, label: "Client cancelled"}
 
   defp status(_value), do: %{data_status: "neutral", tone: :neutral, label: "Unknown"}
 

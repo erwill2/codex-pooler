@@ -1,14 +1,40 @@
 defmodule CodexPooler.Access.APIKeys.Policy do
   @moduledoc false
 
-  alias CodexPooler.Access.APIKey
+  alias CodexPooler.Access.{APIKey, APIKeyPolicyBinding}
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.ServiceTier
 
   @status_active "active"
   @status_paused "paused"
   @status_revoked "revoked"
-  @reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
-  @service_tiers ~w(auto default flex priority scale)
+  @reasoning_efforts ~w(none minimal low medium high xhigh max ultra persistent)
+  @service_tiers ~w(auto default flex priority scale ultrafast)
+
+  # Each group is one unit of an update: an omitted group keeps the stored
+  # value, a submitted one replaces it whole. The allow list and the reasoning
+  # pair are units because each describes one mode (`model_mode` without a
+  # list, or an exact effort replacing a ceiling).
+  @allow_list_keys [
+    :model_mode,
+    "model_mode",
+    :allowed_models_mode,
+    "allowed_models_mode",
+    :allowed_model_identifiers,
+    "allowed_model_identifiers",
+    :allowed_models,
+    "allowed_models"
+  ]
+  @enforced_model_keys [:enforced_model_identifier, "enforced_model_identifier"]
+  @reasoning_keys [
+    :enforced_reasoning_effort,
+    "enforced_reasoning_effort",
+    :maximum_reasoning_effort,
+    "maximum_reasoning_effort"
+  ]
+  @service_tier_keys [:enforced_service_tier, "enforced_service_tier"]
+  @default_policy_keys [:default_policy, "default_policy"]
+  @model_policies_keys [:model_policies, "model_policies"]
 
   @type access_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type policy_result :: {:ok, map()} | {:error, atom() | access_error()}
@@ -37,6 +63,77 @@ defmodule CodexPooler.Access.APIKeys.Policy do
   def allow_list_mode([], :models), do: :deny_all_models
   def allow_list_mode(_values, :models), do: :selected_models
 
+  @doc """
+  Completes an update's attrs with the stored policy for every policy group
+  the caller did not submit, so an omitted field keeps its value instead of
+  normalizing to all models, no enforcement or no limit (findings#206 row
+  206-497). A submitted group replaces the stored one, `nil` included, and
+  the caller validates the merged result as a whole.
+  """
+  @spec merge_stored(map(), APIKey.t(), [APIKeyPolicyBinding.t()]) :: map()
+  def merge_stored(attrs, %APIKey{} = api_key, bindings) when is_map(attrs) and is_list(bindings) do
+    attrs
+    |> put_unless_submitted(@allow_list_keys, %{
+      model_mode: allow_list_mode(api_key.allowed_model_identifiers, :models),
+      allowed_model_identifiers: api_key.allowed_model_identifiers
+    })
+    |> put_unless_submitted(@enforced_model_keys, %{enforced_model_identifier: api_key.enforced_model_identifier})
+    |> put_unless_submitted(@reasoning_keys, %{
+      enforced_reasoning_effort: api_key.enforced_reasoning_effort,
+      maximum_reasoning_effort: api_key.maximum_reasoning_effort
+    })
+    |> put_unless_submitted(@service_tier_keys, %{enforced_service_tier: api_key.enforced_service_tier})
+    |> put_unless_submitted(@default_policy_keys, %{default_policy: stored_default_policy(bindings)})
+    |> put_unless_submitted(@model_policies_keys, %{model_policies: stored_model_policies(bindings)})
+  end
+
+  @doc """
+  Whether an update submits a policy field stored on the key row: the allow
+  list, the enforced model, the reasoning pair or the service tier.
+  """
+  @spec key_policy_submitted?(map()) :: boolean()
+  def key_policy_submitted?(attrs) when is_map(attrs),
+    do: submitted?(attrs, @allow_list_keys ++ @enforced_model_keys ++ @reasoning_keys ++ @service_tier_keys, :with_nested_policy)
+
+  defp put_unless_submitted(attrs, keys, stored, depth \\ :with_nested_policy) do
+    if submitted?(attrs, keys, depth), do: attrs, else: Map.merge(attrs, stored)
+  end
+
+  defp submitted?(attrs, keys, :top_level), do: Enum.any?(keys, &Map.has_key?(attrs, &1))
+
+  defp submitted?(attrs, keys, :with_nested_policy) do
+    nested_policy = Map.get(attrs, :policy) || Map.get(attrs, "policy")
+
+    submitted?(attrs, keys, :top_level) or
+      (is_map(nested_policy) and submitted?(nested_policy, keys, :top_level))
+  end
+
+  defp stored_default_policy(bindings) do
+    case Enum.find(bindings, &(&1.binding_scope == "default")) do
+      %APIKeyPolicyBinding{} = binding -> stored_binding_attrs(binding, "default")
+      nil -> %{}
+    end
+  end
+
+  defp stored_model_policies(bindings) do
+    bindings
+    |> Enum.filter(&(&1.binding_scope == "model"))
+    |> Enum.map(&stored_binding_attrs(&1, "model"))
+  end
+
+  defp stored_binding_attrs(%APIKeyPolicyBinding{} = binding, scope) do
+    %{
+      binding_scope: scope,
+      model_identifier: binding.model_identifier,
+      status: binding.status,
+      max_requests_per_minute: binding.max_requests_per_minute,
+      max_tokens_per_day: binding.max_tokens_per_day,
+      max_tokens_per_week: binding.max_tokens_per_week,
+      max_input_tokens_per_request: binding.max_input_tokens_per_request,
+      max_output_tokens_per_request: binding.max_output_tokens_per_request
+    }
+  end
+
   @spec normalize_attrs(Scope.t(), Ecto.UUID.t(), map()) ::
           {:ok, map()} | {:error, access_error()}
   def normalize_attrs(%Scope{}, _pool_id, attrs) do
@@ -47,20 +144,36 @@ defmodule CodexPooler.Access.APIKeys.Policy do
            normalize_reasoning_policy(attrs),
          {:ok, enforced_service_tier} <- normalize_enforced_service_tier(attrs) do
       {:ok,
-       %{
-         allowed_model_identifiers: allowed_model_identifiers,
-         enforced_model_identifier: enforced_model_identifier,
-         enforced_reasoning_effort: enforced_reasoning_effort,
-         maximum_reasoning_effort: maximum_reasoning_effort,
-         enforced_service_tier: enforced_service_tier
-       }}
+       Map.merge(
+         %{
+           allowed_model_identifiers: allowed_model_identifiers,
+           enforced_model_identifier: enforced_model_identifier,
+           enforced_reasoning_effort: enforced_reasoning_effort,
+           maximum_reasoning_effort: maximum_reasoning_effort,
+           enforced_service_tier: enforced_service_tier
+         },
+         optional_active_request_limit(attrs)
+       )}
+    end
+  end
+
+  defp optional_active_request_limit(attrs) do
+    cond do
+      Map.has_key?(attrs, :max_active_requests) ->
+        Map.take(attrs, [:max_active_requests])
+
+      Map.has_key?(attrs, "max_active_requests") ->
+        %{max_active_requests: attrs["max_active_requests"]}
+
+      true ->
+        %{}
     end
   end
 
   @spec normalize_inputs(map()) :: {:ok, [map()]} | {:error, access_error()}
   def normalize_inputs(attrs) do
-    default_policy = Map.get(attrs, :default_policy) || Map.get(attrs, "default_policy") || %{}
-    model_policies = Map.get(attrs, :model_policies) || Map.get(attrs, "model_policies") || []
+    default_policy = input(attrs, @default_policy_keys) || %{}
+    model_policies = input(attrs, @model_policies_keys) || []
 
     with {:ok, default_policy} <- normalize_default_policy(default_policy),
          {:ok, model_policies} <- normalize_model_policies(model_policies) do
@@ -113,12 +226,12 @@ defmodule CodexPooler.Access.APIKeys.Policy do
        %{
          api_key_id: input(source, [:id, "id", :api_key_id, "api_key_id"]),
          status: status,
+         max_active_requests: Map.get(source, :max_active_requests, Map.get(source, "max_active_requests")),
          allowed_model_identifiers: allowed_model_identifiers,
          enforced_model_identifier: enforced_model_identifier,
          enforced_reasoning_effort: enforced_reasoning_effort,
          maximum_reasoning_effort: maximum_reasoning_effort,
-         reasoning_policy_mode:
-           reasoning_policy_mode(enforced_reasoning_effort, maximum_reasoning_effort),
+         reasoning_policy_mode: reasoning_policy_mode(enforced_reasoning_effort, maximum_reasoning_effort),
          enforced_service_tier: enforced_service_tier,
          metadata: metadata
        }}
@@ -220,8 +333,7 @@ defmodule CodexPooler.Access.APIKeys.Policy do
     case normalizer.(values) do
       {:ok, normalized} ->
         if normalized in [nil, []] do
-          {:error,
-           access_error(:invalid_policy, "#{mode_name} requires at least one selected value")}
+          {:error, access_error(:invalid_policy, "#{mode_name} requires at least one selected value")}
         else
           {:ok, normalized}
         end
@@ -301,11 +413,16 @@ defmodule CodexPooler.Access.APIKeys.Policy do
 
   defp normalize_enforced_service_tier(attrs) do
     normalize_enforced_enum(
-      input(attrs, [:enforced_service_tier, "enforced_service_tier"]),
+      attrs
+      |> input([:enforced_service_tier, "enforced_service_tier"])
+      |> canonicalize_service_tier(),
       @service_tiers,
       "enforced_service_tier is invalid"
     )
   end
+
+  defp canonicalize_service_tier(value) when is_binary(value), do: ServiceTier.canonicalize(value)
+  defp canonicalize_service_tier(value), do: value
 
   defp normalize_enforced_enum(nil, _allowed, _message), do: {:ok, nil}
 
@@ -339,16 +456,14 @@ defmodule CodexPooler.Access.APIKeys.Policy do
 
   defp validate_enforced_model_mode([], enforced_model_identifier)
        when is_binary(enforced_model_identifier),
-       do:
-         {:error, access_error(:invalid_policy, "enforced model is not allowed in deny-all mode")}
+       do: {:error, access_error(:invalid_policy, "enforced model is not allowed in deny-all mode")}
 
   defp validate_enforced_model_mode(allowed_model_identifiers, enforced_model_identifier)
        when is_list(allowed_model_identifiers) and is_binary(enforced_model_identifier) do
     if enforced_model_identifier in allowed_model_identifiers do
       :ok
     else
-      {:error,
-       access_error(:invalid_policy, "enforced model must be included in selected models")}
+      {:error, access_error(:invalid_policy, "enforced model must be included in selected models")}
     end
   end
 
@@ -372,8 +487,7 @@ defmodule CodexPooler.Access.APIKeys.Policy do
       true ->
         {:ok,
          %{
-           "labels" =>
-             Enum.map(labels, &String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.uniq(),
+           "labels" => Enum.map(labels, &String.trim/1) |> Enum.reject(&(&1 == "")) |> Enum.uniq(),
            "operator_notes" => operator_notes
          }}
     end
@@ -428,8 +542,7 @@ defmodule CodexPooler.Access.APIKeys.Policy do
 
     cond do
       scope != "model" ->
-        {:error,
-         access_error(:invalid_scope, "model_policies[#{index}].binding_scope must be model")}
+        {:error, access_error(:invalid_scope, "model_policies[#{index}].binding_scope must be model")}
 
       not present?(model_identifier) ->
         {:error,
@@ -451,12 +564,9 @@ defmodule CodexPooler.Access.APIKeys.Policy do
       binding_scope: scope,
       model_identifier: Map.get(policy, :model_identifier) || Map.get(policy, "model_identifier"),
       status: Map.get(policy, :status) || Map.get(policy, "status") || @status_active,
-      max_requests_per_minute:
-        Map.get(policy, :max_requests_per_minute) || Map.get(policy, "max_requests_per_minute"),
-      max_tokens_per_day:
-        Map.get(policy, :max_tokens_per_day) || Map.get(policy, "max_tokens_per_day"),
-      max_tokens_per_week:
-        Map.get(policy, :max_tokens_per_week) || Map.get(policy, "max_tokens_per_week"),
+      max_requests_per_minute: Map.get(policy, :max_requests_per_minute) || Map.get(policy, "max_requests_per_minute"),
+      max_tokens_per_day: Map.get(policy, :max_tokens_per_day) || Map.get(policy, "max_tokens_per_day"),
+      max_tokens_per_week: Map.get(policy, :max_tokens_per_week) || Map.get(policy, "max_tokens_per_week"),
       max_input_tokens_per_request:
         Map.get(policy, :max_input_tokens_per_request) ||
           Map.get(policy, "max_input_tokens_per_request"),

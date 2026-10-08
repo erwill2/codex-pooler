@@ -1,0 +1,370 @@
+defmodule CodexPooler.Upstreams.Quota.Windows.ExpiredPruningTest do
+  use CodexPooler.DataCase, async: false
+
+  import CodexPooler.PoolerFixtures
+  import CodexPooler.UnboxedFixture, only: [register_unboxed_cleanup!: 1]
+
+  alias CodexPooler.Jobs.HealthPolicy
+  alias CodexPooler.Jobs.RuntimeStateCleanup
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+  alias CodexPooler.Upstreams.Quota.Windows
+  alias CodexPooler.Upstreams.Quota.Windows.EvidenceStore
+  alias CodexPooler.Upstreams.Quota.Windows.ExpiredPruning
+  alias CodexPooler.Upstreams.SavedResets.AutomaticConfirmation
+  alias Ecto.Adapters.SQL.Sandbox
+
+  @day 86_400
+  @detection_timeout_ms 15_000
+
+  describe "within one transaction" do
+    test "deletes rows expired beyond the retention across every source and keeps the rest" do
+      now = now()
+      identity = upstream_identity_fixture()
+      old = DateTime.add(now, -(retention_days() + 1) * @day, :second)
+      recent = DateTime.add(now, -(retention_days() - 1) * @day, :second)
+
+      expired_headers = insert_window!(identity, source: "codex_response_headers", reset_at: old)
+      expired_event = insert_window!(identity, source: "codex_rate_limit_event", reset_at: old)
+      expired_error = insert_window!(identity, source: "codex_rate_limit_error", reset_at: old)
+      # A Usage API descriptor the provider stopped returning: never covered by
+      # a later complete poll, so the poll-time delete never reaches it.
+      retired_usage = insert_window!(identity, source: "codex_usage_api", quota_key: "gpt_reserve", quota_scope: "model", model: "gpt-reserve", reset_at: old)
+      recently_expired = insert_window!(identity, source: "codex_usage_api", reset_at: recent)
+      running = insert_window!(identity, source: "codex_usage_api", window_kind: "primary", window_minutes: 300, reset_at: DateTime.add(now, 3_600, :second))
+
+      assert {:ok, %{expired_quota_windows_pruned: 4}} = Windows.prune_expired_windows(now)
+
+      for deleted <- [expired_headers, expired_event, expired_error, retired_usage] do
+        refute Repo.get(AccountQuotaWindow, deleted.id)
+      end
+
+      assert Repo.get(AccountQuotaWindow, recently_expired.id)
+      assert Repo.get(AccountQuotaWindow, running.id)
+      assert {:ok, %{expired_quota_windows_pruned: 0}} = Windows.prune_expired_windows(now)
+    end
+
+    test "deletes a marker row only once every reset the marker carries passed before the cutoff" do
+      now = now()
+      identity = upstream_identity_fixture()
+      cutoff = DateTime.add(now, -ExpiredPruning.retention_seconds(), :second)
+      old = DateTime.add(cutoff, -10 * @day, :second)
+
+      # The production shape: an approach witness left on a retired descriptor.
+      lapsed = insert_window!(identity, source: "codex_usage_api", reset_at: old, metadata: approach_marker(old))
+      # A marker still naming a reset after the cutoff stays even on an old row.
+      live = insert_window!(identity, source: "codex_usage_api", quota_key: "codex_spark", quota_scope: "model", model: "gpt-5.3-codex-spark", reset_at: old, metadata: approach_marker(DateTime.add(cutoff, @day, :second)))
+      # A malformed marker is read as absent by every reader.
+      malformed = insert_window!(identity, source: "codex_usage_api", window_kind: "primary", window_minutes: 300, reset_at: old, metadata: %{AutomaticConfirmation.metadata_key() => %{"version" => 1, "state" => "approach"}})
+
+      assert {:ok, %{expired_quota_windows_pruned: 2}} = Windows.prune_expired_windows(now)
+      refute Repo.get(AccountQuotaWindow, lapsed.id)
+      refute Repo.get(AccountQuotaWindow, malformed.id)
+      assert Repo.get(AccountQuotaWindow, live.id)
+    end
+
+    test "a marker has lapsed only when its first, latest and approach resets are all before the cutoff" do
+      cutoff = ~U[2026-08-01 00:00:00Z]
+      before = DateTime.add(cutoff, -@day, :second)
+      later = DateTime.add(cutoff, @day, :second)
+
+      assert AutomaticConfirmation.lapsed_before?(%{}, cutoff)
+      assert AutomaticConfirmation.lapsed_before?(nil, cutoff)
+      assert AutomaticConfirmation.lapsed_before?(approach_marker(before), cutoff)
+      refute AutomaticConfirmation.lapsed_before?(approach_marker(later), cutoff)
+      refute AutomaticConfirmation.lapsed_before?(approach_marker(cutoff), cutoff)
+
+      candidate = AutomaticConfirmation.observe(%{}, blocked_observation(before))
+      assert AutomaticConfirmation.state(candidate) == "candidate"
+      assert AutomaticConfirmation.lapsed_before?(candidate, cutoff)
+      refute AutomaticConfirmation.lapsed_before?(AutomaticConfirmation.observe(%{}, blocked_observation(later)), cutoff)
+
+      confirmed = AutomaticConfirmation.observe(candidate, blocked_observation(before, DateTime.add(before, -3_000, :second)))
+      assert AutomaticConfirmation.state(confirmed) == "confirmed"
+      assert AutomaticConfirmation.lapsed_before?(confirmed, cutoff)
+    end
+
+    test "a pass deletes at most the batch size, oldest reset first" do
+      now = now()
+      identity = upstream_identity_fixture()
+      base = DateTime.add(now, -(retention_days() + 5) * @day, :second)
+
+      oldest = insert_window!(identity, source: "codex_rate_limit_event", reset_at: DateTime.add(base, -@day, :second))
+      younger = insert_window!(identity, source: "codex_response_headers", reset_at: base)
+
+      assert {:ok, %{expired_quota_windows_pruned: 1}} = Windows.prune_expired_windows(now, batch_size: 1)
+      refute Repo.get(AccountQuotaWindow, oldest.id)
+      assert Repo.get(AccountQuotaWindow, younger.id)
+      assert ExpiredPruning.batch_size() == 500
+    end
+
+    test "bounded scans durably continue past retained marker pages" do
+      now = now()
+      cutoff = DateTime.add(now, -ExpiredPruning.retention_seconds(), :second)
+      identity = upstream_identity_fixture()
+
+      live =
+        for index <- 1..1_001 do
+          insert_window!(identity, source: "codex_usage_api", window_minutes: 10_000 + index, reset_at: DateTime.add(cutoff, -2_000 + index, :second), metadata: approach_marker(DateTime.add(cutoff, @day, :second)))
+        end
+
+      expired = insert_window!(identity, source: "codex_usage_api", window_minutes: 20_000, reset_at: DateTime.add(cutoff, -1, :second), metadata: approach_marker(DateTime.add(cutoff, -1, :second)))
+      assert {:ok, %{expired_quota_windows_pruned: 0}} = Windows.prune_expired_windows(now)
+      assert Repo.get(AccountQuotaWindow, expired.id)
+      [first] = all_enqueued(worker: CodexPooler.Jobs.ExpiredQuotaPruningWorker)
+      assert first.args["cursor_id"] in Enum.map(live, & &1.id)
+      assert :ok = perform_job(CodexPooler.Jobs.ExpiredQuotaPruningWorker, first.args)
+      second = Enum.find(all_enqueued(worker: CodexPooler.Jobs.ExpiredQuotaPruningWorker), &(&1.id != first.id))
+      assert second
+      assert :ok = perform_job(CodexPooler.Jobs.ExpiredQuotaPruningWorker, second.args)
+      refute Repo.get(AccountQuotaWindow, expired.id)
+      live_ids = Enum.map(live, & &1.id)
+      assert Repo.aggregate(from(w in AccountQuotaWindow, where: w.id in ^live_ids), :count) == length(live)
+    end
+
+    test "continuation jobs reject malformed cursor arguments and retain bounded timeouts" do
+      alias CodexPooler.Jobs.ExpiredQuotaPruningWorker
+      assert {:cancel, :invalid_quota_pruning_args} = perform_job(ExpiredQuotaPruningWorker, %{})
+      assert {:cancel, :invalid_quota_pruning_args} = perform_job(ExpiredQuotaPruningWorker, %{now: "invalid", cursor_reset_at: "invalid", cursor_id: "invalid", batch_size: 1})
+      assert ExpiredQuotaPruningWorker.timeout(%Oban.Job{}) == 30_000
+      assert HealthPolicy.known_worker_timeout_ms("CodexPooler.Jobs.ExpiredQuotaPruningWorker") == 30_000
+    end
+
+    test "continuation insertion failure rolls back page deletion" do
+      identity = upstream_identity_fixture()
+      now = now()
+      old = DateTime.add(now, -ExpiredPruning.retention_seconds() - 1, :second)
+      row = insert_window!(identity, source: "codex_usage_api", reset_at: old)
+      Repo.query!("CREATE FUNCTION pg_temp.reject_pruning_page() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.worker = 'CodexPooler.Jobs.ExpiredQuotaPruningWorker' THEN RAISE EXCEPTION 'sample continuation failure' USING ERRCODE = 'check_violation'; END IF; RETURN NEW; END $$")
+      Repo.query!("CREATE TRIGGER reject_pruning_page BEFORE INSERT ON oban_jobs FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_pruning_page()")
+      assert_raise Postgrex.Error, fn -> Windows.prune_expired_windows(now, batch_size: 1) end
+      assert Repo.get(AccountQuotaWindow, row.id)
+      assert all_enqueued(worker: CodexPooler.Jobs.ExpiredQuotaPruningWorker) == []
+    end
+
+    test "actual candidate pages use the reset index against retained evidence" do
+      now = now()
+      identity = upstream_identity_fixture()
+      cutoff = DateTime.add(now, -ExpiredPruning.retention_seconds(), :second)
+      expired = insert_window!(identity, source: "codex_usage_api", reset_at: DateTime.add(cutoff, -1, :second))
+      attrs = expired |> Map.from_struct() |> Map.drop([:__meta__])
+
+      rows =
+        for index <- 1..10_000 do
+          Map.merge(attrs, %{id: Ecto.UUID.generate(), window_minutes: 20_000 + index, reset_at: DateTime.add(now, @day, :second)})
+        end
+
+      rows |> Enum.chunk_every(1_000) |> Enum.each(&Repo.insert_all(AccountQuotaWindow, &1))
+      CodexPooler.PlannerStatistics.analyze!(["account_quota_windows"])
+      ref = {__MODULE__, make_ref()}
+      on_exit(fn -> :telemetry.detach(ref) end)
+      :telemetry.attach(ref, [:codex_pooler, :repo, :query], &__MODULE__.capture_candidate_query/4, self())
+      assert {:ok, %{expired_quota_windows_pruned: 1}} = Windows.prune_expired_windows(now)
+      :telemetry.detach(ref)
+      assert_receive {:candidate_query, sql, params}
+      %{rows: [[plan]]} = Repo.query!("EXPLAIN (FORMAT JSON) " <> sql, params)
+      assert inspect(plan) =~ "account_quota_windows_expired_reset_idx"
+    end
+
+    test "runtime state cleanup runs the quota step and reports its count" do
+      now = now()
+      identity = upstream_identity_fixture()
+      expired = insert_window!(identity, source: "codex_response_headers", reset_at: DateTime.add(now, -(retention_days() + 1) * @day, :second))
+
+      assert {:ok, summary} = RuntimeStateCleanup.run(now)
+      assert summary.expired_quota_windows_pruned == 1
+      refute Repo.get(AccountQuotaWindow, expired.id)
+    end
+  end
+
+  describe "against concurrent committed transactions" do
+    setup do
+      identity = unboxed(fn -> upstream_identity_fixture() end)
+      register_unboxed_cleanup!(fn -> Repo.delete!(identity) end)
+      %{identity: identity, now: now()}
+    end
+
+    # A saved-reset claim and its reservation lock their proof rows FOR UPDATE.
+    # The pass must neither delete such a row nor wait for the claim.
+    test "skips a row another transaction holds locked and deletes the unlocked one", %{identity: identity, now: now} do
+      old = DateTime.add(now, -(retention_days() + 1) * @day, :second)
+      held = unboxed(fn -> insert_window!(identity, source: "codex_usage_api", reset_at: old) end)
+      free = unboxed(fn -> insert_window!(identity, source: "codex_response_headers", reset_at: old) end)
+      parent = self()
+
+      holder =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.transaction(fn ->
+              Repo.query!("SELECT id FROM account_quota_windows WHERE id = $1 FOR UPDATE", [Ecto.UUID.dump!(held.id)])
+              send(parent, {:held, self()})
+
+              receive do
+                :release -> :ok
+              after
+                @detection_timeout_ms -> flunk("holder was never released")
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:held, holder_pid}, @detection_timeout_ms
+
+      assert {:ok, %{expired_quota_windows_pruned: 1}} = unboxed(fn -> Windows.prune_expired_windows(now) end)
+
+      send(holder_pid, :release)
+      assert {:ok, :ok} = Task.await(holder, @detection_timeout_ms)
+
+      assert unboxed(fn -> Repo.get(AccountQuotaWindow, held.id) end)
+      refute unboxed(fn -> Repo.get(AccountQuotaWindow, free.id) end)
+    end
+
+    # An evidence writer holds the identity locks and refreshes the expired row
+    # with a new cycle. The pass must queue behind it on the identity advisory
+    # mutex and then keep the refreshed row, because the candidate conditions
+    # are evaluated again under the lock.
+    test "waits for a concurrent evidence writer and keeps the row it refreshed", %{identity: identity, now: now} do
+      old = DateTime.add(now, -(retention_days() + 1) * @day, :second)
+      expired = unboxed(fn -> insert_window!(identity, source: "codex_rate_limit_event", reset_at: old) end)
+      parent = self()
+
+      writer =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.transaction(fn ->
+              :ok = EvidenceStore.lock_evidence_identity!(identity.id)
+              %{rows: [[writer_pid]]} = Repo.query!("SELECT pg_backend_pid()")
+
+              assert {:ok, %AccountQuotaWindow{id: refreshed_id}} =
+                       EvidenceStore.record_evidence(identity, CodexPooler.QuotaEvidenceSupport.account_secondary_evidence("12", now), now)
+
+              send(parent, {:writer_holding, self(), writer_pid, refreshed_id})
+
+              receive do
+                :commit -> :ok
+              after
+                @detection_timeout_ms -> flunk("writer was never released")
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:writer_holding, writer_task_pid, writer_pid, refreshed_id}, @detection_timeout_ms
+      assert refreshed_id == expired.id
+
+      pruner =
+        Task.async(fn ->
+          unboxed(fn ->
+            %{rows: [[pruner_pid]]} = Repo.query!("SELECT pg_backend_pid()")
+            send(parent, {:pruner, pruner_pid})
+            Windows.prune_expired_windows(now)
+          end)
+        end)
+
+      assert_receive {:pruner, pruner_pid}, @detection_timeout_ms
+      assert await_blocked_on(pruner_pid, writer_pid) == {"advisory", [writer_pid]}
+
+      send(writer_task_pid, :commit)
+      assert {:ok, :ok} = Task.await(writer, @detection_timeout_ms)
+      assert {:ok, %{expired_quota_windows_pruned: 0}} = Task.await(pruner, @detection_timeout_ms)
+
+      assert %AccountQuotaWindow{reset_at: reset_at} = unboxed(fn -> Repo.get(AccountQuotaWindow, expired.id) end)
+      assert DateTime.compare(reset_at, now) == :gt
+    end
+  end
+
+  defp await_blocked_on(backend_pid, holder_pid) do
+    deadline = System.monotonic_time(:millisecond) + @detection_timeout_ms
+    do_await_blocked_on(backend_pid, holder_pid, deadline)
+  end
+
+  defp do_await_blocked_on(backend_pid, holder_pid, deadline) do
+    %{rows: rows} =
+      unboxed(fn ->
+        Repo.query!("SELECT wait_event, pg_blocking_pids(pid) FROM pg_stat_activity WHERE pid = $1", [backend_pid])
+      end)
+
+    # Activity and blockers are sampled separately: the holder can already
+    # appear while `wait_event` is nil or still ClientRead. Only the actual
+    # advisory wait with that holder proves the pruner reached its mutex.
+    case rows do
+      [["advisory", [^holder_pid]]] ->
+        {"advisory", [holder_pid]}
+
+      other ->
+        if System.monotonic_time(:millisecond) >= deadline,
+          do: {:not_blocked, other},
+          else: do_await_blocked_on(backend_pid, holder_pid, deadline)
+    end
+  end
+
+  def capture_candidate_query(_event, _measurements, metadata, owner) do
+    if self() == owner and String.starts_with?(metadata.query, "SELECT") and metadata.query =~ "ORDER BY" and metadata.query =~ ~s("account_quota_windows"),
+      do: send(owner, {:candidate_query, metadata.query, metadata.params})
+  end
+
+  defp insert_window!(identity, attrs) do
+    attrs = Map.new(attrs)
+    reset_at = Map.fetch!(attrs, :reset_at)
+    observed_at = DateTime.add(reset_at, -3_600, :second)
+
+    %AccountQuotaWindow{}
+    |> AccountQuotaWindow.changeset(
+      Map.merge(
+        %{
+          upstream_identity_id: identity.id,
+          quota_key: "account",
+          quota_scope: "account",
+          quota_family: "account",
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          used_percent: Decimal.new("40"),
+          source_precision: "observed",
+          freshness_state: "fresh",
+          last_sync_at: observed_at,
+          observed_at: observed_at,
+          metadata: %{},
+          created_at: observed_at,
+          updated_at: observed_at
+        },
+        attrs
+      )
+    )
+    |> Repo.insert!()
+  end
+
+  defp approach_marker(reset_at) do
+    AutomaticConfirmation.observe_allowed(%{}, %{used_percent: 40.0, provider_observed_at: DateTime.add(reset_at, -3_600, :second), reset_at: reset_at})
+  end
+
+  defp blocked_observation(reset_at, observed_at \\ nil) do
+    observed_at = observed_at || DateTime.add(reset_at, -3_600, :second)
+
+    %{
+      binding: %{
+        identity_id: "00000000-0000-4000-8000-000000000260",
+        credential_epoch: 1,
+        reset_identity: DateTime.to_iso8601(reset_at),
+        provider_scope: String.duplicate("a", 64),
+        descriptor: String.duplicate("b", 64),
+        trigger: :blocked,
+        threshold_percent: nil,
+        bank_count: 1,
+        keep_credits: 0,
+        permission: %{allowed: false, reached: true, account_state: "blocked"}
+      },
+      provider_observed_at: observed_at,
+      observed_at: observed_at,
+      used_percent: 100.0,
+      rate_limit_allowed: false,
+      rate_limit_reached: true,
+      reset_at: reset_at,
+      available_count: 1
+    }
+  end
+
+  defp retention_days, do: div(ExpiredPruning.retention_seconds(), @day)
+
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  defp unboxed(fun), do: Sandbox.unboxed_run(Repo, fun)
+end

@@ -1,0 +1,134 @@
+defmodule CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomyTest do
+  use ExUnit.Case, async: false
+
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
+
+  describe "identifier/1" do
+    test "renders every source-owned websocket code in cleartext" do
+      Enum.each(WebsocketOwnerContract.owner_errors(), fn code ->
+        assert DiagnosticTaxonomy.identifier(code) == Atom.to_string(code)
+      end)
+
+      Enum.each(ErrorCodes.known_error_codes(), fn code ->
+        assert DiagnosticTaxonomy.identifier(code) == code
+      end)
+
+      Enum.each(DiagnosticTaxonomy.internal_lifecycle_reason_codes(), fn code ->
+        assert DiagnosticTaxonomy.identifier(code) == code
+        assert DiagnosticTaxonomy.reason_code(String.to_atom(code)) == code
+      end)
+    end
+
+    test "keeps replay and task-exception lifecycle reasons in the fixed vocabulary" do
+      for code <- ["lifecycle_conflict", "owner_task_exception", "orphaned_turn_closed"] do
+        assert code in DiagnosticTaxonomy.internal_lifecycle_reason_codes()
+      end
+    end
+
+    test "includes the native fallback codes in the static stream vocabulary" do
+      assert ErrorCodes.upstream_request_failed_code() == "upstream_request_failed"
+      assert ErrorCodes.websocket_request_failed_code() == "websocket_request_failed"
+
+      assert "upstream_request_failed" in ErrorCodes.known_error_codes()
+      assert "websocket_request_failed" in ErrorCodes.known_error_codes()
+    end
+
+    test "renders an unknown code in cleartext when it passes the relay allowlist" do
+      assert DiagnosticTaxonomy.identifier("synthetic_unlisted_provider_code") ==
+               "synthetic_unlisted_provider_code"
+
+      assert DiagnosticTaxonomy.identifier("Provider.Code-v2") == "Provider.Code-v2"
+    end
+
+    test "fingerprints unknown binaries outside the relay allowlist" do
+      malformed_identifiers = [
+        "https://example.invalid/terminal",
+        "provider/terminal",
+        "has spaces inside",
+        "clean_code\n",
+        <<255>>,
+        String.duplicate("a", 81)
+      ]
+
+      fingerprints = Enum.map(malformed_identifiers, &DiagnosticTaxonomy.identifier/1)
+
+      assert Enum.all?(fingerprints, &(&1 =~ ~r/^sha256_[0-9a-f]{12}$/))
+      assert length(Enum.uniq(fingerprints)) == length(fingerprints)
+      assert DiagnosticTaxonomy.identifier(%{code: "any_code"}) == nil
+    end
+
+    test "keeps word-bearing structured unknown identifiers in cleartext" do
+      for identifier <- [
+            "bearer_expired",
+            "invalid_authorization_value",
+            "authorization.value",
+            "cookie_parse_failed"
+          ] do
+        assert DiagnosticTaxonomy.identifier(identifier) == identifier
+      end
+    end
+  end
+
+  describe "reason_code/1" do
+    test "extracts atom and tuple reasons plus atom- and string-keyed map codes" do
+      assert DiagnosticTaxonomy.reason_code(:owner_unavailable) == "owner_unavailable"
+
+      assert DiagnosticTaxonomy.reason_code({:owner_forward_timeout, :details}) ==
+               "owner_forward_timeout"
+
+      assert DiagnosticTaxonomy.reason_code(%{code: :owner_busy}) == "owner_busy"
+      assert DiagnosticTaxonomy.reason_code(%{"code" => "server_error"}) == "server_error"
+    end
+
+    test "relays clean unknown codes, fingerprints unclean ones, rejects non-code terms" do
+      assert DiagnosticTaxonomy.reason_code("synthetic_unknown_map_code") ==
+               "synthetic_unknown_map_code"
+
+      assert DiagnosticTaxonomy.reason_code(%{"code" => "synthetic_unknown_map_code"}) ==
+               "synthetic_unknown_map_code"
+
+      unclean = "synthetic unknown with spaces"
+      unclean_identifier = DiagnosticTaxonomy.reason_code(unclean)
+      assert unclean_identifier =~ ~r/^sha256_[0-9a-f]{12}$/
+      refute unclean_identifier =~ "spaces"
+
+      assert DiagnosticTaxonomy.reason_code(%{"reason" => :owner_busy}) == nil
+      assert DiagnosticTaxonomy.reason_code({"some_code", :details}) == nil
+      assert DiagnosticTaxonomy.reason_code(code: :owner_busy) == nil
+    end
+  end
+
+  describe "resend_predecessor_shape/1" do
+    test "renders only the fixed resend predecessor shape vocabulary" do
+      for shape <- ~w(identical_resend previsible_idle_timeout provider_terminal task_exception lifecycle_cut partial_reasoning_cut partial_http_tool_cut zero_output_http_failure resampled_completion previsible_disconnect quota_rejection advanced_http_resume mailbox_continuation anchor_refusal compaction_cut) do
+        assert DiagnosticTaxonomy.resend_predecessor_shape(shape) == shape
+        assert DiagnosticTaxonomy.resend_predecessor_shape(String.to_atom(shape)) == shape
+      end
+
+      for value <- [nil, "unknown_cut", "identical_resend ", "previsible_idle_timeout\n", "lifecycle_cut ", "prompt", 1, %{shape: :lifecycle_cut}] do
+        assert DiagnosticTaxonomy.resend_predecessor_shape(value) == nil
+      end
+    end
+  end
+
+  describe "safe_correlator/1" do
+    test "normalizes punctuation, empty values, and caps output at 120 characters" do
+      assert DiagnosticTaxonomy.safe_correlator("request/id with spaces") ==
+               "request_id_with_spaces"
+
+      assert DiagnosticTaxonomy.safe_correlator("") == "none"
+      assert DiagnosticTaxonomy.safe_correlator(nil) == "none"
+      assert DiagnosticTaxonomy.safe_correlator(<<255>>) == "none"
+
+      assert DiagnosticTaxonomy.safe_correlator(String.duplicate("a", 121)) ==
+               String.duplicate("a", 120)
+    end
+
+    test "redacts sensitive-looking values case-insensitively" do
+      assert DiagnosticTaxonomy.safe_correlator("Bearer synthetic-value") == "redacted"
+      assert DiagnosticTaxonomy.safe_correlator("contains-AUTH.JSON-marker") == "redacted"
+    end
+  end
+end

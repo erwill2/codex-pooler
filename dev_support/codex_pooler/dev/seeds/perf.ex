@@ -6,6 +6,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
   alias CodexPooler.Accounting.{LedgerEntry, Request}
   alias CodexPooler.Accounts.{Scope, User}
   alias CodexPooler.Catalog.Model
+  alias CodexPooler.Dev.LocalTarget
   alias CodexPooler.Gateway.Persistence.{CodexSession, RoutingCircuitState}
   alias CodexPooler.InstanceSettings
   alias CodexPooler.Pools.Pool
@@ -27,24 +28,23 @@ defmodule CodexPooler.Dev.Seeds.Perf do
   @perf_seed_key "codex_pooler_perf_seed"
   @seed_key @perf_seed_key
   @perf_pool_slug "dev-perf-pool"
-  @perf_http_url "http://127.0.0.1:4058"
-  @perf_websocket_url "ws://127.0.0.1:4058/ws"
   @perf_cluster_host "gateway-perf-fake-upstream.codex-pooler-perf.svc.cluster.local"
   @perf_cluster_http_url "http://#{@perf_cluster_host}:4058"
   @perf_cluster_websocket_url "ws://#{@perf_cluster_host}:4058/ws"
   @perf_bootstrap_dir "tmp/gateway-perf/bootstrap"
   @perf_env_path Path.join(@perf_bootstrap_dir, "perf.env")
   @perf_summary_path Path.join(@perf_bootstrap_dir, "seed-summary.json")
-  @perf_model_ids ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"]
+  @perf_model_ids ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra"]
 
-  @spec run(%{required(:owner) => User.t()}) :: map()
-  def run(%{owner: owner}) do
+  @spec run(%{required(:owner) => User.t(), optional(:upstream_base_url) => String.t()}) :: map()
+  def run(%{owner: owner} = context) do
+    upstream_base_url = Map.get(context, :upstream_base_url, LocalTarget.default_fake_upstream_base_url())
     reset_perf_fake_data!()
 
     pool = seed_pool!(owner, %{slug: @perf_pool_slug, name: "Dev Performance Pool"})
     api_key_result = seed_perf_api_key!(owner, pool)
-    identities = seed_perf_identities!(owner)
-    assignments = seed_perf_assignments!(owner, pool, identities)
+    identities = seed_perf_identities!(owner, upstream_base_url)
+    assignments = seed_perf_assignments!(owner, pool, identities, upstream_base_url)
     models = seed_perf_models!(pool, assignments)
     quota_windows = seed_perf_quota_windows!(identities)
     circuit_states = seed_perf_circuit_states!(pool, assignments)
@@ -85,9 +85,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
   defp reset_perf_fake_data! do
     perf_pool_ids = from(pool in Pool, where: pool.slug == @perf_pool_slug, select: pool.id)
 
-    Repo.delete_all(
-      from ledger_entry in LedgerEntry, where: ledger_entry.pool_id in subquery(perf_pool_ids)
-    )
+    Repo.delete_all(from ledger_entry in LedgerEntry, where: ledger_entry.pool_id in subquery(perf_pool_ids))
 
     Repo.delete_all(from request in Request, where: request.pool_id in subquery(perf_pool_ids))
     Repo.delete_all(from pool in Pool, where: pool.slug == @perf_pool_slug)
@@ -133,7 +131,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
     })
   end
 
-  defp seed_perf_identities!(owner) do
+  defp seed_perf_identities!(owner, upstream_base_url) do
     1..12
     |> Enum.map(fn index ->
       label = perf_upstream_label(index)
@@ -154,7 +152,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
           created_by_user_id: owner.id,
           created_at: now(),
           updated_at: now(),
-          metadata: perf_endpoint_metadata(label)
+          metadata: perf_endpoint_metadata(label, upstream_base_url)
         })
         |> Repo.insert!()
 
@@ -174,7 +172,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
     :ok
   end
 
-  defp seed_perf_assignments!(owner, pool, identities) do
+  defp seed_perf_assignments!(owner, pool, identities, upstream_base_url) do
     identities
     |> Enum.map(fn identity ->
       %PoolUpstreamAssignment{}
@@ -190,7 +188,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
         created_by_user_id: owner.id,
         created_at: now(),
         updated_at: now(),
-        metadata: perf_endpoint_metadata(identity.account_label)
+        metadata: perf_endpoint_metadata(identity.account_label, upstream_base_url)
       })
       |> Repo.insert!()
     end)
@@ -198,22 +196,6 @@ defmodule CodexPooler.Dev.Seeds.Perf do
 
   defp seed_perf_models!(pool, assignments) do
     source_assignment_ids = Enum.map(assignments, & &1.id)
-
-    source_assignment_models =
-      Map.new(assignments, fn assignment ->
-        {assignment.id,
-         %{
-           "capabilities" => %{
-             "responses" => true,
-             "streaming" => true,
-             "tools" => true,
-             "reasoning" => true,
-             "image_input" => true
-           },
-           "service_tiers" => ["default", "priority"],
-           "additional_speed_tiers" => []
-         }}
-      end)
 
     @perf_model_ids
     |> Enum.map(fn model_id ->
@@ -234,10 +216,31 @@ defmodule CodexPooler.Dev.Seeds.Perf do
         metadata: %{
           "dev_seed" => @perf_seed_key,
           "source_assignment_ids" => source_assignment_ids,
-          "source_assignment_models" => source_assignment_models
+          "source_assignment_models" => perf_source_models(assignments, model_id)
         }
       })
       |> Repo.insert!()
+    end)
+  end
+
+  # Canonical partition selection only routes to a source whose per-assignment
+  # metadata names the model's slug; without it the seeded Pool answers
+  # `no_eligible_backend` for every turn.
+  defp perf_source_models(assignments, model_id) do
+    Map.new(assignments, fn assignment ->
+      {assignment.id,
+       %{
+         "slug" => model_id,
+         "capabilities" => %{
+           "responses" => true,
+           "streaming" => true,
+           "tools" => true,
+           "reasoning" => true,
+           "image_input" => true
+         },
+         "service_tiers" => ["default", "priority"],
+         "additional_speed_tiers" => []
+       }}
     end)
   end
 
@@ -270,7 +273,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
         api_key_id: nil,
         pool_upstream_assignment_id: assignment.id,
         upstream_identity_id: assignment.upstream_identity_id,
-        model_identifier: "gpt-5.5",
+        model_identifier: "gpt-6-astra",
         route_class: route_class,
         status: "closed",
         reason_code: nil,
@@ -295,7 +298,6 @@ defmodule CodexPooler.Dev.Seeds.Perf do
         pool_id: pool.id,
         api_key_id: api_key.id,
         session_key: "dev-perf-session-#{index}",
-        conversation_key: "dev-perf-conversation-#{index}",
         pool_upstream_assignment_id: assignment.id,
         status: "active",
         created_at: minutes_ago(index + 5),
@@ -333,7 +335,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
       "starter_rows" => result.starter_rows
     }
 
-    File.write!(@perf_summary_path, Jason.encode_to_iodata!(summary, pretty: true))
+    File.write!(@perf_summary_path, CodexPooler.JSON.encode_to_iodata!(summary, pretty: true))
   end
 
   defp write_perf_env!(%{pool: pool, raw_api_key: raw_api_key, metrics_token: metrics_token}) do
@@ -367,16 +369,18 @@ defmodule CodexPooler.Dev.Seeds.Perf do
     end
   end
 
-  defp perf_endpoint_metadata(label) do
+  defp perf_endpoint_metadata(label, upstream_base_url) do
     %{
       "dev_seed" => @perf_seed_key,
-      "base_url" => @perf_http_url,
-      "websocket_url" => @perf_websocket_url,
+      "base_url" => upstream_base_url,
+      "websocket_url" => websocket_url(upstream_base_url),
       "cluster_base_url" => @perf_cluster_http_url,
       "cluster_websocket_url" => @perf_cluster_websocket_url,
       "perf_label" => label
     }
   end
+
+  defp websocket_url("http://" <> origin), do: "ws://" <> origin <> "/ws"
 
   defp perf_upstream_label(index), do: "perf-upstream-#{pad2(index)}"
 

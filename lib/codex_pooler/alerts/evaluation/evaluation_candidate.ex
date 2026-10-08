@@ -3,6 +3,7 @@ defmodule CodexPooler.Alerts.Evaluation.EvaluationCandidate do
   Builds generic alert evaluation match/clear candidates and stable dedupe keys.
   """
 
+  alias CodexPooler.Alerts.Evaluation.CircuitTerm
   alias CodexPooler.Alerts.Incidents.IncidentLifecycle
   alias CodexPooler.Alerts.Schemas.AlertRule
   alias CodexPooler.Upstreams.Quota
@@ -20,6 +21,7 @@ defmodule CodexPooler.Alerts.Evaluation.EvaluationCandidate do
   @spec pool_match(AlertRule.t(), map(), String.t(), DateTime.t()) :: candidate()
   def pool_match(%AlertRule{} = rule, projection, reason_code, %DateTime{} = timestamp) do
     dedupe_key = dedupe_key_for_rule(rule, nil)
+    circuit_evidence = Map.get(projection, :circuit_evidence, CircuitTerm.default_evidence())
 
     match(rule, dedupe_key, timestamp, %{
       pool_id: rule.pool_id,
@@ -27,18 +29,31 @@ defmodule CodexPooler.Alerts.Evaluation.EvaluationCandidate do
         "reason_code" => reason_code,
         "pool_id" => rule.pool_id,
         "model" => rule.model,
+        "route_class_scope" => rule.route_class || "any",
         "assignment_count" => projection.assignment_count,
         "enabled_assignment_count" => projection.enabled_assignment_count,
         "usable_assignment_count" => projection.usable_assignment_count,
         "state_counts" => stringify_count_keys(projection.state_counts),
         "min_usable_assignments" => rule.min_usable_assignments,
-        "target_state" => rule.target_state
+        "target_state" => rule.target_state,
+        "circuit_blocked_assignment_count" => circuit_evidence.circuit_blocked_assignment_count,
+        "circuit_blocked_route_classes" => circuit_evidence.circuit_blocked_route_classes,
+        "circuit_blocked_reasons" => circuit_evidence.circuit_blocked_reasons,
+        "circuit_blocked_lane_count" => circuit_evidence.circuit_blocked_lane_count,
+        "circuit_recency_seconds" => circuit_evidence.circuit_recency_seconds,
+        "model_membership_resolved" => circuit_evidence.model_membership_resolved,
+        "non_serving_assignment_count" => circuit_evidence.non_serving_assignment_count
       },
       targets: [target(rule, rule.pool_id, %{reason_code: reason_code})]
     })
   end
 
   @spec threshold(AlertRule.t(), map(), DateTime.t()) :: candidate()
+  # A rule naming a model its Pool does not serve has no quota to watch: the
+  # evaluation reports `model_not_served`, and the threshold stays clear.
+  def threshold(%AlertRule{} = rule, %{quota: %{state: "model_not_served"}} = assignment, %DateTime{} = timestamp),
+    do: clear(rule, dedupe_key_for_rule(rule, assignment.upstream_identity_id), timestamp)
+
   def threshold(%AlertRule{} = rule, assignment, %DateTime{} = timestamp) do
     dedupe_key = dedupe_key_for_rule(rule, assignment.upstream_identity_id)
     threshold = rule.threshold_used_percent || Decimal.new(100)
@@ -130,6 +145,20 @@ defmodule CodexPooler.Alerts.Evaluation.EvaluationCandidate do
     )
   end
 
+  def dedupe_key_for_rule(
+        %AlertRule{rule_kind: "pool_no_usable_assignments"} = rule,
+        _upstream_identity_id
+      ) do
+    pool_usability_dedupe_key(rule)
+  end
+
+  def dedupe_key_for_rule(
+        %AlertRule{rule_kind: "pool_low_usable_assignments"} = rule,
+        _upstream_identity_id
+      ) do
+    pool_usability_dedupe_key(rule)
+  end
+
   def dedupe_key_for_rule(%AlertRule{} = rule, _upstream_identity_id) do
     Enum.join(
       [
@@ -144,6 +173,27 @@ defmodule CodexPooler.Alerts.Evaluation.EvaluationCandidate do
         rule.min_usable_assignments || "none",
         "state",
         rule.target_state || "none"
+      ],
+      ":"
+    )
+  end
+
+  defp pool_usability_dedupe_key(rule) do
+    Enum.join(
+      [
+        "alerts",
+        "v1",
+        rule.rule_kind,
+        "pool",
+        rule.pool_id,
+        "model",
+        rule.model || "any",
+        "min",
+        rule.min_usable_assignments || "none",
+        "state",
+        rule.target_state || "none",
+        "route_class",
+        rule.route_class || "any"
       ],
       ":"
     )

@@ -17,6 +17,7 @@ defmodule CodexPooler.Accounts.OperatorManagement do
   }
 
   alias CodexPooler.Accounts.{OperatorAssignments, OperatorRoles}
+  alias CodexPooler.Alerts
   alias CodexPooler.Pools
   alias CodexPooler.Repo
 
@@ -91,6 +92,7 @@ defmodule CodexPooler.Accounts.OperatorManagement do
     with {:ok, actor} <- require_operator_management(actor),
          {:ok, operator} <- get_operator_target(operator) do
       update_operator_target(actor, operator, attrs, metadata)
+      |> invalidate_notifications_after_visibility_change()
       |> broadcast_operator_change("operator.update")
     end
   end
@@ -270,11 +272,27 @@ defmodule CodexPooler.Accounts.OperatorManagement do
                previous_lifecycle
              )
            ) do
-      operator
+      {operator, pool_visibility_changed?(role_summary, assignment_summary)}
     else
       error -> rollback_transaction_error(error)
     end
   end
+
+  # A role or a Pool assignment decides which Pools the operator sees.
+  defp pool_visibility_changed?(role_summary, assignment_summary) do
+    role_summary.previous_role != role_summary.role or assignment_summary.added_pool_ids != [] or
+      assignment_summary.removed_pool_ids != []
+  end
+
+  # The operator's open notification centers subscribed to the Pools the
+  # operator could see; after the commit they hear one invalidation on the
+  # operator's own topic and resync (findings#206 row 206-319).
+  defp invalidate_notifications_after_visibility_change({:ok, {%User{} = operator, visibility_changed?}}) do
+    if visibility_changed?, do: _ = Alerts.invalidate_notifications_after_operator_visibility_change(operator.id)
+    {:ok, operator}
+  end
+
+  defp invalidate_notifications_after_visibility_change({:error, _reason} = error), do: error
 
   defp update_current_operator_profile_target(user, attrs, metadata) do
     attrs = operator_profile_attrs(attrs)
@@ -310,7 +328,7 @@ defmodule CodexPooler.Accounts.OperatorManagement do
   end
 
   defp validate_timezone(:timezone, timezone) when is_binary(timezone) do
-    case DateTime.shift_zone(DateTime.utc_now(), timezone, Zoneinfo.TimeZoneDatabase) do
+    case DateTime.shift_zone(DateTime.utc_now(), timezone, Tz.TimeZoneDatabase) do
       {:ok, _datetime} -> []
       {:error, _reason} -> [timezone: "must be a valid IANA time zone"]
     end
@@ -494,9 +512,7 @@ defmodule CodexPooler.Accounts.OperatorManagement do
 
     with {:ok, role} <- OperatorRoles.normalize(map_value(attrs, :role) || current_lifecycle.role),
          {:ok, pool_ids} <-
-           OperatorAssignments.normalize_pool_ids(
-             map_value(attrs, :pool_ids, current_lifecycle.assigned_pool_ids)
-           ),
+           OperatorAssignments.normalize_pool_ids(map_value(attrs, :pool_ids, current_lifecycle.assigned_pool_ids)),
          :ok <- OperatorAssignments.ensure_pool_ids_exist(pool_ids) do
       {:ok, %{role: role, pool_ids: OperatorAssignments.role_pool_ids(role, pool_ids)}}
     end
@@ -586,9 +602,7 @@ defmodule CodexPooler.Accounts.OperatorManagement do
   defp get_operator_target(_operator), do: {:error, :invalid_operator}
 
   defp lock_user(user_id) do
-    case Repo.one(
-           from u in User, where: u.id == ^user_id and is_nil(u.deleted_at), lock: "FOR UPDATE"
-         ) do
+    case Repo.one(from u in User, where: u.id == ^user_id and is_nil(u.deleted_at), lock: "FOR UPDATE") do
       %User{} = user -> {:ok, user}
       nil -> {:error, :invalid_operator}
     end

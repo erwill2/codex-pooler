@@ -1,7 +1,13 @@
 defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
   @moduledoc false
 
-  @status_options ~w(in_progress succeeded failed rejected cancelled)
+  @status_options ~w(in_progress succeeded failed client_cancelled rejected)
+  # `failed` lists failures without the client cancellations, which have their
+  # own option (`RequestOutcome`); the menu says so where the choice is made.
+  @status_option_details %{
+    "failed" => %{detail: "excl. client cancelled", title: "Failed requests, not counting requests the client cancelled"},
+    "client_cancelled" => %{detail: "not a failure", title: "Requests the client closed before the response finished; recorded as failed, not counted as failures"}
+  }
   @default_request_status_presentation %{
     icon: "hero-question-mark-circle",
     icon_class: "mx-auto size-5 text-base-content/60",
@@ -23,8 +29,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
       icon_class: "mx-auto size-5 text-error",
       filter_icon_color: "text-error"
     },
-    "cancelled" => %{
-      icon: "hero-no-symbol",
+    "client_cancelled" => %{
+      icon: "hero-stop-circle",
       icon_class: "mx-auto size-5 text-warning",
       filter_icon_color: "text-warning"
     },
@@ -55,12 +61,15 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
         icon_class: "text-base-content/60"
       }
       | Enum.map(@status_options, fn status ->
-          %{
-            label: status_label(status),
-            value: status,
-            icon: request_status_icon(status),
-            icon_class: request_status_filter_icon_color(status)
-          }
+          Map.merge(
+            %{
+              label: status_label(status),
+              value: status,
+              icon: request_status_icon(status),
+              icon_class: request_status_filter_icon_color(status)
+            },
+            Map.get(@status_option_details, status, %{})
+          )
         end)
     ]
   end
@@ -69,6 +78,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
     %{label: model_filter_label(model), value: model || "", icon: "hero-cpu-chip"}
   end
 
+  def status_label("client_cancelled"), do: "Client cancelled"
   def status_label(status), do: status |> String.replace("_", " ") |> String.capitalize()
 
   def request_status_icon(status), do: request_status_presentation(status).icon

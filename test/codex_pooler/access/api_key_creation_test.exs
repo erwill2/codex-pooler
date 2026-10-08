@@ -109,8 +109,15 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
       assert exact_key.enforced_reasoning_effort == "xhigh"
       assert is_nil(exact_key.maximum_reasoning_effort)
 
+      # An omitted reasoning pair keeps the stored policy; nil clears it.
+      assert {:ok, %{api_key: kept_key}} = Access.update_api_key_with_policy(scope, exact_key, %{})
+      assert kept_key.enforced_reasoning_effort == "xhigh"
+
       assert {:ok, %{api_key: unrestricted_key}} =
-               Access.update_api_key_with_policy(scope, exact_key, %{})
+               Access.update_api_key_with_policy(scope, exact_key, %{
+                 enforced_reasoning_effort: nil,
+                 maximum_reasoning_effort: nil
+               })
 
       assert is_nil(unrestricted_key.enforced_reasoning_effort)
       assert is_nil(unrestricted_key.maximum_reasoning_effort)
@@ -209,13 +216,15 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
       assert exact_key.enforced_reasoning_effort == "xhigh"
       assert is_nil(exact_key.maximum_reasoning_effort)
 
+      # The omitted reasoning pair is kept from the locked row, not from the
+      # stale struct's ceiling.
       assert {:ok, %{api_key: returned_key}} =
                Access.update_api_key_with_policy(scope, stale_maximum_key, %{})
 
       persisted_key = Repo.get!(APIKey, maximum_key.id)
       assert returned_key.enforced_reasoning_effort == persisted_key.enforced_reasoning_effort
       assert returned_key.maximum_reasoning_effort == persisted_key.maximum_reasoning_effort
-      assert is_nil(returned_key.enforced_reasoning_effort)
+      assert returned_key.enforced_reasoning_effort == "xhigh"
       assert is_nil(returned_key.maximum_reasoning_effort)
 
       latest_audit =
@@ -228,8 +237,9 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
 
       assert latest_audit.details["previous_reasoning_policy_mode"] == "always_use"
       assert latest_audit.details["previous_reasoning_policy_configuration"] == "xhigh"
-      assert latest_audit.details["reasoning_policy_mode"] == "unrestricted"
-      assert is_nil(latest_audit.details["reasoning_policy_configuration"])
+      assert latest_audit.details["reasoning_policy_mode"] == "always_use"
+      assert latest_audit.details["reasoning_policy_configuration"] == "xhigh"
+      assert latest_audit.details["changed_fields"] == []
     end
 
     test "rejects API key assignment when a selected key is not visible" do
@@ -283,11 +293,11 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
       assert {:ok, %{policy_bindings: [_default_policy, model_policy]}} =
                Access.create_api_key(scope, pool, %{
                  display_name: "Model key",
-                 model_policies: [%{model_identifier: "gpt-5.4-mini", max_tokens_per_day: 1000}]
+                 model_policies: [%{model_identifier: "gpt-6-luna", max_tokens_per_day: 1000}]
                })
 
       assert model_policy.binding_scope == "model"
-      assert model_policy.model_identifier == "gpt-5.4-mini"
+      assert model_policy.model_identifier == "gpt-6-luna"
       assert model_policy.max_tokens_per_day == 1000
     end
 
@@ -311,7 +321,7 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
 
       assert updated.display_name == "Edited key"
       assert updated.status == "paused"
-      assert updated.allowed_model_identifiers == ["GPT-Admin"]
+      assert updated.allowed_model_identifiers == ["gpt-admin"]
       assert updated.metadata["operator_notes"] == "admin form update"
       assert {:error, :api_key_disabled} = Access.normalize_api_key_policy(updated)
 
@@ -421,9 +431,7 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
 
       blocked_user =
         %User{}
-        |> User.bootstrap_changeset(
-          valid_bootstrap_attributes(%{"email" => "blocked@example.com"})
-        )
+        |> User.bootstrap_changeset(valid_bootstrap_attributes(%{"email" => "blocked@example.com"}))
         |> Repo.insert!()
 
       blocked_scope = Scope.for_user(blocked_user, [])
@@ -475,9 +483,7 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
 
       refute api_key_changeset.valid?
 
-      assert "must be a non-empty model identifier without whitespace" in errors_on(
-               api_key_changeset
-             ).enforced_model_identifier
+      assert "must be a non-empty model identifier without whitespace" in errors_on(api_key_changeset).enforced_model_identifier
 
       assert "is invalid" in errors_on(api_key_changeset).enforced_reasoning_effort
       assert "is invalid" in errors_on(api_key_changeset).enforced_service_tier
@@ -489,12 +495,42 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
           key_prefix: "sk_typed_policy_valid",
           key_hash: <<"typed-policy-valid">>,
           status: "active",
-          enforced_model_identifier: "gpt-5.4-mini",
+          enforced_model_identifier: "gpt-6-luna",
           enforced_reasoning_effort: "ultra",
           enforced_service_tier: "scale"
         })
 
       assert valid_api_key_changeset.valid?
+
+      priority_api_key_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Priority policy key",
+          key_prefix: "sk_typed_policy_priority",
+          key_hash: <<"typed-policy-priority">>,
+          status: "active",
+          enforced_service_tier: "priority"
+        })
+
+      assert priority_api_key_changeset.valid?
+
+      assert Ecto.Changeset.get_change(priority_api_key_changeset, :enforced_service_tier) ==
+               "priority"
+
+      fast_api_key_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Fast policy key",
+          key_prefix: "sk_typed_policy_fast",
+          key_hash: <<"typed-policy-fast">>,
+          status: "active",
+          enforced_service_tier: " FAST "
+        })
+
+      assert fast_api_key_changeset.valid?
+
+      assert Ecto.Changeset.get_change(fast_api_key_changeset, :enforced_service_tier) ==
+               "priority"
 
       none_reasoning_api_key_changeset =
         APIKey.changeset(%APIKey{}, %{
@@ -547,9 +583,7 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
 
       refute conflicting_reasoning_api_key_changeset.valid?
 
-      assert "cannot be set when exact reasoning effort is enforced" in errors_on(
-               conflicting_reasoning_api_key_changeset
-             ).maximum_reasoning_effort
+      assert "cannot be set when exact reasoning effort is enforced" in errors_on(conflicting_reasoning_api_key_changeset).maximum_reasoning_effort
 
       ultrafast_api_key_changeset =
         APIKey.changeset(%APIKey{}, %{
@@ -561,8 +595,23 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
           enforced_service_tier: "ultrafast"
         })
 
-      refute ultrafast_api_key_changeset.valid?
-      assert "is invalid" in errors_on(ultrafast_api_key_changeset).enforced_service_tier
+      assert ultrafast_api_key_changeset.valid?
+      assert Ecto.Changeset.get_change(ultrafast_api_key_changeset, :enforced_service_tier) == "ultrafast"
+
+      blank_service_tier_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Blank service tier policy key",
+          key_prefix: "sk_typed_policy_blank_service_tier",
+          key_hash: <<"typed-policy-blank-service-tier">>,
+          status: "active",
+          enforced_service_tier: " "
+        })
+
+      assert blank_service_tier_changeset.valid?
+
+      assert Ecto.Changeset.get_change(blank_service_tier_changeset, :enforced_service_tier) ==
+               nil
 
       binding_changeset =
         APIKeyPolicyBinding.changeset(%APIKeyPolicyBinding{}, %{

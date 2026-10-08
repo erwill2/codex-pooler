@@ -47,6 +47,16 @@ defmodule CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle do
     )
   end
 
+  @spec overload_completion(SelectedCandidateContext.t()) :: success_result()
+  def overload_completion(%SelectedCandidateContext{} = context) do
+    RoutingRouteLifecycle.selection_overload_completion(
+      context.auth,
+      context.model,
+      routing_selection(context),
+      context.reserved.request.id
+    )
+  end
+
   defp merge_failure_metadata(%SelectedCandidateContext{} = context, demotion_reason) do
     case Accounting.merge_request_metadata(
            context.reserved.request,
@@ -75,7 +85,8 @@ defmodule CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle do
       selected_metadata: %{},
       attempt_metadata: context.routing_attempt_metadata,
       route_metadata: %{},
-      circuit_state: context.routing_circuit_state
+      circuit_state: context.routing_circuit_state,
+      circuit_admission: context.routing_circuit_admission
     }
   end
 end

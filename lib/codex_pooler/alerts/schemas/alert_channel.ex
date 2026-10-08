@@ -5,6 +5,7 @@ defmodule CodexPooler.Alerts.Schemas.AlertChannel do
   import Ecto.Changeset
 
   alias CodexPooler.Alerts.Delivery.ChannelEndpoint
+  alias CodexPooler.Alerts.StatusVocabulary.Channel, as: ChannelStatus
   alias CodexPooler.InstanceSettings.AppSecretCrypto
 
   @derive {Inspect,
@@ -20,9 +21,9 @@ defmodule CodexPooler.Alerts.Schemas.AlertChannel do
              :webhook_signing_secret_aad
            ]}
 
-  @channel_types ~w(email webhook)
-  @states ~w(active disabled)
-  @endpoint_schemes ~w(https)
+  @channel_types ChannelStatus.channel_types()
+  @states ChannelStatus.states()
+  @endpoint_schemes ChannelStatus.endpoint_schemes()
   @endpoint_secret_kind "alert_webhook_endpoint_url"
   @webhook_secret_kind "alert_webhook_signing_secret"
 
@@ -43,14 +44,14 @@ defmodule CodexPooler.Alerts.Schemas.AlertChannel do
     field :endpoint_host, :string
     field :endpoint_path_prefix, :string
     field :endpoint_fingerprint, :string
-    field :endpoint_url_ciphertext, :binary
-    field :endpoint_url_nonce, :binary
+    field :endpoint_url_ciphertext, :binary, redact: true
+    field :endpoint_url_nonce, :binary, redact: true
     field :endpoint_url_aad, :map, default: %{}
     field :endpoint_url_key_version, :string
     field :webhook_signing_secret, :string, virtual: true, redact: true
     field :webhook_signing_secret_action, :string, virtual: true
-    field :webhook_signing_secret_ciphertext, :binary
-    field :webhook_signing_secret_nonce, :binary
+    field :webhook_signing_secret_ciphertext, :binary, redact: true
+    field :webhook_signing_secret_nonce, :binary, redact: true
     field :webhook_signing_secret_aad, :map, default: %{}
     field :webhook_signing_secret_key_version, :string
     field :created_by_user_id, :binary_id
@@ -129,19 +130,19 @@ defmodule CodexPooler.Alerts.Schemas.AlertChannel do
   end
 
   @spec channel_types() :: [channel_type()]
-  def channel_types, do: @channel_types
+  defdelegate channel_types(), to: ChannelStatus
 
   @spec states() :: [state()]
-  def states, do: @states
+  defdelegate states(), to: ChannelStatus
 
   @spec endpoint_schemes() :: [endpoint_scheme()]
-  def endpoint_schemes, do: @endpoint_schemes
+  defdelegate endpoint_schemes(), to: ChannelStatus
 
   @spec active_state() :: state()
-  def active_state, do: "active"
+  defdelegate active_state(), to: ChannelStatus
 
   @spec disabled_state() :: state()
-  def disabled_state, do: "disabled"
+  defdelegate disabled_state(), to: ChannelStatus
 
   defp normalize_endpoint_url(changeset) do
     case get_change(changeset, :endpoint_url) do
@@ -242,9 +243,7 @@ defmodule CodexPooler.Alerts.Schemas.AlertChannel do
   defp validate_email_channel(changeset) do
     changeset
     |> validate_required([:email_to])
-    |> validate_format(:email_to, ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/,
-      message: "must be a valid email address"
-    )
+    |> validate_format(:email_to, ~r/^[^\s@]+@[^\s@]+\.[^\s@]+$/, message: "must be a valid email address")
     |> validate_absent([
       :endpoint_scheme,
       :endpoint_host,

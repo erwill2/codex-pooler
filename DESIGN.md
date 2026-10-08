@@ -1,3 +1,130 @@
+---
+name: Codex Pooler
+description: A flat, dense operator bench for routing, capacity, and redacted evidence.
+colors:
+  primary: "#ff9900"
+  primary-content: "#000000"
+  primary-border: "#e17d00"
+  primary-hover: "#f2a000"
+  primary-active: "#d87400"
+  secondary: "oklch(55% 0.027 264.364)"
+  accent: "oklch(0% 0 0)"
+  base-100: "oklch(98% 0 0)"
+  base-200: "oklch(96% 0.001 286.375)"
+  base-300: "oklch(92% 0.004 286.32)"
+  base-content: "oklch(21% 0.006 285.885)"
+  info: "oklch(62% 0.214 259.815)"
+  success: "oklch(70% 0.14 182.503)"
+  warning: "oklch(66% 0.179 58.318)"
+  error: "oklch(58% 0.253 17.585)"
+  reset-bank: "oklch(52% 0.22 295)"
+  rank-gold: "oklch(78% 0.13 85)"
+  rank-bronze: "oklch(62% 0.11 55)"
+  chart-other-models: "oklch(58% 0.15 315)"
+  chart-requests: "oklch(52% 0.13 210)"
+typography:
+  page-title:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "1.875rem"
+    fontWeight: 700
+    lineHeight: "2.25rem"
+  eyebrow:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "0.875rem"
+    fontWeight: 600
+    letterSpacing: "0.025em"
+  surface-title:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "1rem"
+    fontWeight: 600
+    lineHeight: "1.25rem"
+  section-heading:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "0.75rem"
+    fontWeight: 600
+    letterSpacing: "0.025em"
+  micro-label:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "0.62rem"
+    fontWeight: 600
+    letterSpacing: "0.08em"
+  value:
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"
+    fontSize: "1.25rem"
+    fontWeight: 600
+    fontFeature: "tnum"
+  body:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "0.875rem"
+    fontWeight: 400
+    lineHeight: "1.5rem"
+  fine-print:
+    fontFamily: "Roboto Condensed, ui-sans-serif, system-ui, sans-serif"
+    fontSize: "0.6875rem"
+    fontWeight: 400
+    lineHeight: "1rem"
+rounded:
+  selector: "0.25rem"
+  field: "0.25rem"
+  box: "0.5rem"
+  pill: "999px"
+spacing:
+  chip: "0.5rem"
+  band: "0.625rem"
+  grid: "0.75rem"
+  card: "1rem"
+  section: "1.5rem"
+components:
+  button-primary:
+    backgroundColor: "{colors.primary}"
+    textColor: "{colors.primary-content}"
+    rounded: "{rounded.field}"
+    padding: "0.5rem 0.875rem"
+    typography: "{typography.body}"
+  button-primary-hover:
+    backgroundColor: "{colors.primary-hover}"
+    textColor: "{colors.primary-content}"
+  button-primary-active:
+    backgroundColor: "{colors.primary-active}"
+    textColor: "{colors.primary-content}"
+  button-ghost:
+    backgroundColor: "transparent"
+    textColor: "{colors.base-content}"
+    rounded: "{rounded.field}"
+    padding: "0.5rem 0.875rem"
+  admin-surface:
+    backgroundColor: "{colors.base-100}"
+    textColor: "{colors.base-content}"
+    rounded: "{rounded.box}"
+    padding: "1rem"
+  metric-card:
+    backgroundColor: "{colors.base-100}"
+    textColor: "{colors.base-content}"
+    rounded: "{rounded.box}"
+    padding: "0.75rem"
+    typography: "{typography.value}"
+  chip-success:
+    backgroundColor: "{colors.success}"
+    textColor: "{colors.success}"
+    rounded: "{rounded.field}"
+    padding: "0.0625rem 0.375rem"
+    typography: "{typography.micro-label}"
+  input-field:
+    backgroundColor: "{colors.base-100}"
+    textColor: "{colors.base-content}"
+    rounded: "{rounded.field}"
+    padding: "0.375rem 0.75rem"
+    height: "2rem"
+  nav-item:
+    backgroundColor: "transparent"
+    textColor: "{colors.base-content}"
+    padding: "0.5rem 0.75rem"
+    typography: "{typography.micro-label}"
+  nav-item-active:
+    backgroundColor: "{colors.base-300}"
+    textColor: "{colors.base-content}"
+---
+
 # Design System: Codex Pooler
 
 This document is the source-linked contract for the Codex Pooler web UI. Every
@@ -8,31 +135,47 @@ wins and this file must be corrected in the same change.
 Token source of truth: [`assets/css/app.css`](assets/css/app.css) (Tailwind v4 +
 daisyUI 5 theme plugins). Verified against the live app (light and dark) on
 2026-07-17 across `/admin/upstreams`, `/admin/stats`, `/admin/api-keys`, and
-`/admin/request-logs`.
+`/admin/request-logs`; tokens re-verified against `app.css` on 2026-08-06.
+
+The frontmatter above is the machine-readable layer and carries the **light**
+theme, which is the default. Every token has a dark pair, and those pairs, the
+tonal ramps, and the shadow and motion vocabularies do not fit that schema;
+they are regenerated into a local, untracked sidecar alongside this file. The
+prose below names roles and describes where each token is used; it never
+asserts a value that contradicts the frontmatter.
 
 Contents:
 
-1. [Atmosphere](#1-atmosphere)
-2. [Color](#2-color)
-3. [Typography](#3-typography)
-4. [Spacing and layout](#4-spacing-and-layout)
-5. [Components — current admin system](#5-components--current-admin-system)
-6. [Components — API Key Observatory extension](#6-components--api-key-observatory-extension)
-7. [Motion](#7-motion)
-8. [Depth](#8-depth)
-9. [Accessibility and design rules](#9-accessibility-and-design-rules)
+1. [Overview](#overview)
+2. [Colors](#colors)
+3. [Typography](#typography)
+4. [Layout](#layout)
+5. [Elevation & Depth](#elevation--depth)
+6. [Shapes](#shapes)
+7. [Components](#components)
+8. [Do's and Don'ts](#dos-and-donts)
 
 ---
 
-## 1. Atmosphere
+## Overview
 
-**Creative north star: "The Operator Bench."** Codex Pooler is a compact
+### Selected satin plan badge
+
+On upstream account cards only, the existing `admin-token-burn-active` recent-usage signal also enables a clipped static-width highlight sweep on the plan badge. Cadence is fixed at3.2seconds, independent of burn level and quota meter speed. Idle cards and badges outside account cards do not animate. The pseudo-element cannot intercept pointer events; reduced-motion removes the sweep entirely while retaining the satin material. This indicates the existing recent five-minute token-burn activity, not a new in-flight-request detector.
+
+Plan badges use the approved B satin material through `admin-plan-badge` in `assets/css/app.css`: a static 165-degree highlight, 999px capsule radius, 24px minimum height, 11px medium-bold text and subtle inset/outer shadow. Component consumers retain their existing compact sizing overrides. Palette hue/saturation tokens are Free 220/10%, Go 190/70%, Plus 245/65%, Pro 42/80%, Pro Lite 32/48%, Team 213/72%, Business 163/48%, Enterprise 300/22%, Edu 275/62%. Light text/border lightness is24/69%; gradient stops96/80/89%. Dark text is82%, border39% with saturation scaled0.65; gradient lightness31/19/25% with saturation35/38/32%. The user accepted the proposed dark treatment provisionally for in-context review. This is an explicit badge-only exception to the flat-first rule; no animation or changes to status chips. Unknown plans retain the previous fallback. Plan labels reflect provider evidence and never infer5x/20x.
+
+### Development plan badge proposals
+
+The `plan-badges` component-showcase state compares three CSS-only treatments inside the real account card: enamel (solid tint), satin (static restrained metallic highlight), and split (plan plus compact multiplier segment). This is a scoped material exception for badges only: existing shell, density, fonts, cards, spacing and controls remain the operator-bench contract. Pro uses gold; Go uses cyan, Free neutral, Plus indigo, Team blue, Business teal, Enterprise plum, Edu violet. Light and dark pairs use readable foregrounds and visible borders; each badge stays compact at 24px high with no animation. Pro 5x/20x labels are explicitly hypothetical layout examples, never inferred provider entitlements. Proposal styles apply only below `.plan-badge-review`; production badges do not opt in. Full cards stack on mobile; no horizontal page overflow, no decorative card shadows, no imagery or background effects.
+
+**Creative North Star: "The Operator Bench."** Codex Pooler is a compact
 operations surface for trusted users who inspect routing, upstream capacity,
 API keys, request history, quota evidence, and maintenance state without ever
 seeing sensitive payloads. The interface should feel like a well-labeled bench
 of controls: precise, flat, readable, built for repeated use under pressure.
 
-Key characteristics, all observable in the current admin pages:
+**Key Characteristics:** (all observable in the current admin pages)
 
 - **Dense but scan-friendly.** Cards, definition lists, and zebra rows carry
   many small facts; type stays legible because labels are uppercase micro-text
@@ -53,7 +196,127 @@ Anti-goals (enforced, not aspirational): no glassmorphism, no neon/terminal
 styling, no gradient text, no decorative grid backgrounds, no oversized hero
 typography on admin screens, no equal-tile KPI boilerplate as filler.
 
-## 2. Color
+### Motion
+
+Motion belongs to the world rather than to any one component, so it is
+specified here. Motion carries state meaning or it does not exist. Current
+inventory (all in
+`app.css` or component classes, all `prefers-reduced-motion`-guarded where
+animated):
+
+- Known quota meters: width 260ms / color 180ms transitions
+  (`admin-live-progress`); token-burn gloss sweep with per-card
+  `--shine-delay` stagger and burn-scaled `--shine-period`. An unreported
+  quota uses the component-scoped `admin-static-unknown-progress` treatment:
+  native indeterminate semantics but no daisyUI gradient or animation, in
+  normal and reduced-motion sessions ([Upstream account card](#upstream-account-card)/[Quota progress row](#quota-progress-row-and-provider-credits)).
+- Panel switcher: 150ms opacity ease-out with `motion-reduce:transition-none`.
+- Pool compat disclosure: 160ms slide/fade in (`pool-compat-panel-in`),
+  disabled under reduced motion.
+- Admin rail expansion below `xl` (`.admin-rail`): 160ms `ease-out` on width and
+  box-shadow, opening after a 140ms delay and closing with none. Reduced motion
+  drops the duration to `0s` but keeps the delay: the wait is an intent filter
+  that stops a passing pointer from opening the rail, not decoration.
+- Hover/focus color transitions: `transition-colors` (~200ms) on nav items,
+  chips, pills, dropdown items.
+- Flash show/hide: 200–300ms fade/scale via `CoreComponents.show/hide`;
+  reconnect spinner is `motion-safe:animate-spin`.
+- Shared admin loading indicators: `admin-loading-icon` rotates through
+  `transform` on an 800ms linear loop. Reduced-motion sessions replace the
+  rotation with a calm 1.4s opacity pulse, so loading never reads as a static
+  refresh glyph.
+- Theme toggle thumb: `transition-[left]`.
+- Observatory segmented/pause/logout controls: the semantic control motion
+  role is 150ms `ease` for border/background/text state changes; the live-dot
+  role is a 2.4s `ease-in-out` opacity pulse whose midpoint is 0.35. These map
+  to the `--observatory-motion-*` tokens in [Layout](#layout); pause makes the dot static and
+  `prefers-reduced-motion: reduce` removes the pulse and control transitions.
+
+- Observatory hold-to-launch (`admin-nav-hold-*` in `app.css`, `HoldToLaunch`
+  hook): the nav exit opens only after a ~1s press — the icon's ring fills as
+  functional progress (JS-driven stroke offset), early release drains it in
+  150ms, and the tab opens on the release gesture so popup blockers stay
+  quiet. Only the 300ms launch pop is decorative, and it is motion-gated.
+
+- OAuth callback paste figure (`oauth-paste-demo` in `app.css`, browser route of
+  the [OAuth handoff dialog](#oauth-handoff-dialog-two-doors)): one 8s loop on a
+  single `--opd-loop` clock — select, `Copy`, carry the value down into the
+  field, `Paste`, arm `Complete link` — with a short opacity veil covering the
+  reset so the loop never rewinds on screen. Reduced motion stops the clock and
+  keeps the finished frame, where the selection, the pasted value, both key
+  pills and the armed button are already shown.
+
+Rule: no looping decorative animation; the burn shine is the ceiling for
+ambient motion and it is evidence-driven (recent token burn). The callback paste
+figure is the one loop that is not ambient: every moving part is a step of an
+instruction for something that happens outside this app, it runs only while that
+step is actually owed, and it holds the same drawing still under reduced motion.
+
+## Colors
+
+A near-neutral operator surface carrying exactly one warm brand voice, with the
+semantic status hues held at a saturation that reads as instrumentation rather
+than decoration.
+
+### Primary
+
+- **Operator Orange** (`{colors.primary}`): the single brand voice. Primary
+  action, active nav item, selected state, section eyebrow, focus ring. Never
+  decoration, never a second one on the same panel.
+
+### Secondary
+
+- **Bench Graphite** (`{colors.secondary}`): secondary buttons and muted chart
+  series — present, deliberately unremarkable, never competing with Primary.
+
+### Tertiary
+
+- **Banked Violet** (`{colors.reset-bank}`): the saved-reset resource. A stored
+  charge is neither a status nor an action, so it sits deliberately outside the
+  semantic vocabulary and owns its own hue.
+- **Podium Gold** (`{colors.rank-gold}`) and **Podium Bronze**
+  (`{colors.rank-bronze}`): leaderboard rank metals only. Theme-invariant, so
+  first place reads the same in both themes.
+- **Other models** (`--admin-chart-other-models`): positive-token model usage
+  outside the ranked top five. It is a chart category, not an error or status.
+  Light uses `oklch(58% 0.15 315)`; dark uses `oklch(74% 0.12 315)`.
+- **Requests** (`--admin-chart-requests`): every admitted request status,
+  including failed, rejected, interrupted, cancelled, and in-progress traffic.
+  It is a volume series, not a success signal. Light uses
+  `oklch(52% 0.13 210)`; dark uses `oklch(72% 0.11 210)`.
+
+### Neutral
+
+- **Paper** (`{colors.base-100}`): the card and work surface.
+- **Bench** (`{colors.base-200}`): page chrome and tonal washes.
+- **Hairline** (`{colors.base-300}`): borders, dividers, inactive fills, and
+  the active nav item's background.
+- **Ink** (`{colors.base-content}`): all text. Muted ink is this token at
+  reduced opacity, never a separate gray.
+
+### Status
+
+- **Info** (`{colors.info}`): in progress, WebSocket transport.
+- **Success** (`{colors.success}`): healthy, succeeded, eligible.
+- **Warning** (`{colors.warning}`): paused, refresh due, attention.
+- **Error** (`{colors.error}`): failed, revoked, blocked, destructive.
+
+### Named Rules
+
+**The Orange Scarcity Rule.** `--color-primary` marks the primary action, the
+active nav item, the selected state, and the section eyebrow — nothing else. If
+two things on one panel are orange, one of them is wrong.
+
+**The Text Plus Color Rule.** Every status is written out (chip label,
+`sr-only` prefix, `title` attribute) before it is colored. Color only
+reinforces a reading that already exists in text; a hue is never the only
+channel.
+
+**The One Token Store Rule.** Per-theme values live in `app.css` and nowhere
+else. No raw color literals in `lib/`, no hand-managed `dark:` pairs for custom
+hues, no second token store.
+
+### Theme pairing
 
 Both themes are daisyUI theme plugins in `assets/css/app.css`. The `dark`
 variant is selected by `data-theme="dark"` on `<html>` (a custom variant maps
@@ -96,17 +359,33 @@ theme-invariant `--codex-rank-gold`/`--codex-rank-bronze` (+`-ink`) podium
 metals. Components reference them as `text-(--color-reset-bank)`-style
 utilities; never hardcode raw violet/oklch literals in `lib/`.
 
-## 3. Typography
+## Typography
+
+**Display / Body Font:** Roboto Condensed (with `ui-sans-serif`, `system-ui`,
+`sans-serif`)
+**Code / Identifier Mono Font:** the Tailwind `font-mono` stack (`ui-monospace`, Menlo, …)
+
+**Character:** one condensed grotesque doing every job, narrow enough that a
+dense row of facts still reads at a glance. There is no display face and no pairing to admire; the hierarchy is
+carried by weight, case, and opacity rather than by contrast between families.
+
+### Named Rules
+
+**The No-Hero-Type Rule.** No fluid or clamped hero type on admin screens. The
+largest type on any page is the `text-3xl` page title, and tracked uppercase
+appears only at micro sizes.
+
+### Family notes
 
 - **Family:** Roboto Condensed, self-hosted TTFs at weights 400–900
   (`@font-face` in `app.css`), wired as `--font-sans` and on `body`.
   Fallbacks: `ui-sans-serif, system-ui, sans-serif`. Note the face's
-  asymmetric vertical metrics: centered labels often need `leading-none` plus
-  flex centering rather than line-height tricks.
-- **Mono:** the Tailwind `font-mono` stack (`ui-monospace`, Menlo, …) is data
-  dress, used for IDs, prefixes, versions, tabular values
-  (`font-mono tabular-nums`), the sidebar nav labels, and the OTP slots. Mono
-  is never product personality.
+  asymmetric vertical metrics: centering a line box does not necessarily center
+  its visible letters. Compact cockpit header actions use `admin-control-label`
+  on the label span: `text-box: trim-both cap alphabetic` lets flex center the
+  font's cap-to-baseline box beside its icon. Unsupported browsers retain the
+  existing line box; icons and control hit areas keep their original geometry.
+- **Mono:** existing shell and code-specific components may use the Tailwind `font-mono` stack. Data does not require a different font family; numeric alignment uses `tabular-nums`.
 
 Observed hierarchy (all from live pages):
 
@@ -117,19 +396,19 @@ Observed hierarchy (all from live pages):
 | Surface title | `text-base font-semibold leading-5` | `admin_surface`, card headers |
 | Section heading | `text-xs font-semibold uppercase tracking-wide text-base-content/45` | drawer sections |
 | Micro label | `text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35` | metric cards, card footers |
-| Value | `font-mono font-semibold tabular-nums` (`text-xl`/`text-lg` compact) | metric cards, leaderboards |
+| Value | `font-semibold tabular-nums` (`text-xl`/`text-lg` compact) | metric cards, leaderboards |
 | Body / help | `text-sm leading-6 text-base-content/65` | wizard copy, descriptions |
 | Fine print | `text-xs` / `text-[11px] leading-4 text-base-content/55` | card details, sublabels |
 
 Rules: no fluid hero type on admin screens; tracked uppercase only at micro
 sizes (labels, chips, nav); prose capped around 65–75ch.
 
-## 4. Spacing and layout
+## Layout
 
-Radii come from the theme: `--radius-field: 0.25rem` (controls, `rounded`,
-inputs), `--radius-box: 0.5rem` (`rounded-box`, cards, popovers), pills are
-`rounded-full`. Border width token is 1.5px for daisyUI controls; hairlines
-elsewhere are 1px `border-base-300` (often at `/70` opacity).
+The admin surface is a fixed frame with exactly one scrolling region: chrome
+never moves, and everything the operator reads scrolls inside the content
+column. Density is deliberate — the frame is sized so the widest table fits
+whole rather than so the page looks roomy.
 
 **Admin shell** (source:
 [`shell.ex`](lib/codex_pooler_web/live/admin/components/shared/components/shell.ex),
@@ -139,12 +418,73 @@ wrapped by `Layouts.app chrome={:admin}` in
 - Root: `h-svh overflow-hidden bg-base-200`; only the main region scrolls
   (`#admin-shell-scroll-region`, `overflow-y-auto`). `:root` carries
   `scrollbar-gutter: stable`.
-- Fixed top bar: `h-12`, wordmark left, GitHub/notifications/WebSocket-state
-  dropdowns right.
-- Fixed sidebar: `w-16` icon rail on mobile, `md:w-64` with labels; active item
-  gets `!border-l-primary bg-base-300` on a `border-l-[3px]` slot.
-- Content: `ml-16 md:ml-64 pt-12`, inner column `flex flex-col gap-6 p-4
+- Fixed top bar: `h-12`, wordmark left; right, in order, the GitHub resources
+  dropdown, alert notifications, the live-updates toggle, and the WebSocket
+  state dropdown.
+- Fixed sidebar: `w-16` icon rail, `xl:w-64` with labels; active item gets
+  `!border-l-primary bg-base-300` on a `border-l-[3px]` slot. Below `xl` the
+  collapsed rail opens to that same labelled shape on pointer or keyboard
+  focus; see the rail rule below.
+- The nav ends with the Observatory item, the one exit to the key-holder
+  surface. It looks like its siblings — no arrow glyphs, separators, or
+  group labels — and the protection is the interaction: it opens through the
+  hold-to-launch ring ([Motion](#motion)) instead of a plain click, and carries "hold to
+  open in a new tab" in its accessible name and title. Plain left-click is
+  owned by the hold; modified clicks, middle-click, and keyboard Enter
+  follow `target="_blank"` natively (`HoldToLaunch` hook in
+  `assets/js/hold_to_launch.mjs`).
+- Content: `ml-16 xl:ml-64 pt-12`, inner column `flex flex-col gap-6 p-4
   sm:p-6 xl:p-8`.
+
+**The rail holds until `xl`, and this is a content decision, not a nav one.**
+The usable content column is `viewport − sidebar − padding`. With labels from
+`md` the sidebar took 256px from every viewport at 768 and up, which is exactly
+the band where the widest surfaces have the least room to give: an iPad
+landscape at 1180 had 862px of content for a table that needs 896, so the last
+column fell off the edge, and an iPad portrait at 820 had 502px and dropped to
+a phone layout. Holding the 64px rail to `xl` returns ~192px to every admin
+page in the 768–1280 band — landscape goes to 1054px and the table fits whole.
+Nav labels are recoverable (each item keeps `title` and `aria-label`); a column
+that has been pushed off the screen is not. When judging any layout change,
+measure the content column, not the viewport.
+
+**The collapsed rail opens on demand, and it overlays rather than reflows.**
+Recoverable is not the same as legible: an icon alone does not say where it
+goes, and `title` answers a second late and never to a keyboard. Below `xl`,
+pointing at the rail or tabbing into it widens it to the `xl` shape (`.admin-rail`
+in `app.css`). Because the aside is `position: fixed`, the open rail lies over
+the content column instead of pushing it, so the width the rail exists to
+protect is never handed back — which is also why the open rail takes a shadow,
+the one place this flat-first chrome behaves like an overlay. Opening waits
+140ms and closing does not, so crossing the rail is not a request to open it.
+
+The labelled shape is a **container query on the rail's own width**, not a
+second breakpoint: `.admin-rail` declares `container: admin-rail / inline-size`
+and every element inside switches at `rail-open` (`@container admin-rail (width
+>= 12rem)`). Whatever widens the rail — the `xl` breakpoint, a pointer, a
+keyboard focus — the labels follow one rule. **New sidebar items use
+`rail-open:`, never `xl:`**; an `xl:` variant inside the rail is a bug that
+shows up only between 768 and 1280. Pointer expansion is gated behind
+`(hover: hover)`, so touch below `xl` still has icons and accessible names only.
+
+**The live-updates toggle is global, and belongs to the reading session.** Eight
+admin pages rebuild themselves when Pool events arrive, and the operators page
+on its own domain's events. That is right while an operator is watching traffic
+and wrong while they are reading, so one topbar control answers it for all of
+them and no single surface — pagination least of all — has to guess. State
+lives in `sessionStorage`: a second tab stays live, a new tab starts live, and
+the choice survives moving between pages.
+
+Three things follow for the UI. The accessible name stays "Pause live updates"
+in both states, because a name that flips alongside `aria-pressed` announces a
+contradiction ("Resume live updates, pressed"). Which icon shows is decided by a
+`data-live-updates-paused` attribute on `:root`, written by an inline script
+before first paint, so the button never renders the state it is about to be
+corrected out of — the same technique the theme uses, and with the attribute
+absent the resting "live" reading wins. And a change carries a flash, because
+the icon swap is easy to miss on a control this small and a list that has simply
+gone quiet does not explain itself; only an actual change speaks, since the
+control also reports on mount and on reconnect.
 
 Spacing rhythm inside content: page sections stack at `gap-6`; metric strips
 use `gap-2`; card bodies use `p-4` with `gap-3`/`gap-4` grids; surface headers
@@ -160,6 +500,13 @@ Grid conventions:
 - Responsive breakpoints in active use: `sm` (640), `md` (768), `lg` (1024),
   `xl` (1280), plus one bespoke `min-[1900px]` on the stats KPI strip.
 
+### Named Rules
+
+**The Content-Column Rule.** Judge every layout change by the width left for
+content — viewport minus chrome minus padding — not by the viewport. Nav labels
+are recoverable through `title` and `aria-label`; a table column pushed off the
+screen is not.
+
 ### Observatory token extension
 
 The Observatory keeps its exact approved geometry while using the existing
@@ -170,7 +517,7 @@ Tailwind v4 utilities (`min-h-12`, the `gap-*`/`p-*`/`m*` scale, `size-*`,
 chart minimum is the existing Tailwind `--container-xl` token; compact body
 type is `--text-xs`; weights and tight leading use `--font-weight-*` and
 `--leading-tight`. Cards and field controls remain on `--radius-box` and
-`--radius-field`; colors remain on the §2 semantic theme slots.
+`--radius-field`; colors remain on the [Colors](#colors) semantic theme slots.
 
 Only values with no exact framework token receive an Observatory-local token.
 This is the complete inventory; it is not a new global scale:
@@ -217,12 +564,66 @@ them through `@variant`, and HEEx uses `observatory-split:*`. Tailwind 4 emits
 the concrete media queries during the asset build. The ordinary `sm` variant
 continues to control safe-prefix visibility at 640px.
 
-## 5. Components — current admin system
+## Elevation & Depth
+
+Flat-first. Two sanctioned separation methods, never combined on a resting
+surface:
+
+- **Content layering:** `border border-base-300` (+ `/70` for internal
+  dividers) over tonal `bg-base-200/*` washes; header bands `bg-base-200/35`,
+  footer bands `bg-base-200/20`.
+- **Overlay shadows:** `shadow-xl` for dropdown menus and flash, `shadow-2xl`
+  for dialogs, drawers, and top-bar popovers. `shadow-sm` appears only on the
+  object-inspector default shell.
+
+z-index ladder in use: dropdowns in cards `z-20`, chart/tooltip internals,
+top-bar popovers and toasts `z-50`, request-log drawer `z-[70]`.
+
+### Named Rules
+
+**The Flat-By-Default Rule.** Surfaces are flat at rest. A shadow is a response
+to elevation — an overlay leaving the page plane — never a way to make a
+resting card look important.
+
+**The One Separation Method Rule.** A resting surface separates by border or by
+tonal wash, never by both plus a shadow. Stacking separation devices is how a
+flat system turns into a soft one.
+
+## Shapes
+
+A rectilinear system with just enough softening to read as controls rather than
+as a spreadsheet. Three radii and one border weight cover every surface; there
+is no clipping, no bespoke silhouette, and no decorative geometry.
+
+- **Controls and inputs** use `--radius-field` (0.25rem, the `rounded` /
+  `rounded-field` utilities). Small enough that a dense toolbar still reads as
+  a row of discrete controls.
+- **Cards, popovers, drawers, and dialogs** use `--radius-box` (0.5rem, the
+  `rounded-box` utility). One step softer, which is what separates a container
+  from a control at a glance.
+- **Pills** — segmented controls, key chips, the live dot, the Observatory
+  minibar — are fully round (`rounded-full`, or
+  `--observatory-radius-pill: 999px` where the Observatory needs the exact
+  value).
+- **Borders** are the primary separation device. daisyUI controls carry the
+  1.5px `--border` token; hairlines everywhere else are 1px `border-base-300`,
+  frequently at `/70` opacity for internal dividers.
+- **Status stripes** are a 3px left border on an otherwise unchanged card,
+  painted from a data attribute. They are the one place a shape carries
+  meaning, and they only ever reinforce status text that is already visible.
+
+### Named Rules
+
+**The Two-Radius Rule.** A surface is a control (0.25rem) or a container
+(0.5rem). Anything fully round is a pill by intent. There is no fourth radius;
+if a new element seems to need one, it has been miscategorized.
+
+## Components
 
 Each entry: source, purpose, anatomy/API, tones and states, responsive/scroll
 ownership, accessibility, and a minimal real markup example.
 
-### 5.1 Page header
+### Page header
 
 - **Source:** `page_header/1` in
   [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex)
@@ -244,7 +645,7 @@ ownership, accessibility, and a minimal real markup example.
 </AdminComponents.page_header>
 ```
 
-### 5.2 Metric strip and metric card
+### Metric strip and metric card
 
 - **Source:** `metric_strip/1`, `metric_card/1` in
   [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex);
@@ -257,10 +658,14 @@ ownership, accessibility, and a minimal real markup example.
 - **metric_card API:** attrs `id`, `icon`, `label`, `value` (req);
   `description`; `tone` (`:neutral | :primary | :success | :warning |
   :error`, colors the icon only); `compact_mobile` (denser paddings, hides
-  icon below `lg`, exposes `data-density`); slot `breakdown` (rendered under
-  the value — the stats Tokens card uses it for the input/cached/output
-  split).
-- **Anatomy:** micro uppercase label + trailing icon, `font-mono tabular-nums`
+  icon below `lg`, exposes `data-density`). Every card is label + value +
+  one description line; a card that needs more than one supporting line is
+  telling you the detail belongs elsewhere. The stats Tokens card once
+  stacked an input/cached/output split under its value and read as an
+  outlier in the strip — the split's one interesting number already lives
+  in the dedicated Cache rate card, so Tokens went back to a single
+  description like its siblings.
+- **Anatomy:** micro uppercase label + trailing icon, `tabular-nums`
   value (`data-role="metric-card-value"`), optional muted description.
 - **metric_strip API:** attrs `id`, `compact_mobile`, `desktop_columns`
   (`:four | :five`), `class` (full grid override — the stats KPI strip passes
@@ -280,7 +685,7 @@ ownership, accessibility, and a minimal real markup example.
 />
 ```
 
-### 5.3 Admin surface (card with header, count, actions, toolbar, footer)
+### Admin surface (card with header, count, actions, toolbar, footer)
 
 - **Source:** `admin_surface/1` in
   [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex)
@@ -297,12 +702,18 @@ ownership, accessibility, and a minimal real markup example.
 
 ```heex
 <AdminComponents.admin_surface id="stats-api-key-surface" title="Leaderboard" description="Top API keys by token usage in the last 24 hours">
-  <:header_actions>… segmented pill (§5.12) …</:header_actions>
+  <:header_actions>… segmented pill ([Segmented pill control](#segmented-pill-control)) …</:header_actions>
   <ol class="list-none divide-y divide-base-300/70">…rows…</ol>
 </AdminComponents.admin_surface>
 ```
 
-### 5.4 Upstream account card
+### Traffic distribution
+
+Traffic distribution keeps current assigned accounts visible at zero usage. Deleted accounts and accounts removed from the selected Pools appear only when the selected period contains their accounting history. Their existing account heading, title, and traffic-share accessibility label append `(deleted)` or `(removed from selected Pools)`; retain the same typography, truncation, rails, and density, without status badges or links to unavailable account detail pages.
+
+### Upstream account card
+
+The existing Delete action is permanent and becomes available only after every Pool assignment has been removed, including disabled assignments. Disabled Delete explains this prerequisite without exposing hidden Pool names. Legacy deleted accounts appear in Any status and the Deleted filter; their list menu contains only Delete, and their cockpit keeps other actions unavailable. Deletion in progress and Deletion failed use the existing written status treatment. Reuse the typed-account-label confirmation dialog, explicitly naming permanent removal and retained shared request accounting; do not add a separate purge action.
 
 - **Source:** `account_card/1` in
   [`account_card.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card.ex)
@@ -310,9 +721,16 @@ ownership, accessibility, and a minimal real markup example.
   [`account_card/`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card).
 - **Purpose:** one upstream identity's health, quota, token burn, and Pool
   routing at a glance, with recovery actions.
+- **Inventory grid:** one column below `700px`, two equal columns from `700px`,
+  three from `2xl`, and four from `112rem`; `items-start` preserves each
+  card's natural height instead of stretching a row to its tallest account.
 - **Root:** `<article data-role="upstream-account-card">`, classes
-  `min-w-0 rounded-box border border-base-300 bg-base-100 transition-colors`
+  `upstream-account-card min-w-0 rounded-box border border-base-300
+  bg-base-100 transition-colors`
   plus `admin-token-burn-active` when tokens burned in the last 5 minutes.
+  The root declares the named `upstream-account-card` inline-size container,
+  so quota and leaderboard internals respond to the width left by the page
+  grid rather than to the viewport.
   The routing tone is exposed as `data-routing-tone="success|warning|error"`;
   `app.css` paints the card's left border from it (the status stripe — a
   reinforcement of the footer routing label, never the sole channel).
@@ -329,83 +747,169 @@ border-base-300 bg-base-200/35 px-4 py-3`):
   `!px-2 !py-0.5 !text-[10px]` micro override + `max-w-48 truncate`),
   auth-expiration line (`data-role="upstream-auth-expiration"`, `text-xs
   text-base-content/55`, full timestamp in `title`).
-- Header actions cluster: saved-reset count badge (§5.6), plan badge (§5.9) or
+- Header actions cluster: plan badge ([Plan badge](#plan-badge--all-tones)) or
   `diagnostic_popover` when the plan is unreported, and the actions dropdown
-  (§5.10).
+  ([Dropdown action menu](#dropdown-action-menu)).
 
 **Body — panel switcher:** three stacked `<section>` panels (usage / tokens /
 pools) inside `data-role="upstream-account-panel-switcher"` with
 `data-panel-view` reflecting the open one. The hidden panels use `max-h-0
 opacity-0 pointer-events-none` plus `aria-hidden` and `inert`; the visible one
 `max-h-[28rem] opacity-100` with a 150ms opacity transition
-(`motion-reduce:transition-none`). Usage panel holds the quota rows (§5.5) and
-saved-reset meter (§5.6); tokens panel holds a model leaderboard list (§5.8);
+(`motion-reduce:transition-none`). Usage panel holds the quota rows ([Quota progress row](#quota-progress-row-and-provider-credits)) and
+saved-reset meter ([Saved-reset badge and meter](#saved-reset-badge-and-meter)); tokens panel holds a model leaderboard list ([Compact and definition lists](#compact-and-definition-lists));
 pools panel renders per-assignment route chevrons:
 
-- `data-role="upstream-account-pool-route"` is a `role="meter"` with
-  `aria-valuemin/max/now` = ready gate count and a spoken label; each
-  `.route-chevron` segment (Assignment → Health → Quota) carries tone classes
-  `bg-success/80 text-success-content` (or warning/error/neutral) and clips
-  into chevrons via `clip-path` (CSS in `app.css`). The gate model lives in
-  the shared
-  [`route_path.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/route_path.ex),
-  reused by the cockpit's routing lanes (§5.16).
+- Multiple quota rows stack while the card is narrower than `20rem`; from
+  `20rem` they use two equal `minmax(0, 1fr)` tracks and the saved-reset meter
+  spans both. This lets tablet portrait and mobile landscape both show two
+  account cards per page row without crushing quota copy in the narrower card.
 
-**Footer — metric blocks** (`data-role="upstream-account-card-footer"`,
-`border-t border-base-300 bg-base-200/20 px-4 py-2.5`): a three-column `dl`
-(`grid grid-cols-3 divide-x divide-base-300/70 text-xs`). The Pools and
-Tokens/5m cells double as the panel toggles: an absolutely positioned overlay
-`<button>` (`phx-click="toggle_account_pools_panel"` /
-`"toggle_account_tokens_panel"`, `aria-controls` + `aria-expanded`) sits under
-pointer-events-disabled text, and the open panel keeps its cell in the hover
-tint (`text-primary/70` label). Minimal cell:
+- Each assignment row heads with the pool label on the left and a live
+  traffic stat on the right
+  (`data-role="upstream-account-pool-assignment-traffic"`): settled tokens
+  this account routed toward that Pool in the last 5 minutes, formatted
+  `1.2M tok/5m` (`Format.token_count`, 11px `tabular-nums` at 60% ink,
+  detail sentence in `title`). It reuses the token-burn window and ledger
+  rows — the projection folds the same single settlement query by Pool —
+  so it costs no extra query. A row whose recent requests all lack settled
+  usage shows `? tok/5m`, never a false zero. This stat replaced the old
+  binary "Eligible" label: readiness already lives gate-by-gate in the
+  route meter below, so the label now says what the assignment is actually
+  doing. For operators with `pool.manage`, the entire assignment block is a
+  permission-aware patch link that opens that Pool's editor in place on the
+  Upstreams step. The block reuses `saved-reset-open-gloss` so hover or keyboard
+  focus sweeps the full clickable area once; reduced-motion users get no sweep.
+  Other operators keep the same block as non-interactive content.
+- The route path is always four gates in this order: **Assignment → Health →
+  Quota → Circuit**. The compact account-card segment shortens only the first
+  visible label to **Assign**; cockpit segments, the meter's accessible name,
+  and every spoken detail keep **Assignment**. `Circuit` is a fourth gate, not
+  a replacement for quota or a broad account-availability claim.
+- `data-role="upstream-account-pool-route"` is a `role="meter"` with stable
+  route and segment ids, `data-role="upstream-account-pool-route-segment"`,
+  `aria-valuemin="0"`, `aria-valuemax={RoutePath.segment_count()}`,
+  `aria-valuenow`, and matching `aria-label` / `aria-valuetext` spoken detail.
+  The count is always out of four. A disabled assignment with no circuit rows
+  can intentionally read **1/4**: its Circuit gate is clear because no circuit
+  protection is active, while its Assignment, Health, and Quota gates retain
+  their own state. Each `.route-chevron` segment carries tone classes
+  `bg-success/80 text-success-content` (or warning/error/neutral) and clips
+  into chevrons via `clip-path` (CSS in `app.css`). The gate model lives in the shared
+  [`route_path.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/route_path.ex),
+  reused by the cockpit's routing lanes ([Upstream cockpit](#upstream-cockpit-detail-page-pattern)).
+- Circuit presentation is a load/refresh-time snapshot. Persisted circuit
+  lifecycle is retained across replicas, but current blocking is determined
+  only by `CircuitHealth.blocked?/3` and its `blocked_reason/3`; a persisted
+  active lifecycle row is not automatically current blocking. A blocked lane
+  is not ready. Among non-blocked rows, an eligible `half_open` lane, or a lane
+  with eligible `opened_at`/`last_failure_at` evidence inside the inclusive
+  recovery window, is recovering and currently ready. A non-blocked `open` lane
+  recovers only with that evidence; stale, future, or absent evidence leaves it
+  clear. Recent evidence is never current blocking. Circuit rows are limited to
+  current served models:
+  retired or non-serving models are ignored before classification or recovery.
+  For each exact lane, the latest row is selected by `updated_at DESC`, then
+  `created_at DESC`, before history and recovery evidence are considered. The
+  inclusive recovery presentation window is
+  `clamp(10 * circuit_open_seconds, 300, 3600)`.
+- The snapshot updates on page load/refresh only: there are no timers, polling,
+  circuit PubSub subscriptions, or self-updating cooldowns. Circuit evidence
+  can change visible account-verdict copy and tone, but it does not change the
+  broad `routing_ready_now?` meaning or existing KPI meanings. The account
+  circuit aggregate includes only independently active, health-active, eligible
+  assignments; every assignment chevron still shows its own four-gate state.
+  Observed circuit rows cannot prove complete availability and must never infer
+  a `total blackout`. Telemetry, alerts, and dashboards already exist and are
+  not changed by this presentation contract.
+
+**Footer — routing readiness** (`data-role="upstream-account-card-footer"`):
+the shared card fact strip ([Card fact strip](#card-fact-strip-shared-card-footer)) with three facts. The Pools and Tokens/5m
+cells are `interactive`: an absolutely positioned overlay `<button>`
+(`phx-click="toggle_account_pools_panel"` / `"toggle_account_tokens_panel"`,
+`aria-controls` + `aria-expanded`) sits under pointer-events-disabled text, and
+the open panel keeps its cell in the hover tint (`text-primary/70` label).
+Tokens/5m uses plain `{count} tokens` when usage accounting is complete,
+`{count}+ tokens` when reported usage is only a verified lower bound, and
+`Usage unavailable` when no token total can be claimed. Minimal cell:
+
+Below `sm`, the account-specific footer hook reduces only the band's inline
+padding to `0.75rem` and keeps values on the fine-print `0.6875rem` token so
+all three facts remain readable inside the single-column phone card.
 
 ```heex
-<div class="min-w-0 pr-3" data-role="upstream-routing-cell">
-  <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">Routing</dt>
-  <dd class="truncate text-base-content/60" title={@routing_readiness.reason}>{@routing_readiness.label}</dd>
-</div>
+<:fact role="upstream-routing-cell">
+  <AdminComponents.card_fact_label>Routing</AdminComponents.card_fact_label>
+  <AdminComponents.card_fact_value title={@routing_readiness.reason}>
+    {@routing_readiness.label}
+  </AdminComponents.card_fact_value>
+</:fact>
 ```
 
 **States:** routing tone (success/warning/error stripe + footer label),
 token-burn shine active/idle, per-panel open state, deleted/paused disabling
 of actions, lifecycle warning block via `ReconciliationStatus`.
 
-### 5.5 Quota progress row (including striped credit-backed state)
+### Quota progress row and provider credits
 
 - **Source:** `quota_limit_row/1` in
   [`quota_limit_row.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card/quota_limit_row.ex);
-  meter CSS (`admin-live-progress`, `progress-striped`, shine keyframes) in
+  meter CSS (`admin-live-progress`, `progress-striped`, and shine keyframes) in
   `app.css`.
 - **Purpose:** one reported quota window (e.g. Weekly, 30d) as label +
-  remaining percent + live `<progress>` meter + optional count/reset detail.
+  remaining percent + live `<progress>` meter + optional count detail. Current
+  admin views omit dynamically stale additional rows at their snapshot time.
+  Fixed account rows and fresh or unknown-freshness additional rows remain
+  visible. The compact row shows no freshness or history copy, reset status, or
+  unconfirmed reset.
+- **Observation details:** a quota opens a compact, scrollable evidence dialog using saved-reset typography and disclosure patterns. The selected record comes first; other records follow by evidence timestamp, newest first. Five records are initially visible, with a total count and Show all for the remainder. Only the selected bar and percentage use quota colors; alternatives use theme-aware gray, and stale percentages say last known. Source and original provider slot identify each record. Expand a record for reset, synchronization, precision, window and scope details. Values are reconciled retained state, not raw response history. Event-driven reloads wait until close and then catch up. Preserve Escape/backdrop dismissal, focus restoration, existing quota selection and metadata-only output.
 - **Tones:** percent ≥ 70 → `progress-success`/`text-success`; ≥ 30 →
-  warning; below → error; unreported → `progress-neutral` and muted percent.
-- **Striped state:** `credit_backed: true` appends `progress-striped` —
-   45° white stripes over the tone color signal that remaining value burns
-  credits rather than a percent window (visible live on credit-backed
-  accounts). Stripes stay pinned during the burn shine (a second
-  background-position layer in the keyframes).
-- **Motion:** width/color transitions 260/180ms; cards with recent burn run
-  the gloss sweep. Firefox falls back to a static bar; `prefers-reduced-motion`
-  disables all of it.
-- **A11y:** the `<progress>` carries `aria-label` "{label} remaining {pct}"
-  and the percent renders as text besides the bar.
+  warning; below → error. Unreported remains `progress-neutral` with muted
+  text and adds `admin-static-unknown-progress`; it is never presented as a
+  determinate zero-value meter.
+- **Included quota:** each account window always shows the provider's included-quota percentage with a solid fill. An exhausted Weekly remains `0%` even when provider credits can serve a request. Credit balance, baseline ratios and credit counts belong only to the distinct provider-credit row; do not restore `burning_credits` or reinterpret the Weekly meter as credit capacity.
+- **Provider credits:** `ProviderCreditsComponents.provider_credits_summary/1` sits in the same quota grid: Credits at top left, the observed percentage alone at top right, a 1.5-height striped bar, and the footer with Enabled/Disabled on the left and the numeric balance on the right, directly below the percentage. Percentages truncate to exactly three decimal places with a decimal point, such as `99.976%`. Use the same success >=70, warning >=30 and error <30 palette for text, bar and hover as included quota rows. Balance and baseline amounts truncate to whole numbers with comma grouping and no repeated unit suffix, such as `62,485`; positive balances below one display `<1`. Exact decimals remain in the source and optional native title, while dialog values also use whole numbers. The reference qualifier belongs in the tooltip, ARIA and details, not the visible percentage. The stripe describes an observed reference, never confirmed credit consumption or purchased allocation. Hide the Credits row for unknown/unreported balances and finite zero, keeping those facts distinct in the policy dialog. Show finite positive balances and explicit Unlimited independently of plan labels. An absent baseline or Unlimited state has no invented percentage or progress bar. Keep policy entry available in the list menu and cockpit action even when the row is hidden; those actions use the existing currency-dollar icon.
+- **Credit readiness and interaction:** fresh enabled usable credits produce the normal successful routing tone and Routing ready via credits label after identity/assignment checks; circuit protection still overrides that presentation. Included exhaustion remains a separate red 0% meter. Unknown, disabled and blocked states retain their own labels and tones. A native hover title gives availability and identifies the observed reference. Authorized operators click the row to open the existing provider-credit policy dialog; read-only viewers get no policy action. The dialog reuses the existing modal shell, eyebrow/title typography and shared footer, with Cancel followed by Save policy associated with the form. Extra balance, baseline and availability explanations stay in the collapsed Balance and availability disclosure. Credit expiry is unreported in the inspected provider facts; never borrow saved-reset expiry or quota reset time. Preserve the backend's cross-Pool mutation authorization and focus restoration.
+- **Motion:** known values use width/color transitions 260/180ms; cards with
+  recent burn run the gloss sweep. An unreported value omits `value`, keeps
+  native indeterminate semantics, and neutralizes daisyUI's indeterminate
+  gradient/animation with `admin-static-unknown-progress`; it stays static in
+  normal and `prefers-reduced-motion` sessions. Firefox falls back to a static
+  bar for the known-value gloss; reduced motion disables known-value motion.
+- **A11y:** included-quota progress uses "{label} included Codex quota remaining {pct}". The separate credit progress uses "Observed provider credit balance relative to observed baseline", an `aria-valuetext` with the same three-decimal visible ratio and an associated description identifying the reference. The row action has a balance-bearing label, `aria-haspopup="dialog"` and the existing policy-dialog target. Do not claim credits are in use or equate provider units with currency.
 
 ```heex
+<%!-- Separate observed credit-reference meter; included quota has its own solid bar. --%>
+<progress
+  id={"#{@id}-progress"}
+  data-role="provider-credits-observed-progress"
+  aria-label="Observed provider credit balance relative to observed baseline"
+  aria-valuetext={"#{@percent_label} of observed baseline"}
+  aria-describedby={"#{@id}-baseline-description"}
+  class={["progress admin-live-progress progress-striped h-1.5 w-full", progress_tone(@summary.observed_percent)]}
+  value={@percent_value}
+  max="100"
+>
+  {@percent_label}
+</progress>
+
+<%!-- Unknown included meter: preserve id, role, ARIA and max; omit `value`. --%>
 <progress
   id={"#{@id}-progress"}
   data-role="upstream-limit-progress"
-  aria-label={"#{@limit.label} remaining #{@limit.percent_label}"}
-  class="progress admin-live-progress progress-warning progress-striped h-1.5 w-full"
-  value={@limit.percent_value}
+  aria-label={"#{@limit.label} included Codex quota remaining #{@limit.percent_label}"}
+  class="progress admin-live-progress admin-static-unknown-progress progress-neutral h-1.5 w-full"
   max="100"
 >
   {@limit.percent_label}
 </progress>
 ```
 
-### 5.6 Saved-reset badge and meter
+### Saved-reset badge and meter
+
+Future expiration countdowns in the saved-reset bank dialog and upstream cockpit are native download links. Keep their existing clock icon, purple type, alignment, countdown text and stable ids; add hover underline, keyboard focus and a tooltip/accessibility label explaining that the download includes all upcoming expirations for that upstream. Both surfaces use the shared expiration component and the same authenticated `.ics` route. Expired, due-now and unknown timestamps remain plain text. Clicking a countdown starts a file download without submitting policy changes or queuing redemption.
+
+The cockpit's Actions rail also exposes **Download reset calendar**, using the existing action-row treatment and calendar icon. It downloads the same complete upstream calendar; when no upcoming expirations are available it remains visible as a disabled action with the reason in its tooltip.
 
 - **Source:** `saved_reset_count_badge/1` and `saved_reset_meter/1` in
   [`saved_reset_meter.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/account_card/saved_reset_meter.ex)
@@ -414,15 +918,48 @@ of actions, lifecycle warning block via `ReconciliationStatus`.
 - **Count badge** (`data-role="upstream-saved-reset-count-badge"`): a pill
   `<button>` in the card header (battery icon + count) that opens the policy
   dialog (`aria-haspopup="dialog"`, `aria-controls`). Tones: auto-redeem
-  enabled → success recipe; disabled → the `--color-reset-bank` token (§2).
+  enabled → success recipe; disabled → the `--color-reset-bank` token ([Colors](#colors)).
   Renders nothing when no resets are reported.
 - **Meter** (`data-role="upstream-saved-reset-meter"`): title "Banked Resets",
   `x{count}` counter, then a `role="meter"` bar of five `h-1.5 rounded-full`
   segments (`grid grid-cols-5 gap-1`), filled segments reset-bank-toned, empty
   `bg-base-300/70`, with `aria-valuemin/max/now` and a text label. Footer line
   states "Auto redeem active/inactive" and next expiry with a clock icon.
+- **Post-consume confirmation**
+  (`data-role="upstream-saved-reset-confirmation"`): a compact operator-bench
+  fact panel below the meter. It renders while confirmation is pending, or when
+  the attempt ended as not applied or expired, including after the available
+  count has reached zero. A healthy `Confirmed` terminal state is omitted from
+  the card. The three projection dimensions are shown through stable selectors
+  and fixed vocabulary only:
+  - visible confirmation state: `Awaiting confirmation`, `Not applied`, or
+    `Confirmation expired`
+  - challenged evidence: `Absent`, `Exhausted`, `Candidate progressing`, or
+    `Usable`
+  - additional blocker: `None`, `Reset missing`, `Expired`, `Not fresh`,
+    `Exhausted`, or `Unknown or unusable`
+- The five meter segments always represent current bank inventory only. Saved
+  reset lifecycle state never recolors, animates, or annotates a segment.
+- The panel also shows the sanitized consumed time and confirmation deadline,
+  an explicit `Routing paused` / `Routing pause released` fact, and the fixed
+  guarantee `This confirmation never consumes a second saved reset.` Applied
+  but reblocked work remains `Awaiting confirmation`; it never collapses into
+  `Not applied` or `Confirmation expired`. The old visible `still blocked`
+  lifecycle chip is not part of the component vocabulary.
+- Long confirmation detail remains accessible through matching `title` and
+  `aria-label` text on the panel even when individual facts truncate. The
+  opener remains a keyboard-operable button, the bar remains `role="meter"`,
+  and awaiting-confirmation segment motion includes
+  `motion-reduce:animate-none`.
+- The component accepts only the projection's bounded atoms. A malformed or
+  unknown map renders `Confirmation details unavailable` with the conservative
+  routing pause and never interpolates the input. Raw candidate metadata,
+  percentages, quota reset timestamps, ids, provider strings, or unknown
+  values never reach visible copy, tooltips, ARIA, or data attributes. Token
+  accounting's separate `Usage unavailable` state remains owned by the token
+  burn surface and is never reused as saved-reset confirmation copy.
 
-### 5.7 Chips (status, count, metadata, severity, protocol, redacted)
+### Chips (status, count, metadata, severity, protocol, redacted)
 
 - **Source:** `chip_class/1` and helpers in
   [`badge_components.ex`](lib/codex_pooler_web/live/admin/components/shared/badge_components.ex);
@@ -471,59 +1008,81 @@ counter overlay, not a status chip.
 <span class={AdminBadges.count_chip_class()}>{@count} keys</span>
 ```
 
-### 5.8 Compact and definition lists
+### Compact and definition lists
 
 Three recurring list shapes, all `text-xs`-scale and truncation-guarded:
 
-- **Definition grid (`dl`)** — labeled facts in card footers (§5.4) and the
+- **Definition grid (`dl`)** — labeled facts in card footers ([Card fact strip](#card-fact-strip-shared-card-footer)) and the
   request-log drawer rows. Drawer row (`detail_row/1` in
   [`detail_drawer.ex`](lib/codex_pooler_web/live/admin/components/pages/request_logs/detail_drawer.ex)):
 
 ```heex
 <div id={@row.id} data-role="request-log-detail-field" class="grid gap-1 rounded-box bg-base-200/60 px-3 py-2">
   <dt class="text-xs font-semibold uppercase tracking-wide text-base-content/45">{@row.label}</dt>
-  <dd class="break-words text-base-content/80 font-mono text-xs tabular-nums">{@row.value}</dd>
+  <dd class="break-words text-base-content/80 text-xs tabular-nums">{@row.value}</dd>
 </div>
 ```
 
 - **Ranked compact rows** — the account tokens panel
-  (`data-role="upstream-account-token-model"`,
-  `grid-cols-[minmax(0,1fr)_4rem_3.5rem_3.5rem] … odd:bg-base-200/40` with an
-  inline share bar `h-1 rounded-full bg-primary/70`) and the stats leaderboard
+  (`data-role="upstream-account-token-models"`, class
+  `upstream-account-token-model-grid`) owns one shared four-column grid for all
+  rows. Each `upstream-account-token-model-row` spans that parent grid and uses
+  `subgrid`, so the model, share bar, token, and cost columns stay vertically
+  aligned even when the numeric values have different lengths. The model track
+  is `minmax(0, 1fr)` and the token and cost tracks are `max-content`; existing
+  model titles and info popovers preserve the complete identifier when the
+  visible label needs an ellipsis. On cards below `20rem`, the share track is
+  compact (`clamp(1.5rem, 9cqi, 2.25rem)`) to protect model-label space. At
+  `18.5rem`, the model track reserves `7.45rem` so long catalog identifiers remain
+  readable in the narrow two-card tablet layout. At `20rem` and above the share
+  track expands to `clamp(1.5rem, 15cqi, 4rem)`. The shared gap
+  remains `clamp(0.25rem, 2cqi, 0.625rem)`, and the inline share bar remains
+  `h-1 rounded-full bg-primary/70`. The stats leaderboard
   runner rows (`divide-y divide-base-300/70`, rank medallion, name+pool stack,
   right-aligned mono values).
-- **Zebra tables** — long homogeneous records (request logs, jobs, audit)
-  use `table table-zebra`, compacted by `admin-log-table.table-sm` padding in
-  `app.css`. Row detail lives in the drawer, not in ever-wider columns.
+- **Hairline tables** — long homogeneous records (request logs, jobs) use
+  daisyUI `table` with its default row hairlines and `hover:bg-base-200/80`;
+  request logs and the jobs explorer additionally compact cell padding
+  through `admin-log-table.table-sm` in `app.css` and follow the record-row
+  contract in [Record row](#record-row--the-ledger-contract) for widths, tone, and reflow. The audit trail left this
+  family for the prose ledger ([Audit prose ledger](#audit-prose-ledger)). There
+  is no `table-zebra` in the app — the only striping is the Observatory
+  outcomes table (`nth-child(odd)` in `app.css`) and the pool serving-modes
+  grid (`even:`). Row detail lives in the drawer, not in ever-wider columns.
 
-### 5.9 Plan badge — all tones
+### Plan badge — all tones
 
 - **Source:** `plan_badge/1` in
   [`badge_components.ex`](lib/codex_pooler_web/live/admin/components/shared/badge_components.ex)
 - **API:** attrs `id`, `label`, `family`, `placeholder` (default
   "Plan unknown"), `class`, global rest. Labels are canonicalized
   ("chatgpt plus" → "ChatGPT Plus"); when a family is present and differs it
-  renders as "Label (Family)". Always renders as a §5.7 pill chip.
+  renders as "Label (Family)". Known plans use the selected satin capsule; unknown values retain the [Chips](#chips-status-count-metadata-severity-protocol-redacted) fallback.
 - **Tone map:**
 
 | Tone | Plans | Chip |
 | --- | --- | --- |
-| free | Free | success chip |
-| pro | Pro, Plus, ChatGPT Pro/Plus | primary chip |
-| team | Team, Business, ChatGPT Team | info chip |
-| enterprise | Enterprise, Edu, Education | warning chip |
+| free | Free | neutral satin |
+| go | Go | cyan satin |
+| plus | Plus, ChatGPT Plus | indigo satin |
+| pro | Pro, ChatGPT Pro | gold satin |
+| prolite | Pro Lite | bronze satin |
+| team | Team, ChatGPT Team, self-serve business variants | blue satin |
+| business | Business | teal satin |
+| enterprise | Enterprise variants | plum satin |
+| edu | Edu, Education variants | violet satin |
 | generated | any other non-empty label | phash2-stable tone chip |
 | unknown | blank | neutral chip |
 
 Used on upstream card headers, the upstream cockpit header, request-log rows
 (with `!`-override micro sizing), and the pool wizard's identity options —
-verified live as the orange "Pro" / green "Free" pills.
+verified in the local runtime with gold Pro, neutral Free and separate plan hues.
 
 ```heex
 <AdminBadges.plan_badge id={"#{@dom}-plan-label"} label={@account.plan_label} aria-label={"Account plan: #{@account.plan_label}"} />
 ```
 
-### 5.10 Dropdown action menu
+### Dropdown action menu
 
 - **Source:** `dropdown_action_item/1` in shared
   [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex);
@@ -539,7 +1098,7 @@ verified live as the orange "Pro" / green "Free" pills.
   Items render as `<.link>` when given `href/navigate/patch`, else buttons.
   `copy_feedback?` opts into the copy-label swap hook contract.
 
-### 5.11 Object inspector and request-log drawer
+### Object inspector and request-log drawer
 
 - **Source:** `object_inspector/1` in shared
   [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex);
@@ -552,11 +1111,11 @@ verified live as the orange "Pro" / green "Free" pills.
 - The drawer composes it inside `drawer-side z-[70]` with a click-away
   overlay label, `role="dialog"` + `aria-modal`, `max-w-2xl`, `shadow-2xl`,
   and section groups ("Final outcome", "Attempts timeline", "Sanitized
-  metadata") each headed by the §3 section-heading recipe. Attempt cards are
+  metadata") each headed by the [Typography](#typography) section-heading recipe. Attempt cards are
   `rounded-box border border-base-300 bg-base-200/35`; transport failures use
   the error wash (`border-error/20 bg-error/5`).
 
-### 5.12 Segmented pill control
+### Segmented pill control
 
 - **Source:** the private `chart_mode_control/1` is rendered only through the
   public `traffic_charts/1` composition in
@@ -584,7 +1143,115 @@ verified live as the orange "Pro" / green "Free" pills.
 </div>
 ```
 
-### 5.13 Time-series chart surface
+### Firewall system tab
+
+- **Source:** `cards/1` in
+  [`firewall.ex`](lib/codex_pooler_web/live/admin/components/pages/system/page_components/firewall.ex),
+  selected through the shared system tab picker in
+  [`page_components.ex`](lib/codex_pooler_web/live/admin/components/pages/system/page_components.ex).
+- **Purpose:** gives runtime ingress policy its own focused workspace instead
+  of leaving firewall state above every system tab or mixing ingress controls
+  into Gateway. Gateway keeps routing, transport, file, operator, and catalog
+  settings; Firewall owns the current policy summary and the complete ingress
+  form.
+- **Anatomy:** the first surface is a compact visibility card with policy state
+  and the current authenticated session IP. The second surface is the existing
+  settings card for allowlist CIDRs, trusted proxies, forwarded-client policy,
+  and compressed-body limits. Both follow the normal system card density,
+  typography, border, status, validation, and save-action contracts.
+- **State isolation:** the visibility card reflects persisted ingress state;
+  edits and validation remain scoped to the `ingress` form and are not allowed
+  to validate or overwrite Gateway fields. The card updates after a successful
+  ingress save and is absent from every other tab.
+- **Responsive:** tab navigation wraps through the shared picker when needed;
+  the visibility facts stack below the description on narrow screens, while
+  the ingress controls retain their established one-, two-, and three-column
+  breakpoints.
+
+### Gateway runtime limits matrix
+
+- **Source:** `matrix/1` in
+  [`gateway_settings_matrix.ex`](lib/codex_pooler_web/live/admin/components/pages/system/page_components/gateway_settings_matrix.ex),
+  with canonical reference values from
+  [`defaults.ex`](lib/codex_pooler/instance_settings/defaults.ex).
+- **Purpose:** replaces the loose gateway scalar grid with one grouped matrix
+  whose compound value control combines the numeric input and its unit. File
+  bridge and audio transcription limits belong to this same runtime surface,
+  immediately after circuit recovery, instead of living in separate cards.
+  Each row-group header exposes one right-aligned reset action for loading the
+  canonical defaults of the settings below it. The
+  gateway debug toggle remains a separate control because it is a behavior
+  switch, not a numeric limit.
+- **Anatomy:** a normal `text-sm` heading and help text, a two-column matrix
+  (`Setting`, `Current value`), and six operational row groups: streaming,
+  upstream timing, continuity, circuit recovery, file bridge, and audio
+  transcription. Setting names and descriptions use body type. Each value uses
+  the existing daisy input-shell recipe with the native number input and a
+  bordered unit segment. Each group header owns the sole top hairline on its
+  spanning cell, so the separator remains visible without doubling across table
+  rendering modes. Reset is an icon-only square action, vertically centered in
+  the group header, with its group-specific name retained in the tooltip and
+  accessible label rather than repeated as visible text in every header. Setting
+  descriptions consume the full available setting column and wrap only when the
+  responsive table width requires it; they do not use a prose-measure cap inside
+  the matrix.
+- **States:** the same `FormField` instances, ids, changeset errors, card-level
+  summary, unsaved status, and submit path used by the former scalar grid stay
+  authoritative. The Gateway card is one persistence boundary for `gateway`,
+  `files`, and `transcription`: one validation pass, stale check, save action,
+  and reload updates the complete visible matrix. Native minimum/maximum
+  attributes mirror the server-side numeric constraints without replacing them.
+- **Responsive and scroll ownership:** the matrix owns horizontal overflow in
+  `instance-settings-gateway-scalar-scroll-region`; the page never scrolls
+  horizontally. Phones show the explicit `Swipe table for values`
+  continuation cue.
+- **Accessibility:** row headers describe every value, each current-value input
+  has a stable id and accessible name, reset buttons name the affected group,
+  and validation appears beside the setting name as text plus color. Native
+  number steppers remain available.
+
+### Route-class bulkhead editor
+
+- **Source:** `editor/1` in
+  [`bulkhead_editor.ex`](lib/codex_pooler_web/live/admin/components/pages/system/page_components/bulkhead_editor.ex),
+  with preset and parameter normalization in
+  [`system_settings_form.ex`](lib/codex_pooler_web/live/admin/forms/system_settings_form.ex).
+- **Purpose:** replaces the gateway bulkhead JSON textarea with a fixed matrix
+  for the nine runtime route classes. Operators edit per-node concurrency,
+  queue length, and timeout without changing route keys or JSON structure.
+- **Anatomy:** a normal `text-sm` field heading and help text, a three-choice
+  preset selector using the shared [Selection card](#selection-card-radio-less-choice-card)
+  anatomy, a horizontally scrollable four-column matrix, inline field
+  errors, and one compact constraint note immediately above the matrix for fixed
+  route keys and numeric limits. Route names and numeric inputs use the shared
+  admin form type so bulkhead values match every other editable number;
+  read-only identifiers follow their component's typography.
+  Each row-group header puts the sole top hairline on the spanning header cell
+  so the boundary remains explicit after the preceding data row without a
+  second border on the group row.
+- **Presets:** Solo / Small (1-4 active users), Medium (5-49), and Large (50+)
+  set concurrency and queue limits from the runtime defaults. They preserve
+  every timeout and leave the reserved control-plane lane unchanged. Manual
+  edits to preset-controlled concurrency or queue values produce a neutral
+  `Custom values` badge; timeout edits remain independent of the capacity
+  preset. No hidden preset state is persisted.
+- **States:** each preset is an independent `rounded-box` selection card with a
+  check glyph, primary selected-state wash, native `aria-pressed`, and the
+  permanent `DEFAULT` micro-tag on Solo / Small. Hover and focus use the shared
+  selection-card transitions; invalid inputs use `input-error`,
+  `aria-invalid`, an associated error line, and the card-level error summary.
+- **Responsive and scroll ownership:** preset choices stack below `sm`, become
+  three columns above it, and stop at `max-w-2xl` so they retain selection-card
+  proportions instead of stretching across the desktop card. The matrix owns
+  horizontal overflow inside `bulkhead-scroll-region`; the page never scrolls
+  horizontally. Phones show the explicit `Swipe table for limits` continuation
+  cue.
+- **Accessibility:** the preset group exposes `aria-pressed`; table headers and
+  row headers label every numeric control; each input has a screen-reader
+  label, minimum, required state, and error description. Server-side changeset
+  validation remains authoritative for persistence.
+
+### Time-series chart surface
 
 - **Source:** `traffic_charts/1` in
   [`presentation_charts.ex`](lib/codex_pooler_web/live/admin/components/pages/stats/presentation_charts.ex);
@@ -598,23 +1265,59 @@ verified live as the orange "Pro" / green "Free" pills.
   consume the structured export/root/selector identities, not this human
   documentation prose.
 - **Anatomy:** an `admin_surface`-style card whose header holds the title, a
-  live `tabular-nums` total line, and a mode pill (§5.12); the plot `div`
+  live `tabular-nums` total line, and a mode pill ([Segmented pill control](#segmented-pill-control)); the plot `div`
   carries `phx-hook="ApexTimeSeriesChart" phx-update="ignore"` and a
   `data-chart-*` contract (categories/series/units/value-kinds/yaxis/colors/
   height/legend/stacked/zoom/mode-control...). Colors are CSS variables
   (`var(--color-primary)` etc.) so charts re-skin per theme.
+  Admin Stats binds `Other models` and `Requests` by semantic series name to
+  `--admin-chart-other-models` and `--admin-chart-requests`; fallback and
+  overflow ordering must never move those colors to another series. The token
+  stack is uncached input + cached input + `Output (standard)` + `Reasoning`,
+  where standard output is `max(output - reasoning, 0)` and displayed
+  reasoning is bounded to canonical output. Standard plus reasoning therefore
+  equals canonical output rather than double-counting it.
 - **Scroll ownership:** the plot sits in
   `data-role="chart-scroll-region"` (`overflow-x-auto overscroll-x-contain`);
   below `48rem` the plot keeps `min-width: 36rem` and scrolls inside the card.
-- **A11y:** the plot is `role="img"` labeled by an `sr-only` title and a
+- **A11y:** the plot is `role="group"` because Apex adds keyboard-operable
+  legend controls inside it. The group is labeled by an `sr-only` title and a
   description summarizing buckets/totals; an `sr-only` `<ul
   data-chart-source="interval">` mirrors every interval value; mode changes
   announce through an `aria-live="polite"` description.
 
-### 5.14 Policy editor dialog and wizard
+### Pool traffic viewport optimization
+
+- **Source:** `pool_activity_panel/1` in
+  [`list_components.ex`](lib/codex_pooler_web/live/admin/components/pages/pools/list_components.ex),
+  with visibility lifecycle in `PoolTrafficVisibility` and the Pools LiveView.
+- **Purpose:** preserves the established static Pool traffic instrument while
+  deferring histogram queries, JSON payloads, and Apex mounting until the card
+  is near the viewport.
+- **Anatomy:** the non-interactive activity root keeps the existing tonal band
+  and exposes the Pool id to `phx-hook="PoolTrafficVisibility"`. The histogram
+  remains a static section with the established `Traffic` header, totals,
+  empty state, and chart selector
+  `#pool-row-<id>-traffic-histogram-plot[phx-hook="ApexTimeSeriesChart"][phx-update="ignore"]`.
+  There is no disclosure, toggle, or manual load affordance. A near-viewport
+  row waiting for its traffic projection renders the shared admin loading icon
+  and `Loading traffic` status inside the existing plot-height region.
+- **Lifecycle:** offscreen rows retain the static layout but contain no plot or
+  `data-chart-series`. Near-viewport rows load through the existing traffic
+  lane, show the non-interactive loading status while that read is pending, and
+  render the unchanged totals plus chart or no-traffic state when ready.
+  Leaving the viewport prunes histogram payload immediately; a later re-entry
+  loads it again.
+- **Authorization:** viewport visibility is only an optimization hint.
+  Server-side scope and the currently rendered Pool rows remain authoritative,
+  and events cannot activate a hidden or unauthorized Pool.
+
+### Policy editor dialog and wizard
 
 - **Source:** `policy_editor_dialog/1` in
   [`policy_editor_components.ex`](lib/codex_pooler_web/live/admin/components/shared/policy_editor_components.ex);
+  Pool composition and step panels in
+  [`wizard_components.ex`](lib/codex_pooler_web/live/admin/components/pages/pools/wizard_components.ex);
   API-key composition and step panels in
   [`wizard_components.ex`](lib/codex_pooler_web/live/admin/components/pages/api_keys/wizard_components.ex);
   tab CSS (`policy-editor-tab`, `is-current`, step-marker hover) in `app.css`.
@@ -625,41 +1328,141 @@ verified live as the orange "Pro" / green "Free" pills.
 - **Step tabs:** `role="tablist"` of numbered buttons; each has a `size-5`
   mono step marker; the current tab gets `.is-current` (orange-tinted border +
   wash) and `aria-current="step"`/`aria-selected`; hover promotes the marker to
-  solid primary. Below `lg` the tabs collapse to a 2-column grid
-  (`policy-editor-tabs` CSS).
+  solid primary. From `sm` the tabs hold **one compact row** — marker plus
+  uppercase label, with the descriptions `lg`-and-up — and below `sm` they
+  collapse to a 2-column grid of slim rows (`policy-editor-tabs` CSS). The
+  tablist never stacks one-per-row: five full-width rows pushed the step
+  content below the fold on tablets.
 - **Step panels:** `role="tabpanel"` sections toggled by `block`/`hidden`
   (state lives server-side in `current_step`).
-- **Policy mode cards** (`policy_mode_card/1`, `reasoning_policy_mode/1`): a
-  radio wrapped in a selectable card label — selected state
-  `border-primary bg-primary/10`, idle `border-base-300 bg-base-100
-  hover:bg-base-200`. The checkbox flavor of this pattern (orange
-  checkbox-card multi-select) is the reference multi-select list
-  (`api-key-model-option-*` rows: `checkbox checkbox-primary` inside a
-  `rounded-box border hover:border-primary/50 hover:bg-primary/5` label).
+- **Pool editor URL state:** `/admin/pools` accepts `edit_pool_id` plus `step`
+  for the owning inventory page. `/admin/upstreams` accepts the same params and
+  renders the shared Pool wizard in place, preserving the current upstream
+  filters while tabs and cancel patch only the host page URL. Both hosts resolve
+  the id through the current scope and require `pool.manage`; missing, hidden,
+  or unauthorized ids never open the editor.
+- **In-place invite:** the Upstreams header Invite action patches
+  `create_invite=1` onto `/admin/upstreams` and renders the shared Pool invite
+  dialog without moving to the Invites page. Validation, creation, the one-time
+  receipt, cancel, browser back, and filter preservation remain URL-driven.
+- **Policy mode cards** (`policy_mode_card/1`, `reasoning_policy_mode/1`):
+  single-choice selection cards following the [Selection card](#selection-card-radio-less-choice-card) radio-less contract
+  (sr-only radio, ✓ corner glyph while checked, `border-primary/60 +
+  bg-primary/5` checked recipe, 13px/11px type scale). The checkbox flavor
+  of this pattern (orange checkbox-card multi-select) is the reference
+  multi-select list (`api-key-model-option-*` rows: `checkbox
+  checkbox-primary` inside a `rounded-box border hover:border-primary/50
+  hover:bg-primary/5` label) — the checkbox stays visible because
+  multi-select state has no other per-card glyph channel.
 
-```heex
-<label class={["grid cursor-pointer gap-2 rounded-box border p-3 transition-colors hover:bg-base-200",
-  selected? && "border-primary bg-primary/10", !selected? && "border-base-300 bg-base-100"]}>
-  <input type="radio" class="radio radio-primary radio-sm mt-1" … />
-  <span class="grid gap-1">
-    <span class="font-semibold text-base-content">All models</span>
-    <span class="text-sm leading-5 text-base-content/60">Allow current and future routable models.</span>
-  </span>
-</label>
-```
+Every single-choice card family — the pool routing step, the saved-reset
+trigger, and the policy mode cards above — follows the radio-less selection
+card contract ([Selection card](#selection-card-radio-less-choice-card)). Only multi-select checkbox cards keep a visible
+control.
 
-### 5.15 Filters, empty state, notices, buttons, flash, theme toggle
+### Dialog shell (every admin modal)
+
+The Pool wizard and editor reuse the same Compatibility toggle rows for `/v1`, image generation, and audio transcription, in that order. Pool cards expose the same three settings through the existing compact icon disclosure: code brackets, photo, and microphone. Audio uses the shared checked, disabled, focus and help-text treatments; it adds no separate palette, card style, or dialog layout. Keep the quick toggle and both forms synchronized through the canonical persisted Pool settings.
+
+The API-key Limits panel uses a compact tonal key-wide control band, a bordered default-policy group, and a subordinate single-model group separated by a hairline. Both policy groups share a three-column grid from `sm`, one column below it, `gap-3`, and standard inputs with fieldset outer margin/padding removed; input height and label typography remain unchanged. The active-request cap stays separate from model policy fields. Configured overrides and validation remain visible. A compact known/provisional/pending/effective budget breakdown explains reservations without changing measured burn. The existing policy dialog body owns scrolling and the footer remains reachable.
+
+- **Presentation:** `<dialog class="modal modal-bottom overflow-x-hidden sm:modal-middle">`.
+  Below `sm` the dialog is a **bottom sheet** — edge to edge, anchored to the
+  bottom, top corners rounded and bottom corners square, capped at
+  `calc(100vh - 5em)` and scrolling inside itself. From `sm` up it is a
+  centered modal. This is not decoration: on a phone the dialog's actions
+  belong within thumb reach, and a floating panel puts them mid-screen.
+- **Width:** the size utility is `sm:`-prefixed (`modal-box sm:max-w-xl`), never
+  bare. daisyUI's `.modal-bottom .modal-box` sets `max-width: none`, but a bare
+  `max-w-xl` is a Tailwind *utility* and utilities win over daisyUI's components
+  layer regardless of specificity — so an unprefixed width silently keeps the
+  sheet at 576px and cancels the whole pattern.
+- **Scrolling:** `.modal-box` already ships `overflow-y: auto`, so the box is
+  the scroll container and no inner wrapper needs to become one. The footer is
+  `sticky bottom-0` (the `dialog_footer` default) so a long body scrolls under
+  actions that stay put.
+- **Two shells exist and must agree.** `policy_editor_dialog/1` in
+  [`policy_editor_components.ex`](lib/codex_pooler_web/live/admin/components/shared/policy_editor_components.ex)
+  is the wizard shell (its own header with numbered steps, an explicit
+  `flex-col` body with `flex-1 overflow-y-auto`, `sm:max-w-4xl`); everything
+  else is a hand-written `<dialog>` + `modal-box` + `dialog_footer`. The
+  presentation rules above are the same for both. A new dialog copies an
+  existing one — so copy one that already follows this.
+
+### OAuth handoff dialog (two doors)
+
+- **Source:** `method_doors/1`, `browser_authorization_step/1` and
+  `device_authorization_step/1` in
+  [`oauth_dialog_components.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/oauth_dialog_components.ex),
+  composed by the upstream link and cockpit relink dialogs.
+- **Anatomy:** one modal panel that shows exactly one thing at a time. Before a
+  flow starts, the Pool select sits over two peer selection cards — `via OAuth
+  (browser)` and `via Device Code` — following the selection-card anatomy
+  below. Neither route is the default and their hints are written to hold the
+  same line count, so the two cards stay the same height.
+  Once a route starts, its section replaces the doors: a labelled row with a
+  readonly field carrying the value and a labelled `Open` + `Copy` pair beside
+  it. Both routes use that same shape, because both hand back the same kind of
+  proof. The device route additionally carries the code, its expiry as a live
+  countdown inside the help sentence, and the only status line in the dialog —
+  a poll really is running there. The browser route has no status line: nothing
+  is running, the pooler is waiting for the operator.
+- **The browser route draws its one off-screen step.** Under the callback help
+  text, `callback_paste_demo/1` renders an inline SVG figure (`oauth-paste-demo`
+  in `app.css`): a browser window whose address bar holds the callback URL over
+  a page that did not load, an arrow down to the dialog's own field, and an
+  8s loop that selects the URL, shows a `Copy` pill, carries the value into the
+  field, shows a `Paste` pill and arms `Complete link`. It is the only place
+  where the flow leaves the pooler's screen, and the dead page is drawn as part
+  of the expected picture rather than left to read as the error it resembles.
+  See [Motion](#motion) for the exception this claims and its reduced-motion frame.
+- **The completing action lives in the dialog footer**, beside the dismiss,
+  submitting the body form through `form=`. It is the dialog's only filled
+  orange; `Open` is secondary. A finished flow replaces it with `Open cockpit`,
+  built from `result_upstream_identity_id` on the completed flow.
+- **The header follows the flow.** Titles are imperative while a step is owed
+  (`Link an account to <Pool>`, `Relink <account>`) and declarative once it is
+  not (`Added to <Pool>`, `<account> reauthorized`). The description never
+  repeats an instruction the flow has already satisfied. The Pool name rides
+  the title so it survives the whole flow, since the select is gone after the
+  first step.
+- **Responsive behavior:** open and copy actions share one row with the field
+  from `sm` and stack below it under `sm`. Presentation follows the shared
+  dialog shell below — bottom sheet on phone, centered from `sm`. Touch-width
+  control heights follow the accessibility baseline; the selection cards keep
+  their own height.
+- **Contract:** preserve the existing `oauth-link-*` and `oauth-relink-*`
+  ids. Never render a pending flow as a success alert. The callback input is
+  `required`, described by adjacent help text, and keeps browser-native URL
+  validation. Every state is reviewable at
+  `/dev/component-showcase/<theme>?state=oauth-browser-dialog&case=<case>`.
+
+### Filters, empty state, notices, buttons, flash, theme toggle
 
 - **`filter_form/1`** (shared components.ex): a `.form` with
   `phx-hook="AdminFilterDropdowns"`, arbitrary-variant class surgery that
   compacts nested daisyUI fields (`[&_.input]:input-sm`,
   `[&_.label]:uppercase …`), optional `<details>` "Advanced filters", and a
-  `data-role="filter-actions"` cluster. `cally_date_filter/1` provides the
-  anchored calendar popover.
+  `data-role="filter-actions"` cluster. Call sites may add a named layout hook
+  through `fields_class` without replacing the shared control recipe.
+  Upstreams uses it for a two-column phone layout with search spanning both,
+  then a `1.55fr / 1fr / 1fr` search/Pool/status row from `sm`.
+  `cally_date_filter/1` provides the anchored calendar popover. Its scoped `admin-calendar` uses the body font, `text-xs` tabular date numerals and weekday labels, and a `text-sm font-semibold` month heading. Navigation buttons inherit the body font; weekday headers have no selectable-day radius or hover fill. Keep Cally's seven-column geometry and native popover anchoring; month/year select elements are not part of this primitive.
 - **`empty_state/1`:** dashed-border `rounded-box` panel, icon at
   `text-base-content/40`, title + optional description + actions, all
   centered. The chart-free variant (`pool-activity-empty-state` in `app.css`)
-  is the same idea for plot areas.
+  is the same idea for plot areas. Use it when the **whole surface** has no
+  records — it replaces the list, table, or card body.
+- **`table_empty_row/1`:** the in-table counterpart. First child of the
+  `tbody`, `hidden only:table-row`, one `td` spanning every column at
+  `py-8 text-center text-sm text-base-content/60`. Use it when the column
+  header should stay visible (audit logs, operators) instead of the table
+  being swapped for a block. Never hand-roll the `colspan` row.
+- **Compact lists** — a list inside a panel, dialog, or card body that is too
+  small for a dashed block states its emptiness in one muted sentence
+  (`text-xs`/`text-sm text-base-content/60`), e.g. the pool assignment picker
+  and the account tokens panel. Every list still says something when empty;
+  a header with nothing under it is a bug.
 - **`extended_notice/1`:** daisyUI `alert alert-{info|success|warning|error}
   items-start` with icon, bold title, and body; `role="status"` by default.
 - **`diagnostic_popover/1`:** hover/focus dropdown for warnings that need
@@ -667,11 +1470,28 @@ verified live as the orange "Pro" / green "Free" pills.
   btn-circle` trigger with `aria-describedby` pointing at a `role="tooltip"`
   card.
 - **`action_button/1`:** icon+label control; `:primary` → `btn btn-primary`
-  (custom edge/hover vars from §2), `:danger` → `btn btn-error btn-outline
+  (custom edge/hover vars from [Colors](#colors)), `:danger` → `btn btn-error btn-outline
   btn-sm`, default `btn btn-secondary btn-sm`. Renders as link when given a
   navigation attr. Primary buttons keep the inset top highlight and a
   `focus-visible` orange outline (CSS in `app.css`); disabled goes flat
   `base-300` with `cursor-not-allowed`.
+  **A dismissal takes no icon.** `Cancel` / `Close` in a dialog footer is
+  `variant={:ghost}` with a label and nothing else — the word already says it,
+  and an `✕` beside it is the same message twice. Confirming actions do take an
+  icon, because it names *which* action (`hero-check`, `hero-trash`,
+  `hero-pencil-square`). The exception is a terminal acknowledgement that is the
+  dialog's only action — a one-time secret's `Close` — which is `:primary` with
+  `hero-check`, because there it confirms rather than dismisses.
+- **`clipboard_button/1`:** the shared copy action for values shown beside a
+  destination link or compact data field. It composes the neutral daisyUI
+  button recipe, `ClipboardCopy` hook, clipboard/check icon swap, and an
+  `aria-live` label that changes to Copied. The default `Copy` label is
+  screen-reader-only for square compact controls; handoff workflows may supply
+  a visible label such as `Copy link`. Call sites provide the stable id, safe
+  copy value, and explicit accessible name, and may override button/icon sizing
+  classes without replacing the hook contract. The component ignores LiveView
+  patches so polling cannot erase transient copied feedback. Copy controls
+  never replace the visible value or destination link.
 - **Flash / toast** (`flash_group/1` in layouts.ex, `flash/1` in
   [`core_components.ex`](lib/codex_pooler_web/components/core_components.ex)):
   `toast toast-top toast-end z-50` stack, `aria-live="polite"`; each flash is
@@ -688,7 +1508,7 @@ verified live as the orange "Pro" / green "Free" pills.
   `otp_input/1` renders the grouped mono OTP slots styled by `codex-otp-*`
   CSS.
 
-### 5.16 Upstream cockpit (detail-page pattern)
+### Upstream cockpit (detail-page pattern)
 
 - **Source:**
   [`cockpit_components.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/cockpit_components.ex)
@@ -725,15 +1545,26 @@ verified live as the orange "Pro" / green "Free" pills.
 - **Routing lanes** (`#upstream-assignments`): a readiness verdict strip
   (status chip + reason + a calm 24h failure note — a share of failed
   upstream calls is expected and only escalates past the domain threshold),
-  then one row per Pool assignment: pool link, §5.4 route-chevron gate meter
-  (via `RoutePath`), and the lane's share of 7-day successes.
-- **Quota & banked resets** (`#upstream-quota`): account-level window rows
-  (reusing the index card's `quota_limit_row`, §5.5), the saved-reset meter
-  (§5.6), expiration table, and the auto-redeem policy form behind a
+  then one row per Pool assignment: pool link, [Upstream account card](#upstream-account-card) four-gate route-chevron
+  meter (via `RoutePath`), and the lane's share of 7-day successes. The stable
+  Pool link keeps the existing generic Pools navigation. The stable
+  `upstream-assignment-<assignment>-route` id and
+  `data-role="upstream-assignment-route"` / `data-role="upstream-assignment-route-segment"`
+  selectors expose the same `role="meter"`, dynamic four-gate maximum, current
+  ready count, and full `Assignment → Health → Quota → Circuit` spoken text as
+  the card. Cockpit labels never use the compact `Assign` form.
+- **Quota & banked resets** (`#upstream-quota`): account plus additional
+  model, upstream-model, and feature window rows (reusing the index card's
+  `quota_limit_row`, [Quota progress row](#quota-progress-row-and-provider-credits)).
+  Both current admin views apply the same snapshot-time rule: dynamically stale
+  additional rows are omitted, while fixed account rows and fresh or
+  unknown-freshness additional rows remain visible.
+  The saved-reset meter
+  ([Saved-reset badge and meter](#saved-reset-badge-and-meter)), expiration table, and the auto-redeem policy form behind a
   `<details>` disclosure with an on/off state chip.
 - **Request health** (`#request-health-chart`): inline facts (24h/7d
   volumes, failure rate, p50 latency), the ApexTimeSeriesChart plot
-  (§5.13 contract), a 24h error-code breakdown list, and the on-demand
+  ([Time-series chart surface](#time-series-chart-surface) contract), a 24h error-code breakdown list, and the on-demand
   refresh control.
 - **Recent activity** (`#upstream-event-summary`): compact metadata-only
   event rows (timestamp · title/subtitle · source chip · "Evidence →" link)
@@ -744,7 +1575,426 @@ verified live as the orange "Pro" / green "Free" pills.
   (error breakdown, event subtitles); no raw UUIDs in prose — deep links
   carry them instead.
 
-## 6. Components — API Key Observatory extension
+### Card fact strip (shared card footer)
+
+- **Source:** `card_fact_strip/1`, `card_fact_label/1`, `card_fact_value/1` in
+  [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex)
+- **Purpose:** the band of two to four labeled facts that closes a card. This
+  is the only sanctioned way to render a card footer strip; the upstream
+  account card ([Upstream account card](#upstream-account-card)), the jobs worker card, and the operator card ([Operator card](#operator-card))
+  all use it.
+- **API:** strip attrs `id` (goes on the facts `dl`), `facts_role`
+  (`data-role` for the `dl`), `class`, and a global `rest` that lands on the
+  `footer` band; slot `fact` with `role` (cell `data-role`), `class`, and
+  `interactive`. Label and value take `tone_class` (replaces the resting
+  colour) and `class` (adds to the base).
+- **Anatomy:** band `border-t border-base-300 bg-base-200/20 px-4 py-2.5`;
+  facts `dl` `grid min-w-0 divide-x divide-base-300/70 text-xs leading-5` with
+  the column count derived from the number of facts. Divider padding is
+  positional and owned by the component — first cell `pr-3`, middle cells
+  `px-3`, last cell `pl-3`. Labels are the [Typography](#typography) micro label
+  (`text-[0.62rem] font-semibold uppercase tracking-[0.08em]`,
+  `text-base-content/35` at rest); values truncate at `text-base-content/60`.
+- **Interactive cells:** `interactive` makes the cell
+  `group relative isolate` so the slot can host an absolutely positioned
+  overlay `button` (panel toggles on the account card). Keep the visible label
+  and value `pointer-events-none relative z-30` so the overlay stays clickable
+  underneath them, and swap `tone_class` on both while the panel is open.
+
+```heex
+<AdminComponents.card_fact_strip
+  facts_role="worker-schedule-grid"
+  data-role="worker-schedule-facts"
+  data-density="compact"
+>
+  <:fact role="next-run-group">
+    <AdminComponents.card_fact_label>Next run</AdminComponents.card_fact_label>
+    <AdminComponents.card_fact_value class="tabular-nums">{@card.next_run}</AdminComponents.card_fact_value>
+  </:fact>
+</AdminComponents.card_fact_strip>
+```
+
+- **Rules:** never re-declare the band, grid, divider padding, or micro-label
+  classes at a call site; add a fact rather than a second strip; numeric values
+  carry `tabular-nums`.
+
+### Record row — the ledger contract
+
+Lens is the standalone model-declaration observability page at `/admin/lens`, immediately after Audit logs in the sidebar. It reuses the admin shell, filters, compact numeric strip and record ledger with the normal sans-serif UI font for model names and evidence. An ApexTimeSeriesChart plots unstacked mismatch/conflict counts over time below the counters. A neighboring horizontal bar chart shows the eight most frequent sent / first-declared / first-conflicting combinations among affected attempts, counting overlapping signals once per attempt. Both use the same Pool/upstream/model/window population. Declaration coverage is neutral information in a compact disclosure; missing declarations are never downgrade signals. The default attempt filter includes only mismatches or conflicts. The affected-groups table uses that same signals-only population and its links select signals explicitly. No retained attempts replace the whole data surface with the shared `empty_state`; retained data without signals replaces both charts with one shared empty panel and omits empty groups. An explicitly selected evidence filter with no rows uses the same empty-state component for the attempt list. Operator copy names the comparisons explicitly: Different from sent and Name changed in response. An inline help disclosure gives A/B examples and the Operators Lens guide explains the historical labels mismatch/conflict. The goal is to identify a different model; no quality comparison is required. The source of evidence remains the model name reported by the provider. The attempt table is one markup tree that stacks labelled model facts on phones and pairs them in the dense tablet ledger; the grouped count matrix retains contained horizontal scrolling. Unknown/uncollected evidence never receives a success badge. The drawer shows the evidence on each attempt, preserving sent-versus-first-model meaning. Reuse existing chart shells, colors, typography and hooks; no new visual language or chart library.
+
+Lens's main filter row uses the shared admin filter form and actual Pool selector with status/strategy icons, plus matching icon dropdowns for Window, Sent model and Attempt evidence. Keep all four on the same desktop row with accessible trigger names instead of visible labels. Evidence icons distinguish mismatch (warning arrows), conflict (error triangle), missing (muted question), uncollected (muted eye-off) and partial (info pie). Raw upstream identity belongs in Advanced filters. The page relies on the shared live-update controls without a separate header refresh or timestamp; a Retry action is shown only after a failed load. Mismatch/conflict links share the title row at the right of the signal-card header, with `admin-control-label` centering the text beside the icons. Filter menus use a soft primary selection background with normal content text so semantic icon colors stay readable in light and dark themes. Initial content has an async loading surface, event reloads preserve the previous charts, and failed refreshes label the stale snapshot. The shared live-update pause gates automatic refreshes, including in-flight publication, while explicit filters, error retries and authorization changes remain active.
+
+The jobs explorer and the request-log table are the two record tables. They
+share one contract, and a third record table should join it rather than invent
+a fourth shape.
+
+**The One-Tree Rule.** One markup tree, two readings. A record table is a real `<table>` that
+reflows below its breakpoint instead of being duplicated as a card list. Add
+`admin-ledger-table`; the CSS in `app.css` switches `display` and the template
+places cells with `max-lg:` grid utilities. The `thead` becomes `sr-only`, never
+absent. Never render a second tree for small screens: the explorer used to print
+twenty articles beside twenty rows on every update.
+
+**The breakpoint is `lg`, for every record table.** There was briefly a second
+opt-in (`admin-ledger-table-md`) for tables whose columns "still fit a tablet."
+They do not. The tablet band is precisely where a table stops giving way in its
+elastic column and starts compressing all of them at once — on the request-log
+table at 900px, model, attribution and transport all truncated together, which
+is worse than the reflow the second breakpoint existed to postpone. One
+breakpoint also means the reflow CSS is written once.
+
+**A ledger entry is not automatically a phone layout.** The reflowed entry
+stacks one field per line, which is right at 430px and wasteful at 700: on an
+iPad portrait a record ran 141px tall with half its width empty and six records
+filled the screen. From `sm` up to the reflow breakpoint a table opts in with
+`data-ledger-dense`, the entry gets a second content column, and the template
+places the paired fields with stacked `max-lg:sm:` utilities — on request logs
+attribution and transport move beside the identity instead of under it, 141px
+becomes 79px, and ten records fit. Two things to keep in mind: each `tr` is its
+own grid container, so any `auto` track is measured per row and a record missing
+that field will shift its neighbours' columns — the figures track is a fixed
+`4.5rem` for exactly this reason; and the opt-in is per table, because a table
+whose fields do not pair up gains nothing from a second column.
+
+**Column widths belong to the `colgroup`, and only hold up with a floor under
+the table.** Give every column a floor and leave one elastic — the one
+whose content already truncates with the full value in a `title`. Then give the
+table `lg:min-w-[Nrem]` equal to the sum of those floors, and let the wrapper
+scroll (`lg:overflow-x-auto`). Without it the floors are decoration: `<col>`
+widths are hints, so a narrow container compresses every column at once and the
+elastic column stops being the one that gives. The min-width is safe *because*
+the table reflows below `lg` — it never applies at a width where it could push
+content off a phone. Request logs use a 58.4375rem floor without issues and a 69.8125rem floor when the current page contains issues. Their fixed content tracks are 128px time/status/duration, 136px model, 126px attribution, 162px tokens and 55px cost, with 14px gaps and 14px edge padding; the `colgroup` includes that padding in each width. Endpoint is the main elastic track, starting at 230px of content. Model and upstream tracks do not expand on wide screens. The optional issues track starts at 168px of content. The model column keeps model and effort together; different upstream declarations belong to the issues column with their warning icon and full diagnostic text. Matching or missing declarations add no warning. Jobs: `72rem`.
+
+**Request log groups.** Read each record from left to right as time/status/duration, model/effort/tier, upstream/Pool/key, endpoint/transport/client, errors/warnings, tokens/cache, and cost. The request-explorer structure is a 34px header and 52px desktop rows, with 12px primary text, 11px secondary text, 16px line height and 4px between the two lines. Typography remains Roboto Condensed and colors remain existing theme tokens. Time sits above the status label and a 12px icon; both use the semantic status color: success for succeeded, error for failed/rejected, warning for cancelled and info for in progress. The icon has a 4px gap before the label; the measured duration follows the colored label with one normal text space as `Succeeded in 3.2s`, using muted text and its existing millisecond tooltip. Missing duration adds no label. There is no separate duration column, duration bar or vertical status rail. The full date/time follows the operator's preference in the tooltip and accessible text. Model identity has an 8px square marker, followed by the model name and reasoning effort on the same line, separated by a middle dot (`sample-model · high`); the existing conditional `model default` label occupies that same effort position. Tier and requested-versus-effective annotations remain on the indented second line; declaration warnings move to the dedicated issues cell. Upstream and canonical plan label share the first line as plain text, with Pool and key separated by a middle dot below. The endpoint displays its complete recorded path, including `/backend-api` where present; the original rounded transport badge and client occupy the second line. Transport badges retain their full labels and semantic colors: WebSocket/info, HTTP SSE/success, HTTP JSON/primary, HTTP multipart/warning and unknown HTTP/neutral, with the existing priority indicator. Structural changes must preserve the existing presentation values rather than copying sample strings from a proposal. The timestamp button and whole-row click open the inspector. Preserve the existing page shell and filters.
+
+**Request token composition.** Each 8px token bar represents 100% of that request's recorded total, split into cached input (`info`), uncached input (`info/25`) and output (`success`). All tracks have the same width; segment lengths depend only on that request, never other rows, filters or page maxima. A visible legend above the table is titled `Token breakdown` and names the three colors. Its text uses `admin-control-label` to center the letters beside the 8px swatches within a 16px row. Tooltips and the accessible image label give exact segment counts; reasoning is already part of output and is not added again. The recorded total stays beside the bar. Beneath the left edge, retain the cached count and add its percentage of input, explicitly labelled `of input`; omit that percentage if input is zero or cache evidence is missing or invalid. Draw the composition only when all four counts are nonnegative integers, total is positive, input plus output equals total, and cached input does not exceed input. Otherwise show `breakdown n/a` in the bar slot while retaining the recorded numbers; never infer missing cache as zero or rewrite counts to fill the track. A recorded zero cache reads `0 cached`; an absent measurement reads `cache n/a`. Bars have no animation. Below `lg`, numeric values and the input-cache percentage remain visible while bars and their legend step aside; the percentage wraps beneath the cached count. Cost, duration, endpoint and transport retain their current placement and values.
+
+**Request log footer.** This table intentionally uses the proposal's footer instead of the shared sticky top pager: timezone, result range and page number sit at the left, with the selected request action and previous/next controls at the right. Paging still uses `LogPagination.metadata/1` and the existing pinned-window URL contract, including newer-count and Back to latest controls. The shared pager and rail rules below continue to govern the other ledgers. On narrow viewports the footer may wrap so its actions remain reachable; the ledger omits the old rail's empty column.
+
+**Request issues.** An `Errors · Warnings` column sits between endpoint/transport/client and tokens/cache only when at least one currently displayed row has a formatted error, a different declared model or a model-name conflict. Omit its header, `col` and every body cell together on clean pages, and remove its minimum width from the table. Recompute from the current page's rows after filtering, pagination or live updates, including retry errors and warnings on successful requests. When present, show all formatted messages in a compact 11px/16px stack, allowing wrapping rather than truncating or limiting the list to two entries. Every request/attempt error has a decorative red triangle; model warnings use amber for both icon and text. Preserve the actual final request status and show a muted dash in unaffected rows of a mixed page. The issue column starts at 11.375rem including padding and receives 25% of spare width; endpoint receives the rest. On clean pages all spare width goes to endpoint. Time, model, attribution, tokens and cost retain fixed widths. The desktop scroll wrapper is the inline-size query container; one `--request-log-min-width` token drives the desktop floor and growth calculations. Long identity labels keep an ellipsis and full tooltip when space is limited; the plan may use up to half its line rather than a fixed 80px cap. On phones the same issues cell spans the record beneath endpoint metadata; from sm it spans all three ledger tracks beneath identity and route. Hide empty issue cells on narrow layouts. Failed rows may grow to show their evidence; healthy desktop rows retain their 52px rhythm.
+
+The endpoint/transport/translation/client group is at most two lines. For translated requests, the first line reads recorded source, the existing arrows-right-left icon, then recorded destination; the second contains only protocol, client and other existing route metadata. Prefer the accounting endpoint as destination when it differs from the source, preserving special routes such as `/backend-api/codex/responses/compact`; when accounting already records the source, use the recorded `translated_endpoint`. Native routes and equal or incomplete pairs show one available recorded path, without duplicate paths or invented mappings. Give the shorter source up to half the first line and let the destination use the remaining width; both may ellipsize when constrained, with complete original strings and the translation meaning in tooltips and accessible text. Give this column spare desktop width before expanding fixed identity columns. Keep icons and the protocol badge visible and never wrap the group into a third line.
+
+On phones, the numeric column is fixed at 4.5rem so token/cache text cannot take the model's available width. Cached count and percentage remain on separate lines; model plus effort share the remaining track, and long identifiers retain their full tooltip and accessible text.
+
+Model name, separator and reasoning share one typographic line: Roboto Condensed, 12px, normal weight, 16px line height and a common text baseline. Preserve the established tones: model name uses base-content, reasoning and separator use base-content/60, and `model default` uses base-content/45. The effort and `model default` inherit the same font metrics; neither uses the smaller secondary-line size. The model swatch remains vertically centered beside the text.
+
+When there is no recorded model, render the entire `— no model` placeholder with `text-base-content/45`; it is missing metadata, not a primary model identity.
+
+Upstream name and plan follow the same first-line pairing as model and reasoning: `Sample upstream · Pro More`, with a middle dot, shared Roboto Condensed 12px normal-weight typography, 16px line height and a common baseline. Both first-line groups use a 4px gap (`gap-1`). Preserve upstream base-content and separator base-content/50 tones. The plan name uses the exact foreground color of its existing plan badge: `admin-plan-text` shares the badge's hue/saturation modifiers and light/dark foreground rules without capsule, background, border or typography changes. Unknown labels use the badge's existing generated tone; missing values use its neutral fallback. Omit the separator when either value is missing. Curated plan names use plain words without parentheses: Pro More, Pro Max and Enterprise Automation; raw provider identifiers and unknown labels stay unchanged.
+
+Model identity swatches use only the general theme palette (`info`, `success`, `secondary`, `warning`, `neutral`, `base-content`). Reserve `reset-bank` for banked resets and `admin-chart-other-models` for the chart's aggregated category; an individual model must not consume either domain token. Names, accessible text and tooltips remain the identity, and color only distinguishes neighbouring rows.
+
+Request timestamps display the complete date and time using the operator's selected format and timezone. Use the same Roboto Condensed, 12px, normal weight and 16px line height as the model name; do not apply bold. Keep the date visible, and allow longer formats to wrap within the time column instead of truncating the value. The tooltip and accessible label retain the same complete timestamp.
+
+Request user-agent labels use a local normalized brand mark when the client is recognized, rendered at 14px with a 4px gap before the existing name/version. SVG masters have a 24x24 canvas and proportional 20x20 painted bounds; render them as alpha masks using the label's neutral theme color. Preserve internal secondary opacity and negative space. The official LiteLLM train is raster: use the grayscale 32px export at 14px and invert its tones on dark surfaces, preserving its internal detail. Unknown clients retain the existing generic icon. Center the mark and text within the endpoint metadata line; truncate only the text so the mark stays visible. Missing user agents render neither label nor icon. SDK/runtime logos identify the reported SDK/runtime, never a guessed harness. Source provenance and reusable PNG sizes live in the client-logo asset catalog.
+
+Status icons reuse the shared status mapping: clock for in progress, check-circle for succeeded, x-circle for failed, shield-exclamation for rejected, no-symbol for cancelled and question-mark-circle for unknown. Each 12px icon centers against the status/latency text's cap-to-baseline box using the shared `admin-control-label` primitive on that text group. The icon is decorative (`aria-hidden`) because visible and accessible status text already names the outcome. Preserve the surrounding 16px row rhythm, status colors and 4px horizontal gap.
+
+**Status tick.** Opt in with `admin-status-tick` and put `data-tone` on the row
+(`success` / `warning` / `error` / `info`). A rounded 4px bar is painted inside
+the leading cell's padding, and in ledger mode it becomes a grid item measuring
+the record — the identity and its figures — and stopping before anything that
+follows. Tone is never the only channel: the row spells its status out.
+
+**The title is the trigger.** A row that opens a drawer makes its headline a
+`<button>` — the worker name in jobs, the timestamp in request logs and audit
+logs — and gives the row the same `phx-click`, so the whole row is clickable and
+keyboards get a real target. No chevron column: it costs width on every row to
+say what the cursor already says.
+
+**Failures belong to their record.** A record table has no "Outcome" column,
+which is empty on every healthy row and too narrow on the ones that matter. A
+failed record emits a second `<tr>` carrying its reasons along one line, bound
+to the record above by a continuing tone bar and by the suppressed rule between
+them. It renders only when something actually failed.
+
+**Figures.** Measures live in right-aligned `tabular-nums` columns, with the
+qualifier under its figure — cached tokens under the total, recorded cost qualifiers under
+the cost. Units and currency marks are notation, not figure: same weight as the
+number, stepped back to `text-base-content/60`. Never repeat the column heading
+in the cell (`235.3k`, not `235.3k tokens`).
+
+The request cost column uses 55px of content plus its existing 21px edge padding, contains only the recorded monetary value and does not absorb spare desktop width. Token totals align to the left within a fixed 36px slot, exactly 4px after the bar. The token column is 176px including padding, keeping the existing 122px bar width while reducing unused space. Preserve recorded values, precision, tooltip semantics and the surrounding font sizes.
+
+**The count comes with the way to move, and the pager sticks.** A record table
+draws from a set larger than a page, so it carries one nav: `Page X of Y` at the
+start, `Showing a-b of N` in `tabular-nums`, and a `join` of Previous/Next at
+the end, disabled as `btn-disabled` spans rather than removed so the control
+keeps its shape. It sits **above** the rows and is `sticky top-0 z-20` on the
+page-chrome background — fifty records is a long scroll to reach Next, and
+taller on a tablet, so a pager only at the bottom is a pager you cannot reach.
+Sticky rather than rendered twice: one tree. Audit logs and the
+jobs explorer render it from `LogPagination`, so there is no second copy of
+either the markup or the arithmetic. It renders only where there are rows: an
+empty result has nothing to page through, and the count it still owes a screen
+reader is the `sr-only` total above it, not a range of zero.
+
+The pager takes the type size of the records it counts — `text-xs` with
+`btn-xs`, not `text-sm` — because a control set one step larger than everything
+around it reads as though it came from another design, even in the same
+typeface. And it stays **one row at every width**: the ordinal (`Page 2 of
+11893`) is the range said less precisely, so below `sm` it is the part that
+steps aside, leaving `51-100 of 587938` on the line with the buttons. Stacking
+the three parts turned a control into four rows of chrome above the first
+record.
+
+The `<caption>` stays but goes `sr-only` —
+it names the table and its total for a screen reader before the rows, which is
+the only job a caption does that the pager cannot. It is written **first inside
+the table**, before `<colgroup>`, because that is where the content model puts
+it: a caption placed anywhere else is silently reparented by the parser, so the
+markup stops saying what it renders. A visible caption reporting
+"594617 matching" under fifty rows and no way to reach row 51 is the shape to
+avoid; it reads as a total when it is a page. Paging is a list control: the links
+carry the filters forward and drop the drawer selection, and changing any filter
+drops the page, because a page number only means something against the result set
+it was counted from.
+
+**Offset paging only holds still if the list holds still.** These tables are
+live — request logs debounce a rebuild on every Pool event — and an offset into
+a growing set is not a stable address: rows shift down under the reader and
+records already seen come back. So page one is the live reading and rebuilds on
+every event, while **leaving page one pins the window**.
+
+**Pin to the row, not to the clock.** The pin is a cursor in the list's own sort
+key — the head row's `{admitted_at, id}`, carried as `as_of` + `as_of_id` — and
+the window bounds on `admitted_at < t or (admitted_at = t and id <= id)`. A
+timestamp alone is not enough: `admitted_at` is the transaction timestamp, so
+requests admitted in one transaction share it exactly and only `id` separates
+them, which means an `admitted_at <= t` bound admits a row inserted *after* the
+pin that sorts *above* it — the drift the pin exists to prevent. Being its own
+filter rather than a `date_to`, the cursor also composes with the operator's date
+range by plain intersection, so nothing they set has to be merged or overridden.
+Behind page one the list no longer rebuilds; the event refresh only recounts
+arrivals, through the complement cursor, so the count and the page can never
+disagree about which side of the pin a row falls on.
+
+**The pin moves with the live page.** Page one rebuilds on every event, so the
+cursor is re-derived from each rebuild. Left at the head of the last full load it
+names a window that has already ended, and the record pushed off the bottom of
+page one lands on neither page — a gap that grows for as long as the tab stays
+open.
+
+**A page number is address-bar input.** It becomes an OFFSET, so it is clamped
+before it reaches the query — an unclamped one exceeds int64, raises while
+handling the params, kills the LiveView, and is retried by the reconnecting
+client, which is a crash loop from a single link. Past the end of the result set
+the window is then corrected against the total and lands on the last page that
+has rows: rendering the empty state over a set that has thousands, with the pager
+hidden because there are no items, leaves no way back except editing the URL.
+
+The pinned state rides on the range line rather than adding a row:
+`Showing 51-100 of 587938 · 6679 newer · Back to latest`. It needs the count and
+the exit, not a sentence naming the mechanism — an explanation of why the list
+stopped moving is chrome, and chrome that only appears in one state is the kind
+that gets written as an extra row. The range is what truncates when the line is
+tight; the way back to live never does. Returning to page one drops the pin, so
+live is always one click away and never something the operator has to arrange.
+
+### Selection card (radio-less choice card)
+
+- **Source:** routing strategy cards in
+  [`wizard_components.ex`](lib/codex_pooler_web/live/admin/components/pages/pools/wizard_components.ex)
+  (pool wizard, Routing step), trigger-mode cards in
+  [`saved_reset_components.ex`](lib/codex_pooler_web/live/admin/components/pages/upstreams/saved_reset_components.ex)
+  (saved-reset policy panels), and the policy mode cards
+  (`policy_mode_card/1`, `reasoning_policy_mode/1`) in the API-key
+  [`wizard_components.ex`](lib/codex_pooler_web/live/admin/components/pages/api_keys/wizard_components.ex)
+  ([Policy editor dialog and wizard](#policy-editor-dialog-and-wizard)); decision record in the "Selection cards · Radio-less ✓" artifact
+  (2026-08-05).
+- **Purpose:** a single-choice option card whose border and wash carry the
+  selection and whose check glyph is the non-color selected channel. There is
+  no visible radio control.
+- **Anatomy:** card shell `rounded-box border border-base-300 bg-base-100`;
+  the `p-2.5` padding lives on the inner `<label>` so the entire card is the
+  click target. Title `text-[13px] font-semibold leading-tight`; description
+  `text-[11px] leading-4 text-base-content/55`, worded to hold **two lines at
+  the narrowest column** the grid produces. Corner cluster
+  `absolute right-2.5 top-2 pointer-events-none`: a `hero-check size-3
+  text-primary` glyph rendered only while the card is checked, composing with
+  a permanent micro tag when one exists (the Bridge ring card reads
+  "✓ DEFAULT" while selected; the tag alone otherwise).
+  The Bridge ring description is exactly "Stable rendezvous ordering, within
+  continuity and quota." and remains within the two-line description contract
+  at the narrowest strategy-card column.
+- **States:** hover `border-primary/50`; checked `border-primary/60
+  bg-primary/5` (the [Policy editor dialog and wizard](#policy-editor-dialog-and-wizard) wash recipe is retired for these cards); focus
+  ring `outline-2 outline-primary outline-offset-2` driven by the hidden
+  radio's `:focus-visible`.
+- **Mechanism:** the radio input stays in the DOM as `sr-only`, so radiogroup
+  semantics, arrow-key navigation, and form submission are unchanged. The
+  pool wizard drives state with Tailwind `has-[]`/`group-has-[]` utilities;
+  the saved-reset cards use top-level `:has()` rules in `app.css` because the
+  cockpit form is submit-only and nested `&:has` re-invalidation proved
+  unreliable there. New call sites should prefer the utility form unless they
+  hit the same constraint.
+- **Dependent controls stay put:** a control owned by one option (Ring size
+  for Bridge ring) is always rendered and dims to `opacity-45` while its
+  option is unselected — never `hidden`, so changing the selection cannot
+  shift the layout.
+- **Toggle-gated tunables go read-only, not disabled:** when a whole panel
+  of cards and fields is gated by a switch (auto-redeem and the saved-reset
+  tunables), the off state keeps everything rendered and dimmed, makes text
+  inputs `readonly`, and locks the card radiogroup with
+  `pointer-events-none` + `tabindex="-1"` + `aria-disabled` on the fieldset.
+  Never the `disabled` attribute: disabled controls drop out of the form
+  submit, and saving with the gate off would silently clobber the stored
+  policy values.
+
+```heex
+<div class="group/strategy relative min-w-0 rounded-box border border-base-300 bg-base-100 transition-colors hover:border-primary/50 has-[.strategy-radio:checked]:border-primary/60 has-[.strategy-radio:checked]:bg-primary/5 …">
+  <span class="pointer-events-none absolute right-2.5 top-2 inline-flex items-center gap-1">
+    <.icon name="hero-check" class="hidden size-3 text-primary group-has-[.strategy-radio:checked]/strategy:inline-block" />
+    <span :if={default?} class="text-[0.56rem] font-bold uppercase tracking-wide text-primary/70">Default</span>
+  </span>
+  <label class="flex min-w-0 cursor-pointer items-start gap-2.5 p-2.5">
+    <input type="radio" class="strategy-radio sr-only" … />
+    <span class="grid min-w-0 gap-0.5">…title + two-line description…</span>
+  </label>
+</div>
+```
+
+### Model info popover
+
+- **Source:** `model_info_popover/1` in
+  [`components.ex`](lib/codex_pooler_web/live/admin/components/shared/components.ex),
+  fed only by the safe presentation projection in
+  [`model_info.ex`](lib/codex_pooler/catalog/model_info.ex).
+- **Purpose:** explain an unfamiliar catalog entry without increasing every
+  model row's height. The primary content is the short upstream description and
+  one compact context summary. Exceptional catalog facts such as a hidden alias
+  or lack of public API support appear in a quiet footer band. Raw provider
+  metadata never reaches the component.
+- **Trigger variants:** catalog and policy forms use a neutral 24px info-icon
+  button immediately after the model name. Dense usage leaderboards make the
+  model label itself the trigger, with a subtle underline affordance instead
+  of adding an icon to every row. Both variants retain the full model label in
+  their accessible name.
+- **Mechanism:** use the native `popover`/`popovertarget` contract with the
+  existing daisyUI anchored-dropdown treatment. The panel enters the browser
+  top layer, so scrollable wizard bodies and cards cannot clip it. Invocation
+  is click, tap, or keyboard activation. The shared admin overlay coordinator
+  in `app.js` gives the open model popover precedence over its containing
+  dialog for Escape, restores focus to the invoker, and provides deterministic
+  outside-click dismissal inside modal top layers. Do not make the information
+  hover-only and do not add a page-specific positioning hook.
+- **Panel:** `w-80 max-w-[calc(100vw-2rem)] rounded-box border
+  border-base-300 bg-base-100 shadow-2xl`; the original compact monospace
+  `Model info` eyebrow stays in primary color and the exact model id is the bold
+  subtitle above the `text-xs leading-5` description. Context stays inside the body as
+  one plain-language definition row without a divider: a fixed token limit, a
+  default plus maximum, or a bounded value marked `varies by upstream`.
+  Context values use the normal UI font with tabular numerals, not monospace,
+  and do not expose internal usable-percentage terminology. The optional facts
+  footer uses `border-t border-base-300 bg-base-200/35` and pairs text with an
+  icon, never color alone; it may include the source-reported minimum Codex
+  version and the catalog row's last successful observation as relative time,
+  with the absolute UTC timestamp retained in the row title.
+- **Metadata drift:** one shared description is shown when all reporting
+  upstreams that provide one agree. Conflicting descriptions are stated as a
+  conflict rather than choosing an arbitrary source. Context profiles retain
+  distinct source values and render bounded ranges when sources disagree;
+  missing percentages use Codex's 95% default. Minimum client versions retain
+  distinct values and say when they vary by upstream. Catalog freshness uses
+  model `last_seen_at`; a preserved source does not inherit a newer observation
+  timestamp from another assignment. Hidden/API facts are shown only when their
+  aggregate state is known; mixed reports are named as mixed.
+- **Accessibility and selectors:** the invoker owns `aria-controls` and
+  `aria-describedby`; the panel is focusable and carries `role="tooltip"`.
+  Preserve stable `data-role="model-info-popover"`, `model-info-trigger`,
+  `model-info-content`, `model-info-title`, `model-info-model-id`,
+  `model-info-description`, and `model-info-context` hooks
+  for LiveView tests and browser QA. Focus-visible uses the standard primary
+  outline.
+
+### Operator card
+
+- **Source:** `operator_cards/1` and the private `operator_card/1` in
+  [`operator_components.ex`](lib/codex_pooler_web/live/admin/components/shared/operator_components.ex);
+  page state in
+  [`operators_live.ex`](lib/codex_pooler_web/live/admin/pages/operators_live.ex).
+- **Purpose:** `/admin/operators` renders a grid of profile cards
+  (`md:grid-cols-2 xl:grid-cols-3`) instead of a table — operators are few
+  and trusted, and the page's job is identity plus security posture at a
+  glance. The filtered-empty surface is the dashed `empty_state` ([Filters, empty state, notices, buttons, flash, theme toggle](#filters-empty-state-notices-buttons-flash-theme-toggle)).
+- **Anatomy:** header band (`border-b bg-base-200/35 px-4 py-3`) holding the
+  Gravatar avatar with lifecycle presence dot, the display name with a
+  primary "you" marker on the viewer's own card, the email, and the role as
+  a quiet uppercase micro-label — the single active **instance owner** in
+  primary ink, **instance admins** muted, never a second chip — plus the
+  [Dropdown action menu](#dropdown-action-menu) actions dropdown. Body is a 2×2 vitals `dl` (TOTP, Password policy,
+  Last login, Joined) using the [Typography](#typography) micro-label recipe, warning-toned values
+  for "Not set up" and a pending password change.
+- **Footer:** the [Card fact strip](#card-fact-strip-shared-card-footer) fact strip with two facts. **Status** is written
+  out (capitalized, `text-success`/`text-warning`). **Pools** is an
+  interactive cell using the upstream account card's exact overlay-trigger
+  contract, toggling `toggle_operator_pools_panel`; the assigned-Pools
+  panel above the strip follows the [Upstream account card](#upstream-account-card) collapse contract (`aria-hidden`
+  plus `inert`, 150ms opacity, reduced-motion safe). The owner's panel
+  states that the role is not Pool-scoped instead of faking a list; an
+  admin with no Pools says so in one muted sentence.
+- Panel open state lives server-side in `operator_panel_views` (pruned on
+  reload), mirroring the upstreams page.
+
+### Audit prose ledger
+
+- **Source:** the ledger shell in
+  [`components.ex`](lib/codex_pooler_web/live/admin/components/pages/audit_logs/components.ex)
+  and the sentence builder in
+  [`prose.ex`](lib/codex_pooler_web/live/admin/components/pages/audit_logs/components/prose.ex);
+  the reading was piloted on the request-logs prose experiment
+  (`feat/request-logs-prose`).
+- **Purpose:** the audit trail told as sentences — who did what to whom —
+  at every width, desktop included. One tree, no table, no reflow contract:
+  a sentence wraps where a column would truncate.
+- **Grammar:** values carry the contrast in full-ink `text-base-content` at
+  regular weight — bold entities proved too loud in a dense ledger — while
+  connective words step back to 45% ink at `text-[0.8rem] leading-relaxed`;
+  the leading timestamp is time-only, set in the day kicker's own type
+  (`text-[0.62rem] font-semibold tracking-[0.08em] tabular-nums`) at 35%
+  ink, raised `-top-px` so the cap-height digit block sits optically
+  centered on the line, and is a drawer trigger; the date lives once, in
+  the kicker that heads each day card. Free-standing em dashes are the only punctuation
+  that separates clauses. Every clause is optional because events genuinely
+  differ; a failure outcome appends an error-toned tail
+  ("— it failed: reason").
+- **Derived clauses, no schema change:** already-recorded detail keys keep
+  the sentence honest without new columns — an invite names the invited
+  email, a Pool status change names the destination status, an operator
+  update whose role actually moved appends "— role set to …" using the
+  Operators-page role labels, and any labeled record owning a `pool_id`
+  says "in the Pool …" with the Pool acting on the filter. Everything
+  heavier (previous states, assignment id lists, trigger kinds) stays in
+  the drawer.
+- **Day cards and row anatomy:** each day group is its own `rounded-box`
+  card headed by the kicker; rows are flex (`items-start gap-2.5`) with the
+  family icon leading, the sentence `flex-1`, and a `hero-chevron-right`
+  drawer trigger `self-center` at the row's end. Rows bleed to the card
+  edge (`-mx-4 px-4`) for a full-width `hover:bg-base-200/40`, split by
+  `border-base-300/55` hairlines. Both icon buttons are `flex` so they
+  collapse to the glyph's 16px instead of inheriting the 24px base line
+  box — that, plus the asymmetric `pt-[9.5px] pb-[6.5px]` (compensating
+  the bottom hairline and the half-leading), is what centers a one-line
+  sentence in its row; measure before changing either.
+- **Entities act on the page's own filters, never navigate away:** the
+  actor, the target operator, and the Pool render as inline buttons that set
+  the matching filter (`select_actor_filter`, `select_target_filter`,
+  `select_pool_filter`); the family icon (the [Chips](#chips-status-count-metadata-severity-protocol-redacted)-toned `audit_action_icon`
+  set, `size-4`) filters by that exact action, and the "failed" word filters
+  by outcome. A target with no email filters by its id while showing its
+  presentation label; an entity with nothing to filter by falls back to a
+  plain full-ink span.
+- **Coverage is a contract:** every action in `Audit.action_options/0` has a
+  handcrafted sentence in the prose map, enforced by a test that diffs the
+  two lists; unknown actions degrade to a marked generic fallback. Porting
+  this page surfaced two recorded-but-unlisted actions (the OAuth browser
+  and device link flows), which joined the vocabulary and the filter.
+- The sticky `LogPagination` pager, the filters (stacked `mobile_single_column`
+  on phones like the other log pages), and the detail drawer are unchanged.
+
+### The API Key Observatory extension
 
 The Observatory (`live /observatory`) is a **separate, key-holder-facing
 surface**. It reuses the token system, chips, metric cards, chart contract,
@@ -752,7 +2002,7 @@ and states above, but not the admin chrome. The layout below was chosen from
 five browser-verified candidates on 2026-07-17 ("Ledger" composition with the
 "Console" facts rail) and this section is its authoritative description.
 
-### 6.1 Shell and toolbar
+#### Shell and toolbar
 
 **Sources:** [`Layouts.app`](lib/codex_pooler_web/components/layouts.ex),
 [`ObservatoryLive`](lib/codex_pooler_web/live/observatory_live.ex),
@@ -776,7 +2026,7 @@ and [Observatory rules in `app.css`](assets/css/app.css).
      key glyph in a `primary/14` circle, the key's display name (600), and
      the safe prefix (`font-mono`, muted, e.g. `sk-cxp-8308…d412`) — never
      the raw key. Prefix hides below `sm`.
-  3. Spacer, then the time-window segmented pill (§5.12): `1h / 5h / 24h /
+  3. Spacer, then the time-window segmented pill ([Segmented pill control](#segmented-pill-control)): `1h / 5h / 24h /
      7d`, `aria-pressed` state, server-validated selection.
   4. Freshness: live dot (success tone, 2.4s opacity pulse, warning + static
      when paused, `prefers-reduced-motion` disables) + "Updated Ns ago".
@@ -797,7 +2047,7 @@ and [Observatory rules in `app.css`](assets/css/app.css).
   Observatory copy; statuses use the holder's perspective (usage, models,
   outcomes).
 
-### 6.2 Telemetry grid
+#### Telemetry grid
 
 **Sources:** [`ObservatoryLive`](lib/codex_pooler_web/live/observatory_live.ex),
 [`Telemetry.telemetry`](lib/codex_pooler_web/live/observatory/components/telemetry.ex),
@@ -813,7 +2063,7 @@ and [Observatory rules in `app.css`](assets/css/app.css).
   everything collapses to one column (rail first, static) and charts scroll
   inside their own `overflow-x-auto` region. No horizontal scroll of primary
   content at any width (375/768/1280 are the checked breakpoints).
-- **Left rail, card 1 — facts** (§5.2 metric-card anatomy, stacked as one
+- **Left rail, card 1 — facts** ([Metric strip and metric card](#metric-strip-and-metric-card) metric-card anatomy, stacked as one
   card with hairline row dividers, never an equal-tile KPI grid; row weight
   follows priority):
   1. *Success rate* (lead row, larger value): value + trend delta, detail
@@ -826,33 +2076,33 @@ and [Observatory rules in `app.css`](assets/css/app.css).
   4. *Throughput*: tok/s value + delta.
   5. *Latency*: p50 as the value with a smaller p95 beside it, detail "Mean
      Ns · slowest settled Ns".
-  Values are `font-mono tabular-nums`; labels are §3 micro labels; deltas are
-  small mono figures in success/error ink.
-- **Left rail, card 2 — models**: §5.8 ranked compact rows
+  Values are `tabular-nums`; labels are [Typography](#typography) micro labels; deltas are
+  small tabular figures in success/error ink.
+- **Left rail, card 2 — models**: [Compact and definition lists](#compact-and-definition-lists) ranked compact rows
   (`name | bar | tokens`), bars relative to the leader, series colors in
   fixed order primary → info → success → muted ink mixes; every row is
   direct-labeled so identity never rides on color alone.
 - **Right column — traffic** (cardless: a heading with a hairline rule, no
   bordered wrapper): the window total in the sub-line ("138.2M tokens ·
   $79.62" — total tokens and total cost, echoing the chart), an
-  Interval/Cumulative segmented pill (§5.12) beside the heading, and the
-  ApexTimeSeriesChart contract (§5.13) in a `chart-scroll` body: stacked token
+  Interval/Cumulative segmented pill ([Segmented pill control](#segmented-pill-control)) beside the heading, and the
+  ApexTimeSeriesChart contract ([Time-series chart surface](#time-series-chart-surface)) in a `chart-scroll` body: stacked token
   columns **broken down by model** (top models plus a folded "Other" so the
   stack sums to total tokens) with a settled+estimated **cost line** on a
   second (right) axis — the app's shipped "Traffic over time" pattern. Green
   is reserved for the cost line, so the model columns draw from
   primary/info/warning/accent/secondary and never collide with it. ~264px tall.
 - **Right column — recent outcomes** (cardless: heading + hairline rule): a
-  zebra table (§5.8 idiom, `table-sm` density) inside its own
+  zebra table ([Compact and definition lists](#compact-and-definition-lists) idiom, `table-sm` density) inside its own
   `overflow-x-auto`. Columns: Time (mono, muted, readable "Jul 16, 23:22:23"
   format) · Model (500 weight, truncated) · Endpoint class (muted) · Status
-  (§5.7 micro chips: ok/warn/err/neutral) · Latency · Tokens · Cost (all
+  ([Chips](#chips-status-count-metadata-severity-protocol-redacted) micro chips: ok/warn/err/neutral) · Latency · Tokens · Cost (all
   right-aligned mono). Bounded at 12 rows; only sanitized fields ever appear
   (timestamp, model, endpoint class, safe status/code, latency, settled
   tokens/cost). No per-row status stripe and no `sanitized` chip — the status
   chip and the section's "metadata only" subtext carry that.
 
-### 6.3 Window control and refresh states
+#### Window control and refresh states
 
 **Sources:** [`ObservatoryLive`](lib/codex_pooler_web/live/observatory_live.ex),
 [`States.state`](lib/codex_pooler_web/live/observatory/components/states.ex),
@@ -862,10 +2112,10 @@ and [`Toolbar.toolbar`](lib/codex_pooler_web/live/observatory/components/toolbar
 - Windows are the allowlisted `1h / 5h / 24h / 7d` as a segmented pill;
   selection is server-validated (client ids are never authority).
 - Freshness states, each with a stable selector and visible text: `loading`,
-  `empty` (§5.15 empty-state anatomy), `stale` (paused or hidden-tab), and
+  `empty` ([Filters, empty state, notices, buttons, flash, theme toggle](#filters-empty-state-notices-buttons-flash-theme-toggle) empty-state anatomy), `stale` (paused or hidden-tab), and
   `error`. Partial (still-settling) accounting is not a banner — the dashboard
   renders normally and the settled/estimated split is carried by the Cost fact
-  (§5.2). Connection loss surfaces in the freshness pill, not a banner. Refresh
+  ([Metric strip and metric card](#metric-strip-and-metric-card)). Connection loss surfaces in the freshness pill, not a banner. Refresh
   cadence is 30s only while visible; pause/resume is explicit and reflected in
   the toolbar.
 - The named state rendering, window allowlist, and initial loading behavior are
@@ -873,48 +2123,7 @@ and [`Toolbar.toolbar`](lib/codex_pooler_web/live/observatory/components/toolbar
   stale-result behavior are a separate runtime contract and are not claimed as
   implemented by these source links.
 
-## 7. Motion
-
-Motion carries state meaning or it does not exist. Current inventory (all in
-`app.css` or component classes, all `prefers-reduced-motion`-guarded where
-animated):
-
-- Quota meters: width 260ms / color 180ms transitions
-  (`admin-live-progress`); token-burn gloss sweep with per-card
-  `--shine-delay` stagger and burn-scaled `--shine-period` (§5.4/§5.5).
-- Panel switcher: 150ms opacity ease-out with `motion-reduce:transition-none`.
-- Pool compat disclosure: 160ms slide/fade in (`pool-compat-panel-in`),
-  disabled under reduced motion.
-- Hover/focus color transitions: `transition-colors` (~200ms) on nav items,
-  chips, pills, dropdown items.
-- Flash show/hide: 200–300ms fade/scale via `CoreComponents.show/hide`;
-  reconnect spinner is `motion-safe:animate-spin`.
-- Theme toggle thumb: `transition-[left]`.
-- Observatory segmented/pause/logout controls: the semantic control motion
-  role is 150ms `ease` for border/background/text state changes; the live-dot
-  role is a 2.4s `ease-in-out` opacity pulse whose midpoint is 0.35. These map
-  to the `--observatory-motion-*` tokens in §4; pause makes the dot static and
-  `prefers-reduced-motion: reduce` removes the pulse and control transitions.
-
-Rule: no looping decorative animation; the burn shine is the ceiling for
-ambient motion and it is evidence-driven (recent token burn).
-
-## 8. Depth
-
-Flat-first. Two sanctioned separation methods, never combined on a resting
-surface:
-
-- **Content layering:** `border border-base-300` (+ `/70` for internal
-  dividers) over tonal `bg-base-200/*` washes; header bands `bg-base-200/35`,
-  footer bands `bg-base-200/20`.
-- **Overlay shadows:** `shadow-xl` for dropdown menus and flash, `shadow-2xl`
-  for dialogs, drawers, and top-bar popovers. `shadow-sm` appears only on the
-  object-inspector default shell.
-
-z-index ladder in use: dropdowns in cards `z-20`, chart/tooltip internals,
-top-bar popovers and toasts `z-50`, request-log drawer `z-[70]`.
-
-## 9. Accessibility and design rules
+## Do's and Don'ts
 
 ### Accessibility baseline (verified patterns to preserve)
 
@@ -926,11 +2135,40 @@ top-bar popovers and toasts `z-50`, request-log drawer `z-[70]`.
   value attributes; charts have `sr-only` data mirrors and `aria-live` mode
   announcements; toggles expose `aria-pressed`/`aria-expanded`/
   `aria-controls`; hidden panels are `aria-hidden` **and** `inert`.
+- The upstream route meters preserve stable ids and `data-role` selectors on
+  both the route and each gate, expose their dynamic four-gate count through
+  `aria-valuemin`, `aria-valuemax`, and `aria-valuenow`, and use the same full
+  `aria-label` / `aria-valuetext` detail on both surfaces. Compact visual copy
+  may say `Assign`; accessibility text says `Assignment`.
 - Reduced motion disables shine, transitions, and disclosure animations.
 - Icons are decorative (`aria-hidden` spans) unless paired with `sr-only`
   text.
+- **Control height belongs to the pointer, not to the control.** Admin sizing
+  is tuned for a mouse — `btn-sm` footers land at 28px, dialog fields at 32-35px,
+  the footer `Docs` link at 14px — and those heights are correct on a desktop,
+  where a field and the buttons beside it are levelled to agree. Where the
+  pointer is coarse, or the viewport is 768px or narrower, every control inside
+  a dialog clears the 44px minimum instead. The rule lives once in
+  [`app.css`](assets/css/app.css) under
+  `@media (pointer: coarse), (width <= 48rem)`, scoped to `.modal-box` and
+  `[data-role="admin-dialog-footer"]` so it covers **every** dialog. Do not
+  re-solve it per dialog: a rule scoped to one dialog's ids leaves a 44px field
+  sitting next to another dialog's 35px field, which is worse than the problem
+  it fixed. 768px is inside the range because a tablet is held, not clicked.
+- **The dialog footer is one row at every width.** `Docs` on the left, actions
+  on the right, `flex-wrap` for the rare long label. It does not collapse to a
+  column on phones: stacking a 44px `Docs` row above two 44px button rows turns
+  a 65px footer into 143px, and on a dialog whose only action is `Cancel` that
+  reads as a hole. The row height comes from the buttons, so the `Docs` link
+  takes its 44px tap target at no layout cost.
+- **CSS keyed to a component's markup must not key to `data-role`.**
+  `dialog_footer` exposes `docs_link_role` and `docs_icon_role` as overridable
+  test hooks, and the policy-editor shell does override them, so a rule written
+  against `[data-role="admin-dialog-docs-link"]` silently skips every dialog
+  built on that shell. Styling hooks are separate attributes the component
+  always emits — `data-admin-dialog-docs`, `data-role="admin-dialog-footer"`.
 
-### Do / Don't
+### Do:
 
 - **Do** keep admin surfaces dense, table long homogeneous records, drawer the
   detail, and preserve light/dark parity for every new color or state.
@@ -940,9 +2178,17 @@ top-bar popovers and toasts `z-50`, request-log drawer `z-[70]`.
 - **Do** paint status stripes from data attributes (`data-routing-tone`,
   `data-status`) in `app.css` — domain read models never emit CSS class
   names, and a stripe always reinforces visible status text.
+- **Do** match the data shape: a table for many homogeneous records, grouped
+  cards for a small fixed set of known systems, an inspector or drawer for the
+  detail behind one of them.
+- **Do** measure the content column, not the viewport, when judging any layout
+  change (see [Layout](#layout)).
+
+### Don't:
+
 - **Don't** hardcode raw color literals (`violet-*`, bracket-escaped oklch)
   in `lib/`, hand-manage `dark:` pairs for custom hues, or introduce a second
-  token store — per-theme values live in `app.css` (§2).
+  token store — per-theme values live in `app.css` ([Colors](#colors)).
 - **Don't** render prompts, bearer tokens, raw payloads, cookies, upstream
   secrets, raw idempotency keys, or raw API keys in UI, examples, tests, or
   screenshots.
@@ -950,3 +2196,6 @@ top-bar popovers and toasts `z-50`, request-log drawer `z-[70]`.
   reinforcement of visible status text, painted from a data attribute),
   gradient/glass/neon decoration, monospace-as-personality, or motion without
   state meaning.
+- **Don't** put a second orange on one panel, add a fourth radius, or use
+  monospace for prose — see the named rules in [Colors](#colors),
+  [Typography](#typography), and [Shapes](#shapes).

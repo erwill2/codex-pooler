@@ -31,8 +31,38 @@ defmodule CodexPooler.Gateway.Payloads.ToolResultShapeTest do
            ]
   end
 
-  test "requires a call id and result-like payload" do
+  test "requires paired identity or the exact named standalone function output shape" do
+    assert ToolResultShape.tool_result?(%{
+             "type" => "function_call_output",
+             "name" => "lookup_fixture",
+             "output" => nil
+           })
+
+    assert ToolResultShape.items([
+             %{
+               "type" => "function_call_output",
+               "call_id" => nil,
+               "name" => "lookup_fixture",
+               "output" => "ok"
+             }
+           ]) == [%{type: "function_call_output", call_id: nil}]
+
     refute ToolResultShape.tool_result?(%{"type" => "function_call_output", "output" => "ok"})
+    refute ToolResultShape.tool_result?(%{"name" => "lookup_fixture", "output" => "ok"})
+
+    refute ToolResultShape.tool_result?(%{
+             "type" => "message",
+             "name" => "lookup",
+             "output" => "ok"
+           })
+
+    refute ToolResultShape.tool_result?(%{
+             "type" => "function_call_output",
+             "name" => " ",
+             "output" => "ok"
+           })
+
+    refute ToolResultShape.tool_result?(%{"type" => "function_call_output", "name" => "lookup"})
     refute ToolResultShape.tool_result?(%{"type" => "message", "call_id" => "call_message"})
     refute ToolResultShape.tool_result?(%{"type" => "function_call_output", "call_id" => " "})
 
@@ -49,9 +79,8 @@ defmodule CodexPooler.Gateway.Payloads.ToolResultShapeTest do
            })
   end
 
-  @tag :structured_tool_result_pass_through
-  test "debug payload summary keeps structured tool output shape-only" do
-    previous_config = Application.get_env(:codex_pooler, OperationalSettings, [])
+  test "debug payload summary omits standalone identity previews and raw values" do
+    previous_config = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -61,9 +90,68 @@ defmodule CodexPooler.Gateway.Payloads.ToolResultShapeTest do
       |> Keyword.put(:use_instance_settings?, false)
     )
 
-    on_exit(fn ->
-      Application.put_env(:codex_pooler, OperationalSettings, previous_config)
-    end)
+    payload = %{
+      "input" => [
+        %{
+          "type" => "function_call_output",
+          "name" => "STANDALONE_NAME_SENTINEL",
+          "output" => "STANDALONE_OUTPUT_SENTINEL"
+        }
+      ]
+    }
+
+    assert summary =
+             DebugPayloadSummary.record(
+               "/backend-api/codex/responses",
+               payload,
+               payload,
+               %{request_id: "req_standalone_shape"},
+               "http_sse"
+             )
+
+    assert get_in(summary, ["shape", "client", "entries", "tool_result_count"]) == 1
+    assert get_in(summary, ["items", "tool_result_types"]) == ["function_call_output"]
+    assert get_in(summary, ["items", "tool_result_call_id_previews"]) == []
+    refute inspect(summary) =~ "STANDALONE_NAME_SENTINEL"
+    refute inspect(summary) =~ "STANDALONE_OUTPUT_SENTINEL"
+  end
+
+  test "preserves depth-first ordering across mixed keys and repeated tool outputs" do
+    input = [
+      %{
+        :type => "response",
+        "items" => [
+          %{"call_id" => "call_first", "output" => "ok", "type" => "function_call_output"},
+          %{
+            "nested" => %{
+              :type => "future_tool_output",
+              "call_id" => "call_nested",
+              "result" => %{"ok" => true}
+            }
+          }
+        ]
+      },
+      %{"call_id" => "call_last", "output" => ["ok"], "type" => "custom_tool_call_output"}
+    ]
+
+    assert ToolResultShape.items(input) == [
+             %{type: "function_call_output", call_id: "call_first"},
+             %{type: "unknown_tool_output", call_id: "call_nested"},
+             %{type: "custom_tool_call_output", call_id: "call_last"}
+           ]
+  end
+
+  @tag :structured_tool_result_pass_through
+  test "debug payload summary keeps structured tool output shape-only" do
+    previous_config = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
+
+    Application.put_env(
+      :codex_pooler,
+      OperationalSettings,
+      previous_config
+      |> Keyword.put(:settings, %OperationalSettings{gateway_debug?: true})
+      |> Keyword.put(:use_instance_settings?, false)
+    )
 
     previous_response_id = "resp_payload_shape_previous"
     call_id = "call_payload_shape_structured"
@@ -103,17 +191,17 @@ defmodule CodexPooler.Gateway.Payloads.ToolResultShapeTest do
 
   defp structured_tool_result_output do
     %{
-      "command" => "TASK7_RAW_TOOL_COMMAND_SENTINEL run private command",
+      "command" => "RAW_TOOL_COMMAND_SENTINEL run private command",
       "files" => [
         %{
           "path" => "sample-output.txt",
-          "content" => "TASK7_RAW_TOOL_OUTPUT_SENTINEL\n" <> String.duplicate("line\n", 200)
+          "content" => "RAW_TOOL_OUTPUT_SENTINEL\n" <> String.duplicate("line\n", 200)
         }
       ],
       "nested" => %{
         "list" => [
-          %{"stdout_preview" => String.duplicate("TASK7_LONG_NESTED_VALUE_", 40)},
-          %{"secret_like" => "TASK7_SECRET_LIKE_TOOL_SENTINEL"}
+          %{"stdout_preview" => String.duplicate("RAW_TOOL_LONG_NESTED_VALUE_", 40)},
+          %{"secret_like" => "RAW_TOOL_SECRET_LIKE_SENTINEL"}
         ]
       }
     }
@@ -121,10 +209,10 @@ defmodule CodexPooler.Gateway.Payloads.ToolResultShapeTest do
 
   defp structured_tool_result_sentinels do
     [
-      "TASK7_RAW_TOOL_COMMAND_SENTINEL",
-      "TASK7_RAW_TOOL_OUTPUT_SENTINEL",
-      "TASK7_LONG_NESTED_VALUE_",
-      "TASK7_SECRET_LIKE_TOOL_SENTINEL"
+      "RAW_TOOL_COMMAND_SENTINEL",
+      "RAW_TOOL_OUTPUT_SENTINEL",
+      "RAW_TOOL_LONG_NESTED_VALUE_",
+      "RAW_TOOL_SECRET_LIKE_SENTINEL"
     ]
   end
 

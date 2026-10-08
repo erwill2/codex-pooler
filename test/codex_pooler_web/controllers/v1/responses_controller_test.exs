@@ -20,6 +20,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     only: [
       auth: 2,
       await_public_websocket_upgrade: 2,
+      curl_json_request!: 4,
       gateway_setup: 1,
       gateway_setup: 2,
       gateway_upstream: 4,
@@ -27,6 +28,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       pricing_config: 1,
       pricing_snapshot!: 2,
       prime_routing_quota!: 1,
+      prime_weekly_exhausted_quota!: 1,
+      prime_weekly_probe_quota!: 1,
       public_websocket_receive_close!: 3,
       public_websocket_receive_text!: 3,
       public_websocket_send_text!: 4,
@@ -34,20 +37,192 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       register_unboxed_pool_cleanup!: 1,
       assert_pre_first_stream_idle_timeout!: 1,
       start_public_endpoint!: 0,
+      start_public_endpoint_with_server!: 0,
       start_upstream: 1,
       unboxed_run: 1,
       use_routing_strategy!: 3
     ]
 
   alias CodexPooler.Access
-  alias CodexPooler.Accounting.{Attempt, DailyRollup, LedgerEntry, Request, RequestLogs}
+  alias CodexPooler.Access.DashboardSessions.Principal, as: DashboardPrincipal
+  alias CodexPooler.Accounting.Usage.Observatory
+
+  alias CodexPooler.Accounting.{
+    Attempt,
+    DailyRollup,
+    LedgerEntry,
+    Request,
+    RequestLogFact,
+    RequestLogs
+  }
+
   alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Metadata.CanonicalModelSource
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Payloads.CompactionTrigger
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
+  alias CodexPooler.Gateway.Transports.Admission
+  alias CodexPooler.Pools.ModelServingOverride
   alias CodexPooler.Repo
 
+  for mode <- ~w(full lite), stream <- [false, true] do
+    @tag :access_programs
+    test "POST /v1/responses rejects malformed access programs before effects in #{mode} with stream=#{stream}", %{conn: conn} do
+      upstream = start_upstream(issue_241_completed_response("access_programs_rejected"))
+      setup = gateway_setup(upstream)
+      put_public_model_serving_mode!(setup, unquote(mode))
+      response = conn |> auth(setup) |> post("/v1/responses", %{"model" => setup.model.exposed_model_id, "input" => "synthetic request", "stream" => unquote(stream), "access_programs" => %{"cyber" => "unknown"}})
+      assert %{"error" => %{"type" => "invalid_request_error", "code" => "invalid_request", "param" => "access_programs.cyber"}} = json_response(response, 400)
+      assert FakeUpstream.count(upstream) == 0
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+      assert Repo.aggregate(LedgerEntry, :count) == 0
+    end
+
+    @tag :access_programs
+    test "POST /v1/responses preserves access programs in #{mode} with stream=#{stream}", %{conn: conn} do
+      upstream = start_upstream(issue_241_completed_response("access_programs"))
+      setup = gateway_setup(upstream)
+      put_public_model_serving_mode!(setup, unquote(mode))
+
+      for value <- ~w(standard daybreak_blue daybreak_red) do
+        response =
+          conn
+          |> recycle()
+          |> auth(setup)
+          |> post("/v1/responses", %{
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic access program request",
+            "stream" => unquote(stream),
+            "access_programs" => %{"cyber" => value}
+          })
+
+        assert response.status == 200
+        assert List.last(FakeUpstream.requests(upstream)).json["access_programs"] == %{"cyber" => value}
+      end
+    end
+  end
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  defmodule ClosedChunkAdapter do
+    def chunk(_payload, _chunk), do: {:error, :closed}
+  end
+
   @reasoning_denial_message "reasoning effort is not available for this API key"
+
+  @tag :bulkhead_overload
+  test "POST /v1/responses returns the Codex overload vocabulary before JSON or SSE dispatch", %{
+    conn: conn
+  } do
+    setup_runtime_ingress_override(overloaded_bulkhead_settings())
+
+    for stream? <- [false, true] do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream)
+
+      leases =
+        Enum.map(Admission.route_classes(), fn route_class ->
+          assert {:ok, lease} =
+                   Admission.acquire(route_class, %{request_id: "held-#{route_class}-#{stream?}"})
+
+          lease
+        end)
+
+      try do
+        response =
+          conn
+          |> recycle()
+          |> auth(setup)
+          |> post("/v1/responses", %{
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic overload contract",
+            "stream" => stream?
+          })
+
+        assert %{"error" => error} = json_response(response, 503)
+
+        assert error == %{
+                 "code" => "server_is_overloaded",
+                 "message" => "gateway route class is temporarily overloaded",
+                 "param" => nil,
+                 "type" => "server_error"
+               }
+
+        assert FakeUpstream.count(upstream) == 0
+        assert Repo.aggregate(Request, :count) == 0
+        assert Repo.aggregate(Attempt, :count) == 0
+        assert Repo.aggregate(LedgerEntry, :count) == 0
+      after
+        Enum.each(leases, &Admission.release/1)
+      end
+    end
+  end
+
+  @tag :bulkhead_overload
+  @tag :v1_websocket
+  test "GET /v1/responses websocket returns the Codex overload vocabulary before dispatch" do
+    for {internal_reason, queue_limit, queue_timeout_ms} <- [
+          {"bulkhead_rejected", 0, 1_000},
+          {"bulkhead_queue_timeout", 1, 25}
+        ] do
+      setup_runtime_ingress_override(overloaded_bulkhead_settings(queue_limit, queue_timeout_ms))
+
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream)
+      port = start_public_endpoint!()
+
+      {conn, websocket, ref, _response_headers} =
+        public_v1_websocket_connect!(
+          port,
+          setup,
+          "v1-websocket-overload-#{internal_reason}",
+          [{"openai-beta", "responses_websockets=2026-02-06"}]
+        )
+
+      assert {:ok, lease} =
+               Admission.acquire("proxy_websocket", %{request_id: "held-#{internal_reason}"})
+
+      try do
+        payload =
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic public websocket overload",
+            "stream" => true,
+            "generate" => true
+          })
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+        {_conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+        assert %{
+                 "type" => "error",
+                 "status" => 503,
+                 "error" => %{
+                   "code" => "server_is_overloaded",
+                   "message" => "gateway route class is temporarily overloaded",
+                   "param" => nil,
+                   "type" => "server_error"
+                 }
+               } = CodexPooler.JSON.decode!(frame)
+
+        refute frame =~ internal_reason
+        assert FakeUpstream.count(upstream) == 0
+        assert Repo.aggregate(Request, :count) == 0
+        assert Repo.aggregate(Attempt, :count) == 0
+        assert Repo.aggregate(LedgerEntry, :count) == 0
+      after
+        Admission.release(lease)
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
 
   test "POST /v1/responses denies unavailable canonical reasoning before JSON or SSE dispatch", %{
     conn: conn
@@ -103,10 +278,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   } do
     cases = [
       {[maximum_reasoning_effort: "medium"], %{}, false, "medium", "allow_up_to"},
-      {[maximum_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, true, "low",
-       "allow_up_to"},
-      {[enforced_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, false, "high",
-       "always_use"},
+      {[maximum_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, true, "low", "allow_up_to"},
+      {[enforced_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, false, "high", "always_use"},
       {[], %{}, false, nil, "unrestricted"},
       {[], %{"reasoning" => %{"effort" => "focused"}}, false, "focused", "unrestricted"}
     ]
@@ -151,6 +324,94 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end
   end
 
+  test "POST /v1/responses rewrites ultra to the highest catalog level and forwards none unchanged",
+       %{conn: conn} do
+    cases = [
+      {"ultra", "xhigh", "ultra_to_xhigh"},
+      {"none", "none", nil}
+    ]
+
+    for {requested_effort, expected_effort, expected_rewrite} <- cases do
+      upstream = start_upstream(reasoning_policy_responses_upstream())
+
+      setup =
+        gateway_setup(upstream,
+          model_metadata: %{"supported_reasoning_levels" => ~w(low medium high xhigh)}
+        )
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic",
+          "reasoning" => %{"effort" => requested_effort}
+        })
+
+      assert %{"id" => "resp_reasoning_policy_v1"} = json_response(response, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["reasoning"]["effort"] == expected_effort
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      assert get_in(attempt.response_metadata, ["reasoning", "requested_effort"]) ==
+               requested_effort
+
+      assert get_in(attempt.response_metadata, ["reasoning", "effective_effort"]) ==
+               expected_effort
+
+      assert get_in(attempt.response_metadata, ["reasoning", "rewrite"]) == expected_rewrite
+    end
+  end
+
+  @tag :model_serving_modes
+  test "public Responses keeps one model id while switching only the outgoing Pool mode", %{
+    conn: conn
+  } do
+    for stream? <- [false, true] do
+      upstream = start_upstream(public_mode_matrix_upstream())
+      setup = gateway_setup(upstream)
+
+      payload = %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic public mode input",
+        "stream" => stream?
+      }
+
+      put_public_model_serving_mode!(setup, "full")
+
+      full_response =
+        conn
+        |> recycle()
+        |> put_req_header("x-openai-internal-codex-responses-lite", "client-spoofed-lite")
+        |> auth(setup)
+        |> post("/v1/responses", payload)
+
+      assert_public_mode_matrix_response!(full_response, stream?)
+
+      put_public_model_serving_mode!(setup, "lite")
+
+      lite_response =
+        conn
+        |> recycle()
+        |> put_req_header("x-openai-internal-codex-responses-lite", "client-spoofed-lite")
+        |> auth(setup)
+        |> post("/v1/responses", payload)
+
+      assert_public_mode_matrix_response!(lite_response, stream?)
+
+      assert [full_capture, lite_capture] = FakeUpstream.requests(upstream)
+      assert full_capture.path == "/backend-api/codex/responses"
+      assert lite_capture.path == "/backend-api/codex/responses"
+      assert full_capture.json["model"] == setup.model.upstream_model_id
+      assert lite_capture.json["model"] == setup.model.upstream_model_id
+      assert_public_mode_matrix_bodies!(full_capture, lite_capture)
+      assert_public_mode_matrix_headers!(full_capture, lite_capture)
+      assert_public_mode_matrix_metadata!(setup, ["full", "lite"])
+    end
+  end
+
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
 
   alias CodexPooler.Gateway.Persistence.{
@@ -161,11 +422,16 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     SessionContinuity
   }
 
+  alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
+  alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPoolerWeb.PublicGatewayResult
+  alias CodexPoolerWeb.Runtime.V1BridgedAnchorSupport, as: BridgedAnchor
   alias Ecto.Adapters.SQL.Sandbox
 
-  @websocket_frame_timeout 1_000
+  # Detection budget for a server-side connection teardown the test only
+  # observes, never a scenario timeout.
+  @connection_shutdown_timeout_ms 15_000
   @ttfh_threshold_ms 9_500
   @timing_observation_timeout_ms 1_000
   @failure_observation_timeout_ms 2_000
@@ -175,8 +441,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     |> put_req_header("x-codex-turn-metadata", "turn-metadata-redacted")
     |> put_req_header("x-codex-window-id", "window-redacted")
     |> put_req_header("x-codex-parent-thread-id", "thread-redacted")
-    |> put_req_header("x-codex-installation-id", "installation-redacted")
     |> put_req_header("x-openai-subagent", "subagent-redacted")
+    |> put_req_header("x-openai-memgen-request", "true")
+    |> put_req_header("x-codex-guardian", "reviewer")
+    |> put_req_header("x-codex-inference-call-id", "public-inference-call-redacted")
     |> put_req_header("x-codex-extra", "extra-redacted")
     |> put_req_header("x-openai-extra", "extra-redacted")
     |> put_req_header("cookie", "public-client-cookie")
@@ -204,7 +472,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                       reason: "request_finalized",
                       payload: %{"status" => "succeeded"}
                     }},
-                   @websocket_frame_timeout
+                   @detection_timeout_ms
   end
 
   defp perform_public_continuity_websocket_request!(port, setup, extra_headers) do
@@ -215,7 +483,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
@@ -229,7 +497,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert %{
                "type" => "response.completed",
                "response" => %{"id" => "resp_v1_websocket_continuity"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert_receive_finalized_request!()
 
@@ -245,55 +513,6 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute Map.has_key?(captured_headers, "session-id")
     refute Map.has_key?(captured_headers, "x-session-id")
     refute Map.has_key?(captured_headers, "x-session-affinity")
-  end
-
-  defp assert_pinned_reauth_recovery_body!(conn) do
-    assert get_resp_header(conn, "x-codex-recovery-kind") == ["restart_with_full_context"]
-
-    assert %{
-             "error" => %{
-               "code" => "pinned_continuation_reauth_required",
-               "retryable" => false,
-               "requires_new_upstream_session" => true,
-               "recovery_kind" => "restart_with_full_context",
-               "recovery" => recovery
-             }
-           } = json_response(conn, 503)
-
-    assert_pinned_reauth_recovery_contract!(recovery)
-  end
-
-  defp assert_pinned_reauth_recovery_frame!(frame) do
-    assert %{
-             "type" => "error",
-             "status" => 503,
-             "error" => %{
-               "code" => "pinned_continuation_reauth_required",
-               "retryable" => false,
-               "requires_new_upstream_session" => true,
-               "recovery_kind" => "restart_with_full_context",
-               "recovery" => recovery
-             }
-           } = Jason.decode!(frame)
-
-    assert_pinned_reauth_recovery_contract!(recovery)
-  end
-
-  defp assert_pinned_reauth_recovery_contract!(recovery) do
-    assert recovery["kind"] == "restart_with_full_context"
-    assert recovery["anchor_removal"]["body"] == ["previous_response_id"]
-
-    assert recovery["anchor_removal"]["headers"] == [
-             "x-codex-previous-response-id",
-             "x-codex-turn-state",
-             "x-codex-window-id",
-             "x-codex-session-id",
-             "session-id",
-             "x-session-id",
-             "x-session-affinity",
-             "session_id",
-             "x-codex-conversation-id"
-           ]
   end
 
   defp pinned_reauth_gateway_setup(pinned_upstream, fallback_upstream) do
@@ -329,7 +548,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
              Gateway.register_codex_session_continuity(
                session,
                %{},
-               Jason.encode!(%{"id" => previous_response_id})
+               CodexPooler.JSON.encode!(%{"id" => previous_response_id})
              )
 
     session
@@ -426,9 +645,31 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   test "GET /v1/responses upgrades and dispatches through the public websocket route" do
     upstream =
-      start_upstream(public_websocket_completed_response("resp_v1_websocket_public"))
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_v1_websocket_public",
+                 "status" => "completed",
+                 "service_tier" => "fast",
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+               }
+             }}
+          ],
+          done: false
+        )
+      )
 
-    setup = gateway_setup(upstream)
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{"service_tiers" => [%{"id" => "priority"}]}
+        }
+      )
+
     request_count = Repo.aggregate(Request, :count)
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
@@ -450,12 +691,13 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert Repo.aggregate(Request, :count) == request_count
 
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
           "stream" => true,
-          "generate" => true
+          "generate" => true,
+          "service_tier" => "fast"
         })
 
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
@@ -463,14 +705,18 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert %{
                "type" => "response.completed",
-               "response" => %{"id" => "resp_v1_websocket_public"}
-             } = Jason.decode!(frame)
+               "response" => %{
+                 "id" => "resp_v1_websocket_public",
+                 "service_tier" => "fast"
+               }
+             } = CodexPooler.JSON.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["type"] == "response.create"
       assert captured.json["generate"] == true
+      assert captured.json["service_tier"] == "priority"
 
       assert_no_continuity_headers_forwarded!(captured)
 
@@ -545,7 +791,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
             "generate" => true
           }
           |> Map.merge(effort_payload)
-          |> Jason.encode!()
+          |> CodexPooler.JSON.encode!()
 
         {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
         {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
@@ -553,7 +799,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         assert %{
                  "type" => "response.completed",
                  "response" => %{"id" => "resp_v1_ws_reasoning_policy"}
-               } = Jason.decode!(frame)
+               } = CodexPooler.JSON.decode!(frame)
 
         assert [captured] = FakeUpstream.requests(upstream)
         assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
@@ -563,7 +809,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                           reason: "request_finalized",
                           payload: %{"request_id" => request_id, "status" => "succeeded"}
                         }},
-                       @websocket_frame_timeout
+                       @detection_timeout_ms
 
         request = Repo.get!(Request, request_id)
         assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
@@ -597,7 +843,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => "synthetic public websocket policy denial",
@@ -617,7 +863,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                  "message" => @reasoning_denial_message,
                  "param" => "reasoning.effort"
                }
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert FakeUpstream.count(upstream) == 0
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -674,7 +920,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
@@ -692,7 +938,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                  "status" => "incomplete",
                  "incomplete_details" => %{"reason" => "max_output_tokens"}
                }
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       refute frame =~ "response.failed"
       assert_receive_finalized_request!()
@@ -719,9 +965,15 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   test "GET /v1/responses websocket coerces public opencode replay frames before dispatch" do
     upstream =
-      start_upstream(public_websocket_completed_response("resp_v1_websocket_opencode_replay"))
+      start_upstream(
+        # provenance: synthetic_adversarial; healthy producing turn followed by anchored replay.
+        FakeUpstream.strict_sequence([
+          public_websocket_completed_response("resp_v1_ws_opencode_previous"),
+          public_websocket_completed_response("resp_v1_websocket_opencode_replay")
+        ])
+      )
 
-    setup = gateway_setup(upstream)
+    setup = gateway_setup(upstream, model_metadata: %{"input_modalities" => ["text", "image"]})
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
     request_id = "v1-public-ws-opencode-#{System.unique_integer([:positive])}"
@@ -733,11 +985,18 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       ])
 
     try do
+      opener = CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "input" => "synthetic opener"})
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, opener)
+      {conn, websocket, opener_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      assert %{"type" => "response.completed", "response" => %{"id" => previous_response_id}} = CodexPooler.JSON.decode!(opener_frame)
+      assert previous_response_id == "resp_v1_ws_opencode_previous"
+      assert_receive_finalized_request!()
+
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
-          "previous_response_id" => "resp_v1_ws_opencode_previous",
+          "previous_response_id" => previous_response_id,
           "store" => false,
           "moderation" => %{"model" => "omni-moderation-latest"},
           "input" => [
@@ -758,7 +1017,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
               "call_id" => "",
               "name" => "lookup_fixture",
               "namespace" => "browser.search",
-              "arguments" => "{\"value\":\"sample\"}"
+              "arguments" => "{\"value\":\"sample\"}",
+              "encrypted_function_args" => []
             },
             %{
               "type" => "function_call_output",
@@ -777,15 +1037,17 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert %{
                "type" => "response.completed",
                "response" => %{"id" => "resp_v1_websocket_opencode_replay"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      assert [producing, captured] = FakeUpstream.requests(upstream)
+      assert producing.websocket_connection_id == captured.websocket_connection_id
+      refute Map.has_key?(producing.json, "previous_response_id")
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["type"] == "response.create"
       assert captured.json["generate"] == true
       assert captured.json["stream"] == true
       assert captured.json["store"] == false
-      assert captured.json["previous_response_id"] == "resp_v1_ws_opencode_previous"
+      assert captured.json["previous_response_id"] == previous_response_id
       assert captured.json["moderation"] == %{"model" => "omni-moderation-latest"}
 
       assert Enum.map(captured.json["input"], & &1["type"]) == [
@@ -799,6 +1061,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       refute Map.has_key?(hd(captured.json["input"]), "id")
       assert Enum.at(captured.json["input"], 1)["id"] == "rs_v1_ws_opencode_reasoning"
       assert Enum.at(captured.json["input"], 2)["id"] == "fc_v1_ws_opencode_call"
+      assert Enum.at(captured.json["input"], 2)["encrypted_function_args"] == []
 
       assert Enum.at(captured.json["input"], 2)["call_id"] == "fc_v1_ws_opencode_call"
       assert Enum.at(captured.json["input"], 2)["namespace"] == "browser.search"
@@ -806,7 +1069,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert_receive_finalized_request!()
 
-      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [opener_request, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
+      assert opener_request.status == "succeeded"
       assert request.endpoint == "/v1/responses"
       assert request.transport == "websocket"
       assert request.status == "succeeded"
@@ -819,6 +1083,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       refute persistence_text =~ "fc_v1_ws_opencode_call"
       refute persistence_text =~ setup.authorization
       refute persistence_text =~ setup.raw_key
+      assert :ok = FakeUpstream.verify!(upstream)
 
       conn
     after
@@ -830,7 +1095,13 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   test "GET /v1/responses websocket forwards namespaced custom tool replay before dispatch" do
     upstream =
-      start_upstream(public_websocket_completed_response("resp_v1_websocket_custom_tool_replay"))
+      start_upstream(
+        # provenance: synthetic_adversarial; healthy producing turn followed by namespaced replay.
+        FakeUpstream.strict_sequence([
+          public_websocket_completed_response("resp_v1_custom_tool_previous"),
+          public_websocket_completed_response("resp_v1_websocket_custom_tool_replay")
+        ])
+      )
 
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
@@ -843,11 +1114,18 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       ])
 
     try do
+      opener = CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "input" => "synthetic opener"})
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, opener)
+      {conn, websocket, opener_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      assert %{"type" => "response.completed", "response" => %{"id" => previous_response_id}} = CodexPooler.JSON.decode!(opener_frame)
+      assert previous_response_id == "resp_v1_custom_tool_previous"
+      assert_receive_finalized_request!()
+
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
-          "previous_response_id" => "resp_v1_custom_tool_previous",
+          "previous_response_id" => previous_response_id,
           "store" => false,
           "generate" => true,
           "input" => [
@@ -884,15 +1162,17 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert %{
                "type" => "response.completed",
                "response" => %{"id" => "resp_v1_websocket_custom_tool_replay"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert_receive_finalized_request!()
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      assert [producing, captured] = FakeUpstream.requests(upstream)
+      assert producing.websocket_connection_id == captured.websocket_connection_id
+      refute Map.has_key?(producing.json, "previous_response_id")
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["type"] == "response.create"
       assert captured.json["generate"] == true
-      assert captured.json["previous_response_id"] == "resp_v1_custom_tool_previous"
+      assert captured.json["previous_response_id"] == previous_response_id
 
       assert [custom_call, custom_output] = captured.json["input"]
       assert custom_call["type"] == "custom_tool_call"
@@ -906,7 +1186,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert custom_output["name"] == "lookup"
       assert custom_output["output"] == "synthetic custom output"
 
-      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [opener_request, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
+      assert opener_request.status == "succeeded"
       assert request.endpoint == "/v1/responses"
       assert request.transport == "websocket"
       assert request.status == "succeeded"
@@ -920,6 +1201,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       refute persistence_text =~ "turn_v1_custom_output"
       refute persistence_text =~ setup.authorization
       refute persistence_text =~ setup.raw_key
+      assert :ok = FakeUpstream.verify!(upstream)
 
       conn
     after
@@ -941,7 +1223,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "conversation.item.create",
           "item" => %{
             "type" => "message",
@@ -953,9 +1235,11 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {_conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"type" => "error", "status" => 400, "error" => error} = Jason.decode!(frame)
+      assert %{"type" => "error", "status" => 400, "error" => error} =
+               CodexPooler.JSON.decode!(frame)
+
       assert error["code"] == "invalid_request"
-      assert error["param"] == "model"
+      assert error["param"] == "type"
 
       refute frame =~ "synthetic realtime text"
       assert FakeUpstream.requests(upstream) == []
@@ -969,14 +1253,21 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   @tag :tool_result_previous_response
   test "GET /v1/responses websocket forwards the same safe continuation shape and rejects malformed item references" do
+    previous_response_id = "resp_v1_ws_safe_previous_#{System.unique_integer([:positive])}"
+
     upstream =
-      start_upstream(public_websocket_completed_response("resp_v1_websocket_safe_continuation"))
+      start_upstream(
+        # provenance: synthetic_adversarial; healthy producing turn followed by safe continuation.
+        FakeUpstream.strict_sequence([
+          public_websocket_completed_response(previous_response_id),
+          public_websocket_completed_response("resp_v1_websocket_safe_continuation")
+        ])
+      )
 
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
     turn_state = "v1-safe-continuation-ws-#{System.unique_integer([:positive])}"
-    previous_response_id = "resp_v1_ws_safe_previous_#{System.unique_integer([:positive])}"
     tool_call_id = "call_v1_ws_safe_#{System.unique_integer([:positive])}"
 
     {safe_conn, safe_websocket, safe_ref, _response_headers} =
@@ -985,8 +1276,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       ])
 
     try do
+      opener = CodexPooler.JSON.encode!(%{"type" => "response.create", "model" => setup.model.exposed_model_id, "input" => "synthetic opener"})
+      {safe_conn, safe_websocket} = public_websocket_send_text!(safe_conn, safe_websocket, safe_ref, opener)
+      {safe_conn, safe_websocket, opener_frame} = public_websocket_receive_text!(safe_conn, safe_websocket, safe_ref)
+      assert %{"type" => "response.completed", "response" => %{"id" => ^previous_response_id}} = CodexPooler.JSON.decode!(opener_frame)
+      assert_receive_finalized_request!()
+
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => previous_response_id,
@@ -997,6 +1294,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
             %{
               "type" => "function_call_output",
               "call_id" => tool_call_id,
+              "name" => "lookup",
+              "namespace" => "browser.search",
               "output" => "{\"ok\":true}"
             },
             %{
@@ -1015,11 +1314,13 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert %{
                "type" => "response.completed",
                "response" => %{"id" => "resp_v1_websocket_safe_continuation"}
-             } = Jason.decode!(frame)
+             } = CodexPooler.JSON.decode!(frame)
 
       assert_receive_finalized_request!()
 
-      assert [captured] = FakeUpstream.requests(upstream)
+      assert [producing, captured] = FakeUpstream.requests(upstream)
+      assert producing.websocket_connection_id == captured.websocket_connection_id
+      refute Map.has_key?(producing.json, "previous_response_id")
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["type"] == "response.create"
       assert captured.json["generate"] == true
@@ -1035,9 +1336,12 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert hd(captured.json["input"])["id"] == "msg_v1_ws_safe_reference"
       assert Enum.at(captured.json["input"], 1)["call_id"] == tool_call_id
+      assert Enum.at(captured.json["input"], 1)["name"] == "lookup"
+      assert Enum.at(captured.json["input"], 1)["namespace"] == "browser.search"
       assert Enum.at(captured.json["input"], 2)["role"] == "user"
 
-      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [opener_request, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
+      assert opener_request.status == "succeeded"
       assert request.endpoint == "/v1/responses"
       assert request.transport == "websocket"
       assert request.status == "succeeded"
@@ -1054,7 +1358,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       try do
         invalid_payload =
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.create",
             "model" => setup.model.exposed_model_id,
             "previous_response_id" => invalid_previous_response_id,
@@ -1085,7 +1389,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
           public_websocket_receive_text!(invalid_conn, invalid_websocket, invalid_ref)
 
         assert %{"type" => "error", "status" => 400, "error" => error} =
-                 Jason.decode!(invalid_frame)
+                 CodexPooler.JSON.decode!(invalid_frame)
 
         assert error["code"] == "invalid_request"
         assert error["param"] == "input"
@@ -1097,9 +1401,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         Mint.HTTP.close(invalid_conn)
       end
 
-      assert FakeUpstream.count(upstream) == 1
-      assert Repo.aggregate(Request, :count) == 1
-      assert Repo.aggregate(Attempt, :count) == 1
+      assert FakeUpstream.count(upstream) == 2
+      assert Repo.aggregate(Request, :count) == 2
+      assert Repo.aggregate(Attempt, :count) == 2
+      assert :ok = FakeUpstream.verify!(upstream)
 
       safe_conn
     after
@@ -1134,9 +1439,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     requests =
       Repo.all(
-        from r in Request,
+        from(r in Request,
           where: r.pool_id == ^setup.pool.id,
           order_by: [asc: r.admitted_at]
+        )
       )
 
     assert Enum.map(requests, & &1.endpoint) == ["/v1/responses", "/v1/responses"]
@@ -1176,6 +1482,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
+  @tag :capture_log
   test "GET /v1/responses blocked by runtime ingress fails before websocket upgrade", %{
     conn: conn
   } do
@@ -1210,6 +1517,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
              "response" => %{
                "id" => "resp_v1_non_stream",
                "status" => "completed",
+               "service_tier" => "fast",
                "output" => [
                  %{
                    "type" => "message",
@@ -1228,7 +1536,12 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         ])
       )
 
-    setup = gateway_setup(upstream)
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{"service_tiers" => [%{"id" => "priority"}]}
+        }
+      )
 
     conn =
       conn
@@ -1236,10 +1549,16 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
         "input" => "synthetic v1 response",
+        "service_tier" => "fast",
         "reasoning" => %{"effort" => "focused"}
       })
 
-    assert %{"id" => "resp_v1_non_stream", "object" => "response", "usage" => usage} =
+    assert %{
+             "id" => "resp_v1_non_stream",
+             "object" => "response",
+             "service_tier" => "fast",
+             "usage" => usage
+           } =
              json_response(conn, 200)
 
     assert usage["input_tokens"] == 23
@@ -1252,6 +1571,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
+    assert captured.json["service_tier"] == "priority"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "succeeded"
@@ -1280,7 +1600,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert settlement.input_tokens == 23
     assert settlement.cached_input_tokens == 11
     assert settlement.output_tokens == 29
-    assert settlement.reasoning_tokens == nil
+    assert settlement.reasoning_tokens == 17
     assert settlement.total_tokens == 52
     refute Map.has_key?(settlement.details, "input_tokens_details")
     refute Map.has_key?(settlement.details, "output_tokens_details")
@@ -1291,14 +1611,1372 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert log.token_counts.input_tokens == 23
     assert log.token_counts.cached_input_tokens == 11
     assert log.token_counts.output_tokens == 29
-    assert log.token_counts.reasoning_tokens == nil
+    assert log.token_counts.reasoning_tokens == 17
     assert log.token_counts.total_tokens == 52
     refute Map.has_key?(log.token_counts, :input_tokens_details)
     refute Map.has_key?(log.token_counts, :output_tokens_details)
   end
 
+  @tag :ultrafast_service_tier
+  test "POST /v1/responses forwards, projects, and accounts for ultrafast JSON responses", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_ultrafast_json",
+          "object" => "response",
+          "status" => "completed",
+          "service_tier" => "ultrafast",
+          "output" => [],
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+        })
+      )
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{"service_tiers" => [%{"id" => "ultrafast"}]}
+        }
+      )
+
+    ultrafast_pricing =
+      pricing_snapshot!(setup.model, %{
+        config: pricing_config(%{"service_tier" => "ultrafast"}),
+        input_token_micros: Decimal.new(100),
+        output_token_micros: Decimal.new(200)
+      })
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic ultrafast JSON request",
+        "service_tier" => "ultrafast"
+      })
+
+    assert %{
+             "id" => "resp_v1_ultrafast_json",
+             "object" => "response",
+             "service_tier" => "ultrafast"
+           } = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["service_tier"] == "ultrafast"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.requested_service_tier == "ultrafast"
+    assert request.actual_service_tier == "ultrafast"
+    assert request.service_tier == "ultrafast"
+    assert request.request_metadata["pricing"]["status"] == "priced"
+    assert request.request_metadata["pricing"]["requested_service_tier"] == "ultrafast"
+    assert request.request_metadata["pricing"]["actual_service_tier"] == "ultrafast"
+    assert request.request_metadata["pricing"]["service_tier"] == "ultrafast"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.pricing_snapshot_id == ultrafast_pricing.id
+
+    assert [settlement] =
+             Repo.all(
+               from(l in LedgerEntry,
+                 where:
+                   l.request_id == ^request.id and l.entry_kind == "settlement" and
+                     l.amount_status == "recorded"
+               )
+             )
+
+    assert settlement.pricing_snapshot_id == ultrafast_pricing.id
+    assert settlement.details["pricing_status"] == "priced"
+    assert settlement.details["requested_service_tier"] == "ultrafast"
+    assert settlement.details["actual_service_tier"] == "ultrafast"
+    assert settlement.details["service_tier"] == "ultrafast"
+
+    assert %{items: [log], total: 1} =
+             RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+    assert log.requested_service_tier == "ultrafast"
+    assert log.actual_service_tier == "ultrafast"
+    assert log.service_tier == "ultrafast"
+    assert log.cost.status == "priced"
+  end
+
+  @tag :ultrafast_service_tier
+  test "POST /v1/responses forwards, projects, and accounts for ultrafast SSE responses", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_ultrafast_sse",
+               "status" => "completed",
+               "service_tier" => "ultrafast",
+               "output" => [],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+             }
+           }}
+        ])
+      )
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{"service_tiers" => [%{"id" => "ultrafast"}]}
+        }
+      )
+
+    ultrafast_pricing =
+      pricing_snapshot!(setup.model, %{
+        config: pricing_config(%{"service_tier" => "ultrafast"}),
+        input_token_micros: Decimal.new(100),
+        output_token_micros: Decimal.new(200)
+      })
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic ultrafast SSE request",
+        "service_tier" => "ultrafast",
+        "stream" => true
+      })
+
+    assert conn.status == 200
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+
+    completed =
+      conn.resp_body
+      |> public_sse_events()
+      |> Enum.find(&(&1["event"] == "response.completed"))
+
+    assert %{"data" => completed} = completed
+
+    assert completed["response"]["id"] == "resp_v1_ultrafast_sse"
+    assert completed["response"]["service_tier"] == "ultrafast"
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["service_tier"] == "ultrafast"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+    assert request.requested_service_tier == "ultrafast"
+    assert request.actual_service_tier == "ultrafast"
+    assert request.service_tier == "ultrafast"
+    assert request.request_metadata["pricing"]["status"] == "priced"
+    assert request.request_metadata["pricing"]["requested_service_tier"] == "ultrafast"
+    assert request.request_metadata["pricing"]["actual_service_tier"] == "ultrafast"
+    assert request.request_metadata["pricing"]["service_tier"] == "ultrafast"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.transport == "http_sse"
+    assert attempt.status == "succeeded"
+    assert attempt.pricing_snapshot_id == ultrafast_pricing.id
+
+    assert [settlement] =
+             Repo.all(
+               from(l in LedgerEntry,
+                 where:
+                   l.request_id == ^request.id and l.entry_kind == "settlement" and
+                     l.amount_status == "recorded"
+               )
+             )
+
+    assert settlement.pricing_snapshot_id == ultrafast_pricing.id
+    assert settlement.details["pricing_status"] == "priced"
+    assert settlement.details["requested_service_tier"] == "ultrafast"
+    assert settlement.details["actual_service_tier"] == "ultrafast"
+    assert settlement.details["service_tier"] == "ultrafast"
+
+    assert %{items: [log], total: 1} =
+             RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+    assert log.requested_service_tier == "ultrafast"
+    assert log.actual_service_tier == "ultrafast"
+    assert log.service_tier == "ultrafast"
+    assert log.cost.status == "priced"
+  end
+
+  # codex issue 46632: the provider answered `gpt-6-astra` with a response
+  # findings#239: the public SSE surface carries no native controls, so a
+  # provider `headers` object is dropped from every relayed event, top-level
+  # and nested under `response`, while a block without one keeps the bytes
+  # the upstream sent.
+  test "POST /v1/responses SSE relays no provider event header objects and keeps header-free blocks byte-identical",
+       %{conn: conn} do
+    control_delta = %{
+      "type" => "response.output_text.delta",
+      "delta" => " world",
+      "sequence_number" => 2
+    }
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "headers" => %{
+               "openai-model" => "gpt-event-header-sentinel",
+               "x-codex-primary-used-percent" => "42"
+             },
+             "response" => %{
+               "id" => "resp_v1_sse_event_headers",
+               "status" => "in_progress",
+               "output" => [],
+               "headers" => %{"openai-model" => "gpt-nested-header-sentinel"}
+             }
+           }},
+          {"response.output_text.delta",
+           %{
+             "type" => "response.output_text.delta",
+             "delta" => "hello",
+             "headers" => %{"x-reasoning-included" => "delta-header-sentinel"}
+           }},
+          {"response.output_text.delta", control_delta},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_sse_event_headers",
+               "status" => "completed",
+               "output" => [],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic event header SSE request",
+        "stream" => true
+      })
+
+    assert conn.status == 200
+    refute conn.resp_body =~ ~s("headers")
+    refute conn.resp_body =~ "-sentinel"
+
+    events = public_sse_events(conn.resp_body)
+
+    assert Enum.map(events, & &1["event"]) == [
+             "response.created",
+             "response.output_text.delta",
+             "response.output_text.delta",
+             "response.completed"
+           ]
+
+    for %{"data" => data} <- events do
+      refute Map.has_key?(data, "headers")
+
+      case data["response"] do
+        %{} = response -> refute Map.has_key?(response, "headers")
+        _absent -> :ok
+      end
+    end
+
+    control_block =
+      "event: response.output_text.delta\ndata: " <>
+        CodexPooler.JSON.encode!(control_delta) <> "\n\n"
+
+    assert String.contains?(conn.resp_body, control_block)
+  end
+
+  # object declaring `gpt-5.6-luna`. The attempt keeps the model it sent and
+  # the one the first response object declared, on every upstream body shape.
+  test "POST /v1/responses SSE records the model the upstream declared it served", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "response" => %{
+               "id" => "resp_v1_served_sse",
+               "status" => "in_progress",
+               "model" => "gpt-served-variant",
+               "output" => []
+             }
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_served_sse",
+               "status" => "completed",
+               "model" => "gpt-served-variant",
+               "output" => [],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic served model SSE request",
+        "stream" => true
+      })
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "event: response.completed\n"
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["model"] == setup.model.upstream_model_id
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.requested_model == setup.model.exposed_model_id
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.transport == "http_sse"
+    assert attempt.status == "succeeded"
+    assert attempt.upstream_model_id == setup.model.upstream_model_id
+    assert attempt.served_model == "gpt-served-variant"
+
+    assert %{items: [log], total: 1} =
+             RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+    assert log.requested_model == setup.model.exposed_model_id
+    assert log.upstream_model == setup.model.upstream_model_id
+    assert log.served_model == "gpt-served-variant"
+  end
+
+  test "POST /v1/responses JSON records the model the upstream declared it served", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_served_json",
+          "object" => "response",
+          "status" => "completed",
+          "model" => "gpt-served-variant",
+          "output" => [],
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic served model JSON request"
+      })
+
+    assert %{"id" => "resp_v1_served_json", "model" => "gpt-served-variant"} =
+             json_response(conn, 200)
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.upstream_model_id == setup.model.upstream_model_id
+    assert attempt.served_model == "gpt-served-variant"
+
+    assert %{items: [log], total: 1} =
+             RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+    assert log.upstream_model == setup.model.upstream_model_id
+    assert log.served_model == "gpt-served-variant"
+  end
+
+  test "POST /v1/responses records the served model even when it echoes the sent one, and none when undeclared", %{conn: conn} do
+    echoing =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_served_echo",
+          "object" => "response",
+          "status" => "completed",
+          "model" => nil,
+          "output" => [],
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+        })
+      )
+
+    setup = gateway_setup(echoing)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic undeclared model request"
+      })
+
+    assert %{"id" => "resp_v1_served_echo"} = json_response(conn, 200)
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.served_model == nil
+
+    FakeUpstream.set_mode(
+      echoing,
+      FakeUpstream.json_response(%{
+        "id" => "resp_v1_served_echo_2",
+        "object" => "response",
+        "status" => "completed",
+        "model" => setup.model.upstream_model_id,
+        "output" => [],
+        "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+      })
+    )
+
+    conn =
+      build_conn()
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic echoed model request"
+      })
+
+    assert %{"id" => "resp_v1_served_echo_2"} = json_response(conn, 200)
+
+    assert [echoed] =
+             Repo.all(
+               from(a in Attempt,
+                 join: r in Request,
+                 on: r.id == a.request_id,
+                 where: r.pool_id == ^setup.pool.id and a.request_id != ^request.id
+               )
+             )
+
+    assert echoed.served_model == setup.model.upstream_model_id
+    assert echoed.served_model == echoed.upstream_model_id
+  end
+
+  test "POST /v1/responses relays standalone-CR upstream SSE through the live HTTP endpoint" do
+    terminal = %{
+      "type" => "response.completed",
+      "response" => %{
+        "id" => "resp_v1_standalone_cr",
+        "object" => "response",
+        "status" => "completed",
+        "output" => [],
+        "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+      }
+    }
+
+    source =
+      "event: response.completed\rdata: " <> CodexPooler.JSON.encode!(terminal) <> "\r\r"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.chunked_response([source, "\n"],
+          headers: [{"content-type", "text/event-stream"}]
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => "synthetic standalone CR response",
+      "stream" => true
+    }
+
+    {:ok, http_conn, ref, started} = start_public_v1_responses_request(port, setup, payload)
+
+    try do
+      {http_conn, status, response_headers, _elapsed_ms, chunks, done?} =
+        await_public_response_headers!(http_conn, ref, started, @timing_observation_timeout_ms)
+
+      assert status == 200
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+
+      {body, :eof} =
+        await_public_response_eof!(
+          http_conn,
+          ref,
+          chunks,
+          done?,
+          @timing_observation_timeout_ms
+        )
+
+      assert [%{"event" => "response.created"}, %{"event" => "response.completed"} = event] =
+               public_sse_events(body)
+
+      assert get_in(event, ["data", "response", "id"]) == "resp_v1_standalone_cr"
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "succeeded"
+      assert request.transport == "http_sse"
+    after
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :external_issues_229_231
+  @tag :issue_231
+  test "POST /v1/responses uses a divergent healthy canonical alternate for JSON and SSE", %{
+    conn: conn
+  } do
+    for stream? <- [false, true] do
+      selected_upstream =
+        start_upstream(FakeUpstream.json_response(%{"id" => "selected_must_not_dispatch"}))
+
+      alternate_upstream =
+        start_upstream(issue_231_completed_response("resp_issue_231_responses_#{stream?}"))
+
+      {setup, alternate, source_proof} =
+        issue_231_gateway_setup(selected_upstream, alternate_upstream, divergent?: true)
+
+      assert source_proof.selected_digest != source_proof.alternate_digest
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "issue-231-private-responses-input",
+          "stream" => stream?,
+          "service_tier" => "priority",
+          "reasoning" => %{"effort" => "high"}
+        })
+
+      if stream? do
+        assert response.status == 200
+        assert [content_type] = get_resp_header(response, "content-type")
+        assert content_type =~ "text/event-stream"
+        assert response.resp_body =~ "response.completed"
+        assert response.resp_body =~ "resp_issue_231_responses_true"
+      else
+        assert %{"id" => "resp_issue_231_responses_false", "object" => "response"} =
+                 json_response(response, 200)
+      end
+
+      assert FakeUpstream.count(selected_upstream) == 0
+      assert [captured] = FakeUpstream.requests(alternate_upstream)
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["model"] == setup.model.upstream_model_id
+      assert captured.json["service_tier"] == "priority"
+      assert get_in(captured.json, ["reasoning", "effort"]) == "high"
+
+      assert_issue_231_successful_accounting!(setup, alternate, "/v1/responses")
+    end
+  end
+
+  @tag :external_issues_229_231
+  @tag :issue_231
+  test "POST /v1/responses keeps identical canonical sources eligible under weekly quota", %{
+    conn: conn
+  } do
+    selected_upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "selected_must_not_dispatch"}))
+
+    alternate_upstream =
+      start_upstream(issue_231_completed_response("resp_issue_231_identical_control"))
+
+    {setup, alternate, source_proof} =
+      issue_231_gateway_setup(selected_upstream, alternate_upstream, divergent?: false)
+
+    assert source_proof.selected_digest == source_proof.alternate_digest
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "issue-231-private-identical-control",
+        "service_tier" => "priority",
+        "reasoning" => %{"effort" => "high"}
+      })
+
+    assert %{"id" => "resp_issue_231_identical_control"} = json_response(response, 200)
+    assert FakeUpstream.count(selected_upstream) == 0
+    assert FakeUpstream.count(alternate_upstream) == 1
+    assert_issue_231_successful_accounting!(setup, alternate, "/v1/responses")
+  end
+
+  @tag :external_issues_229_231
+  @tag :issue_231
+  @tag :issue_231_all_exhausted
+  test "POST /v1/responses rejects all divergent weekly-exhausted candidates without dispatch", %{
+    conn: conn
+  } do
+    selected_upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "selected_must_not_dispatch"}))
+
+    alternate_upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "alternate_must_not_dispatch"}))
+
+    {setup, alternate, source_proof} =
+      issue_231_gateway_setup(selected_upstream, alternate_upstream, divergent?: true)
+
+    assert source_proof.selected_digest != source_proof.alternate_digest
+
+    Repo.delete_all(
+      from(window in CodexPooler.Upstreams.Quota.AccountQuotaWindow,
+        where: window.upstream_identity_id == ^alternate.identity.id
+      )
+    )
+
+    prime_weekly_exhausted_quota!(alternate.identity)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "issue-231-private-all-exhausted-input",
+        "service_tier" => "priority",
+        "reasoning" => %{"effort" => "high"}
+      })
+
+    # Every candidate exhausted with a known reset: the Pooler's own terminal
+    # usage-limit answer, unredacted on `/v1` (findings#206 row 206-508).
+    assert %{
+             "error" => %{
+               "code" => "quota_exhausted",
+               "message" => "all upstream accounts in pool are quota exhausted (0 of 2 accounts available until reset)",
+               "type" => "usage_limit_reached"
+             }
+           } = json_response(response, 429)
+
+    assert FakeUpstream.count(selected_upstream) == 0
+    assert FakeUpstream.count(alternate_upstream) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.pool_id == setup.pool.id
+    assert request.api_key_id == setup.api_key.id
+    assert request.model_id == setup.model.id
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.status == "rejected"
+    assert request.last_error_code == "quota_exhausted"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+    exclusions = request.request_metadata["candidate_exclusions"]
+
+    assert MapSet.new(exclusions, fn exclusion ->
+             {exclusion["pool_upstream_assignment_id"], exclusion["upstream_identity_id"]}
+           end) ==
+             MapSet.new([
+               {setup.assignment.id, setup.identity.id},
+               {alternate.assignment.id, alternate.identity.id}
+             ])
+
+    assert Enum.all?(exclusions, fn exclusion ->
+             exclusion["reasons"]
+             |> hd()
+             |> Map.fetch!("reason_codes") == ["exhausted"]
+           end)
+
+    assert_issue_231_private_metadata!(
+      {request.request_metadata, RequestLogs.list(setup.pool)},
+      setup
+    )
+  end
+
+  test "POST /v1/responses rejects invalid service tiers before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    for tier <- ["latency_preview", nil, 1, []] do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic invalid tier",
+          "service_tier" => tier
+        })
+
+      assert %{"error" => %{"code" => "invalid_request", "param" => "service_tier"}} =
+               json_response(response, 400)
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+    assert Repo.aggregate(LedgerEntry, :count) == 0
+  end
+
+  test "POST /v1/responses lets an enforced priority tier override an admitted client tier", %{
+    conn: conn
+  } do
+    upstream = start_upstream(reasoning_policy_responses_upstream())
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{"service_tiers" => [%{"id" => "priority"}]}
+        }
+      )
+
+    setup.api_key
+    |> Ecto.Changeset.change(enforced_service_tier: "priority")
+    |> Repo.update!()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic priority override",
+        "service_tier" => "default"
+      })
+
+    assert %{"id" => "resp_reasoning_policy_v1"} = json_response(response, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["service_tier"] == "priority"
+  end
+
+  test "POST /v1/responses rejects an enforced tier unsupported by every candidate", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    setup.api_key
+    |> Ecto.Changeset.change(enforced_service_tier: "priority")
+    |> Repo.update!()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic unsupported enforced tier",
+        "service_tier" => "default"
+      })
+
+    assert %{"error" => %{"code" => "no_compatible_backend"}} = json_response(response, 503)
+    assert FakeUpstream.count(upstream) == 0
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+    assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) == 0
+  end
+
+  @tag :programmatic_tool_calling
+  test "POST /v1/responses collects programmatic tool output with one metadata-only settlement",
+       %{
+         conn: conn
+       } do
+    sentinels = programmatic_tool_sentinels()
+    output_items = programmatic_tool_items(sentinels)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_programmatic_collected",
+               "object" => "response",
+               "status" => "completed",
+               "output" => output_items,
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    payload = programmatic_tool_payload(setup.model.exposed_model_id, sentinels)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", payload)
+
+    assert %{
+             "id" => "resp_v1_programmatic_collected",
+             "object" => "response",
+             "status" => "completed",
+             "output" => ^output_items
+           } = json_response(response, 200)
+
+    response_body = json_response(response, 200)
+
+    refute Map.has_key?(response_body, "request_id")
+    refute Map.has_key?(response_body, "attempt_id")
+    refute Map.has_key?(response_body, "pool_id")
+    refute Map.has_key?(response_body, "gateway_metadata")
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+    assert_programmatic_input_forwarded!(captured.json["input"], sentinels)
+    assert captured.json["tools"] == payload["tools"]
+    assert captured.json["tool_choice"] == payload["tool_choice"]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_sse"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+
+    assert Repo.aggregate(
+             from(l in LedgerEntry,
+               where:
+                 l.request_id == ^request.id and l.entry_kind == "settlement" and
+                   l.amount_status == "recorded"
+             ),
+             :count
+           ) == 1
+
+    assert_programmatic_metadata_only!(request, attempt, sentinels)
+  end
+
+  @tag :programmatic_tool_calling
+  test "POST /v1/responses streams ordered programmatic tool events through EOF", %{conn: _conn} do
+    sentinels = programmatic_tool_sentinels()
+    output_items = programmatic_tool_items(sentinels)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "response" => %{
+               "id" => "resp_v1_programmatic_streamed",
+               "object" => "response",
+               "status" => "in_progress"
+             }
+           }},
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 0,
+             "item" => Enum.at(output_items, 0)
+           }},
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "output_index" => 0,
+             "item" => Enum.at(output_items, 0)
+           }},
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 1,
+             "item" => Enum.at(output_items, 1)
+           }},
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "output_index" => 1,
+             "item" => Enum.at(output_items, 1)
+           }},
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 2,
+             "item" => Enum.at(output_items, 2)
+           }},
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "output_index" => 2,
+             "item" => Enum.at(output_items, 2)
+           }},
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 3,
+             "item" => Enum.at(output_items, 3)
+           }},
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "output_index" => 3,
+             "item" => Enum.at(output_items, 3)
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_programmatic_streamed",
+               "object" => "response",
+               "status" => "completed",
+               "output" => output_items,
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    payload =
+      programmatic_tool_payload(setup.model.exposed_model_id, sentinels)
+      |> Map.put("stream", true)
+
+    {:ok, http_conn, ref, started} = start_public_v1_responses_request(port, setup, payload)
+
+    try do
+      {http_conn, status, response_headers, _elapsed_ms, chunks, done?} =
+        await_public_response_headers!(http_conn, ref, started, @timing_observation_timeout_ms)
+
+      assert status == 200
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+
+      {body, :eof} =
+        await_public_response_eof!(
+          http_conn,
+          ref,
+          chunks,
+          done?,
+          @timing_observation_timeout_ms
+        )
+
+      refute body =~ "[DONE]"
+
+      events = public_sse_events(body)
+
+      assert Enum.map(events, & &1["event"]) == [
+               "response.created",
+               "response.output_item.added",
+               "response.output_item.done",
+               "response.output_item.added",
+               "response.output_item.done",
+               "response.output_item.added",
+               "response.output_item.done",
+               "response.output_item.added",
+               "response.output_item.done",
+               "response.completed"
+             ]
+
+      assert Enum.map(
+               Enum.filter(events, &(&1["event"] == "response.output_item.added")),
+               &get_in(&1, ["data", "item"])
+             ) == output_items
+
+      assert Enum.map(
+               Enum.filter(events, &(&1["event"] == "response.output_item.done")),
+               &get_in(&1, ["data", "item"])
+             ) == output_items
+
+      assert %{
+               "data" => %{
+                 "response" => %{
+                   "id" => "resp_v1_programmatic_streamed",
+                   "object" => "response",
+                   "status" => "completed",
+                   "output" => ^output_items
+                 }
+               }
+             } = List.last(events)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["stream"] == true
+      assert captured.json["store"] == false
+      assert_programmatic_input_forwarded!(captured.json["input"], sentinels)
+      assert captured.json["tools"] == payload["tools"]
+      assert captured.json["tool_choice"] == payload["tool_choice"]
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "succeeded"
+      assert request.transport == "http_sse"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "succeeded"
+
+      assert Repo.aggregate(
+               from(l in LedgerEntry,
+                 where:
+                   l.request_id == ^request.id and l.entry_kind == "settlement" and
+                     l.amount_status == "recorded"
+               ),
+               :count
+             ) == 1
+
+      assert_programmatic_metadata_only!(request, attempt, sentinels)
+    after
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :programmatic_tool_calling
+  test "POST /v1/responses rejects malformed programmatic vocabulary before admission", %{
+    conn: conn
+  } do
+    sentinels = programmatic_tool_sentinels()
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+    payload = programmatic_tool_payload(setup.model.exposed_model_id, sentinels)
+
+    invalid_cases = [
+      {"input", put_programmatic_payload_item(payload, 0, "unexpected", true)},
+      {"input", put_programmatic_payload_item(payload, 1, "caller", %{"type" => "program"})},
+      {"tools", Map.update!(payload, "tools", &[%{"type" => "programmatic_tool_calling", "unexpected" => true} | &1])},
+      {"tools", put_programmatic_payload_tool(payload, 0, "output_schema", [])}
+    ]
+
+    counts = durable_accounting_counts()
+
+    Enum.each(invalid_cases, fn {expected_param, invalid_payload} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", invalid_payload)
+
+      assert %{"error" => error} = json_response(response, 400)
+      assert error["type"] == "invalid_request_error"
+      assert error["code"] == "invalid_request"
+      assert error["param"] == expected_param
+      refute response.resp_body =~ sentinels.code
+      refute response.resp_body =~ sentinels.result
+      refute response.resp_body =~ sentinels.fingerprint
+      refute response.resp_body =~ sentinels.schema
+      refute response.resp_body =~ sentinels.item
+      refute response.resp_body =~ sentinels.call
+      refute response.resp_body =~ sentinels.caller
+    end)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert durable_accounting_counts() == counts
+  end
+
+  @tag :hosted_shell_history
+  test "POST /v1/responses forwards hosted shell history across JSON and SSE without persistence or execution",
+       %{conn: conn} do
+    fixture = hosted_shell_privacy_fixture!()
+    on_exit(fn -> File.rm_rf(fixture.temp_dir) end)
+
+    assert File.exists?(fixture.temp_dir)
+    refute File.exists?(fixture.marker_path)
+    assert {:ok, %{mode: mode}} = File.stat(fixture.temp_dir)
+    if match?({:unix, _}, :os.type()), do: assert(Bitwise.band(mode, 0o777) == 0o700)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            json: [valid: true, required: ["input"]],
+            respond: hosted_shell_completed_response("resp_hosted_shell_json")
+          ),
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            json: [valid: true, required: ["input"]],
+            respond: hosted_shell_completed_response("resp_hosted_shell_sse")
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    {{json_response_body, stream_response}, logs} =
+      with_log(fn ->
+        json_response =
+          conn
+          |> auth(setup)
+          |> post(
+            "/v1/responses",
+            hosted_shell_payload(setup.model.exposed_model_id, fixture.input)
+          )
+
+        stream_response =
+          conn
+          |> recycle()
+          |> auth(setup)
+          |> post(
+            "/v1/responses",
+            setup.model.exposed_model_id
+            |> hosted_shell_payload(fixture.input)
+            |> Map.put("stream", true)
+          )
+
+        Logger.flush()
+        {json_response(json_response, 200), stream_response}
+      end)
+
+    assert %{
+             "id" => "resp_hosted_shell_json",
+             "object" => "response",
+             "status" => "completed"
+           } = json_response_body
+
+    assert stream_response.status == 200
+    assert stream_response.resp_body =~ "event: response.completed\n"
+    refute File.exists?(fixture.marker_path)
+
+    captures = FakeUpstream.requests(upstream)
+
+    unless length(captures) == 2 do
+      flunk("expected two hosted shell upstream dispatches")
+    end
+
+    [json_capture, stream_capture] = captures
+
+    assert_hosted_shell_forwarded!(json_capture, fixture.input)
+    assert_hosted_shell_forwarded!(stream_capture, fixture.input)
+
+    requests = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    request_ids = Enum.map(requests, & &1.id)
+    attempts = Repo.all(from(a in Attempt, where: a.request_id in ^request_ids))
+
+    assert length(requests) == 2
+    assert length(attempts) == 2
+
+    observable_text =
+      inspect({
+        Enum.map(requests, & &1.request_metadata),
+        Enum.map(attempts, & &1.response_metadata),
+        RequestLogs.list(setup.pool),
+        CodexPooler.Audit.list_events(setup.pool).items,
+        logs
+      })
+
+    assert_hosted_shell_sentinels_absent!(observable_text, fixture.sentinels)
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  @tag :hosted_shell_history
+  test "POST /v1/responses relays five hosted shell events through SSE in order", %{conn: conn} do
+    events = hosted_shell_sse_events()
+    upstream = start_upstream(FakeUpstream.sse_stream(events))
+    setup = gateway_setup(upstream)
+    input = hosted_shell_history_fixture()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/responses",
+        setup.model.exposed_model_id
+        |> hosted_shell_payload(input)
+        |> Map.put("stream", true)
+      )
+
+    assert response.status == 200
+    assert [content_type] = get_resp_header(response, "content-type")
+    assert content_type =~ "text/event-stream"
+
+    relayed = public_sse_events(response.resp_body)
+    expected_types = Enum.map(events, fn {type, _event} -> type end)
+
+    assert Enum.map(relayed, & &1["event"]) == expected_types
+    assert Enum.all?(relayed, &(&1["event"] == get_in(&1, ["data", "type"])))
+
+    assert Enum.zip(events, relayed)
+           |> Enum.all?(fn {{_type, expected}, %{"data" => actual}} ->
+             Map.delete(actual, "sequence_number") == Map.delete(expected, "sequence_number")
+           end)
+
+    sequences = Enum.map(relayed, &get_in(&1, ["data", "sequence_number"]))
+    assert Enum.all?(sequences, &(is_integer(&1) and &1 >= 0))
+    assert sequences == Enum.sort(sequences)
+    assert sequences == Enum.uniq(sequences)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert_hosted_shell_forwarded!(captured, input)
+  end
+
+  @tag :hosted_shell_history
+  test "POST /v1/responses rejects malformed hosted shell history before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+    input = hosted_shell_history_fixture()
+
+    malformed_inputs = [
+      List.update_at(input, 0, &Map.put(&1, "unexpected", true)),
+      List.update_at(input, 1, fn item ->
+        Map.update!(item, "output", fn output ->
+          List.replace_at(output, 0, %{"stdout" => "", "stderr" => ""})
+        end)
+      end)
+    ]
+
+    Enum.each(malformed_inputs, fn malformed_input ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/responses",
+          hosted_shell_payload(setup.model.exposed_model_id, malformed_input)
+        )
+
+      assert %{
+               "error" => %{
+                 "code" => "invalid_request",
+                 "param" => "input",
+                 "type" => "invalid_request_error"
+               }
+             } = json_response(response, 400)
+
+      assert_no_hosted_shell_lifecycle_stream!(response.resp_body)
+      assert FakeUpstream.count(upstream) == 0
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+    end)
+  end
+
+  @tag :hosted_shell_history
+  test "live curl exercises hosted shell JSON, malformed, and SSE boundaries" do
+    input = hosted_shell_history_fixture()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            json: [valid: true, required: ["input"]],
+            respond: hosted_shell_completed_response("resp_hosted_shell_curl_json")
+          ),
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            json: [valid: true, required: ["input"]],
+            respond: FakeUpstream.sse_stream(hosted_shell_sse_events())
+          )
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {_server, port} = start_public_endpoint_with_server!()
+
+    {json_headers, json_body} =
+      curl_json_request!(
+        port,
+        setup.authorization,
+        hosted_shell_payload(setup.model.exposed_model_id, input),
+        "/v1/responses"
+      )
+
+    assert String.starts_with?(json_headers, "HTTP/1.1 200")
+
+    assert %{
+             "id" => "resp_hosted_shell_curl_json",
+             "object" => "response",
+             "status" => "completed"
+           } = CodexPooler.JSON.decode!(json_body)
+
+    counts_before_malformed = durable_accounting_counts()
+
+    malformed_input = List.update_at(input, 0, &Map.put(&1, "unexpected", true))
+
+    {malformed_headers, malformed_body} =
+      curl_json_request!(
+        port,
+        setup.authorization,
+        hosted_shell_payload(setup.model.exposed_model_id, malformed_input),
+        "/v1/responses"
+      )
+
+    assert String.starts_with?(malformed_headers, "HTTP/1.1 400")
+
+    assert %{
+             "error" => %{
+               "code" => "invalid_request",
+               "param" => "input",
+               "type" => "invalid_request_error"
+             }
+           } = CodexPooler.JSON.decode!(malformed_body)
+
+    assert_no_hosted_shell_lifecycle_stream!(malformed_body)
+    assert FakeUpstream.count(upstream) == 1
+    assert durable_accounting_counts() == counts_before_malformed
+
+    {stream_headers, stream_body} =
+      curl_hosted_shell_stream!(
+        port,
+        setup.authorization,
+        setup.model.exposed_model_id,
+        input
+      )
+
+    assert String.starts_with?(stream_headers, "HTTP/1.1 200")
+    assert String.downcase(stream_headers) =~ "content-type: text/event-stream"
+
+    events = public_sse_events(stream_body)
+
+    assert Enum.map(events, & &1["event"]) ==
+             Enum.map(hosted_shell_sse_events(), fn {type, _event} -> type end)
+
+    refute Enum.any?(events, &(&1["event"] == "response.created"))
+    assert FakeUpstream.count(upstream) == 2
+    assert :ok = FakeUpstream.verify!(upstream)
+  end
+
+  @tag :prompt_cache_product_characterization
+  test "POST /v1/responses accepts prompt cache controls without a public marker", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_prompt_cache_product_characterization",
+               "status" => "completed",
+               "output" => [],
+               "usage" => %{"input_tokens" => 1, "output_tokens" => 1, "total_tokens" => 2}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "prompt_cache_key" => "characterization-cache-key",
+        "prompt_cache_options" => %{"mode" => "explicit", "ttl" => "30m"},
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{
+                "type" => "input_text",
+                "text" => "characterization content",
+                "prompt_cache_breakpoint" => %{"mode" => "explicit"}
+              }
+            ]
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_prompt_cache_product_characterization", "status" => "completed"} =
+             json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["prompt_cache_key"] == "characterization-cache-key"
+    assert get_resp_header(conn, "x-codex-prompt-cache-mode") == []
+    refute conn.resp_body =~ "prompt_cache_controls_downgraded"
+  end
+
   @tag :prompt_cache_controls
-  test "POST /v1/responses preserves prompt cache controls without metadata leakage", %{
+  @tag :prompt_cache_adaptation
+  test "POST /v1/responses accepts prompt cache controls and adapts them only at egress", %{
     conn: conn
   } do
     upstream =
@@ -1338,30 +3016,88 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                 "type" => "input_text",
                 "text" => raw_prompt,
                 "prompt_cache_breakpoint" => breakpoint
+              },
+              %{
+                "type" => "input_text",
+                "text" => "fixture prompt cache content after the breakpoint"
               }
             ]
           }
-        ]
+        ],
+        "stream" => false,
+        "store" => false
       })
 
     assert %{"id" => "resp_prompt_cache_controls"} = json_response(conn, 200)
+    assert get_resp_header(conn, "x-codex-prompt-cache-mode") == []
+    refute conn.resp_body =~ "prompt_cache_controls_downgraded"
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["prompt_cache_key"] == raw_cache_key
-    assert captured.json["prompt_cache_options"] == options
+    refute Map.has_key?(captured.json, "prompt_cache_options")
+    assert captured.json["store"] == false
 
     assert [
              %{
                "content" => [
-                 %{"prompt_cache_breakpoint" => ^breakpoint}
+                 %{"type" => "input_text", "text" => ^raw_prompt},
+                 %{
+                   "type" => "input_text",
+                   "text" => "fixture prompt cache content after the breakpoint"
+                 }
                ]
              }
            ] = captured.json["input"]
 
+    refute inspect(captured.json) =~ "prompt_cache_breakpoint"
+
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-    persistence_text = inspect({request.request_metadata, RequestLogs.list(setup.pool)})
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.response_metadata["prompt_cache_controls_downgraded"] == true
+    refute Map.has_key?(request.request_metadata, "prompt_cache_controls_downgraded")
+
+    persistence_text =
+      inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)})
+
     refute persistence_text =~ raw_prompt
     refute persistence_text =~ raw_cache_key
+  end
+
+  @tag :prompt_cache_adaptation
+  test "POST /v1/responses omits the attempt marker when no prompt cache controls were sent", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_prompt_cache_unaffected",
+               "status" => "completed",
+               "output" => [],
+               "usage" => %{"input_tokens" => 1, "output_tokens" => 1, "total_tokens" => 2}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "unaffected prompt cache adaptation fixture"
+      })
+
+    assert %{"id" => "resp_prompt_cache_unaffected"} = json_response(conn, 200)
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    refute Map.has_key?(attempt.response_metadata, "prompt_cache_controls_downgraded")
+    refute Map.has_key?(request.request_metadata, "prompt_cache_controls_downgraded")
   end
 
   @tag :selected_assignment_false_reasoning_envelope
@@ -1423,7 +3159,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.json["include"] == ["reasoning.encrypted_content"]
   end
 
-  test "POST /v1/responses normalizes an OMP 16.3.14 GPT-5.6 first turn for Responses Lite",
+  test "POST /v1/responses normalizes an OMP GPT-6 first turn for Responses Lite",
        %{conn: conn} do
     upstream =
       start_upstream(
@@ -1432,7 +3168,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
            %{
              "type" => "response.completed",
              "response" => %{
-               "id" => "resp_v1_omp_gpt56_first_turn",
+               "id" => "resp_v1_omp_gpt6_first_turn",
                "object" => "response",
                "status" => "completed",
                "output" => [],
@@ -1491,7 +3227,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
     assert conn.resp_body =~ "event: response.completed\n"
-    assert conn.resp_body =~ "resp_v1_omp_gpt56_first_turn"
+    assert conn.resp_body =~ "resp_v1_omp_gpt6_first_turn"
 
     assert [captured] = FakeUpstream.requests(upstream)
     captured_headers = Map.new(captured.headers)
@@ -1523,53 +3259,695 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute Map.has_key?(captured.json, "max_output_tokens")
   end
 
-  test "POST /v1/responses forwards encrypted compaction replay before dispatch", %{conn: conn} do
+  # `/v1/responses` goes through the same payload normalizer as the native route: a Full request that omits `instructions` is sent upstream
+  # with an empty string, and Lite removes the key again, so a Lite request that omits it gets no instructions message.
+  for stream <- [false, true] do
+    test "POST /v1/responses without instructions sends an empty string in Full and none in Lite with stream=#{stream}", %{conn: conn} do
+      upstream = start_upstream(issue_241_completed_response("v1_instructions_default"))
+      setup = gateway_setup(upstream)
+      payload = %{"model" => setup.model.exposed_model_id, "input" => "synthetic request", "stream" => unquote(stream)}
+
+      for mode <- ~w(full lite) do
+        put_public_model_serving_mode!(setup, mode)
+        response = conn |> recycle() |> auth(setup) |> post("/v1/responses", payload)
+        assert response.status == 200
+      end
+
+      assert [full_capture, lite_capture] = FakeUpstream.requests(upstream)
+      assert full_capture.path == "/backend-api/codex/responses"
+      assert lite_capture.path == "/backend-api/codex/responses"
+      assert full_capture.json["instructions"] == ""
+      refute Map.has_key?(lite_capture.json, "instructions")
+      assert Enum.map(lite_capture.json["input"], & &1["type"]) == ["additional_tools", "message"]
+    end
+  end
+
+  test "POST /v1/responses bridges a terminal compaction trigger across JSON and SSE", %{
+    conn: conn
+  } do
+    for stream? <- [false, true] do
+      response_id = "resp_v1_compaction_trigger_#{stream?}"
+
+      upstream =
+        start_upstream(
+          FakeUpstream.compaction_stream(%{
+            "id" => response_id,
+            "object" => "response.compaction",
+            "output" => [
+              %{
+                "type" => "compaction",
+                "encrypted_content" => "synthetic-public-trigger-encrypted-#{stream?}",
+                "id" => nil,
+                "internal_chat_message_metadata_passthrough" => %{
+                  "turn_id" => "native-public-turn-must-drop",
+                  "compaction" => %{"implementation" => "responses_compaction_v2"},
+                  "instruction" => "returned metadata must not select request transport"
+                },
+                "compaction" => %{"implementation" => "responses_compaction_v2"},
+                "summary" => "plaintext-public-summary-must-drop"
+              }
+            ],
+            "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+          })
+        )
+
+      setup = gateway_setup(upstream, compact?: true)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          # Unanchored: the provider refuses `previous_response_id` over HTTP
+          # and an anchored `/v1` request is answered before dispatch
+          # (findings#232 rows 232-275 and 232-277).
+          "model" => setup.model.exposed_model_id,
+          "input" => public_tool_output_compaction_trigger_input("synthetic public compact #{stream?}"),
+          "stream" => stream?,
+          "include" => ["reasoning.encrypted_content"],
+          "store" => false,
+          "prompt_cache_key" => "public-compaction-cache-#{stream?}",
+          "prompt_cache_options" => %{"mode" => "explicit", "ttl" => "30m"}
+        })
+
+      public_items =
+        if stream? do
+          assert response.status == 200
+          assert [content_type] = get_resp_header(response, "content-type")
+          assert content_type =~ "text/event-stream"
+
+          events = public_sse_events(response.resp_body)
+
+          # The public stream follows the Responses grammar the SDK stream
+          # helpers enforce: opened, item announced, item closed, completed,
+          # under one response id (findings#254).
+          assert Enum.map(events, & &1["event"]) == [
+                   "response.created",
+                   "response.output_item.added",
+                   "response.output_item.done",
+                   "response.completed"
+                 ]
+
+          assert Enum.map(events, &get_in(&1, ["data", "sequence_number"])) == [0, 1, 2, 3]
+          assert get_in(hd(events), ["data", "response", "id"]) == response_id
+          assert get_in(hd(events), ["data", "response", "output"]) == []
+          added_item = get_in(Enum.at(events, 1), ["data", "item"])
+          done_item = get_in(Enum.at(events, 2), ["data", "item"])
+          assert get_in(Enum.at(events, 2), ["data", "output_index"]) == 0
+          completed_item = List.first(get_in(List.last(events), ["data", "response", "output"]))
+          assert added_item == done_item
+          assert done_item == completed_item
+          assert get_in(List.last(events), ["data", "response", "object"]) == "response"
+          assert get_in(List.last(events), ["data", "response", "id"]) == response_id
+
+          assert response.resp_body =~ "data: [DONE]\n\n"
+          [done_item, completed_item]
+        else
+          assert %{
+                   "id" => ^response_id,
+                   "object" => "response",
+                   "status" => "completed",
+                   "output" => [item],
+                   "usage" => %{"total_tokens" => 8}
+                 } = json_response(response, 200)
+
+          [item]
+        end
+
+      # The upstream item had a null id; the public item carries the id
+      # derived from its encrypted content, and replaying it strips that id
+      # again so the upstream receives the item as it produced it.
+      encrypted_content = "synthetic-public-trigger-encrypted-#{stream?}"
+      derived_id = CompactionTrigger.public_compaction_item_id(encrypted_content)
+      assert "cmp_" <> _digest = derived_id
+
+      for item <- public_items do
+        assert item == %{
+                 "type" => "compaction",
+                 "encrypted_content" => encrypted_content,
+                 "id" => derived_id
+               }
+
+        replayed = Map.delete(item, "id")
+
+        assert {:ok, %{payload: %{"input" => [^replayed]}}} =
+                 Responses.coerce(%{
+                   "model" => setup.model.exposed_model_id,
+                   "input" => [item]
+                 })
+      end
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["stream"] == true
+      refute Map.has_key?(captured.json, "include")
+      assert captured.json["store"] == false
+      refute Map.has_key?(captured.json, "prompt_cache_options")
+      assert captured.json["prompt_cache_key"] == "public-compaction-cache-#{stream?}"
+      refute Map.has_key?(captured.json, "previous_response_id")
+
+      assert Enum.map(captured.json["input"], & &1["type"]) == [
+               "function_call_output",
+               "compaction_trigger"
+             ]
+
+      assert Enum.count(captured.json["input"], &(&1 == %{"type" => "compaction_trigger"})) == 1
+      assert List.last(captured.json["input"]) == %{"type" => "compaction_trigger"}
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/backend-api/codex/responses/compact"
+      assert request.transport == "http_sse"
+      assert request.status == "succeeded"
+
+      assert get_in(request.request_metadata, ["reservation_snapshot_inputs", "route_class"]) ==
+               "proxy_compact"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+               "/v1/responses"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "translated_endpoint"]) ==
+               "/backend-api/codex/responses"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.transport == "http_sse"
+      assert attempt.status == "succeeded"
+
+      assert Repo.aggregate(
+               from(entry in LedgerEntry,
+                 where: entry.request_id == ^request.id and entry.entry_kind == "settlement"
+               ),
+               :count
+             ) == 1
+
+      persisted = inspect({request, attempt, RequestLogs.list(setup.pool)})
+      refute persisted =~ "synthetic-public-trigger-encrypted-#{stream?}"
+      refute persisted =~ "native-public-turn-must-drop"
+      refute persisted =~ "plaintext-public-summary-must-drop"
+      refute persisted =~ "returned metadata must not select request transport"
+    end
+  end
+
+  test "POST /v1/responses streams V2 compact-trigger metadata and keeps Lite incremental input",
+       %{conn: conn} do
     upstream =
       start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_compaction_replay",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
-        })
+        FakeUpstream.sse_stream([
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "item" => %{
+               "type" => "compaction",
+               "encrypted_content" => "synthetic-v2-compact-encrypted"
+             }
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_v2_compact",
+               "object" => "response",
+               "status" => "completed",
+               "output" => [
+                 %{
+                   "type" => "compaction",
+                   "encrypted_content" => "synthetic-v2-compact-encrypted"
+                 }
+               ],
+               "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+             }
+           }}
+        ])
       )
 
-    setup = gateway_setup(upstream)
+    setup =
+      upstream
+      |> gateway_setup(compact?: true)
+      |> put_setup_model_source_metadata!(%{
+        "use_responses_lite" => true,
+        "capabilities" => %{"reasoning" => true, "responses" => true, "tools" => true}
+      })
 
-    encrypted_compaction = "synthetic-encrypted-compaction"
-
-    conn =
+    response =
       conn
       |> auth(setup)
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
-        "store" => false,
-        "stream" => true,
-        "input" => [
-          %{"type" => "compaction", "encrypted_content" => encrypted_compaction},
+        "previous_response_id" => "resp_v1_v2_compact_previous",
+        "instructions" => "synthetic compact instructions",
+        "tools" => [
           %{
-            "role" => "user",
-            "content" => [
-              %{"type" => "input_text", "text" => "synthetic follow-up after compaction"}
-            ]
+            "type" => "function",
+            "name" => "lookup_fixture",
+            "parameters" => %{"type" => "object", "properties" => %{}}
           }
-        ]
+        ],
+        "input" => public_tool_output_compaction_trigger_input("synthetic v2 compact"),
+        "client_metadata" => %{
+          "x-codex-turn-metadata" => Jason.encode!(%{"compaction" => %{"implementation" => "responses_compaction_v2"}})
+        }
       })
 
-    assert response(conn, 200) == ""
-    assert get_resp_header(conn, "content-type") == ["text/event-stream"]
+    assert %{"error" => %{"code" => "previous_response_not_found", "param" => "previous_response_id"}} =
+             json_response(response, 400)
+
+    assert FakeUpstream.requests(upstream) == []
+  end
+
+  @tag :public_compaction_trigger_http_qa
+  test "live curl bridges a public terminal compaction trigger as Responses SSE" do
+    prompt_text = "synthetic public compaction curl input"
+    encrypted_content = "synthetic-public-compaction-curl-encrypted"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.compaction_stream(%{
+          "id" => "resp_public_compaction_curl",
+          "object" => "response.compaction",
+          "output" => [
+            %{"type" => "compaction", "encrypted_content" => encrypted_content}
+          ],
+          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+        })
+      )
+
+    setup = gateway_setup(upstream, compact?: true)
+    {_server, port} = start_public_endpoint_with_server!()
+
+    {headers, response_body} =
+      curl_json_request!(
+        port,
+        setup.authorization,
+        %{
+          "model" => setup.model.exposed_model_id,
+          "input" => public_compaction_trigger_input(prompt_text),
+          "stream" => true
+        },
+        "/v1/responses"
+      )
+
+    assert String.starts_with?(headers, "HTTP/1.1 200")
+    assert String.downcase(headers) =~ "content-type: text/event-stream"
+
+    events = public_sse_events(response_body)
+
+    assert Enum.map(events, & &1["event"]) == [
+             "response.created",
+             "response.output_item.added",
+             "response.output_item.done",
+             "response.completed"
+           ]
+
+    assert get_in(List.last(events), ["data", "response", "object"]) == "response"
+
+    assert get_in(Enum.at(events, 2), ["data", "item", "id"]) ==
+             CompactionTrigger.public_compaction_item_id(encrypted_content)
+
+    assert response_body =~ "data: [DONE]\n\n"
 
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
-
-    assert [
-             %{"type" => "compaction", "encrypted_content" => ^encrypted_compaction},
-             %{"type" => "message", "role" => "user"}
-           ] = captured.json["input"]
+    assert Enum.count(captured.json["input"], &(&1 == %{"type" => "compaction_trigger"})) == 1
+    assert List.last(captured.json["input"]) == %{"type" => "compaction_trigger"}
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-    refute inspect(request.request_metadata) =~ encrypted_compaction
+    assert request.endpoint == "/backend-api/codex/responses/compact"
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ prompt_text
+    refute metadata_text =~ encrypted_content
+  end
+
+  test "POST /v1/responses rejects malformed compaction trigger placement before dispatch", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream, compact?: true)
+    visible = hd(public_compaction_trigger_input("visible public trigger fixture"))
+    trigger = %{"type" => "compaction_trigger"}
+
+    invalid_inputs = [
+      [trigger],
+      [trigger, visible],
+      [visible, trigger, trigger],
+      [%{"type" => "reasoning", "encrypted_content" => "hidden-only-trigger-fixture"}, trigger],
+      [
+        %{
+          "type" => "function_call_output",
+          "call_id" => "call_public_zero_byte",
+          "output" => ""
+        },
+        trigger
+      ]
+    ]
+
+    for input <- invalid_inputs do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => input,
+          "stream" => true
+        })
+
+      assert %{
+               "error" => %{
+                 "code" => "invalid_request",
+                 "message" => "compaction_trigger must be the final input item and must follow visible input",
+                 "param" => "input"
+               }
+             } = json_response(response, 400)
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  test "POST /v1/responses finalizes invalid selected compaction output across JSON and SSE", %{
+    conn: conn
+  } do
+    invalid_items = [
+      %{"type" => "compaction"},
+      %{"type" => "compaction", "encrypted_content" => ""},
+      %{"type" => "compaction", "encrypted_content" => " \t\n"}
+    ]
+
+    for stream? <- [false, true], invalid_item <- invalid_items do
+      encrypted_later =
+        "synthetic-invalid-public-later-#{stream?}-#{System.unique_integer([:positive])}"
+
+      upstream =
+        start_upstream(
+          FakeUpstream.compaction_stream(%{
+            "output" => [
+              invalid_item,
+              %{"type" => "compaction", "encrypted_content" => encrypted_later}
+            ]
+          })
+        )
+
+      setup = gateway_setup(upstream, compact?: true)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => public_compaction_trigger_input("invalid public compact #{stream?}"),
+          "stream" => stream?
+        })
+
+      # findings#191: a 502 is a failure on this side of the wire. Typing it as
+      # the terminal client class told an SDK the caller's own request was
+      # malformed and would fail identically forever.
+      assert %{
+               "error" => %{
+                 "code" => "invalid_compaction_response",
+                 "message" => "upstream request failed",
+                 "type" => "server_error"
+               }
+             } = json_response(response, 502)
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/backend-api/codex/responses/compact"
+      assert request.status == "failed"
+      assert request.completed_at
+      assert request.last_error_code == "invalid_compaction_response"
+
+      assert get_in(request.request_metadata, ["reservation_snapshot_inputs", "route_class"]) ==
+               "proxy_compact"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "failed"
+      assert attempt.completed_at
+      assert attempt.network_error_code == "invalid_compaction_response"
+
+      assert attempt.response_metadata["compaction_invalid_reason"] ==
+               "invalid_compaction"
+
+      assert Repo.aggregate(
+               from(entry in LedgerEntry,
+                 where: entry.request_id == ^request.id and entry.entry_kind == "settlement"
+               ),
+               :count
+             ) == 1
+
+      persisted = inspect({request, attempt, RequestLogs.list(setup.pool)})
+      refute response.resp_body =~ encrypted_later
+      refute persisted =~ encrypted_later
+    end
+  end
+
+  @tag slow: "dispatches the complete compaction replay variant matrix over both JSON and SSE"
+  test "POST /v1/responses preserves verified compaction variants across JSON and SSE", %{
+    conn: conn
+  } do
+    setup_runtime_ingress_override(%OperationalSettings{gateway_debug?: true})
+
+    variants = [
+      {"public_without_id",
+       %{
+         "type" => "compaction",
+         "encrypted_content" => "synthetic-public-idless-compaction-private"
+       }},
+      {"public",
+       %{
+         "type" => "compaction",
+         "encrypted_content" => "synthetic-public-compaction-private",
+         "id" => "cmp_v1_public_private"
+       }},
+      {"public_with_null_id",
+       %{
+         "type" => "compaction",
+         "encrypted_content" => "synthetic-public-null-id-compaction-private",
+         "id" => nil
+       }},
+      {"native",
+       %{
+         "type" => "compaction",
+         "encrypted_content" => "synthetic-native-compaction-private",
+         "id" => "cmp_v1_native_private",
+         "internal_chat_message_metadata_passthrough" => %{
+           "turn_id" => "turn_v1_native_private"
+         }
+       }},
+      {"omp_idless_native",
+       %{
+         "type" => "compaction",
+         "encrypted_content" => "synthetic-omp-idless-compaction-private",
+         "internal_chat_message_metadata_passthrough" => %{
+           "turn_id" => "turn_v1_omp_private"
+         }
+       }}
+    ]
+
+    assert Enum.any?(variants, fn {_variant_name, item} ->
+             Map.has_key?(item, "id") and is_nil(item["id"])
+           end)
+
+    for {variant_name, compaction_item} <- variants,
+        {mode_name, stream?} <- [{"json", false}, {"sse", true}] do
+      response_id = "resp_v1_compaction_#{variant_name}_#{mode_name}"
+
+      upstream =
+        start_upstream(
+          FakeUpstream.sse_stream([
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => response_id,
+                 "object" => "response",
+                 "status" => "completed",
+                 "output" => [],
+                 "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+               }
+             }}
+          ])
+        )
+
+      setup = gateway_setup(upstream)
+
+      {response, log_output} =
+        with_log(fn ->
+          conn
+          |> recycle()
+          |> auth(setup)
+          |> post("/v1/responses", %{
+            "model" => setup.model.exposed_model_id,
+            "store" => false,
+            "stream" => stream?,
+            "input" => [
+              compaction_item,
+              %{
+                "role" => "user",
+                "content" => [
+                  %{
+                    "type" => "input_text",
+                    "text" => "synthetic private follow-up for #{variant_name} #{mode_name}"
+                  }
+                ]
+              }
+            ]
+          })
+        end)
+
+      if stream? do
+        assert response.status == 200
+        assert [content_type] = get_resp_header(response, "content-type")
+        assert content_type =~ "text/event-stream"
+        assert response.resp_body =~ "event: response.completed\n"
+        assert response.resp_body =~ response_id
+      else
+        assert %{
+                 "id" => ^response_id,
+                 "object" => "response",
+                 "status" => "completed"
+               } = json_response(response, 200)
+      end
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["stream"] == true
+      assert captured.json["store"] == false
+      refute Map.has_key?(captured.json, "previous_response_id")
+
+      assert [captured_compaction, captured_user] = captured.json["input"]
+
+      if variant_name == "omp_idless_native" do
+        assert captured_compaction ==
+                 Map.delete(compaction_item, "internal_chat_message_metadata_passthrough")
+      else
+        assert captured_compaction == compaction_item
+      end
+
+      if variant_name == "public_with_null_id" do
+        assert Map.has_key?(captured_compaction, "id")
+        assert captured_compaction["id"] == nil
+      end
+
+      assert captured_user["type"] == "message"
+      assert captured_user["role"] == "user"
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "succeeded"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "succeeded"
+
+      assert get_in(attempt.response_metadata, ["gateway_debug", "items", "item_types"]) == [
+               "compaction",
+               "message"
+             ]
+
+      projection_text =
+        inspect({
+          request.request_metadata,
+          attempt.response_metadata,
+          RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+        })
+
+      private_values = [
+        compaction_item["encrypted_content"],
+        compaction_item["id"],
+        get_in(compaction_item, ["internal_chat_message_metadata_passthrough", "turn_id"]),
+        "internal_chat_message_metadata_passthrough",
+        "created_by"
+      ]
+
+      for private_value <- Enum.reject(private_values, &is_nil/1) do
+        refute projection_text =~ private_value
+        refute log_output =~ private_value
+      end
+    end
+  end
+
+  test "POST /v1/responses rejects unverified compaction metadata without side effects", %{
+    conn: conn
+  } do
+    setup_runtime_ingress_override(%OperationalSettings{gateway_debug?: true})
+
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_items = [
+      %{
+        "type" => "compaction",
+        "encrypted_content" => "synthetic-malformed-compaction-private",
+        "id" => "cmp_v1_malformed_private",
+        "internal_chat_message_metadata_passthrough" => %{
+          "turn_id" => "turn_v1_malformed_private",
+          "unexpected_nested_field" => "nested-v1-private"
+        }
+      },
+      %{
+        "type" => "compaction",
+        "encrypted_content" => "synthetic-unverified-compaction-private",
+        "id" => "cmp_v1_unverified_private",
+        "created_by" => "creator-v1-private"
+      },
+      %{
+        "type" => "compaction",
+        "encrypted_content" => "synthetic-unknown-field-compaction-private",
+        "id" => "cmp_v1_unknown_field_private",
+        "unexpected_field" => "unknown-v1-private"
+      }
+    ]
+
+    counts = durable_accounting_counts()
+
+    for invalid_item <- invalid_items do
+      {response, log_output} =
+        with_log(fn ->
+          conn
+          |> recycle()
+          |> auth(setup)
+          |> post("/v1/responses", %{
+            "model" => setup.model.exposed_model_id,
+            "input" => [invalid_item]
+          })
+        end)
+
+      assert %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => "invalid_request",
+                 "param" => "input"
+               }
+             } = json_response(response, 400)
+
+      private_values = [
+        invalid_item["encrypted_content"],
+        invalid_item["id"],
+        get_in(invalid_item, ["internal_chat_message_metadata_passthrough", "turn_id"]),
+        get_in(invalid_item, [
+          "internal_chat_message_metadata_passthrough",
+          "unexpected_nested_field"
+        ]),
+        invalid_item["created_by"],
+        invalid_item["unexpected_field"],
+        "internal_chat_message_metadata_passthrough",
+        "created_by",
+        "unexpected_nested_field",
+        "unexpected_field"
+      ]
+
+      for private_value <- Enum.reject(private_values, &is_nil/1) do
+        refute response.resp_body =~ private_value
+        refute log_output =~ private_value
+      end
+
+      assert FakeUpstream.requests(upstream) == []
+      assert durable_accounting_counts() == counts
+      assert %{items: [], total: 0} = RequestLogs.list(setup.pool)
+    end
   end
 
   test "POST /v1/responses forwards lowered non-strict function tool schemas", %{conn: conn} do
@@ -1612,7 +3990,652 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
              lowered_tool_schema()
   end
 
-  test "POST /v1/responses preserves output-only translated tool output before dispatch",
+  test "POST /v1/responses forwards a Continue-style null strict function tool as omitted", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_continue_null_strict",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic Continue tool request",
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "continue_style_fixture",
+            "description" => "Synthetic flat function tool",
+            "parameters" => %{"type" => "object", "properties" => %{}},
+            "strict" => nil
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_continue_null_strict", "object" => "response"} =
+             json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+
+    assert captured.json["tools"] == [
+             %{
+               "type" => "function",
+               "name" => "continue_style_fixture",
+               "description" => "Synthetic flat function tool",
+               "parameters" => %{"type" => "object", "properties" => %{}}
+             }
+           ]
+  end
+
+  @tag :responses_allowed_tools
+  test "POST /v1/responses Full forwards allowed tools in caller order with duplicates", %{
+    conn: conn
+  } do
+    upstream = start_upstream(issue_241_completed_response("resp_v1_allowed_tools"))
+    setup = gateway_setup(upstream)
+    put_public_model_serving_mode!(setup, "full")
+
+    function_tool = %{
+      "type" => "function",
+      "name" => "lookup_allowed_fixture",
+      "strict" => false,
+      "defer_loading" => false,
+      "parameters" => non_strict_tool_schema()
+    }
+
+    custom_tool = %{
+      "type" => "custom",
+      "name" => "custom_allowed_fixture",
+      "format" => %{
+        "type" => "grammar",
+        "definition" => ~s(start: "allowed"),
+        "syntax" => "lark"
+      }
+    }
+
+    tools = [
+      function_tool,
+      custom_tool,
+      %{"type" => "web_search"},
+      %{"type" => "image_generation"}
+    ]
+
+    allowed_tools = [
+      %{"type" => "custom", "name" => custom_tool["name"]},
+      %{"type" => "web_search"},
+      %{"type" => "function", "name" => function_tool["name"]},
+      %{"type" => "image_generation"},
+      %{"type" => "function", "name" => function_tool["name"]},
+      %{"type" => "web_search"}
+    ]
+
+    tool_choice = %{"type" => "allowed_tools", "mode" => "required", "tools" => allowed_tools}
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic allowed tools request",
+        "tools" => tools,
+        "tool_choice" => tool_choice
+      })
+
+    assert %{"id" => "resp_v1_allowed_tools", "object" => "response"} =
+             json_response(response, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "POST"
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["tool_choice"] === tool_choice
+
+    assert [forwarded_function, forwarded_custom | forwarded_builtins] = captured.json["tools"]
+
+    assert forwarded_function ==
+             function_tool
+             |> Map.put("parameters", lowered_tool_schema())
+
+    assert forwarded_custom == custom_tool
+    assert forwarded_builtins == Enum.drop(tools, 2)
+    assert_issue_241_success_lifecycle!(setup)
+  end
+
+  @tag :responses_allowed_tools
+  test "POST /v1/responses rejects malformed Full allowed tools before admission", %{conn: conn} do
+    upstream = start_upstream(issue_241_completed_response("must_not_dispatch_allowed_tools"))
+    setup = gateway_setup(upstream)
+    put_public_model_serving_mode!(setup, "full")
+
+    function_tool = %{
+      "type" => "function",
+      "name" => "lookup_allowed_fixture",
+      "parameters" => %{"type" => "object", "properties" => %{}}
+    }
+
+    valid_tools = [function_tool, %{"type" => "web_search"}]
+    function_member = %{"type" => "function", "name" => function_tool["name"]}
+
+    invalid_cases = [
+      {"missing mode", valid_tools, %{"type" => "allowed_tools", "tools" => [function_member]},
+       %{
+         "code" => "invalid_request",
+         "message" => "tool_choice shape is not translatable",
+         "param" => "tool_choice"
+       }},
+      {"undeclared function", valid_tools,
+       %{
+         "type" => "allowed_tools",
+         "mode" => "auto",
+         "tools" => [%{"type" => "function", "name" => "missing_allowed_fixture"}]
+       },
+       %{
+         "code" => "invalid_request",
+         "message" => "tool_choice shape is not translatable",
+         "param" => "tool_choice"
+       }},
+      {"MCP member", valid_tools,
+       %{
+         "type" => "allowed_tools",
+         "mode" => "auto",
+         "tools" => [%{"type" => "mcp", "server_label" => "fixture-mcp"}]
+       },
+       %{
+         "code" => "invalid_request",
+         "message" => "tool_choice shape is not translatable",
+         "param" => "tool_choice"
+       }},
+      {"MCP declaration", [%{"type" => "mcp"}],
+       %{
+         "type" => "allowed_tools",
+         "mode" => "auto",
+         "tools" => [%{"type" => "mcp", "server_label" => "fixture-mcp"}]
+       },
+       %{
+         "code" => "invalid_request",
+         "message" => "remote MCP tools are not supported",
+         "param" => "tools"
+       }}
+    ]
+
+    for {label, tools, tool_choice, expected_error} <- invalid_cases do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic invalid allowed tools request",
+          "tools" => tools,
+          "tool_choice" => tool_choice
+        })
+
+      assert %{"error" => error} = json_response(response, 400), label
+      assert Map.take(error, ["code", "message", "param"]) == expected_error, label
+      assert error["type"] == "invalid_request_error", label
+      assert FakeUpstream.count(upstream) == 0, label
+      assert Repo.aggregate(Request, :count) == 0, label
+      assert Repo.aggregate(Attempt, :count) == 0, label
+      assert Repo.aggregate(LedgerEntry, :count) == 0, label
+    end
+  end
+
+  @tag :responses_allowed_tools
+  test "POST /v1/responses rejects valid Lite allowed tools inside gateway accounting", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(issue_241_completed_response("must_not_dispatch_lite_allowed_tools"))
+
+    setup = gateway_setup(upstream)
+    put_public_model_serving_mode!(setup, "lite")
+
+    function_tool = %{
+      "type" => "function",
+      "name" => "lookup_lite_allowed_fixture",
+      "parameters" => %{"type" => "object", "properties" => %{}}
+    }
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic Lite allowed tools request",
+        "tools" => [function_tool],
+        "tool_choice" => %{
+          "type" => "allowed_tools",
+          "mode" => "auto",
+          "tools" => [%{"type" => "function", "name" => function_tool["name"]}]
+        }
+      })
+
+    assert %{
+             "error" => %{
+               "code" => "unsupported_parameter",
+               "message" => "Unsupported parameter: tool_choice",
+               "param" => "tool_choice"
+             }
+           } = json_response(response, 400)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "unsupported_parameter"
+    assert request.request_metadata["gateway_denial"]["param"] == "tool_choice"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.request_id == ^request.id),
+             :count
+           ) == 0
+  end
+
+  @tag :issue_241
+  test "POST /v1/responses forwards an official custom tool and its exact named choice", %{
+    conn: conn
+  } do
+    upstream = start_upstream(issue_241_completed_response("resp_v1_custom_definition"))
+    setup = gateway_setup(upstream)
+
+    custom_tool = %{
+      "type" => "custom",
+      "name" => " custom_definition_fixture ",
+      "description" => "  Synthetic grammar fixture  ",
+      "defer_loading" => true,
+      "allowed_callers" => ["programmatic", "direct", "programmatic"],
+      "format" => %{
+        "type" => "grammar",
+        "definition" => "  ^fixture-[0-9]+$  ",
+        "syntax" => "regex"
+      }
+    }
+
+    tool_choice = %{"type" => "custom", "name" => custom_tool["name"]}
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic custom definition request",
+        "tools" => [custom_tool],
+        "tool_choice" => tool_choice
+      })
+
+    assert %{"id" => "resp_v1_custom_definition", "object" => "response"} =
+             json_response(response, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "POST"
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["tools"] == [custom_tool]
+    assert captured.json["tool_choice"] == tool_choice
+    assert_issue_241_success_lifecycle!(setup)
+  end
+
+  @tag :issue_241
+  test "POST /v1/responses rejects a Lite named custom choice before dispatch", %{conn: conn} do
+    upstream = start_upstream(issue_241_completed_response("should_not_dispatch_lite_choice"))
+    setup = gateway_setup(upstream)
+    put_public_model_serving_mode!(setup, "lite")
+
+    custom_tool = %{
+      "type" => "custom",
+      "name" => "lite_custom_choice_fixture",
+      "description" => "Synthetic Lite choice fixture",
+      "format" => %{
+        "type" => "grammar",
+        "definition" => ~s(start: "responses_tool"),
+        "syntax" => "lark"
+      }
+    }
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic Lite custom choice request",
+        "tools" => [custom_tool],
+        "tool_choice" => %{"type" => "custom", "name" => custom_tool["name"]}
+      })
+
+    assert %{
+             "error" => %{
+               "code" => "unsupported_parameter",
+               "message" => "Unsupported parameter: tool_choice",
+               "param" => "tool_choice"
+             }
+           } = json_response(response, 400)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "unsupported_parameter"
+    assert request.request_metadata["gateway_denial"]["param"] == "tool_choice"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.request_id == ^request.id),
+             :count
+           ) == 0
+  end
+
+  @tag :issue_241
+  test "POST /v1/responses forwards only direct nested strict schema type repairs", %{conn: conn} do
+    upstream = start_upstream(issue_241_completed_response("resp_v1_repaired_schema"))
+    setup = gateway_setup(upstream)
+    parameters = issue_241_repairable_parameters()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic strict schema repair request",
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "repair_schema_fixture",
+            "strict" => true,
+            "parameters" => parameters
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_repaired_schema", "object" => "response"} =
+             json_response(response, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "POST"
+    assert captured.path == "/backend-api/codex/responses"
+
+    assert [captured_tool] = captured.json["tools"]
+
+    expected_parameters =
+      parameters
+      |> put_in(["properties", "config", "type"], "object")
+      |> put_in(["properties", "config", "properties", "entries", "type"], "array")
+      |> put_in(
+        ["properties", "config", "properties", "entries", "items", "type"],
+        "object"
+      )
+
+    assert captured_tool == %{
+             "type" => "function",
+             "name" => "repair_schema_fixture",
+             "strict" => true,
+             "parameters" => expected_parameters
+           }
+
+    refute get_in(parameters, ["properties", "config"]) |> Map.has_key?("type")
+    assert_issue_241_success_lifecycle!(setup)
+  end
+
+  @tag :issue_241
+  test "POST /v1/responses tool validation failures have no dispatch or accounting effects", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    base_payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => "synthetic rejected tool request"
+    }
+
+    invalid_cases = [
+      {"malformed custom", "invalid_request", "tools",
+       %{
+         "tools" => [
+           %{
+             "type" => "custom",
+             "name" => "malformed_custom_fixture",
+             "format" => %{"type" => "grammar", "syntax" => "lark"}
+           }
+         ]
+       }},
+      {"unknown custom choice", "invalid_request", "tool_choice",
+       %{
+         "tools" => [%{"type" => "custom", "name" => "known_custom_fixture"}],
+         "tool_choice" => %{"type" => "custom", "name" => "missing_custom_fixture"}
+       }},
+      {"executable name collision", "invalid_request", "tools",
+       %{
+         "tools" => [
+           %{
+             "type" => "function",
+             "name" => "shared_fixture",
+             "parameters" => %{"type" => "object", "properties" => %{}}
+           },
+           %{"type" => "custom", "name" => "shared_fixture"}
+         ]
+       }},
+      {"explicit invalid public type", "invalid_function_parameters", "tools.0.parameters.properties.candidate.type",
+       %{
+         "tools" => [
+           issue_241_strict_function_tool(%{
+             "type" => "object",
+             "additionalProperties" => false,
+             "properties" => %{"candidate" => %{"type" => "future-type"}},
+             "required" => ["candidate"]
+           })
+         ]
+       }},
+      {"ambiguous repair evidence", "invalid_function_parameters", "tools.0.parameters.properties.candidate.type",
+       %{
+         "tools" => [
+           issue_241_strict_function_tool(%{
+             "type" => "object",
+             "additionalProperties" => false,
+             "properties" => %{
+               "candidate" => %{
+                 "additionalProperties" => false,
+                 "properties" => %{"value" => %{"type" => "string"}},
+                 "required" => ["value"],
+                 "items" => %{"type" => "string"}
+               }
+             },
+             "required" => ["candidate"]
+           })
+         ]
+       }},
+      {"opaque combinator subtree", "invalid_function_parameters", "tools.0.parameters.properties.candidate.allOf.0.type",
+       %{
+         "tools" => [
+           issue_241_strict_function_tool(%{
+             "type" => "object",
+             "additionalProperties" => false,
+             "properties" => %{
+               "candidate" => %{
+                 "type" => "string",
+                 "allOf" => [
+                   %{
+                     "additionalProperties" => false,
+                     "properties" => %{"value" => %{"type" => "string"}},
+                     "required" => ["value"]
+                   }
+                 ]
+               }
+             },
+             "required" => ["candidate"]
+           })
+         ]
+       }}
+    ]
+
+    counts = durable_accounting_counts()
+
+    Enum.each(invalid_cases, fn {label, expected_code, expected_param, payload} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", Map.merge(base_payload, payload))
+
+      assert %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => ^expected_code,
+                 "param" => ^expected_param
+               }
+             } = json_response(response, 400),
+             label
+
+      assert FakeUpstream.requests(upstream) == [], label
+      assert durable_accounting_counts() == counts, label
+    end)
+  end
+
+  @tag :issue_78
+  test "POST /v1/responses rejects strict non-object roots before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_cases = [
+      {"invalid_json_schema", "text.format.schema",
+       %{
+         "text" => %{
+           "format" => %{
+             "type" => "json_schema",
+             "name" => "array_root_fixture",
+             "strict" => true,
+             "schema" => %{"type" => "array", "items" => %{"type" => "string"}}
+           }
+         }
+       }},
+      {"invalid_function_parameters", "tools.0.parameters",
+       %{
+         "tools" => [
+           %{
+             "type" => "function",
+             "name" => "root_ref_fixture",
+             "strict" => true,
+             "parameters" => %{
+               "$ref" => "#/$defs/arguments",
+               "$defs" => %{
+                 "arguments" => %{
+                   "type" => "object",
+                   "additionalProperties" => false,
+                   "properties" => %{"value" => %{"type" => "string"}},
+                   "required" => ["value"]
+                 }
+               }
+             }
+           }
+         ]
+       }}
+    ]
+
+    counts = durable_accounting_counts()
+
+    Enum.each(invalid_cases, fn {expected_code, expected_param, fields} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/responses",
+          Map.merge(
+            %{
+              "model" => setup.model.exposed_model_id,
+              "input" => "synthetic strict root rejection"
+            },
+            fields
+          )
+        )
+
+      assert %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => ^expected_code,
+                 "param" => ^expected_param
+               }
+             } = json_response(response, 400)
+
+      assert FakeUpstream.requests(upstream) == []
+      assert durable_accounting_counts() == counts
+    end)
+  end
+
+  @tag :command_read_protection
+  test "POST /v1/responses forwards generic function file-read build output byte-exact",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_command_read_protection",
+               "status" => "completed",
+               "output" => [],
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream, exposed_model_id: "gpt-4o", upstream_model_id: "gpt-4o")
+    command = "nl -ba src/private-example.ex | sed -n '1,75p'"
+    call_id = "call_v1_private_file_read"
+    original_output = preservation_log_fixture("v1 private build output sentinel")
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "arbitrary_command_tool",
+            "parameters" => %{"type" => "object", "properties" => %{}}
+          }
+        ],
+        "input" => [
+          %{
+            "type" => "function_call",
+            "call_id" => call_id,
+            "name" => "arbitrary_command_tool",
+            "arguments" => CodexPooler.JSON.encode!(%{"cmd" => command})
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => call_id,
+            "output" => original_output
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_command_read_protection"} = json_response(conn, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+
+    forwarded_output =
+      captured.json["input"]
+      |> Enum.find(&(&1["type"] == "function_call_output"))
+      |> Map.fetch!("output")
+
+    assert forwarded_output == original_output
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+    refute Map.has_key?(attempt.response_metadata, "payload_compression")
+  end
+
+  test "POST /v1/responses preserves schema-bound tool output and unbound output bytes",
        %{conn: conn} do
     upstream =
       start_upstream(
@@ -1631,20 +4654,55 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       )
 
     setup = gateway_setup(upstream, exposed_model_id: "gpt-4o", upstream_model_id: "gpt-4o")
-    enable_request_compression!(setup.pool)
-    omitted_sentinel = "v1 translated omitted sentinel"
-    original_output = compression_log_fixture(omitted_sentinel)
+
+    schema_bound_output =
+      CodexPooler.JSON.encode!(%{"rows" => Enum.to_list(1..160)}, pretty: true)
+
+    unbound_output = CodexPooler.JSON.encode!(%{"rows" => Enum.to_list(161..320)}, pretty: true)
+
+    assert byte_size(schema_bound_output) > 512
+    assert byte_size(unbound_output) > 512
 
     conn =
       conn
       |> auth(setup)
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "schema_bound_public_http_fixture",
+            "parameters" => %{"type" => "object", "properties" => %{}},
+            "output_schema" => %{"type" => "object"}
+          },
+          %{
+            "type" => "function",
+            "name" => "unbound_public_http_fixture",
+            "parameters" => %{"type" => "object", "properties" => %{}}
+          }
+        ],
         "input" => [
           %{
-            "role" => "tool",
-            "tool_call_id" => "call_v1_compressed_tool_output",
-            "content" => original_output
+            "type" => "function_call",
+            "call_id" => "call_public_http_schema_bound",
+            "name" => "schema_bound_public_http_fixture",
+            "arguments" => "{}"
+          },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_public_http_unbound",
+            "name" => "unbound_public_http_fixture",
+            "arguments" => "{}"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_public_http_schema_bound",
+            "output" => schema_bound_output
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_public_http_unbound",
+            "output" => unbound_output
           }
         ]
       })
@@ -1655,11 +4713,26 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
 
-    translated_item = List.first(captured.json["input"])
-    assert translated_item["type"] == "function_call_output"
-    assert translated_item["call_id"] == "call_v1_compressed_tool_output"
+    schema_bound_item =
+      Enum.find(captured.json["input"], fn item ->
+        item["type"] == "function_call_output" and
+          item["call_id"] == "call_public_http_schema_bound"
+      end)
 
-    assert translated_item["output"] == original_output
+    unbound_item =
+      Enum.find(captured.json["input"], fn item ->
+        item["type"] == "function_call_output" and item["call_id"] == "call_public_http_unbound"
+      end)
+
+    assert schema_bound_item["output"] == schema_bound_output
+
+    assert CodexPooler.JSON.decode!(schema_bound_item["output"]) ==
+             CodexPooler.JSON.decode!(schema_bound_output)
+
+    assert unbound_item["output"] == unbound_output
+
+    assert CodexPooler.JSON.decode!(unbound_item["output"]) ==
+             CodexPooler.JSON.decode!(unbound_output)
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "succeeded"
@@ -1671,43 +4744,48 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
 
-    assert %{
-             "enabled" => true,
-             "attempted" => true,
-             "status" => "skipped",
-             "reason" => "protected_tool_outputs",
-             "route_class" => "proxy_stream",
-             "transport" => "http_sse",
-             "candidate_count" => 0,
-             "compressed_count" => 0,
-             "skipped_count" => 0,
-             "protected_tool_output_skipped_count" => 1
-           } = metadata = attempt.response_metadata["payload_compression"]
-
-    refute inspect(metadata) =~ omitted_sentinel
-    refute inspect(metadata) =~ "call_v1_compressed_tool_output"
+    refute Map.has_key?(attempt.response_metadata, "payload_compression")
   end
 
+  @tag :v1_websocket_bridge_usage
   test "POST /v1/responses streaming settles retained terminal usage and pricing", %{
     conn: conn
   } do
+    sentinel = "http-tail-#{System.unique_integer([:positive])}"
     padding_unit = "retained terminal padding "
 
     retained_padding =
-      String.duplicate(
-        padding_unit,
-        div(RetainedBody.max_bytes(), byte_size(padding_unit)) + 128
-      )
+      sentinel <>
+        String.duplicate(
+          padding_unit,
+          div(RetainedBody.max_bytes(), byte_size(padding_unit)) + 128
+        )
 
     terminal_payload =
       IO.iodata_to_binary([
-        ~s({"type":"response.completed","response":{"id":"resp_v1_retained_usage_terminal","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":),
-        Jason.encode!(retained_padding),
-        ~s(}]}],"usage":{"input_tokens":16,"input_tokens_details":{"cached_tokens":0},"output_tokens":5,"reasoning_tokens":0,"total_tokens":21},"service_tier":"flex"}})
+        ~s({"type":"response.completed","response":{"id":"resp_v1_retained_usage_terminal","status":"completed","service_tier":"flex","usage":{"input_tokens":16,"input_tokens_details":{"cached_tokens":0},"output_tokens":5,"reasoning_tokens":0,"total_tokens":21},"output":[{"type":"message","content":[{"type":"output_text","text":),
+        CodexPooler.JSON.encode!(retained_padding),
+        ~s(}]}]}})
       ])
 
     terminal_event = "event: response.completed\ndata: " <> terminal_payload <> "\n\n"
     assert byte_size(terminal_event) > RetainedBody.max_bytes()
+
+    retained_terminal =
+      RetainedBody.empty() |> RetainedBody.append(terminal_event) |> RetainedBody.read()
+
+    assert byte_size(retained_terminal) == RetainedBody.max_bytes()
+
+    assert ResponseUsage.from_sse(retained_terminal) == %{
+             model_observation: %{"version" => 1, "coverage" => "full", "terminal_status" => nil, "terminal_model" => nil, "first_conflicting_model" => nil, "conflict" => nil},
+             status: "usage_unknown",
+             source: "sse_usage_missing"
+           }
+
+    usage_split = :binary.match(terminal_event, ~s("usage")) |> elem(0) |> Kernel.+(3)
+
+    <<terminal_before_usage::binary-size(^usage_split), terminal_after_usage::binary>> =
+      terminal_event
 
     upstream =
       start_upstream(
@@ -1728,7 +4806,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                }
              }
            }},
-          terminal_event
+          terminal_before_usage,
+          terminal_after_usage
         ])
       )
 
@@ -1741,21 +4820,26 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         output_token_micros: Decimal.new(50)
       })
 
-    conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "input" => "synthetic retained usage stream request",
-        "service_tier" => "auto",
-        "stream" => true
-      })
+    {{conn, telemetry_events}, log_output} =
+      with_log(fn ->
+        capture_stream_truncation_telemetry(fn ->
+          conn
+          |> auth(setup)
+          |> post("/v1/responses", %{
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic retained usage stream request",
+            "service_tier" => "auto",
+            "stream" => true
+          })
+        end)
+      end)
 
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
     assert conn.resp_body =~ "resp_v1_retained_usage_progress"
     assert conn.resp_body =~ "resp_v1_retained_usage_terminal"
+    assert conn.resp_body =~ sentinel
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.endpoint == "/backend-api/codex/responses"
@@ -1770,18 +4854,29 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
+    assert attempt.transport == "http_sse"
+    assert attempt.upstream_status_code == 200
     assert attempt.usage_status == "usage_known"
 
-    settlement =
-      Repo.get_by!(LedgerEntry,
-        request_id: request.id,
-        entry_kind: "settlement",
-        amount_status: "recorded"
-      )
+    assert %{
+             "terminal_seen" => true,
+             "terminal_kind" => "completed",
+             "terminal_status" => "completed",
+             "synthetic_terminal_sent" => false
+           } = attempt.response_metadata["public_openai_responses_stream"]
+
+    assert [settlement] =
+             Repo.all(
+               from(l in LedgerEntry,
+                 where:
+                   l.request_id == ^request.id and l.entry_kind == "settlement" and
+                     l.amount_status == "recorded"
+               )
+             )
 
     assert settlement.usage_status == "usage_known"
     assert settlement.input_tokens == 16
-    assert settlement.cached_input_tokens == nil
+    assert settlement.cached_input_tokens == 0
     assert settlement.output_tokens == 5
     assert settlement.reasoning_tokens == nil
     assert settlement.total_tokens == 21
@@ -1802,6 +4897,325 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert log.token_counts.total_tokens == 21
     assert log.cost.status == "priced"
     assert Decimal.positive?(log.cost.usd)
+
+    assert telemetry_events != []
+
+    # A truncated retained body is only actionable if the metric says which
+    # transport and route class produced it; an HTTP SSE relay used to report
+    # both as "unknown" because only the websocket session passed its context.
+    assert Enum.any?(telemetry_events, fn {_measurements, metadata} ->
+             metadata == %{
+               buffer: "retained_body",
+               transport: "http_sse",
+               route_class: "proxy_stream",
+               endpoint: "/backend-api/codex/responses"
+             }
+           end),
+           "expected an attributed retained_body truncation, got: " <>
+             inspect(Enum.map(telemetry_events, &elem(&1, 1)))
+
+    persisted =
+      inspect({
+        request.request_metadata,
+        attempt.response_metadata,
+        settlement.details,
+        RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+      })
+
+    refute persisted =~ sentinel
+    refute log_output =~ sentinel
+    refute inspect(telemetry_events) =~ sentinel
+  end
+
+  for scenario <- [
+        :known_large,
+        :known_null_coalesced,
+        :known_primitive_coalesced,
+        :known_split_boundary,
+        :known_after_output,
+        :known_inside_output,
+        :known_crlf,
+        :known_no_event_label,
+        :known_data_no_space,
+        :known_service_tier_split,
+        :missing_large,
+        :null_large,
+        :malformed_large,
+        :candidate_limit_large
+      ] do
+    test "POST /v1/responses preserves measured usage through #{scenario}", %{conn: conn} do
+      scenario = unquote(scenario)
+      {chunks, classification} = measured_usage_chunks(scenario)
+      known? = classification == "known"
+      requested_tier = if known?, do: "auto", else: "flex"
+      upstream = start_upstream(FakeUpstream.sse_stream(chunks))
+
+      setup =
+        gateway_setup(upstream,
+          model_metadata: %{"upstream_model" => %{"service_tiers" => [%{"id" => "flex"}]}}
+        )
+
+      pricing =
+        pricing_snapshot!(setup.model, %{
+          config: pricing_config(%{"service_tier" => "flex"}),
+          input_token_micros: Decimal.new(25),
+          cached_input_token_micros: Decimal.new(5),
+          output_token_micros: Decimal.new(50),
+          reasoning_token_micros: Decimal.new(75)
+        })
+        |> Ecto.Changeset.change(request_base_micros: Decimal.new(3))
+        |> Repo.update!()
+
+      assert Repo.all(from(r in DailyRollup, where: r.pool_id == ^setup.pool.id)) == []
+
+      conn =
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic measured usage contract",
+          "service_tier" => requested_tier,
+          "stream" => true
+        })
+
+      assert conn.status == 200
+      assert FakeUpstream.count(upstream) == 1
+      assert conn.resp_body =~ "event: response.completed"
+      refute conn.resp_body =~ "event: response.failed"
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "succeeded"
+      assert request.transport == "http_sse"
+
+      assert request.request_metadata["openai_compatibility"]["source_endpoint"] ==
+               "/v1/responses"
+
+      assert request.requested_service_tier == requested_tier
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "succeeded"
+      assert attempt.replay_generation == 0
+      assert attempt.upstream_status_code == 200
+
+      assert %{"terminal_kind" => "completed", "synthetic_terminal_sent" => false} =
+               attempt.response_metadata["public_openai_responses_stream"]
+
+      assert %{"version" => 1, "classification" => ^classification} =
+               attempt.response_metadata["usage_observation"]
+
+      entries = Repo.all(from(l in LedgerEntry, where: l.request_id == ^request.id))
+
+      assert Enum.sort(Enum.map(entries, & &1.entry_kind)) == [
+               "release",
+               "reservation",
+               "settlement"
+             ]
+
+      settlement = Enum.find(entries, &(&1.entry_kind == "settlement"))
+      reservation = Enum.find(entries, &(&1.entry_kind == "reservation"))
+      assert settlement.amount_status == "recorded"
+      assert is_binary(reservation.details["strategy"])
+      assert %Decimal{} = reservation.estimated_cost_micros
+      assert Decimal.equal?(settlement.estimated_cost_micros, reservation.estimated_cost_micros)
+      fact = Repo.get_by!(RequestLogFact, request_id: request.id)
+      assert fact.latest_settlement_entry_id == settlement.id
+
+      assert %{items: [log], total: 1} =
+               RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+      expected_status = if known?, do: "usage_known", else: "usage_unknown"
+      assert request.usage_status == expected_status
+      assert attempt.usage_status == expected_status
+      assert settlement.usage_status == expected_status
+      assert fact.latest_settlement_usage_status == expected_status
+      assert log.usage_status == expected_status
+
+      for {field, expected} <- [
+            input_tokens: 16,
+            cached_input_tokens: 4,
+            output_tokens: 5,
+            reasoning_tokens: 2,
+            total_tokens: 21,
+            cache_write_tokens: nil
+          ] do
+        actual = if known?, do: expected
+        assert Map.fetch!(fact, String.to_existing_atom("latest_#{field}")) == actual
+        assert Map.fetch!(log.token_counts, field) == actual
+        if known?, do: assert(Map.fetch!(settlement, field) == expected)
+      end
+
+      if known? do
+        assert request.actual_service_tier == "flex"
+        assert settlement.pricing_snapshot_id == pricing.id
+        assert settlement.details["pricing_status"] == "priced"
+        assert fact.latest_settlement_pricing_status == "priced"
+        assert Decimal.equal?(settlement.settled_cost_micros, Decimal.new(623))
+
+        assert Decimal.equal?(
+                 Decimal.new(settlement.details["settled_cost_micros"]),
+                 Decimal.new(623)
+               )
+
+        assert Decimal.equal?(
+                 Decimal.new(settlement.details["cached_input_cost_micros"]),
+                 Decimal.new(20)
+               )
+
+        assert Decimal.equal?(fact.latest_settled_cost_micros, Decimal.new(623))
+        assert Decimal.equal?(fact.latest_cached_input_cost_micros, Decimal.new(20))
+        assert Decimal.equal?(log.cost.usd, Decimal.new("0.000623"))
+        assert Decimal.equal?(log.token_counts.cached_input_cost_usd, Decimal.new("0.000020"))
+      else
+        assert settlement.details["pricing_status"] == "priced"
+        assert fact.latest_settlement_pricing_status == "priced"
+        assert settlement.details["settled_cost_micros"] == nil
+        assert settlement.details["cached_input_cost_micros"] == nil
+        assert settlement.details["cache_write_cost_micros"] == nil
+        assert fact.latest_settled_cost_micros == nil
+        assert fact.latest_cached_input_cost_micros == nil
+        assert log.cost.usd == nil
+        assert log.token_counts.cached_input_cost_usd == nil
+        assert log.token_counts.cache_write_cost_usd == nil
+      end
+
+      setup.api_key
+      |> Ecto.Changeset.change(dashboard_access: true)
+      |> Repo.update!()
+
+      principal =
+        DashboardPrincipal.new(%{
+          api_key_id: setup.api_key.id,
+          pool_id: setup.pool.id,
+          display_name: setup.api_key.display_name,
+          key_prefix: setup.api_key.key_prefix
+        })
+
+      assert {:ok, projection} =
+               Observatory.read(principal, "1h", as_of: DateTime.add(request.completed_at, 1, :second))
+
+      assert %{total: 1, succeeded: 1, failed: 0, in_progress: 0} = projection.totals.requests
+      assert projection.accounting.recorded_settlements == 1
+      assert projection.accounting.unknown_usage == if(known?, do: 0, else: 1)
+
+      assert projection.totals.tokens ==
+               if(known?,
+                 do: %{input: 16, cached_input: 4, output: 5, reasoning: 2, total: 21},
+                 else: %{input: 0, cached_input: 0, output: 0, reasoning: 0, total: 0}
+               )
+
+      assert projection.totals.cost.settled ==
+               if(known?,
+                 do: %{status: "settled", micros: 623},
+                 else: %{status: "unavailable", micros: 0}
+               )
+
+      if not known?, do: assert(projection.totals.cost.estimated.status == "estimated")
+
+      assert [daily] =
+               Repo.all(
+                 from(r in DailyRollup,
+                   where: r.pool_id == ^setup.pool.id and r.dimension_kind == "pool"
+                 )
+               )
+
+      assert [hourly] =
+               Repo.all(
+                 from(r in CodexPooler.Accounting.HourlyModelUsageRollup,
+                   where: r.pool_id == ^setup.pool.id
+                 )
+               )
+
+      for rollup <- [daily, hourly] do
+        assert rollup.request_count == 1
+        assert rollup.success_count == 1
+        assert rollup.failure_count == 0
+
+        for {field, expected} <- [
+              input_tokens: 16,
+              cached_input_tokens: 4,
+              output_tokens: 5,
+              reasoning_tokens: 2,
+              total_tokens: 21
+            ] do
+          assert Map.fetch!(rollup, field) == if(known?, do: expected, else: 0)
+        end
+
+        assert Decimal.equal?(
+                 rollup.settled_cost_micros,
+                 Decimal.new(if(known?, do: 623, else: 0))
+               )
+      end
+    end
+  end
+
+  defp measured_usage_chunks(scenario) do
+    usage =
+      ~s({"input_tokens":16,"input_tokens_details":{"cached_tokens":4},"output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":21})
+
+    padding = CodexPooler.JSON.encode!(String.duplicate("x", 290_000))
+
+    output =
+      ~s("output":[{"type":"message","content":[{"type":"output_text","text":#{padding}}]}])
+
+    {classification, usage_field} = measured_usage_field(scenario, usage)
+    fields = measured_usage_fields(scenario, usage_field, output, padding)
+
+    terminal =
+      ~s(event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_synthetic_usage_contract","status":"completed","service_tier":"flex",#{fields}}}\n\n)
+
+    {measured_usage_transport_chunks(scenario, terminal), classification}
+  end
+
+  defp measured_usage_field(:missing_large, _usage), do: {"missing", ""}
+  defp measured_usage_field(:null_large, _usage), do: {"null", ~s("usage":null,)}
+  defp measured_usage_field(:malformed_large, _usage), do: {"malformed", ~s("usage":17,)}
+
+  defp measured_usage_field(:candidate_limit_large, _usage) do
+    {"candidate_limit", ~s("usage":{"padding":#{CodexPooler.JSON.encode!(String.duplicate("y", 20_000))}},)}
+  end
+
+  defp measured_usage_field(_scenario, usage), do: {"known", ~s("usage":#{usage},)}
+
+  defp measured_usage_fields(:known_after_output, usage, output, _padding),
+    do: output <> "," <> String.trim_trailing(usage, ",")
+
+  defp measured_usage_fields(:known_inside_output, usage, output, padding),
+    do: ~s("padding_before":#{padding},) <> usage <> output
+
+  defp measured_usage_fields(_scenario, usage, output, _padding), do: usage <> output
+
+  defp measured_usage_transport_chunks(scenario, terminal) do
+    progress = fn value ->
+      ~s(event: response.created\ndata: {"type":"response.created","response":{"status":"in_progress","usage":#{value}}}\n\n)
+    end
+
+    case scenario do
+      :known_crlf ->
+        [String.replace(terminal, "\n", "\r\n")]
+
+      :known_no_event_label ->
+        [String.replace_prefix(terminal, "event: response.completed\n", "")]
+
+      :known_data_no_space ->
+        [String.replace(terminal, "data: ", "data:")]
+
+      :known_service_tier_split ->
+        split = elem(:binary.match(terminal, ~s("service_tier")), 0) + 17
+        <<first::binary-size(^split), rest::binary>> = terminal
+        [first, rest]
+
+      :known_null_coalesced ->
+        [progress.("null") <> terminal]
+
+      :known_primitive_coalesced ->
+        [progress.("17") <> terminal]
+
+      :known_split_boundary ->
+        split = elem(:binary.match(terminal, ~s("cached_tokens")), 0) + 5
+        <<first::binary-size(^split), rest::binary>> = terminal
+        [first, rest <> progress.("null")]
+
+      _ ->
+        [terminal]
+    end
   end
 
   test "POST /v1/responses rejects unsafe reasoning effort before dispatch", %{conn: conn} do
@@ -2030,6 +5444,53 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
+  # findings#313: a client-sent manifest's `tool_search` is forwarded for the provider to validate, like the manifest's
+  # other tools; the provider takes it beside a deferred tool in either serving mode.
+  test "POST /v1/responses forwards a nested tool_search for the provider to validate", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_nested_tool_search", "object" => "response", "status" => "completed", "output" => [], "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}}
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    supported_tool = %{
+      "type" => "function",
+      "name" => "lookup_nested_tool_search",
+      "parameters" => %{"type" => "object", "properties" => %{}},
+      "defer_loading" => true
+    }
+
+    for {position, stream} <- [{0, false}, {1, false}, {2, true}] do
+      tools =
+        [supported_tool, supported_tool]
+        |> List.insert_at(position, %{"type" => "tool_search"})
+
+      manifest = %{"type" => "additional_tools", "role" => "developer", "tools" => tools}
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "stream" => stream,
+          "input" => [%{"role" => "user", "content" => "synthetic nested tool search"}, manifest]
+        })
+
+      assert response.status == 200
+      assert manifest in List.last(FakeUpstream.requests(upstream)).json["input"]
+    end
+
+    assert FakeUpstream.count(upstream) == 3
+  end
+
   test "POST /v1/responses rejects malformed instruction-role content before dispatch", %{
     conn: conn
   } do
@@ -2061,12 +5522,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "first"}},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "second"}},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "third"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "first"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "second"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "third"}},
           {"response.completed",
            %{
              "type" => "response.completed",
@@ -2103,60 +5561,65 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
   @tag :custom_tool_replay
   @tag :tool_result_previous_response
+  # An anchored `/v1` turn reaches the provider only bridged onto the upstream
+  # websocket connection that produced its anchor (findings#232 rows 232-275
+  # and 232-277), so the replay shape is certified on that path.
   test "POST /v1/responses forwards namespaced custom tool replay without metadata leakage", %{
     conn: conn
   } do
+    BridgedAnchor.enable_bridge!()
+
     upstream =
       start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_custom_tool_replay",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-        })
+        BridgedAnchor.upstream_mode(
+          "resp_v1_custom_tool_previous",
+          BridgedAnchor.completed_frames(%{
+            "id" => "resp_v1_custom_tool_replay",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
       )
 
     setup = gateway_setup(upstream)
 
-    conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => "resp_v1_custom_tool_previous",
-        "store" => false,
-        "input" => [
-          %{
-            "type" => "custom_tool_call",
-            "id" => "ctc_v1_http_call",
-            "call_id" => "call_v1_custom_namespaced",
-            "namespace" => "browser.search",
-            "name" => "lookup",
-            "input" => "{}",
-            "status" => "completed",
-            "metadata" => %{"turn_id" => "turn_v1_custom_call_legacy"},
-            "internal_chat_message_metadata_passthrough" => %{"turn_id" => "turn_v1_custom_call"}
-          },
-          %{
-            "type" => "custom_tool_call_output",
-            "id" => "ctco_v1_http_call",
-            "call_id" => "call_v1_custom_namespaced",
-            "name" => "lookup",
-            "output" => "synthetic custom output",
-            "metadata" => %{"turn_id" => "turn_v1_custom_output_legacy"},
-            "internal_chat_message_metadata_passthrough" => %{
-              "turn_id" => "turn_v1_custom_output"
-            }
+    conn
+    |> BridgedAnchor.post_anchored(setup, %{
+      "model" => setup.model.exposed_model_id,
+      "previous_response_id" => "resp_v1_custom_tool_previous",
+      "store" => false,
+      "input" => [
+        %{
+          "type" => "custom_tool_call",
+          "id" => "ctc_v1_http_call",
+          "call_id" => "call_v1_custom_namespaced",
+          "namespace" => "browser.search",
+          "name" => "lookup",
+          "input" => "{}",
+          "status" => "completed",
+          "metadata" => %{"turn_id" => "turn_v1_custom_call_legacy"},
+          "internal_chat_message_metadata_passthrough" => %{
+            "turn_id" => "turn_v1_custom_call",
+            "replay_context" => "custom-call-context"
           }
-        ]
-      })
+        },
+        %{
+          "type" => "custom_tool_call_output",
+          "id" => "ctco_v1_http_call",
+          "call_id" => "call_v1_custom_namespaced",
+          "name" => "lookup",
+          "output" => "synthetic custom output",
+          "metadata" => %{"turn_id" => "turn_v1_custom_output_legacy"},
+          "internal_chat_message_metadata_passthrough" => %{
+            "turn_id" => "turn_v1_custom_output"
+          }
+        }
+      ]
+    })
+    |> BridgedAnchor.assert_completed!("resp_v1_custom_tool_replay")
 
-    assert %{"id" => "resp_v1_custom_tool_replay", "object" => "response"} =
-             json_response(conn, 200)
-
-    assert [captured] = FakeUpstream.requests(upstream)
+    captured = BridgedAnchor.anchored_request!(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["previous_response_id"] == "resp_v1_custom_tool_previous"
-    assert captured.json["stream"] == true
     assert captured.json["store"] == false
 
     assert [custom_call, custom_output] = captured.json["input"]
@@ -2164,6 +5627,12 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert custom_call["namespace"] == "browser.search"
     assert custom_call["name"] == "lookup"
     assert custom_call["input"] == "{}"
+
+    assert custom_call["internal_chat_message_metadata_passthrough"] == %{
+             "turn_id" => "turn_v1_custom_call",
+             "replay_context" => "custom-call-context"
+           }
+
     refute Map.has_key?(custom_call, "status")
 
     assert custom_output["type"] == "custom_tool_call_output"
@@ -2171,7 +5640,11 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert custom_output["name"] == "lookup"
     assert custom_output["output"] == "synthetic custom output"
 
-    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert custom_output["internal_chat_message_metadata_passthrough"] == %{
+             "turn_id" => "turn_v1_custom_output"
+           }
+
+    assert [_opener, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
     assert request.endpoint == "/backend-api/codex/responses"
     assert request.status == "succeeded"
 
@@ -2184,9 +5657,71 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute persistence_text =~ "call_v1_custom_namespaced"
     refute persistence_text =~ "turn_v1_custom_call"
     refute persistence_text =~ "turn_v1_custom_output"
+    refute persistence_text =~ "custom-call-context"
     refute persistence_text =~ setup.authorization
     refute persistence_text =~ setup.raw_key
     refute persistence_text =~ "raw_request"
+  end
+
+  @tag :custom_tool_replay
+  test "POST /v1/responses strips reserved tool-call metadata before dispatch", %{
+    conn: conn
+  } do
+    reserved_key = "executed_tool_calls"
+    reserved_sentinel = "reserved-executed-tool-calls-http-sentinel"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_reserved_metadata_stripped",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "store" => false,
+        "input" => [
+          %{
+            "type" => "custom_tool_call_output",
+            "call_id" => "call_reserved_metadata_http",
+            "name" => "lookup",
+            "output" => "synthetic custom output",
+            "internal_chat_message_metadata_passthrough" => %{
+              "turn_id" => "turn_reserved_metadata_http",
+              reserved_key => reserved_sentinel
+            }
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_reserved_metadata_stripped", "object" => "response"} =
+             json_response(conn, 200)
+
+    assert FakeUpstream.count(upstream) == 1
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert [custom_output] = captured.json["input"]
+    assert custom_output["type"] == "custom_tool_call_output"
+
+    assert custom_output["internal_chat_message_metadata_passthrough"] == %{
+             "turn_id" => "turn_reserved_metadata_http"
+           }
+
+    refute inspect(captured.json) =~ reserved_sentinel
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+
+    persistence_text = inspect({request.request_metadata, RequestLogs.list(setup.pool)})
+    refute persistence_text =~ reserved_key
+    refute persistence_text =~ reserved_sentinel
+    refute persistence_text =~ "turn_reserved_metadata_http"
   end
 
   @tag :custom_tool_replay
@@ -2225,7 +5760,427 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :tool_result_previous_response
-  test "POST /v1/responses forwards namespace tools unchanged", %{conn: conn} do
+  test "POST /v1/responses characterizes function-only namespace choices", %{conn: conn} do
+    upstream = start_upstream(issue_241_completed_response("resp_v1_function_namespace"))
+    setup = gateway_setup(upstream)
+
+    namespace_tool = %{
+      "type" => "namespace",
+      "name" => "functions",
+      "description" => "Synthetic function namespace",
+      "tools" => [
+        %{
+          "type" => "function",
+          "name" => "namespace_function_fixture",
+          "description" => "Synthetic namespace function",
+          "parameters" => %{"type" => "object", "properties" => %{}}
+        }
+      ]
+    }
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic function namespace request",
+        "tools" => [namespace_tool],
+        "tool_choice" => %{"type" => "function", "name" => "namespace_function_fixture"}
+      })
+
+    assert %{"id" => "resp_v1_function_namespace", "object" => "response"} =
+             json_response(response, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["tools"] == [namespace_tool]
+
+    assert captured.json["tool_choice"] == %{
+             "type" => "function",
+             "name" => "namespace_function_fixture"
+           }
+
+    assert_issue_241_success_lifecycle!(setup)
+  end
+
+  test "POST /v1/responses forwards mixed namespaced custom tools without metadata leakage", %{
+    conn: conn
+  } do
+    upstream = start_upstream(issue_241_completed_response("resp_v1_namespace_custom_definition"))
+    setup = gateway_setup(upstream)
+    prompt_marker = "synthetic namespaced custom prompt marker"
+    description_marker = "synthetic namespaced custom description marker"
+    custom_input_marker = "synthetic_namespaced_custom_input_marker"
+    grammar_marker = ~s(start: "#{custom_input_marker}")
+
+    namespace_tool = %{
+      "type" => "namespace",
+      "name" => "functions",
+      "description" => "Synthetic mixed namespace",
+      "tools" => [
+        %{
+          "type" => "function",
+          "name" => "namespaced_function_fixture",
+          "description" => "Synthetic adjacent function",
+          "parameters" => %{"type" => "object", "properties" => %{}}
+        },
+        %{
+          "type" => "custom",
+          "name" => "namespaced_custom_fixture",
+          "description" => description_marker,
+          "format" => %{
+            "type" => "grammar",
+            "definition" => grammar_marker,
+            "syntax" => "lark"
+          }
+        }
+      ]
+    }
+
+    tool_choice = %{"type" => "custom", "name" => "namespaced_custom_fixture"}
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => prompt_marker,
+        "tools" => [namespace_tool],
+        "tool_choice" => tool_choice
+      })
+
+    assert %{"id" => "resp_v1_namespace_custom_definition", "object" => "response"} =
+             json_response(response, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "POST"
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["tools"] == [namespace_tool]
+    assert captured.json["tool_choice"] == tool_choice
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+
+    persistence_text =
+      inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)})
+
+    for marker <- [prompt_marker, description_marker, grammar_marker, custom_input_marker] do
+      refute persistence_text =~ marker
+    end
+
+    assert_issue_241_success_lifecycle!(setup)
+  end
+
+  test "POST /v1/responses restores only declared custom namespaces in collected output", %{
+    conn: conn
+  } do
+    namespaced_name = "collected_namespaced_custom_fixture"
+    flat_name = "collected_flat_custom_fixture"
+
+    output = [
+      %{
+        "type" => "custom_tool_call",
+        "name" => namespaced_name,
+        "call_id" => "call_collected_omitted",
+        "input" => "collected_omitted"
+      },
+      %{
+        "type" => "custom_tool_call",
+        "name" => namespaced_name,
+        "namespace" => nil,
+        "call_id" => "call_collected_null",
+        "input" => "collected_null"
+      },
+      %{
+        "type" => "custom_tool_call",
+        "name" => namespaced_name,
+        "namespace" => "provider.tools",
+        "call_id" => "call_collected_explicit",
+        "input" => "collected_explicit"
+      },
+      %{
+        "type" => "custom_tool_call",
+        "name" => flat_name,
+        "call_id" => "call_collected_flat",
+        "input" => "collected_flat"
+      },
+      %{
+        "type" => "custom_tool_call",
+        "name" => "collected_unknown_custom_fixture",
+        "namespace" => nil,
+        "call_id" => "call_collected_unknown",
+        "input" => "collected_unknown"
+      }
+    ]
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_collected_custom_namespaces",
+               "status" => "completed",
+               "output" => output,
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    namespace_tool = %{
+      "type" => "namespace",
+      "name" => "functions",
+      "description" => "Synthetic collected namespace",
+      "tools" => [%{"type" => "custom", "name" => namespaced_name}]
+    }
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic collected namespace restoration",
+        "tools" => [namespace_tool, %{"type" => "custom", "name" => flat_name}]
+      })
+
+    assert %{"output" => [omitted, null, explicit, flat, unknown]} = json_response(response, 200)
+    assert omitted["namespace"] == "functions"
+    assert null["namespace"] == "functions"
+    assert explicit["namespace"] == "provider.tools"
+    refute Map.has_key?(flat, "namespace")
+    assert unknown["namespace"] == nil
+  end
+
+  test "POST /v1/responses restores declared custom namespaces in SSE output items", %{
+    conn: conn
+  } do
+    name = "streamed_namespaced_custom_fixture"
+
+    calls = [
+      %{
+        "type" => "custom_tool_call",
+        "name" => name,
+        "call_id" => "call_streamed_omitted",
+        "input" => "streamed_omitted"
+      },
+      %{
+        "type" => "custom_tool_call",
+        "name" => name,
+        "namespace" => nil,
+        "call_id" => "call_streamed_null",
+        "input" => "streamed_null"
+      }
+    ]
+
+    events =
+      Enum.map(calls, fn call ->
+        {"response.output_item.done", %{"type" => "response.output_item.done", "item" => call}}
+      end) ++
+        [
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_streamed_custom_namespaces",
+               "status" => "completed",
+               "output" => [],
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ]
+
+    upstream = start_upstream(FakeUpstream.sse_stream(events))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic streamed namespace restoration",
+        "stream" => true,
+        "tools" => [
+          %{
+            "type" => "namespace",
+            "name" => "functions",
+            "description" => "Synthetic streamed namespace",
+            "tools" => [%{"type" => "custom", "name" => name}]
+          }
+        ]
+      })
+
+    restored_calls =
+      response.resp_body
+      |> public_sse_events()
+      |> Enum.filter(&(&1["event"] == "response.output_item.done"))
+      |> Enum.map(&get_in(&1, ["data", "item"]))
+
+    assert Enum.map(restored_calls, & &1["namespace"]) == ["functions", "functions"]
+  end
+
+  test "POST /v1/responses rejects invalid namespaced custom tools before gateway accounting", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_tools = [
+      {"malformed nested custom",
+       %{
+         "type" => "namespace",
+         "name" => "functions",
+         "description" => "Synthetic namespace",
+         "tools" => [
+           %{
+             "type" => "custom",
+             "name" => "malformed_namespaced_custom_fixture",
+             "format" => %{"type" => "grammar", "syntax" => "lark"}
+           }
+         ]
+       }},
+      {"hosted namespace child",
+       %{
+         "type" => "namespace",
+         "name" => "functions",
+         "description" => "Synthetic namespace",
+         "tools" => [%{"type" => "web_search_preview"}]
+       }},
+      {"nested namespace child",
+       %{
+         "type" => "namespace",
+         "name" => "functions",
+         "description" => "Synthetic namespace",
+         "tools" => [
+           %{
+             "type" => "namespace",
+             "name" => "nested",
+             "description" => "Synthetic nested namespace",
+             "tools" => [
+               %{
+                 "type" => "function",
+                 "name" => "nested_function_fixture",
+                 "parameters" => %{"type" => "object", "properties" => %{}}
+               }
+             ]
+           }
+         ]
+       }},
+      {"duplicate executable name",
+       [
+         %{
+           "type" => "function",
+           "name" => "duplicated_namespaced_executable",
+           "parameters" => %{"type" => "object", "properties" => %{}}
+         },
+         %{
+           "type" => "namespace",
+           "name" => "functions",
+           "description" => "Synthetic namespace",
+           "tools" => [
+             %{"type" => "custom", "name" => "duplicated_namespaced_executable"}
+           ]
+         }
+       ]}
+    ]
+
+    for {label, tools} <- invalid_tools do
+      tools = if is_list(tools), do: tools, else: [tools]
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic invalid namespaced custom request",
+          "tools" => tools
+        })
+
+      assert %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => "invalid_request",
+                 "param" => "tools"
+               }
+             } = json_response(response, 400),
+             label
+
+      assert FakeUpstream.count(upstream) == 0, label
+      assert Repo.aggregate(Request, :count) == 0, label
+      assert Repo.aggregate(Attempt, :count) == 0, label
+      assert Repo.aggregate(LedgerEntry, :count) == 0, label
+      assert Repo.aggregate(RequestLogFact, :count) == 0, label
+    end
+  end
+
+  test "POST /v1/responses keeps Lite namespaced custom choice denial inside gateway accounting",
+       %{
+         conn: conn
+       } do
+    upstream =
+      start_upstream(issue_241_completed_response("should_not_dispatch_lite_namespace_choice"))
+
+    setup = gateway_setup(upstream)
+    put_public_model_serving_mode!(setup, "lite")
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic Lite namespaced custom choice request",
+        "tools" => [
+          %{
+            "type" => "namespace",
+            "name" => "functions",
+            "description" => "Synthetic namespace",
+            "tools" => [
+              %{
+                "type" => "custom",
+                "name" => "lite_namespaced_custom_fixture",
+                "format" => %{
+                  "type" => "grammar",
+                  "definition" => ~s(start: "lite_namespaced_custom_input"),
+                  "syntax" => "lark"
+                }
+              }
+            ]
+          }
+        ],
+        "tool_choice" => %{"type" => "custom", "name" => "lite_namespaced_custom_fixture"}
+      })
+
+    assert %{
+             "error" => %{
+               "code" => "unsupported_parameter",
+               "message" => "Unsupported parameter: tool_choice",
+               "param" => "tool_choice"
+             }
+           } = json_response(response, 400)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "unsupported_parameter"
+    assert request.request_metadata["gateway_denial"]["param"] == "tool_choice"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.request_id == ^request.id),
+             :count
+           ) == 0
+  end
+
+  test "POST /v1/responses keeps nested namespace lowering and strict function handling", %{
+    conn: conn
+  } do
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
@@ -2248,6 +6203,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       "name" => "fixture_namespace",
       "description" => "Synthetic namespace tools",
       "tools" => [
+        %{
+          "type" => "function",
+          "name" => "lower_namespaced_fixture",
+          "description" => "Lower synthetic namespaced fixture",
+          "parameters" => non_strict_tool_schema(),
+          "strict" => false,
+          "defer_loading" => false
+        },
         %{
           "type" => "function",
           "name" => "lookup_namespaced_fixture",
@@ -2281,7 +6244,19 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
-    assert captured.json["tools"] == [namespace_tool]
+
+    [non_strict_function, strict_function] = namespace_tool["tools"]
+
+    expected_namespace_tool =
+      Map.put(namespace_tool, "tools", [
+        Map.put(non_strict_function, "parameters", lowered_tool_schema()),
+        strict_function
+      ])
+
+    assert captured.json["tools"] == [expected_namespace_tool]
+
+    [captured_namespace] = captured.json["tools"]
+    assert Enum.at(captured_namespace["tools"], 1) == strict_function
 
     assert captured.json["tool_choice"] == %{
              "type" => "function",
@@ -2296,52 +6271,131 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute metadata =~ "lookup_namespaced_fixture"
   end
 
+  # The Codex client declares its multi-agent tools in the reserved `collaboration` namespace with `encrypted: true` on
+  # their message parameters, and the provider refuses a reserved function whose declaration differs from the schema it
+  # configured (`400 invalid_request_error`, param `tools`, "must match the configured schema"). A client that sends that
+  # manifest to /v1 reaches the provider with the namespace exactly as declared, marker included, in both serving modes;
+  # an ordinary top-level function still loses the marker.
+  test "POST /v1/responses keeps encrypted markers inside namespace functions in Full and Lite", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed", %{"type" => "response.completed", "response" => %{"id" => "resp_v1_encrypted_namespace", "status" => "completed", "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}}}}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    message = %{"type" => "string", "description" => "Message text to queue on the target agent.", "encrypted" => true}
+    parameters = %{"type" => "object", "properties" => %{"target" => %{"type" => "string", "description" => "Agent to message."}, "message" => message}, "required" => ["target", "message"], "additionalProperties" => false}
+    send_message = %{"type" => "function", "name" => "send_message", "description" => "Send a message to an existing agent.", "strict" => false, "parameters" => parameters}
+    namespace_tool = %{"type" => "namespace", "name" => "collaboration", "description" => "Tools for spawning and managing sub-agents.", "tools" => [send_message]}
+    flat_tool = %{send_message | "name" => "send_note"}
+    payload = %{"model" => setup.model.exposed_model_id, "input" => "synthetic encrypted namespace request", "tools" => [namespace_tool, flat_tool]}
+
+    for mode <- ["full", "lite"] do
+      put_public_model_serving_mode!(setup, mode)
+      response = conn |> recycle() |> auth(setup) |> post("/v1/responses", payload)
+      assert %{"id" => "resp_v1_encrypted_namespace"} = json_response(response, 200)
+    end
+
+    assert [full_capture, lite_capture] = FakeUpstream.requests(upstream)
+    assert [lite_manifest] = for(%{"type" => "additional_tools", "tools" => tools} <- lite_capture.json["input"], do: tools)
+
+    for {mode, [captured_namespace, captured_flat]} <- [{"full", full_capture.json["tools"]}, {"lite", lite_manifest}] do
+      assert captured_namespace == namespace_tool, mode
+      assert get_in(captured_flat, ["parameters", "properties", "message"]) == Map.delete(message, "encrypted"), mode
+    end
+  end
+
+  test "POST /v1/responses rejects malformed namespace and unsupported tools before dispatch", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_tools = [
+      %{
+        "type" => "namespace",
+        "name" => "fixture_namespace",
+        "description" => "Synthetic namespace tools",
+        "tools" => [%{"type" => "function", "name" => "missing_parameters"}]
+      },
+      %{"type" => "unsupported_tool", "name" => "fixture"}
+    ]
+
+    for invalid_tool <- invalid_tools do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic invalid tool request",
+          "tools" => [invalid_tool]
+        })
+
+      assert %{"error" => error} = json_response(response, 400)
+      assert error["type"] == "invalid_request_error"
+      assert error["code"] == "invalid_request"
+      assert error["param"] == "tools"
+      refute response.resp_body =~ "missing_parameters"
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
   @tag :tool_result_previous_response
+  # The anchored shape is certified on the bridged path, the only one on which
+  # the provider serves an anchored `/v1` turn (findings#232 rows 232-275 and
+  # 232-277).
   test "POST /v1/responses forwards safe continuation shape and rejects malformed item references without echoing payloads",
        %{
          conn: conn
        } do
-    upstream =
-      start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_http_safe_continuation",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-        })
-      )
-
-    setup = gateway_setup(upstream)
+    BridgedAnchor.enable_bridge!()
     previous_response_id = "resp_v1_http_safe_previous_#{System.unique_integer([:positive])}"
     tool_call_id = "call_v1_http_safe_#{System.unique_integer([:positive])}"
 
-    conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => previous_response_id,
-        "store" => false,
-        "input" => [
-          %{"type" => "item_reference", "id" => "msg_v1_http_safe_reference"},
-          %{
-            "type" => "function_call_output",
-            "call_id" => tool_call_id,
-            "output" => "{\"ok\":true}"
-          },
-          %{
-            "role" => "user",
-            "content" => [%{"type" => "input_text", "text" => "synthetic follow-up"}]
-          }
-        ]
-      })
+    upstream =
+      start_upstream(
+        BridgedAnchor.upstream_mode(
+          previous_response_id,
+          BridgedAnchor.completed_frames(%{
+            "id" => "resp_v1_http_safe_continuation",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+      )
 
-    assert %{"id" => "resp_v1_http_safe_continuation", "object" => "response"} =
-             json_response(conn, 200)
+    setup = gateway_setup(upstream)
 
-    assert [captured] = FakeUpstream.requests(upstream)
+    conn
+    |> BridgedAnchor.post_anchored(setup, %{
+      "model" => setup.model.exposed_model_id,
+      "previous_response_id" => previous_response_id,
+      "store" => false,
+      "input" => [
+        %{"type" => "item_reference", "id" => "msg_v1_http_safe_reference"},
+        %{
+          "type" => "function_call_output",
+          "call_id" => tool_call_id,
+          "name" => "lookup",
+          "namespace" => "browser.search",
+          "output" => "{\"ok\":true}"
+        },
+        %{
+          "role" => "user",
+          "content" => [%{"type" => "input_text", "text" => "synthetic follow-up"}]
+        }
+      ]
+    })
+    |> BridgedAnchor.assert_completed!("resp_v1_http_safe_continuation")
+
+    captured = BridgedAnchor.anchored_request!(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["previous_response_id"] == previous_response_id
-    assert captured.json["stream"] == true
     assert captured.json["store"] == false
 
     assert Enum.map(captured.json["input"], & &1["type"]) == [
@@ -2352,9 +6406,11 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert hd(captured.json["input"])["id"] == "msg_v1_http_safe_reference"
     assert Enum.at(captured.json["input"], 1)["call_id"] == tool_call_id
+    assert Enum.at(captured.json["input"], 1)["name"] == "lookup"
+    assert Enum.at(captured.json["input"], 1)["namespace"] == "browser.search"
     assert Enum.at(captured.json["input"], 2)["role"] == "user"
 
-    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [_opener, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
     assert request.endpoint == "/backend-api/codex/responses"
     assert request.status == "succeeded"
 
@@ -2390,54 +6446,54 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute invalid_text =~ "unsafe-inline-leak"
     refute invalid_text =~ "msg_v1_http_unsafe_reference"
 
-    assert FakeUpstream.count(upstream) == 1
-    assert Repo.aggregate(Request, :count) == 1
-    assert Repo.aggregate(Attempt, :count) == 1
+    assert FakeUpstream.count(upstream) == 2
+    assert Repo.aggregate(Request, :count) == 2
+    assert Repo.aggregate(Attempt, :count) == 2
   end
 
   @tag :structured_tool_result_pass_through
   test "POST /v1/responses forwards structured tool output unchanged and keeps projections shape-only",
        %{conn: conn} do
     setup_runtime_ingress_override(%OperationalSettings{gateway_debug?: true})
-
-    upstream =
-      start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_http_structured_tool_result",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-        })
-      )
-
-    setup = gateway_setup(upstream)
+    # Bridged: the only path on which the provider serves an anchored `/v1`
+    # turn (findings#232 rows 232-275 and 232-277).
+    BridgedAnchor.enable_bridge!()
     previous_response_id = "resp_v1_http_structured_previous"
     tool_call_id = "call_v1_http_structured_tool"
     structured_output = structured_tool_result_output()
 
-    conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => previous_response_id,
-        "store" => false,
-        "input" => [
-          %{"type" => "item_reference", "id" => "msg_v1_http_structured_reference"},
-          %{
-            "type" => "function_call_output",
-            "call_id" => tool_call_id,
-            "output" => structured_output
-          }
-        ]
-      })
+    upstream =
+      start_upstream(
+        BridgedAnchor.upstream_mode(
+          previous_response_id,
+          BridgedAnchor.completed_frames(%{
+            "id" => "resp_v1_http_structured_tool_result",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+      )
 
-    assert %{"id" => "resp_v1_http_structured_tool_result", "object" => "response"} =
-             json_response(conn, 200)
+    setup = gateway_setup(upstream)
 
-    assert [captured] = FakeUpstream.requests(upstream)
+    conn
+    |> BridgedAnchor.post_anchored(setup, %{
+      "model" => setup.model.exposed_model_id,
+      "previous_response_id" => previous_response_id,
+      "store" => false,
+      "input" => [
+        %{"type" => "item_reference", "id" => "msg_v1_http_structured_reference"},
+        %{
+          "type" => "function_call_output",
+          "call_id" => tool_call_id,
+          "output" => structured_output
+        }
+      ]
+    })
+    |> BridgedAnchor.assert_completed!("resp_v1_http_structured_tool_result")
+
+    captured = BridgedAnchor.anchored_request!(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["previous_response_id"] == previous_response_id
-    assert captured.json["stream"] == true
     assert captured.json["store"] == false
 
     assert Enum.map(captured.json["input"], & &1["type"]) == [
@@ -2453,7 +6509,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       "structured function_call_output output was not forwarded unchanged"
     )
 
-    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [_opener, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
     assert request.status == "succeeded"
     assert request.endpoint == "/backend-api/codex/responses"
 
@@ -2482,69 +6538,68 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute projection_text =~ tool_call_id
   end
 
+  # Bridged: the only path on which the provider serves an anchored `/v1`
+  # turn (findings#232 rows 232-275 and 232-277).
   @tag :tool_result_previous_response
   test "POST /v1/responses keeps store false replay item ids at the raw Responses boundary", %{
     conn: conn
   } do
+    BridgedAnchor.enable_bridge!()
+
     upstream =
       start_upstream(
-        FakeUpstream.sse_stream([
-          {"response.completed",
-           %{
-             "type" => "response.completed",
-             "response" => %{
-               "id" => "resp_v1_http_store_false_replay_ids",
-               "status" => "completed",
-               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-             }
-           }}
-        ])
+        BridgedAnchor.upstream_mode(
+          "resp_v1_http_store_false_previous",
+          BridgedAnchor.completed_frames(%{
+            "id" => "resp_v1_http_store_false_replay_ids",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
       )
 
     setup = gateway_setup(upstream)
 
-    conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => "resp_v1_http_store_false_previous",
-        "store" => false,
-        "input" => [
-          %{
-            "type" => "reasoning",
-            "id" => "rs_v1_http_store_false_replay",
-            "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
-            "encrypted_content" => "synthetic-encrypted-reasoning"
-          },
-          %{
-            "type" => "message",
-            "role" => "assistant",
-            "id" => "msg_v1_http_store_false_replay",
-            "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
-          },
-          %{
-            "type" => "function_call",
-            "id" => "fc_v1_http_store_false_replay",
-            "call_id" => "call_v1_http_store_false_replay",
-            "name" => "lookup_fixture",
-            "namespace" => "fixture_namespace",
-            "arguments" => "{}"
-          },
-          %{
-            "type" => "function_call_output",
-            "id" => "fco_v1_http_store_false_replay",
-            "call_id" => "call_v1_http_store_false_replay",
-            "output" => "synthetic tool output"
-          },
-          %{"type" => "item_reference", "id" => "msg_v1_http_store_false_reference"}
-        ]
-      })
+    conn
+    |> BridgedAnchor.post_anchored(setup, %{
+      "model" => setup.model.exposed_model_id,
+      "previous_response_id" => "resp_v1_http_store_false_previous",
+      "store" => false,
+      "input" => [
+        %{
+          "type" => "reasoning",
+          "id" => "rs_v1_http_store_false_replay",
+          "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
+          "content" => [
+            %{"type" => "reasoning_text", "text" => "synthetic reasoning replay"}
+          ],
+          "encrypted_content" => "synthetic-encrypted-reasoning"
+        },
+        %{
+          "type" => "message",
+          "role" => "assistant",
+          "id" => "msg_v1_http_store_false_replay",
+          "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
+        },
+        %{
+          "type" => "function_call",
+          "id" => "fc_v1_http_store_false_replay",
+          "call_id" => "call_v1_http_store_false_replay",
+          "name" => "lookup_fixture",
+          "namespace" => "fixture_namespace",
+          "arguments" => "{}"
+        },
+        %{
+          "type" => "function_call_output",
+          "id" => "fco_v1_http_store_false_replay",
+          "call_id" => "call_v1_http_store_false_replay",
+          "output" => "synthetic tool output"
+        },
+        %{"type" => "item_reference", "id" => "msg_v1_http_store_false_reference"}
+      ]
+    })
+    |> BridgedAnchor.assert_completed!("resp_v1_http_store_false_replay_ids")
 
-    assert %{"id" => "resp_v1_http_store_false_replay_ids", "object" => "response"} =
-             json_response(conn, 200)
-
-    assert [captured] = FakeUpstream.requests(upstream)
+    captured = BridgedAnchor.anchored_request!(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["store"] == false
     assert captured.json["previous_response_id"] == "resp_v1_http_store_false_previous"
@@ -2560,9 +6615,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Enum.at(captured.json["input"], 2)["call_id"] == "call_v1_http_store_false_replay"
     assert Enum.at(captured.json["input"], 3)["call_id"] == "call_v1_http_store_false_replay"
 
-    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert Enum.at(captured.json["input"], 0)["content"] == [
+             %{"type" => "reasoning_text", "text" => "synthetic reasoning replay"}
+           ]
+
+    assert [_opener, request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id, order_by: [asc: r.admitted_at]))
     metadata = inspect(request.request_metadata)
     refute metadata =~ "synthetic summary"
+    refute metadata =~ "synthetic reasoning replay"
     refute metadata =~ "synthetic assistant replay"
     refute metadata =~ "synthetic tool output"
     refute metadata =~ "resp_v1_http_store_false_previous"
@@ -2621,6 +6681,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
           },
           %{
             "type" => "reasoning",
+            "content" => [
+              %{"type" => "reasoning_text", "text" => "synthetic stateless reasoning"}
+            ],
             "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
             "encrypted_content" => "synthetic-encrypted-reasoning"
           },
@@ -2669,6 +6732,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
            ]
 
     refute inspect(captured.json["input"]) =~ "synthetic-encrypted-reasoning"
+    refute inspect(captured.json["input"]) =~ "synthetic stateless reasoning"
     assert %{"role" => "assistant", "phase" => "commentary"} = Enum.at(captured.json["input"], 1)
     refute Map.has_key?(Enum.at(captured.json["input"], 1), "id")
     assert Enum.at(captured.json["input"], 2)["id"] == "fc_v1_http_replay"
@@ -2830,7 +6894,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     tool = %{
       "type" => "web_search",
       "external_web_access" => true,
-      "index_gated_web_access" => true
+      "indexed_web_access" => true
     }
 
     upstream =
@@ -2872,6 +6936,98 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.json["tools"] == [tool]
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
+  end
+
+  test "POST /v1/responses forwards exact web search domain filters without external access", %{
+    conn: conn
+  } do
+    tool = %{
+      "type" => "web_search",
+      "filters" => %{
+        "allowed_domains" => [" Example.COM ", "example.com", "Example.COM"],
+        "blocked_domains" => [" blocked.example ", "blocked.example", "blocked.example"]
+      }
+    }
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_web_search_domain_filters",
+               "status" => "completed",
+               "output" => [],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic filtered web search request",
+        "stream" => false,
+        "store" => true,
+        "tools" => [tool]
+      })
+
+    assert %{"id" => "resp_v1_web_search_domain_filters"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "POST"
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["tools"] == [tool]
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+    refute Map.has_key?(hd(captured.json["tools"]), "external_web_access")
+  end
+
+  test "POST /v1/responses rejects an unsupported web search filter before dispatch", %{
+    conn: conn
+  } do
+    rejected_field = "unsupported"
+    rejected_value = "other.example"
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic invalid filtered web search request",
+        "tools" => [
+          %{
+            "type" => "web_search",
+            "filters" => %{
+              "allowed_domains" => ["example.com"],
+              rejected_field => [rejected_value]
+            }
+          }
+        ]
+      })
+
+    public_error = json_response(conn, 400)
+
+    assert %{
+             "error" => %{
+               "code" => "invalid_request",
+               "param" => "tools"
+             }
+           } = public_error
+
+    public_error_text = CodexPooler.JSON.encode!(public_error)
+    refute public_error_text =~ rejected_field
+    refute public_error_text =~ rejected_value
+
+    assert FakeUpstream.requests(upstream) == []
   end
 
   test "POST /v1/responses keeps opencode continuity headers local without forwarding", %{
@@ -2957,9 +7113,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     requests =
       Repo.all(
-        from r in Request,
+        from(r in Request,
           where: r.pool_id == ^setup.pool.id,
           order_by: [asc: r.admitted_at]
+        )
       )
 
     assert Enum.map(requests, & &1.endpoint) == [
@@ -2991,6 +7148,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
   @tag :v1_post_session_start_race
   test "POST /v1/responses recovers concurrent first starts for the same session key" do
+    assert :ok = Sandbox.mode(Repo, :auto)
+    on_exit(fn -> assert :ok = Sandbox.mode(Repo, :manual) end)
+
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
@@ -3014,7 +7174,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     setup = unboxed_run(fn -> gateway_setup(upstream) end)
     unboxed_run(fn -> precreate_daily_rollups!(setup) end)
-    register_unboxed_pool_cleanup!(setup.pool)
+    register_unboxed_pool_cleanup!(setup)
     parent = self()
     barrier = make_ref()
     session_key = "v1-session-start-race-#{System.unique_integer([:positive])}"
@@ -3022,7 +7182,6 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     tasks =
       for label <- [:first, :second] do
         Task.async(fn ->
-          Sandbox.allow(Repo, parent, self())
           Process.put({SessionContinuity, :before_session_insert_barrier}, {parent, barrier})
 
           conn =
@@ -3079,20 +7238,22 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [session] =
              unboxed_run(fn ->
                Repo.all(
-                 from session in CodexSession,
+                 from(session in CodexSession,
                    where:
                      session.pool_id == ^setup.pool.id and
                        fragment("lower(?)", session.session_key) == ^String.downcase(session_key) and
                        session.status in ["active", "interrupted"]
+                 )
                )
              end)
 
     requests =
       unboxed_run(fn ->
         Repo.all(
-          from request in Request,
+          from(request in Request,
             where: request.pool_id == ^setup.pool.id,
             order_by: [asc: request.admitted_at]
+          )
         )
       end)
 
@@ -3103,9 +7264,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     attempts =
       unboxed_run(fn ->
-        Repo.all(
-          from(attempt in Attempt, where: attempt.request_id in ^Enum.map(requests, & &1.id))
-        )
+        Repo.all(from(attempt in Attempt, where: attempt.request_id in ^Enum.map(requests, & &1.id)))
       end)
 
     assert length(attempts) == success_count
@@ -3182,8 +7341,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     register_previous_response_anchor!(auth, setup.assignment, previous_response_id)
 
     anchored_cases = [
-      {"body previous_response_id", [], %{"previous_response_id" => previous_response_id}},
-      {"header previous response", [{"x-codex-previous-response-id", previous_response_id}], %{}}
+      {"body previous_response_id", [], %{"previous_response_id" => previous_response_id}}
     ]
 
     for {{label, headers, payload_updates}, index} <- Enum.with_index(anchored_cases) do
@@ -3203,14 +7361,15 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         |> put_request_headers(headers)
         |> post("/v1/responses", payload)
 
-      assert_pinned_reauth_recovery_body!(response)
+      assert %{"error" => %{"code" => "previous_response_not_found"}} =
+               json_response(response, 400)
 
-      response_text = inspect(json_response(response, 503))
+      response_text = inspect(json_response(response, 400))
       assert_no_pinned_reauth_leakage!(response_text, setup, previous_response_id, label)
 
       assert FakeUpstream.count(pinned_upstream) == 0, label
       assert FakeUpstream.count(fallback_upstream) == 0, label
-      assert Repo.aggregate(Attempt, :count) == 0, label
+      assert Repo.aggregate(Attempt, :count) == 1, label
 
       denied_requests =
         Repo.all(
@@ -3222,11 +7381,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert length(denied_requests) == index + 1, label
       denied_request = List.last(denied_requests)
-      assert denied_request.status == "rejected", label
-      assert denied_request.last_error_code == "pinned_continuation_reauth_required", label
-
-      assert denied_request.request_metadata["continuity_denial"]["denial_family"] ==
-               "pinned_continuation_reauth"
+      assert denied_request.status in ["failed", "rejected"], label
+      assert denied_request.last_error_code == "previous_response_not_found", label
 
       assert denied_request.endpoint == "/backend-api/codex/responses", label
 
@@ -3263,9 +7419,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
+          "previous_response_id" => previous_response_id,
           "input" => visible_pinned_input(),
           "stream" => true,
           "generate" => true
@@ -3274,22 +7431,16 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert_pinned_reauth_recovery_frame!(frame)
+      assert %{"type" => "error", "status" => 400, "error" => %{"code" => "previous_response_not_found"}} =
+               CodexPooler.JSON.decode!(frame)
+
       assert_no_pinned_reauth_leakage!(frame, setup, previous_response_id)
 
       assert FakeUpstream.count(pinned_upstream) == 0
       assert FakeUpstream.count(fallback_upstream) == 0
-      assert Repo.aggregate(Attempt, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 1
 
       assert [denied_request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-      assert denied_request.endpoint == "/backend-api/codex/responses"
-      assert denied_request.transport == "websocket"
-      assert denied_request.status == "rejected"
-      assert denied_request.response_status_code == 503
-      assert denied_request.last_error_code == "pinned_continuation_reauth_required"
-
-      assert denied_request.request_metadata["continuity_denial"]["denial_family"] ==
-               "pinned_continuation_reauth"
 
       denied_metadata_text =
         inspect({denied_request.request_metadata, RequestLogs.list(setup.pool)})
@@ -3302,7 +7453,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end
   end
 
-  @tag :installation_id_metadata
+  @tag :lineage_metadata_forwarding
   test "POST /v1/responses does not forward public metadata headers upstream", %{conn: conn} do
     upstream =
       start_upstream(
@@ -3331,6 +7482,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       conn
       |> auth(setup)
       |> with_public_metadata_headers()
+      |> put_req_header("x-codex-routing-hint", "model=forged")
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
         "input" => "synthetic v1 response with public metadata headers"
@@ -3345,16 +7497,245 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute Map.has_key?(captured_headers, "x-codex-turn-metadata")
     refute Map.has_key?(captured_headers, "x-codex-window-id")
     refute Map.has_key?(captured_headers, "x-codex-parent-thread-id")
-    refute Map.has_key?(captured_headers, "x-codex-installation-id")
     refute Map.has_key?(captured_headers, "x-openai-subagent")
+    refute Map.has_key?(captured_headers, "x-openai-memgen-request")
+    refute Map.has_key?(captured_headers, "x-codex-guardian")
+    refute Map.has_key?(captured_headers, "x-codex-inference-call-id")
     refute Map.has_key?(captured_headers, "x-codex-extra")
     refute Map.has_key?(captured_headers, "x-openai-extra")
+    assert captured_headers["x-codex-routing-hint"] == "model=#{setup.model.upstream_model_id}"
     refute Map.has_key?(captured_headers, "cookie")
     refute Map.has_key?(captured_headers, "idempotency-key")
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "succeeded"
     assert request.endpoint == "/backend-api/codex/responses"
+  end
+
+  test "POST /v1/responses derives the Codex routing hint from the effective model and tier",
+       %{conn: conn} do
+    upstream_model = "provider-v1-routing-hint-model"
+
+    upstream =
+      start_upstream(
+        # provenance: observed released Codex client source core/src/client.rs build_routing_hint_header (header format; replies invented)
+        FakeUpstream.strict_sequence([
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            headers: [
+              required: %{"x-codex-routing-hint" => "model=#{upstream_model};tier=priority"}
+            ],
+            json: [
+              valid: true,
+              equals: %{"model" => upstream_model, "service_tier" => "priority"}
+            ],
+            respond: routing_hint_completed_response("resp_v1_routing_hint_priority")
+          ),
+          FakeUpstream.expect_request(
+            method: "POST",
+            path: "/backend-api/codex/responses",
+            headers: [required: %{"x-codex-routing-hint" => "model=#{upstream_model}"}],
+            json: [valid: true, forbidden: ["service_tier"]],
+            respond: routing_hint_completed_response("resp_v1_routing_hint_default")
+          )
+        ])
+      )
+
+    setup =
+      gateway_setup(upstream,
+        upstream_model_id: upstream_model,
+        model_metadata: priority_tier_metadata()
+      )
+
+    priority =
+      conn
+      |> auth(setup)
+      |> put_req_header("x-codex-routing-hint", "model=forged;tier=forged")
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic v1 priority routing hint request",
+        "service_tier" => "fast"
+      })
+
+    assert %{"id" => "resp_v1_routing_hint_priority"} = json_response(priority, 200)
+
+    default =
+      conn
+      |> recycle()
+      |> auth(setup)
+      |> put_req_header("x-codex-routing-hint", "model=forged;tier=priority")
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic v1 default routing hint request"
+      })
+
+    assert %{"id" => "resp_v1_routing_hint_default"} = json_response(default, 200)
+    assert :ok = FakeUpstream.verify!(upstream)
+    refute inspect(FakeUpstream.requests(upstream)) =~ "forged"
+  end
+
+  defp priority_tier_metadata do
+    %{"upstream_model" => %{"service_tiers" => [%{"id" => "priority"}]}}
+  end
+
+  defp routing_hint_completed_response(id) do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => id,
+           "status" => "completed",
+           "output" => [
+             %{
+               "type" => "message",
+               "content" => [%{"type" => "output_text", "text" => "synthetic answer"}]
+             }
+           ],
+           "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+         }
+       }}
+    ])
+  end
+
+  @tag :invalid_request_error
+  @tag :typed_input_contract
+  test "POST /v1/responses rejects explicit unknown typed content before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+    counts = durable_accounting_counts()
+
+    invalid_items = [
+      %{
+        "type" => "future_input_item",
+        "role" => "user",
+        "content" => [%{"type" => "input_text", "text" => "synthetic known-looking content"}]
+      },
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [%{"type" => "future_content_part", "text" => "synthetic unknown part"}]
+      }
+    ]
+
+    for stream? <- [false, true], item <- invalid_items do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => [item],
+          "stream" => stream?
+        })
+
+      assert %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => "invalid_request",
+                 "param" => "input"
+               }
+             } = json_response(response, 400)
+    end
+
+    assert FakeUpstream.requests(upstream) == []
+    assert durable_accounting_counts() == counts
+    assert %{items: [], total: 0} = RequestLogs.list(setup.pool)
+  end
+
+  @tag :invalid_request_error
+  @tag :encrypted_function_args
+  test "POST /v1/responses rejects malformed encrypted function-call replay args before dispatch",
+       %{
+         conn: conn
+       } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+    counts = durable_accounting_counts()
+
+    for {stream?, invalid_args} <-
+          [{false, "opaque"}, {true, %{}}, {false, ["a", 1]}, {true, [nil]}] do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call",
+              "call_id" => "call_encrypted_args_validation",
+              "name" => "lookup_fixture",
+              "arguments" => "{}",
+              "encrypted_function_args" => invalid_args
+            }
+          ],
+          "stream" => stream?
+        })
+
+      assert %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => "invalid_request",
+                 "param" => "input"
+               }
+             } = json_response(response, 400)
+    end
+
+    assert FakeUpstream.requests(upstream) == []
+    assert durable_accounting_counts() == counts
+    assert %{items: [], total: 0} = RequestLogs.list(setup.pool)
+  end
+
+  @tag :encrypted_function_args
+  test "POST /v1/responses forwards encrypted function-call replay args without durable metadata",
+       %{
+         conn: conn
+       } do
+    for encrypted_args <- [[], ["a", "bb"]] do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_encrypted_function_args",
+            "object" => "response",
+            "status" => "completed"
+          })
+        )
+
+      setup = gateway_setup(upstream)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call",
+              "call_id" => "call_encrypted_args_forward",
+              "name" => "lookup_fixture",
+              "arguments" => "{}",
+              "encrypted_function_args" => encrypted_args
+            }
+          ]
+        })
+
+      assert %{"id" => "resp_encrypted_function_args"} = json_response(response, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert [forwarded] = captured.json["input"]
+      assert Map.has_key?(forwarded, "encrypted_function_args")
+
+      assert Enum.map(forwarded["encrypted_function_args"], &byte_size/1) ==
+               Enum.map(encrypted_args, &byte_size/1)
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      metadata = inspect({request.request_metadata, attempt.response_metadata})
+      refute metadata =~ "encrypted_function_args"
+    end
   end
 
   @tag :invalid_request_error
@@ -3388,12 +7769,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     conn: conn
   } do
     cases = [
-      {401, "invalid_api_key", "provider_key",
-       "provider 401 leaked https://provider.internal.example/auth?key=sk-secret account acct_123"},
-      {403, "insufficient_quota", "organization",
-       "provider 403 leaked org org-secret and https://provider.internal.example/quota"},
-      {400, "context_length_exceeded", "input",
-       "provider 400 echoed prompt SENTINEL_PROMPT_CONTEXT and file file-secret.txt"}
+      {401, "invalid_api_key", "provider_key", "provider 401 leaked https://provider.internal.example/auth?key=sk-secret account acct_123"},
+      {403, "insufficient_quota", "organization", "provider 403 leaked org org-secret and https://provider.internal.example/quota"},
+      {400, "context_length_exceeded", "input", "provider 400 echoed prompt SENTINEL_PROMPT_CONTEXT and file file-secret.txt"}
     ]
 
     Enum.each(cases, fn {status, code, param, provider_message} ->
@@ -3404,7 +7782,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
            %{
              status: status,
              raw_body:
-               Jason.encode!(%{
+               CodexPooler.JSON.encode!(%{
                  "error" => provider_invalid_request_error(code, provider_message, param)
                })
            }},
@@ -3413,7 +7791,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert %{"error" => error} = json_response(response, status)
       assert error["message"] == "upstream request failed"
-      assert error["type"] == "server_error"
+      # A refused 400 is typed as the client's error; the upstream 401/403
+      # (the upstream account's standing) keep `server_error` (findings#254
+      # row 254-51).
+      assert error["type"] == if(status == 400, do: "invalid_request_error", else: "server_error")
       assert error["code"] == code
       refute Map.has_key?(error, "param")
       refute response.resp_body =~ provider_message
@@ -3465,7 +7846,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
-    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
 
     for error <- [data["error"], get_in(data, ["response", "error"])] do
       assert error["message"] == "upstream request failed"
@@ -3479,7 +7860,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute conn.resp_body =~ "sk-secret"
     refute conn.resp_body =~ "SENTINEL_STREAM"
     refute conn.resp_body =~ "\"param\""
-    refute conn.resp_body =~ "event: response.created\n"
+    assert conn.resp_body =~ "event: response.created\n"
     refute conn.resp_body =~ "event: response.output_text.delta\n"
     assert FakeUpstream.count(upstream) == 1
   end
@@ -3550,7 +7931,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     body =
       "event: response.failed\n" <>
         "data: " <>
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.failed",
           "error" => upstream_error,
           "response" => %{
@@ -3572,6 +7953,86 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute inspect(error) =~ "provider_stack"
   end
 
+  test "POST /v1/responses SSE collection accepts standalone-CR terminal framing" do
+    terminal = %{
+      "type" => "response.completed",
+      "response" => %{
+        "id" => "resp_v1_collect_standalone_cr",
+        "status" => "completed",
+        "output" => []
+      }
+    }
+
+    body = "event: response.completed\rdata: " <> CodexPooler.JSON.encode!(terminal) <> "\r\r"
+
+    assert {:ok, response} = Responses.response_from_sse(body)
+    assert response["id"] == "resp_v1_collect_standalone_cr"
+    assert response["status"] == "completed"
+    assert response["object"] == "response"
+  end
+
+  # The real Codex backend sends `"output": []` in every terminal
+  # response.completed — wire-verified 2026-08-03 across six decrypted turns,
+  # including ones where the model demonstrably called a tool. Tool calls travel
+  # in the streamed response.output_item.done events, so SSE collection must
+  # backfill from them. Asserting on the bare terminal array is asserting on a
+  # field this provider never populates.
+  @tag :issue_241
+  test "POST /v1/responses SSE collection backfills tool calls from a real empty terminal" do
+    call = %{
+      "type" => "custom_tool_call",
+      "name" => "responses_tool_probe",
+      "call_id" => "call_responses_tool",
+      "input" => "responses_tool"
+    }
+
+    body =
+      "event: response.output_item.done\n" <>
+        "data: " <>
+        CodexPooler.JSON.encode!(%{"type" => "response.output_item.done", "item" => call}) <>
+        "\n\n" <>
+        "event: response.completed\n" <>
+        "data: " <>
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.completed",
+          "response" => %{
+            "id" => "resp_responses_tool_empty_terminal",
+            "status" => "completed",
+            "error" => nil,
+            "output" => []
+          }
+        }) <> "\n\n"
+
+    assert {:ok, response} = Responses.response_from_sse(body)
+    assert [^call] = response["output"]
+    assert response["status"] == "completed"
+  end
+
+  @tag :issue_241
+  test "POST /v1/responses SSE collection prefers a populated terminal over streamed items" do
+    streamed = %{"type" => "function_call", "name" => "streamed", "arguments" => "{}"}
+    authoritative = %{"type" => "function_call", "name" => "terminal", "arguments" => "{}"}
+
+    body =
+      "event: response.output_item.done\n" <>
+        "data: " <>
+        CodexPooler.JSON.encode!(%{"type" => "response.output_item.done", "item" => streamed}) <>
+        "\n\n" <>
+        "event: response.completed\n" <>
+        "data: " <>
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.completed",
+          "response" => %{
+            "id" => "resp_responses_tool_populated_terminal",
+            "status" => "completed",
+            "output" => [authoritative]
+          }
+        }) <> "\n\n"
+
+    assert {:ok, response} = Responses.response_from_sse(body)
+    assert [^authoritative] = response["output"]
+  end
+
   @tag :server_error_redaction
   test "POST /v1/responses SSE collection redacts top-level-only terminal errors" do
     provider_message =
@@ -3583,7 +8044,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     body =
       "event: response.failed\n" <>
         "data: " <>
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.failed",
           "error" => upstream_error,
           "response" => %{
@@ -3609,7 +8070,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     body =
       "event: response.incomplete\n" <>
         "data: " <>
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.incomplete",
           "response" => %{
             "id" => "resp_v1_collect_failed_incomplete",
@@ -3675,14 +8136,15 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         {:ok,
          %{
            status: 429,
-           raw_body: Jason.encode!(%{"error" => safe_looking_upstream_error(provider_message)})
+           raw_body: CodexPooler.JSON.encode!(%{"error" => safe_looking_upstream_error(provider_message)})
          }},
         fn decoded -> decoded end
       )
 
     assert %{"error" => error} = json_response(conn, 429)
     assert error["message"] == "upstream request failed"
-    assert error["type"] == "server_error"
+    # Typed as the throttle it is (findings#254 row 254-72).
+    assert error["type"] == "rate_limit_error"
     assert error["code"] in ["rate_limit_exceeded", "upstream_error"]
     refute Map.has_key?(error, "param")
     refute conn.resp_body =~ "provider failed"
@@ -3767,7 +8229,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
-    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
     assert get_in(data, ["error", "message"]) == "upstream request failed"
     assert get_in(data, ["error", "type"]) == "server_error"
     assert get_in(data, ["error", "code"]) == "internal_error"
@@ -3776,7 +8238,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute conn.resp_body =~ "upstream.internal.example"
     refute conn.resp_body =~ "/internal/stream"
     refute conn.resp_body =~ "provider_stack"
-    refute conn.resp_body =~ "event: response.created\n"
+    assert conn.resp_body =~ "event: response.created\n"
     refute conn.resp_body =~ "event: response.output_text.delta\n"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -3824,7 +8286,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
-    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
 
     for error <- [data["error"], get_in(data, ["response", "error"])] do
       assert error["message"] == "upstream request failed"
@@ -3837,7 +8299,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute conn.resp_body =~ "upstream.internal.example"
     refute conn.resp_body =~ "/internal/stream"
     refute conn.resp_body =~ "provider_stack"
-    refute conn.resp_body =~ "event: response.created\n"
+    assert conn.resp_body =~ "event: response.created\n"
     refute conn.resp_body =~ "event: response.output_text.delta\n"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -3847,7 +8309,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
-  test "POST /v1/responses streaming emits early response.failed as the first event", %{
+  test "POST /v1/responses streaming prefixes early response.failed with its opening snapshot", %{
     conn: conn
   } do
     upstream =
@@ -3888,9 +8350,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
-    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
     assert get_in(data, ["error", "code"]) == "invalid_request_error"
-    refute conn.resp_body =~ "event: response.created\n"
+    assert conn.resp_body =~ "event: response.created\n"
     refute conn.resp_body =~ "event: response.output_text.delta\n"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -3903,7 +8365,69 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
-  test "POST /v1/responses streaming emits early top-level error as the first event", %{
+  test "POST /v1/responses treats whitespace event labels as absent and drops late frames", %{
+    conn: conn
+  } do
+    failed =
+      %{
+        "type" => "response.failed",
+        "prompt" => "private-responses-blank-label-sentinel",
+        "response" => %{
+          "id" => "resp_v1_blank_label",
+          "status" => "failed",
+          "hostile" => "private-response-sibling",
+          "error" => %{
+            "code" => "context_length_exceeded",
+            "message" => "private provider detail"
+          }
+        }
+      }
+
+    raw_failed = "event: \t \ndata: " <> CodexPooler.JSON.encode!(failed) <> "\n\n"
+
+    late_completed =
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{"id" => "resp_v1_late_completed", "status" => "completed"}
+       }}
+
+    upstream =
+      start_upstream(FakeUpstream.sse_stream([raw_failed, late_completed], done: false))
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic blank-label Responses request",
+        "stream" => true
+      })
+
+    assert conn.status == 200
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert data["sequence_number"] == 1
+    assert data["response"]["status"] == "failed"
+    assert data["response"]["error"]["code"] == "context_length_exceeded"
+    assert data["response"]["error"]["message"] == "upstream request failed"
+    refute conn.resp_body =~ "private-responses-blank-label-sentinel"
+    refute conn.resp_body =~ "private-response-sibling"
+    refute conn.resp_body =~ "private provider detail"
+    refute conn.resp_body =~ "resp_v1_late_completed"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.last_error_code == "context_length_exceeded"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "context_length_exceeded"
+  end
+
+  @tag :streaming_sequence
+  test "POST /v1/responses streaming prefixes early top-level error with its opening snapshot", %{
     conn: conn
   } do
     upstream =
@@ -3935,9 +8459,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
-    assert [%{"event" => "error", "data" => data}] = public_sse_events(conn.resp_body)
+    assert [%{"event" => "response.created"}, %{"event" => "error", "data" => data}] = public_sse_events(conn.resp_body)
     assert get_in(data, ["error", "code"]) == "invalid_request_error"
-    refute conn.resp_body =~ "event: response.created\n"
+    assert conn.resp_body =~ "event: response.created\n"
     refute conn.resp_body =~ "event: response.output_text.delta\n"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -3956,8 +8480,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "partial public text"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "partial public text"}},
           {"response.failed",
            %{
              "type" => "response.failed",
@@ -4016,7 +8539,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
-  test "POST /v1/responses streaming emits terminal response.failed when upstream closes after visible output",
+  test "POST /v1/responses streaming emits one hybrid error after visible output when upstream closes without a terminal",
        %{conn: conn} do
     upstream =
       start_upstream(
@@ -4052,25 +8575,43 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert body =~ "visible-before-upstream-close"
     refute body =~ "event: response.completed\n"
     refute body =~ "event: response.incomplete\n"
-
-    assert body =~ "event: response.failed"
-    assert body =~ ~s("type":"response.failed")
-    assert body =~ ~s("status":"failed")
-    assert body =~ ~s("code":"upstream_stream_error")
     assert body =~ "upstream request failed: stream interrupted before terminal response event"
     refute body =~ "upstream stream interrupted before terminal response event"
 
-    assert [%{"event" => "response.failed", "data" => data}] =
-             public_sse_events(body)
-             |> Enum.filter(&(&1["event"] == "response.failed"))
+    assert [
+             %{
+               "event" => "response.output_text.delta",
+               "data" => %{"delta" => "visible-before-upstream-close"}
+             },
+             %{"event" => "error", "data" => data}
+           ] = public_sse_events(body)
 
-    assert data["type"] == "response.failed"
-    assert data["response"]["status"] == "failed"
-    assert data["response"]["id"] == "resp_visible_before_close"
-    assert data["error"]["code"] == "upstream_stream_error"
+    assert MapSet.new(Map.keys(data)) ==
+             MapSet.new(["code", "error", "message", "param", "sequence_number", "type"])
 
-    assert data["error"]["message"] ==
-             "upstream request failed: stream interrupted before terminal response event"
+    assert %{
+             "code" => "server_error",
+             "error" => nested_error,
+             "message" => "upstream request failed: stream interrupted before terminal response event",
+             "param" => nil,
+             "sequence_number" => sequence_number,
+             "type" => "error"
+           } = data
+
+    assert is_integer(sequence_number)
+    assert sequence_number >= 0
+    refute Map.has_key?(data, "response")
+
+    assert MapSet.new(Map.keys(nested_error)) == MapSet.new(["code", "message", "param", "type"])
+
+    assert nested_error == %{
+             "code" => "server_error",
+             "message" => "upstream request failed: stream interrupted before terminal response event",
+             "param" => nil,
+             "type" => "server_error"
+           }
+
+    refute Enum.any?(public_sse_events(body), &(&1["event"] == "response.failed"))
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
@@ -4090,6 +8631,139 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute persistence_text =~ "visible-before-upstream-close"
   end
 
+  @tag :owner_drained_terminal_state
+  test "POST /v1/responses streaming emits owner_drained only for a post-budget bridge drain",
+       %{conn: conn} do
+    enable_websocket_owner_forwarding!()
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.delayed_terminal_sse_stream(
+          [
+            {"response.created",
+             %{
+               "type" => "response.created",
+               "response" => %{"id" => "resp_controller_owner_drained", "status" => "in_progress"}
+             }},
+            {"response.output_text.delta",
+             %{
+               "type" => "response.output_text.delta",
+               "response_id" => "resp_controller_owner_drained",
+               "output_index" => 0,
+               "content_index" => 0,
+               "delta" => "visible before controller drain"
+             }}
+          ],
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_controller_owner_drained", "status" => "completed"}
+           }},
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    parent = self()
+
+    request_task =
+      Task.async(fn ->
+        Sandbox.allow(Repo, parent, self())
+
+        conn
+        |> auth(setup)
+        |> put_req_header(
+          "x-session-id",
+          "controller-owner-drained-#{System.unique_integer([:positive])}"
+        )
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic controller owner drain",
+          "stream" => true
+        })
+      end)
+
+    assert_receive {:fake_upstream_timeout_barrier, :before_terminal, upstream_pid, ^release_ref},
+                   @detection_timeout_ms
+
+    assert %CodexTurn{first_visible_output_at: %DateTime{}} =
+             turn = await_committed_public_turn(setup.pool.id)
+
+    harness = start_rollout_drain_harness()
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain(
+          [name: harness.name, timeout_ms: 25, deadline_margin_ms: 20, deadline_floor_ms: 10] ++
+            WebsocketRolloutDrainSupport.deadline_options(harness.deadline)
+        )
+      end)
+
+    assert_receive {:rollout_drain_deadline_wait, deadline, 10}
+    assert deadline == harness.deadline
+    assert :ok = WebsocketRolloutDrainSupport.VirtualDeadline.advance(deadline, 10)
+
+    response = Task.await(request_task, 2_000)
+    send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+    assert %{turns_completed: 0, turns_aborted: 1} = Task.await(drain_task, 2_000)
+
+    assert response.status == 200
+    assert response.resp_body =~ "visible before controller drain"
+
+    assert [%{"event" => "error", "data" => data}] =
+             response.resp_body
+             |> public_sse_events()
+             |> Enum.filter(&(&1["event"] == "error"))
+
+    assert Map.keys(data) |> Enum.sort() ==
+             ~w(code error message param sequence_number type)
+
+    assert Map.keys(data["error"]) |> Enum.sort() == ~w(code message param type)
+
+    assert %{
+             "code" => "server_error",
+             "error" => nested_error,
+             "message" => message,
+             "param" => nil,
+             "sequence_number" => sequence_number,
+             "type" => "error"
+           } = data
+
+    assert is_integer(sequence_number)
+
+    assert nested_error == %{
+             "code" => "server_error",
+             "message" => message,
+             "param" => nil,
+             "type" => "server_error"
+           }
+
+    assert message ==
+             "upstream request failed: stream interrupted before terminal response event"
+
+    refute Map.has_key?(data, "response")
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.response_status_code == 499
+    assert request.last_error_code == "owner_drained"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.transport == "websocket"
+    assert attempt.network_error_code == "owner_drained"
+
+    assert %CodexTurn{
+             status: "interrupted",
+             error_code: "owner_drained",
+             first_visible_output_at: %DateTime{}
+           } = Repo.reload!(turn)
+
+    assert FakeUpstream.http_request_count(upstream) == 0
+  end
+
   @tag :streaming_sequence
   test "POST /v1/responses streaming keeps non-timeout terminal-missing interruptions health-neutral after visible data",
        %{conn: conn} do
@@ -4100,12 +8774,31 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
            %{
              "type" => "response.output_text.delta",
              "delta" => "visible-before-abrupt-close",
-             "response" => %{"id" => "resp_visible_before_abrupt_close"}
+             "response" => %{
+               "id" => "resp_visible_before_abrupt_close",
+               "usage" => %{
+                 "input_tokens" => 16,
+                 "input_tokens_details" => %{"cached_tokens" => 4},
+                 "output_tokens" => 5,
+                 "output_tokens_details" => %{"reasoning_tokens" => 2},
+                 "total_tokens" => 21
+               }
+             }
            }}
         ])
       )
 
     setup = gateway_setup(upstream)
+
+    pricing =
+      pricing_snapshot!(setup.model, %{
+        input_token_micros: Decimal.new(25),
+        cached_input_token_micros: Decimal.new(5),
+        output_token_micros: Decimal.new(50),
+        reasoning_token_micros: Decimal.new(75)
+      })
+      |> Ecto.Changeset.change(request_base_micros: Decimal.new(3))
+      |> Repo.update!()
 
     conn =
       conn
@@ -4120,8 +8813,31 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
     assert conn.resp_body =~ "visible-before-abrupt-close"
-    assert conn.resp_body =~ "event: response.failed\n"
-    assert conn.resp_body =~ ~s("code":"upstream_stream_error")
+
+    assert [%{"event" => "response.output_text.delta"}, %{"event" => "error", "data" => data}] =
+             public_sse_events(conn.resp_body)
+
+    assert Map.keys(data) |> Enum.sort() ==
+             ~w(code error message param sequence_number type)
+
+    assert Map.keys(data["error"]) |> Enum.sort() == ~w(code message param type)
+
+    assert %{
+             "code" => "server_error",
+             "error" => %{
+               "code" => "server_error",
+               "message" => message,
+               "param" => nil,
+               "type" => "server_error"
+             },
+             "message" => message,
+             "param" => nil,
+             "sequence_number" => sequence_number,
+             "type" => "error"
+           } = data
+
+    assert is_integer(sequence_number)
+    refute Map.has_key?(data, "response")
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.endpoint == "/backend-api/codex/responses"
@@ -4132,6 +8848,28 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "failed"
     assert attempt.network_error_code == "upstream_stream_error"
+    assert request.usage_status == "usage_known"
+    assert attempt.usage_status == "usage_known"
+    assert %{"classification" => "known"} = attempt.response_metadata["usage_observation"]
+
+    settlement =
+      Repo.get_by!(LedgerEntry,
+        request_id: request.id,
+        entry_kind: "settlement",
+        amount_status: "recorded"
+      )
+
+    assert settlement.input_tokens == 16
+    assert settlement.cached_input_tokens == 4
+    assert settlement.output_tokens == 5
+    assert settlement.reasoning_tokens == 2
+    assert settlement.total_tokens == 21
+    assert settlement.pricing_snapshot_id == pricing.id
+    assert Decimal.equal?(settlement.settled_cost_micros, Decimal.new(623))
+    fact = Repo.get_by!(RequestLogFact, request_id: request.id)
+    assert Decimal.equal?(fact.latest_settled_cost_micros, Decimal.new(623))
+    assert Decimal.equal?(fact.latest_cached_input_cost_micros, Decimal.new(20))
+    assert FakeUpstream.count(upstream) == 1
 
     assert %{
              "reason_class" => "upstream_stream_interrupted",
@@ -4159,7 +8897,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       [
         "event: response.completed\n",
         "data: ",
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.completed",
           "response" => %{
             "id" => "resp_v1_terminal_without_separator",
@@ -4240,7 +8978,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
-  test "POST /v1/responses streaming accepts oversized terminal response without trailing separator",
+  test "POST /v1/responses streaming accepts a large recognizable terminal across chunks",
        %{conn: conn} do
     terminal_padding = String.duplicate("oversized terminal output ", 4_000)
 
@@ -4248,7 +8986,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       [
         "event: response.completed\n",
         "data: ",
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.completed",
           "response" => %{
             "id" => "resp_v1_large_terminal_without_separator",
@@ -4301,9 +9039,27 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     events = public_sse_events(conn.resp_body)
     event_names = Enum.map(events, & &1["event"])
 
-    assert "response.completed" in event_names
+    assert event_names == [
+             "response.created",
+             "response.output_item.added",
+             "response.content_part.added",
+             "response.output_text.delta",
+             "response.output_text.done",
+             "response.content_part.done",
+             "response.output_item.done",
+             "response.completed"
+           ]
+
+    assert %{"data" => completed} = List.last(events)
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["id"] == "resp_v1_large_terminal_without_separator"
+    assert completed["response"]["status"] == "completed"
+
+    assert [%{"content" => [%{"text" => ^terminal_padding}]}] =
+             completed["response"]["output"]
+
     refute "response.failed" in event_names
-    assert conn.resp_body =~ "resp_v1_large_terminal_without_separator"
+    refute "error" in event_names
     refute conn.resp_body =~ "upstream_stream_error"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -4317,13 +9073,238 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert attempt.usage_status == "usage_known"
     assert is_nil(attempt.network_error_code)
 
+    assert %{
+             "mode" => "normalized",
+             "finish_class" => "completed",
+             "synthetic_terminal_sent" => false,
+             "terminal_kind" => "completed",
+             "terminal_seen" => true,
+             "terminal_status" => "completed"
+           } = attempt.response_metadata["public_openai_responses_stream"]
+
     persistence_text = inspect({request.request_metadata, attempt.response_metadata})
     refute persistence_text =~ "synthetic oversized terminal-buffer stream request"
+    refute persistence_text =~ "resp_v1_large_terminal_without_separator"
     refute persistence_text =~ terminal_padding
   end
 
   @tag :streaming_sequence
-  test "POST /v1/responses streaming fails oversized failure-coded response.incomplete",
+  test "POST /v1/responses settles a buffered separator-less terminal for an already-closed client" do
+    terminal =
+      [
+        "event: response.completed\n",
+        "data: ",
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.completed",
+          "response" => %{
+            "id" => "resp_v1_flushed_terminal_closed_client",
+            "status" => "completed",
+            "output" => [
+              %{
+                "type" => "message",
+                "content" => [%{"type" => "output_text", "text" => "buffered terminal text"}]
+              }
+            ],
+            "usage" => %{
+              "input_tokens" => 16,
+              "input_tokens_details" => %{"cached_tokens" => 4},
+              "output_tokens" => 5,
+              "output_tokens_details" => %{"reasoning_tokens" => 2},
+              "total_tokens" => 21
+            }
+          }
+        })
+      ]
+      |> IO.iodata_to_binary()
+
+    split_at = div(byte_size(terminal), 2)
+    first = binary_part(terminal, 0, split_at)
+    second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
+
+    upstream = start_upstream(FakeUpstream.sse_stream([first, second], done: false))
+    setup = gateway_setup(upstream)
+
+    pricing =
+      pricing_snapshot!(setup.model, %{
+        input_token_micros: Decimal.new(25),
+        cached_input_token_micros: Decimal.new(5),
+        output_token_micros: Decimal.new(50),
+        reasoning_token_micros: Decimal.new(75)
+      })
+      |> Ecto.Changeset.change(request_base_micros: Decimal.new(3))
+      |> Repo.update!()
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => [
+        %{
+          "type" => "message",
+          "role" => "user",
+          "content" => [
+            %{
+              "type" => "input_text",
+              "text" => "synthetic closed-client flushed terminal request"
+            }
+          ]
+        }
+      ],
+      "stream" => true
+    }
+
+    assert {:ok, %{stream: stream}} =
+             CodexPooler.Gateway.execute(
+               auth,
+               "/v1/responses",
+               payload,
+               RequestOptions.build(
+                 %{
+                   upstream_endpoint: "/backend-api/codex/responses",
+                   public_openai_responses_stream: true
+                 },
+                 "/v1/responses",
+                 payload
+               )
+             )
+
+    closed_conn = %{
+      Phoenix.ConnTest.build_conn()
+      | adapter: {ClosedChunkAdapter, nil},
+        state: :chunked
+    }
+
+    assert {:ok, _conn} = stream.(closed_conn)
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.usage_status == "usage_known"
+    assert is_nil(request.last_error_code)
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.usage_status == "usage_known"
+    assert is_nil(attempt.network_error_code)
+
+    settlement =
+      Repo.get_by!(LedgerEntry,
+        request_id: request.id,
+        entry_kind: "settlement",
+        amount_status: "recorded"
+      )
+
+    assert settlement.input_tokens == 16
+    assert settlement.cached_input_tokens == 4
+    assert settlement.output_tokens == 5
+    assert settlement.reasoning_tokens == 2
+    assert settlement.total_tokens == 21
+    assert settlement.pricing_snapshot_id == pricing.id
+    assert Decimal.equal?(settlement.settled_cost_micros, Decimal.new(623))
+    fact = Repo.get_by!(RequestLogFact, request_id: request.id)
+    assert Decimal.equal?(fact.latest_settled_cost_micros, Decimal.new(623))
+    assert Decimal.equal?(fact.latest_cached_input_cost_micros, Decimal.new(20))
+    assert FakeUpstream.count(upstream) == 1
+
+    assert %{
+             "finish_class" => "completed",
+             "terminal_seen" => true,
+             "terminal_kind" => "completed",
+             "synthetic_terminal_sent" => false
+           } = attempt.response_metadata["public_openai_responses_stream"]
+  end
+
+  @tag :streaming_sequence
+  test "classifies a buffered separator-less failed terminal for an already-closed client" do
+    terminal =
+      [
+        "event: response.failed\n",
+        "data: ",
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.failed",
+          "response" => %{
+            "id" => "resp_v1_flushed_failed_terminal_closed_client",
+            "status" => "failed",
+            "error" => %{
+              "code" => "context_length_exceeded",
+              "message" => "private provider detail"
+            }
+          }
+        })
+      ]
+      |> IO.iodata_to_binary()
+
+    split_at = div(byte_size(terminal), 2)
+    first = binary_part(terminal, 0, split_at)
+    second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
+
+    upstream = start_upstream(FakeUpstream.sse_stream([first, second], done: false))
+    setup = gateway_setup(upstream)
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => [
+        %{
+          "type" => "message",
+          "role" => "user",
+          "content" => [
+            %{
+              "type" => "input_text",
+              "text" => "synthetic closed-client flushed failed terminal request"
+            }
+          ]
+        }
+      ],
+      "stream" => true
+    }
+
+    assert {:ok, %{stream: stream}} =
+             CodexPooler.Gateway.execute(
+               auth,
+               "/v1/responses",
+               payload,
+               RequestOptions.build(
+                 %{
+                   upstream_endpoint: "/backend-api/codex/responses",
+                   public_openai_responses_stream: true
+                 },
+                 "/v1/responses",
+                 payload
+               )
+             )
+
+    closed_conn = %{
+      Phoenix.ConnTest.build_conn()
+      | adapter: {ClosedChunkAdapter, nil},
+        state: :chunked
+    }
+
+    stream.(closed_conn)
+
+    # A separator-less failed terminal classifies through the first-event
+    # summary, whose coarse event-type code is the inherited accounting for
+    # this shape (the with-separator path extracts the nested error code).
+    # The contract under test: the upstream terminal failure wins over
+    # client_disconnected and no synthetic terminal is fabricated.
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.last_error_code == "response.failed"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "response.failed"
+
+    # The relayed-stream summary stays pre-visible on this route (the failed
+    # write drops the advanced relay state), so the load-bearing check is that
+    # no synthetic terminal was fabricated for the dead client.
+    summary = attempt.response_metadata["public_openai_responses_stream"]
+    assert summary["synthetic_terminal_sent"] == false
+    assert summary["visible_seen"] == false
+  end
+
+  @tag :streaming_sequence
+  test "POST /v1/responses streaming buffers and sanitizes a large failure-coded incomplete terminal across chunks",
        %{conn: conn} do
     terminal_padding = String.duplicate("oversized failed incomplete output ", 4_000)
 
@@ -4331,7 +9312,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       [
         "event: response.incomplete\n",
         "data: ",
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.incomplete",
           "response" => %{
             "id" => "resp_v1_large_failed_incomplete_without_separator",
@@ -4374,16 +9355,29 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert conn.status == 200
 
-    assert [%{"event" => "response.incomplete", "data" => data}] =
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] =
              public_sse_events(conn.resp_body)
 
-    assert data["type"] == "response.incomplete"
-    assert data["response"]["status"] == "incomplete"
+    assert data["type"] == "response.failed"
+    assert data["sequence_number"] == 1
+    assert data["response"]["id"] == "resp_v1_large_failed_incomplete_without_separator"
+    assert data["response"]["status"] == "failed"
 
-    assert get_in(data, ["response", "incomplete_details", "reason"]) ==
-             "context_length_exceeded"
+    assert data["error"] == %{
+             "code" => "context_length_exceeded",
+             "message" => "upstream request failed",
+             "type" => "server_error"
+           }
 
+    assert data["response"]["error"] == data["error"]
+    assert is_nil(data["response"]["incomplete_details"])
+    assert data["response"]["output"] == []
+    assert is_nil(data["response"]["usage"])
+
+    refute conn.resp_body =~ "event: response.incomplete"
+    refute conn.resp_body =~ ~s("type":"error")
     refute conn.resp_body =~ "upstream_stream_error"
+    refute conn.resp_body =~ terminal_padding
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
@@ -4395,6 +9389,15 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert attempt.status == "failed"
     assert attempt.usage_status == "usage_unknown"
     assert attempt.network_error_code == "context_length_exceeded"
+
+    assert %{
+             "mode" => "normalized",
+             "finish_class" => "failed",
+             "synthetic_terminal_sent" => false,
+             "terminal_kind" => "failed",
+             "terminal_seen" => true,
+             "terminal_status" => "failed"
+           } = attempt.response_metadata["public_openai_responses_stream"]
 
     assert %{items: [log], total: 1} =
              RequestLogs.list(setup.pool, filters: %{request_id: request.id})
@@ -4408,6 +9411,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     persistence_text = inspect({request.request_metadata, attempt.response_metadata})
     refute persistence_text =~ "synthetic oversized failed incomplete stream request"
+    refute persistence_text =~ "resp_v1_large_failed_incomplete_without_separator"
     refute persistence_text =~ terminal_padding
   end
 
@@ -4442,7 +9446,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert conn.status == 200
 
-    assert [%{"event" => "response.incomplete", "data" => data}] =
+    assert [%{"event" => "response.created"}, %{"event" => "response.incomplete", "data" => data}] =
              public_sse_events(conn.resp_body)
 
     assert data["type"] == "response.incomplete"
@@ -4505,7 +9509,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       })
 
     assert conn.status == 200
-    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
     assert data["type"] == "response.failed"
     assert data["response"]["status"] == "failed"
     assert data["error"]["code"] == "context_length_exceeded"
@@ -4539,14 +9543,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       start_upstream(
         FakeUpstream.sse_stream([
           {"codex.rate_limits", %{"type" => "codex.rate_limits", "limits" => []}},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "visible text"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "visible text"}},
           {"response.completed",
            %{
              "type" => "response.completed",
              "response" => %{
                "id" => "resp_v1_stream",
                "status" => "completed",
+               "service_tier" => "fast",
                "usage" => %{
                  "input_tokens" => 53,
                  "input_tokens_details" => input_tokens_details,
@@ -4559,7 +9563,12 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         ])
       )
 
-    setup = gateway_setup(upstream)
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{"service_tiers" => [%{"id" => "priority"}]}
+        }
+      )
 
     conn =
       conn
@@ -4567,7 +9576,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
         "input" => "synthetic stream request",
-        "stream" => true
+        "stream" => true,
+        "service_tier" => "fast"
       })
 
     assert [content_type] = get_resp_header(conn, "content-type")
@@ -4582,12 +9592,15 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     events = public_sse_events(conn.resp_body)
 
+    assert List.last(events)["event"] == "response.completed"
+
     assert %{
              "event" => "response.completed",
              "data" => %{
                "type" => "response.completed",
                "response" => %{
                  "id" => "resp_v1_stream",
+                 "service_tier" => "fast",
                  "usage" => usage
                }
              }
@@ -4601,6 +9614,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["service_tier"] == "priority"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
@@ -4619,7 +9633,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert settlement.input_tokens == 53
     assert settlement.cached_input_tokens == 31
     assert settlement.output_tokens == 59
-    assert settlement.reasoning_tokens == nil
+    assert settlement.reasoning_tokens == 41
     assert settlement.total_tokens == 112
     refute Map.has_key?(settlement.details, "input_tokens_details")
     refute Map.has_key?(settlement.details, "output_tokens_details")
@@ -4630,7 +9644,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert log.token_counts.input_tokens == 53
     assert log.token_counts.cached_input_tokens == 31
     assert log.token_counts.output_tokens == 59
-    assert log.token_counts.reasoning_tokens == nil
+    assert log.token_counts.reasoning_tokens == 41
     assert log.token_counts.total_tokens == 112
     refute Map.has_key?(log.token_counts, :input_tokens_details)
     refute Map.has_key?(log.token_counts, :output_tokens_details)
@@ -4649,8 +9663,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
              "model" => "omni-moderation-latest",
              "check_id" => "mod_check_stream_fixture"
            }},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "visible moderated text"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "visible moderated text"}},
           {"response.moderation.completed",
            %{
              "type" => "response.moderation.completed",
@@ -4739,8 +9752,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                "metadata" => moderation_metadata
              }
            }},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "visible metadata text"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "visible metadata text"}},
           {"response.completed",
            %{
              "type" => "response.completed",
@@ -4809,12 +9821,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "first"}},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "second"}},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "third"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "first"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "second"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "third"}},
           {"response.completed",
            %{
              "type" => "response.completed",
@@ -4880,7 +9889,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       })
 
     assert_receive {:fake_upstream_chunk_barrier, 0, upstream_pid, ^release_ref},
-                   @timing_observation_timeout_ms
+                   @detection_timeout_ms
 
     try do
       {http_conn, status, response_headers, elapsed_ms, chunks, done?} =
@@ -4916,25 +9925,23 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 200})
 
     upstream =
-      start_upstream(
-        FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref)
-      )
+      start_upstream(FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref))
 
     setup = gateway_setup(upstream)
     port = start_public_endpoint!()
 
-    {:ok, http_conn, ref, started} =
-      start_public_v1_responses_request(port, setup, %{
-        "model" => setup.model.exposed_model_id,
-        "input" => "synthetic timeout stream request",
-        "stream" => true
-      })
-
-    assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
-                   @timing_observation_timeout_ms
-
     logs =
       capture_log([level: :warning], fn ->
+        {:ok, http_conn, ref, started} =
+          start_public_v1_responses_request(port, setup, %{
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic timeout stream request",
+            "stream" => true
+          })
+
+        assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                       @detection_timeout_ms
+
         try do
           {http_conn, status, _response_headers, header_elapsed_ms, chunks, done?} =
             await_public_response_headers!(
@@ -4958,7 +9965,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
           assert status == 502
           assert header_elapsed_ms < @ttfh_threshold_ms
           assert total_elapsed_ms < @ttfh_threshold_ms
-          assert %{"error" => %{"code" => "upstream_request_failed"}} = Jason.decode!(body)
+
+          assert %{"error" => %{"code" => "upstream_request_failed"}} =
+                   CodexPooler.JSON.decode!(body)
         after
           send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
           Mint.HTTP.close(http_conn)
@@ -5069,7 +10078,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       })
 
     assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
-                   @timing_observation_timeout_ms
+                   @detection_timeout_ms
 
     try do
       {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
@@ -5125,9 +10134,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 100})
 
     upstream =
-      start_upstream(
-        FakeUpstream.timeout_after_sse_headers(notify: self(), release_ref: release_ref)
-      )
+      start_upstream(FakeUpstream.timeout_after_sse_headers(notify: self(), release_ref: release_ref))
 
     setup = gateway_setup(upstream)
     port = start_public_endpoint!()
@@ -5139,9 +10146,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         "stream" => true
       })
 
-    assert_receive {:fake_upstream_timeout_barrier, :after_sse_headers, upstream_pid,
-                    ^release_ref},
-                   @timing_observation_timeout_ms
+    assert_receive {:fake_upstream_timeout_barrier, :after_sse_headers, upstream_pid, ^release_ref},
+                   @detection_timeout_ms
 
     try do
       {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
@@ -5224,7 +10230,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       })
 
     assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
-                   @timing_observation_timeout_ms
+                   @detection_timeout_ms
 
     try do
       {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
@@ -5309,7 +10315,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
@@ -5328,9 +10334,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       total_elapsed_ms = elapsed_ms(started)
 
       assert first_elapsed_ms < @ttfh_threshold_ms
-      assert Jason.decode!(first_frame)["type"] == "response.output_text.delta"
-      assert Jason.decode!(second_frame)["delta"] == "progress-2"
-      assert %{"type" => "response.completed"} = Jason.decode!(terminal_frame)
+      assert CodexPooler.JSON.decode!(first_frame)["type"] == "response.output_text.delta"
+      assert CodexPooler.JSON.decode!(second_frame)["delta"] == "progress-2"
+      assert %{"type" => "response.completed"} = CodexPooler.JSON.decode!(terminal_frame)
       assert total_elapsed_ms >= 600
 
       assert_receive_finalized_request!()
@@ -5355,7 +10361,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     upstream = start_upstream(FakeUpstream.json_response(%{"id" => "unused_v1_oversized_frame"}))
     setup = gateway_setup(upstream)
-    port = start_public_endpoint!()
+    {server, port} = start_public_endpoint_with_server!()
     turn_state = "v1-ws-oversized-frame-#{System.unique_integer([:positive])}"
 
     {conn, websocket, ref, _response_headers} =
@@ -5364,16 +10370,26 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       ])
 
     try do
-      {{conn, _websocket, code, reason}, _logs} =
+      assert {:ok, [connection_pid]} = ThousandIsland.connection_pids(server)
+      monitor_ref = Process.monitor(connection_pid)
+
+      {{conn, _websocket, code, reason}, logs} =
         with_log(fn ->
           {conn, websocket} =
             public_websocket_send_text!(conn, websocket, ref, String.duplicate("x", 1_000))
 
-          public_websocket_receive_close!(conn, websocket, ref)
+          result = public_websocket_receive_close!(conn, websocket, ref)
+
+          assert_receive {:DOWN, ^monitor_ref, :process, ^connection_pid, _reason},
+                         @connection_shutdown_timeout_ms
+
+          Logger.flush()
+          result
         end)
 
       assert code == 1009
       assert reason == ""
+      assert logs =~ "max_frame_size_exceeded"
       assert FakeUpstream.requests(upstream) == []
       assert Repo.aggregate(Request, :count) == 0
 
@@ -5390,7 +10406,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     upstream =
       start_upstream(
         FakeUpstream.websocket_text_frames([
-          Jason.encode!(%{"detail" => upstream_detail})
+          CodexPooler.JSON.encode!(%{"detail" => upstream_detail})
         ])
       )
 
@@ -5408,7 +10424,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
@@ -5429,7 +10445,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                  "status" => "failed",
                  "error" => %{"code" => "upstream_terminal_failure"}
                }
-             } = Jason.decode!(terminal_frame)
+             } = CodexPooler.JSON.decode!(terminal_frame)
 
       refute terminal_frame =~ upstream_detail
 
@@ -5438,7 +10454,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
                         reason: "request_finalized",
                         payload: %{"status" => "failed"}
                       }},
-                     @websocket_frame_timeout
+                     @detection_timeout_ms
 
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
       assert request.endpoint == "/v1/responses"
@@ -5462,7 +10478,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :v1_websocket
-  test "GET /v1/responses websocket reports idle timeout after visible output" do
+  test "GET /v1/responses websocket keeps HTTP synthetic terminals isolated after visible timeout" do
     release_ref = make_ref()
     setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 150})
 
@@ -5489,7 +10505,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     try do
       payload =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "type" => "response.create",
           "model" => setup.model.exposed_model_id,
           "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
@@ -5507,13 +10523,17 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert visible_elapsed_ms < @ttfh_threshold_ms
       assert silent_gap_elapsed_ms >= 250
-      assert Jason.decode!(visible_frame)["delta"] == "visible-before-ws-idle"
+      assert CodexPooler.JSON.decode!(visible_frame)["delta"] == "visible-before-ws-idle"
 
       assert %{
                "type" => "error",
                "status" => 502,
                "error" => %{"code" => "stream_idle_timeout"}
-             } = Jason.decode!(terminal_frame)
+             } = terminal = CodexPooler.JSON.decode!(terminal_frame)
+
+      refute Map.has_key?(terminal, "code")
+      refute Map.has_key?(terminal, "param")
+      refute Map.has_key?(terminal, "sequence_number")
 
       assert total_elapsed_ms >= 150
 
@@ -5526,6 +10546,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
       assert attempt.status == "failed"
       assert attempt.network_error_code == "stream_idle_timeout"
+
+      assert is_map(request.request_metadata)
+      assert is_map(attempt.response_metadata)
+
+      persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+      refute persistence_text =~ "hello"
+      refute persistence_text =~ setup.authorization
+      refute persistence_text =~ setup.raw_key
 
       conn
     after
@@ -5614,8 +10642,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
              "output_index" => 0,
              "item" => web_search_item
            }},
-          {"response.output_text.delta",
-           %{"type" => "response.output_text.delta", "delta" => "final text"}},
+          {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "final text"}},
           {"response.completed",
            %{
              "type" => "response.completed",
@@ -5789,7 +10816,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert %{"error" => error} = json_response(conn, 400)
     assert error["message"] == "upstream request failed"
-    assert error["type"] == "server_error"
+    # Typed from the 400 it rides on, not as the retryable server class
+    # (findings#254 row 254-51).
+    assert error["type"] == "invalid_request_error"
     assert error["code"] == "upstream_status"
     refute Map.has_key?(error, "param")
     refute conn.resp_body =~ "synthetic startup rejection"
@@ -5797,6 +10826,103 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "failed"
+  end
+
+  @tag :input_file_upstream_404
+  test "POST /v1/responses projects input-file upstream 404 without provider detail", %{
+    conn: conn
+  } do
+    provider_detail = "provider 404 leaked https://provider.internal.example/files?key=sk-secret"
+
+    upstream =
+      start_upstream(
+        {:json_error, 404,
+         %{
+           "error" => %{
+             "code" => "provider_not_found",
+             "message" => provider_detail,
+             "param" => "input[0].content[0].file_id",
+             "type" => "api_error"
+           }
+         }}
+      )
+
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{
+                "type" => "input_file",
+                "filename" => "synthetic.pdf",
+                "file_data" => "data:application/pdf;base64,c3ludGhldGljIGZpbGU="
+              }
+            ]
+          }
+        ]
+      })
+
+    assert %{"error" => error} = json_response(response, 404)
+
+    assert error == %{
+             "code" => "upstream_status",
+             "message" => "upstream request failed",
+             "type" => "invalid_request_error",
+             "upstream_status" => 404
+           }
+
+    refute response.resp_body =~ "synthetic.pdf"
+
+    refute response.resp_body =~ provider_detail
+    refute response.resp_body =~ "provider.internal.example"
+    refute response.resp_body =~ "sk-secret"
+    refute response.resp_body =~ "provider_not_found"
+    assert FakeUpstream.count(upstream) == 1
+  end
+
+  @tag :input_file_upstream_404
+  test "POST /v1/responses keeps unrelated upstream 404 redacted", %{conn: conn} do
+    provider_detail =
+      "provider 404 leaked https://provider.internal.example/responses?key=sk-secret"
+
+    upstream =
+      start_upstream(
+        {:json_error, 404,
+         %{
+           "error" => %{
+             "code" => "provider_not_found",
+             "message" => provider_detail,
+             "param" => "input",
+             "type" => "api_error"
+           }
+         }}
+      )
+
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic ordinary response"
+      })
+
+    assert %{"error" => error} = json_response(response, 502)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] == "upstream_status"
+    refute Map.has_key?(error, "param")
+    refute response.resp_body =~ provider_detail
+    refute response.resp_body =~ "provider.internal.example"
+    refute response.resp_body =~ "sk-secret"
+    assert FakeUpstream.count(upstream) == 1
   end
 
   test "POST /v1/responses rejects unsupported logprobs before dispatch", %{conn: conn} do
@@ -5961,7 +11087,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         })
       )
 
-    setup = gateway_setup(upstream)
+    setup = gateway_setup(upstream, model_metadata: %{"input_modalities" => ["text", "image"]})
 
     conn =
       conn
@@ -6018,10 +11144,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     setup = gateway_setup(upstream)
 
     invalid_parts = [
-      {%{"type" => "input_image", "image_url" => "file:///tmp/private.png"},
-       "unsupported_input_image_format"},
-      {%{"type" => "input_image", "image_url" => "http://example.com/private.png"},
-       "unsupported_input_image_format"},
+      {%{"type" => "input_image", "image_url" => "file:///tmp/private.png"}, "unsupported_input_image_format"},
+      {%{"type" => "input_image", "image_url" => "http://example.com/private.png"}, "unsupported_input_image_format"},
       {%{
          "type" => "input_file",
          "filename" => "sample.html",
@@ -6054,61 +11178,189 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
     setup = gateway_setup(upstream, compact?: true)
 
-    conn =
-      conn
-      |> auth(setup)
-      |> with_public_metadata_headers()
-      |> post("/v1/responses/compact", %{
-        "model" => setup.model.exposed_model_id,
-        "input" => "synthetic compact request"
-      })
+    responses =
+      for mode <- ["full", "lite"] do
+        put_public_model_serving_mode!(setup, mode)
 
-    assert %{"error" => error} = json_response(conn, 404)
-    assert error["code"] == "unsupported_endpoint"
-    assert error["message"] == "Unsupported OpenAI /v1 endpoint"
+        response =
+          conn
+          |> recycle()
+          |> auth(setup)
+          |> with_public_metadata_headers()
+          |> post("/v1/responses/compact", %{
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic compact request"
+          })
+
+        assert %{
+                 "error" => %{
+                   "code" => "unsupported_endpoint",
+                   "message" => "Unsupported OpenAI /v1 endpoint",
+                   "param" => nil
+                 }
+               } = json_response(response, 404)
+
+        response
+      end
+
+    assert [full_response, lite_response] = responses
+    assert json_response(full_response, 404) == json_response(lite_response, 404)
     assert FakeUpstream.count(upstream) == 0
     assert Repo.aggregate(Request, :count) == 0
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
-  defp enable_request_compression!(pool) do
-    pool
-    |> CodexPooler.Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{
-      request_compression_enabled: true,
-      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    })
-    |> Repo.update!()
+  defp put_public_model_serving_mode!(setup, mode) do
+    timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    case Repo.get_by(ModelServingOverride,
+           pool_id: setup.pool.id,
+           exposed_model_id: setup.model.exposed_model_id
+         ) do
+      nil ->
+        Repo.insert!(%ModelServingOverride{
+          pool_id: setup.pool.id,
+          exposed_model_id: setup.model.exposed_model_id,
+          mode: mode,
+          created_at: timestamp,
+          updated_at: timestamp
+        })
+
+      override ->
+        override
+        |> Ecto.Changeset.change(mode: mode, updated_at: timestamp)
+        |> Repo.update!()
+    end
   end
 
-  defp compression_log_fixture(omitted_sentinel) do
-    middle =
-      1..96
-      |> Enum.map(fn
-        48 -> "ordinary build line 48 #{omitted_sentinel}"
-        index -> "ordinary build line #{index}"
-      end)
-
+  defp public_compaction_trigger_input(text) do
     [
-      "command started",
-      "context before first",
-      "error: first failure",
-      "context after first"
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [%{"type" => "input_text", "text" => text}]
+      },
+      %{"type" => "compaction_trigger"}
     ]
-    |> Kernel.++(middle)
-    |> Kernel.++([
-      "context before final",
-      "fatal: final failure",
-      "context after final"
+  end
+
+  defp public_tool_output_compaction_trigger_input(output) do
+    [
+      %{
+        "type" => "function_call_output",
+        "call_id" => "call_public_compaction_trigger",
+        "output" => output
+      },
+      %{"type" => "compaction_trigger"}
+    ]
+  end
+
+  defp public_mode_matrix_upstream do
+    FakeUpstream.sse_stream([
+      {"response.created",
+       %{
+         "type" => "response.created",
+         "response" => %{"id" => "resp_public_mode_matrix", "status" => "in_progress"}
+       }},
+      {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "synthetic public mode answer"}},
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => "resp_public_mode_matrix",
+           "status" => "completed",
+           "model" => "provider-gpt-test-model",
+           "output" => [],
+           "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+         }
+       }}
     ])
-    |> Enum.join("\n")
+  end
+
+  defp assert_public_mode_matrix_response!(response, false) do
+    assert %{"id" => "resp_public_mode_matrix", "object" => "response"} =
+             json_response(response, 200)
+  end
+
+  defp assert_public_mode_matrix_response!(response, true) do
+    assert response.status == 200
+    assert [content_type] = get_resp_header(response, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert response.resp_body =~ "response.completed"
+  end
+
+  defp assert_public_mode_matrix_headers!(full_capture, lite_capture) do
+    mode_header = "x-openai-internal-codex-responses-lite"
+    full_headers = Map.new(full_capture.headers)
+    lite_headers = Map.new(lite_capture.headers)
+
+    refute Map.has_key?(full_headers, mode_header)
+    assert lite_headers[mode_header] == "true"
+    assert comparable_public_headers(full_headers) == comparable_public_headers(lite_headers)
+  end
+
+  defp comparable_public_headers(headers) do
+    Map.drop(headers, [
+      "x-openai-internal-codex-responses-lite",
+      "content-length",
+      "host",
+      "authorization",
+      "chatgpt-account-id"
+    ])
+  end
+
+  defp assert_public_mode_matrix_bodies!(full_capture, lite_capture) do
+    mode_specific_keys = ["input", "instructions", "reasoning", "parallel_tool_calls"]
+
+    assert Map.drop(full_capture.json, mode_specific_keys) ==
+             Map.drop(lite_capture.json, mode_specific_keys)
+
+    assert is_list(full_capture.json["input"])
+    assert is_list(lite_capture.json["input"])
+    assert Enum.drop(lite_capture.json["input"], 1) == full_capture.json["input"]
+    assert get_in(lite_capture.json, ["reasoning", "context"]) == "all_turns"
+    assert lite_capture.json["parallel_tool_calls"] == false
+  end
+
+  defp assert_public_mode_matrix_metadata!(setup, modes) do
+    expected_keys = [
+      "model_serving_mode_configured",
+      "model_serving_mode",
+      "model_serving_mode_source"
+    ]
+
+    requests =
+      Repo.all(
+        from(r in Request,
+          where: r.pool_id == ^setup.pool.id,
+          order_by: [asc: r.admitted_at]
+        )
+      )
+
+    assert length(requests) == length(modes)
+
+    for {request, mode} <- Enum.zip(requests, modes) do
+      expected = %{
+        "model_serving_mode_configured" => mode,
+        "model_serving_mode" => mode,
+        "model_serving_mode_source" => "override"
+      }
+
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.status == "succeeded"
+      assert request.transport == "http_sse"
+      assert Map.take(request.request_metadata["routing"], expected_keys) == expected
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "succeeded"
+      assert Map.take(attempt.response_metadata["routing"], expected_keys) == expected
+    end
   end
 
   defp long_turn_progress_events(response_id) do
     progress_events =
       for index <- 1..6 do
-        {"response.output_text.delta",
-         %{"type" => "response.output_text.delta", "delta" => "progress-#{index}"}}
+        {"response.output_text.delta", %{"type" => "response.output_text.delta", "delta" => "progress-#{index}"}}
       end
 
     progress_events ++
@@ -6145,7 +11397,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   defp receive_public_websocket_until_completed!(conn, websocket, ref) do
     {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-    case Jason.decode!(frame) do
+    case CodexPooler.JSON.decode!(frame) do
       %{"type" => "response.completed"} -> {conn, websocket, frame}
       _other -> receive_public_websocket_until_completed!(conn, websocket, ref)
     end
@@ -6178,7 +11430,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     started = System.monotonic_time(:millisecond)
 
     {:ok, conn, ref} =
-      Mint.HTTP.request(conn, "POST", "/v1/responses", headers, Jason.encode!(payload))
+      Mint.HTTP.request(conn, "POST", "/v1/responses", headers, CodexPooler.JSON.encode!(payload))
 
     {:ok, conn, ref, started}
   end
@@ -6186,6 +11438,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   defp capture_repo_queries(fun) do
     parent = self()
     handler_id = "v1-responses-controller-test-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -6207,6 +11462,41 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {result, drain_repo_queries(handler_id, [])}
     after
       :telemetry.detach(handler_id)
+    end
+  end
+
+  defp capture_stream_truncation_telemetry(fun) do
+    parent = self()
+    handler_id = "v1-responses-truncation-#{System.unique_integer([:positive])}"
+    event = [:codex_pooler, :gateway, :stream_buffer, :truncated]
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn ^event, measurements, metadata, _config ->
+          send(parent, {handler_id, measurements, metadata})
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_stream_truncation_telemetry(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_stream_truncation_telemetry(handler_id, events) do
+    receive do
+      {^handler_id, measurements, metadata} ->
+        drain_stream_truncation_telemetry(handler_id, [{measurements, metadata} | events])
+    after
+      0 -> Enum.reverse(events)
     end
   end
 
@@ -6327,6 +11617,37 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end
   end
 
+  defp await_public_response_eof!(conn, ref, chunks, done?, timeout_ms) do
+    {body, done?} = await_public_response_eof(conn, ref, chunks, done?, timeout_ms)
+    {body, if(done?, do: :eof, else: flunk("expected public /v1 response stream EOF"))}
+  end
+
+  defp await_public_response_eof(_conn, _ref, chunks, true, _timeout_ms) do
+    {chunks |> Enum.reverse() |> IO.iodata_to_binary(), true}
+  end
+
+  defp await_public_response_eof(conn, ref, chunks, false, timeout_ms) do
+    receive do
+      message ->
+        case Mint.HTTP.stream(conn, message) do
+          {:ok, conn, responses} ->
+            {_status, _headers, chunks, done?} =
+              merge_public_response_parts(responses, ref, nil, nil, chunks, false)
+
+            await_public_response_eof(conn, ref, chunks, done?, timeout_ms)
+
+          {:error, conn, reason, _responses} ->
+            Mint.HTTP.close(conn)
+            flunk("public /v1 response stream failed before EOF: #{inspect(reason)}")
+
+          :unknown ->
+            await_public_response_eof(conn, ref, chunks, false, timeout_ms)
+        end
+    after
+      timeout_ms -> flunk("timed out waiting for public /v1 response stream EOF")
+    end
+  end
+
   defp merge_public_response_parts(responses, ref, status, headers, chunks, done?) do
     Enum.reduce(responses, {status, headers, chunks, done?}, fn
       {:status, ^ref, status}, {_status, headers, chunks, done?} ->
@@ -6354,10 +11675,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   defp await_silent_gap!(started, gap_ms) do
-    Process.send_after(self(), {:task_11_silent_gap_elapsed, make_ref()}, gap_ms)
+    Process.send_after(self(), {:silent_gap_elapsed, make_ref()}, gap_ms)
 
     receive do
-      {:task_11_silent_gap_elapsed, _ref} -> elapsed_ms(started)
+      {:silent_gap_elapsed, _ref} -> elapsed_ms(started)
     after
       gap_ms + @timing_observation_timeout_ms -> flunk("timed out waiting for silent gap")
     end
@@ -6418,18 +11739,18 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
   defp structured_tool_result_output do
     %{
-      "command" => "TASK7_RAW_TOOL_COMMAND_SENTINEL run private command",
+      "command" => "RAW_TOOL_COMMAND_SENTINEL run private command",
       "exit_code" => 0,
       "files" => [
         %{
           "path" => "sample-output.txt",
-          "content" => "TASK7_RAW_TOOL_OUTPUT_SENTINEL\n" <> String.duplicate("line\n", 200)
+          "content" => "RAW_TOOL_OUTPUT_SENTINEL\n" <> String.duplicate("line\n", 200)
         }
       ],
       "nested" => %{
         "list" => [
-          %{"stdout_preview" => String.duplicate("TASK7_LONG_NESTED_VALUE_", 40)},
-          %{"secret_like" => "TASK7_SECRET_LIKE_TOOL_SENTINEL"}
+          %{"stdout_preview" => String.duplicate("RAW_TOOL_LONG_NESTED_VALUE_", 40)},
+          %{"secret_like" => "RAW_TOOL_SECRET_LIKE_SENTINEL"}
         ],
         "ok" => true
       }
@@ -6438,10 +11759,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
   defp structured_tool_result_sentinels do
     [
-      "TASK7_RAW_TOOL_COMMAND_SENTINEL",
-      "TASK7_RAW_TOOL_OUTPUT_SENTINEL",
-      "TASK7_LONG_NESTED_VALUE_",
-      "TASK7_SECRET_LIKE_TOOL_SENTINEL"
+      "RAW_TOOL_COMMAND_SENTINEL",
+      "RAW_TOOL_OUTPUT_SENTINEL",
+      "RAW_TOOL_LONG_NESTED_VALUE_",
+      "RAW_TOOL_SECRET_LIKE_SENTINEL"
     ]
   end
 
@@ -6473,6 +11794,514 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end)
   end
 
+  defp programmatic_tool_sentinels do
+    suffix = System.unique_integer([:positive])
+
+    %{
+      code: "program-code-#{suffix}",
+      result: "program-result-#{suffix}",
+      fingerprint: "program-fingerprint-#{suffix}",
+      schema: "program-schema-#{suffix}",
+      item: "program-item-#{suffix}",
+      call: "program-call-#{suffix}",
+      caller: "program-caller-#{suffix}"
+    }
+  end
+
+  defp hosted_shell_privacy_fixture! do
+    suffix =
+      8
+      |> :crypto.strong_rand_bytes()
+      |> Base.encode16(case: :lower)
+
+    temp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "codex-pooler-hosted-shell-#{System.unique_integer([:positive])}-#{suffix}"
+      )
+
+    marker_path = Path.join(temp_dir, "execution-marker")
+    File.mkdir!(temp_dir)
+    File.chmod!(temp_dir, 0o700)
+
+    sentinels = %{
+      command: "cmd_#{suffix}",
+      stdout: "out_#{suffix}",
+      stderr: "err_#{suffix}"
+    }
+
+    command = "printf #{sentinels.command} >/dev/null; : > #{marker_path}"
+
+    input =
+      hosted_shell_history_fixture(%{
+        command: command,
+        stdout: sentinels.stdout,
+        stderr: sentinels.stderr,
+        call_id: "call_#{suffix}"
+      })
+
+    %{
+      input: input,
+      marker_path: marker_path,
+      sentinels: sentinels,
+      temp_dir: temp_dir
+    }
+  end
+
+  defp hosted_shell_payload(model, input) do
+    %{
+      "model" => model,
+      "store" => false,
+      "input" => input
+    }
+  end
+
+  defp hosted_shell_history_fixture(overrides \\ %{}) do
+    call_id = Map.get(overrides, :call_id, "hosted-shell-call")
+    command = Map.get(overrides, :command, "printf synthetic-command")
+    stdout = Map.get(overrides, :stdout, "synthetic stdout")
+    stderr = Map.get(overrides, :stderr, "synthetic stderr")
+
+    [
+      %{
+        "type" => "shell_call",
+        "id" => "hosted-shell-call-item",
+        "call_id" => call_id,
+        "status" => "completed",
+        "caller" => %{"type" => "direct"},
+        "environment" => %{"type" => "local", "skills" => []},
+        "action" => %{
+          "commands" => [command],
+          "timeout_ms" => 1_000,
+          "max_output_length" => 4_096
+        }
+      },
+      %{
+        "type" => "shell_call_output",
+        "id" => "hosted-shell-output-item",
+        "call_id" => call_id,
+        "status" => "completed",
+        "caller" => %{"type" => "direct"},
+        "max_output_length" => 4_096,
+        "output" => [
+          %{
+            "stdout" => stdout,
+            "stderr" => stderr,
+            "outcome" => %{"type" => "exit", "exit_code" => 7}
+          }
+        ]
+      },
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [%{"type" => "input_text", "text" => "continue after hosted shell"}]
+      }
+    ]
+  end
+
+  defp hosted_shell_completed_response(response_id) do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => response_id,
+           "object" => "response",
+           "status" => "completed",
+           "output" => [],
+           "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+         }
+       }}
+    ])
+  end
+
+  defp curl_hosted_shell_stream!(port, authorization, model, input) do
+    temp_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "codex-pooler-hosted-shell-curl-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir!(temp_dir)
+    File.chmod!(temp_dir, 0o700)
+    on_exit(fn -> File.rm_rf(temp_dir) end)
+
+    request_path = Path.join(temp_dir, "request.json")
+
+    File.write!(
+      request_path,
+      CodexPooler.JSON.encode!(hosted_shell_payload(model, input) |> Map.put("stream", true))
+    )
+
+    File.chmod!(request_path, 0o600)
+
+    {output, exit_code} =
+      System.cmd(
+        "curl",
+        [
+          "-N",
+          "-i",
+          "--silent",
+          "--show-error",
+          "--max-time",
+          "10",
+          "-H",
+          "content-type: application/json",
+          "-H",
+          "authorization: #{authorization}",
+          "--data-binary",
+          "@#{request_path}",
+          "http://127.0.0.1:#{port}/v1/responses"
+        ],
+        stderr_to_stdout: true
+      )
+
+    unless exit_code == 0 do
+      flunk("hosted shell curl SSE request failed")
+    end
+
+    case String.split(output, "\r\n\r\n", parts: 2) do
+      [headers, body] -> {headers, body}
+      _parts -> flunk("hosted shell curl SSE response was malformed")
+    end
+  end
+
+  defp hosted_shell_sse_events do
+    [
+      {"response.shell_call_command.added",
+       %{
+         "type" => "response.shell_call_command.added",
+         "command" => "printf synthetic-command",
+         "command_index" => 0,
+         "output_index" => 2,
+         "sequence_number" => 50
+       }},
+      {"response.shell_call_command.delta",
+       %{
+         "type" => "response.shell_call_command.delta",
+         "command_index" => 0,
+         "delta" => " --synthetic-delta",
+         "obfuscation" => "synthetic-padding",
+         "output_index" => 2,
+         "sequence_number" => 1
+       }},
+      {"response.shell_call_command.done",
+       %{
+         "type" => "response.shell_call_command.done",
+         "command" => "printf synthetic-command --synthetic-delta",
+         "command_index" => 0,
+         "created_by" => "synthetic-response-actor",
+         "output_index" => 2,
+         "sequence_number" => 55
+       }},
+      {"response.shell_call_output_content.delta",
+       %{
+         "type" => "response.shell_call_output_content.delta",
+         "command_index" => 0,
+         "delta" => %{
+           "stdout" => "synthetic stdout delta",
+           "stderr" => "synthetic stderr delta"
+         },
+         "item_id" => "hosted-shell-output-item",
+         "output_index" => 2,
+         "sequence_number" => 54
+       }},
+      {"response.shell_call_output_content.done",
+       %{
+         "type" => "response.shell_call_output_content.done",
+         "command_index" => 0,
+         "item_id" => "hosted-shell-output-item",
+         "output" => [
+           %{
+             "stdout" => "synthetic stdout final",
+             "stderr" => "synthetic stderr final",
+             "outcome" => %{"type" => "exit", "exit_code" => 7},
+             "created_by" => "synthetic-output-actor"
+           }
+         ],
+         "output_index" => 2,
+         "sequence_number" => 60
+       }},
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "created_by" => "synthetic-completion-actor",
+         "response" => %{
+           "id" => "resp_hosted_shell_events",
+           "object" => "response",
+           "status" => "completed",
+           "output" => [],
+           "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+         },
+         "sequence_number" => 2
+       }}
+    ]
+  end
+
+  defp assert_hosted_shell_forwarded!(capture, expected_input) do
+    expected_input = hosted_shell_expected_upstream_input(expected_input)
+
+    unless capture.path == "/backend-api/codex/responses" and capture.json["stream"] == true and
+             capture.json["store"] == false and capture.json["input"] == expected_input do
+      flunk("hosted shell history changed before upstream dispatch")
+    end
+  end
+
+  defp hosted_shell_expected_upstream_input(input) do
+    Enum.map(input, fn
+      %{"type" => type} = item when type in ["shell_call", "shell_call_output"] ->
+        Map.delete(item, "id")
+
+      item ->
+        item
+    end)
+  end
+
+  defp assert_hosted_shell_sentinels_absent!(text, sentinels) do
+    if Enum.any?(Map.values(sentinels), &String.contains?(text, &1)) do
+      flunk("hosted shell history leaked into an observable metadata surface")
+    end
+  end
+
+  defp assert_no_hosted_shell_lifecycle_stream!(body) do
+    lifecycle_markers = ["event:", "response.created", "response.completed"]
+
+    if Enum.any?(lifecycle_markers, &String.contains?(body, &1)) do
+      flunk("malformed hosted shell history emitted a lifecycle stream")
+    end
+  end
+
+  # A stateless replay of a programmatic turn: the program and its output items, and the function tool the program
+  # called. The hosted `programmatic_tool_calling` tool and a choice naming it are not declared: the Codex backend refuses
+  # the tool on Full and the choice on every mode (findings#333, `responses_refused_request_fields_test.exs`).
+  defp programmatic_tool_payload(model, sentinels) do
+    %{
+      "model" => model,
+      "store" => true,
+      "input" => programmatic_tool_items(sentinels),
+      "tools" => [
+        %{
+          "type" => "function",
+          "name" => "lookup_programmatic_fixture",
+          "parameters" => %{"type" => "object", "properties" => %{}},
+          "allowed_callers" => ["direct", "programmatic"],
+          "output_schema" => %{
+            "type" => "object",
+            "x-opaque-programmatic-schema" => sentinels.schema
+          }
+        }
+      ]
+    }
+  end
+
+  defp programmatic_tool_items(sentinels) do
+    [
+      %{
+        "type" => "program",
+        "id" => sentinels.item,
+        "call_id" => sentinels.call,
+        "code" => sentinels.code,
+        "fingerprint" => sentinels.fingerprint
+      },
+      %{
+        "type" => "function_call",
+        "id" => "#{sentinels.item}-function-call",
+        "call_id" => "#{sentinels.call}-function",
+        "name" => "lookup_programmatic_fixture",
+        "arguments" => "{}",
+        "caller" => %{"type" => "program", "caller_id" => sentinels.caller}
+      },
+      %{
+        "type" => "function_call_output",
+        "id" => "#{sentinels.item}-function-output",
+        "call_id" => "#{sentinels.call}-function",
+        "output" => sentinels.result,
+        "caller" => %{"type" => "program", "caller_id" => sentinels.caller}
+      },
+      %{
+        "type" => "program_output",
+        "id" => "#{sentinels.item}-output",
+        "call_id" => sentinels.call,
+        "result" => sentinels.result,
+        "status" => "completed"
+      }
+    ]
+  end
+
+  defp assert_programmatic_input_forwarded!(input, sentinels) do
+    assert Enum.map(input, & &1["type"]) == [
+             "program",
+             "function_call",
+             "function_call_output",
+             "program_output"
+           ]
+
+    assert [program, function_call, function_output, program_output] = input
+    refute Map.has_key?(program, "id")
+    assert program["call_id"] == sentinels.call
+    assert program["code"] == sentinels.code
+    assert program["fingerprint"] == sentinels.fingerprint
+
+    refute Map.has_key?(function_call, "id")
+    assert function_call["call_id"] == "#{sentinels.call}-function"
+    assert function_call["caller"] == %{"type" => "program", "caller_id" => sentinels.caller}
+
+    refute Map.has_key?(function_output, "id")
+    assert function_output["call_id"] == "#{sentinels.call}-function"
+    assert function_output["output"] == sentinels.result
+    assert function_output["caller"] == %{"type" => "program", "caller_id" => sentinels.caller}
+
+    refute Map.has_key?(program_output, "id")
+    assert program_output["call_id"] == sentinels.call
+    assert program_output["result"] == sentinels.result
+    assert program_output["status"] == "completed"
+  end
+
+  defp put_programmatic_payload_item(payload, index, key, value) do
+    input = List.update_at(payload["input"], index, &Map.put(&1, key, value))
+    Map.put(payload, "input", input)
+  end
+
+  defp put_programmatic_payload_tool(payload, index, key, value) do
+    tools = List.update_at(payload["tools"], index, &Map.put(&1, key, value))
+    Map.put(payload, "tools", tools)
+  end
+
+  defp assert_programmatic_metadata_only!(request, attempt, sentinels) do
+    metadata = inspect({request.request_metadata, attempt.response_metadata})
+
+    for sentinel <- Map.values(sentinels) do
+      refute metadata =~ sentinel
+    end
+  end
+
+  defp issue_241_completed_response(response_id) do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => response_id,
+           "object" => "response",
+           "status" => "completed",
+           "output" => [],
+           "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+         }
+       }}
+    ])
+  end
+
+  defp issue_241_repairable_parameters do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "properties" => %{
+        "config" => %{
+          "additionalProperties" => false,
+          "properties" => %{
+            "entries" => %{
+              "items" => %{
+                "additionalProperties" => false,
+                "properties" => %{"value" => %{"type" => "string"}},
+                "required" => ["value"]
+              }
+            }
+          },
+          "required" => ["entries"]
+        }
+      },
+      "required" => ["config"]
+    }
+  end
+
+  defp issue_241_strict_function_tool(parameters) do
+    %{
+      "type" => "function",
+      "name" => "invalid_schema_fixture",
+      "strict" => true,
+      "parameters" => parameters
+    }
+  end
+
+  defp assert_issue_241_success_lifecycle!(setup) do
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_sse"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+
+    ledger_entries =
+      Repo.all(
+        from(l in LedgerEntry,
+          where: l.request_id == ^request.id,
+          order_by: [asc: l.created_at]
+        )
+      )
+
+    assert Enum.frequencies_by(ledger_entries, & &1.entry_kind) == %{
+             "reservation" => 1,
+             "release" => 1,
+             "settlement" => 1
+           }
+
+    assert %LedgerEntry{amount_status: "recorded", usage_status: "usage_pending"} =
+             Enum.find(ledger_entries, &(&1.entry_kind == "reservation"))
+
+    assert %LedgerEntry{amount_status: "recorded"} =
+             Enum.find(ledger_entries, &(&1.entry_kind == "release"))
+
+    assert %LedgerEntry{amount_status: "recorded", usage_status: "usage_known"} =
+             Enum.find(ledger_entries, &(&1.entry_kind == "settlement"))
+
+    assert Repo.aggregate(
+             from(fact in RequestLogFact, where: fact.request_id == ^request.id),
+             :count
+           ) == 1
+  end
+
+  defp durable_accounting_counts do
+    ledger_counts =
+      LedgerEntry
+      |> group_by([entry], entry.entry_kind)
+      |> select([entry], {entry.entry_kind, count(entry.id)})
+      |> Repo.all()
+      |> Map.new()
+
+    %{
+      requests: Repo.aggregate(Request, :count),
+      attempts: Repo.aggregate(Attempt, :count),
+      ledger_entries: Repo.aggregate(LedgerEntry, :count),
+      request_log_facts: Repo.aggregate(RequestLogFact, :count),
+      reservations: Map.get(ledger_counts, "reservation", 0),
+      releases: Map.get(ledger_counts, "release", 0),
+      settlements: Map.get(ledger_counts, "settlement", 0)
+    }
+  end
+
+  defp preservation_log_fixture(omitted_sentinel) do
+    middle =
+      1..96
+      |> Enum.map(fn
+        48 -> "ordinary build line 48 #{omitted_sentinel}"
+        index -> "ordinary build line #{index}"
+      end)
+
+    [
+      "command started",
+      "context before first",
+      "error: first failure",
+      "context after first"
+    ]
+    |> Kernel.++(middle)
+    |> Kernel.++([
+      "context before final",
+      "fatal: final failure",
+      "context after final"
+    ])
+    |> Enum.join("\n")
+  end
+
   defp public_sse_events(body) do
     body
     |> String.split("\n\n", trim: true)
@@ -6484,13 +12313,47 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end)
   end
 
+  defp await_committed_public_turn(pool_id),
+    do: await_committed_public_turn(pool_id, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+
+  defp await_committed_public_turn(pool_id, deadline) do
+    turn =
+      Repo.one(
+        from(turn in CodexTurn,
+          join: request in Request,
+          on: request.id == turn.request_id,
+          where: request.pool_id == ^pool_id,
+          order_by: [desc: turn.started_at],
+          limit: 1
+        )
+      )
+
+    case turn do
+      %CodexTurn{first_visible_output_at: %DateTime{}} ->
+        turn
+
+      _pending ->
+        if System.monotonic_time(:millisecond) >= deadline, do: flunk("expected committed public bridge turn")
+
+        receive do
+        after
+          1 -> await_committed_public_turn(pool_id, deadline)
+        end
+    end
+  end
+
+  defp enable_websocket_owner_forwarding! do
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+  end
+
   defp public_sse_event(block) do
     lines = String.split(block, "\n")
     event = lines |> Enum.find(&String.starts_with?(&1, "event: ")) |> strip_sse_prefix("event: ")
     data = lines |> Enum.find(&String.starts_with?(&1, "data: ")) |> strip_sse_prefix("data: ")
 
     if is_binary(event) and is_binary(data) and data != "[DONE]" do
-      %{"event" => event, "data" => Jason.decode!(data)}
+      %{"event" => event, "data" => CodexPooler.JSON.decode!(data)}
     end
   end
 
@@ -6514,6 +12377,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   defp put_setup_model_source_metadata!(setup, source_metadata) when is_map(source_metadata) do
+    source_metadata = Map.put_new(source_metadata, "slug", setup.model.exposed_model_id)
+
     metadata =
       setup.model.metadata
       |> Map.put("source_assignment_models", %{setup.assignment.id => source_metadata})
@@ -6526,8 +12391,126 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     %{setup | model: model}
   end
 
+  defp issue_231_gateway_setup(selected_upstream, alternate_upstream, opts) do
+    setup = gateway_setup(selected_upstream, quota?: false)
+
+    alternate =
+      gateway_upstream(
+        setup.pool,
+        alternate_upstream,
+        "upstream-token-issue-231-alternate",
+        compact?: false
+      )
+
+    prime_weekly_exhausted_quota!(setup.identity)
+    prime_weekly_probe_quota!(alternate.identity)
+
+    source = get_in(setup.model.metadata, ["source_assignment_models", setup.assignment.id])
+
+    selected_source =
+      source
+      |> Map.put("service_tiers", [%{"id" => "priority"}])
+      |> Map.put("default_reasoning_level", "medium")
+      |> Map.put("default_service_tier", "default")
+
+    alternate_source =
+      if Keyword.fetch!(opts, :divergent?) do
+        # The reported pool diverged on presentation hints, which no longer
+        # split a canonical partition. Keep them here as the realistic shape,
+        # and add the behavioral field that does still split.
+        selected_source
+        |> Map.put("default_reasoning_level", "high")
+        |> Map.put("default_service_tier", "priority")
+        |> Map.put("context_window", 111_111)
+      else
+        selected_source
+      end
+
+    metadata =
+      setup.model.metadata
+      |> Map.put("source_assignment_ids", [setup.assignment.id, alternate.assignment.id])
+      |> Map.put("source_assignment_models", %{
+        setup.assignment.id => selected_source,
+        alternate.assignment.id => alternate_source
+      })
+
+    model =
+      setup.model
+      |> Ecto.Changeset.change(%{source_assignment_count: 2, metadata: metadata})
+      |> Repo.update!()
+
+    {:ok, selected_canonical} = CanonicalModelSource.canonical_source(selected_source)
+    {:ok, alternate_canonical} = CanonicalModelSource.canonical_source(alternate_source)
+
+    {%{setup | model: model}, alternate,
+     %{
+       selected_digest: selected_canonical.digest,
+       alternate_digest: alternate_canonical.digest
+     }}
+  end
+
+  defp issue_231_completed_response(response_id) do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => response_id,
+           "status" => "completed",
+           "model" => "provider-gpt-test-model",
+           "service_tier" => "priority",
+           "output" => [],
+           "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+         }
+       }}
+    ])
+  end
+
+  defp assert_issue_231_successful_accounting!(setup, alternate, source_endpoint) do
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.pool_id == setup.pool.id
+    assert request.api_key_id == setup.api_key.id
+    assert request.model_id == setup.model.id
+    assert request.status == "succeeded"
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert_issue_231_origin_metadata!(request, source_endpoint)
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.pool_upstream_assignment_id == alternate.assignment.id
+    assert attempt.upstream_identity_id == alternate.identity.id
+    assert attempt.model_id == setup.model.id
+
+    assert_issue_231_private_metadata!(
+      {request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)},
+      setup
+    )
+  end
+
+  defp assert_issue_231_origin_metadata!(request, source_endpoint) do
+    assert get_in(request.request_metadata, ["openai_compatibility", "surface"]) == "openai_v1"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+             source_endpoint
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "translated_endpoint"]) ==
+             "/backend-api/codex/responses"
+  end
+
+  defp assert_issue_231_private_metadata!(metadata, setup) do
+    metadata_text = inspect(metadata)
+    refute metadata_text =~ "issue-231-private-"
+    refute metadata_text =~ "supported_reasoning_levels"
+    refute metadata_text =~ "default_reasoning_level"
+    refute metadata_text =~ "default_service_tier"
+    refute metadata_text =~ "used_percent"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ setup.raw_key
+    refute metadata_text =~ "upstream-token-issue-231"
+  end
+
   defp setup_runtime_ingress_override(%OperationalSettings{} = settings) do
-    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -6536,7 +12519,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       |> Keyword.put(:settings, settings)
       |> Keyword.put(:use_instance_settings?, false)
     )
+  end
 
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
+  defp overloaded_bulkhead_settings(queue_limit \\ 0, queue_timeout_ms \\ 25) do
+    %OperationalSettings{
+      bulkheads:
+        Map.new(Admission.route_classes(), fn route_class ->
+          {route_class, %{max_concurrency: 1, queue_limit: queue_limit, queue_timeout_ms: queue_timeout_ms}}
+        end)
+    }
   end
 end

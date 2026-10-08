@@ -8,7 +8,9 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
   alias CodexPooler.Quotas.{Evidence, WindowClassifier}
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Charts.Measurements
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Quota.Windows.Routing
 
   @spec quota_health(
           Scope.t(),
@@ -21,28 +23,65 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
     pool_ids = Common.visible_pool_ids(scope)
     visible_assignments = Common.filter_assignments_by_pool_ids(assignments, pool_ids)
 
-    windows = quota_windows(identity_or_id, visible_assignments, as_of)
+    snapshot = quota_snapshot(identity_or_id, visible_assignments, as_of)
 
-    from_windows(identity_or_id, visible_assignments, windows, as_of)
+    from_snapshot(identity_or_id, visible_assignments, snapshot, as_of)
+  end
+
+  @spec quota_health_from_readiness(
+          Scope.t(),
+          term(),
+          [UpstreamCockpitMetrics.assignment_summary()],
+          UpstreamQuotaReadiness.t(),
+          DateTime.t()
+        ) :: UpstreamCockpitMetrics.quota_health()
+  def quota_health_from_readiness(
+        %Scope{} = scope,
+        identity_or_status,
+        assignments,
+        readiness,
+        %DateTime{} = as_of
+      )
+      when is_list(assignments) and is_map(readiness) do
+    pool_ids = Common.visible_pool_ids(scope)
+    visible_assignments = Common.filter_assignments_by_pool_ids(assignments, pool_ids)
+    from_readiness(identity_or_status, visible_assignments, readiness, as_of)
   end
 
   @spec without_quota_data([UpstreamCockpitMetrics.assignment_summary()], DateTime.t()) ::
           UpstreamCockpitMetrics.quota_health()
   def without_quota_data(assignments, %DateTime{} = as_of) when is_list(assignments) do
-    from_windows(nil, assignments, [], as_of)
+    from_readiness(nil, assignments, UpstreamQuotaReadiness.from_windows([], as_of), as_of)
   end
 
-  defp quota_windows(_identity_or_id, [], _as_of), do: []
+  defp quota_snapshot(_identity_or_id, [], _as_of), do: nil
 
-  defp quota_windows(identity_or_id, _visible_assignments, as_of) do
+  defp quota_snapshot(identity_or_id, _visible_assignments, as_of) do
     identity_or_id
     |> Common.identity_id()
-    |> QuotaWindows.list_quota_windows(as_of)
+    |> then(&RoutingQuotaSnapshot.load_by_identity_ids([&1], as_of))
+    |> Map.get(Common.identity_id(identity_or_id))
   end
 
-  defp from_windows(identity_or_status, assignments, windows, as_of) do
-    readiness = UpstreamQuotaReadiness.from_windows(windows, as_of)
+  defp from_snapshot(identity_or_status, assignments, %RoutingQuotaSnapshot{} = snapshot, as_of) do
+    from_readiness(
+      identity_or_status,
+      assignments,
+      UpstreamQuotaReadiness.from_snapshot(snapshot),
+      as_of
+    )
+  end
 
+  defp from_snapshot(identity_or_status, assignments, nil, as_of) do
+    from_readiness(
+      identity_or_status,
+      assignments,
+      UpstreamQuotaReadiness.from_windows([], as_of),
+      as_of
+    )
+  end
+
+  defp from_readiness(identity_or_status, assignments, readiness, as_of) do
     items =
       assignments
       |> Enum.map(&quota_health_item(&1, readiness, identity_or_status, as_of))
@@ -57,8 +96,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
       kpis: kpis,
       empty?: items == [],
       degraded?: quota_health_degraded?(kpis),
-      missing?:
-        kpis.assignment_count > 0 and kpis.missing_evidence_count == kpis.assignment_count,
+      missing?: kpis.assignment_count > 0 and kpis.missing_evidence_count == kpis.assignment_count,
       state: quota_health_state(kpis)
     }
   end
@@ -73,13 +111,12 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
     measurements = quota_measurements(display_window)
 
     %{}
-    |> Map.merge(
-      Map.take(assignment, [:upstream_identity_id, :pool_id, :pool_label, :assignment_label])
-    )
+    |> Map.merge(Map.take(assignment, [:upstream_identity_id, :pool_id, :pool_label, :assignment_label]))
     |> Map.put(:assignment_id, assignment.id)
     |> Map.put(:state, state)
     |> Map.put(:state_label, quota_state_label(state))
     |> Map.put(:routing_usable?, routing_readiness.routing_ready_now?)
+    |> Map.put(:routing_conditional?, routing_readiness.routing_ready_now? and Map.get(readiness, :conditional?, false))
     |> Map.merge(Common.routing_readiness_contract(routing_readiness))
     |> Map.put(:window_kind, display_window && display_window.window_kind)
     |> Map.put(:window_minutes, display_window && display_window.window_minutes)
@@ -111,6 +148,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
     %{}
     |> Map.put(:assignment_count, length(items))
     |> Map.put(:routing_usable_count, Enum.count(items, & &1.routing_usable?))
+    |> Map.put(:routing_conditional_count, Enum.count(items, & &1.routing_conditional?))
     |> Map.put(:fresh_count, Map.get(counts, "fresh", 0))
     |> Map.put(:stale_count, Map.get(counts, "stale", 0))
     |> Map.put(:missing_evidence_count, Map.get(counts, "missing_evidence", 0))
@@ -128,7 +166,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
 
   defp quota_health_degraded?(kpis) do
     kpis.stale_or_missing_count > 0 or kpis.exhausted_count > 0 or kpis.blocked_count > 0 or
-      kpis.routing_usable_count < kpis.assignment_count
+      kpis.routing_usable_count < kpis.assignment_count or kpis.routing_conditional_count > 0
   end
 
   defp quota_health_state(%{assignment_count: 0}), do: "empty"
@@ -151,19 +189,35 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.QuotaHealth do
   defp quota_health_state(_kpis), do: "unknown"
 
   defp quota_assignment_state(%{state: "ready"}), do: "fresh"
+
+  defp quota_assignment_state(%{included_quota_state: state} = readiness) do
+    readiness |> Map.delete(:included_quota_state) |> Map.put(:state, state) |> quota_assignment_state()
+  end
+
   defp quota_assignment_state(%{state: "weekly_only_probe"}), do: "weekly_only"
+  defp quota_assignment_state(%{state: "provider_available_no_windows"}), do: "fresh"
   defp quota_assignment_state(%{state: state}), do: state
 
-  defp quota_measurements(%Quota.AccountQuotaWindow{} = window),
-    do: Measurements.for_window(window)
+  defp quota_measurements(%Quota.AccountQuotaWindow{quota_scope: "account"} = window) do
+    [included] = Routing.included_only_windows([window])
+    quota_measurements_for_window(included)
+  end
+
+  defp quota_measurements(%Quota.AccountQuotaWindow{} = window), do: quota_measurements_for_window(window)
 
   defp quota_measurements(_window),
     do: %{remaining: nil, capacity: nil, used: nil, used_percent: nil, remaining_percent: nil}
 
+  defp quota_measurements_for_window(window) do
+    window
+    |> Measurements.for_window()
+    |> Map.put(:remaining_percent, Measurements.meter_remaining_percent(window))
+  end
+
   defp quota_window_contract(nil, _as_of), do: nil
 
   defp quota_window_contract(%Quota.AccountQuotaWindow{} = window, as_of) do
-    measurements = Measurements.for_window(window)
+    measurements = quota_measurements(window)
 
     %{
       window_kind: window.window_kind,

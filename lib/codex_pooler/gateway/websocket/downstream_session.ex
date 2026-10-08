@@ -8,10 +8,12 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   alias CodexPooler.Gateway.Transports.Websocket.{
     RolloutDrain,
     WebsocketOwnerContract,
+    WebsocketOwnerForwarder,
     WebsocketOwnerSession
   }
 
   alias CodexPooler.Gateway.Websocket
+  alias CodexPooler.Gateway.Websocket.OwnerCleanup
 
   @type socket_state :: map()
   @type monitor_result ::
@@ -37,6 +39,9 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
         } = runtime
       ) do
     state
+    |> Map.delete(:websocket_owner_cleanup_witness)
+    |> Map.delete(:websocket_owner_cleanup_task)
+    |> Map.delete(:websocket_owner_lost?)
     |> Map.put(:codex_session, session)
     |> Map.put(:websocket_owner_lease_token, owner_lease_token)
     |> Map.put(:websocket_owner_downstream, downstream)
@@ -47,6 +52,38 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
     |> put_monitor(session)
   end
 
+  @spec accept_cleanup_witness(term(), socket_state()) :: socket_state()
+  def accept_cleanup_witness(
+        {:websocket_owner_cleanup_witness, correlation, epoch, task, %OwnerCleanup{} = witness},
+        %{
+          codex_session: %{id: session_id, owner_instance_id: owner},
+          websocket_owner_lease_token: lease,
+          websocket_owner_downstream: %{correlation_id: correlation, epoch: epoch},
+          tasks: tasks
+        } = state
+      ) do
+    if MapSet.member?(tasks, task) and witness.session_id == session_id and
+         witness.owner_instance_id == owner and witness.owner_lease_token == lease and
+         witness.downstream_epoch == epoch do
+      state
+      |> Map.put(:websocket_owner_cleanup_witness, witness)
+      |> Map.put(:websocket_owner_cleanup_task, task)
+    else
+      state
+    end
+  end
+
+  def accept_cleanup_witness(_message, state), do: state
+
+  @spec clear_cleanup_witness(socket_state(), pid()) :: socket_state()
+  def clear_cleanup_witness(%{websocket_owner_cleanup_task: task} = state, task) do
+    state
+    |> Map.delete(:websocket_owner_cleanup_witness)
+    |> Map.delete(:websocket_owner_cleanup_task)
+  end
+
+  def clear_cleanup_witness(state, _task), do: state
+
   @spec handle_monitor_down(socket_state(), pid(), term()) :: monitor_result()
   def handle_monitor_down(state, owner_pid, reason) when is_pid(owner_pid) do
     state = clear_monitor(state, owner_pid)
@@ -56,7 +93,8 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
         {:ok, state}
 
       :owner_drained ->
-        handle_owner_exit(:owner_drained, state, reason)
+        {:ok, state} = handle_owner_exit(:owner_drained, state, reason)
+        {:ok, Map.put(state, :websocket_owner_lost?, true)}
 
       :owner_crashed ->
         {:ok, state} = handle_owner_exit(:owner_crashed, state, reason)
@@ -92,13 +130,18 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   def close_detail(:owner_unavailable), do: {1011, "websocket owner is unavailable"}
   def close_detail(:owner_drained), do: {1001, "websocket owner is draining"}
   def close_detail(:stale_owner), do: {1011, "websocket owner lease is stale"}
+  # An idle native socket whose upstream connection closed between two requests
+  # (findings#270): "going away" with a fixed reason, like `:owner_drained`.
+  # The released client handles a close of its idle socket the same way
+  # whatever the code (1000, 1001, 1011 and 1012 were probed).
+  def close_detail(:upstream_connection_closed), do: {1001, "upstream connection closed"}
   def close_detail(_reason), do: {1011, "websocket owner unavailable"}
 
   @spec maybe_retarget_before_start(binary(), socket_state()) ::
           {:ok, socket_state()} | {:error, WebsocketOwnerContract.owner_error()}
   def maybe_retarget_before_start(payload, %{websocket_owner_downstream: downstream} = state)
       when is_binary(payload) and is_map(downstream) do
-    with {:ok, %{} = decoded_payload} <- Jason.decode(payload),
+    with {:ok, %{} = decoded_payload} <- CodexPooler.JSON.decode(payload),
          {:ok, runtime} <-
            Websocket.retarget_websocket_owner_runtime(
              state.auth,
@@ -106,17 +149,116 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
              decoded_payload,
              Map.get(state, :opts, %{})
            ) do
-      {:ok, maybe_put_retargeted_runtime(state, runtime)}
+      state = maybe_put_retargeted_runtime(state, runtime)
+
+      if Map.get(decoded_payload, "type") == "response.create",
+        do: recover_missing_local_owner(state),
+        else: {:ok, state}
     else
-      {:error, %Jason.DecodeError{}} -> {:ok, state}
-      {:error, reason} -> {:error, reason}
+      {:error, {:unexpected_end, _offset}} ->
+        {:ok, state}
+
+      {:error, {kind, _offset, _value}} when kind in [:invalid_byte, :unexpected_sequence] ->
+        {:ok, state}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
   def maybe_retarget_before_start(_payload, state), do: {:ok, state}
 
+  defp recover_missing_local_owner(state) do
+    if local_owner?(state) and missing_local_owner?(state) do
+      opts = response_options(state)
+
+      case Websocket.recover_websocket_owner_response_options(opts) do
+        {:ok, options} ->
+          owner = options.transport.websocket_owner
+
+          {:ok,
+           put_runtime(clear_monitor(state), %{
+             codex_session: options.continuity.codex_session,
+             websocket_owner_lease_token: owner.lease_token,
+             websocket_owner_downstream: owner.downstream
+           })}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
+  defp missing_local_owner?(%{websocket_owner_pid: pid}) when is_pid(pid),
+    do: not Process.alive?(pid)
+
+  defp missing_local_owner?(_state), do: true
+
+  # The socket saw its owner exit without crashing (a drain, a normal stop)
+  # (findings#276): an idle native socket closes, and a socket that stays open
+  # takes the session over before its next request reaches an owner. An owner
+  # that crashed closes the socket at once.
+  @spec owner_lost?(socket_state()) :: boolean()
+  def owner_lost?(state), do: owner?(state) and Map.get(state, :websocket_owner_lost?, false)
+
+  @spec recover_lost_owner(socket_state()) :: {:ok, socket_state()} | {:error, term()}
+  def recover_lost_owner(state) do
+    case Websocket.recover_lost_websocket_owner_runtime(response_options(state)) do
+      {:ok, runtime} -> {:ok, state |> clear_monitor() |> put_runtime(runtime)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec accept_downstream_message(term(), socket_state()) ::
           WebsocketOwnerContract.downstream_match_result() | :drop
+  def accept_downstream_message(
+        message,
+        %{
+          opts: %RequestOptions{
+            openai_compatibility: %{public_openai_responses_stream: true}
+          },
+          public_response_task_pid: owner_turn_id,
+          websocket_owner_downstream: downstream
+        }
+      )
+      when is_pid(owner_turn_id) and is_map(downstream) do
+    WebsocketOwnerContract.accept_downstream_message(
+      message,
+      Map.get(downstream, :epoch),
+      Map.get(downstream, :correlation_id),
+      owner_turn_id
+    )
+  end
+
+  def accept_downstream_message(
+        _message,
+        %{
+          opts: %RequestOptions{
+            openai_compatibility: %{public_openai_responses_stream: true}
+          }
+        }
+      ),
+      do: :drop
+
+  def accept_downstream_message(
+        {:websocket_owner_frame, _correlation_id, _epoch, owner_turn_id, _payload} = message,
+        %{websocket_owner_downstream: downstream, tasks: tasks} = state
+      )
+      when is_pid(owner_turn_id) and is_map(downstream) do
+    if MapSet.member?(tasks, owner_turn_id) or reconnect_owner_turn?(state, owner_turn_id) do
+      WebsocketOwnerContract.accept_downstream_message(
+        message,
+        Map.get(downstream, :epoch),
+        Map.get(downstream, :correlation_id),
+        owner_turn_id
+      )
+    else
+      :drop
+    end
+  end
+
   def accept_downstream_message(message, %{websocket_owner_downstream: downstream})
       when is_map(downstream) do
     WebsocketOwnerContract.accept_downstream_message(
@@ -128,6 +270,202 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
 
   def accept_downstream_message(_message, _state), do: :drop
 
+  @spec accept_handoff_message(term(), socket_state()) ::
+          {:ok, WebsocketOwnerContract.handoff_outcome()}
+          | {:ok, {:ready, pid()}}
+          | {:ok, {{:failed, :owner_forward_timeout | :owner_drained}, pid()}}
+          | :drop
+  def accept_handoff_message(
+        message,
+        %{
+          websocket_owner_downstream: %{
+            pid: downstream_pid,
+            epoch: epoch,
+            correlation_id: correlation_id
+          },
+          websocket_owner_pending_handoff: %{
+            owner_turn_id: owner_turn_id,
+            control_ref: control_ref
+          }
+        }
+      )
+      when is_pid(downstream_pid) and is_integer(epoch) and epoch > 0 and
+             is_binary(correlation_id) and is_pid(owner_turn_id) and is_reference(control_ref) do
+    case WebsocketOwnerContract.accept_handoff_message(
+           message,
+           downstream_pid,
+           epoch,
+           correlation_id,
+           owner_turn_id,
+           control_ref
+         ) do
+      {:error, :invalid_handoff_message} -> :drop
+      result -> result
+    end
+  end
+
+  def accept_handoff_message(
+        {:websocket_owner_handoff_ready, correlation_id, epoch, owner_turn_id, downstream_pid, control_ref} = message,
+        %{
+          websocket_owner_downstream: %{
+            pid: downstream_pid,
+            epoch: epoch,
+            correlation_id: correlation_id
+          },
+          websocket_owner_pending_handoff: %{
+            owner_turn_id: nil,
+            control_ref: control_ref
+          }
+        }
+      )
+      when is_pid(owner_turn_id) do
+    case WebsocketOwnerContract.accept_handoff_message(
+           message,
+           downstream_pid,
+           epoch,
+           correlation_id,
+           owner_turn_id,
+           control_ref
+         ) do
+      {:ok, :ready} -> {:ok, {:ready, owner_turn_id}}
+      _other -> :drop
+    end
+  end
+
+  def accept_handoff_message(
+        {:websocket_owner_handoff_failed, correlation_id, epoch, owner_turn_id, downstream_pid, control_ref, reason} = message,
+        %{
+          websocket_owner_downstream: %{
+            pid: downstream_pid,
+            epoch: epoch,
+            correlation_id: correlation_id
+          },
+          websocket_owner_pending_handoff: %{
+            owner_turn_id: nil,
+            control_ref: control_ref
+          }
+        }
+      )
+      when is_pid(owner_turn_id) do
+    case WebsocketOwnerContract.accept_handoff_message(
+           message,
+           downstream_pid,
+           epoch,
+           correlation_id,
+           owner_turn_id,
+           control_ref
+         ) do
+      {:ok, {:failed, ^reason}} -> {:ok, {{:failed, reason}, owner_turn_id}}
+      _other -> :drop
+    end
+  end
+
+  def accept_handoff_message(_message, _state), do: :drop
+
+  # The owner's word that the upstream connection behind this downstream
+  # closed between two requests (findings#270). Like every owner message it
+  # counts only for the downstream binding it names: this socket's current
+  # correlation id and epoch. A well-formed one for another binding is
+  # `:stale` (the socket's binding changed after the owner decided, e.g. a
+  # recovered owner), anything else is dropped.
+  @spec accept_upstream_closed_message(term(), socket_state()) ::
+          {:ok, WebsocketOwnerContract.upstream_closed_signal()}
+          | {:stale, WebsocketOwnerContract.upstream_closed_signal()}
+          | :drop
+  def accept_upstream_closed_message(message, %{websocket_owner_downstream: downstream}) when is_map(downstream) do
+    case WebsocketOwnerContract.accept_upstream_closed_message(message, Map.get(downstream, :epoch), Map.get(downstream, :correlation_id)) do
+      {:ok, signal} -> {:ok, signal}
+      :drop -> {:stale, elem(message, 3)}
+      {:error, _invalid} -> :drop
+    end
+  end
+
+  def accept_upstream_closed_message(_message, _state), do: :drop
+
+  @spec preflight_reconnect(socket_state(), <<_::256>>, reference()) ::
+          WebsocketOwnerSession.reconnect_preflight_result()
+  def preflight_reconnect(state, semantic_turn_key, control_ref)
+      when is_binary(semantic_turn_key) and byte_size(semantic_turn_key) == 32 and
+             is_reference(control_ref) do
+    Websocket.preflight_websocket_owner_reconnect(
+      Map.get(state, :codex_session),
+      Map.get(state, :websocket_owner_lease_token),
+      Map.get(state, :websocket_owner_downstream),
+      semantic_turn_key,
+      control_ref,
+      Map.get(state, :opts, %{})
+    )
+  end
+
+  @spec reconnect_control_v2(
+          socket_state(),
+          CodexPooler.Gateway.Transports.Websocket.RemoteReconnectControlV2.t()
+        ) :: term()
+  def reconnect_control_v2(state, control) do
+    WebsocketOwnerForwarder.reconnect_control_v2(
+      Map.get(state, :codex_session),
+      Map.get(state, :websocket_owner_lease_token),
+      control,
+      forwarder_opts(Map.get(state, :opts))
+    )
+  end
+
+  defp forwarder_opts(%RequestOptions{transport: %{websocket_owner: owner}}),
+    do: owner.forwarder_opts
+
+  defp forwarder_opts(opts) when is_map(opts),
+    do: Map.get(opts, :websocket_owner_forwarder_opts, [])
+
+  defp forwarder_opts(opts) when is_list(opts),
+    do: Keyword.get(opts, :websocket_owner_forwarder_opts, [])
+
+  defp forwarder_opts(_opts), do: []
+
+  @spec cancel_reconnect(socket_state(), <<_::256>>, reference()) ::
+          :ok | {:error, WebsocketOwnerContract.owner_error()}
+  def cancel_reconnect(state, semantic_turn_key, control_ref)
+      when is_binary(semantic_turn_key) and byte_size(semantic_turn_key) == 32 and
+             is_reference(control_ref) do
+    Websocket.cancel_websocket_owner_reconnect(
+      Map.get(state, :codex_session),
+      Map.get(state, :websocket_owner_lease_token),
+      Map.get(state, :websocket_owner_downstream),
+      semantic_turn_key,
+      control_ref,
+      Map.get(state, :opts, %{})
+    )
+  end
+
+  defp reconnect_owner_turn?(state, owner_turn_id) do
+    Map.get(state, :websocket_owner_active_turn_reconnect?, false) and
+      Map.get(state, :websocket_owner_reconnect_turn_pid) == owner_turn_id
+  end
+
+  @spec accept_recovered_runtime(term(), socket_state()) :: {:ok, socket_state()} | :drop
+  def accept_recovered_runtime(
+        {:websocket_owner_runtime_recovered, correlation_id, epoch,
+         %{
+           codex_session: %{owner_lease_token: owner_lease_token},
+           websocket_owner_lease_token: owner_lease_token,
+           websocket_owner_downstream: %{
+             correlation_id: correlation_id,
+             epoch: epoch
+           }
+         } = runtime},
+        %{
+          websocket_owner_downstream: %{
+            correlation_id: correlation_id,
+            epoch: epoch
+          }
+        } = state
+      )
+      when is_binary(correlation_id) and is_integer(epoch) and epoch > 0 and
+             is_binary(owner_lease_token) do
+    {:ok, state |> clear_monitor() |> put_runtime(runtime)}
+  end
+
+  def accept_recovered_runtime(_message, _state), do: :drop
+
   @spec retarget_error_payload(term()) :: {:error, term()}
   def retarget_error_payload(reason) do
     case WebsocketOwnerContract.safe_error_payload(reason, nil) do
@@ -136,13 +474,13 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
     end
   end
 
-  @spec response_options(socket_state()) :: RequestOptions.t()
-  def response_options(state) do
+  @spec response_options(socket_state(), pid() | nil) :: RequestOptions.t()
+  def response_options(state, owner_turn_id \\ nil) do
     Websocket.websocket_owner_response_options(
       Map.get(state, :opts, %{}),
       Map.get(state, :codex_session),
       Map.get(state, :websocket_owner_lease_token),
-      Map.get(state, :websocket_owner_downstream)
+      per_call_downstream(state, owner_turn_id)
     )
   end
 
@@ -153,6 +491,68 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
     else
       detach_downstream(state)
     end
+  end
+
+  @doc """
+  Finishes the cleanup of a downstream the owner already detached when the
+  socket began to close (`detach_previsible/2` answered `:detached`): the same
+  leftover recovery and turn interrupt `cleanup/2` runs after its owner detach.
+  """
+  @spec cleanup_detached(socket_state()) :: :ok
+  def cleanup_detached(state), do: after_detach(:ok, state)
+
+  @doc """
+  Asks the owner to arm the replay of a pre-visible turn attached to this
+  closing downstream before the socket drains its response tasks
+  (findings#232, 232-100), or to detach and fence it when the owner has not
+  accepted any of its turns yet (`:detached`, rows 232-171 and 232-175). A
+  rollout drain or shutdown keeps its own cleanup, and `:not_previsible` leaves
+  everything to `cleanup/2`.
+  """
+  @spec detach_previsible(socket_state(), term()) :: :suspended | :detached | :not_previsible
+  def detach_previsible(state, reason) do
+    if owner?(state) and not shutdown_reason?(reason) and not rollout_drain_cleanup?(state, reason) do
+      state
+      |> Map.get(:codex_session)
+      |> Websocket.detach_previsible_websocket_owner_downstream(
+        Map.get(state, :websocket_owner_lease_token),
+        Map.get(state, :websocket_owner_downstream),
+        Map.get(state, :opts, %{})
+      )
+    else
+      :not_previsible
+    end
+  end
+
+  @spec take_over_inherited_turn(socket_state(), <<_::256>> | nil) :: :taken_over | :unsettled | :not_taken_over
+  def take_over_inherited_turn(state, request_turn_digest \\ nil) do
+    Websocket.take_over_inherited_websocket_owner_turn(
+      Map.get(state, :codex_session),
+      Map.get(state, :websocket_owner_lease_token),
+      Map.get(state, :websocket_owner_downstream),
+      Map.get(state, :opts, %{}),
+      request_turn_digest
+    )
+  end
+
+  @spec cancel_owner_turn(socket_state(), pid(), :owner_drained) :: :ok
+  def cancel_owner_turn(state, owner_turn_id, :owner_drained)
+      when is_pid(owner_turn_id) do
+    session = Map.get(state, :codex_session)
+    owner_lease_token = Map.get(state, :websocket_owner_lease_token)
+    downstream = per_call_downstream(state, owner_turn_id)
+    opts = Map.get(state, :opts, %{})
+
+    _result =
+      Websocket.cancel_websocket_owner_turn(
+        session,
+        owner_lease_token,
+        downstream,
+        :owner_drained,
+        opts
+      )
+
+    :ok
   end
 
   defp detach_downstream(state) do
@@ -167,8 +567,15 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   end
 
   defp rollout_drain_cleanup?(state, reason) do
-    owner?(state) and (RolloutDrain.draining?() or shutdown_reason?(reason))
+    local_owner?(state) and (RolloutDrain.draining?() or shutdown_reason?(reason))
   end
+
+  defp local_owner?(%{codex_session: %{owner_instance_id: owner_instance_id}} = state)
+       when is_binary(owner_instance_id) do
+    owner?(state) and owner_instance_id == Atom.to_string(node())
+  end
+
+  defp local_owner?(_state), do: false
 
   defp shutdown_reason?(:shutdown), do: true
   defp shutdown_reason?({:shutdown, _details}), do: true
@@ -176,11 +583,13 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
 
   defp record_owner_drained_cleanup(state) do
     _owner_drain_result = drain_owner_session(state)
-    _recovery_result = recover_leftovers({:error, :owner_drained}, state)
+    recovery_result = recover_leftovers({:error, :owner_drained}, state)
 
-    "owner_drained"
-    |> release_lease(state)
-    |> log_monitor_lease_release(state, :owner_drained)
+    if match?({:ok, _result}, recovery_result) do
+      "owner_drained"
+      |> release_lease(state)
+      |> log_monitor_lease_release(state, :owner_drained)
+    end
   end
 
   defp drain_owner_session(%{websocket_owner_pid: owner_pid}) when is_pid(owner_pid) do
@@ -196,7 +605,7 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   defp drain_owner_session(_state), do: {:error, :owner_unavailable}
 
   defp put_monitor(state, session) do
-    case Websocket.monitor_websocket_owner(session) do
+    case Websocket.monitor_websocket_owner(session, Map.get(state, :opts, %{})) do
       {:ok, owner_pid, owner_monitor} ->
         state
         |> Map.put(:websocket_owner_pid, owner_pid)
@@ -224,14 +633,18 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   defp effective_monitor_down_reason(_state, reason), do: monitor_down_reason(reason)
 
   defp handle_owner_exit(owner_reason, state, raw_reason) do
-    {:error, owner_reason}
-    |> recover_leftovers(state)
-    |> log_monitor_recovery(state, raw_reason)
+    recovery_result =
+      {:error, owner_reason}
+      |> recover_leftovers(state)
 
-    owner_reason
-    |> Atom.to_string()
-    |> release_lease(state)
-    |> log_monitor_lease_release(state, raw_reason)
+    log_monitor_recovery(recovery_result, state, raw_reason)
+
+    if match?({:ok, _recovered}, recovery_result) do
+      owner_reason
+      |> Atom.to_string()
+      |> release_lease(state)
+      |> log_monitor_lease_release(state, raw_reason)
+    end
 
     {:ok, state}
   end
@@ -241,8 +654,7 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
       codex_session: Map.get(state, :codex_session),
       websocket_owner_lease_token: Map.get(state, :websocket_owner_lease_token),
       websocket_owner_downstream: Map.get(state, :websocket_owner_downstream),
-      websocket_owner_active_turn_reconnect?:
-        Map.get(state, :websocket_owner_active_turn_reconnect?, false)
+      websocket_owner_active_turn_reconnect?: Map.get(state, :websocket_owner_active_turn_reconnect?, false)
     }
   end
 
@@ -256,40 +668,111 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
     end
   end
 
+  defp per_call_downstream(state, owner_turn_id) do
+    downstream = Map.get(state, :websocket_owner_downstream)
+
+    if is_map(downstream) and is_pid(owner_turn_id) do
+      Map.put(downstream, :owner_turn_id, owner_turn_id)
+    else
+      downstream
+    end
+  end
+
+  # A detach the owner did not answer within its call budget: the owner is
+  # alive but slow, and the detach is still waiting for it, to run once it
+  # answers again. It cancels a turn that showed output and settles it
+  # `client_disconnected`, or arms a pre-visible turn's replay. The socket used
+  # to take the timeout for an owner that is gone: its owner-lost recovery
+  # interrupted the turn `owner_unavailable` under the owner. The resend of a
+  # turn that showed output then met `409 duplicate_turn`. A pre-visible
+  # turn's replay could no longer be armed, the owner generated that turn to
+  # its end for nobody and its late success rewrote the interruption, while
+  # the resend was served by a second generation (findings#270 row 270-257).
+  # The turn is now left to the owner. An owner that never answers again stops
+  # renewing its lease, and the expired-owner recovery settles the turn.
+  defp after_detach({:error, :owner_forward_timeout}, state) do
+    Logger.info(
+      "websocket owner detach left to the owner after its call budget " <>
+        "codex_session_id=#{codex_session_id(state)} " <>
+        "owner_instance_id=#{owner_instance_id(state)} " <>
+        "request_id=#{request_id(Map.get(state, :opts))} " <>
+        "downstream_epoch=#{downstream_epoch(Map.get(state, :websocket_owner_downstream))}"
+    )
+  end
+
+  # A socket that already pushed its task's terminal defers the turn interrupt
+  # (`websocket_owner_defer_turn_interrupt?`): the task settles that turn itself,
+  # and interrupting it first recorded a refusal the client had displayed as
+  # `499 client_disconnected` whenever the settlement was slow (findings#254
+  # row 254-140). The socket runs `cleanup_detached/1` again without the flag
+  # only for such a task it had to kill.
   defp after_detach(result, state) do
     recovery_result = recover_leftovers(result, state)
-    _interrupt_result = interrupt_downstream_turn(result, state)
+
+    _interrupt_result =
+      if result in [:reattachable, :suspended] or Map.get(state, :websocket_owner_defer_turn_interrupt?, false) == true,
+        do: :ok,
+        else: interrupt_downstream_turn(result, state)
+
     log_detach_failure(result, state, recovery_result)
   end
 
   defp interrupt_downstream_turn(:ok, state) do
-    state
-    |> Map.get(:codex_session)
-    |> Websocket.interrupt_codex_turn(downstream_interrupt_opts(state))
-    |> log_interrupt_failure(state)
+    unless idle_without_cleanup_authority?(state) do
+      state
+      |> Map.get(:codex_session)
+      |> Websocket.interrupt_detached_codex_turn(downstream_interrupt_opts(state))
+      |> log_interrupt_failure(state)
+    end
+
+    :ok
   end
 
   defp interrupt_downstream_turn(_result, _state), do: :ok
 
   defp recover_leftovers({:error, reason}, state) when reason in @owner_recovery_reasons do
-    state
-    |> Map.get(:codex_session)
-    |> Websocket.recover_owner_lifecycle_leftovers(reason, lifecycle_recovery_opts(state, reason))
-    |> log_lifecycle_recovery_failure(state)
+    if idle_without_cleanup_authority?(state) do
+      {:ok, %{interrupted_turn_count: 0}}
+    else
+      state
+      |> Map.get(:codex_session)
+      |> Websocket.recover_owner_lifecycle_leftovers(
+        reason,
+        lifecycle_recovery_opts(state, reason)
+      )
+      |> log_lifecycle_recovery_failure(state)
+    end
   end
 
   defp recover_leftovers(_result, _state), do: :ok
+
+  defp idle_without_cleanup_authority?(state) do
+    no_turn_of_its_own?(state) and Map.get(state, :websocket_owner_active_turn_reconnect?, false) != true
+  end
+
+  # The socket never started a turn: no cleanup witness, no task, no bound
+  # reconnect turn, no handoff and nothing queued or awaiting direct cleanup.
+  defp no_turn_of_its_own?(state) do
+    Enum.all?(
+      [
+        :websocket_owner_cleanup_witness,
+        :websocket_owner_cleanup_task,
+        :websocket_owner_reconnect_turn_pid,
+        :websocket_owner_pending_handoff,
+        :public_response_task_pid
+      ],
+      &is_nil(Map.get(state, &1))
+    ) and
+      MapSet.size(Map.get(state, :tasks, MapSet.new())) == 0 and
+      map_size(Map.get(state, :direct_cleanup_contexts, %{})) == 0 and
+      map_size(Map.get(state, :direct_cleanup_receipts, %{})) == 0 and
+      :queue.is_empty(Map.get(state, :queued_response_payloads, :queue.new()))
+  end
 
   defp lifecycle_recovery_opts(state, reason) do
     interrupt_reason = reason |> failure_reason() |> lifecycle_interrupt_reason()
 
     put_lifecycle_recovery_opts(state, interrupt_reason)
-  end
-
-  defp put_lifecycle_recovery_opts(%{opts: %RequestOptions{} = opts}, interrupt_reason) do
-    opts
-    |> RequestOptions.put_runtime_context(interrupt_reason: interrupt_reason)
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
   end
 
   defp put_lifecycle_recovery_opts(state, interrupt_reason) do
@@ -298,6 +781,8 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
     |> RequestOptions.for_websocket()
     |> RequestOptions.put_runtime_context(interrupt_reason: interrupt_reason)
     |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
+    |> RequestOptions.put_transport(websocket_owner_lease_token: Map.get(state, :websocket_owner_lease_token))
+    |> OwnerCleanup.put_options(Map.get(state, :websocket_owner_cleanup_witness))
   end
 
   defp lifecycle_interrupt_reason(reason)
@@ -311,18 +796,8 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
 
   defp lifecycle_interrupt_reason(_reason), do: "owner_unavailable"
 
-  defp downstream_interrupt_opts(%{opts: %RequestOptions{} = opts}) do
-    opts
-    |> RequestOptions.put_runtime_context(interrupt_reason: "client_disconnected")
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
-  end
-
   defp downstream_interrupt_opts(state) do
-    state
-    |> Map.get(:opts, %{})
-    |> RequestOptions.for_websocket()
-    |> RequestOptions.put_runtime_context(interrupt_reason: "client_disconnected")
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
+    put_lifecycle_recovery_opts(state, "client_disconnected")
   end
 
   defp release_lease(reason, state) do
@@ -334,6 +809,15 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   end
 
   defp log_monitor_recovery({:ok, _result}, _state, _reason), do: :ok
+
+  # The recovery stood down for a later running turn; its producer already
+  # logged that at info, and the lease correctly stays with that turn.
+  defp log_monitor_recovery({:error, :superseded_owner_cleanup}, _state, _reason), do: :ok
+
+  # A takeover released the lease this cleanup held (findings#270 row
+  # 270-313): the session is the new owner's, and its producer logged that
+  # at info.
+  defp log_monitor_recovery({:error, :taken_over_owner_cleanup}, _state, _reason), do: :ok
 
   defp log_monitor_recovery({:error, recovery_reason}, state, owner_reason) do
     Logger.warning(
@@ -349,7 +833,9 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   end
 
   defp log_monitor_lease_release(:ok, _state, _reason), do: :ok
+
   defp log_monitor_lease_release({:error, :stale_owner}, _state, _reason), do: :ok
+  defp log_monitor_lease_release({:error, :taken_over_owner_cleanup}, _state, _reason), do: :ok
 
   defp log_monitor_lease_release({:error, release_reason}, state, owner_reason) do
     Logger.warning(
@@ -365,6 +851,8 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   end
 
   defp log_detach_failure(:ok, _state, _recovery_result), do: :ok
+  defp log_detach_failure(:reattachable, _state, _recovery_result), do: :ok
+  defp log_detach_failure(:suspended, _state, _recovery_result), do: :ok
   defp log_detach_failure(:detached_stale_downstream, _state, _recovery_result), do: :ok
 
   defp log_detach_failure({:error, reason}, state, {:ok, recovery}) do
@@ -388,6 +876,9 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
     :ok
   end
 
+  defp log_detach_failure({:error, _reason}, _state, {:error, :superseded_owner_cleanup}), do: :ok
+  defp log_detach_failure({:error, _reason}, _state, {:error, :taken_over_owner_cleanup}), do: :ok
+
   defp log_detach_failure({:error, reason}, state, {:error, _recovery_failure}) do
     log_detach_failure({:error, reason}, state, :log_warning)
   end
@@ -396,6 +887,12 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
   defp interrupted_turn_count(_recovery), do: 0
 
   defp log_lifecycle_recovery_failure({:ok, _result} = result, _state), do: result
+
+  defp log_lifecycle_recovery_failure({:error, :superseded_owner_cleanup} = result, _state),
+    do: result
+
+  defp log_lifecycle_recovery_failure({:error, :taken_over_owner_cleanup} = result, _state),
+    do: result
 
   defp log_lifecycle_recovery_failure({:error, reason}, state) do
     Logger.warning(
@@ -412,11 +909,61 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSession do
 
   defp log_interrupt_failure({:ok, _result}, _state), do: :ok
 
-  defp log_interrupt_failure({:error, reason}, state) do
+  # A later turn of the session was already running, so the owner-scoped
+  # interrupt stood down on purpose (findings#225): routine, not a failure.
+  defp log_interrupt_failure({:error, :superseded_owner_cleanup}, state) do
+    Logger.info(
+      "websocket interrupt cleanup superseded " <>
+        "codex_session_id=#{codex_session_id(state)} " <>
+        "cleanup_path=owner_detach reason_code=replacement_turn_active"
+    )
+
+    :ok
+  end
+
+  # A takeover released the lease the interrupt was bound to (findings#270 row
+  # 270-313): routine, as for a later running turn.
+  defp log_interrupt_failure({:error, :taken_over_owner_cleanup}, state) do
+    Logger.info(
+      "websocket interrupt cleanup superseded " <>
+        "codex_session_id=#{codex_session_id(state)} " <>
+        "cleanup_path=owner_detach reason_code=lease_taken_over"
+    )
+
+    :ok
+  end
+
+  # The owner-scoped interrupt needs the cleanup witness the owner sends once
+  # it has started the socket's turn; without one it rolls back as stale by
+  # construction, so that outcome is routine, never a failed cleanup. Two
+  # shapes reach it: a reconnect socket whose only frame the owner refused
+  # (findings#225 row 225-95), and a socket cut before the owner's witness
+  # reached it, with its turn still being reserved or already refused
+  # (row 225-210, a pre-visible cut whose resend then succeeded). Neither left
+  # anything this interrupt could close: the owner settles a turn it started
+  # through its own detach or monitor, and a turn it never started is settled
+  # by the socket's own response task when the terminate cancels it.
+  defp log_interrupt_failure({:error, :stale_owner_cleanup} = result, state) do
+    if is_nil(Map.get(state, :websocket_owner_cleanup_witness)) do
+      Logger.info(
+        "websocket interrupt cleanup skipped " <>
+          "codex_session_id=#{codex_session_id(state)} " <>
+          "cleanup_path=owner_detach reason_code=no_cleanup_witness"
+      )
+
+      :ok
+    else
+      log_interrupt_failure_warning(result, state)
+    end
+  end
+
+  defp log_interrupt_failure(result, state), do: log_interrupt_failure_warning(result, state)
+
+  defp log_interrupt_failure_warning({:error, reason}, state) do
     Logger.warning(
       "websocket interrupt cleanup failed " <>
         "codex_session_id=#{codex_session_id(state)} " <>
-        "failure_reason=#{failure_reason(reason)}"
+        "failure_reason=#{failure_reason(reason)} cleanup_path=owner_detach"
     )
 
     :ok

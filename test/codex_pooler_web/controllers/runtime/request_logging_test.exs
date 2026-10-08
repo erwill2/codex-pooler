@@ -4,50 +4,22 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
   import Ecto.Query
   import ExUnit.CaptureLog
 
+  import CodexPooler.AccountsFixtures, only: [reset_bootstrap_state_fixture!: 0]
+
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport,
     only: [auth: 2, gateway_setup: 1, start_upstream: 1]
 
-  alias CodexPooler.Access
-  alias CodexPooler.Accounting
   alias CodexPooler.Accounting.Request
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
-  alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
-  alias CodexPoolerWeb.WebsocketConnectionLogger
-
-  @websocket_lifecycle_metadata_keys ~w(
-    codex_session_id
-    downstream_epoch
-    elapsed_ms
-    endpoint
-    owner_instance_id
-    phase
-    proxy_instance_id
-    reason_class
-    request_id
-    route_class
-    transport
-  )
-
-  @websocket_lifecycle_forbidden_terms ~w(
-    auth.json
-    authorization
-    bearer
-    cookie
-    headers
-    idempotency
-    payload
-    prompt
-    upstream_body
-    websocket_frame
-  )
 
   setup do
+    reset_bootstrap_state_fixture!()
+
     previous_level = Logger.level()
 
-    previous_owner_forwarding =
-      Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
 
     Logger.configure(level: :info)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
@@ -55,11 +27,6 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
 
     on_exit(fn ->
       Logger.configure(level: previous_level)
-
-      case previous_owner_forwarding do
-        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
-        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
-      end
     end)
 
     :ok
@@ -141,303 +108,45 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
 
     assert line =~ "path=/login"
     assert line =~ "remote_ip=203.0.113.55"
-    refute line =~ "10.42.0.50"
+    assert line =~ "immediate_peer_ip=10.42.0.50"
+    assert line =~ "client_ip_source=x_forwarded_for"
+    assert line =~ "inspected_hops=2"
   end
 
-  test "websocket init timeout emits one bounded lifecycle line and no request row" do
-    remote_instance_id = "codex_pooler@request-log-init-timeout.example"
-    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
-    setup = gateway_setup(upstream)
-    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+  test "request logging omits peer provenance from untrusted forwarding input", %{conn: conn} do
+    setup_trusted_proxies(["10.42.0.0/16"])
 
-    {:ok, session} =
-      Gateway.start_codex_session(auth, %{
-        accepted_turn_state: "stable-ws-request-log-init-timeout",
-        owner_instance_id: remote_instance_id
-      })
-
-    request_id = "ws-request-log-init-timeout"
-
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok =
-                 WebsocketConnectionLogger.log_init_failed_before_request_reservation(
-                   %{
-                     request_id: request_id,
-                     endpoint: "/backend-api/codex/responses",
-                     transport: "websocket",
-                     route_class: "proxy_websocket",
-                     phase: "init",
-                     elapsed_ms: 17,
-                     codex_session_id: session.id,
-                     owner_instance_id: remote_instance_id,
-                     proxy_instance_id: Atom.to_string(node())
-                   },
-                   :timeout
-                 )
+    log =
+      capture_log([level: :info], fn ->
+        conn
+        |> Map.put(:remote_ip, {198, 51, 100, 20})
+        |> put_req_header("x-forwarded-for", "203.0.113.55")
+        |> get(~p"/login")
+        |> response(302)
       end)
 
-    line =
-      assert_websocket_lifecycle_line!(
-        logs,
-        "websocket init failed before request reservation",
-        ~w(codex_session_id elapsed_ms endpoint phase reason_class request_id route_class transport),
-        ~w(owner_instance_id proxy_instance_id)
-      )
+    assert [line] =
+             log
+             |> String.split("\n", trim: true)
+             |> Enum.filter(&String.contains?(&1, "request_completed"))
 
-    expected_endpoint = String.replace("/backend-api/codex/responses", ~r/[^a-zA-Z0-9_.:-]+/, "_")
-    expected_owner_instance_id = String.replace(remote_instance_id, ~r/[^a-zA-Z0-9_.:-]+/, "_")
-
-    expected_proxy_instance_id =
-      String.replace(Atom.to_string(node()), ~r/[^a-zA-Z0-9_.:-]+/, "_")
-
-    assert line =~ "request_id=#{request_id}"
-    assert line =~ "endpoint=#{expected_endpoint}"
-    assert line =~ "transport=websocket"
-    assert line =~ "route_class=proxy_websocket"
-    assert line =~ "codex_session_id=#{log_id_prefix(session.id)}"
-    refute line =~ session.id
-    assert line =~ "owner_instance_id=#{expected_owner_instance_id}"
-    assert line =~ "proxy_instance_id=#{expected_proxy_instance_id}"
-
-    assert [] = Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
-    assert %{items: [], total: 0} = Accounting.list_request_logs(setup.pool)
-
-    assert FakeUpstream.count(upstream) == 0
-  end
-
-  test "websocket lifecycle reason classifier keeps max frame size reason queryable" do
-    assert WebsocketConnectionLogger.reason_class({:error, :max_frame_size_exceeded}) ==
-             "max_frame_size_exceeded"
-
-    assert WebsocketConnectionLogger.reason_class({:deserializing, :max_frame_size_exceeded}) ==
-             "max_frame_size_exceeded"
-  end
-
-  test "websocket lifecycle reason classifier keeps fragmented message cap reason queryable" do
-    assert WebsocketConnectionLogger.reason_class("Received oversize fragmented message") ==
-             "max_fragmented_message_size_exceeded"
-  end
-
-  test "websocket lifecycle max frame close logs allowlisted metadata only" do
-    codex_session_id = Ecto.UUID.generate()
-
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok =
-                 WebsocketConnectionLogger.log_closed_before_request_reservation(
-                   %{
-                     request_id: "ws-max-frame-close",
-                     endpoint: "/backend-api/codex/responses",
-                     transport: "websocket",
-                     route_class: "proxy_websocket",
-                     phase: "terminate",
-                     elapsed_ms: 8,
-                     codex_session_id: codex_session_id,
-                     owner_instance_id: "codex_pooler@owner.example",
-                     proxy_instance_id: "codex_pooler@proxy.example",
-                     downstream_epoch: 3,
-                     request_body: "dropped-request-body",
-                     raw_frame: "dropped-websocket-frame",
-                     headers: [{"authorization", "Bearer dropped"}],
-                     prompt_cache_key: "dropped-prompt-key"
-                   },
-                   {:deserializing, :max_frame_size_exceeded}
-                 )
-      end)
-
-    line =
-      assert_websocket_lifecycle_line!(
-        logs,
-        WebsocketConnectionLogger.closed_message(),
-        ~w(codex_session_id downstream_epoch elapsed_ms endpoint owner_instance_id phase proxy_instance_id reason_class request_id route_class transport),
-        []
-      )
-
-    assert line =~ "request_id=ws-max-frame-close"
-    assert line =~ "endpoint=_backend-api_codex_responses"
-    assert line =~ "transport=websocket"
-    assert line =~ "route_class=proxy_websocket"
-    assert line =~ "phase=terminate"
-    assert line =~ "reason_class=max_frame_size_exceeded"
-    assert line =~ "elapsed_ms=8"
-    assert line =~ "codex_session_id=#{log_id_prefix(codex_session_id)}"
-    refute line =~ codex_session_id
-    assert line =~ "owner_instance_id=codex_pooler_owner.example"
-    assert line =~ "proxy_instance_id=codex_pooler_proxy.example"
-    assert line =~ "downstream_epoch=3"
-    refute line =~ "request_body"
-    refute line =~ "raw_frame"
-    refute line =~ "headers="
-    refute line =~ "prompt_cache_key"
-  end
-
-  test "websocket lifecycle fragmented message cap close logs distinct sanitized reason class" do
-    codex_session_id = Ecto.UUID.generate()
-
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok =
-                 WebsocketConnectionLogger.log_closed_before_request_reservation(
-                   %{
-                     request_id: "ws-fragmented-message-close",
-                     endpoint: "/backend-api/codex/responses",
-                     transport: "websocket",
-                     route_class: "proxy_websocket",
-                     phase: "terminate",
-                     elapsed_ms: 9,
-                     codex_session_id: codex_session_id,
-                     owner_instance_id: "codex_pooler@owner.example",
-                     proxy_instance_id: "codex_pooler@proxy.example",
-                     downstream_epoch: 4,
-                     request_body: "dropped-request-body",
-                     raw_frame: "dropped-websocket-frame",
-                     headers: [{"authorization", "Bearer dropped"}],
-                     prompt_cache_key: "dropped-prompt-key"
-                   },
-                   "Received oversize fragmented message"
-                 )
-      end)
-
-    line =
-      assert_websocket_lifecycle_line!(
-        logs,
-        WebsocketConnectionLogger.closed_message(),
-        ~w(codex_session_id downstream_epoch elapsed_ms endpoint owner_instance_id phase proxy_instance_id reason_class request_id route_class transport),
-        []
-      )
-
-    assert line =~ "request_id=ws-fragmented-message-close"
-    assert line =~ "reason_class=max_fragmented_message_size_exceeded"
-    assert line =~ "codex_session_id=#{log_id_prefix(codex_session_id)}"
-    refute line =~ codex_session_id
-    refute line =~ "Received_oversize_fragmented_message"
-    refute line =~ "request_body"
-    refute line =~ "raw_frame"
-    refute line =~ "headers="
-    refute line =~ "prompt_cache_key"
-  end
-
-  test "websocket lifecycle timeout close logs allowlisted metadata with prefixed session id" do
-    codex_session_id = Ecto.UUID.generate()
-
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok =
-                 WebsocketConnectionLogger.log_closed_before_request_reservation(
-                   %{
-                     request_id: "ws-timeout-close",
-                     endpoint: "/backend-api/codex/responses",
-                     transport: "websocket",
-                     route_class: "proxy_websocket",
-                     phase: "terminate",
-                     elapsed_ms: 300_005,
-                     codex_session_id: codex_session_id,
-                     owner_instance_id: "codex_pooler@owner.example",
-                     proxy_instance_id: "codex_pooler@proxy.example",
-                     downstream_epoch: 2
-                   },
-                   :timeout
-                 )
-      end)
-
-    line =
-      assert_websocket_lifecycle_line!(
-        logs,
-        WebsocketConnectionLogger.closed_message(),
-        ~w(codex_session_id downstream_epoch elapsed_ms endpoint owner_instance_id phase proxy_instance_id reason_class request_id route_class transport),
-        []
-      )
-
-    assert line =~ "request_id=ws-timeout-close"
-    assert line =~ "endpoint=_backend-api_codex_responses"
-    assert line =~ "transport=websocket"
-    assert line =~ "route_class=proxy_websocket"
-    assert line =~ "phase=terminate"
-    assert line =~ "reason_class=timeout"
-    assert line =~ "elapsed_ms=300005"
-    assert line =~ "codex_session_id=#{log_id_prefix(codex_session_id)}"
-    refute line =~ codex_session_id
-    assert line =~ "owner_instance_id=codex_pooler_owner.example"
-    assert line =~ "proxy_instance_id=codex_pooler_proxy.example"
-    assert line =~ "downstream_epoch=2"
-  end
-
-  test "websocket lifecycle generic closed reason stays queryable" do
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok =
-                 WebsocketConnectionLogger.log_closed_before_request_reservation(
-                   %{
-                     request_id: "ws-generic-close",
-                     endpoint: "/backend-api/codex/responses",
-                     transport: "websocket",
-                     route_class: "proxy_websocket",
-                     phase: "terminate",
-                     elapsed_ms: 41
-                   },
-                   :closed
-                 )
-      end)
-
-    line =
-      assert_websocket_lifecycle_line!(
-        logs,
-        WebsocketConnectionLogger.closed_message(),
-        ~w(elapsed_ms endpoint phase reason_class request_id route_class transport),
-        ~w(codex_session_id downstream_epoch owner_instance_id proxy_instance_id)
-      )
-
-    assert line =~ "request_id=ws-generic-close"
-    assert line =~ "reason_class=closed"
-  end
-
-  test "websocket lifecycle log redacts sensitive-looking values and drops unknown metadata" do
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok =
-                 WebsocketConnectionLogger.log_closed_before_request_reservation(
-                   %{
-                     request_id: "ws-sensitive-close",
-                     endpoint: "/backend-api/codex/responses?authorization=Bearer-sensitive",
-                     transport: "websocket",
-                     route_class: "proxy_websocket",
-                     phase: "terminate",
-                     elapsed_ms: 13,
-                     codex_session_id: "session-with-prompt-cookie-secret",
-                     owner_instance_id: "owner-with-authorization-secret",
-                     proxy_instance_id: "proxy-with-idempotency-secret",
-                     downstream_epoch: 1,
-                     request_body: "body-secret",
-                     prompt_cache_key: "prompt-secret",
-                     headers: [{"cookie", "cookie-secret"}],
-                     raw_frame: "websocket-frame-secret"
-                   },
-                   {:deserializing, "Bearer prompt cookie"}
-                 )
-      end)
-
-    line =
-      assert_websocket_lifecycle_line!(
-        logs,
-        WebsocketConnectionLogger.closed_message(),
-        ~w(codex_session_id downstream_epoch elapsed_ms endpoint owner_instance_id phase proxy_instance_id reason_class request_id route_class transport),
-        []
-      )
-
-    assert line =~ "endpoint=redacted"
-    assert line =~ "reason_class=binary_reason"
-    assert line =~ "codex_session_id=redacted"
-    assert line =~ "owner_instance_id=redacted"
-    assert line =~ "proxy_instance_id=redacted"
-    refute line =~ "request_body"
-    refute line =~ "prompt_cache_key"
-    refute line =~ "headers="
-    refute line =~ "raw_frame"
+    assert line =~ "remote_ip=198.51.100.20"
+    refute line =~ "immediate_peer_ip="
+    refute line =~ "client_ip_source="
+    refute line =~ "inspected_hops="
+    refute line =~ "203.0.113.55"
   end
 
   test "healthy backend response coalesces routing request metadata writes", %{conn: conn} do
-    input = "metadata coalescing input #{System.unique_integer([:positive])}"
+    input_text = "metadata coalescing input #{System.unique_integer([:positive])}"
+
+    input = [
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [%{"type" => "input_text", "text" => input_text}]
+      }
+    ]
 
     upstream =
       start_upstream(
@@ -476,12 +185,12 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
     assert request_update_count(query_events) <= 3
 
     metadata_text = inspect(request.request_metadata)
-    refute metadata_text =~ input
+    refute metadata_text =~ input_text
     refute metadata_text =~ setup.authorization
   end
 
   defp setup_trusted_proxies(trusted_proxies) do
-    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -490,24 +199,13 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
       |> Keyword.put(:settings, %OperationalSettings{trusted_proxies: trusted_proxies})
       |> Keyword.put(:use_instance_settings?, false)
     )
-
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
-  end
-
-  defp capture_websocket_lifecycle_log(fun) when is_function(fun, 0) do
-    capture_log(
-      [
-        level: :info,
-        format: "$metadata$message\n",
-        metadata: @websocket_lifecycle_metadata_keys,
-        colors: [enabled: false]
-      ],
-      fun
-    )
   end
 
   defp collect_repo_query_events(fun) when is_function(fun, 0) do
     handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -553,40 +251,4 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
   end
 
   defp query_command(_query), do: "UNKNOWN"
-
-  defp log_id_prefix(id) when is_binary(id), do: String.slice(id, 0, 8)
-
-  defp assert_websocket_lifecycle_line!(logs, message, required_keys, optional_keys) do
-    lifecycle_lines =
-      logs
-      |> String.split("\n", trim: true)
-      |> Enum.filter(&String.contains?(&1, message))
-
-    assert [line] = lifecycle_lines
-
-    metadata_text =
-      line
-      |> String.replace_prefix(message, "")
-      |> String.trim_leading()
-
-    metadata_keys =
-      metadata_text
-      |> String.split(" ", trim: true)
-      |> Enum.map(fn token -> token |> String.split("=", parts: 2) |> hd() end)
-
-    assert Enum.all?(metadata_keys, &(&1 in @websocket_lifecycle_metadata_keys))
-    assert Enum.all?(required_keys, &(&1 in metadata_keys))
-    assert Enum.all?(metadata_keys, &(&1 in (required_keys ++ optional_keys)))
-    assert_no_websocket_lifecycle_leaks!(logs)
-
-    line
-  end
-
-  defp assert_no_websocket_lifecycle_leaks!(logs) do
-    downcased_logs = String.downcase(logs)
-
-    for forbidden_term <- @websocket_lifecycle_forbidden_terms do
-      refute downcased_logs =~ forbidden_term
-    end
-  end
 end

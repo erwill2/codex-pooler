@@ -5,8 +5,10 @@ defmodule CodexPooler.AccessTest do
   alias CodexPooler.Access.{APIKey, APIKeyPolicyBinding}
   alias CodexPooler.Access.APIKeys.TouchDebounce
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Pools
   alias CodexPooler.Repo
+  alias Ecto.Adapters.SQL
 
   import Ecto.Query
   import CodexPooler.AccountsFixtures
@@ -20,6 +22,164 @@ defmodule CodexPooler.AccessTest do
     end)
 
     :ok
+  end
+
+  describe "key-wide active request setting" do
+    test "persists create, update, rotation, Pool move, safe reads, audit and explicit clearing" do
+      {scope, pool} = owner_scope_and_pool()
+      {:ok, %{api_key: key}} = Access.create_api_key(scope, pool, %{display_name: "Optional cap"})
+      assert Map.fetch(Repo.get!(APIKey, key.id), :max_active_requests) == {:ok, nil}
+
+      {:ok, %{api_key: capped}} =
+        Access.create_api_key(scope, pool, %{display_name: "Capped key", max_active_requests: 3})
+
+      assert Map.get(Repo.get!(APIKey, capped.id), :max_active_requests) == 3
+      assert {:ok, _} = Access.update_api_key(scope, key, %{max_active_requests: 2})
+      assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 2
+
+      CodexPooler.TestDiagnostics.puts("active_request_cap persisted_create=nil persisted_update=2")
+
+      assert {:ok, %{api_key: rotated}} = Access.rotate_api_key(scope, key)
+      assert Map.get(Repo.get!(APIKey, rotated.id), :max_active_requests) == 2
+
+      destination = pool_fixture(%{created_by_user_id: scope.user.id})
+      assert :ok = Access.assign_api_keys_to_pool(scope, destination, [key.id])
+      persisted = Repo.get!(APIKey, key.id)
+      assert persisted.pool_id == destination.id
+      assert Map.get(persisted, :max_active_requests) == 2
+      assert {:ok, policy} = Access.normalize_api_key_policy(persisted)
+      assert Map.get(policy, :max_active_requests) == 2
+      assert {:ok, read} = Access.get_api_key(scope, key.id)
+      assert Map.get(read, :max_active_requests) == 2
+
+      CodexPooler.TestDiagnostics.puts("active_request_cap persisted_rotation=2 persisted_pool_move=2 safe_read=2")
+
+      assert {:ok, _} =
+               Access.update_api_key_with_policy(scope, key.id, %{"max_active_requests" => nil})
+
+      assert Map.fetch(Repo.get!(APIKey, key.id), :max_active_requests) == {:ok, nil}
+      events = Repo.all(from e in AuditEvent, where: e.target_id == ^key.id)
+      assert Enum.any?(events, &(&1.details["max_active_requests"] == 2))
+
+      assert Enum.any?(events, fn event ->
+               event.details["previous_max_active_requests"] == 2 and
+                 event.details["max_active_requests"] == nil and
+                 "max_active_requests" in (event.details["changed_fields"] || [])
+             end)
+
+      CodexPooler.TestDiagnostics.puts("active_request_cap persisted_clear=nil audit_previous=2 audit_current=nil audit_changed_field=true")
+    end
+
+    test "rejects malformed caps without changing persisted state and casts numeric form strings" do
+      {scope, pool} = owner_scope_and_pool()
+
+      {:ok, %{api_key: key}} =
+        Access.create_api_key(scope, pool, %{
+          display_name: "Validated cap",
+          max_active_requests: 4
+        })
+
+      for invalid <- [0, -1, 1.5, "garbage", "1.5", 2_147_483_648] do
+        assert {:error, %Ecto.Changeset{} = create_error} =
+                 Access.create_api_key(scope, pool, %{
+                   display_name: "Invalid cap",
+                   max_active_requests: invalid
+                 })
+
+        assert Keyword.has_key?(create_error.errors, :max_active_requests)
+
+        for update <- [&Access.update_api_key/3, &Access.update_api_key_with_policy/3] do
+          assert {:error, %Ecto.Changeset{} = error} =
+                   update.(scope, key, %{max_active_requests: invalid})
+
+          assert Keyword.has_key?(error.errors, :max_active_requests)
+          assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 4
+        end
+      end
+
+      CodexPooler.TestDiagnostics.puts("active_request_cap malformed_create_and_updates=rejected persisted_after_each_failure=4")
+
+      assert {:ok, _} = Access.update_api_key(scope, key, %{"max_active_requests" => "7"})
+      assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 7
+      assert {:ok, _} = Access.update_api_key(scope, key, %{max_active_requests: nil})
+      assert Map.fetch(Repo.get!(APIKey, key.id), :max_active_requests) == {:ok, nil}
+    end
+
+    test "model bindings cannot change the key-wide cap and invalid bindings roll back cap updates" do
+      {scope, pool} = owner_scope_and_pool()
+
+      {:ok, %{api_key: key}} =
+        Access.create_api_key(scope, pool, %{display_name: "Binding cap", max_active_requests: 4})
+
+      assert {:ok, %{policy_bindings: bindings}} =
+               Access.update_api_key_with_policy(scope, key, %{
+                 default_policy: %{max_active_requests: 80},
+                 model_policies: [%{model_identifier: "sample-model", max_active_requests: 90}]
+               })
+
+      assert Enum.all?(bindings, &(not Map.has_key?(&1, :max_active_requests)))
+      assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 4
+
+      assert {:error, %Ecto.Changeset{}} =
+               Access.update_api_key_with_policy(scope, key, %{
+                 max_active_requests: 2,
+                 model_policies: [%{model_identifier: "sample-model", max_tokens_per_day: 0}]
+               })
+
+      assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 4
+      assert {:ok, _} = Access.update_api_key(scope, key, %{display_name: "Still usable"})
+      assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 4
+    end
+
+    test "unassigned users cannot create or mutate a cap" do
+      {scope, pool} = owner_scope_and_pool()
+      %{user: admin} = operator_fixture(scope.user, %{"email" => unique_user_email()})
+      denied_scope = Scope.for_user(admin)
+
+      {:ok, %{api_key: key}} =
+        Access.create_api_key(scope, pool, %{
+          display_name: "Protected cap",
+          max_active_requests: 4
+        })
+
+      assert {:error, _} =
+               Access.create_api_key(denied_scope, pool, %{
+                 display_name: "Denied",
+                 max_active_requests: 1
+               })
+
+      assert {:error, _} = Access.update_api_key(denied_scope, key, %{max_active_requests: 1})
+
+      assert {:error, _} =
+               Access.update_api_key_with_policy(denied_scope, key, %{max_active_requests: 1})
+
+      assert Map.get(Repo.get!(APIKey, key.id), :max_active_requests) == 4
+    end
+
+    test "PostgreSQL rejects nonpositive caps when changesets are bypassed" do
+      {scope, pool} = owner_scope_and_pool()
+
+      {:ok, %{api_key: key}} =
+        Access.create_api_key(scope, pool, %{display_name: "Database cap", max_active_requests: 4})
+
+      for invalid <- [0, -1] do
+        assert {:error,
+                %Postgrex.Error{
+                  postgres: %{
+                    code: :check_violation,
+                    constraint: "api_keys_max_active_requests_positive"
+                  }
+                }} =
+                 SQL.query(
+                   Repo,
+                   "UPDATE api_keys SET max_active_requests = $1 WHERE id = $2",
+                   [invalid, Ecto.UUID.dump!(key.id)],
+                   mode: :savepoint
+                 )
+
+        assert Repo.get!(APIKey, key.id).max_active_requests == 4
+      end
+    end
   end
 
   describe "server-authoritative API key policy APIs" do
@@ -291,6 +451,40 @@ defmodule CodexPooler.AccessTest do
 
       assert {:error, %{code: :api_key_missing}} = Access.authenticate_api_key(raw_key)
       assert {:error, %{code: :api_key_missing}} = Access.authenticate_v1_api_key(raw_key)
+    end
+  end
+
+  describe "API key listing" do
+    test "batches authorized Pool reads as the Pool count grows" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner)
+
+      first_pool = pool_fixture(%{name: "Batched API keys 1"})
+      %{api_key: first_key} = api_key_fixture(first_pool, %{scope: scope, display_name: "Key 1"})
+
+      {{:ok, [listed_first_key]}, one_pool_queries} =
+        count_repo_sources(fn -> Access.list_api_keys(scope) end)
+
+      assert listed_first_key.id == first_key.id
+
+      additional_keys =
+        for index <- 2..10 do
+          pool = pool_fixture(%{name: "Batched API keys #{index}"})
+
+          %{api_key: api_key} =
+            api_key_fixture(pool, %{scope: scope, display_name: "Key #{index}"})
+
+          api_key
+        end
+
+      {{:ok, listed_keys}, ten_pool_queries} =
+        count_repo_sources(fn -> Access.list_api_keys(scope) end)
+
+      assert MapSet.new(Enum.map(listed_keys, & &1.id)) ==
+               MapSet.new(Enum.map([first_key | additional_keys], & &1.id))
+
+      assert one_pool_queries == %{"api_keys" => 1, "memberships" => 1, "pools" => 1}
+      assert ten_pool_queries == one_pool_queries
     end
   end
 
@@ -649,12 +843,70 @@ defmodule CodexPooler.AccessTest do
     end
 
     @tag :api_key_policy_contract
+    test "persists and authorizes enforced ultrafast without granting account eligibility" do
+      {scope, pool} = owner_scope_and_pool()
+      assert {:ok, %{api_key: api_key}} = Access.create_api_key(scope, pool, %{display_name: "Ultrafast policy", enforced_service_tier: " ULTRAFAST "})
+      assert Repo.get!(APIKey, api_key.id).enforced_service_tier == "ultrafast"
+      assert {:ok, policy} = Access.normalize_api_key_policy(api_key)
+      assert {:ok, %{enforced_service_tier: "ultrafast"}} = Access.authorize_api_key_policy(policy, %{model: "sample-model"})
+      assert {:ok, %{api_key: updated}} = Access.update_api_key_with_policy(scope, api_key, %{enforced_service_tier: "default"})
+      assert updated.enforced_service_tier == "default"
+      assert {:ok, %{api_key: restored}} = Access.update_api_key_with_policy(scope, updated, %{enforced_service_tier: "ultrafast"})
+      assert restored.enforced_service_tier == "ultrafast"
+      assert Repo.get_by!(AuditEvent, action: "api_key.create", target_id: api_key.id).details["enforced_service_tier"] == "ultrafast"
+      assert {:error, %{code: :invalid_policy}} = Access.update_api_key_with_policy(scope, restored, %{enforced_service_tier: "ultrafaster"})
+      assert Repo.get!(APIKey, api_key.id).enforced_service_tier == "ultrafast"
+    end
+
+    @tag :api_key_policy_contract
+    test "canonicalizes fast service tiers before persistence and authorization" do
+      {scope, pool} = owner_scope_and_pool()
+
+      assert {:ok, %{api_key: api_key, raw_key: raw_key}} =
+               Access.create_api_key(scope, pool, %{
+                 display_name: "Fast service tier key",
+                 enforced_service_tier: " FAST "
+               })
+
+      persisted = Repo.get!(APIKey, api_key.id)
+      assert persisted.enforced_service_tier == "priority"
+
+      assert {:ok, policy} = Access.normalize_api_key_policy(persisted)
+      assert policy.enforced_service_tier == "priority"
+
+      assert {:ok, authorized_policy} =
+               Access.authorize_api_key_policy(policy, %{model: "any-model"})
+
+      assert authorized_policy.enforced_service_tier == "priority"
+
+      assert {:ok, %{api_key: updated}} =
+               Access.update_api_key_with_policy(scope, api_key, %{
+                 enforced_service_tier: "fast"
+               })
+
+      assert updated.enforced_service_tier == "priority"
+      assert Repo.get!(APIKey, api_key.id).enforced_service_tier == "priority"
+
+      for tier <- ["latency_preview", 123] do
+        assert {:error, %{code: :invalid_policy, message: "enforced_service_tier is invalid"}} =
+                 Access.create_api_key(scope, pool, %{
+                   display_name: "Invalid service tier #{inspect(tier)}",
+                   enforced_service_tier: tier
+                 })
+      end
+
+      assert audit = Repo.get_by(AuditEvent, action: "api_key.create", target_id: api_key.id)
+      assert audit.details["enforced_service_tier"] == "priority"
+      refute inspect(audit.details) =~ raw_key
+    end
+
+    @tag :api_key_policy_contract
     @tag :empty_allow_lists
     test "empty model allow-list denies all models" do
       assert {:ok, policy} = Access.normalize_api_key_policy(%{allowed_model_identifiers: []})
 
       assert {:error, :model_not_allowed} =
-               Access.authorize_api_key_policy(policy, %{model_identifier: "gpt-5.4-mini"})
+               Access.authorize_api_key_policy(policy, %{model_identifier: "gpt-6-luna"})
     end
 
     @tag :api_key_policy_contract
@@ -677,7 +929,7 @@ defmodule CodexPooler.AccessTest do
                Access.create_api_key(scope, pool, %{
                  display_name: "Restricted key",
                  policy: %{
-                   allowed_model_identifiers: [" GPT-5.4-Mini ", "gpt-5.4-mini"],
+                   allowed_model_identifiers: [" GPT-6-Luna ", "gpt-6-luna"],
                    metadata: %{
                      "labels" => [" production ", "production", ""],
                      "operator_notes" => "Created for a focused tenant rollout"
@@ -688,13 +940,13 @@ defmodule CodexPooler.AccessTest do
       persisted = Repo.get!(APIKey, api_key.id)
 
       assert {:ok, policy} = Access.normalize_api_key_policy(persisted)
-      assert policy.allowed_model_identifiers == ["gpt-5.4-mini"]
+      assert policy.allowed_model_identifiers == ["gpt-6-luna"]
       assert policy.metadata["labels"] == ["production"]
       assert policy.metadata["operator_notes"] == "Created for a focused tenant rollout"
 
       assert {:ok, ^policy} =
                Access.authorize_api_key_policy(policy, %{
-                 model: "GPT-5.4-MINI"
+                 model: "GPT-6-LUNA"
                })
     end
   end
@@ -715,6 +967,9 @@ defmodule CodexPooler.AccessTest do
   defp count_api_key_updates(fun) when is_function(fun, 0) do
     handler_id = {__MODULE__, :api_key_updates, System.unique_integer([:positive])}
     parent = self()
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -744,6 +999,42 @@ defmodule CodexPooler.AccessTest do
       {^handler_id, :api_key_update} -> count_received_api_key_updates(handler_id, count + 1)
     after
       0 -> count
+    end
+  end
+
+  defp count_repo_sources(fun) when is_function(fun, 0) do
+    parent = self()
+    handler_id = {__MODULE__, :repo_sources, System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and is_binary(metadata[:source]) do
+            send(parent, {handler_id, metadata.source})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_sources(handler_id, %{})}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_sources(handler_id, counts) do
+    receive do
+      {^handler_id, source} ->
+        drain_repo_sources(handler_id, Map.update(counts, source, 1, &(&1 + 1)))
+    after
+      0 -> counts
     end
   end
 end

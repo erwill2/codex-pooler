@@ -1,13 +1,592 @@
 defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Quota.WindowSelector
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection
   alias CodexPoolerWeb.DateTimeDisplay
 
   import CodexPooler.PoolerFixtures
+
+  @snapshot_at ~U[2026-07-25 12:00:00Z]
+
+  @tag :primary_idle_display
+  test "confirmed idle account primary retains starts-on-use presentation across stale evidence" do
+    t0 = DateTime.utc_now() |> DateTime.add(-20, :minute) |> DateTime.truncate(:second)
+    preferences = DateTimeDisplay.preferences_for_user(nil)
+
+    for allowed <- [true, false] do
+      %{identity: identity} = active_upstream_assignment_fixture(pool_fixture(), %{})
+
+      for offset <- [0, 60, 240] do
+        at = DateTime.add(t0, offset, :second)
+
+        payload = %{
+          "plan_type" => "team",
+          "rate_limit" => %{"allowed" => allowed, "limit_reached" => not allowed, "primary_window" => %{"used_percent" => 0, "limit_window_seconds" => 18_000, "reset_after_seconds" => 18_000, "reset_at" => DateTime.to_unix(DateTime.add(at, 18_000, :second))}}
+        }
+
+        assert {:ok, %{windows: [evidence]}} = Evidence.CodexParsers.parse_codex_usage_result(payload, at)
+        assert {:ok, _} = QuotaWindows.EvidenceStore.record_evidence(identity, Evidence.to_window_attrs(evidence), at, at)
+      end
+
+      window = Repo.one!(from window in AccountQuotaWindow, where: window.upstream_identity_id == ^identity.id)
+      assert window.metadata["reset_state"] == "floating"
+      assert DateTime.compare(window.reset_at, DateTime.add(t0, 18_000, :second)) == :eq
+
+      for offset <- [241, 901, 1141] do
+        row = QuotaProjection.quota_limit_rows([window], preferences, DateTime.add(t0, offset, :second)) |> Enum.find(&(&1.key == :primary_5h))
+        assert row.reset_semantics == :floating
+        assert row.reset_display_state == :static
+        assert row.reset_label == "starts on use"
+        assert row.permission_facts == %{allowed: allowed, limit_reached: not allowed}
+      end
+    end
+  end
+
+  @tag :quota_projection
+  test "keeps a valid post-consume candidate visible when the effective fold selects another source" do
+    consumed_at = DateTime.add(@snapshot_at, -5, :minute)
+
+    candidate_row =
+      account_window(
+        id: "10000000-0000-4000-8000-000000000001",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: DateTime.add(@snapshot_at, 6, :day),
+        observed_at: DateTime.add(@snapshot_at, -60, :second),
+        merge_precedence: 60,
+        metadata: candidate_metadata(DateTime.add(@snapshot_at, -60, :second))
+      )
+
+    selected_row =
+      account_window(
+        id: "20000000-0000-4000-8000-000000000002",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: DateTime.add(@snapshot_at, 6, :day),
+        observed_at: @snapshot_at,
+        source: "codex_response_headers",
+        merge_precedence: 80
+      )
+
+    raw_windows = [candidate_row, selected_row]
+    effective_windows = QuotaWindows.effective_quota_windows(raw_windows, @snapshot_at)
+
+    assert [^selected_row] = effective_windows
+
+    assert QuotaProjection.saved_reset_confirmation(
+             redemption("consumed_pending_probe", consumed_at),
+             raw_windows,
+             effective_windows,
+             @snapshot_at
+           ) == %{
+             confirmation_state: :awaiting_confirmation,
+             challenged_evidence_state: :candidate_progressing
+           }
+  end
+
+  @tag :quota_projection
+  test "fails closed for malformed, unknown-version, and future candidate evidence" do
+    consumed_at = DateTime.add(@snapshot_at, -5, :minute)
+    raw_sentinel = "future-projection-version-private-value"
+
+    for metadata <- [
+          %{"__quota_confirmed_candidate_v1" => %{"version" => 2, "source" => raw_sentinel}},
+          %{"__quota_confirmed_candidate_v1" => %{"version" => raw_sentinel}},
+          candidate_metadata(DateTime.add(@snapshot_at, 1, :second)),
+          candidate_metadata(DateTime.add(@snapshot_at, -2, :hour)),
+          candidate_metadata(DateTime.add(consumed_at, -1, :second))
+        ] do
+      challenged =
+        account_window(
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          used_percent: Decimal.new("100"),
+          reset_at: DateTime.add(@snapshot_at, 6, :day),
+          observed_at: @snapshot_at,
+          metadata: metadata
+        )
+
+      unknown_unusable =
+        account_window(
+          window_kind: "primary",
+          window_minutes: 300,
+          active_limit: 0,
+          credits: 1,
+          used_percent: nil,
+          reset_at: DateTime.add(@snapshot_at, 5, :hour),
+          source: raw_sentinel,
+          observed_at: @snapshot_at
+        )
+
+      projection =
+        QuotaProjection.saved_reset_confirmation(
+          redemption("consumed_pending_probe", consumed_at),
+          [challenged],
+          [challenged, unknown_unusable],
+          @snapshot_at
+        )
+
+      assert projection.challenged_evidence_state == :exhausted
+      refute inspect(projection) =~ raw_sentinel
+    end
+  end
+
+  @tag :quota_projection
+  test "keeps model-scoped exhaustion outside the challenged account evidence" do
+    consumed_at = DateTime.add(@snapshot_at, -5, :minute)
+
+    challenged =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: DateTime.add(@snapshot_at, 6, :day),
+        observed_at: @snapshot_at,
+        metadata: candidate_metadata(@snapshot_at)
+      )
+
+    model_window = %{
+      challenged
+      | quota_key: "codex_spark",
+        quota_scope: "model",
+        quota_family: "codex_spark",
+        model: "gpt-example-model",
+        metadata: %{}
+    }
+
+    projection =
+      QuotaProjection.saved_reset_confirmation(
+        redemption("consumed_pending_probe", consumed_at),
+        [challenged],
+        [challenged, model_window],
+        @snapshot_at
+      )
+
+    assert projection.challenged_evidence_state == :candidate_progressing
+  end
+
+  @tag :quota_projection
+  test "emits only the four bounded confirmation states and omits unknown phases" do
+    expected = %{
+      "consuming" => :awaiting_confirmation,
+      "consumed_pending_probe" => :awaiting_confirmation,
+      "reblocked" => :awaiting_confirmation,
+      "confirmed_by_upstream" => :confirmed,
+      "confirmed_by_quota" => :confirmed,
+      "consume_not_applied" => :not_applied,
+      "expired" => :confirmation_expired
+    }
+
+    for {phase, confirmation_state} <- expected do
+      projection =
+        QuotaProjection.saved_reset_confirmation(
+          redemption(phase, DateTime.add(@snapshot_at, -5, :minute)),
+          [],
+          [],
+          @snapshot_at
+        )
+
+      assert projection.confirmation_state == confirmation_state
+      assert projection.challenged_evidence_state == :absent
+    end
+
+    assert QuotaProjection.saved_reset_confirmation(
+             redemption("future-private-phase", DateTime.add(@snapshot_at, -5, :minute)),
+             [],
+             [],
+             @snapshot_at
+           ) == nil
+  end
+
+  test "requires one trusted snapshot timestamp for readiness and quota rows" do
+    refute function_exported?(QuotaProjection, :readiness, 1)
+    refute function_exported?(QuotaProjection, :quota_limit_rows, 2)
+  end
+
+  test "uses a generic label when an additional quota window has no safe display identity" do
+    unsafe_limit_name = "private-provider-limit-name"
+    unsafe_metered_feature = "private-provider-metered-feature"
+
+    row =
+      %AccountQuotaWindow{
+        quota_key: "provider_feature",
+        quota_scope: "feature",
+        quota_family: "provider_feature",
+        display_label: nil,
+        model: nil,
+        upstream_model: nil,
+        limit_name: nil,
+        raw_limit_name: unsafe_limit_name,
+        metered_feature: unsafe_metered_feature,
+        window_kind: "primary",
+        window_minutes: 300,
+        used_percent: Decimal.new("25"),
+        reset_at: DateTime.add(@snapshot_at, 5, :hour),
+        source: "codex_usage_api",
+        source_precision: "observed",
+        freshness_state: "fresh",
+        observed_at: @snapshot_at,
+        last_sync_at: @snapshot_at,
+        updated_at: @snapshot_at,
+        metadata: %{}
+      }
+      |> then(
+        &QuotaProjection.quota_limit_rows(
+          [&1],
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+      )
+      |> Enum.find(&is_binary(&1.key))
+
+    assert row.label == "Additional limit 5h"
+
+    for value <- [row.label, row.freshness_title, row.observed_label, row.observed_title] do
+      refute value =~ unsafe_limit_name
+      refute value =~ unsafe_metered_feature
+    end
+  end
+
+  test "fingerprints private meter identities when additional quota DOM keys collide" do
+    raw_metered_feature = "private-meter-alpha-7b"
+    raw_limit_id = "private-limit-beta-7b"
+
+    windows = [
+      private_meter_window(raw_metered_feature: raw_metered_feature),
+      private_meter_window(raw_limit_id: raw_limit_id, used_percent: Decimal.new("40"))
+    ]
+
+    singleton_rows =
+      QuotaProjection.quota_limit_rows(
+        [hd(windows)],
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    assert Enum.any?(singleton_rows, &(&1.key == "feature-shared_meter-primary-300"))
+
+    rows =
+      QuotaProjection.quota_limit_rows(
+        windows,
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    additional_rows = Enum.reject(rows, &is_atom(&1.key))
+    keys = Enum.map(additional_rows, & &1.key)
+
+    assert length(keys) == 2
+    assert keys == Enum.uniq(keys)
+    assert Enum.all?(keys, &Regex.match?(~r/-meter-[0-9a-f]{24}$/, &1))
+
+    assert Enum.sort(keys) ==
+             windows
+             |> Enum.reverse()
+             |> QuotaProjection.quota_limit_rows(
+               DateTimeDisplay.preferences_for_user(nil),
+               @snapshot_at
+             )
+             |> Enum.reject(&is_atom(&1.key))
+             |> Enum.map(& &1.key)
+             |> Enum.sort()
+
+    assert Enum.map(additional_rows, & &1.label) == [
+             "Approved shared meter 5h (Feature scope, Family shared family)",
+             "Approved shared meter 5h (Feature scope, Family shared family)"
+           ]
+
+    rendered_projection = inspect(additional_rows)
+
+    for private_value <- [raw_metered_feature, raw_limit_id] do
+      reversible_token = private_value |> Base.encode32(padding: false) |> String.downcase()
+
+      refute rendered_projection =~ private_value
+      refute rendered_projection =~ reversible_token
+    end
+  end
+
+  @tag :quota_projection
+  test "characterizes account and Spark quota row arithmetic before freshness presentation" do
+    account =
+      account_window(
+        window_kind: "primary",
+        window_minutes: 300,
+        used_percent: Decimal.new("25"),
+        reset_at: DateTime.add(@snapshot_at, 5, :hour),
+        observed_at: @snapshot_at
+      )
+
+    spark =
+      spark_window("primary", 300, @snapshot_at,
+        used_percent: Decimal.new("40"),
+        metadata: %{"reset_state" => "anchored"}
+      )
+
+    rows =
+      QuotaProjection.quota_limit_rows(
+        [account, spark],
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    assert account_row = Enum.find(rows, &(&1.key == :primary_5h))
+    assert Decimal.equal?(account_row.percent, Decimal.new("75"))
+    assert account_row.percent_value == 75
+    assert account_row.percent_label == "75%"
+
+    assert spark_row = Enum.find(rows, &(&1.key == "model-codex_spark-primary-300"))
+    assert Decimal.equal?(spark_row.percent, Decimal.new("60"))
+    assert spark_row.percent_value == 60
+    assert spark_row.percent_label == "60%"
+    assert spark_row.reset_semantics == :anchored
+    assert spark_row.reset_label == "in 5h"
+  end
+
+  @tag :quota_projection
+  test "keeps approved display labels and limit names ahead of quota-key fallback" do
+    rows =
+      [
+        spark_window("primary", 300, @snapshot_at,
+          quota_key: "safe_display_label",
+          model: nil,
+          display_label: "Approved display label",
+          limit_name: "Approved limit name"
+        ),
+        spark_window("primary", 300, @snapshot_at,
+          quota_key: "safe_limit_name",
+          model: nil,
+          display_label: nil,
+          limit_name: "Approved limit name"
+        )
+      ]
+      |> QuotaProjection.quota_limit_rows(
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    assert Enum.filter(rows, &(&1.key not in [:primary_5h, :primary_30d, :weekly]))
+           |> Enum.map(& &1.label) == [
+             "Approved display label 5h",
+             "Approved limit name 5h"
+           ]
+  end
+
+  describe "additional quota freshness presentation" do
+    @tag :stale_additional_visibility
+    test "keeps fresh additional evidence visible" do
+      rows =
+        [spark_window("primary", 300, @snapshot_at, used_percent: Decimal.new("25"))]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      assert Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
+    end
+
+    @tag :stale_additional_visibility
+    test "keeps additional evidence with unknown freshness visible" do
+      rows =
+        [
+          spark_window("primary", 300, @snapshot_at,
+            used_percent: Decimal.new("25"),
+            observed_at: nil,
+            freshness_state: "unknown"
+          )
+        ]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      assert Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
+    end
+
+    @tag :stale_additional_visibility
+    test "omits stale non-exhausted additional evidence" do
+      observed_at = DateTime.add(@snapshot_at, -(Evidence.freshness_ttl_seconds() + 1), :second)
+
+      rows =
+        [spark_window("primary", 300, observed_at, used_percent: Decimal.new("25"))]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      refute Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
+    end
+
+    @tag :stale_additional_visibility
+    test "omits stale exhausted additional evidence" do
+      observed_at = DateTime.add(@snapshot_at, -(Evidence.freshness_ttl_seconds() + 1), :second)
+
+      rows =
+        [spark_window("primary", 300, observed_at, used_percent: Decimal.new("100"))]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      refute Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
+    end
+
+    @tag :stale_additional_visibility
+    test "omits stale markerless additional evidence" do
+      observed_at = DateTime.add(@snapshot_at, -(Evidence.freshness_ttl_seconds() + 1), :second)
+
+      rows =
+        [
+          spark_window("primary", 300, observed_at,
+            used_percent: Decimal.new("0"),
+            metadata: %{}
+          )
+        ]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      refute Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
+    end
+
+    @tag :stale_additional_visibility
+    test "keeps fixed account evidence visible when stale" do
+      observed_at = DateTime.add(@snapshot_at, -(Evidence.freshness_ttl_seconds() + 1), :second)
+
+      rows =
+        [
+          account_window(
+            observed_at: observed_at,
+            used_percent: Decimal.new("25"),
+            reset_at: DateTime.add(@snapshot_at, 5, :hour)
+          )
+        ]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      assert Enum.any?(rows, &(&1.key == :primary_5h))
+    end
+
+    @tag :stale_additional_visibility
+    test "uses the supplied snapshot timestamp for additional evidence freshness" do
+      observed_at = @snapshot_at
+      row = spark_window("primary", 300, observed_at, used_percent: Decimal.new("25"))
+      ttl_seconds = Evidence.freshness_ttl_seconds()
+
+      before_expiry_rows =
+        [row]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          DateTime.add(observed_at, ttl_seconds - 1, :second)
+        )
+
+      after_expiry_rows =
+        [row]
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          DateTime.add(observed_at, ttl_seconds + 1, :second)
+        )
+
+      assert Enum.any?(before_expiry_rows, &(&1.key == "model-codex_spark-primary-300"))
+      refute Enum.any?(after_expiry_rows, &(&1.key == "model-codex_spark-primary-300"))
+    end
+
+    @tag :quota_projection
+    test "projects fresh anchored evidence as a current countdown-capable meter" do
+      row = projected_spark_row(used_percent: "25", metadata: %{"reset_state" => "anchored"})
+
+      assert Decimal.equal?(row.percent, Decimal.new("75"))
+      assert row.percent_value == 75
+      assert row.evidence_state == :fresh
+      assert row.meter_state == :current
+      assert row.freshness_label == "current"
+      assert row.freshness_title == "evidence current"
+      assert row.observed_label == "observed just now"
+      assert row.observed_title == "observed 2026-07-25 12:00:00 UTC"
+      assert row.reset_display_state == :countdown
+      assert row.reset_label == "in 7d"
+    end
+
+    @tag :quota_projection
+    test "projects stale non-exhausted evidence as historical with an unconfirmed reset" do
+      row =
+        projected_account_row(
+          used_percent: "25",
+          observed_at: DateTime.add(@snapshot_at, -16, :minute),
+          reset_at: DateTime.add(@snapshot_at, 6, :day),
+          metadata: %{"reset_state" => "anchored"}
+        )
+
+      assert Decimal.equal?(row.percent, Decimal.new("75"))
+      assert row.percent_value == 75
+      assert row.evidence_state == :stale
+      assert row.meter_state == :historical
+      assert row.freshness_label == "last reported"
+      assert row.freshness_title == "evidence stale; showing the last reported value"
+      assert row.observed_label == "last reported 16m ago"
+      assert row.reset_display_state == :unconfirmed
+      assert row.reset_at == nil
+      assert row.reset_label == "reset unconfirmed"
+    end
+
+    @tag :quota_projection
+    test "projects stale exhausted evidence as historical exhaustion with an error state" do
+      row =
+        projected_account_row(
+          used_percent: "100",
+          observed_at: DateTime.add(@snapshot_at, -16, :minute),
+          reset_at: DateTime.add(@snapshot_at, 6, :day),
+          metadata: %{"reset_state" => "anchored"}
+        )
+
+      assert Decimal.equal?(row.percent, Decimal.new("0"))
+      assert row.percent_value == 0
+      assert row.evidence_state == :stale
+      assert row.meter_state == :historical_exhausted
+      assert row.freshness_label == "last reported"
+      assert row.reset_display_state == :unconfirmed
+      assert row.reset_label == "reset unconfirmed"
+    end
+
+    @tag :quota_projection
+    test "projects fresh markerless zero-use evidence as current without a reset" do
+      row = projected_spark_row(used_percent: "0", metadata: %{})
+
+      assert Decimal.equal?(row.percent, Decimal.new("100"))
+      assert row.evidence_state == :fresh
+      assert row.meter_state == :current
+      assert row.freshness_label == "current"
+      assert row.reset_display_state == :absent
+      assert row.reset_at == nil
+      assert row.reset_label == nil
+    end
+
+    @tag :quota_projection
+    test "projects fresh unknown-reset evidence as current without a reset" do
+      row =
+        projected_spark_row(
+          used_percent: "40",
+          metadata: %{"reset_state" => "unknown"}
+        )
+
+      assert Decimal.equal?(row.percent, Decimal.new("60"))
+      assert row.evidence_state == :fresh
+      assert row.meter_state == :current
+      assert row.freshness_label == "current"
+      assert row.reset_display_state == :absent
+      assert row.reset_at == nil
+      assert row.reset_label == nil
+    end
+  end
 
   describe "identity observability projection" do
     test "newer success supersedes an older sibling failure" do
@@ -89,17 +668,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         identity_observability(
           now,
           [
-            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -120,
-              code: "quota_refresh_unavailable"
-            ),
+            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -120, code: "quota_refresh_unavailable"),
             reconciliation_assignment("00000000-0000-0000-0000-000000000002", "succeeded", 60),
             reconciliation_assignment("00000000-0000-0000-0000-000000000003", "refreshing", -10),
-            reconciliation_assignment("00000000-0000-0000-0000-000000000004", "failed", -5,
-              finished_at: "malformed"
-            ),
-            reconciliation_assignment("00000000-0000-0000-0000-000000000005", "succeeded", -1,
-              assignment_status: "deleted"
-            )
+            reconciliation_assignment("00000000-0000-0000-0000-000000000004", "failed", -5, finished_at: "malformed"),
+            reconciliation_assignment("00000000-0000-0000-0000-000000000005", "succeeded", -1, assignment_status: "deleted")
           ]
         )
 
@@ -115,9 +688,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         identity_observability(
           now,
           [
-            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -60,
-              code: "quota_refresh_failed"
-            ),
+            reconciliation_assignment("00000000-0000-0000-0000-000000000001", "failed", -60, code: "quota_refresh_failed"),
             reconciliation_assignment("00000000-0000-0000-0000-000000000002", "succeeded", -60)
           ]
         )
@@ -125,6 +696,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
       assert projection.reconciliation.status == "succeeded"
     end
 
+    @tag :relative_countdown_contract
     test "keeps attempt, successful refresh, evidence age, and credential expiry distinct" do
       now = ~U[2026-07-13 12:00:00Z]
       identity = active_upstream_identity_fixture()
@@ -159,6 +731,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
       assert future.credential_expiry.state == "known_future"
       assert future.credential_expiry.expires_at == future_expiry
       assert future.credential_expiry.age == "in 1h"
+
+      subsecond_future_expiry = ~U[2026-07-13 12:00:00.999999Z]
+
+      subsecond_future =
+        identity
+        |> Map.put(:metadata, %{
+          "access_token_expires_at" => DateTime.to_iso8601(subsecond_future_expiry)
+        })
+        |> UpstreamAccountsReadModel.identity_observability([], [], now)
+
+      assert subsecond_future.credential_expiry.state == "known_future"
+      assert subsecond_future.credential_expiry.expires_at == subsecond_future_expiry
+      assert subsecond_future.credential_expiry.age == "just now"
 
       past =
         identity
@@ -209,7 +794,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     rows =
       identity
       |> QuotaWindows.list_quota_windows()
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(
+        DateTimeDisplay.preferences_for_user(nil),
+        observed_at
+      )
 
     spark_rows = Enum.filter(rows, &String.starts_with?(&1.label, "GPT-5.3-Codex-Spark"))
 
@@ -327,7 +915,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     rows =
       identity
       |> QuotaWindows.list_quota_windows()
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(
+        DateTimeDisplay.preferences_for_user(nil),
+        observed_at
+      )
 
     primary_5h = Enum.find(rows, &(&1.key == :primary_5h))
     assert primary_5h.percent == nil
@@ -355,7 +946,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
                provider_shape_window_attrs(initial_at, :full)
              )
 
-    initial_rows = projected_rows(identity)
+    initial_rows = projected_rows(identity, initial_at)
     assert_one_account_and_spark_window(initial_rows, "5h")
     assert_one_account_and_spark_window(initial_rows, "Weekly")
 
@@ -365,7 +956,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
                provider_shape_window_attrs(weekly_at, :weekly_only)
              )
 
-    weekly_rows = projected_rows(identity)
+    weekly_rows = projected_rows(identity, weekly_at)
     assert account_5h_row(weekly_rows).percent == nil
     assert account_5h_row(weekly_rows).reset_label == nil
     refute Enum.any?(weekly_rows, &(&1.label == "GPT-5.3-Codex-Spark 5h"))
@@ -377,7 +968,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
                provider_shape_window_attrs(restored_at, :primary_only, used_percent: "13")
              )
 
-    restored_rows = projected_rows(identity)
+    restored_rows = projected_rows(identity, restored_at)
     assert_one_account_and_spark_window(restored_rows, "5h")
     assert_one_account_and_spark_window(restored_rows, "Weekly")
     assert account_5h_row(restored_rows).reset_label != nil
@@ -406,7 +997,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
     primary =
       [outlier, measured]
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
       |> Enum.find(&(&1.key == :primary_5h))
 
     assert Decimal.equal?(primary.percent, Decimal.new("94"))
@@ -429,7 +1020,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
     primary =
       [outlier]
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
       |> Enum.find(&(&1.key == :primary_5h))
 
     assert Decimal.equal?(primary.percent, Decimal.new("100"))
@@ -454,7 +1045,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
             observed_at: observed_at
           )
         ]
-        |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          observed_at
+        )
         |> Enum.find(&(&1.key == :primary_5h))
 
       assert Decimal.equal?(primary.percent, Decimal.new("100")), source
@@ -480,13 +1074,98 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
 
     primary =
       [row]
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
       |> Enum.find(&(&1.key == :primary_5h))
 
     assert primary.percent == nil
     assert primary.percent_value == 0
     assert primary.percent_label == "not reported"
     assert primary.reset_label == nil
+  end
+
+  @tag :quota_account_projection
+  test "resetless provider account usage keeps its reported included-quota percent" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    row =
+      account_window(
+        window_kind: "primary",
+        window_minutes: 43_200,
+        active_limit: 601,
+        credits: 601,
+        used_percent: Decimal.new("3"),
+        reset_at: nil,
+        source: "codex_usage_api",
+        source_precision: "observed",
+        observed_at: observed_at
+      )
+
+    primary =
+      [row]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
+      |> Enum.find(&(&1.key == :primary_30d))
+
+    assert Decimal.equal?(primary.percent, Decimal.new("97"))
+    assert primary.percent_value == 97
+    assert primary.percent_label == "97%"
+    assert primary.count_label == nil
+    assert primary.count_title == nil
+    assert primary.reset_label == nil
+  end
+
+  @tag :quota_account_projection
+  test "depleted provider credits never fabricate a balance capacity fraction" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    row =
+      account_window(
+        window_kind: "primary",
+        window_minutes: 43_200,
+        active_limit: 601,
+        credits: 0,
+        used_percent: Decimal.new("100"),
+        reset_at: DateTime.add(observed_at, 20, :day),
+        source: "codex_usage_api",
+        source_precision: "observed",
+        observed_at: observed_at
+      )
+
+    primary =
+      [row]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
+      |> Enum.find(&(&1.key == :primary_30d))
+
+    assert Decimal.equal?(primary.percent, Decimal.new("0"))
+    assert primary.percent_value == 0
+    assert primary.percent_label == "0%"
+    assert primary.count_label == nil
+    assert primary.count_title == nil
+  end
+
+  @tag :quota_account_projection
+  test "omitted provider credits leave the credit footer absent" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    row =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        active_limit: nil,
+        credits: nil,
+        used_percent: Decimal.new("12"),
+        reset_at: DateTime.add(observed_at, 6, :day),
+        source: "codex_usage_api",
+        source_precision: "observed",
+        observed_at: observed_at
+      )
+
+    secondary =
+      [row]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
+      |> Enum.find(&(&1.key == :weekly))
+
+    assert is_nil(secondary.count_label)
+    assert is_nil(secondary.count_title)
   end
 
   @tag :quota_spark_projection
@@ -498,7 +1177,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         spark_window("primary", 300, observed_at),
         spark_window("secondary", 10_080, observed_at)
       ]
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
 
     assert primary = Enum.find(rows, &(&1.key == "model-codex_spark-primary-300"))
     assert primary.label == "GPT-5.3-Codex-Spark 5h"
@@ -512,7 +1191,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     assert Decimal.equal?(secondary.percent, Decimal.new("100"))
     assert secondary.percent_value == 100
     assert secondary.percent_label == "100%"
-    assert String.starts_with?(secondary.reset_label, "in ")
+    assert secondary.reset_semantics == :unknown
+    assert secondary.reset_at == nil
+    assert secondary.reset_label == nil
+    assert secondary.reset_title == nil
   end
 
   @tag :quota_spark_projection
@@ -522,7 +1204,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     for source <- ~w(codex_rate_limit_event codex_response_headers codex_rate_limit_error) do
       rows =
         [spark_window("primary", 300, observed_at, source: source)]
-        |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          observed_at
+        )
 
       assert primary = Enum.find(rows, &(&1.key == "model-codex_spark-primary-300"))
       assert Decimal.equal?(primary.percent, Decimal.new("100")), source
@@ -533,22 +1218,148 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
   end
 
   @tag :quota_spark_projection
-  test "floating Spark weekly evidence keeps the existing reset countdown presentation" do
+  test "floating Spark weekly evidence projects starts-on-use semantics without an absolute reset" do
     observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     rows =
       [
-        spark_window("secondary", 10_080, observed_at,
-          metadata: %{"reset_state" => "floating", "reset_after_seconds" => 604_800}
-        )
+        spark_window("secondary", 10_080, observed_at, metadata: %{"reset_state" => "floating", "reset_after_seconds" => 604_800})
       ]
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
 
     assert weekly = Enum.find(rows, &(&1.key == "model-codex_spark-secondary-10080"))
-    assert String.starts_with?(weekly.reset_label, "in ")
-    assert String.starts_with?(weekly.reset_title, "resets ")
-    refute weekly.reset_label =~ "floating"
-    refute weekly.reset_title =~ "floating"
+    assert weekly.reset_semantics == :floating
+    assert weekly.reset_at == nil
+    assert weekly.reset_label == "starts on use"
+    assert weekly.reset_title == "provider reports a rolling seven-day window until use starts"
+  end
+
+  @tag :quota_spark_projection
+  @tag :relative_countdown_contract
+  test "anchored Spark weekly evidence keeps the countdown and absolute reset title" do
+    observed_at = ~U[2026-07-31 12:00:00Z]
+
+    rows =
+      [spark_window("secondary", 10_080, observed_at, metadata: %{"reset_state" => "anchored"})]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
+
+    assert weekly = Enum.find(rows, &(&1.key == "model-codex_spark-secondary-10080"))
+    assert weekly.reset_semantics == :anchored
+    assert weekly.reset_at == DateTime.add(observed_at, 10_080, :minute)
+    assert weekly.reset_label == "in 7d"
+
+    assert weekly.reset_title ==
+             "resets " <>
+               DateTimeDisplay.format_datetime(
+                 weekly.reset_at,
+                 DateTimeDisplay.preferences_for_user(nil)
+               )
+  end
+
+  @tag :relative_countdown_contract
+  test "anchored reset state stays future for a subsecond target and becomes unconfirmed at the instant" do
+    snapshot_at = ~U[2026-07-31 12:00:00.000000Z]
+    subsecond_future = ~U[2026-07-31 12:00:00.999999Z]
+    preferences = DateTimeDisplay.preferences_for_user(nil)
+
+    future_rows =
+      [
+        account_window(
+          observed_at: snapshot_at,
+          used_percent: Decimal.new("25"),
+          reset_at: subsecond_future,
+          metadata: %{"reset_state" => "anchored"}
+        )
+      ]
+      |> QuotaProjection.quota_limit_rows(preferences, snapshot_at)
+
+    due_rows =
+      [
+        account_window(
+          observed_at: snapshot_at,
+          used_percent: Decimal.new("25"),
+          reset_at: snapshot_at,
+          metadata: %{"reset_state" => "anchored"}
+        )
+      ]
+      |> QuotaProjection.quota_limit_rows(preferences, snapshot_at)
+
+    assert Enum.find(future_rows, &(&1.key == :primary_5h)).reset_label == "in <1m"
+
+    due_row = Enum.find(due_rows, &(&1.key == :primary_5h))
+    assert due_row.evidence_state == :stale
+    assert due_row.reset_display_state == :unconfirmed
+    assert due_row.reset_at == nil
+    assert due_row.reset_label == "reset unconfirmed"
+  end
+
+  @tag :quota_spark_projection
+  test "unknown Spark weekly reset state remains unreported" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    rows =
+      [spark_window("secondary", 10_080, observed_at, metadata: %{"reset_state" => "unknown"})]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
+
+    assert weekly = Enum.find(rows, &(&1.key == "model-codex_spark-secondary-10080"))
+    assert weekly.reset_semantics == :unknown
+    assert weekly.reset_at == nil
+    assert weekly.reset_label == nil
+    assert weekly.reset_title == nil
+  end
+
+  @tag :quota_spark_projection
+  test "markerless zero-use Spark weekly evidence has no reset countdown" do
+    rows =
+      [spark_window("secondary", 10_080, @snapshot_at)]
+      |> QuotaProjection.quota_limit_rows(
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    assert weekly = Enum.find(rows, &(&1.key == "model-codex_spark-secondary-10080"))
+    assert weekly.reset_semantics == :unknown
+    assert weekly.reset_at == nil
+    assert weekly.reset_label == nil
+    assert weekly.reset_title == nil
+  end
+
+  @tag :quota_spark_projection
+  test "QF-001 projects the explicit floating winner in both input permutations" do
+    explicit_floating =
+      spark_window("secondary", 10_080, ~U[2026-07-25 11:59:00Z],
+        id: "10000000-0000-4000-8000-000000000001",
+        reset_at: ~U[2026-08-01 12:00:00Z],
+        merge_precedence: 60,
+        metadata: %{"reset_state" => "floating"}
+      )
+
+    markerless_headers =
+      spark_window("secondary", 10_080, ~U[2026-07-25 11:59:30Z],
+        id: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        reset_at: ~U[2026-08-01 12:30:00Z],
+        source: "codex_response_headers",
+        merge_precedence: 80,
+        metadata: %{}
+      )
+
+    for candidates <- [
+          [explicit_floating, markerless_headers],
+          [markerless_headers, explicit_floating]
+        ] do
+      rows =
+        candidates
+        |> WindowSelector.logical_windows(@snapshot_at)
+        |> QuotaProjection.quota_limit_rows(
+          DateTimeDisplay.preferences_for_user(nil),
+          @snapshot_at
+        )
+
+      assert weekly = Enum.find(rows, &(&1.key == "model-codex_spark-secondary-10080"))
+      assert weekly.reset_semantics == :floating
+      assert weekly.reset_at == nil
+      assert weekly.reset_label == "starts on use"
+    end
   end
 
   @tag :quota_spark_projection
@@ -562,9 +1373,208 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
           source_precision: "inferred"
         )
       ]
-      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil), observed_at)
 
     refute Enum.any?(rows, &(&1.key == "model-codex_spark-primary-300"))
+  end
+
+  @tag :quota_projection
+  test "quota_limit_rows preserves stale gpt-reserve window as historical while rejecting other stale windows" do
+    stale_reset = DateTime.add(@snapshot_at, -1, :day)
+    observed_at = DateTime.add(@snapshot_at, -2, :day)
+
+    stale_reserve =
+      account_window(
+        quota_scope: "model",
+        quota_family: "codex_model",
+        quota_key: "gpt_reserve",
+        model: "gpt-reserve",
+        display_label: "GPT-Reserve",
+        window_kind: "primary",
+        window_minutes: 300,
+        used_percent: Decimal.new("0"),
+        reset_at: stale_reset,
+        observed_at: observed_at,
+        freshness_state: "stale"
+      )
+
+    stale_generic =
+      account_window(
+        quota_scope: "feature",
+        quota_family: "custom",
+        quota_key: "ephemeral_meter",
+        display_label: "Ephemeral Meter",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("50"),
+        reset_at: stale_reset,
+        observed_at: observed_at,
+        freshness_state: "stale"
+      )
+
+    windows = [stale_reserve, stale_generic]
+
+    rows =
+      QuotaProjection.quota_limit_rows(
+        windows,
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at
+      )
+
+    additional = Enum.drop(rows, 3)
+
+    assert length(additional) == 1
+    [reserve_row] = additional
+    assert reserve_row.meter_state == :historical
+    assert reserve_row.evidence_state == :stale
+    assert reserve_row.percent_value == 100
+  end
+
+  test "marks a retained exhausted measurement with newer safe provider evidence as pending confirmation" do
+    selected_observed_at = DateTime.add(@snapshot_at, -2, :minute)
+    candidate_observed_at = DateTime.add(@snapshot_at, -1, :minute)
+    reset_at = DateTime.add(@snapshot_at, 6, :day)
+
+    selected =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: reset_at,
+        observed_at: selected_observed_at,
+        metadata: %{
+          "__quota_confirmed_candidate_v1" => %{
+            "version" => 1,
+            "used_percent" => "32",
+            "reset_at" => DateTime.to_iso8601(reset_at),
+            "observed_at" => DateTime.to_iso8601(candidate_observed_at),
+            "count" => 1
+          },
+          "__quota_candidate_provider_status_v1" => %{
+            "version" => 1,
+            "allowed" => true,
+            "limit_reached" => false,
+            "observed_at" => DateTime.to_iso8601(candidate_observed_at)
+          }
+        }
+      )
+
+    stale_runtime =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_rate_limit_event",
+        used_percent: Decimal.new("32"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@snapshot_at, -1, :hour)
+      )
+
+    stale_headers =
+      account_window(
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        source: "codex_response_headers",
+        used_percent: Decimal.new("31"),
+        reset_at: reset_at,
+        observed_at: DateTime.add(@snapshot_at, -2, :hour)
+      )
+
+    rows =
+      QuotaProjection.quota_limit_rows(
+        [selected],
+        DateTimeDisplay.preferences_for_user(nil),
+        @snapshot_at,
+        [selected, stale_runtime, stale_headers]
+      )
+
+    weekly = Enum.find(rows, &(&1.key == :weekly))
+
+    assert weekly.percent_label == "0%"
+    assert weekly.measurement_pending? == true
+
+    assert weekly.measurement_pending_label == "Retained measurement awaits confirmation"
+
+    assert weekly.measurement_pending_detail ==
+             "Retained measurement; newer provider measurement awaits confirmation"
+
+    assert weekly.permission_facts == %{allowed: true, limit_reached: false}
+
+    assert Enum.map(weekly.observations, &{&1.source, &1.remaining, &1.selected?}) == [
+             {"Usage API", "0%", true},
+             {"Rate-limit event", "68%", false},
+             {"Response headers", "69%", false}
+           ]
+  end
+
+  @tag :quota_projection
+  test "keeps consistent and incomplete permission evidence free of a false measurement-pending state" do
+    observed_at = @snapshot_at
+
+    for {metadata, used_percent} <- [
+          {%{"rate_limit_allowed" => false, "rate_limit_reached" => true}, "100"},
+          {%{"rate_limit_allowed" => true, "rate_limit_reached" => false}, "45"},
+          {%{"rate_limit_allowed" => true}, "100"},
+          {%{"rate_limit_reached" => false}, "100"},
+          {%{}, "100"}
+        ] do
+      [weekly] =
+        QuotaProjection.quota_limit_rows(
+          [
+            account_window(
+              window_kind: "secondary",
+              window_minutes: 10_080,
+              used_percent: Decimal.new(used_percent),
+              reset_at: DateTime.add(observed_at, 6, :day),
+              observed_at: observed_at,
+              metadata: metadata
+            )
+          ],
+          DateTimeDisplay.preferences_for_user(nil),
+          observed_at
+        )
+        |> Enum.filter(&(&1.key == :weekly))
+
+      refute weekly.measurement_pending?
+    end
+  end
+
+  @tag :quota_projection
+  test "current usable identity quota overrides a historical failed priming status only for a routable assignment" do
+    historical_failure = %{
+      status: "active",
+      health_status: "active",
+      eligibility_status: "eligible",
+      metadata: %{
+        "quota_priming" => %{"status" => "failed", "reason" => %{"code" => "upstream_status_503"}}
+      }
+    }
+
+    assert %{quota_priming_status: "weekly_only_probe", quota_priming_label: "Weekly-only probe"} =
+             QuotaProjection.put_current_quota_priming(historical_failure, %{
+               state: "weekly_only_probe",
+               routing_ready_now?: true
+             })
+
+    for assignment <- [
+          %{historical_failure | status: "disabled"},
+          %{historical_failure | health_status: "degraded"},
+          %{historical_failure | eligibility_status: "ineligible"}
+        ] do
+      assert %{quota_priming_status: "failed", quota_priming_label: "Quota failed"} =
+               QuotaProjection.put_current_quota_priming(assignment, %{
+                 state: "weekly_only_probe",
+                 routing_ready_now?: true
+               })
+    end
+
+    for readiness <- [
+          %{state: "exhausted", routing_ready_now?: false},
+          %{state: "stale", routing_ready_now?: false},
+          %{state: "missing_evidence", routing_ready_now?: false}
+        ] do
+      assert %{quota_priming_status: "failed", quota_priming_label: "Quota failed"} =
+               QuotaProjection.put_current_quota_priming(historical_failure, readiness)
+    end
   end
 
   defp account_window(attrs) do
@@ -590,6 +1600,58 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
         attrs
       )
     )
+  end
+
+  defp private_meter_window(attrs) do
+    struct!(
+      AccountQuotaWindow,
+      Keyword.merge(
+        [
+          quota_key: "shared_meter",
+          quota_scope: "feature",
+          quota_family: "shared_family",
+          display_label: "Approved shared meter",
+          window_kind: "primary",
+          window_minutes: 300,
+          used_percent: Decimal.new("25"),
+          reset_at: DateTime.add(@snapshot_at, 5, :hour),
+          source: "codex_usage_api",
+          source_precision: "observed",
+          freshness_state: "fresh",
+          observed_at: @snapshot_at,
+          last_sync_at: @snapshot_at,
+          updated_at: @snapshot_at,
+          metadata: %{}
+        ],
+        attrs
+      )
+    )
+  end
+
+  defp candidate_metadata(observed_at) do
+    %{
+      "__quota_confirmed_candidate_v1" => %{
+        "version" => 1,
+        "used_percent" => "0",
+        "reset_at" => DateTime.add(@snapshot_at, 6, :day) |> DateTime.to_iso8601(),
+        "observed_at" => DateTime.to_iso8601(observed_at),
+        "count" => 1
+      },
+      "__quota_candidate_provider_status_v1" => %{
+        "version" => 1,
+        "allowed" => true,
+        "limit_reached" => false,
+        "observed_at" => DateTime.to_iso8601(observed_at)
+      }
+    }
+  end
+
+  defp redemption(phase, consumed_at) do
+    %{
+      "phase" => phase,
+      "consumed_at" => DateTime.to_iso8601(consumed_at),
+      "deadline_at" => DateTime.add(consumed_at, 15, :minute) |> DateTime.to_iso8601()
+    }
   end
 
   defp identity_observability(now, assignments) do
@@ -694,10 +1756,39 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     )
   end
 
-  defp projected_rows(identity) do
+  defp projected_spark_row(attrs) do
+    observed_at = Keyword.get(attrs, :observed_at, @snapshot_at)
+    used_percent = Decimal.new(Keyword.get(attrs, :used_percent, "25"))
+    attrs = attrs |> Keyword.delete(:observed_at) |> Keyword.put(:used_percent, used_percent)
+
+    [spark_window("secondary", 10_080, observed_at, attrs)]
+    |> QuotaProjection.quota_limit_rows(
+      DateTimeDisplay.preferences_for_user(nil),
+      @snapshot_at
+    )
+    |> Enum.find(&(&1.key == "model-codex_spark-secondary-10080"))
+  end
+
+  defp projected_account_row(attrs) do
+    observed_at = Keyword.get(attrs, :observed_at, @snapshot_at)
+    used_percent = Decimal.new(Keyword.get(attrs, :used_percent, "25"))
+    attrs = attrs |> Keyword.delete(:observed_at) |> Keyword.put(:used_percent, used_percent)
+
+    [account_window(Keyword.put(attrs, :observed_at, observed_at))]
+    |> QuotaProjection.quota_limit_rows(
+      DateTimeDisplay.preferences_for_user(nil),
+      @snapshot_at
+    )
+    |> Enum.find(&(&1.key == :primary_5h))
+  end
+
+  defp projected_rows(identity, snapshot_at) do
     identity
-    |> QuotaWindows.list_quota_windows()
-    |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+    |> QuotaWindows.list_quota_windows(snapshot_at)
+    |> QuotaProjection.quota_limit_rows(
+      DateTimeDisplay.preferences_for_user(nil),
+      snapshot_at
+    )
   end
 
   defp account_5h_row(rows), do: Enum.find(rows, &(&1.key == :primary_5h))

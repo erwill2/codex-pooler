@@ -1,19 +1,51 @@
 defmodule CodexPooler.Upstreams.SavedResets.AutoEligibility.Context do
   @moduledoc false
 
-  @triggers [:blocked_weekly_exhaustion, :threshold_pressure, :expiring_reset]
+  @triggers [:blocked_weekly_exhaustion, :threshold_pressure]
 
-  @type trigger :: :blocked_weekly_exhaustion | :threshold_pressure | :expiring_reset
+  @type trigger :: :blocked_weekly_exhaustion | :threshold_pressure
+  @type transient_circuit_exclusion :: %{
+          required(:upstream_identity_id) => Ecto.UUID.t(),
+          required(:pool_upstream_assignment_id) => Ecto.UUID.t(),
+          required(:routing_circuit_state_id) => Ecto.UUID.t(),
+          required(:model_identifier) => String.t(),
+          required(:route_class) => String.t()
+        }
+  @type confirmation_ref :: %{
+          required(:upstream_identity_id) => Ecto.UUID.t(),
+          required(:account_quota_window_id) => Ecto.UUID.t(),
+          required(:fingerprint) => String.t()
+        }
   @type t :: %{
           required(:trigger) => trigger(),
           required(:pool_upstream_assignment_id) => Ecto.UUID.t(),
           required(:upstream_identity_id) => Ecto.UUID.t(),
           required(:candidate_assignment_ids) => [Ecto.UUID.t()],
           required(:candidate_identity_ids) => [Ecto.UUID.t()],
-          required(:route_class) => String.t()
+          required(:capacity_assignment_ids) => [Ecto.UUID.t()],
+          required(:capacity_identity_ids) => [Ecto.UUID.t()],
+          required(:cohort_identity_ids) => [Ecto.UUID.t()],
+          required(:routable_assignment_ids) => [Ecto.UUID.t()],
+          required(:routable_identity_ids) => [Ecto.UUID.t()],
+          required(:route_class) => String.t(),
+          required(:transient_circuit_exclusions) => [transient_circuit_exclusion()],
+          required(:automatic_confirmation_refs) => [confirmation_ref()],
+          optional(:quota_scope) => quota_scope() | nil,
+          optional(:credit_request_contexts) => %{Ecto.UUID.t() => map()},
+          optional(:hard_pinned_continuity?) => boolean()
         }
 
-  @spec normalize(term()) :: {:ok, t()} | {:error, :invalid_gateway_auto_context}
+  @type quota_scope :: %{
+          required(:requested_model) => String.t(),
+          required(:catalog_model) => String.t(),
+          required(:exposed_model_id) => String.t(),
+          required(:upstream_model) => String.t(),
+          required(:upstream_model_id) => String.t()
+        }
+
+  @type normalize_error :: :invalid_gateway_auto_context | :gateway_auto_context_mismatch
+
+  @spec normalize(term()) :: {:ok, t()} | {:error, normalize_error()}
   def normalize(context) when is_list(context) do
     if keyword_context?(context) do
       context |> Map.new() |> normalize()
@@ -31,8 +63,56 @@ defmodule CodexPooler.Upstreams.SavedResets.AutoEligibility.Context do
            normalize_uuid_list(context_value(context, :candidate_assignment_ids)),
          {:ok, candidate_identity_ids} <-
            normalize_uuid_list(context_value(context, :candidate_identity_ids)),
+         {:ok, capacity_assignment_ids} <-
+           normalize_uuid_list(context_value(context, :capacity_assignment_ids)),
+         {:ok, capacity_identity_ids} <-
+           normalize_uuid_list(context_value(context, :capacity_identity_ids)),
+         {:ok, cohort_identity_ids} <-
+           normalize_uuid_list(context_value(context, :cohort_identity_ids),
+             deterministic?: true
+           ),
+         {:ok, routable_assignment_ids} <-
+           normalize_uuid_list(context_value(context, :routable_assignment_ids)),
+         {:ok, routable_identity_ids} <-
+           normalize_uuid_list(context_value(context, :routable_identity_ids)),
+         :ok <-
+           validate_candidate_sets(
+             {assignment_id, identity_id},
+             %{
+               dispatch: {candidate_assignment_ids, candidate_identity_ids},
+               capacity: {capacity_assignment_ids, capacity_identity_ids},
+               routable: {routable_assignment_ids, routable_identity_ids},
+               cohort_identity_ids: cohort_identity_ids
+             }
+           ),
          route_class when is_binary(route_class) and route_class != "" <-
-           context_value(context, :route_class) do
+           context_value(context, :route_class),
+         {:ok, quota_scope} <- normalize_quota_scope(context_value(context, :quota_scope)),
+         {:ok, credit_request_contexts} <- normalize_credit_request_contexts(context_value(context, :credit_request_contexts), candidate_assignment_ids, quota_scope),
+         {:ok, hard_pinned_continuity?} <-
+           normalize_boolean(context_value(context, :hard_pinned_continuity?), false),
+         {:ok, transient_circuit_exclusions} <-
+           normalize_transient_circuit_exclusions(
+             context_value(context, :transient_circuit_exclusions),
+             length(cohort_identity_ids)
+           ),
+         :ok <-
+           validate_transient_circuit_exclusions(
+             transient_circuit_exclusions,
+             cohort_identity_ids,
+             candidate_identity_ids,
+             quota_scope,
+             route_class
+           ),
+         {:ok, automatic_confirmation_refs} <-
+           normalize_confirmation_refs(context_value(context, :automatic_confirmation_refs)),
+         :ok <-
+           validate_confirmation_refs(
+             automatic_confirmation_refs,
+             trigger,
+             identity_id,
+             candidate_identity_ids
+           ) do
       {:ok,
        %{
          trigger: trigger,
@@ -40,9 +120,20 @@ defmodule CodexPooler.Upstreams.SavedResets.AutoEligibility.Context do
          upstream_identity_id: identity_id,
          candidate_assignment_ids: candidate_assignment_ids,
          candidate_identity_ids: candidate_identity_ids,
-         route_class: route_class
+         capacity_assignment_ids: capacity_assignment_ids,
+         capacity_identity_ids: capacity_identity_ids,
+         cohort_identity_ids: cohort_identity_ids,
+         routable_assignment_ids: routable_assignment_ids,
+         routable_identity_ids: routable_identity_ids,
+         route_class: route_class,
+         transient_circuit_exclusions: transient_circuit_exclusions,
+         automatic_confirmation_refs: automatic_confirmation_refs,
+         quota_scope: quota_scope,
+         credit_request_contexts: credit_request_contexts,
+         hard_pinned_continuity?: hard_pinned_continuity?
        }}
     else
+      {:error, :gateway_auto_context_mismatch} = error -> error
       _invalid -> {:error, :invalid_gateway_auto_context}
     end
   end
@@ -52,17 +143,278 @@ defmodule CodexPooler.Upstreams.SavedResets.AutoEligibility.Context do
   defp normalize_uuid(value) when is_binary(value), do: Ecto.UUID.cast(value)
   defp normalize_uuid(_value), do: :error
 
-  defp normalize_uuid_list(values) when is_list(values) and values != [] do
+  defp normalize_uuid_list(values, opts \\ [])
+
+  defp normalize_uuid_list(values, opts) when is_list(values) and values != [] do
     ids = Enum.map(values, &normalize_uuid/1)
 
     if Enum.all?(ids, &match?({:ok, _id}, &1)) do
-      {:ok, Enum.map(ids, fn {:ok, id} -> id end)}
+      normalized_ids = Enum.map(ids, fn {:ok, id} -> id end)
+
+      if Keyword.get(opts, :deterministic?, false) do
+        {:ok, normalized_ids |> Enum.uniq() |> Enum.sort()}
+      else
+        {:ok, normalized_ids}
+      end
     else
       :error
     end
   end
 
-  defp normalize_uuid_list(_values), do: :error
+  defp normalize_uuid_list(_values, _opts), do: :error
+
+  defp validate_candidate_sets(
+         target_pair,
+         %{
+           dispatch: {candidate_assignment_ids, candidate_identity_ids},
+           capacity: {capacity_assignment_ids, capacity_identity_ids},
+           routable: {routable_assignment_ids, routable_identity_ids},
+           cohort_identity_ids: cohort_identity_ids
+         }
+       ) do
+    dispatch_pairs = aligned_pairs(candidate_assignment_ids, candidate_identity_ids)
+    capacity_pairs = aligned_pairs(capacity_assignment_ids, capacity_identity_ids)
+    routable_pairs = aligned_pairs(routable_assignment_ids, routable_identity_ids)
+
+    if valid_unique_pairs?(dispatch_pairs, candidate_assignment_ids, candidate_identity_ids) and
+         valid_unique_pairs?(capacity_pairs, capacity_assignment_ids, capacity_identity_ids) and
+         valid_unique_pairs?(routable_pairs, routable_assignment_ids, routable_identity_ids) and
+         target_pair in dispatch_pairs and
+         subset?(dispatch_pairs, routable_pairs) and
+         subset?(routable_pairs, capacity_pairs) and
+         subset?(capacity_identity_ids, cohort_identity_ids) do
+      :ok
+    else
+      {:error, :gateway_auto_context_mismatch}
+    end
+  end
+
+  defp aligned_pairs(assignment_ids, identity_ids) do
+    if length(assignment_ids) == length(identity_ids),
+      do: Enum.zip(assignment_ids, identity_ids),
+      else: []
+  end
+
+  defp valid_unique_pairs?(pairs, assignment_ids, identity_ids) do
+    pairs != [] and length(pairs) == length(assignment_ids) and
+      length(pairs) == length(identity_ids) and length(pairs) == length(Enum.uniq(pairs)) and
+      length(assignment_ids) == length(Enum.uniq(assignment_ids)) and
+      length(identity_ids) == length(Enum.uniq(identity_ids))
+  end
+
+  defp subset?(members, set), do: Enum.all?(members, &(&1 in set))
+
+  defp normalize_quota_scope(nil), do: {:ok, nil}
+
+  defp normalize_quota_scope(scope) when is_map(scope) do
+    keys = [
+      :requested_model,
+      :catalog_model,
+      :exposed_model_id,
+      :upstream_model,
+      :upstream_model_id
+    ]
+
+    values = Map.new(keys, &{&1, context_value(scope, &1)})
+
+    if Enum.all?(values, fn {_key, value} -> is_binary(value) and value != "" end),
+      do: {:ok, values},
+      else: :error
+  end
+
+  defp normalize_quota_scope(_scope), do: :error
+
+  defp normalize_credit_request_contexts(nil, _assignment_ids, _scope), do: {:ok, %{}}
+
+  defp normalize_credit_request_contexts(contexts, assignment_ids, scope) when is_map(contexts) and is_map(scope) do
+    if Enum.sort(Map.keys(contexts)) == Enum.sort(assignment_ids) and
+         Enum.all?(contexts, fn {_id, context} -> valid_credit_request_context?(context, scope) end) do
+      {:ok, contexts}
+    else
+      :error
+    end
+  end
+
+  defp normalize_credit_request_contexts(_contexts, _assignment_ids, _scope), do: :error
+
+  defp valid_credit_request_context?(context, scope) when is_map(context) do
+    context[:requested_model] == scope.requested_model and
+      context[:upstream_model] == scope.upstream_model and
+      context[:upstream_model_id] == scope.upstream_model_id and
+      context[:serving_mode] in [:full, :lite, "full", "lite", nil] and
+      context[:transport] in [:http_sse, :http_json, :native_websocket, :bridged_websocket, nil] and
+      Map.keys(context) -- [:model, :requested_model, :upstream_model, :upstream_model_id, :serving_mode, :transport, :route_class] == []
+  end
+
+  defp valid_credit_request_context?(_context, _scope), do: false
+
+  defp normalize_boolean(nil, default), do: {:ok, default}
+  defp normalize_boolean(value, _default) when is_boolean(value), do: {:ok, value}
+  defp normalize_boolean(_value, _default), do: :error
+
+  defp normalize_transient_circuit_exclusions(nil, _cohort_size), do: {:ok, []}
+
+  defp normalize_transient_circuit_exclusions(exclusions, cohort_size)
+       when is_list(exclusions) and length(exclusions) <= cohort_size do
+    with {:ok, normalized} <- normalize_transient_circuit_exclusion_entries(exclusions),
+         true <- unique_transient_circuit_ids?(normalized) do
+      {:ok, normalized}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp normalize_transient_circuit_exclusions(_exclusions, _cohort_size), do: :error
+
+  defp normalize_transient_circuit_exclusion_entries(exclusions) do
+    Enum.reduce_while(exclusions, {:ok, []}, fn exclusion, {:ok, normalized} ->
+      case normalize_transient_circuit_exclusion(exclusion) do
+        {:ok, entry} -> {:cont, {:ok, [entry | normalized]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
+      :error -> :error
+    end
+  end
+
+  defp normalize_transient_circuit_exclusion(exclusion) when is_map(exclusion) do
+    with {:ok, identity_id} <-
+           normalize_uuid(context_value(exclusion, :upstream_identity_id)),
+         {:ok, assignment_id} <-
+           normalize_uuid(context_value(exclusion, :pool_upstream_assignment_id)),
+         {:ok, circuit_id} <-
+           normalize_uuid(context_value(exclusion, :routing_circuit_state_id)),
+         {:ok, model_identifier} <-
+           normalize_nonempty_binary(context_value(exclusion, :model_identifier)),
+         {:ok, route_class} <-
+           normalize_nonempty_binary(context_value(exclusion, :route_class)) do
+      {:ok,
+       %{
+         upstream_identity_id: identity_id,
+         pool_upstream_assignment_id: assignment_id,
+         routing_circuit_state_id: circuit_id,
+         model_identifier: model_identifier,
+         route_class: route_class
+       }}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp normalize_transient_circuit_exclusion(_exclusion), do: :error
+
+  defp normalize_nonempty_binary(value) when is_binary(value) do
+    if String.trim(value) == "", do: :error, else: {:ok, value}
+  end
+
+  defp normalize_nonempty_binary(_value), do: :error
+
+  defp unique_transient_circuit_ids?(exclusions) do
+    unique_by?(exclusions, :upstream_identity_id) and
+      unique_by?(exclusions, :pool_upstream_assignment_id) and
+      unique_by?(exclusions, :routing_circuit_state_id)
+  end
+
+  defp unique_by?(entries, key) do
+    entries
+    |> Enum.map(&Map.fetch!(&1, key))
+    |> then(&(length(&1) == length(Enum.uniq(&1))))
+  end
+
+  defp validate_transient_circuit_exclusions(
+         exclusions,
+         cohort_identity_ids,
+         candidate_identity_ids,
+         quota_scope,
+         route_class
+       ) do
+    request_model_identifier = request_model_identifier(quota_scope)
+
+    if Enum.all?(exclusions, fn exclusion ->
+         exclusion.upstream_identity_id in cohort_identity_ids and
+           exclusion.upstream_identity_id not in candidate_identity_ids and
+           exclusion.route_class == route_class and
+           exclusion.model_identifier == request_model_identifier
+       end) do
+      :ok
+    else
+      {:error, :gateway_auto_context_mismatch}
+    end
+  end
+
+  defp request_model_identifier(%{catalog_model: model_identifier}), do: model_identifier
+  defp request_model_identifier(_quota_scope), do: nil
+
+  # The corroborated pressure proof is part of the automatic claim. A malformed,
+  # duplicate or unsorted reference set is not a valid automatic context. An
+  # absent proof normalizes to the empty set, which no locked validation ever
+  # accepts: the claim still runs its ordinary fences in order and then fails
+  # closed on the confirmation mismatch instead of consuming.
+  defp normalize_confirmation_refs(nil), do: {:ok, []}
+
+  defp normalize_confirmation_refs(refs) when is_list(refs) do
+    with {:ok, normalized} <- normalize_confirmation_ref_entries(refs),
+         true <- normalized == Enum.sort_by(normalized, &confirmation_ref_order/1),
+         true <- unique_by?(normalized, :account_quota_window_id) do
+      {:ok, normalized}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp normalize_confirmation_refs(_refs), do: :error
+
+  defp normalize_confirmation_ref_entries(refs) do
+    Enum.reduce_while(refs, {:ok, []}, fn ref, {:ok, normalized} ->
+      case normalize_confirmation_ref(ref) do
+        {:ok, entry} -> {:cont, {:ok, [entry | normalized]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, normalized} -> {:ok, Enum.reverse(normalized)}
+      :error -> :error
+    end
+  end
+
+  defp normalize_confirmation_ref(ref) when is_map(ref) do
+    with {:ok, identity_id} <- normalize_uuid(context_value(ref, :upstream_identity_id)),
+         {:ok, window_id} <- normalize_uuid(context_value(ref, :account_quota_window_id)),
+         {:ok, fingerprint} <- normalize_fingerprint(context_value(ref, :fingerprint)) do
+      {:ok,
+       %{
+         upstream_identity_id: identity_id,
+         account_quota_window_id: window_id,
+         fingerprint: fingerprint
+       }}
+    else
+      _invalid -> :error
+    end
+  end
+
+  defp normalize_confirmation_ref(_ref), do: :error
+
+  defp normalize_fingerprint(value) when is_binary(value) and byte_size(value) == 64 do
+    if String.match?(value, ~r/\A[0-9a-f]{64}\z/), do: {:ok, value}, else: :error
+  end
+
+  defp normalize_fingerprint(_value), do: :error
+
+  defp confirmation_ref_order(ref), do: {ref.upstream_identity_id, ref.account_quota_window_id}
+
+  defp validate_confirmation_refs(refs, :blocked_weekly_exhaustion, identity_id, _candidates) do
+    if Enum.all?(refs, &(&1.upstream_identity_id == identity_id)),
+      do: :ok,
+      else: {:error, :gateway_auto_context_mismatch}
+  end
+
+  defp validate_confirmation_refs(refs, :threshold_pressure, _identity_id, candidate_identity_ids) do
+    if Enum.all?(refs, &(&1.upstream_identity_id in candidate_identity_ids)),
+      do: :ok,
+      else: {:error, :gateway_auto_context_mismatch}
+  end
 
   defp keyword_context?([]), do: true
   defp keyword_context?([{key, _value} | rest]) when is_atom(key), do: keyword_context?(rest)

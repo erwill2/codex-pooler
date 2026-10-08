@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
 
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCanonicalization
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponses
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesWebsocket
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.TerminalOutcome
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.WebsocketErrorHeaders
@@ -15,6 +16,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
           required(:upstream_error_param) => String.t() | nil,
           required(:event_type) => String.t() | nil,
           required(:data_type) => String.t() | nil,
+          optional(:diagnostic_upstream_code) => String.t(),
+          optional(:tool_completion_reason) => :incomplete_tool_item | :invalid_tool_correlation | :tool_tracking_overflow,
           optional(:withheld_body) => String.t()
         }
   @type terminal_outcome :: %{
@@ -25,18 +28,54 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
           optional(:incomplete_reason) => String.t() | nil
         }
   @type public_openai_responses_stream_state :: PublicResponses.state()
+  @type public_openai_responses_websocket_state :: PublicResponsesWebsocket.state()
+  @type sse_block_state :: SSEParser.block_state()
   @type websocket_frame_headers :: %{optional(String.t()) => String.t()}
 
-  @spec public_openai_responses_stream_state() :: public_openai_responses_stream_state()
-  def public_openai_responses_stream_state do
-    PublicResponses.new_state()
+  @spec public_openai_responses_stream_state(map()) :: public_openai_responses_stream_state()
+  def public_openai_responses_stream_state(custom_tool_namespaces \\ %{}) do
+    PublicResponses.new_state(custom_tool_namespaces)
   end
+
+  @spec public_openai_responses_websocket_state() :: public_openai_responses_websocket_state()
+  @spec public_openai_responses_websocket_state(String.t() | nil) ::
+          public_openai_responses_websocket_state()
+  def public_openai_responses_websocket_state(stream_id \\ nil) do
+    PublicResponsesWebsocket.new_state(stream_id)
+  end
+
+  @spec normalize_public_openai_responses_websocket_data(
+          binary(),
+          public_openai_responses_websocket_state()
+        ) :: PublicResponsesWebsocket.result()
+  def normalize_public_openai_responses_websocket_data(data, state) do
+    PublicResponsesWebsocket.normalize(data, state)
+  end
+
+  @spec normalize_public_openai_responses_json_message(binary()) :: binary()
+  defdelegate normalize_public_openai_responses_json_message(data),
+    to: PublicResponses,
+    as: :normalize_owner_json_message
+
+  @spec normalize_public_openai_responses_json_message(binary(), map()) :: {binary(), map()}
+  defdelegate normalize_public_openai_responses_json_message(data, decoded),
+    to: PublicResponses,
+    as: :normalize_owner_json_message
 
   @spec max_incomplete_sse_block_bytes() :: pos_integer()
   defdelegate max_incomplete_sse_block_bytes, to: SSEParser
 
   @spec oversized_incomplete_sse_block?(binary()) :: boolean()
   defdelegate oversized_incomplete_sse_block?(buffer), to: SSEParser
+
+  @spec max_incomplete_terminal_sse_block_bytes() :: pos_integer()
+  defdelegate max_incomplete_terminal_sse_block_bytes, to: SSEParser
+
+  @spec oversized_incomplete_terminal_sse_block?(binary()) :: boolean()
+  defdelegate oversized_incomplete_terminal_sse_block?(buffer), to: SSEParser
+
+  @spec normalize_sse_event_label(term()) :: binary() | nil
+  defdelegate normalize_sse_event_label(label), to: SSEParser
 
   @spec normalize_codex_responses_sse_data(binary()) :: binary()
   defdelegate normalize_codex_responses_sse_data(data),
@@ -46,6 +85,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   @spec normalize_codex_responses_sse_block(binary(), binary()) :: iodata()
   def normalize_codex_responses_sse_block(block, separator \\ "\n\n"),
     do: ErrorCanonicalization.normalize_block(block, separator)
+
+  @spec normalize_private_native_misalignment_sse_block(binary(), binary()) :: iodata()
+  def normalize_private_native_misalignment_sse_block(block, separator \\ "\n\n"),
+    do: ErrorCanonicalization.normalize_private_native_misalignment_block(block, separator)
 
   @spec normalize_terminal_event(String.t() | nil, map()) :: {String.t() | nil, map()}
   defdelegate normalize_terminal_event(event_type, decoded), to: ErrorCanonicalization
@@ -63,29 +106,67 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   def public_openai_responses_passthrough_terminal_kind(state),
     do: PublicResponses.passthrough_terminal_kind(state)
 
-  @spec public_openai_responses_passthrough_terminal_failure(
-          public_openai_responses_stream_state()
-        ) ::
+  @spec public_openai_responses_passthrough_terminal_failure(public_openai_responses_stream_state()) ::
           terminal_failure() | nil
   def public_openai_responses_passthrough_terminal_failure(state),
     do: PublicResponses.passthrough_terminal_failure(state)
 
-  @spec synthetic_public_openai_responses_failure_sse(String.t() | nil, term()) :: binary()
-  defdelegate synthetic_public_openai_responses_failure_sse(response_id, reason),
+  @spec synthetic_public_openai_responses_error_sse(term(), non_neg_integer()) :: binary()
+  defdelegate synthetic_public_openai_responses_error_sse(reason, sequence_number),
     to: ErrorCanonicalization,
-    as: :synthetic_public_openai_responses_failure_sse
+    as: :synthetic_public_openai_responses_error_sse
+
+  @spec synthetic_public_openai_responses_failure_message() :: String.t()
+  defdelegate synthetic_public_openai_responses_failure_message(),
+    to: ErrorCanonicalization
 
   @spec canonicalize_codex_responses_json_message(binary()) :: binary()
   defdelegate canonicalize_codex_responses_json_message(data), to: ErrorCanonicalization
 
-  @spec websocket_error_frame_headers(binary()) :: websocket_frame_headers()
+  @spec canonicalize_codex_responses_json_message(binary(), map()) :: {binary(), map()}
+  defdelegate canonicalize_codex_responses_json_message(data, decoded),
+    to: ErrorCanonicalization
+
+  @spec canonicalize_native_codex_responses_json_message(binary()) :: binary()
+  defdelegate canonicalize_native_codex_responses_json_message(data), to: ErrorCanonicalization
+
+  @spec canonicalize_native_codex_responses_json_message(binary(), map()) :: {binary(), map()}
+  defdelegate canonicalize_native_codex_responses_json_message(data, decoded),
+    to: ErrorCanonicalization
+
+  @spec websocket_error_frame_headers(binary() | map()) :: websocket_frame_headers()
   defdelegate websocket_error_frame_headers(data), to: WebsocketErrorHeaders
+
+  @spec upstream_request_id_header_names() :: [String.t()]
+  defdelegate upstream_request_id_header_names(), to: WebsocketErrorHeaders
+
+  @spec websocket_error_frame_header_allowed?(term()) :: boolean()
+  defdelegate websocket_error_frame_header_allowed?(name),
+    to: WebsocketErrorHeaders,
+    as: :allowed_header_name?
+
+  @spec new_sse_block_state() :: sse_block_state()
+  defdelegate new_sse_block_state(), to: SSEParser, as: :new_block_state
+
+  @spec complete_sse_blocks(sse_block_state(), binary(), keyword()) ::
+          {[binary()], sse_block_state()}
+  defdelegate complete_sse_blocks(state, data, opts), to: SSEParser
 
   @spec complete_sse_blocks(binary(), keyword()) :: {[binary()], binary()}
   defdelegate complete_sse_blocks(data, opts), to: SSEParser
 
   @spec first_complete_event(binary()) :: {:ok, map()} | :incomplete
   defdelegate first_complete_event(buffer), to: TerminalOutcome
+
+  @spec event_summary(map()) :: map()
+  def event_summary(decoded) when is_map(decoded) do
+    ErrorCanonicalization.event_summary(Map.get(decoded, "type"), decoded)
+  end
+
+  @spec event_summary(String.t() | nil, map()) :: map()
+  def event_summary(event_type, decoded) when is_map(decoded) do
+    ErrorCanonicalization.event_summary(event_type, decoded)
+  end
 
   @spec terminal_outcome(binary()) :: {:ok, terminal_outcome()} | :error
   defdelegate terminal_outcome(data), to: TerminalOutcome
@@ -116,8 +197,33 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   @spec internal_rate_limit_event?(term()) :: boolean()
   defdelegate internal_rate_limit_event?(event), to: TerminalOutcome
 
+  @spec internal_control_event?(term()) :: boolean()
+  defdelegate internal_control_event?(event), to: TerminalOutcome
+
   @spec downstream_visible_event?(term()) :: boolean()
   defdelegate downstream_visible_event?(event), to: TerminalOutcome
+
+  @spec lifecycle_only_event?(term()) :: boolean()
+  defdelegate lifecycle_only_event?(event), to: TerminalOutcome
+
+  @spec client_visible_output_event?(term()) :: boolean()
+  defdelegate client_visible_output_event?(event), to: TerminalOutcome
+
+  @spec stream_data_client_visible?(term()) :: boolean()
+  defdelegate stream_data_client_visible?(data), to: TerminalOutcome
+
+  @spec retry_window_preamble_event?(term()) :: boolean()
+  defdelegate retry_window_preamble_event?(event), to: TerminalOutcome
+
+  @spec preamble_only_stream_data?(term()) :: boolean()
+  defdelegate preamble_only_stream_data?(data), to: TerminalOutcome
+
+  @spec split_preamble_blocks(term()) :: {binary(), boolean()}
+  defdelegate split_preamble_blocks(data), to: TerminalOutcome
+
+  @doc false
+  @spec partition_preamble_blocks(term()) :: {binary(), binary(), boolean()}
+  defdelegate partition_preamble_blocks(data), to: TerminalOutcome
 
   @spec stream_data_visible?(term()) :: boolean()
   defdelegate stream_data_visible?(data), to: TerminalOutcome
@@ -139,6 +245,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
 
   @spec decode_sse_data(term()) :: map()
   defdelegate decode_sse_data(data), to: SSEParser
+
+  @spec stream_block_event(binary()) :: {String.t() | nil, map()}
+  defdelegate stream_block_event(block), to: SSEParser
 
   @spec valid_json?(term()) :: boolean()
   defdelegate valid_json?(body), to: SSEParser

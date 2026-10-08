@@ -1,0 +1,394 @@
+#!/bin/bash
+set -euo pipefail
+
+action="${1:-}"
+port="${DEV_SERVER_PORT:-4000}"
+state_dir="${DEV_SERVER_STATE_DIR:-tmp/dev-server}"
+log_path="${DEV_SERVER_LOG:-tmp/dev-server.log}"
+server_cwd="${DEV_SERVER_CWD:-$PWD}"
+server_command="${DEV_SERVER_COMMAND:-mix phx.server}"
+health_url="${DEV_SERVER_HEALTH_URL:-http://127.0.0.1:${port}/healthz}"
+start_attempts="${DEV_SERVER_START_ATTEMPTS:-100}"
+term_attempts="${DEV_SERVER_TERM_ATTEMPTS:-50}"
+poll_seconds="${DEV_SERVER_POLL_SECONDS:-0.1}"
+active_path="${state_dir}/active"
+legacy_pid_path="${DEV_SERVER_LEGACY_PID:-tmp/dev-server.pid}"
+
+fail() {
+  printf 'dev-server: %s\n' "$*" >&2
+  exit 1
+}
+
+process_alive() {
+  local pid="$1" state
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+  [[ -n "$state" && "$state" != *Z* ]]
+}
+
+listener_pids() {
+  lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+}
+
+pid_listens() {
+  local pid="$1"
+  listener_pids | awk -v expected="$pid" '$0 == expected { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+process_start() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+process_command() {
+  ps -o command= -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+process_cwd() {
+  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+}
+
+detached_launcher() {
+  if command -v setsid >/dev/null 2>&1; then
+    printf '%s\n' "setsid"
+  elif command -v perl >/dev/null 2>&1 && perl -MPOSIX -e 'exit(POSIX->can("setsid") ? 0 : 1)'; then
+    printf '%s\n' "perl"
+  else
+    fail "missing process-session launcher; install setsid or Perl with POSIX support"
+  fi
+}
+
+canonical_checkout_path() {
+  local checkout_path="$1"
+  [ -d "$checkout_path" ] || return 1
+  (cd "$checkout_path" && pwd -P)
+}
+
+receipt_value() {
+  local path="$1" key="$2"
+  awk -F '\t' -v expected="$key" '$1 == expected { count += 1; value = substr($0, length($1) + 2) } END { if (count == 1) print value; else exit 1 }' "$path"
+}
+
+write_receipt() {
+  local path="$1" state="$2" pid="$3" start_signature="$4" command="$5" cwd="$6"
+  local temporary="${path}.tmp.$$"
+
+  umask 077
+  printf 'version\t1\nstate\t%s\npid\t%s\nstart_signature\t%s\ncommand\t%s\ncwd\t%s\nport\t%s\n' \
+    "$state" "$pid" "$start_signature" "$command" "$cwd" "$port" > "$temporary"
+  mv -f -- "$temporary" "$path"
+  chmod 600 "$path"
+}
+
+load_active_receipt() {
+  [ -f "$active_path" ] || fail "refusing stop without an active ownership pointer"
+  local run_id
+  run_id="$(tr -d '\n' < "$active_path")"
+  [[ "$run_id" =~ ^[0-9a-f]{24}$ ]] || fail "refusing invalid active ownership pointer"
+  receipt_path="${state_dir}/${run_id}.receipt"
+  [ -f "$receipt_path" ] || fail "refusing missing ownership receipt"
+}
+
+prepare_stop_receipt() {
+  if [ -e "$active_path" ]; then
+    load_active_receipt
+    return 0
+  fi
+
+  [ -e "$legacy_pid_path" ] || {
+    printf 'dev-server: no owned dev server to stop\n'
+    return 1
+  }
+
+  adopt_legacy_receipt
+}
+
+adopt_legacy_receipt() {
+  local legacy_pid current_start current_command current_cwd run_id
+  legacy_pid="$(tr -d '\n' < "$legacy_pid_path")"
+  [[ "$legacy_pid" =~ ^[1-9][0-9]*$ ]] || fail "refusing invalid legacy PID file"
+
+  if ! process_alive "$legacy_pid"; then
+    rm -f -- "$legacy_pid_path"
+    printf 'dev-server: removed stale legacy PID file\n'
+    return 1
+  fi
+
+  current_start="$(process_start "$legacy_pid")"
+  current_command="$(process_command "$legacy_pid")"
+  current_cwd="$(process_cwd "$legacy_pid")"
+
+  [ "$current_cwd" = "$server_cwd" ] || fail "refusing legacy PID from another checkout"
+  [[ "$current_command" == *"mix phx.server"* ]] ||
+    fail "refusing legacy PID without Phoenix/Mix command identity"
+  pid_listens "$legacy_pid" || fail "refusing legacy PID that does not own the configured listener"
+  curl -fsS "$health_url" >/dev/null || fail "refusing legacy listener that failed health validation"
+
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+  run_id="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$run_id" =~ ^[0-9a-f]{24}$ ]] || fail "could not generate legacy run id"
+  receipt_path="${state_dir}/${run_id}.receipt"
+  write_receipt "$receipt_path" "running" "$legacy_pid" "$current_start" "$current_command" "$current_cwd"
+  printf '%s\n' "$run_id" > "${active_path}.tmp.$$"
+  chmod 600 "${active_path}.tmp.$$"
+  mv -f -- "${active_path}.tmp.$$" "$active_path"
+  printf 'dev-server: adopted verified legacy dev server pid %s\n' "$legacy_pid"
+}
+
+# A receipt is provably stale when it is a running-state receipt for THIS
+# checkout and port whose recorded process no longer exists: the pid is gone,
+# or the pid was reused by a process with a different start signature. Both
+# leave nothing of ours to signal, so only the receipt files are cleaned and
+# no process is ever touched. Receipts for another checkout, another port, a
+# non-running state, or with any parse failure stay on the fail-closed
+# validate_owned_process path.
+stale_owned_pid=""
+
+receipt_checkout_matches() {
+  local recorded_cwd="$1" canonical_recorded_cwd
+  [ "$recorded_cwd" = "$server_cwd" ] && return 0
+
+  canonical_recorded_cwd="$(canonical_checkout_path "$recorded_cwd")" || return 1
+  [ "$canonical_recorded_cwd" = "$server_cwd" ]
+}
+
+describe_ownership_receipt() {
+  local recorded_state recorded_pid recorded_cwd recorded_port alive="no" listener="no"
+  recorded_state="$(receipt_value "$receipt_path" state)" || recorded_state="unreadable"
+  recorded_pid="$(receipt_value "$receipt_path" pid)" || recorded_pid="unreadable"
+  recorded_cwd="$(receipt_value "$receipt_path" cwd)" || recorded_cwd="unreadable"
+  recorded_port="$(receipt_value "$receipt_path" port)" || recorded_port="unreadable"
+
+  if [[ "$recorded_pid" =~ ^[1-9][0-9]*$ ]] && process_alive "$recorded_pid"; then
+    alive="yes"
+    if pid_listens "$recorded_pid"; then listener="yes"; fi
+  fi
+
+  printf 'dev-server: ownership receipt=%s\n' "$receipt_path" >&2
+  printf 'dev-server: recorded state=%s pid=%s alive=%s listener=%s port=%s\n' \
+    "$recorded_state" "$recorded_pid" "$alive" "$listener" "$recorded_port" >&2
+  printf 'dev-server: recorded checkout=%s\n' "$recorded_cwd" >&2
+  printf 'dev-server: current checkout=%s requested port=%s\n' "$server_cwd" "$port" >&2
+  printf 'dev-server: no process was stopped and no lifecycle state was changed\n' >&2
+}
+
+fail_foreign_ownership_receipt() {
+  describe_ownership_receipt
+  printf 'dev-server: next: run make dev-status from the recorded checkout to inspect its state\n' >&2
+  printf 'dev-server: next: run make dev-stop there only when it confirms the server is owned\n' >&2
+  printf 'dev-server: next: to run independently, choose both an unused PORT and DEV_SERVER_STATE_DIR\n' >&2
+  fail "refusing ownership receipt for another checkout"
+}
+
+owned_process_gone() {
+  local recorded_pid recorded_start
+  recorded_pid="$(receipt_value "$receipt_path" pid)" || return 1
+  recorded_start="$(receipt_value "$receipt_path" start_signature)" || return 1
+  [[ "$recorded_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  stale_owned_pid="$recorded_pid"
+
+  if ! process_alive "$recorded_pid"; then
+    return 0
+  fi
+
+  [ "$(process_start "$recorded_pid")" != "$recorded_start" ]
+}
+
+stale_owned_receipt() {
+  local recorded_state recorded_cwd recorded_port
+  recorded_state="$(receipt_value "$receipt_path" state)" || return 1
+  recorded_cwd="$(receipt_value "$receipt_path" cwd)" || return 1
+  recorded_port="$(receipt_value "$receipt_path" port)" || return 1
+  [ "$recorded_state" = "running" ] || return 1
+  receipt_checkout_matches "$recorded_cwd" || return 1
+  [ "$recorded_port" = "$port" ] || return 1
+  owned_process_gone
+}
+
+clear_stale_owned_receipt() {
+  rm -f -- "$receipt_path" "$active_path"
+  printf 'dev-server: cleared stale ownership receipt for owned pid %s that no longer exists\n' \
+    "$stale_owned_pid"
+}
+
+validate_owned_process() {
+  local recorded_state recorded_pid recorded_start recorded_command recorded_cwd recorded_port
+  recorded_state="$(receipt_value "$receipt_path" state)" || fail "refusing malformed ownership receipt"
+  recorded_pid="$(receipt_value "$receipt_path" pid)" || fail "refusing malformed ownership receipt"
+  recorded_start="$(receipt_value "$receipt_path" start_signature)" || fail "refusing malformed ownership receipt"
+  recorded_command="$(receipt_value "$receipt_path" command)" || fail "refusing malformed ownership receipt"
+  recorded_cwd="$(receipt_value "$receipt_path" cwd)" || fail "refusing malformed ownership receipt"
+  recorded_port="$(receipt_value "$receipt_path" port)" || fail "refusing malformed ownership receipt"
+
+  if [ "$recorded_state" != "running" ]; then
+    printf 'dev-server: next: inspect listener ownership on port %s and receipt %s; stop only the verified process, then remove this receipt and pointer %s before make dev\n' "$port" "$receipt_path" "$active_path" >&2
+    fail "refusing ownership receipt that is not running"
+  fi
+  [[ "$recorded_pid" =~ ^[1-9][0-9]*$ ]] || fail "refusing invalid owned pid"
+  [ "$recorded_port" = "$port" ] || fail "refusing ownership receipt for another port"
+  receipt_checkout_matches "$recorded_cwd" || fail_foreign_ownership_receipt
+  process_alive "$recorded_pid" || fail "refusing stale owned pid"
+
+  [ "$(process_start "$recorded_pid")" = "$recorded_start" ] ||
+    fail "refusing owned pid because process identity changed"
+  [ "$(process_command "$recorded_pid")" = "$recorded_command" ] ||
+    fail "refusing owned pid because process command changed"
+  [ "$(process_cwd "$recorded_pid")" = "$recorded_cwd" ] ||
+    fail "refusing owned pid because checkout cwd changed"
+  [[ "$recorded_command" == *"mix phx.server"* ]] ||
+    fail "refusing process without Phoenix/Mix command identity"
+  pid_listens "$recorded_pid" || fail "refusing owned pid that does not own the configured listener"
+
+  owned_pid="$recorded_pid"
+}
+
+describe_start_failure() {
+  local pid="$1" alive="no" listener="no" health="failed"
+
+  if process_alive "$pid"; then
+    alive="yes"
+    if pid_listens "$pid"; then listener="yes"; fi
+    if curl -fsS "$health_url" >/dev/null 2>&1; then health="ok"; fi
+  fi
+
+  printf 'dev-server: startup diagnostics: pid=%s alive=%s listener=%s health=%s\n' \
+    "$pid" "$alive" "$listener" "$health" >&2
+  printf 'dev-server: health url=%s\n' "$health_url" >&2
+  printf 'dev-server: server log=%s\n' "$log_path" >&2
+  printf 'dev-server: next: inspect the log, correct the reported boot failure, then rerun make dev\n' >&2
+}
+
+start_server() {
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || fail "invalid port"
+  server_cwd="$(cd "$server_cwd" && pwd -P)"
+  mkdir -p "$state_dir" "$(dirname "$log_path")"
+  chmod 700 "$state_dir"
+  [[ "$server_command" != *$'\n'* && "$server_command" != *$'\t'* ]] || fail "invalid server command"
+  [[ "$server_cwd" != *$'\n'* && "$server_cwd" != *$'\t'* ]] || fail "invalid server cwd"
+
+  [ ! -e "$legacy_pid_path" ] ||
+    fail "refusing legacy PID-file conflict at ${legacy_pid_path}; inspect it manually"
+
+  if [ -e "$active_path" ]; then
+    load_active_receipt
+    if stale_owned_receipt; then
+      clear_stale_owned_receipt
+    else
+      validate_owned_process
+      curl -fsS "$health_url" >/dev/null || fail "owned listener failed health validation"
+      printf 'dev-server: reusing owned dev server pid %s\n' "$owned_pid"
+      return 0
+    fi
+  fi
+
+  [ -z "$(listener_pids)" ] || fail "refusing occupied port ${port}; no process was stopped"
+
+  local run_id receipt_path pid current_start current_command current_cwd launcher
+  launcher="$(detached_launcher)"
+  run_id="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$run_id" =~ ^[0-9a-f]{24}$ ]] || fail "could not generate run id"
+  receipt_path="${state_dir}/${run_id}.receipt"
+  write_receipt "$receipt_path" "starting" "pending" "pending" "pending" "$server_cwd"
+  printf '%s\n' "$run_id" > "${active_path}.tmp.$$"
+  chmod 600 "${active_path}.tmp.$$"
+  mv -f -- "${active_path}.tmp.$$" "$active_path"
+
+  (
+    cd "$server_cwd"
+    if [ "$launcher" = "setsid" ]; then
+      nohup setsid /bin/bash -c "exec /usr/bin/env ${server_command}" > "$log_path" 2>&1 < /dev/null &
+    else
+      nohup perl -MPOSIX -e 'POSIX::setsid() >= 0 or die "setsid failed: $!"; exec @ARGV' \
+        /bin/bash -c "exec /usr/bin/env ${server_command}" > "$log_path" 2>&1 < /dev/null &
+    fi
+    printf '%s\n' "$!" > "${receipt_path}.pid"
+  )
+  pid="$(cat "${receipt_path}.pid")"
+  rm -f -- "${receipt_path}.pid"
+
+  for _attempt in $(seq 1 "$start_attempts"); do
+    if process_alive "$pid" && pid_listens "$pid" && curl -fsS "$health_url" >/dev/null 2>&1; then
+      current_start="$(process_start "$pid")"
+      current_command="$(process_command "$pid")"
+      current_cwd="$(process_cwd "$pid")"
+
+      if [ "$current_cwd" = "$server_cwd" ] && [[ "$current_command" == *"mix phx.server"* ]]; then
+        write_receipt "$receipt_path" "running" "$pid" "$current_start" "$current_command" "$current_cwd"
+        printf 'dev-server: owned dev server started pid %s port %s\n' "$pid" "$port"
+        return 0
+      fi
+    fi
+    sleep "$poll_seconds"
+  done
+
+  describe_start_failure "$pid"
+  if process_alive "$pid"; then kill -TERM "$pid" >/dev/null 2>&1 || true; fi
+  for _attempt in $(seq 1 "$term_attempts"); do
+    process_alive "$pid" || break
+    sleep "$poll_seconds"
+  done
+  if process_alive "$pid"; then kill -KILL "$pid" >/dev/null 2>&1 || true; fi
+  rm -f -- "$receipt_path" "$active_path"
+  fail "server did not become ready; owned process was cleaned"
+}
+
+stop_server() {
+  server_cwd="$(cd "$server_cwd" && pwd -P)"
+  if ! prepare_stop_receipt; then
+    return 0
+  fi
+
+  if stale_owned_receipt; then
+    clear_stale_owned_receipt
+    printf 'dev-server: no live owned dev server to stop\n'
+    return 0
+  fi
+
+  validate_owned_process
+
+  printf 'dev-server: stopping owned dev server pid %s\n' "$owned_pid"
+  kill -TERM "$owned_pid" >/dev/null 2>&1 || true
+
+  for _attempt in $(seq 1 "$term_attempts"); do
+    process_alive "$owned_pid" || break
+    sleep "$poll_seconds"
+  done
+
+  if process_alive "$owned_pid"; then
+    printf 'dev-server: owned process ignored TERM; escalating to KILL\n'
+    kill -KILL "$owned_pid" >/dev/null 2>&1 || true
+  fi
+
+  for _attempt in $(seq 1 "$term_attempts"); do
+    process_alive "$owned_pid" || break
+    sleep "$poll_seconds"
+  done
+  process_alive "$owned_pid" && fail "owned process survived KILL"
+
+  rm -f -- "$receipt_path" "$active_path" "$legacy_pid_path"
+  printf 'dev-server: owned dev server stopped\n'
+}
+
+status_server() {
+  server_cwd="$(cd "$server_cwd" && pwd -P)"
+  if [ ! -e "$active_path" ] && [ ! -e "$legacy_pid_path" ]; then
+    printf 'dev-server: stopped\n'
+    return 0
+  fi
+  load_active_receipt
+
+  if stale_owned_receipt; then
+    fail "stale ownership receipt: owned pid ${stale_owned_pid} no longer exists; start or stop will clean it"
+  fi
+
+  validate_owned_process
+  curl -fsS "$health_url" >/dev/null || fail "owned listener failed health validation"
+  printf 'dev-server: owned dev server running pid %s; healthz ok\n' "$owned_pid"
+}
+
+case "$action" in
+  start) start_server ;;
+  stop) stop_server ;;
+  status) status_server ;;
+  *) fail "usage: dev-server-lifecycle start|stop|status" ;;
+esac

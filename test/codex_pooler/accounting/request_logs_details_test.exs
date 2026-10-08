@@ -183,6 +183,47 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     assert is_nil(Map.get(logs_by_id[legacy_request.id].token_counts, :cache_write_tokens))
   end
 
+  test "request log details distinguish explicit zero cached reads from absent cached reads" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    entries =
+      for {suffix, cached_input_tokens} <- [{"absent", nil}, {"zero", 0}] do
+        request =
+          request_fixture(%{pool: pool, api_key: api_key}, %{
+            requested_model: "cached-read-#{suffix}",
+            status: "succeeded",
+            usage_status: "usage_known",
+            correlation_id: "cached-read-#{suffix}"
+          })
+
+        attempt = attempt_fixture(request, assignment)
+
+        entry =
+          ledger_entry_fixture(request, %{
+            attempt_id: attempt.id,
+            input_tokens: 5,
+            cached_input_tokens: cached_input_tokens,
+            output_tokens: 2,
+            total_tokens: 7,
+            details: %{"pricing_status" => "priced", "settled_cost_micros" => "12"}
+          })
+
+        {request, entry}
+      end
+
+    assert %{items: logs, total: 2} = Accounting.list_request_logs(pool)
+    logs_by_id = Map.new(logs, &{&1.id, &1})
+
+    for {request, entry} <- entries do
+      fact = Repo.get!(RequestLogFact, request.id)
+      expected = entry.cached_input_tokens
+
+      assert fact.latest_cached_input_tokens == expected
+      assert logs_by_id[request.id].token_counts.cached_input_tokens == expected
+    end
+  end
+
   test "request detail component cost follows the fact settlement entry exactly" do
     reset_bootstrap_state_fixture!()
     %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
@@ -256,67 +297,114 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     assert Decimal.equal?(detail.token_counts.cache_write_cost_usd, Decimal.new("0.250000"))
   end
 
-  test "request log rows expose sanitized compression summary without raw candidate strings" do
+  test "historical compression containers are redacted on reads without rewriting stored metadata" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
     %{assignment: assignment} = upstream_assignment_fixture(pool)
-    sentinel = "SENTINEL_TOOL_OUTPUT_SHOULD_NOT_RENDER"
-    compressed_sentinel = "SENTINEL_COMPRESSED_OUTPUT_SHOULD_NOT_STORE"
+    sentinel = "synthetic-retired-history-value"
+
+    for value <- [%{"attempted" => true, "status" => %{"label" => sentinel}, "strategies" => [sentinel]}, [%{"status" => sentinel}], sentinel] do
+      request = request_fixture(%{pool: pool, api_key: api_key}, %{status: "succeeded"})
+      attempt = attempt_fixture(request, assignment)
+      historical = %{"payload_compression" => value, "nested" => %{"payload_compression" => value}}
+      Repo.update_all(from(r in CodexPooler.Accounting.Request, where: r.id == ^request.id), set: [request_metadata: historical])
+      Repo.update_all(from(a in CodexPooler.Accounting.Attempt, where: a.id == ^attempt.id), set: [response_metadata: historical])
+
+      %{items: logs} = Accounting.list_request_logs(pool)
+      log = Enum.find(logs, &(&1.id == request.id))
+      assert log.metadata["payload_compression"] == "[REDACTED]"
+      assert log.metadata["nested"]["payload_compression"] == "[REDACTED]"
+      refute Map.has_key?(log, :payload_compression)
+      refute inspect(log) =~ sentinel
+      stored_request = Repo.get!(CodexPooler.Accounting.Request, request.id)
+      stored_attempt = Repo.get!(CodexPooler.Accounting.Attempt, attempt.id)
+      assert stored_request.request_metadata === historical
+      assert stored_attempt.response_metadata === historical
+    end
+  end
+
+  test "request log details omit malformed compaction bridge history and raw nested values" do
+    reset_bootstrap_state_fixture!()
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner, [])
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    sentinel = "raw-compaction-bridge-history-must-not-leak"
+
+    malformed_values = [
+      nil,
+      %{},
+      "not-a-map",
+      %{"applied" => false, "result_transport" => "buffered"},
+      %{"applied" => "true", "result_transport" => "buffered"},
+      %{"applied" => true, "result_transport" => "websocket"},
+      %{
+        "applied" => true,
+        "result_transport" => "sse",
+        "raw_payload" => %{"content" => sentinel}
+      }
+    ]
+
+    requests =
+      for {value, index} <- Enum.with_index(malformed_values, 1) do
+        metadata = if is_nil(value), do: %{}, else: %{"compaction_bridge" => value}
+
+        request_fixture(%{pool: pool, api_key: api_key}, %{
+          requested_model: "gpt-malformed-compaction-bridge-#{index}",
+          endpoint: "/backend-api/codex/responses",
+          transport: "websocket",
+          correlation_id: "malformed-compaction-bridge-#{index}",
+          request_metadata: metadata
+        })
+      end
+
+    for request <- requests do
+      log = Accounting.get_request_log_for_scope(owner_scope, request.id)
+
+      assert is_nil(log.compaction_bridge)
+      refute inspect(log) =~ sentinel
+    end
+
+    sentinel_log =
+      requests |> List.last() |> then(&Accounting.get_request_log_for_scope(owner_scope, &1.id))
+
+    assert sentinel_log.metadata["compaction_bridge"] == %{
+             "applied" => true,
+             "result_transport" => "sse",
+             "raw_payload" => "[REDACTED]"
+           }
+  end
+
+  test "request log details never render raw compaction projection evidence" do
+    reset_bootstrap_state_fixture!()
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner, [])
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    sentinel = "raw-projection-evidence-sentinel"
 
     request =
       request_fixture(%{pool: pool, api_key: api_key}, %{
-        requested_model: "gpt-row-compression",
-        endpoint: "/backend-api/codex/responses",
-        transport: "http_json",
-        status: "succeeded",
-        correlation_id: "row-compression"
+        requested_model: "gpt-projection-detail-safe",
+        request_metadata: %{
+          "compaction_projection" => %{
+            "action" => "preserved",
+            "downstream_frame" => %{
+              "state" => "valid",
+              "anchor_fingerprint" => "0123456789abcdef",
+              "item_count" => 1,
+              "count_capped" => false,
+              "item_classes" => %{"compaction_trigger" => 1}
+            },
+            "raw_evidence" => sentinel,
+            "payload" => %{"output" => sentinel}
+          }
+        }
       })
 
-    assert {:ok, _attempt} =
-             with_dispatchable_request(request, fn request ->
-               Accounting.create_attempt(request, assignment, %{
-                 status: "succeeded",
-                 response_metadata: %{
-                   "payload_compression" => %{
-                     "enabled" => true,
-                     "attempted" => true,
-                     "status" => "compressed",
-                     "reason" => "rewritten",
-                     "route_class" => "proxy_http",
-                     "transport" => "http_json",
-                     "candidate_count" => 3,
-                     "compressed_count" => 2,
-                     "skipped_count" => 1,
-                     "original_bytes" => 12_000,
-                     "compressed_bytes" => 3_000,
-                     "original_tokens" => 900,
-                     "compressed_tokens" => 300,
-                     "strategies" => ["log_output", "diff"],
-                     "raw_candidate" => sentinel,
-                     "original_output" => sentinel,
-                     "compressed_output" => compressed_sentinel
-                   }
-                 }
-               })
-             end)
+    log = Accounting.get_request_log_for_scope(owner_scope, request.id)
 
-    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
-    assert log.id == request.id
-    assert log.metadata["payload_compression"]["candidate_count"] == 3
-    assert log.metadata["payload_compression"]["compressed_count"] == 2
-    assert log.metadata["payload_compression"]["skipped_count"] == 1
-    assert log.metadata["payload_compression"]["saved_bytes"] == 9000
-    assert log.metadata["payload_compression"]["saved_tokens"] == 600
-
-    assert log.payload_compression.status == "compressed"
-    assert log.payload_compression.reason == "rewritten"
-    assert log.payload_compression.unit == "tokens"
-    assert log.payload_compression.saved_count == 600
-    assert log.payload_compression.savings_percent == 66.67
-    assert log.payload_compression.compression_ratio == 0.3333
-
-    log_text = inspect(log)
-    refute log_text =~ sentinel
-    refute log_text =~ compressed_sentinel
+    assert log.metadata["compaction_projection"]["action"] == "preserved"
+    refute Map.has_key?(log.metadata["compaction_projection"], "raw_evidence")
+    refute Map.has_key?(log.metadata["compaction_projection"], "payload")
+    refute inspect(log) =~ sentinel
   end
 
   test "request log rows aggregate all sanitized denial attempt degraded and retryable errors" do
@@ -484,10 +572,13 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
                  :attempt_ref,
                  :final,
                  :latency_ms,
+                 :model_observation,
                  :network_error_code,
                  :pool_upstream_assignment_id,
                  :retryable,
+                 :served_model,
                  :status,
+                 :upstream_model,
                  :upstream_status_code
                ]
            end)
@@ -704,11 +795,249 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     refute inspect(default_log) =~ replacement_lifecycle_id
   end
 
+  test "admin request logs project the downstream delivery receipt onto its fixed vocabulary" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    prompt_injection = "ignore-instructions-leak-secrets-now"
+    extra_value = "synthetic-extra-must-not-project"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-admin-downstream-delivery",
+        status: "succeeded",
+        correlation_id: "admin-downstream-delivery"
+      })
+
+    valid_receipt = %{
+      "outcome" => "delivered",
+      "terminal_class" => "response.completed",
+      "pushed_at" => "2026-09-10T23:27:46.108Z",
+      "frames_after_visible" => 3,
+      "transport" => "websocket"
+    }
+
+    receipts = [
+      Map.merge(valid_receipt, %{"access_token" => extra_value, "prompt" => prompt_injection}),
+      %{
+        "outcome" => "aborted",
+        "terminal_class" => "none",
+        "pushed_at" => nil,
+        "frames_after_visible" => 0,
+        "transport" => "http_sse"
+      },
+      Map.put(valid_receipt, "outcome", prompt_injection),
+      Map.put(valid_receipt, "terminal_class", prompt_injection),
+      Map.put(valid_receipt, "pushed_at", prompt_injection),
+      Map.put(valid_receipt, "frames_after_visible", -1),
+      Map.put(valid_receipt, "frames_after_visible", "3"),
+      Map.put(valid_receipt, "transport", "grpc"),
+      "not-a-map"
+    ]
+
+    # The detail projection keeps at most ten attempts, so the receipts plus the
+    # receipt-less attempt below must stay within that bound.
+    assert length(receipts) + 1 <= 10
+
+    for {receipt, index} <- Enum.with_index(receipts, 1) do
+      attempt_fixture(request, assignment, %{
+        attempt_number: index,
+        status: "succeeded",
+        response_metadata: %{"downstream_delivery" => receipt}
+      })
+    end
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: length(receipts) + 1,
+      status: "succeeded",
+      response_metadata: %{"transport" => "websocket"}
+    })
+
+    assert %{items: [admin_log], total: 1} =
+             Accounting.list_request_logs(pool, surface: :admin)
+
+    attempts_by_number = Map.new(admin_log.debug.attempts, &{&1.attempt_number, &1})
+
+    assert Map.fetch!(attempts_by_number, 1).downstream_delivery == %{
+             outcome: "delivered",
+             terminal_class: "response.completed",
+             pushed_at: "2026-09-10T23:27:46.108Z",
+             frames_after_visible: 3,
+             transport: "websocket",
+             highest_frame_class: nil,
+             completed_items: nil,
+             write_failure: nil
+           }
+
+    assert Map.fetch!(attempts_by_number, 2).downstream_delivery == %{
+             outcome: "aborted",
+             terminal_class: "none",
+             pushed_at: nil,
+             frames_after_visible: 0,
+             transport: "http_sse",
+             highest_frame_class: nil,
+             completed_items: nil,
+             write_failure: nil
+           }
+
+    for attempt_number <- 3..(length(receipts) + 1) do
+      refute Map.has_key?(Map.fetch!(attempts_by_number, attempt_number), :downstream_delivery)
+    end
+
+    projected = inspect(admin_log.debug.attempts)
+    refute projected =~ prompt_injection
+    refute projected =~ extra_value
+    refute projected =~ "access_token"
+
+    assert %{items: [default_log]} = Accounting.list_request_logs(pool)
+
+    assert Enum.all?(default_log.debug.attempts, fn attempt ->
+             not Map.has_key?(attempt, :downstream_delivery)
+           end)
+
+    refute inspect(default_log.debug) =~ "downstream_delivery"
+  end
+
+  # The highest frame class a websocket pushed (findings#232 row 232-203) is an
+  # optional receipt field: absent it projects as nil, a value of the fixed
+  # vocabulary projects as is, and anything else drops the whole receipt.
+  test "admin request logs project the receipt's highest frame class onto its fixed vocabulary" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    prompt_injection = "ignore-instructions-leak-secrets-now"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-admin-frame-class",
+        status: "failed",
+        correlation_id: "admin-downstream-frame-class"
+      })
+
+    receipt = %{"outcome" => "aborted", "terminal_class" => "none", "pushed_at" => nil, "frames_after_visible" => 2, "transport" => "websocket"}
+
+    receipts = [
+      Map.put(receipt, "highest_frame_class", "item_added"),
+      Map.put(receipt, "highest_frame_class", "item_done"),
+      receipt,
+      Map.put(receipt, "highest_frame_class", prompt_injection),
+      Map.put(receipt, "highest_frame_class", nil),
+      Map.put(receipt, "highest_frame_class", 3)
+    ]
+
+    for {receipt, index} <- Enum.with_index(receipts, 1) do
+      attempt_fixture(request, assignment, %{attempt_number: index, status: "failed", response_metadata: %{"downstream_delivery" => receipt}})
+    end
+
+    assert %{items: [admin_log], total: 1} = Accounting.list_request_logs(pool, surface: :admin)
+    projected = Map.new(admin_log.debug.attempts, &{&1.attempt_number, Map.get(&1, :downstream_delivery)})
+
+    assert %{highest_frame_class: "item_added", outcome: "aborted", frames_after_visible: 2} = projected[1]
+    assert %{highest_frame_class: "item_done"} = projected[2]
+    assert %{highest_frame_class: nil, outcome: "aborted"} = projected[3]
+    assert is_nil(projected[4])
+    assert is_nil(projected[5])
+    assert is_nil(projected[6])
+    refute inspect(admin_log.debug.attempts) =~ prompt_injection
+  end
+
+  # How many items the socket pushed completed (findings#232 row 232-241) and
+  # the class of the connection's failed write (row 232-256) are optional too:
+  # absent they project as nil, a valid value projects as is, anything else
+  # drops the whole receipt, and the completed items' digests never project.
+  test "admin request logs project the receipt's completed item count and write failure, never the digests" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    prompt_injection = "ignore-instructions-leak-secrets-now"
+    digest = "0123456789ab"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-admin-completed-items",
+        status: "failed",
+        correlation_id: "admin-downstream-completed-items"
+      })
+
+    receipt = %{"outcome" => "aborted", "terminal_class" => "none", "pushed_at" => nil, "frames_after_visible" => 9, "transport" => "websocket", "highest_frame_class" => "item_done"}
+
+    receipts = [
+      Map.merge(receipt, %{"completed_items" => 2, "completed_item_digests" => [digest, digest]}),
+      Map.merge(receipt, %{"highest_frame_class" => "delta", "write_failure" => "timeout"}),
+      Map.put(receipt, "completed_items", -1),
+      Map.put(receipt, "completed_items", "2"),
+      Map.put(receipt, "write_failure", prompt_injection),
+      Map.put(receipt, "write_failure", nil)
+    ]
+
+    for {receipt, index} <- Enum.with_index(receipts, 1) do
+      attempt_fixture(request, assignment, %{attempt_number: index, status: "failed", response_metadata: %{"downstream_delivery" => receipt}})
+    end
+
+    assert %{items: [admin_log], total: 1} = Accounting.list_request_logs(pool, surface: :admin)
+    projected = Map.new(admin_log.debug.attempts, &{&1.attempt_number, Map.get(&1, :downstream_delivery)})
+
+    assert %{completed_items: 2, write_failure: nil, highest_frame_class: "item_done"} = projected[1]
+    assert %{completed_items: nil, write_failure: "timeout", highest_frame_class: "delta"} = projected[2]
+    assert is_nil(projected[3])
+    assert is_nil(projected[4])
+    assert is_nil(projected[5])
+    assert is_nil(projected[6])
+    refute Map.has_key?(projected[1], :completed_item_digests)
+    refute inspect(admin_log.debug.attempts) =~ digest
+    refute inspect(admin_log.debug.attempts) =~ prompt_injection
+  end
+
+  test "request log failed rows retain semantic errors and fact-backed list behavior before terminal diagnostics" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-terminal-diagnostic-baseline",
+        status: "failed",
+        last_error_code: "invalid_compaction_response",
+        correlation_id: "terminal-diagnostic-baseline"
+      })
+
+    attempt =
+      attempt_fixture(request, assignment, %{
+        status: "failed",
+        network_error_code: "invalid_compaction_response",
+        response_metadata: %{
+          "upstream_error_code" => "context_length_exceeded",
+          "stream_terminal_type" => "response.failed",
+          "upstream_error_param" => "input"
+        }
+      })
+
+    assert %{items: [log], total: 1} =
+             Accounting.list_request_logs(pool, filters: [status: "failed"])
+
+    assert log.debug.failure == %{
+             error_code: "invalid_compaction_response",
+             error_source: "request_error"
+           }
+
+    assert Enum.any?(log.errors, fn error ->
+             error.source == "request" and error.code == "invalid_compaction_response"
+           end)
+
+    assert Enum.any?(log.errors, fn error ->
+             error.source == "attempt" and error.attempt_number == attempt.attempt_number and
+               error.code == "invalid_compaction_response"
+           end)
+
+    refute Enum.any?(log.errors, &(&1.code == "context_length_exceeded"))
+
+    fact = Repo.get!(RequestLogFact, request.id)
+    assert fact.latest_attempt_id == attempt.id
+    assert fact.latest_attempt_status == "failed"
+    assert fact.latest_network_error_code == "invalid_compaction_response"
+  end
+
   test "request log detail projects only valid upstream error parameters from failed attempts" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
     %{assignment: assignment} = upstream_assignment_fixture(pool)
     raw_message = "raw upstream error message must stay hidden"
-    raw_value = "https://example.com/raw-error-value"
+    invalid_param_url = "https://example.com/raw-error-value"
     raw_frame = ~s({"type":"error","message":"raw websocket frame"})
     raw_header = "Bearer hidden-header-value"
     raw_prompt = "raw upstream prompt must stay hidden"
@@ -728,7 +1057,7 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
         response_metadata: %{
           "upstream_error_param" => "reasoning.summary",
           "raw_message" => raw_message,
-          "value" => raw_value,
+          "value" => invalid_param_url,
           "websocket_frame" => raw_frame,
           "headers" => %{"authorization" => raw_header},
           "prompt" => raw_prompt,
@@ -740,7 +1069,7 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
       attempt_fixture(request, assignment, %{
         attempt_number: 2,
         status: "failed",
-        response_metadata: %{"upstream_error_param" => raw_value}
+        response_metadata: %{"upstream_error_param" => invalid_param_url}
       })
 
     succeeded_attempt =
@@ -769,10 +1098,474 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
       refute Map.has_key?(projected_attempt, :upstream_error_param)
     end
 
-    for forbidden <- [raw_message, raw_value, raw_frame, raw_header, raw_prompt, raw_body] do
+    for forbidden <- [raw_message, invalid_param_url, raw_frame, raw_header, raw_prompt, raw_body] do
       refute inspect(log) =~ forbidden
       refute captured_logs =~ forbidden
     end
+  end
+
+  test "request log detail projects bounded terminal diagnostics for retryable and final failed attempts" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-terminal-diagnostic-detail",
+        status: "failed",
+        last_error_code: "invalid_compaction_response",
+        correlation_id: "terminal-diagnostic-detail"
+      })
+
+    retryable_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 1,
+        status: "retryable_failed",
+        retryable: true,
+        network_error_code: "invalid_compaction_response",
+        response_metadata: %{
+          "upstream_error_code" => "context_length_exceeded",
+          "stream_terminal_type" => "response.failed",
+          "upstream_error_param" => "input"
+        }
+      })
+
+    final_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 2,
+        status: "failed",
+        retryable: false,
+        network_error_code: "invalid_compaction_response",
+        response_metadata: %{
+          "upstream_error_code" => "sha256_0123456789ab",
+          "stream_terminal_type" => "response.incomplete",
+          "upstream_error_param" => "input[0].content"
+        }
+      })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+
+    assert log.debug.failure == %{
+             error_code: "invalid_compaction_response",
+             error_source: "request_error"
+           }
+
+    assert Enum.any?(
+             log.errors,
+             &(&1.source == "request" and &1.code == "invalid_compaction_response")
+           )
+
+    assert Enum.any?(log.errors, fn error ->
+             error.source == "attempt" and error.attempt_number == final_attempt.attempt_number and
+               error.code == "invalid_compaction_response"
+           end)
+
+    refute Enum.any?(log.errors, &(&1.code in ["context_length_exceeded", "sha256_0123456789ab"]))
+
+    retryable_projection =
+      Enum.find(log.debug.attempts, &(&1.attempt_number == retryable_attempt.attempt_number))
+
+    assert Map.take(retryable_projection, [
+             :upstream_error_code,
+             :stream_terminal_type,
+             :upstream_error_param
+           ]) == %{
+             upstream_error_code: "context_length_exceeded",
+             stream_terminal_type: "response.failed",
+             upstream_error_param: "input"
+           }
+
+    final_projection =
+      Enum.find(log.debug.attempts, &(&1.attempt_number == final_attempt.attempt_number))
+
+    assert Map.take(final_projection, [
+             :upstream_error_code,
+             :stream_terminal_type,
+             :upstream_error_param
+           ]) == %{
+             upstream_error_code: "sha256_0123456789ab",
+             stream_terminal_type: "response.incomplete",
+             upstream_error_param: "input[0].content"
+           }
+  end
+
+  test "request log detail retains readable terminal identifiers and fingerprints malformed identifiers" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    readable_identifier = "authorization.value"
+    readable_bearer_identifier = "bearer_expired"
+    readable_authorization_identifier = "invalid_authorization_value"
+    safe_unknown_event = "provider.event-v2"
+    malformed_url_identifier = "https://example.com/not-an-identifier"
+    malformed_event = "response\nfailed"
+    overlong_identifier = String.duplicate("x", 81)
+    invalid_param_url = "https://example.com/not-a-param"
+    raw_body = "terminal body must remain private"
+    raw_frame = ~s({"type":"error","message":"terminal frame must remain private"})
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-terminal-diagnostic-redaction",
+        status: "failed",
+        last_error_code: "invalid_compaction_response",
+        correlation_id: "terminal-diagnostic-redaction"
+      })
+
+    readable_identifier_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 1,
+        status: "failed",
+        network_error_code: "invalid_compaction_response",
+        response_metadata: %{
+          "upstream_error_code" => readable_identifier,
+          "stream_terminal_type" => "response.failed",
+          "upstream_error_param" => "input",
+          "body" => raw_body,
+          "websocket_frame" => raw_frame
+        }
+      })
+
+    readable_unknown_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 2,
+        status: "retryable_failed",
+        retryable: true,
+        network_error_code: "invalid_compaction_response",
+        response_metadata: %{
+          "upstream_error_code" => readable_bearer_identifier,
+          "stream_terminal_type" => safe_unknown_event,
+          "upstream_error_param" => "input[0].content"
+        }
+      })
+
+    readable_authorization_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 3,
+        status: "failed",
+        network_error_code: "invalid_compaction_response",
+        response_metadata: %{
+          "upstream_error_code" => readable_authorization_identifier,
+          "stream_terminal_type" => "response.incomplete",
+          "upstream_error_param" => "input"
+        }
+      })
+
+    malformed_identifier_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 4,
+        status: "failed",
+        response_metadata: %{
+          "upstream_error_code" => malformed_url_identifier,
+          "stream_terminal_type" => malformed_event,
+          "upstream_error_param" => invalid_param_url,
+          "body" => raw_body,
+          "websocket_frame" => raw_frame
+        }
+      })
+
+    overlong_identifier_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 5,
+        status: "failed",
+        response_metadata: %{
+          "upstream_error_code" => overlong_identifier,
+          "stream_terminal_type" => overlong_identifier,
+          "upstream_error_param" => %{"invalid" => "shape"}
+        }
+      })
+
+    succeeded_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 6,
+        status: "succeeded",
+        response_metadata: %{
+          "upstream_error_code" => "context_length_exceeded",
+          "stream_terminal_type" => "response.failed",
+          "upstream_error_param" => "input"
+        }
+      })
+
+    historical_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 7,
+        status: "failed",
+        response_metadata: %{}
+      })
+
+    {log, captured_logs} =
+      with_log(fn ->
+        assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+        log
+      end)
+
+    readable_identifier_projection =
+      Enum.find(
+        log.debug.attempts,
+        &(&1.attempt_number == readable_identifier_attempt.attempt_number)
+      )
+
+    assert Map.take(readable_identifier_projection, [
+             :upstream_error_code,
+             :stream_terminal_type,
+             :upstream_error_param
+           ]) == %{
+             upstream_error_code: readable_identifier,
+             stream_terminal_type: "response.failed",
+             upstream_error_param: "input"
+           }
+
+    readable_unknown_projection =
+      Enum.find(
+        log.debug.attempts,
+        &(&1.attempt_number == readable_unknown_attempt.attempt_number)
+      )
+
+    assert Map.take(readable_unknown_projection, [
+             :upstream_error_code,
+             :stream_terminal_type,
+             :upstream_error_param
+           ]) == %{
+             upstream_error_code: readable_bearer_identifier,
+             stream_terminal_type: safe_unknown_event,
+             upstream_error_param: "input[0].content"
+           }
+
+    readable_authorization_projection =
+      Enum.find(
+        log.debug.attempts,
+        &(&1.attempt_number == readable_authorization_attempt.attempt_number)
+      )
+
+    assert Map.take(readable_authorization_projection, [
+             :upstream_error_code,
+             :stream_terminal_type,
+             :upstream_error_param
+           ]) == %{
+             upstream_error_code: readable_authorization_identifier,
+             stream_terminal_type: "response.incomplete",
+             upstream_error_param: "input"
+           }
+
+    for attempt <- [malformed_identifier_attempt, overlong_identifier_attempt] do
+      projected_attempt =
+        Enum.find(log.debug.attempts, &(&1.attempt_number == attempt.attempt_number))
+
+      assert projected_attempt.upstream_error_code =~ ~r/\Asha256_[0-9a-f]{12}\z/
+      assert projected_attempt.stream_terminal_type =~ ~r/\Asha256_[0-9a-f]{12}\z/
+      refute Map.has_key?(projected_attempt, :upstream_error_param)
+    end
+
+    for attempt <- [succeeded_attempt, historical_attempt] do
+      projected_attempt =
+        Enum.find(log.debug.attempts, &(&1.attempt_number == attempt.attempt_number))
+
+      refute Map.has_key?(projected_attempt, :upstream_error_code)
+      refute Map.has_key?(projected_attempt, :stream_terminal_type)
+      refute Map.has_key?(projected_attempt, :upstream_error_param)
+    end
+
+    for forbidden <- [
+          malformed_url_identifier,
+          malformed_event,
+          overlong_identifier,
+          raw_body,
+          raw_frame
+        ] do
+      refute inspect(log) =~ forbidden
+      refute captured_logs =~ forbidden
+    end
+  end
+
+  test "request log detail revalidates grouped rejection metadata and preserves false" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-rejection-metadata",
+        status: "failed",
+        correlation_id: "rejection-metadata-detail"
+      })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      response_metadata: %{
+        "rejection_error_code" => "invalid_request",
+        "rejection_error_type" => "invalid_request_error",
+        "rejection_error_param" => "input[0].content",
+        "rejection_message_present" => false,
+        "rejection_message_bytes" => 0
+      }
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      status: "failed",
+      response_metadata: %{
+        "rejection_error_code" => String.duplicate("x", 81),
+        "rejection_error_param" => "https://example.com/not-a-path",
+        "rejection_message_present" => true,
+        "rejection_message_bytes" => 2_000
+      }
+    })
+
+    assert %{items: [log]} = Accounting.list_request_logs(pool)
+    [valid, invalid] = log.debug.attempts
+
+    assert valid.rejection_error_code == "invalid_request"
+    assert valid.rejection_error_type == "invalid_request_error"
+    assert valid.rejection_error_param == "input[0].content"
+    assert valid.rejection_message_present == false
+    assert valid.rejection_message_bytes == 0
+
+    refute Enum.any?(
+             Map.keys(invalid),
+             &(&1 in ~w(rejection_error_code rejection_error_param rejection_message_present rejection_message_bytes)a)
+           )
+  end
+
+  # The four supported-values outcomes must stay readable apart in the drawer:
+  # a parsed list, a provider that named none, a list this parser refused, and a
+  # rejection the field never applied to (codex-pooler-findings#177).
+  test "request log detail keeps the supported-values states distinct and revalidates the list" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-supported-values",
+        status: "failed",
+        correlation_id: "supported-values-detail"
+      })
+
+    metadata = [
+      %{
+        "rejection_supported_values_state" => "present",
+        "rejection_supported_values" => ~w(low medium high)
+      },
+      %{"rejection_supported_values_state" => "none"},
+      %{"rejection_supported_values_state" => "unparseable"},
+      %{},
+      # A row whose stored list no longer satisfies the parser's own bounds
+      # keeps its state and drops only the list.
+      %{
+        "rejection_supported_values_state" => "present",
+        "rejection_supported_values" => ["low", "a value with spaces"]
+      },
+      # An unrecognized state is not a state.
+      %{
+        "rejection_supported_values_state" => "probably",
+        "rejection_supported_values" => ~w(low)
+      }
+    ]
+
+    for {response_metadata, index} <- Enum.with_index(metadata, 1) do
+      attempt_fixture(request, assignment, %{
+        attempt_number: index,
+        status: "failed",
+        response_metadata: response_metadata
+      })
+    end
+
+    assert %{items: [log]} = Accounting.list_request_logs(pool)
+    [present, none, unparseable, absent, invalid_list, invalid_state] = log.debug.attempts
+
+    assert present.rejection_supported_values_state == "present"
+    assert present.rejection_supported_values == ~w(low medium high)
+
+    assert none.rejection_supported_values_state == "none"
+    refute Map.has_key?(none, :rejection_supported_values)
+
+    assert unparseable.rejection_supported_values_state == "unparseable"
+    refute Map.has_key?(unparseable, :rejection_supported_values)
+
+    refute Map.has_key?(absent, :rejection_supported_values_state)
+    refute Map.has_key?(absent, :rejection_supported_values)
+
+    assert invalid_list.rejection_supported_values_state == "present"
+    refute Map.has_key?(invalid_list, :rejection_supported_values)
+
+    refute Map.has_key?(invalid_state, :rejection_supported_values_state)
+    refute Map.has_key?(invalid_state, :rejection_supported_values)
+  end
+
+  test "request log detail projects bounded peer close diagnostics only through transport failure" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    raw_reason = "peer-close-private-sentinel-cafebabedeadbeef"
+    lifecycle_id = Ecto.UUID.generate()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-peer-close-debug",
+        status: "failed",
+        correlation_id: "peer-close-debug"
+      })
+
+    response_metadata =
+      Accounting.sanitize_metadata(%{
+        "transport_failure" => %{
+          "reason" => "upstream_websocket_closed_before_terminal",
+          "reason_class" => "upstream_websocket_closed_before_terminal",
+          "phase" => "upstream_close",
+          "pre_visible_output" => true,
+          "terminal_seen" => false,
+          "text_frame_count" => 0,
+          "peer_close_code" => 1000,
+          "peer_close_reason_present" => true,
+          "peer_close_reason_bytes" => byte_size(raw_reason),
+          "peer_close_reason" => raw_reason
+        },
+        "upstream_websocket_connection" => %{
+          "lifecycle_id" => lifecycle_id,
+          "generation" => 1,
+          "reused" => false,
+          "reconnected" => false
+        }
+      })
+
+    request
+    |> attempt_fixture(assignment, %{status: "failed", response_metadata: response_metadata})
+    |> Ecto.Changeset.change(%{
+      network_error_code: "upstream_websocket_closed_before_terminal",
+      error_message: "upstream_websocket_closed_before_terminal"
+    })
+    |> Repo.update!()
+
+    {log, captured_logs} =
+      with_log(fn ->
+        assert %{items: [log], total: 1} =
+                 Accounting.list_request_logs(pool, surface: :admin)
+
+        log
+      end)
+
+    assert [attempt] = log.debug.attempts
+
+    assert attempt.transport_failure == %{
+             reason: "upstream_websocket_closed_before_terminal",
+             reason_class: "upstream_websocket_closed_before_terminal",
+             phase: "upstream_close",
+             pre_visible_output: true,
+             terminal_seen: false,
+             text_frame_count: 0,
+             peer_close_code: 1000,
+             peer_close_reason_present: true,
+             peer_close_reason_bytes: byte_size(raw_reason)
+           }
+
+    assert attempt.upstream_websocket_connection == %{
+             lifecycle_id: lifecycle_id,
+             generation: 1,
+             reused: false,
+             reconnected: false
+           }
+
+    assert Enum.sort(Map.keys(attempt.upstream_websocket_connection)) ==
+             [:generation, :lifecycle_id, :reconnected, :reused]
+
+    refute inspect(log) =~ raw_reason
+    refute captured_logs =~ raw_reason
   end
 
   defp debug_turn_fixture(pool, api_key, assignment, request, final_attempt_id) do
@@ -783,7 +1576,6 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
         pool_id: pool.id,
         api_key_id: api_key.id,
         session_key: "session-key-#{request.correlation_id}",
-        conversation_key: "conversation-#{request.correlation_id}",
         pool_upstream_assignment_id: assignment.id,
         status: "active",
         owner_instance_id: "test-instance",

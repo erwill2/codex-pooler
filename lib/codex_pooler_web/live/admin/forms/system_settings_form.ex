@@ -4,6 +4,8 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
   import Phoenix.Component, only: [to_form: 2]
 
   alias CodexPooler.InstanceSettings.Settings
+  alias CodexPooler.RouteClass
+  alias CodexPoolerWeb.Admin.SystemSettingsGroupContract
 
   @json_fields [{"gateway", "bulkheads"}, {"gateway", "model_context_window_overrides"}]
   @array_fields [
@@ -11,14 +13,18 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
     {"ingress", "trusted_proxies"},
     {"ingress", "decompression_algorithms"}
   ]
-  @settings_groups ~w(gateway ingress files transcription operator catalog development mcp metrics smtp)
-
+  @bulkhead_fields ~w(max_concurrency queue_limit queue_timeout_ms)
+  @bulkhead_presets [default: 1, medium: 2, large: 4]
   @spec settings_groups() :: [String.t()]
-  def settings_groups, do: @settings_groups
+  def settings_groups, do: SystemSettingsGroupContract.groups()
+
+  @spec forwarded_client_ip_source_options() :: [{String.t(), String.t()}]
+  def forwarded_client_ip_source_options,
+    do: SystemSettingsGroupContract.forwarded_client_ip_source_options()
 
   @spec forms(Settings.t(), map()) :: map()
   def forms(%Settings{} = settings, form_params) do
-    Map.new(@settings_groups, fn group ->
+    Map.new(settings_groups(), fn group ->
       changeset = group_changeset(settings, form_params, group)
       {group, to_form(changeset, as: :instance_settings)}
     end)
@@ -35,7 +41,7 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
   def params_for_group_changeset(%Settings{} = settings, form_params, group) do
     settings
     |> params_from_settings()
-    |> Map.put(group, Map.get(form_params, group, %{}))
+    |> put_group_members(form_params, group)
     |> Map.put("lock_version", Map.get(form_params, "lock_version", settings.lock_version))
   end
 
@@ -43,7 +49,7 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
   def group_only_params(%Settings{} = settings, form_params, group) do
     settings
     |> params_from_settings()
-    |> Map.put(group, Map.get(form_params, group, %{}))
+    |> put_group_members(form_params, group)
     |> Map.put("lock_version", settings.lock_version)
     |> normalize_params()
   end
@@ -51,7 +57,7 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
   @spec merge_group_params(map(), String.t(), map()) :: map()
   def merge_group_params(form_params, group, params) do
     form_params
-    |> Map.put(group, Map.get(params, group, %{}))
+    |> merge_group_members(params, group)
     |> Map.put("lock_version", Map.get(params, "lock_version", form_params["lock_version"]))
   end
 
@@ -61,42 +67,48 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
   @spec submitted_group(map()) :: String.t()
   def submitted_group(params) do
     case Map.get(params, "_group") do
-      group when group in @settings_groups ->
-        group
+      group when is_binary(group) ->
+        if SystemSettingsGroupContract.known?(group),
+          do: group,
+          else: infer_submitted_group(params)
 
       _missing_or_invalid ->
-        params
-        |> Map.keys()
-        |> Enum.find("gateway", &(&1 in @settings_groups))
+        infer_submitted_group(params)
     end
   end
 
   @spec group_snapshots(map()) :: map()
-  def group_snapshots(params), do: Map.new(@settings_groups, &{&1, Map.get(params, &1, %{})})
+  def group_snapshots(params),
+    do: Map.new(settings_groups(), &{&1, Map.get(params, &1, %{})})
 
   @spec initial_card_statuses() :: map()
-  def initial_card_statuses, do: Map.new(@settings_groups, &{&1, nil})
+  def initial_card_statuses, do: Map.new(settings_groups(), &{&1, nil})
 
   @spec group_stale?(map(), Settings.t(), String.t()) :: boolean()
   def group_stale?(group_snapshots, %Settings{} = latest_settings, group) do
-    latest_group = latest_settings |> params_from_settings() |> Map.get(group, %{})
-    Map.get(group_snapshots, group, %{}) != latest_group
+    latest_params = params_from_settings(latest_settings)
+
+    Enum.any?(SystemSettingsGroupContract.members(group), fn member ->
+      Map.get(group_snapshots, member, %{}) != Map.get(latest_params, member, %{})
+    end)
   end
 
   @spec refresh_saved_group_params(map(), map(), String.t()) :: map()
   def refresh_saved_group_params(form_params, saved_params, group) do
     form_params
-    |> Map.put(group, Map.fetch!(saved_params, group))
+    |> put_group_members(saved_params, group)
     |> Map.put("lock_version", saved_params["lock_version"])
   end
 
   @spec refresh_group_snapshots(map(), map(), String.t()) :: map()
   def refresh_group_snapshots(assigns, saved_params, saved_group) do
-    Map.new(@settings_groups, fn group ->
-      dirty? = dirty_group?(assigns.form_params, assigns.group_snapshots, group)
+    saved_members = SystemSettingsGroupContract.members(saved_group)
+
+    Map.new(settings_groups(), fn group ->
+      dirty? = dirty_member?(assigns.form_params, assigns.group_snapshots, group)
 
       cond do
-        group == saved_group -> {group, Map.fetch!(saved_params, group)}
+        group in saved_members -> {group, Map.fetch!(saved_params, group)}
         dirty? -> {group, Map.fetch!(assigns.group_snapshots, group)}
         true -> {group, Map.fetch!(saved_params, group)}
       end
@@ -105,7 +117,7 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
 
   @spec saved_card_statuses(map(), map(), String.t()) :: map()
   def saved_card_statuses(form_params, group_snapshots, saved_group) do
-    Map.new(@settings_groups, fn group ->
+    Map.new(settings_groups(), fn group ->
       cond do
         group == saved_group ->
           {group, %{tone: :success, message: "Saved"}}
@@ -128,7 +140,10 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
 
   @spec dirty_group?(map(), map(), String.t()) :: boolean()
   def dirty_group?(form_params, group_snapshots, group) do
-    Map.get(form_params, group, %{}) != Map.get(group_snapshots, group, %{})
+    Enum.any?(
+      SystemSettingsGroupContract.members(group),
+      &dirty_member?(form_params, group_snapshots, &1)
+    )
   end
 
   @spec normalize_params(map()) :: map()
@@ -137,9 +152,62 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
     |> strip_form_meta()
     |> normalize_array_fields()
     |> normalize_json_fields()
+    |> normalize_bulkhead_fields()
     |> normalize_write_only("metrics", "bearer_token", "bearer_token_action")
     |> normalize_write_only("smtp", "password", "password_action")
   end
+
+  @spec apply_bulkhead_preset(map(), String.t()) :: {:ok, map()} | :error
+  def apply_bulkhead_preset(form_params, preset) when is_map(form_params) and is_binary(preset) do
+    with {_preset_id, multiplier} <-
+           Enum.find(@bulkhead_presets, fn {preset_id, _multiplier} ->
+             Atom.to_string(preset_id) == preset
+           end),
+         %{} = gateway <- Map.get(form_params, "gateway"),
+         %{} = current <- Map.get(gateway, "bulkheads") do
+      defaults = RouteClass.default_bulkheads()
+
+      bulkheads =
+        Map.new(RouteClass.all(), fn route_class ->
+          current_config = Map.get(current, route_class, %{})
+          default_config = Map.fetch!(defaults, route_class)
+
+          config = preset_bulkhead_config(route_class, current_config, default_config, multiplier)
+
+          {route_class, config}
+        end)
+
+      {:ok, put_in(form_params, ["gateway", "bulkheads"], bulkheads)}
+    else
+      _invalid -> :error
+    end
+  end
+
+  @spec restore_gateway_group_defaults(map(), String.t()) :: {:ok, map()} | :error
+  def restore_gateway_group_defaults(form_params, group)
+      when is_map(form_params) and is_binary(group) do
+    with {:ok, {settings_group, fields, defaults}} <-
+           SystemSettingsGroupContract.runtime_reset(group),
+         %{} = current <- Map.get(form_params, settings_group) do
+      restored =
+        Enum.reduce(fields, current, fn field, values ->
+          Map.put(values, field, Map.fetch!(defaults, field))
+        end)
+
+      {:ok, Map.put(form_params, settings_group, restored)}
+    else
+      _invalid -> :error
+    end
+  end
+
+  @spec bulkhead_preset(map()) :: :default | :medium | :large | :custom
+  def bulkhead_preset(bulkheads) when is_map(bulkheads) do
+    Enum.find_value(@bulkhead_presets, :custom, fn {preset, multiplier} ->
+      if bulkhead_preset_matches?(bulkheads, multiplier), do: preset
+    end)
+  end
+
+  def bulkhead_preset(_bulkheads), do: :custom
 
   @spec params_from_settings(Settings.t()) :: map()
   def params_from_settings(%Settings{} = settings) do
@@ -198,6 +266,54 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
 
   defp normalize_json_fields(params),
     do: Enum.reduce(@json_fields, params, &normalize_json_field/2)
+
+  defp normalize_bulkhead_fields(params) do
+    update_nested(params, "gateway", "bulkheads", fn
+      bulkheads when is_map(bulkheads) ->
+        Map.new(bulkheads, fn {route_class, config} ->
+          {route_class, normalize_bulkhead_config(config)}
+        end)
+
+      invalid ->
+        invalid
+    end)
+  end
+
+  defp normalize_bulkhead_field(field, config) do
+    atom_field = bulkhead_field_atom(field)
+
+    cond do
+      Map.has_key?(config, field) -> Map.update!(config, field, &normalize_integer/1)
+      Map.has_key?(config, atom_field) -> Map.update!(config, atom_field, &normalize_integer/1)
+      true -> config
+    end
+  end
+
+  defp normalize_bulkhead_config(config) when is_map(config) do
+    config
+    |> Map.reject(fn
+      {"_unused_" <> _field, _value} -> true
+      _field -> false
+    end)
+    |> then(
+      &Enum.reduce(@bulkhead_fields, &1, fn field, values ->
+        normalize_bulkhead_field(field, values)
+      end)
+    )
+  end
+
+  defp normalize_bulkhead_config(config), do: config
+
+  defp normalize_integer(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    case Integer.parse(trimmed) do
+      {integer, ""} -> integer
+      _invalid -> value
+    end
+  end
+
+  defp normalize_integer(value), do: value
 
   defp normalize_array_field({group, field}, params) do
     update_nested(params, group, field, fn
@@ -264,12 +380,61 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
     if value == "" do
       %{}
     else
-      case Jason.decode(value) do
+      case CodexPooler.JSON.decode(value) do
         {:ok, decoded} when is_map(decoded) -> decoded
         _invalid -> value
       end
     end
   end
+
+  defp bulkhead_preset_matches?(bulkheads, multiplier) do
+    defaults = RouteClass.default_bulkheads()
+
+    RouteClass.all()
+    |> Enum.reject(&(&1 == RouteClass.proxy_control()))
+    |> Enum.all?(fn route_class ->
+      current = Map.get(bulkheads, route_class, %{})
+      default = Map.fetch!(defaults, route_class)
+
+      bulkhead_value(current, "max_concurrency") ==
+        bulkhead_value(default, "max_concurrency") * multiplier and
+        bulkhead_value(current, "queue_limit") ==
+          bulkhead_value(default, "queue_limit") * multiplier
+    end)
+  end
+
+  defp bulkhead_config(current, default) do
+    Map.new(@bulkhead_fields, fn field ->
+      {field, bulkhead_value(current, field) || bulkhead_value(default, field)}
+    end)
+  end
+
+  defp preset_bulkhead_config(route_class, current, default, multiplier) do
+    if route_class == RouteClass.proxy_control() do
+      bulkhead_config(current, default)
+    else
+      %{
+        "max_concurrency" => bulkhead_value(default, "max_concurrency") * multiplier,
+        "queue_limit" => bulkhead_value(default, "queue_limit") * multiplier,
+        "queue_timeout_ms" =>
+          bulkhead_value(current, "queue_timeout_ms") ||
+            bulkhead_value(default, "queue_timeout_ms")
+      }
+    end
+  end
+
+  defp bulkhead_value(config, "max_concurrency"),
+    do: Map.get(config, "max_concurrency", Map.get(config, :max_concurrency))
+
+  defp bulkhead_value(config, "queue_limit"),
+    do: Map.get(config, "queue_limit", Map.get(config, :queue_limit))
+
+  defp bulkhead_value(config, "queue_timeout_ms"),
+    do: Map.get(config, "queue_timeout_ms", Map.get(config, :queue_timeout_ms))
+
+  defp bulkhead_field_atom("max_concurrency"), do: :max_concurrency
+  defp bulkhead_field_atom("queue_limit"), do: :queue_limit
+  defp bulkhead_field_atom("queue_timeout_ms"), do: :queue_timeout_ms
 
   defp stringify_keys(map), do: Map.new(map, fn {key, value} -> {to_string(key), value} end)
 
@@ -281,4 +446,28 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsForm do
   end
 
   defp blank_to_nil(value), do: value
+
+  defp put_group_members(params, group_params, group) do
+    Enum.reduce(SystemSettingsGroupContract.members(group), params, fn member, acc ->
+      Map.put(acc, member, Map.get(group_params, member, Map.get(acc, member, %{})))
+    end)
+  end
+
+  defp merge_group_members(form_params, params, group) do
+    Enum.reduce(SystemSettingsGroupContract.members(group), form_params, fn member, acc ->
+      if Map.has_key?(params, member),
+        do: Map.put(acc, member, Map.fetch!(params, member)),
+        else: acc
+    end)
+  end
+
+  defp infer_submitted_group(params) do
+    params
+    |> Map.keys()
+    |> Enum.find("gateway", &SystemSettingsGroupContract.known?/1)
+  end
+
+  defp dirty_member?(form_params, group_snapshots, group) do
+    Map.get(form_params, group, %{}) != Map.get(group_snapshots, group, %{})
+  end
 end

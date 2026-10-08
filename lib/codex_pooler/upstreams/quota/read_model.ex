@@ -5,8 +5,10 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
 
   import Ecto.Query
 
+  alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.WindowSelector
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
@@ -16,17 +18,22 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
   def account_summaries_for_pool_ids(pool_ids, as_of) do
     assignments = assignments_for_pool_ids(pool_ids)
 
-    windows_by_identity_id =
+    snapshots_by_identity_id =
       assignments
       |> Enum.map(& &1.upstream_identity_id)
-      |> quota_windows_by_identity_id(as_of)
+      |> RoutingQuotaSnapshot.load_by_identity_ids(as_of)
 
     Enum.map(assignments, fn assignment ->
-      windows = Map.get(windows_by_identity_id, assignment.upstream_identity_id, [])
+      snapshot = Map.fetch!(snapshots_by_identity_id, assignment.upstream_identity_id)
+      windows = RoutingQuotaSnapshot.effective_windows(snapshot)
       primary = find_primary_5h_window(windows, as_of)
       monthly_primary = find_primary_30d_window(windows, as_of)
       secondary = find_secondary_window(windows, as_of)
-      state = quota_state(primary || monthly_primary, secondary, windows, as_of)
+
+      state =
+        snapshot
+        |> Quota.Windows.routing_quota_eligibility_from_snapshot(account_only: true)
+        |> quota_state_from_snapshot(primary || monthly_primary, secondary, windows, as_of)
 
       %{
         pool_id: assignment.pool_id,
@@ -36,6 +43,7 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
         health_status: assignment.health_status,
         upstream_identity_id: assignment.upstream_identity_id,
         upstream_label: assignment.upstream_label,
+        upstream_status: assignment.upstream_status,
         plan_family: assignment.plan_family,
         state: state,
         primary_5h: quota_window_summary(primary, as_of),
@@ -44,6 +52,13 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
         evidence_count: length(windows)
       }
     end)
+  end
+
+  @doc "Whether a projected account still belongs to the current inventory of its Pool."
+  @spec current_account?(map()) :: boolean()
+  def current_account?(account) do
+    account.upstream_status != UpstreamIdentity.deleted_status() and
+      account.assignment_status != PoolUpstreamAssignment.deleted_status()
   end
 
   @spec summary([map()]) :: map()
@@ -87,21 +102,51 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
           health_status: assignment.health_status,
           upstream_identity_id: identity.id,
           upstream_label: identity.account_label,
+          upstream_status: identity.status,
           plan_family: identity.plan_family
         }
     )
   end
 
-  defp quota_windows_by_identity_id([], _as_of), do: %{}
+  defp quota_state_from_snapshot(
+         %{eligible?: true, routing_state: :windowless_provider_available},
+         _primary,
+         _secondary,
+         _windows,
+         _as_of
+       ),
+       do: :available
 
-  # Effective windows (logical fold plus superseded-primary rejection) keep
-  # bulk stats consistent with routing and admin cards: a frozen 5h primary
-  # whose group kept syncing must classify as weekly-only evidence, not as a
-  # stale primary summary. The caller's as_of drives the effective view so
-  # stats and routing agree at the same instant.
-  defp quota_windows_by_identity_id(identity_ids, as_of) do
-    Quota.Windows.list_quota_windows_by_identity_ids(identity_ids, as_of)
+  defp quota_state_from_snapshot(
+         %{eligible?: true, routing_state: :weekly_only_probe},
+         _primary,
+         _secondary,
+         _windows,
+         _as_of
+       ),
+       do: :weekly_only_evidence
+
+  defp quota_state_from_snapshot(%{eligible?: true}, _primary, _secondary, _windows, _as_of),
+    do: :available
+
+  defp quota_state_from_snapshot(
+         %{routing_state: :blocked, exclusions: exclusions},
+         _primary,
+         _secondary,
+         windows,
+         _as_of
+       ) do
+    cond do
+      Enum.any?(exclusions, &("exhausted" in Map.get(&1, :reason_codes, []))) -> :exhausted
+      windows == [] -> :unknown
+      true -> :missing_evidence
+    end
   end
+
+  defp quota_state_from_snapshot(_eligibility, nil, nil, [], _as_of), do: :unknown
+
+  defp quota_state_from_snapshot(_eligibility, primary, secondary, windows, as_of),
+    do: quota_state(primary, secondary, windows, as_of)
 
   defp find_primary_5h_window(windows, as_of) do
     WindowSelector.best_account_window(windows, :primary_5h, as_of)
@@ -117,7 +162,7 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
 
   defp quota_state(%Quota.AccountQuotaWindow{} = primary, _secondary, _windows, as_of) do
     cond do
-      primary.freshness_state != "fresh" ->
+      Evidence.current_freshness_state(primary, as_of) != "fresh" ->
         :missing_evidence
 
       is_nil(primary.reset_at) ->
@@ -147,12 +192,10 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
       window_minutes: window.window_minutes,
       used_percent: decimal_to_float(window.used_percent),
       reset_at: window.reset_at,
-      freshness_state: window.freshness_state,
+      freshness_state: Evidence.current_freshness_state(window, as_of),
       source: window.source,
       source_precision: window.source_precision,
-      routing_usable?:
-        window.freshness_state == "fresh" and not is_nil(window.reset_at) and
-          DateTime.compare(window.reset_at, as_of) == :gt
+      routing_usable?: Quota.Windows.usable_window?(window, as_of)
     }
   end
 

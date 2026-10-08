@@ -5,7 +5,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
-  @supported_models ~w(gpt-image-1 gpt-image-1.5 gpt-image-1-mini gpt-image-2)
+  @image_25_models ~w(gpt-image-2.5-flare gpt-image-2.5-sunburst gpt-image-2.5-flare-2026-09-08 gpt-image-2.5-sunburst-2026-09-08)
+  @native_models ["gpt-image-2" | @image_25_models]
+  @supported_models ~w(gpt-image-1 gpt-image-1.5 gpt-image-1-mini) ++ @native_models
   @sizes ~w(auto 1024x1024 1024x1536 1536x1024)
   @qualities ~w(auto low medium high)
   @backgrounds ~w(auto transparent opaque)
@@ -29,7 +31,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
              image_payload: map()
            }}
           | {:error, Error.reason()}
-  def coerce_generation(payload, opts \\ %{}) do
+  def coerce_generation(payload, opts \\ %{})
+
+  def coerce_generation(%{"model" => model} = payload, opts)
+      when model in @native_models and not is_map_key(payload, "input_fidelity") and
+             not is_map_key(payload, "mask") do
+    with {:ok, payload} <- normalize_image_payload(payload),
+         :ok <- require_prompt(payload),
+         :ok <- validate_generation_only(payload) do
+      native_response(payload, "generations", opts)
+    end
+  end
+
+  def coerce_generation(payload, opts) do
     with {:ok, %{image_payload: image_payload, response_payload: response_payload}} <-
            prepare_generation(payload),
          {:ok, response} <- Responses.coerce(response_payload, opts) do
@@ -55,29 +69,52 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
              image_payload: map()
            }}
           | {:error, Error.reason()}
-  def coerce_edit(payload, opts \\ %{}) do
-    with {:ok,
-          %{
-            image_payload: image_payload,
-            response_payload: response_payload,
-            images: images,
-            mask: mask
-          }} <-
-           prepare_edit(payload),
-         {:ok, response} <- Responses.coerce(response_payload, opts) do
-      response_payload = put_edit_images(response.payload, image_payload["prompt"], images, mask)
+  def coerce_edit(payload, opts \\ %{})
 
-      {:ok,
-       response |> Map.put(:payload, response_payload) |> Map.put(:image_payload, image_payload)}
+  def coerce_edit(%{"model" => model} = payload, opts)
+      when model in @native_models and not is_map_key(payload, "input_fidelity") and
+             not is_map_key(payload, "mask") do
+    with {:ok, %{image_payload: image_payload, images: images}} <- prepare_edit(payload),
+         {:ok, response} <- native_response(image_payload, "edits", opts) do
+      images = Enum.map(images, &Map.take(&1, ["image_url"]))
+      {:ok, %{response | payload: Map.put(response.payload, "images", images)}}
     end
+  end
+
+  def coerce_edit(payload, opts) do
+    with {:ok, %{image_payload: image_payload, response_payload: response_payload, mask: mask}} <-
+           prepare_edit(payload),
+         opts = Map.put(Map.new(opts), :masked_image_request?, not is_nil(mask)),
+         {:ok, response} <- Responses.coerce(response_payload, opts) do
+      {:ok, Map.put(response, :image_payload, image_payload)}
+    end
+  end
+
+  defp native_response(payload, operation, opts) do
+    endpoint = "/backend-api/codex/images/" <> operation
+    native = payload |> Map.take(~w(model prompt background quality size)) |> Map.put("n", 1)
+
+    options =
+      opts
+      |> Map.new()
+      |> Map.merge(%{
+        upstream_endpoint: endpoint,
+        native_image_request?: true,
+        collect_openai_image_stream: false
+      })
+      |> RequestOptions.build(endpoint, native)
+
+    {:ok, %{endpoint: endpoint, payload: native, image_payload: payload, request_options: options}}
   end
 
   @spec image_response_from_sse(binary()) :: {:ok, map()} | {:error, Error.reason()}
   def image_response_from_sse(body) when is_binary(body) do
     events = decoded_sse_events(body)
 
-    with {:ok, items} <- image_items(events),
+    with :ok <- reject_failed_events(events),
+         {:ok, items} <- image_items(events),
          :ok <- reject_failed_items(items),
+         :ok <- require_completed_event(events),
          data when data != [] <- image_data(items) do
       {:ok,
        %{
@@ -114,6 +151,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
          {:ok, images} <- image_parts(payload),
          {:ok, mask} <- optional_image_part(payload, "mask"),
          {:ok, response_payload} <- response_payload(payload) do
+      response_payload = put_edit_images(response_payload, payload["prompt"], images, mask)
+
       {:ok,
        %{
          image_payload: payload,
@@ -129,14 +168,56 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
          :ok <- Validation.reject_high_impact_fields(payload),
          :ok <- Validation.reject_unsupported_fields(payload, :images),
          :ok <- validate_model(payload),
-         :ok <- validate_one_of(payload, "size", @sizes),
-         :ok <- validate_one_of(payload, "quality", @qualities),
+         :ok <- validate_size(payload),
+         :ok <- validate_quality(payload),
          :ok <- validate_one_of(payload, "background", @backgrounds),
-         :ok <- validate_one_of(payload, "input_fidelity", @input_fidelities),
-         :ok <- validate_n(payload) do
-      {:ok, payload}
+         :ok <- validate_input_fidelity(payload),
+         :ok <- validate_n(payload),
+         :ok <- validate_one_of(payload, "response_format", ["b64_json"]) do
+      discard_user_identifier(payload)
     end
   end
+
+  defp validate_quality(%{"model" => model} = payload) when model in @image_25_models,
+    do: validate_one_of(payload, "quality", @qualities ++ ~w(xhigh max))
+
+  defp validate_quality(payload), do: validate_one_of(payload, "quality", @qualities)
+
+  defp validate_size(%{"model" => model, "size" => size})
+       when model in @image_25_models and is_binary(size) and size != "auto" do
+    if valid_dimensions?(size),
+      do: :ok,
+      else: {:error, Error.invalid_request("size is not supported", "size")}
+  end
+
+  defp validate_size(payload), do: validate_one_of(payload, "size", @sizes)
+
+  defp valid_dimensions?(size) when byte_size(size) <= 9 do
+    case Regex.run(~r/\A([1-9][0-9]{0,3})x([1-9][0-9]{0,3})\z/, size) do
+      [_, width, height] ->
+        width = String.to_integer(width)
+        height = String.to_integer(height)
+        valid_edges?(width, height) and (width * height) in 655_360..8_294_400
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_dimensions?(_size), do: false
+
+  defp valid_edges?(width, height),
+    do:
+      max(width, height) <= 3840 and rem(width, 16) == 0 and rem(height, 16) == 0 and
+        max(width, height) <= 3 * min(width, height)
+
+  defp validate_input_fidelity(%{"model" => model, "input_fidelity" => _})
+       when model in @native_models or model == "gpt-image-1-mini" do
+    {:error, Error.invalid_request("input_fidelity is not supported for #{model}", "input_fidelity")}
+  end
+
+  defp validate_input_fidelity(payload),
+    do: validate_one_of(payload, "input_fidelity", @input_fidelities)
 
   defp validate_generation_only(%{"image" => _image}),
     do: {:error, Error.invalid_request("image is only supported for image edits", "image")}
@@ -144,7 +225,21 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
   defp validate_generation_only(%{"image[]" => _image}),
     do: {:error, Error.invalid_request("image is only supported for image edits", "image")}
 
+  defp validate_generation_only(%{"mask" => _}),
+    do: {:error, Error.invalid_request("mask is only supported for image edits", "mask")}
+
+  defp validate_generation_only(%{"input_fidelity" => _}),
+    do: {:error, Error.invalid_request("input_fidelity is only supported for image edits", "input_fidelity")}
+
   defp validate_generation_only(_payload), do: :ok
+
+  defp discard_user_identifier(%{"user" => user} = payload) when is_binary(user) or is_nil(user),
+    do: {:ok, Map.delete(payload, "user")}
+
+  defp discard_user_identifier(%{"user" => _}),
+    do: {:error, Error.invalid_request("user must be a string or null", "user")}
+
+  defp discard_user_identifier(payload), do: {:ok, payload}
 
   defp validate_model(%{"model" => model}) when model in @supported_models, do: :ok
 
@@ -252,7 +347,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
        "model" => payload["model"],
        "input" => payload["prompt"],
        "tools" => [tool],
-       "tool_choice" => %{"type" => "image_generation"},
        "store" => false,
        "stream" => true
      }}
@@ -263,11 +357,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
   end
 
   defp put_edit_images(response_payload, prompt, images, mask) do
-    prompt =
-      prompt <>
-        "\n\n(The final attached image is a transparent mask: only modify the regions where the mask is non-transparent.)"
-
-    Map.put(response_payload, "input", [message_input(prompt, images ++ [mask])])
+    response_payload
+    |> Map.put("input", [message_input(prompt, images)])
+    |> Map.update!("tools", fn [tool] ->
+      [Map.put(tool, "input_image_mask", Map.take(mask, ["image_url"]))]
+    end)
+    |> Map.put("tool_choice", %{"type" => "image_generation"})
   end
 
   defp message_input(prompt, images) do
@@ -288,6 +383,30 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
     |> Enum.reject(&(&1 == %{}))
   end
 
+  defp require_completed_event(events) do
+    if Enum.any?(events, &(Map.get(&1, "type") == "response.completed")) do
+      :ok
+    else
+      {:error,
+       Error.reason(
+         502,
+         "image_generation_failed",
+         "upstream image response ended before completion"
+       )}
+    end
+  end
+
+  defp reject_failed_events(events) do
+    if Enum.any?(
+         events,
+         &(Map.get(&1, "type") in ["response.failed", "response.incomplete", "error"])
+       ) do
+      {:error, Error.reason(502, "image_generation_failed", "upstream image generation failed")}
+    else
+      :ok
+    end
+  end
+
   defp image_items(events) do
     items =
       events
@@ -298,10 +417,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
         } ->
           [item]
 
-        %{"response" => %{"output" => output}} when is_list(output) ->
+        %{"type" => type, "response" => %{"output" => output}}
+        when type in ["response.completed", "response.failed", "response.incomplete"] and
+               is_list(output) ->
           Enum.filter(output, &image_item?/1)
 
-        %{"output" => output} when is_list(output) ->
+        %{"type" => type, "output" => output}
+        when type in ["response.completed", "response.failed", "response.incomplete"] and
+               is_list(output) ->
           Enum.filter(output, &image_item?/1)
 
         _event ->
@@ -337,14 +460,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Images do
   end
 
   defp image_item_error(error) do
-    code = Map.get(error, "code") || "image_generation_failed"
-    message = Map.get(error, "message") || "upstream image generation failed"
     status = if Map.get(error, "type") == "invalid_request_error", do: 400, else: 502
-    Error.reason(status, code, message, Map.get(error, "param"))
+    Error.reason(status, "image_generation_failed", "upstream image generation failed")
   end
 
   defp image_data(items) do
     items
+    |> Enum.reverse()
+    |> Enum.uniq_by(&(Map.get(&1, "id") || &1))
+    |> Enum.reverse()
     |> Enum.flat_map(fn item ->
       case Map.get(item, "result") do
         result when is_binary(result) and result != "" -> [image_data_item(result, item)]

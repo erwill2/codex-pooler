@@ -7,8 +7,11 @@ defmodule CodexPoolerWeb.UserAuth do
 
   alias CodexPooler.Accounts
   alias CodexPooler.Accounts.{Scope, SessionNotifier}
+  alias CodexPoolerWeb.Plugs.TrustedProxyRemoteIp
 
   @session_key :user_token
+  # Mirrors Phoenix's local-path validation because this session value is untrusted.
+  @unsafe_return_to_path_fragments ["\\", "/%09", "/\t", "\n", "\r"]
 
   def log_in_user(conn, user, token) when is_binary(token) do
     user_return_to = get_session(conn, :user_return_to)
@@ -140,12 +143,31 @@ defmodule CodexPoolerWeb.UserAuth do
     end
   end
 
+  @spec require_authenticated_password_current(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
+  def require_authenticated_password_current(conn, opts) do
+    conn = require_authenticated_user(conn, opts)
+
+    if not conn.halted and password_change_required?(conn.assigns.current_scope.user) do
+      conn
+      |> redirect(to: ~p"/password/change-required")
+      |> halt()
+    else
+      conn
+    end
+  end
+
   def request_metadata(conn) do
-    %{
-      ip_address: remote_ip(conn),
-      request_id: List.first(get_resp_header(conn, "x-request-id")),
-      user_agent: get_req_header(conn, "user-agent") |> List.first()
-    }
+    Map.merge(
+      %{
+        ip_address: remote_ip(conn),
+        request_id: List.first(get_resp_header(conn, "x-request-id")),
+        user_agent: get_req_header(conn, "user-agent") |> List.first()
+      },
+      case TrustedProxyRemoteIp.peer_provenance(conn) do
+        provenance when map_size(provenance) > 0 -> %{ingress_peer_provenance: provenance}
+        _empty -> %{}
+      end
+    )
   end
 
   defp mount_current_scope(socket, session) do
@@ -190,9 +212,7 @@ defmodule CodexPoolerWeb.UserAuth do
 
   defp attach_user_session_disconnect_hook(socket, user_id) do
     Phoenix.LiveView.attach_hook(socket, :user_session_revocation, :handle_info, fn
-      {:disconnect_user_sessions,
-       %{user_id: ^user_id, except_live_socket_id: except_live_socket_id}},
-      socket ->
+      {:disconnect_user_sessions, %{user_id: ^user_id, except_live_socket_id: except_live_socket_id}}, socket ->
         disconnect_or_keep_user_session(socket, except_live_socket_id)
 
       {:disconnect_user_sessions, %{user_id: ^user_id, session_id: session_id}}, socket ->
@@ -244,7 +264,9 @@ defmodule CodexPoolerWeb.UserAuth do
   defp maybe_store_return_to(conn), do: conn
 
   defp safe_return_to_path(return_to) when is_binary(return_to) do
-    if String.starts_with?(return_to, "/") and not String.starts_with?(return_to, "//") do
+    if String.starts_with?(return_to, "/") and
+         not String.starts_with?(return_to, "//") and
+         not String.contains?(return_to, @unsafe_return_to_path_fragments) do
       return_to
     end
   end

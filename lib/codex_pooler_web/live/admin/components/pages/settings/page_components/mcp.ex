@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPooler.MCP.ProtocolVersions
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -21,7 +22,7 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
     ~H"""
     <section
       id="settings-mcp-panel"
-      class="grid gap-4 rounded-box border border-base-300 bg-base-100 p-5 shadow-sm"
+      class="grid gap-4 rounded-box border border-base-300 bg-base-100 p-5"
     >
       <div class="grid gap-4 lg:grid-cols-[16rem_minmax(0,1fr)]">
         <div class="border-base-300 lg:border-r lg:pr-5">
@@ -110,13 +111,13 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
               </div>
               <div>
                 <p class="text-xs font-semibold uppercase tracking-wide text-base-content/45">
-                  Protocol
+                  Preferred protocol
                 </p>
                 <code
                   id="settings-mcp-protocol"
                   class="mt-1 block rounded-field bg-base-200 px-2 py-1 font-mono text-sm"
                 >
-                  2025-11-25
+                  {ProtocolVersions.current()}
                 </code>
               </div>
               <div>
@@ -186,8 +187,7 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
               <div class="grid min-w-0 gap-1">
                 <p class="truncate font-semibold text-base-content">{key.label}</p>
                 <p class="text-xs text-base-content/55">
-                  Prefix <code class="font-mono">{key.key_prefix}</code>
-                  · Created {datetime_label(key.inserted_at, @datetime_preferences)}
+                  Prefix <code class="font-mono">{key.key_prefix}</code> · Created {datetime_label(key.inserted_at, @datetime_preferences)}
                 </p>
               </div>
 
@@ -235,52 +235,32 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
 
   attr :created_secret, :map, required: true
 
-  defp mcp_created_token_dialog(assigns) do
+  def mcp_created_token_dialog(assigns) do
     ~H"""
-    <dialog id="settings-mcp-created-token-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+    <dialog
+      id="settings-mcp-created-token-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">MCP token</p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Copy this MCP token now</h2>
-          <p class="mt-2 text-sm leading-6 text-base-content/70">
-            This raw token is shown once. Future views only show prefix {@created_secret.key.key_prefix}.
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Copy this token before closing</h2>
+          <p
+            id="settings-mcp-created-token-alert"
+            class="mt-2 text-sm leading-6 text-base-content/70"
+          >
+            It is shown once. Afterwards only the prefix <span class="font-semibold text-base-content">{@created_secret.key.key_prefix}</span> identifies it.
           </p>
         </div>
-        <div class="grid gap-5 p-6">
-          <div id="settings-mcp-created-token-alert" class="alert alert-success items-start">
-            <.icon name="hero-key" class="size-5" />
-            <div class="grid gap-1">
-              <p class="font-semibold">Copy this MCP token before closing the dialog.</p>
-              <p class="text-sm">It will not be shown again.</p>
-            </div>
-          </div>
-          <div class="grid gap-2 rounded-box border border-base-300 bg-base-200 p-4">
-            <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-              one-time MCP token
-            </p>
-            <div class="join w-full">
-              <code
-                id="settings-mcp-created-token-value"
-                class="join-item min-h-10 flex-1 break-all border border-base-300 bg-base-100 px-3 py-2.5 font-mono text-sm text-base-content"
-              >
-                {@created_secret.raw_token}
-              </code>
-              <button
-                id="settings-mcp-created-token-copy"
-                type="button"
-                class="btn btn-neutral join-item min-h-10"
-                phx-hook="ClipboardCopy"
-                phx-update="ignore"
-                data-copy-text={@created_secret.raw_token}
-                data-copy-label="Copy"
-                data-copied-label="Copied"
-                aria-label="Copy MCP token"
-              >
-                <.icon name="hero-clipboard-document" class="copy-icon size-4" />
-                <span data-copy-label>Copy</span>
-              </button>
-            </div>
-          </div>
+        <div class="grid gap-5 p-5 sm:p-6">
+          <AdminComponents.one_time_secret
+            value={@created_secret.raw_token}
+            value_id="settings-mcp-created-token-value"
+            copy_id="settings-mcp-created-token-copy"
+            copy_label="Copy token"
+            copy_aria_label="Copy MCP token"
+          />
         </div>
 
         <AdminComponents.dialog_footer id="settings-mcp-created-token-dialog-footer">
@@ -288,7 +268,7 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
             <AdminComponents.action_button
               id="settings-mcp-created-token-close"
               icon="hero-check"
-              label="Close"
+              label="Done"
               phx-click="close_mcp_created_token"
               variant={:primary}
             />
@@ -305,15 +285,19 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
   attr :key, :any, required: true
   attr :form, :any, required: true
 
-  defp mcp_delete_dialog(assigns) do
+  def mcp_delete_dialog(assigns) do
     ~H"""
-    <dialog id="settings-mcp-delete-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-error">Permanent delete</p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete MCP key</h2>
+    <dialog
+      id="settings-mcp-delete-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">MCP key</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete {@key.label}?</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Deleting this MCP key is permanent. Existing clients using it will fail immediately. Usage is not tracked per key
+            Clients authenticating with prefix <span class="font-semibold text-base-content">{@key.key_prefix}</span> start failing immediately. This cannot be undone.
           </p>
         </div>
         <.form
@@ -321,21 +305,8 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
           for={@form}
           phx-submit="confirm_delete_mcp_key"
           autocomplete="off"
-          class="grid gap-5 p-6"
         >
           <.input field={@form[:id]} type="hidden" />
-          <div class="alert alert-warning items-start">
-            <.icon name="hero-exclamation-triangle" class="size-5" />
-            <div class="grid gap-1">
-              <p class="font-semibold">
-                Deleting this MCP key is permanent. Existing clients using it will fail immediately. Usage is not tracked per key
-              </p>
-              <p class="text-sm">This removes {@key.label} permanently.</p>
-              <p class="text-sm">
-                Clients using prefix {@key.key_prefix} stop authenticating immediately.
-              </p>
-            </div>
-          </div>
         </.form>
 
         <AdminComponents.dialog_footer id="settings-mcp-delete-dialog-footer">
@@ -349,7 +320,7 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
             <AdminComponents.action_button
               id="settings-mcp-delete-submit"
               icon="hero-trash"
-              label="Delete MCP key"
+              label="Delete"
               type="submit"
               form="settings-mcp-delete-form"
               variant={:danger}
@@ -376,12 +347,10 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
   end
 
   defp mcp_gate_status_class(true),
-    do:
-      "mt-2 inline-flex rounded-full border border-success/20 bg-success/10 px-2.5 py-1 text-xs font-semibold text-success"
+    do: "mt-2 inline-flex rounded-full border border-success/20 bg-success/10 px-2.5 py-1 text-xs font-semibold text-success"
 
   defp mcp_gate_status_class(false),
-    do:
-      "mt-2 inline-flex rounded-full border border-warning/20 bg-warning/10 px-2.5 py-1 text-xs font-semibold text-warning"
+    do: "mt-2 inline-flex rounded-full border border-warning/20 bg-warning/10 px-2.5 py-1 text-xs font-semibold text-warning"
 
   defp datetime_label(datetime, preferences) do
     DateTimeDisplay.format_datetime(datetime, preferences, missing_label: "not yet")

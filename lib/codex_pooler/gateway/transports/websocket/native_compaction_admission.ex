@@ -1,0 +1,1044 @@
+defmodule CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission do
+  @moduledoc false
+
+  defmodule Topology.Direct do
+    @moduledoc false
+    defstruct []
+    @type t :: %__MODULE__{}
+  end
+
+  defmodule Topology.Forwarded do
+    @moduledoc false
+
+    @enforce_keys [:owner_instance_digest, :downstream_epoch, :owner_lease_digest]
+    defstruct [:owner_instance_digest, :downstream_epoch, :owner_lease_digest]
+
+    @type t :: %__MODULE__{
+            owner_instance_digest: <<_::256>>,
+            downstream_epoch: non_neg_integer(),
+            owner_lease_digest: <<_::256>>
+          }
+  end
+
+  defmodule Binding do
+    @moduledoc false
+
+    @enforce_keys [
+      :semantic_turn_key,
+      :window_digest,
+      :context_digest,
+      :window_number,
+      :serving_mode,
+      :topology,
+      :lifecycle_id,
+      :generation
+    ]
+    defstruct [
+      :semantic_turn_key,
+      :window_digest,
+      :context_digest,
+      :window_number,
+      :compaction_item_digest,
+      :previous_response_digest,
+      :serving_mode,
+      :topology,
+      :lifecycle_id,
+      :generation,
+      standalone_resolved_anchor?: false,
+      pre_turn_continuation?: false
+    ]
+
+    # `pre_turn_continuation?` is set by the socket for an anchored incremental
+    # compaction whose turn metadata declares `phase: pre_turn` (findings#206
+    # row 206-304). A binding crosses nodes to a remote owner, so during a
+    # rolling update a node may meet a binding built by a release without this
+    # key: read it only with `Map.get/3` and a `false` default, never with dot
+    # access. An owner without the key ignores it and answers
+    # `binding_mismatch`, which the socket turns into today's retryable
+    # `503 owner_unavailable`.
+    @type t :: %__MODULE__{
+            semantic_turn_key: <<_::256>>,
+            window_digest: <<_::256>>,
+            context_digest: <<_::256>>,
+            window_number: non_neg_integer() | nil,
+            compaction_item_digest: <<_::256>> | nil,
+            previous_response_digest: <<_::256>> | nil,
+            serving_mode: atom(),
+            topology: Topology.Direct.t() | Topology.Forwarded.t(),
+            lifecycle_id: Ecto.UUID.t(),
+            generation: pos_integer(),
+            standalone_resolved_anchor?: boolean(),
+            pre_turn_continuation?: boolean()
+          }
+  end
+
+  defmodule CapabilityToken do
+    @moduledoc false
+
+    @token_bytes 32
+
+    @spec issue() :: <<_::256>>
+    def issue, do: :crypto.strong_rand_bytes(@token_bytes)
+
+    @spec match?(binary(), binary()) :: boolean()
+    def match?(expected, presented) do
+      match?(expected, presented, &Plug.Crypto.secure_compare/2)
+    end
+
+    @doc false
+    @spec match?(binary(), binary(), (binary(), binary() -> boolean())) :: boolean()
+    def match?(expected, presented, comparator)
+        when is_binary(expected) and is_binary(presented) and is_function(comparator, 2) do
+      byte_size(expected) == @token_bytes and byte_size(presented) == @token_bytes and
+        comparator.(expected, presented)
+    end
+  end
+
+  defmodule Capability do
+    @moduledoc false
+
+    @enforce_keys [:phase, :binding, :control_ref, :token, :expires_at_ms]
+    defstruct [:phase, :binding, :control_ref, :token, :expires_at_ms]
+
+    @type t :: %__MODULE__{
+            phase: :compact | :final,
+            binding: Binding.t(),
+            control_ref: reference(),
+            token: <<_::256>>,
+            expires_at_ms: non_neg_integer()
+          }
+
+    @doc false
+    @spec replace_token(t(), binary()) :: t()
+    def replace_token(%__MODULE__{} = capability, token) when is_binary(token) do
+      %{capability | token: token}
+    end
+  end
+
+  defmodule Confirmation do
+    @moduledoc false
+
+    @enforce_keys [:source_phase, :source_control_ref, :binding]
+    defstruct [:source_phase, :source_control_ref, :binding]
+
+    @type t :: %__MODULE__{
+            source_phase: :compact | :first_full_history_compact,
+            source_control_ref: reference(),
+            binding: Binding.t()
+          }
+  end
+
+  defmodule FirstCompactCollection do
+    @moduledoc false
+
+    @enforce_keys [:phase, :binding, :control_ref, :signature]
+    defstruct [:phase, :binding, :control_ref, :signature]
+
+    @type t :: %__MODULE__{
+            phase: :first_full_history_compact,
+            binding: Binding.t(),
+            control_ref: reference(),
+            signature: <<_::256>>
+          }
+
+    @salt "native_compaction_first_collection:v1"
+
+    @spec issue(Binding.t(), reference()) :: t()
+    def issue(%Binding{} = binding, control_ref) when is_reference(control_ref) do
+      provenance = %__MODULE__{
+        phase: :first_full_history_compact,
+        binding: binding,
+        control_ref: control_ref,
+        signature: <<>>
+      }
+
+      %{provenance | signature: signature(provenance)}
+    end
+
+    @spec valid?(t()) :: boolean()
+    def valid?(%__MODULE__{signature: signature} = provenance) do
+      byte_size(signature) == 32 and
+        Plug.Crypto.secure_compare(signature, signature(%{provenance | signature: <<>>}))
+    end
+
+    @spec match?(t(), t()) :: boolean()
+    def match?(%__MODULE__{} = expected, %__MODULE__{} = presented) do
+      expected.phase == presented.phase and expected.binding == presented.binding and
+        expected.control_ref == presented.control_ref and valid?(presented)
+    end
+
+    @doc false
+    def replace_binding(%__MODULE__{} = provenance, %Binding{} = binding),
+      do: %{provenance | binding: binding}
+
+    @doc false
+    def replace_control_ref(%__MODULE__{} = provenance, control_ref)
+        when is_reference(control_ref),
+        do: %{provenance | control_ref: control_ref}
+
+    @doc false
+    def replace_phase(%__MODULE__{} = provenance, phase), do: %{provenance | phase: phase}
+
+    defp signature(provenance) do
+      key = :crypto.hash(:sha256, secret_key_base() <> <<0>> <> @salt)
+
+      :crypto.mac(
+        :hmac,
+        :sha256,
+        key,
+        :erlang.term_to_binary(
+          {provenance.phase, provenance.binding, provenance.control_ref},
+          [:deterministic]
+        )
+      )
+    end
+
+    defp secret_key_base do
+      :codex_pooler
+      |> Application.fetch_env!(CodexPoolerWeb.Endpoint)
+      |> Keyword.fetch!(:secret_key_base)
+    end
+  end
+
+  defmodule FirstCompactResult do
+    @moduledoc false
+
+    require Logger
+
+    alias CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata
+    alias CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector
+    alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
+    alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
+
+    @enforce_keys [
+      :owner,
+      :result_ref,
+      :request_id,
+      :attempt_id,
+      :binding,
+      :model_digest,
+      :item_digest
+    ]
+    defstruct @enforce_keys
+
+    @type t :: %__MODULE__{
+            owner: pid(),
+            result_ref: reference(),
+            request_id: Ecto.UUID.t(),
+            attempt_id: Ecto.UUID.t(),
+            binding: Binding.t(),
+            model_digest: <<_::256>>,
+            item_digest: <<_::256>>
+          }
+
+    @spec from_collection(map(), map(), map()) :: {:ok, t()} | :error
+    # A request that is not a collect-full-history compaction is not a rejection:
+    # it is every ordinary turn. It must stay silent, so eligibility is decided
+    # before the admission steps whose failures are worth a diagnostic.
+    def from_collection(request, result, lifecycle) do
+      case request do
+        %{
+          websocket_delivery_mode: :collect_full_history,
+          native_compaction_metadata: %NativeCodexTurnMetadata{request_kind: :compaction} = metadata
+        } ->
+          admit_first_compact_result(request, result, lifecycle, metadata)
+
+        _ineligible ->
+          :error
+      end
+    end
+
+    defp admit_first_compact_result(request, result, lifecycle, metadata) do
+      with {:ok, request_id} <- cast_identifier(request.request_id, "request_id"),
+           {:ok, attempt_id} <- cast_identifier(request.attempt_id, "attempt_id"),
+           {:ok, model} <- payload_model(request.payload),
+           {:ok, %{compaction_item: item}} <-
+             CompactionResultCollector.collect_websocket_body(result.body),
+           {:ok, serving_mode} <- serving_mode(request.effective_serving_mode),
+           binding = %Binding{
+             semantic_turn_key: metadata.semantic_turn_key,
+             window_digest: metadata.window_id_digest,
+             context_digest: metadata.context_window_id_digest,
+             window_number: metadata.window_number,
+             serving_mode: serving_mode,
+             topology: %Topology.Direct{},
+             lifecycle_id: lifecycle.lifecycle_id,
+             generation: lifecycle.generation
+           },
+           {:ok, _} <- NativeCompactionAdmission.ordinary_success(binding) do
+        {:ok,
+         %__MODULE__{
+           owner: self(),
+           result_ref: make_ref(),
+           request_id: request_id,
+           attempt_id: attempt_id,
+           binding: binding,
+           model_digest: model_digest(model),
+           item_digest: NativeCodexTurnMetadata.compaction_item_digest(item)
+         }}
+      else
+        {:error, %{compaction_invalid_reason: reason_code}} ->
+          reject("collector_invalid", reason_code)
+
+        {:provider_failure, %{} = failure} ->
+          reject("provider_terminal", provider_reason_code(failure))
+
+        {:error, {:precondition, reason_code}} ->
+          reject("admission_precondition", reason_code)
+
+        {:error, reason} when is_atom(reason) ->
+          reject("admission_precondition", DiagnosticTaxonomy.identifier(reason))
+      end
+    end
+
+    # findings#165: every admission precondition is already known at the point
+    # it fails, so the `with` must not collapse four distinct causes into one
+    # constant. `reason_code=unclassified` told an operator only that the turn
+    # was rejected somewhere in this chain -- the single thing they could
+    # already see -- while the cause was discarded. Each step now names itself
+    # from a closed vocabulary (`precondition_reason_codes/0`, pinned by a
+    # test), and the binding step passes through the bounded atom
+    # `ordinary_success/1` already returns. No content, payload byte, or
+    # provider identifier enters any of these tokens.
+    @precondition_reason_codes ~w(
+      request_id
+      attempt_id
+      payload_decode
+      payload_model
+      serving_mode
+    )
+
+    @spec precondition_reason_codes() :: [String.t()]
+    def precondition_reason_codes, do: @precondition_reason_codes
+
+    defp cast_identifier(value, field) do
+      case Ecto.UUID.cast(value) do
+        {:ok, id} -> {:ok, id}
+        :error -> {:error, {:precondition, field}}
+      end
+    end
+
+    defp payload_model(payload) do
+      case CodexPooler.JSON.decode(payload) do
+        {:ok, %{"model" => model}} when is_binary(model) -> {:ok, model}
+        {:ok, %{}} -> {:error, {:precondition, "payload_model"}}
+        _undecodable -> {:error, {:precondition, "payload_decode"}}
+      end
+    end
+
+    defp serving_mode(effective_serving_mode) do
+      case mode(effective_serving_mode) do
+        {:ok, serving_mode} -> {:ok, serving_mode}
+        :error -> {:error, {:precondition, "serving_mode"}}
+      end
+    end
+
+    # The admission `with` collapses every rejection into `:error`. Naming the
+    # stage and the bounded sanitized reason keeps a first-compact rejection as
+    # diagnosable as the collector's own decision log; only allowlisted
+    # identifiers or fingerprints are rendered.
+    defp reject(stage, reason_code) do
+      Logger.warning(fn ->
+        "native compact admission rejected " <>
+          "source_stage=first_compact_result " <>
+          "stage=#{stage} " <>
+          "code=invalid_compaction_response " <>
+          "reason_code=#{reason_code}"
+      end)
+
+      :error
+    end
+
+    # A collector provider failure always carries `code`, and `upstream_code`
+    # only when the provider named one, so these two clauses are total over it.
+    defp provider_reason_code(%{upstream_code: code}) when is_binary(code),
+      do: DiagnosticTaxonomy.identifier(code)
+
+    defp provider_reason_code(%{code: code}) when is_binary(code),
+      do: DiagnosticTaxonomy.identifier(code)
+
+    @spec model_digest(binary()) :: <<_::256>>
+    def model_digest(model), do: :crypto.hash(:sha256, ["native_compact_model:v1", 0, model])
+
+    @spec binding_matches?(t(), Binding.t()) :: boolean()
+    def binding_matches?(%__MODULE__{binding: expected}, %Binding{} = presented),
+      do: expected == presented
+
+    @spec request_identity(map()) :: tuple() | nil
+    def request_identity(%{native_compaction_metadata: %NativeCodexTurnMetadata{} = metadata} = request) do
+      with {:ok, %{"model" => model}} when is_binary(model) <-
+             CodexPooler.JSON.decode(request.payload),
+           {:ok, mode} <- mode(request.effective_serving_mode) do
+        {request.request_id, request.attempt_id, metadata.semantic_turn_key, metadata.window_id_digest, metadata.context_window_id_digest, metadata.window_number, mode, model_digest(model)}
+      else
+        _invalid -> nil
+      end
+    end
+
+    def request_identity(_request), do: nil
+
+    @spec identity(t()) :: tuple()
+    def identity(%__MODULE__{} = receipt) do
+      binding = receipt.binding
+
+      {receipt.request_id, receipt.attempt_id, binding.semantic_turn_key, binding.window_digest, binding.context_digest, binding.window_number, binding.serving_mode, receipt.model_digest}
+    end
+
+    defp mode("full"), do: {:ok, :full}
+    defp mode("lite"), do: {:ok, :lite}
+    defp mode(_mode), do: :error
+  end
+
+  @enforce_keys [:phase]
+  defstruct [
+    :phase,
+    :binding,
+    :capability,
+    :first_compact_collection,
+    :expires_at_ms,
+    :compaction_item_digest
+  ]
+
+  @type phase ::
+          :ordinary_success
+          | :pending_compact
+          | :reserved_compact
+          | :accounting_started_compact
+          | :consumed_compact
+          | :collected_unconfirmed
+          | :pending_final
+          | :reserved_final
+          | :accounting_started_final
+          | :consumed_final
+          | :cleared
+  @type t :: %__MODULE__{
+          phase: phase(),
+          binding: Binding.t() | nil,
+          capability: Capability.t() | nil,
+          first_compact_collection: FirstCompactCollection.t() | nil,
+          expires_at_ms: non_neg_integer() | nil,
+          compaction_item_digest: <<_::256>> | nil
+        }
+  # The `error` type and `refusal_reasons/0` come from these lists, so a new
+  # refusal is added once. A remote owner's admission control answer crosses
+  # nodes through `WebsocketOwnerForwarder`, which passes exactly
+  # `refusal_reasons/0` through and folds anything else into `owner_crashed`
+  # (findings#206 rows 206-397/206-400).
+  @errors [
+    :invalid_binding,
+    :invalid_transition,
+    :binding_mismatch,
+    :compaction_item_mismatch,
+    :capability_mismatch,
+    :expired
+  ]
+  # The answers outside `error`: `cancel/4` after accounting started
+  # (`committed`) and `record_first_compact_collected/2` (`invalid_provenance`,
+  # `provenance_mismatch`).
+  @refusal_reasons @errors ++ [:committed, :invalid_provenance, :provenance_mismatch]
+
+  @type error :: unquote(Enum.reduce(Enum.reverse(@errors), &{:|, [], [&1, &2]}))
+  @type refusal :: error() | :committed | :invalid_provenance | :provenance_mismatch
+
+  # How long a finalizing or collected admission, and a reservation, stays
+  # usable: `pending_final` from the confirmation that arms it,
+  # `collected_unconfirmed` from its collection, a capability from its
+  # reservation.
+  #
+  # `pending_compact` has no time bound: it lasts as long as the upstream
+  # connection it names (findings#270 row 270-317). The provider resolves
+  # `previous_response_id` only on the connection that produced the response,
+  # and still does after thirty minutes of idle there (direct probe: 10 of 10
+  # after two, ten, twenty and thirty minutes; the same anchor on a new
+  # connection is refused). The connection's own checks keep the anchor
+  # reachable: the admission names its lifecycle and generation, every close
+  # of it clears the admission (a missed pong included), and a reservation
+  # checks that it is still the open one. The 60-second bound protected
+  # nothing those checks do not: it refused incremental compactions the
+  # provider would have served, and the client resent each with its whole
+  # history on a new connection.
+  @reservation_ttl_ms 60_000
+
+  @spec refusal_reasons() :: [refusal()]
+  def refusal_reasons, do: @refusal_reasons
+
+  @doc """
+  The bound, in milliseconds, of a finalizing or collected admission and of a
+  reservation; an armed compaction (`pending_compact`) has none. Only the
+  tests shorten it (`reservation_ttl_ms` in this module's application
+  environment), so an expiry fits a test; neither runtime configuration nor an
+  Instance Setting carries it.
+  """
+  @spec reservation_ttl_ms() :: pos_integer()
+  def reservation_ttl_ms do
+    :codex_pooler
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:reservation_ttl_ms, @reservation_ttl_ms)
+    |> case do
+      ttl_ms when is_integer(ttl_ms) and ttl_ms > 0 -> ttl_ms
+      _ttl_ms -> @reservation_ttl_ms
+    end
+  end
+
+  @spec refusal_reason?(term()) :: boolean()
+  def refusal_reason?(reason), do: reason in @refusal_reasons
+
+  @spec ordinary_success(Binding.t()) :: {:ok, t()} | {:error, :invalid_binding}
+  def ordinary_success(%Binding{} = binding) do
+    if valid_binding?(binding) do
+      {:ok, %__MODULE__{phase: :ordinary_success, binding: binding}}
+    else
+      {:error, :invalid_binding}
+    end
+  end
+
+  # The caller still computes a bound, which the owner admission control
+  # carries across nodes and an owner of an earlier release enforces; an armed
+  # compaction keeps none (`@reservation_ttl_ms`).
+  @spec arm_compact(t(), non_neg_integer()) :: {:ok, t()} | {:error, :invalid_transition}
+  def arm_compact(%__MODULE__{phase: :ordinary_success} = state, expires_at_ms)
+      when is_integer(expires_at_ms) and expires_at_ms >= 0 do
+    {:ok, %{state | phase: :pending_compact, expires_at_ms: nil}}
+  end
+
+  def arm_compact(%__MODULE__{}, _expires_at_ms), do: {:error, :invalid_transition}
+
+  @spec reserve(t(), :compact | :final, Binding.t(), reference(), non_neg_integer()) ::
+          {:ok, t(), Capability.t()} | {:error, error()}
+  def reserve(
+        %__MODULE__{phase: pending_phase, binding: binding, expires_at_ms: expires_at_ms} = state,
+        requested_phase,
+        %Binding{} = requested_binding,
+        control_ref,
+        now_ms
+      )
+      when is_reference(control_ref) and is_integer(now_ms) and now_ms >= 0 do
+    with :ok <- expected_pending_phase(pending_phase, requested_phase),
+         :ok <- pending_not_expired(requested_phase, expires_at_ms, now_ms),
+         :ok <- validate_final_item(requested_phase, binding, requested_binding),
+         true <- reservation_binding_match?(requested_phase, binding, requested_binding) do
+      expires_at_ms = reservation_expires_at_ms(requested_phase, expires_at_ms, now_ms)
+
+      capability = %Capability{
+        phase: requested_phase,
+        binding: requested_binding,
+        control_ref: control_ref,
+        token: CapabilityToken.issue(),
+        expires_at_ms: expires_at_ms
+      }
+
+      {:ok,
+       %{
+         state
+         | phase: reserved_phase(requested_phase),
+           binding: requested_binding,
+           capability: capability,
+           expires_at_ms: expires_at_ms
+       }, capability}
+    else
+      false -> {:error, :binding_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def reserve(%__MODULE__{}, _requested_phase, _binding, _control_ref, _now_ms),
+    do: {:error, :invalid_transition}
+
+  defp validate_final_item(:final, original, candidate)
+       when original.semantic_turn_key == candidate.semantic_turn_key and
+              is_binary(original.compaction_item_digest) do
+    if digest_match?(original.compaction_item_digest, candidate.compaction_item_digest),
+      do: :ok,
+      else: {:error, :compaction_item_mismatch}
+  end
+
+  defp validate_final_item(_phase, _original, _candidate), do: :ok
+
+  @spec mark_accounting_started(t(), Capability.t(), non_neg_integer()) ::
+          {:ok, t()} | {:error, error()}
+  def mark_accounting_started(%__MODULE__{} = state, %Capability{} = capability, now_ms) do
+    with {:ok, requested_phase} <- reserved_state_phase(state.phase),
+         :ok <- valid_capability(state, capability, requested_phase, now_ms) do
+      {:ok, %{state | phase: accounting_phase(requested_phase)}}
+    end
+  end
+
+  @spec consume(t(), Capability.t(), non_neg_integer()) :: {:ok, t()} | {:error, error()}
+  def consume(%__MODULE__{} = state, %Capability{} = capability, now_ms) do
+    with {:ok, requested_phase} <- accounting_state_phase(state.phase),
+         :ok <- valid_capability(state, capability, requested_phase, now_ms) do
+      {:ok,
+       %{
+         state
+         | phase: consumed_phase(requested_phase),
+           capability: retained_capability(requested_phase, state.capability)
+       }}
+    end
+  end
+
+  @spec cancel(t(), Capability.t(), :pre_accounting, non_neg_integer()) ::
+          {:ok, t()} | {:error, error()} | {:error, :committed, t()}
+  def cancel(%__MODULE__{} = state, %Capability{} = capability, :pre_accounting, now_ms) do
+    case reserved_state_phase(state.phase) do
+      {:ok, requested_phase} ->
+        with :ok <- valid_capability(state, capability, requested_phase, now_ms) do
+          {:ok, %{state | phase: pending_phase(requested_phase), capability: nil, expires_at_ms: pending_expires_at_ms(requested_phase, state.expires_at_ms)}}
+        end
+
+      {:error, :invalid_transition} ->
+        cond do
+          state.phase not in [:accounting_started_compact, :accounting_started_final] ->
+            {:error, :invalid_transition}
+
+          owns_capability?(state, capability) ->
+            {:error, :committed, cleared()}
+
+          true ->
+            {:error, :capability_mismatch}
+        end
+    end
+  end
+
+  # A collection waits for its acknowledgement for as long as a confirmed
+  # compaction waits for its final. It used to wait forever: an
+  # acknowledgement lost with its caller left `collected_unconfirmed` for as
+  # long as the socket stayed attached, and every later ordinary success and
+  # first full-history compaction was refused after the provider had served
+  # and billed it (findings#270 row 270-249). `expire_unconsumed/2` ends a
+  # collection past its bound.
+  @spec record_compact_collected(t(), non_neg_integer()) :: {:ok, t()} | {:error, :invalid_transition}
+  def record_compact_collected(%__MODULE__{phase: :consumed_compact} = state, now_ms) when is_integer(now_ms) and now_ms >= 0 do
+    {:ok, %{state | phase: :collected_unconfirmed, expires_at_ms: now_ms + reservation_ttl_ms()}}
+  end
+
+  def record_compact_collected(%__MODULE__{}, _now_ms), do: {:error, :invalid_transition}
+
+  @spec authorize_first_compact_collection(t(), reference()) ::
+          {:ok, t(), FirstCompactCollection.t()} | {:error, :invalid_transition}
+  def authorize_first_compact_collection(
+        %__MODULE__{phase: :ordinary_success, first_compact_collection: nil, binding: binding} =
+          state,
+        control_ref
+      )
+      when is_reference(control_ref) do
+    provenance = FirstCompactCollection.issue(binding, control_ref)
+    {:ok, %{state | first_compact_collection: provenance}, provenance}
+  end
+
+  def authorize_first_compact_collection(%__MODULE__{}, _control_ref),
+    do: {:error, :invalid_transition}
+
+  @spec record_first_compact_collected(t(), FirstCompactCollection.t(), non_neg_integer()) ::
+          {:ok, t()}
+          | {:error, :invalid_transition | :invalid_provenance}
+          | {:error, :provenance_mismatch, t()}
+  def record_first_compact_collected(
+        %__MODULE__{
+          phase: :ordinary_success,
+          first_compact_collection: %FirstCompactCollection{} = expected
+        } = state,
+        %FirstCompactCollection{} = presented,
+        now_ms
+      )
+      when is_integer(now_ms) and now_ms >= 0 do
+    if FirstCompactCollection.match?(expected, presented) do
+      {:ok, %{state | phase: :collected_unconfirmed, expires_at_ms: now_ms + reservation_ttl_ms()}}
+    else
+      {:error, :provenance_mismatch, cleared()}
+    end
+  end
+
+  def record_first_compact_collected(%__MODULE__{phase: :ordinary_success}, _provenance, _now_ms),
+    do: {:error, :invalid_provenance}
+
+  def record_first_compact_collected(%__MODULE__{}, _provenance, _now_ms),
+    do: {:error, :invalid_transition}
+
+  @spec confirm_compact(t(), <<_::256>>, Confirmation.t(), non_neg_integer()) ::
+          {:ok, t()}
+          | {:error, :invalid_transition | :invalid_binding}
+          | {:error, :binding_mismatch, t()}
+  def confirm_compact(
+        %__MODULE__{
+          phase: :collected_unconfirmed,
+          binding: original_binding,
+          capability: capability
+        } = state,
+        compaction_item_digest,
+        %Confirmation{
+          source_phase: source_phase,
+          source_control_ref: source_control_ref,
+          binding: binding
+        },
+        expires_at_ms
+      )
+      when byte_size(compaction_item_digest) == 32 and is_integer(expires_at_ms) and
+             expires_at_ms >= 0 do
+    cond do
+      not valid_binding?(binding) ->
+        {:error, :invalid_binding}
+
+      source_phase != :compact ->
+        confirm_first_compact(
+          state,
+          source_phase,
+          source_control_ref,
+          binding,
+          expires_at_ms,
+          compaction_item_digest
+        )
+
+      not match?(%Capability{phase: :compact}, capability) or
+        capability.control_ref != source_control_ref or
+          not compact_confirmation_binding_match?(
+            original_binding,
+            binding,
+            compaction_item_digest
+          ) ->
+        {:error, :binding_mismatch, cleared()}
+
+      true ->
+        complete_compact_confirmation(
+          state,
+          original_binding,
+          binding,
+          compaction_item_digest,
+          expires_at_ms
+        )
+    end
+  end
+
+  def confirm_compact(%__MODULE__{}, _digest, _binding, _expires_at_ms),
+    do: {:error, :invalid_transition}
+
+  defp complete_compact_confirmation(
+         _state,
+         %Binding{standalone_resolved_anchor?: true},
+         _binding,
+         _digest,
+         _expires
+       ),
+       do: {:ok, cleared()}
+
+  defp complete_compact_confirmation(
+         state,
+         _original,
+         binding,
+         compaction_item_digest,
+         expires_at_ms
+       ) do
+    {:ok,
+     %{
+       state
+       | phase: :pending_final,
+         binding: binding,
+         capability: nil,
+         expires_at_ms: expires_at_ms,
+         compaction_item_digest: compaction_item_digest
+     }}
+  end
+
+  defp confirm_first_compact(
+         %__MODULE__{
+           binding: original_binding,
+           first_compact_collection: %FirstCompactCollection{} = provenance
+         } = state,
+         :first_full_history_compact,
+         source_control_ref,
+         binding,
+         expires_at_ms,
+         compaction_item_digest
+       ) do
+    if provenance.binding == original_binding and
+         (is_nil(state.compaction_item_digest) or
+            state.compaction_item_digest == compaction_item_digest) and
+         compact_confirmation_binding_match?(
+           original_binding,
+           binding,
+           compaction_item_digest
+         ) and
+         provenance.control_ref == source_control_ref and
+         FirstCompactCollection.valid?(provenance) do
+      {:ok,
+       %{
+         state
+         | phase: :pending_final,
+           first_compact_collection: nil,
+           expires_at_ms: expires_at_ms,
+           binding: binding,
+           compaction_item_digest: compaction_item_digest
+       }}
+    else
+      {:error, :binding_mismatch, cleared()}
+    end
+  end
+
+  defp confirm_first_compact(
+         %__MODULE__{},
+         _source_phase,
+         _source_control_ref,
+         _binding,
+         _expires_at_ms,
+         _compaction_item_digest
+       ),
+       do: {:error, :binding_mismatch, cleared()}
+
+  @spec clear(t()) :: t()
+  def clear(%__MODULE__{}), do: cleared()
+
+  @spec clear_owned(t(), Capability.t()) :: {:ok, t()} | {:error, :capability_mismatch}
+  def clear_owned(
+        %__MODULE__{capability: %Capability{} = expected, binding: binding},
+        %Capability{} = capability
+      ) do
+    if Map.delete(expected, :token) == Map.delete(capability, :token) and
+         CapabilityToken.match?(expected.token, capability.token) and
+         binding == capability.binding do
+      {:ok, cleared()}
+    else
+      {:error, :capability_mismatch}
+    end
+  end
+
+  def clear_owned(%__MODULE__{}, %Capability{}), do: {:error, :capability_mismatch}
+
+  @spec owns_capability?(t(), Capability.t()) :: boolean()
+  def owns_capability?(
+        %__MODULE__{capability: %Capability{} = expected, binding: binding},
+        %Capability{} = capability
+      ) do
+    Map.delete(expected, :token) == Map.delete(capability, :token) and
+      CapabilityToken.match?(expected.token, capability.token) and binding == capability.binding
+  end
+
+  def owns_capability?(_state, _capability), do: false
+
+  @doc """
+  Ends an admission past its bound that nothing can use any more: a
+  `collected_unconfirmed` whose acknowledgement never came
+  (`record_compact_collected/2`, `record_first_compact_collected/3`), or a
+  `pending_final` whose final never came in time (findings#270 row 270-289).
+  A final that arrives after the bound is refused `expired` by its
+  reservation and runs as an ordinary turn; kept, the expired `pending_final`
+  also refused that turn's ordinary success and every later one, so no
+  compaction on the connection was armed again. Any other admission is left
+  as it is: an armed compaction has no bound, and a reservation is bounded
+  by its capability.
+  """
+  @spec expire_unconsumed(t(), non_neg_integer()) :: {:active, t()} | {:expired, t()}
+  def expire_unconsumed(%__MODULE__{phase: phase} = state, now_ms) when phase in [:collected_unconfirmed, :pending_final], do: expire(state, now_ms)
+  def expire_unconsumed(%__MODULE__{} = state, _now_ms), do: {:active, state}
+
+  @spec expire(t(), non_neg_integer()) :: {:active, t()} | {:expired, t()}
+  def expire(%__MODULE__{expires_at_ms: expires_at_ms}, now_ms)
+      when is_integer(expires_at_ms) and is_integer(now_ms) and now_ms > expires_at_ms do
+    {:expired, cleared()}
+  end
+
+  def expire(%__MODULE__{} = state, _now_ms), do: {:active, state}
+
+  @spec phase(t()) :: phase()
+  def phase(%__MODULE__{phase: phase}), do: phase
+
+  @spec control_ref(Capability.t()) :: reference()
+  def control_ref(%Capability{control_ref: control_ref}), do: control_ref
+
+  defp valid_binding?(%Binding{} = binding) do
+    valid_binding_digests?(binding) and valid_binding_identity?(binding)
+  end
+
+  defp valid_binding_digests?(binding) do
+    digest?(binding.semantic_turn_key) and digest?(binding.window_digest) and
+      digest?(binding.context_digest) and optional_digest?(binding.previous_response_digest) and
+      optional_digest?(binding.compaction_item_digest)
+  end
+
+  defp valid_binding_identity?(binding) do
+    valid_window_number?(binding.window_number) and is_atom(binding.serving_mode) and
+      is_boolean(binding.standalone_resolved_anchor?) and
+      is_boolean(Map.get(binding, :pre_turn_continuation?, false)) and
+      valid_topology?(binding.topology) and
+      match?({:ok, _uuid}, Ecto.UUID.cast(binding.lifecycle_id)) and
+      is_integer(binding.generation) and binding.generation > 0
+  end
+
+  defp digest?(value), do: is_binary(value) and byte_size(value) == 32
+  defp optional_digest?(nil), do: true
+  defp optional_digest?(value), do: digest?(value)
+  defp valid_window_number?(nil), do: true
+  defp valid_window_number?(value), do: is_integer(value) and value >= 0
+
+  defp valid_topology?(%Topology.Direct{}), do: true
+
+  defp valid_topology?(%Topology.Forwarded{} = topology) do
+    digest?(topology.owner_instance_digest) and is_integer(topology.downstream_epoch) and
+      topology.downstream_epoch >= 0 and digest?(topology.owner_lease_digest)
+  end
+
+  defp valid_topology?(_topology), do: false
+
+  defp immutable_binding_match?(original, candidate) do
+    original.semantic_turn_key == candidate.semantic_turn_key and
+      original.serving_mode == candidate.serving_mode and original.topology == candidate.topology and
+      original.lifecycle_id == candidate.lifecycle_id and
+      original.generation == candidate.generation
+  end
+
+  defp reservation_binding_match?(:compact, original, candidate) do
+    compact_identity_match?(original, candidate) and
+      original.window_digest == candidate.window_digest and
+      original.context_digest == candidate.context_digest and
+      original.window_number == candidate.window_number and
+      is_nil(candidate.compaction_item_digest) and
+      previous_response_compatible?(original, candidate)
+  end
+
+  defp reservation_binding_match?(:final, original, candidate) do
+    immutable_binding_match?(original, candidate) and
+      original.window_digest != candidate.window_digest and
+      original.context_digest != candidate.context_digest and
+      final_window_number_match?(original.window_number, candidate.window_number) and
+      digest_match?(state_compaction_item_digest(original), candidate.compaction_item_digest) and
+      previous_response_compatible?(original, candidate)
+  end
+
+  defp compact_identity_match?(original, %Binding{standalone_resolved_anchor?: true} = candidate) do
+    digest_match?(original.previous_response_digest, candidate.previous_response_digest) and
+      immutable_binding_match?(
+        %{original | semantic_turn_key: candidate.semantic_turn_key},
+        candidate
+      )
+  end
+
+  defp compact_identity_match?(original, candidate),
+    do: immutable_binding_match?(original, candidate) or pre_turn_continuation_match?(original, candidate)
+
+  # The released client's pre-turn compaction (Codex 0.156.1, observed on the
+  # wire, findings#206 row 206-304) runs inside the NEW turn: it carries that
+  # turn's id, so its semantic turn key never equals the one the previous
+  # turn's success armed the admission for, while its anchor is exactly the
+  # response that success produced, on the same window, context window,
+  # connection generation and downstream. Such a compaction is the continuation
+  # the admission was armed for, so it may take the admission once, before the
+  # deadline, and the reservation adopts its turn key: the confirmation then
+  # arms `pending_final` for the turn whose final request carries the item.
+  # Without this it was refused before dispatch and the client paid a
+  # reconnect and a full-history resend for every pre-turn compaction.
+  defp pre_turn_continuation_match?(original, candidate) do
+    Map.get(candidate, :pre_turn_continuation?, false) == true and
+      digest_match?(original.previous_response_digest, candidate.previous_response_digest) and
+      immutable_binding_match?(%{original | semantic_turn_key: candidate.semantic_turn_key}, candidate)
+  end
+
+  defp compact_confirmation_binding_match?(original, candidate, compaction_item_digest) do
+    immutable_binding_match?(original, candidate) and
+      original.window_digest == candidate.window_digest and
+      original.context_digest == candidate.context_digest and
+      original.window_number == candidate.window_number and
+      digest_match?(compaction_item_digest, candidate.compaction_item_digest)
+  end
+
+  defp final_window_number_match?(nil, _candidate), do: true
+  defp final_window_number_match?(_original, nil), do: true
+  defp final_window_number_match?(original, candidate), do: candidate > original
+
+  defp state_compaction_item_digest(%Binding{compaction_item_digest: digest}), do: digest
+
+  defp digest_match?(expected, candidate)
+       when is_binary(expected) and byte_size(expected) == 32 and is_binary(candidate) and
+              byte_size(candidate) == 32,
+       do: Plug.Crypto.secure_compare(expected, candidate)
+
+  defp digest_match?(_expected, _candidate), do: false
+
+  defp previous_response_compatible?(_original, %{previous_response_digest: nil}), do: true
+
+  defp previous_response_compatible?(original, candidate) do
+    original.previous_response_digest == candidate.previous_response_digest
+  end
+
+  defp expected_pending_phase(:pending_compact, :compact), do: :ok
+  defp expected_pending_phase(:pending_final, :final), do: :ok
+  defp expected_pending_phase(_state_phase, _requested_phase), do: {:error, :invalid_transition}
+
+  # An armed compaction has no bound (`@reservation_ttl_ms`): its capability
+  # gets one from the reservation, and a cancelled reservation arms it again
+  # without one. A final keeps the bound its confirmation armed, capability
+  # included.
+  defp pending_not_expired(:compact, _expires_at_ms, _now_ms), do: :ok
+  defp pending_not_expired(:final, expires_at_ms, now_ms), do: not_expired(expires_at_ms, now_ms)
+
+  defp reservation_expires_at_ms(:compact, _expires_at_ms, now_ms), do: now_ms + reservation_ttl_ms()
+  defp reservation_expires_at_ms(:final, expires_at_ms, _now_ms), do: expires_at_ms
+
+  defp pending_expires_at_ms(:compact, _expires_at_ms), do: nil
+  defp pending_expires_at_ms(:final, expires_at_ms), do: expires_at_ms
+
+  defp not_expired(expires_at_ms, now_ms) when now_ms <= expires_at_ms, do: :ok
+  defp not_expired(_expires_at_ms, _now_ms), do: {:error, :expired}
+
+  defp valid_capability(state, capability, requested_phase, now_ms) do
+    with %Capability{} = expected <- state.capability,
+         true <- expected.phase == requested_phase and capability.phase == requested_phase,
+         true <- expected.binding == capability.binding and state.binding == capability.binding,
+         true <- expected.control_ref == capability.control_ref,
+         true <- expected.expires_at_ms == capability.expires_at_ms,
+         true <- CapabilityToken.match?(expected.token, capability.token),
+         true <- now_ms <= capability.expires_at_ms do
+      :ok
+    else
+      false when now_ms > capability.expires_at_ms -> {:error, :expired}
+      false -> {:error, :capability_mismatch}
+      nil -> {:error, :capability_mismatch}
+    end
+  end
+
+  defp retained_capability(:compact, capability), do: capability
+  defp retained_capability(:final, _capability), do: nil
+
+  defp reserved_state_phase(:reserved_compact), do: {:ok, :compact}
+  defp reserved_state_phase(:reserved_final), do: {:ok, :final}
+  defp reserved_state_phase(_phase), do: {:error, :invalid_transition}
+
+  defp accounting_state_phase(:accounting_started_compact), do: {:ok, :compact}
+  defp accounting_state_phase(:accounting_started_final), do: {:ok, :final}
+  defp accounting_state_phase(_phase), do: {:error, :invalid_transition}
+
+  defp pending_phase(:compact), do: :pending_compact
+  defp pending_phase(:final), do: :pending_final
+  defp reserved_phase(:compact), do: :reserved_compact
+  defp reserved_phase(:final), do: :reserved_final
+  defp accounting_phase(:compact), do: :accounting_started_compact
+  defp accounting_phase(:final), do: :accounting_started_final
+  defp consumed_phase(:compact), do: :consumed_compact
+  defp consumed_phase(:final), do: :consumed_final
+
+  defp cleared, do: %__MODULE__{phase: :cleared}
+end
+
+defimpl Inspect,
+  for: CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.FirstCompactResult do
+  def inspect(_result, _opts), do: "#NativeCompactionAdmission.FirstCompactResult<redacted>"
+end
+
+defimpl Inspect,
+  for: CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission do
+  def inspect(state, _opts), do: "#NativeCompactionAdmission<#{state.phase}:redacted>"
+end
+
+defimpl Inspect,
+  for: CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Binding do
+  def inspect(_binding, _opts), do: "#NativeCompactionAdmission.Binding<redacted>"
+end
+
+defimpl Inspect,
+  for: CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability do
+  def inspect(capability, _opts),
+    do: "#NativeCompactionAdmission.Capability<#{capability.phase}:redacted>"
+end
+
+defimpl Inspect,
+  for: CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.FirstCompactCollection do
+  def inspect(provenance, _opts),
+    do: "#NativeCompactionAdmission.FirstCompactCollection<#{provenance.phase}:redacted>"
+end

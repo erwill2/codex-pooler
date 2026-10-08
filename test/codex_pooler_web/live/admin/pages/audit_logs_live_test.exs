@@ -253,27 +253,52 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              ~s|#audit-log-filter-form-advanced > div[class*="auto-fit"][class*="minmax(10rem,1fr)"]|
            )
 
-    assert has_element?(view, "#audit-log-page-size", "Hard limit: 50 rows")
+    # The count moved to the pager when the list stopped being capped at one
+    # page; the caption stays for assistive tech only.
+    refute has_element?(view, "#audit-log-page-size")
+    assert has_element?(view, "#audit-log-pagination [data-role='pagination-range']")
     assert has_element?(view, "#audit-event-details-drawer-root")
     assert has_element?(view, "#audit-event-details-drawer")
     refute has_element?(view, "#audit-event-details-title")
     assert has_element?(view, "#admin-audit-logs")
-    assert has_element?(view, "#audit-logs-table")
-    assert has_element?(view, "#admin-audit-logs thead", "Time")
-    assert has_element?(view, "#admin-audit-logs thead", "Event")
-    assert has_element?(view, "#admin-audit-logs thead", "Actor")
-    assert has_element?(view, "#admin-audit-logs thead", "Context")
-    assert has_element?(view, "#mobile-audit-logs-table")
-    assert has_element?(view, "#mobile-audit-logs-table thead", "Time")
-    assert has_element?(view, "#mobile-audit-logs-table thead", "Event")
-    assert has_element?(view, "#mobile-audit-logs-table thead", "Actor")
-    refute has_element?(view, "#mobile-audit-logs-table thead", "Context")
-    assert has_element?(view, "#audit-log-row-#{operator_event.id}")
-    assert has_element?(view, "#audit-log-row-#{pool_routing_event.id}", "Pool routing updated")
+    refute has_element?(view, "#audit-logs-table")
+    refute has_element?(view, "#admin-audit-logs table")
+    refute has_element?(view, "#mobile-audit-logs-table")
+    assert has_element?(view, "#admin-audit-logs [data-role='audit-day-break']")
 
-    assert has_element?(view, "#mobile-audit-log-row-#{operator_event.id}")
-    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "Pool updated")
-    assert has_element?(view, "a[href='/admin/operators']", user.email)
+    assert has_element?(
+             view,
+             "#audit-log-row-#{operator_event.id}[data-role='audit-prose-event']"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-row-#{pool_routing_event.id}",
+             "updated the routing of the Pool"
+           )
+
+    assert has_element?(view, "#audit-log-row-#{pool_routing_event.id}", "Audit Page")
+    refute has_element?(view, "#mobile-audit-log-row-#{operator_event.id}")
+    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "updated the Pool")
+    refute has_element?(view, "#admin-audit-logs a[href='/admin/operators']")
+
+    assert has_element?(
+             view,
+             "#audit-log-row-#{operator_event.id} [data-role='audit-prose-actor']",
+             user.email
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-row-#{operator_event.id} [data-role='audit-prose-target']",
+             "Operator account"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-row-#{operator_event.id} " <>
+               "button[data-role='audit-prose-target'][phx-value-target='#{user.id}']"
+           )
 
     html = render(view)
     assert html =~ "Operator account updated"
@@ -327,7 +352,8 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              "Hidden Audit"
            )
 
-    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "Pool updated")
+    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "updated the Pool")
+    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "Hidden Audit")
 
     view
     |> element("#audit-log-pool-filter button[data-pool-id='']")
@@ -355,7 +381,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
     assert_patch(view, ~p"/admin/audit-logs")
 
     view
-    |> element("#mobile-audit-log-time-#{operator_event.id}")
+    |> element("#audit-log-time-#{operator_event.id}")
     |> render_click()
 
     assert has_element?(view, "#audit-event-details-title", "Operator account updated")
@@ -449,10 +475,15 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
       from(audit in AuditEvent, where: audit.id == ^event.id)
       |> Repo.update_all(set: [occurred_at: ~U[2026-05-27 13:45:06Z]])
 
-    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs")
+    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs?target=#{user.id}")
 
-    assert has_element?(view, "#audit-log-time-#{event.id}", "2026-05-27 15:45")
-    assert has_element?(view, "#mobile-audit-log-time-#{event.id}", "2026-05-27 15:45")
+    assert %{datetime_format: "short", timezone: "Europe/Rome"} =
+             :sys.get_state(view.pid).socket.assigns.datetime_preferences
+
+    assert has_element?(view, "#admin-audit-logs [data-role='audit-day-break']", "2026-05-27")
+    assert has_element?(view, "#audit-log-time-#{event.id}", "15:45")
+    refute has_element?(view, "#audit-log-time-#{event.id}", "2026-05-27")
+    refute has_element?(view, "#mobile-audit-log-time-#{event.id}")
 
     view
     |> element("#audit-log-time-#{event.id}")
@@ -473,7 +504,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
     assert has_element?(view, "#audit-log-filter-errors", "Actor type filter is not supported")
     assert has_element?(view, "#audit-log-filter-errors", "Action filter is not supported")
     assert has_element?(view, "#audit-log-filter-errors", "Date from must be a valid date")
-    assert has_element?(view, "tr[id^='audit-log-row-']")
+    assert has_element?(view, "li[id^='audit-log-row-'][data-role='audit-prose-event']")
   end
 
   test "instance settings audit rows and drawer keep metrics and smtp secrets redacted", %{
@@ -517,7 +548,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
 
     {:ok, view, html} = live(conn, ~p"/admin/audit-logs")
 
-    assert has_element?(view, "#audit-log-row-#{event.id}", "Instance settings updated")
+    assert has_element?(view, "#audit-log-row-#{event.id}", "updated the instance settings")
     refute html =~ metrics_token
     refute html =~ smtp_password
 
@@ -568,7 +599,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
 
     {:ok, view, html} = live(conn, ~p"/admin/audit-logs")
 
-    assert has_element?(view, "#audit-log-row-#{event.id}", "Alert channel created")
+    assert has_element?(view, "#audit-log-row-#{event.id}", "created the alert channel")
 
     assert has_element?(
              view,
@@ -647,7 +678,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
 
     {:ok, view, _html} = live(admin_conn, ~p"/admin/audit-logs")
 
-    assert has_element?(view, "#audit-log-row-#{assigned_event.id}", "Pool updated")
+    assert has_element?(view, "#audit-log-row-#{assigned_event.id}", "updated the Pool")
     refute has_element?(view, "#audit-log-row-#{hidden_event.id}")
     refute has_element?(view, "#audit-log-row-#{global_event.id}")
     assert has_element?(view, "#audit-log-pool-filter button[data-pool-id='#{assigned_pool.id}']")
@@ -700,54 +731,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
         ~p"/admin/audit-logs?target=#{delete_pool.id}"
       )
 
-    assert has_element?(owner_view, "#audit-log-row-#{nilified_event.id}", "Pool deleted")
-  end
-
-  test "paginates audit logs, preserves filters, and clamps overflow pages", %{conn: conn} do
-    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
-
-    for index <- 1..52 do
-      %AuditEvent{
-        occurred_at: DateTime.add(now, -index, :second),
-        actor_type: "system",
-        action: "pool.update",
-        target_type: "pool",
-        target_id: Ecto.UUID.generate(),
-        outcome: "success",
-        details: %{"index" => index}
-      }
-      |> Repo.insert!()
-    end
-
-    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs?action=pool.update")
-
-    assert has_element?(view, "#admin-audit-logs-pagination-top", "Page 1 of 2")
-    assert has_element?(view, "#admin-audit-logs-pagination-bottom", "Page 1 of 2")
-    assert has_element?(view, "#admin-audit-logs-range-top", "Showing 1-50 of 52")
-    assert has_element?(view, "#admin-audit-logs-range-bottom", "Showing 1-50 of 52")
-    assert has_element?(view, "#admin-audit-logs-pagination-top-prev.btn-disabled")
-    refute has_element?(view, "#admin-audit-logs-pagination-top-next.btn-disabled")
-
-    view
-    |> element("#admin-audit-logs-pagination-top-next")
-    |> render_click()
-
-    assert_patch(view, "/admin/audit-logs?action=pool.update&page=2")
-    assert has_element?(view, "#admin-audit-logs-pagination-bottom", "Page 2 of 2")
-    assert has_element?(view, "#admin-audit-logs-range-bottom", "Showing 51-52 of 52")
-    refute has_element?(view, "#admin-audit-logs-pagination-bottom-prev.btn-disabled")
-    assert has_element?(view, "#admin-audit-logs-pagination-bottom-next.btn-disabled")
-
-    view
-    |> element("#admin-audit-logs-pagination-bottom-prev")
-    |> render_click()
-
-    assert_patch(view, "/admin/audit-logs?action=pool.update")
-
-    assert {:error, {:live_redirect, %{to: overflow_to}}} =
-             live(conn, ~p"/admin/audit-logs?action=pool.update&page=99")
-
-    assert overflow_to == "/admin/audit-logs?action=pool.update&page=2"
+    assert has_element?(owner_view, "#audit-log-row-#{nilified_event.id}", "deleted the Pool")
   end
 
   test "clamps an empty audit-log page to page one", %{conn: conn} do
@@ -778,6 +762,389 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              Accounts.login_user(%{"email" => admin.email, "password" => temporary_password})
 
     %{conn: log_in_user(build_conn(), admin, token), user: admin}
+  end
+
+  test "pages through audit events, preserving filters and pinning the window", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "audit-paging", name: "Audit Paging"})
+
+    events =
+      for index <- 1..51 do
+        assert {:ok, event} =
+                 Audit.record_system_event(%{
+                   pool_id: pool.id,
+                   action: "pool.update",
+                   target_type: "pool",
+                   target_id: pool.id,
+                   details: %{"seq" => index}
+                 })
+
+        event
+      end
+
+    [oldest | _rest] = events
+
+    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs?pool_id=#{pool.id}")
+
+    # Creating the Pool is itself an audited event, so the total is 51 plus
+    # whatever the fixtures wrote — the page count is the assertion, not a
+    # hand-counted row total.
+    assert has_element?(view, "#audit-log-pagination", "Page 1 of 2")
+    assert has_element?(view, "#audit-log-pagination-prev.btn-disabled")
+    refute has_element?(view, "#audit-log-row-#{oldest.id}")
+
+    view |> element("#audit-log-pagination-next") |> render_click()
+
+    assert has_element?(view, "#audit-log-pagination", "Page 2 of 2")
+    assert has_element?(view, "#audit-log-row-#{oldest.id}")
+    assert has_element?(view, "#audit-log-pagination-next.btn-disabled")
+
+    # Stepping back onto page one drops the pin: nothing behind it to hold still.
+    view |> element("#audit-log-pagination-prev") |> render_click()
+
+    assert has_element?(view, "#audit-log-pagination", "Page 1 of 2")
+    refute has_element?(view, "#audit-log-row-#{oldest.id}")
+  end
+
+  test "a page past the end of the audit result set lands on the last page with rows", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "audit-range", name: "Audit Range"})
+
+    assert {:ok, event} =
+             Audit.record_system_event(%{
+               pool_id: pool.id,
+               action: "pool.update",
+               target_type: "pool",
+               target_id: pool.id,
+               details: %{"only" => true}
+             })
+
+    assert {:error, {:live_redirect, %{to: corrected}}} =
+             live(conn, ~p"/admin/audit-logs?pool_id=#{pool.id}&page=99")
+
+    refute corrected =~ "page="
+
+    {:ok, view, _html} = live(conn, corrected)
+
+    assert has_element?(view, "#audit-log-row-#{event.id}")
+    assert has_element?(view, "#audit-log-pagination")
+  end
+
+  test "an out-of-range audit page number is clamped instead of raising", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "audit-clamp", name: "Audit Clamp"})
+
+    assert {:ok, event} =
+             Audit.record_system_event(%{
+               pool_id: pool.id,
+               action: "pool.update",
+               target_type: "pool",
+               target_id: pool.id,
+               details: %{"only" => true}
+             })
+
+    assert {:error, {:live_redirect, %{to: corrected}}} =
+             live(conn, ~p"/admin/audit-logs?pool_id=#{pool.id}&page=200000000000000000")
+
+    {:ok, view, _html} = live(conn, corrected)
+
+    assert has_element?(view, "#audit-log-row-#{event.id}")
+  end
+
+  test "an unpinned page number never hides the rows between it and the head", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "audit-unpinned", name: "Audit Unpinned"})
+
+    events =
+      for index <- 1..120 do
+        assert {:ok, event} =
+                 Audit.record_system_event(%{
+                   pool_id: pool.id,
+                   action: "pool.update",
+                   target_type: "pool",
+                   target_id: pool.id,
+                   details: %{"seq" => index}
+                 })
+
+        event
+      end
+
+    # Pinning this page in place would bound the list at the head of page two
+    # and then apply the same offset again, landing on rows 101+ and reporting
+    # "Page 2 of 2" — with everything between silently absent from both pages.
+    assert {:error, {:live_redirect, %{to: corrected}}} =
+             live(conn, ~p"/admin/audit-logs?pool_id=#{pool.id}&page=2")
+
+    refute corrected =~ "page="
+    refute corrected =~ "as_of"
+
+    {:ok, view, _html} = live(conn, corrected)
+
+    assert has_element?(view, "#audit-log-pagination", "Page 1 of 3")
+
+    # Walking forward from the live first page reaches every record, because
+    # each link carries the window it was counted from.
+    seen =
+      Enum.reduce(1..3, MapSet.new(), fn page, seen ->
+        if page > 1, do: view |> element("#audit-log-pagination-next") |> render_click()
+
+        Enum.reduce(events, seen, fn event, acc ->
+          if has_element?(view, "#audit-log-row-#{event.id}"),
+            do: MapSet.put(acc, event.id),
+            else: acc
+        end)
+      end)
+
+    missing = Enum.reject(events, &MapSet.member?(seen, &1.id))
+
+    assert missing == [],
+           "#{length(missing)} audit events were reachable on no page at all"
+  end
+
+  test "provider credits policy audit entries expose safe changes and filterable entities", %{
+    conn: conn,
+    scope: scope,
+    user: user
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "audit-provider-credits", name: "Audit Provider Credits"})
+    %{identity: identity} = upstream_assignment_fixture(pool, %{account_label: "Audited credit account"})
+    sensitive_marker = "audit-provider-credit-secret-do-not-render"
+    action = "upstream_account.provider_credits_policy_update"
+
+    assert {:ok, event} =
+             Audit.record_user_event(user, %{
+               pool_id: pool.id,
+               action: action,
+               target_type: "upstream_identity",
+               target_id: identity.id,
+               details: %{
+                 "label" => identity.account_label,
+                 "previous_allow_provider_credits" => true,
+                 "allow_provider_credits" => false,
+                 "access_token" => sensitive_marker
+               }
+             })
+
+    {:ok, view, html} = live(conn, ~p"/admin/audit-logs")
+    row = "#audit-log-row-#{event.id}"
+
+    assert has_element?(view, "#{row} [data-role='audit-prose-actor']", user.email)
+    assert has_element?(view, "#{row} [data-role='audit-prose-named-target']", identity.account_label)
+    assert has_element?(view, "#{row} [data-role='audit-prose-pool']", pool.name)
+    refute html =~ sensitive_marker
+
+    view
+    |> element("#audit-log-action-filter button[data-action='#{action}']")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/audit-logs?action=#{action}")
+    assert has_element?(view, "#filters_action[value='#{action}']")
+    assert render(view) |> LazyHTML.from_fragment() |> LazyHTML.query("[id^='audit-log-row-']") |> Enum.count() == 1
+    assert has_element?(view, row)
+
+    view |> element("#{row} [data-role='audit-prose-actor']") |> render_click()
+    assert_patch(view)
+    assert has_element?(view, "#filters_actor[value='#{user.email}']")
+
+    view |> element("#{row} [data-role='audit-prose-pool']") |> render_click()
+    assert_patch(view)
+    assert has_element?(view, "#filters_pool_id[value='#{pool.id}']")
+    assert has_element?(view, row)
+
+    view |> element("#audit-log-time-#{event.id}") |> render_click()
+    assert has_element?(view, "#audit-event-details-sidebar[role='dialog']")
+    assert has_element?(view, "#audit-event-detail-summary", action)
+
+    drawer_html = view |> element("#audit-event-details-sidebar") |> render()
+
+    detail_values =
+      drawer_html
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query("#audit-event-detail-metadata dl > div")
+      |> Map.new(fn detail ->
+        label = detail |> LazyHTML.query("dt") |> LazyHTML.text() |> String.trim()
+        value = detail |> LazyHTML.query("dd") |> LazyHTML.text() |> String.trim()
+        {label, value}
+      end)
+
+    assert detail_values["Previous allow provider credits"] == "true"
+    assert detail_values["Allow provider credits"] == "false"
+    refute drawer_html =~ sensitive_marker
+  end
+
+  test "prose entities drive the page filters", %{conn: conn, scope: scope, user: user} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "prose-pool", name: "Prose Pool"})
+
+    assert {:ok, _settings} =
+             Pools.update_routing_settings(scope, pool, %{"routing_strategy" => "quota_first"})
+
+    assert %{items: [pool_event]} =
+             Audit.list_events(pool, filters: [action: "pool.routing_update"])
+
+    assert {:ok, operator_event} =
+             Audit.record_user_event(user, %{
+               action: "operator.update",
+               target_type: "user",
+               target_id: user.id,
+               details: %{}
+             })
+
+    assert {:ok, failed_event} =
+             Audit.record_user_event(user, %{
+               action: "upstream_account.refresh_enqueue",
+               target_type: "upstream_identity",
+               target_id: Ecto.UUID.generate(),
+               outcome: "failure",
+               details: %{"label" => "codex-prose", "reason" => "reauth required"}
+             })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs")
+
+    assert has_element?(view, "#audit-log-row-#{failed_event.id}", "codex-prose")
+    assert has_element?(view, "#audit-log-row-#{failed_event.id}", "reauth required")
+
+    view
+    |> element("#audit-log-row-#{operator_event.id} [data-role='audit-prose-actor']")
+    |> render_click()
+
+    assert_patch(view)
+    assert has_element?(view, "#audit-log-filter-form input[value='#{user.email}']")
+
+    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs")
+
+    view
+    |> element("#audit-log-row-#{pool_event.id} [data-role='audit-prose-pool']")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/audit-logs?pool_id=#{pool.id}")
+    assert has_element?(view, "#filters_pool_id[value='#{pool.id}']")
+
+    view
+    |> element("#audit-log-row-#{pool_event.id} [data-role='audit-prose-family']")
+    |> render_click()
+
+    assert_patch(view)
+    assert has_element?(view, "#filters_action[value='pool.routing_update']")
+
+    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs")
+
+    view
+    |> element("#audit-log-row-#{failed_event.id} [data-role='audit-prose-failure']")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/audit-logs?outcome=failure")
+    assert has_element?(view, "#filters_outcome[value='failure']")
+    assert has_element?(view, "#audit-log-row-#{failed_event.id}")
+    refute has_element?(view, "#audit-log-row-#{operator_event.id}")
+  end
+
+  test "derived detail clauses enrich the prose without a schema change", %{
+    conn: conn,
+    scope: scope,
+    user: user
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "clause-pool", name: "Clause Pool"})
+
+    assert {:ok, role_kept_event} =
+             Audit.record_user_event(user, %{
+               action: "operator.update",
+               target_type: "user",
+               target_id: user.id,
+               details: %{"previous_role" => nil, "role" => "instance_admin"}
+             })
+
+    assert {:ok, role_change_event} =
+             Audit.record_user_event(user, %{
+               action: "operator.update",
+               target_type: "user",
+               target_id: user.id,
+               details: %{"previous_role" => "instance_admin", "role" => "instance_owner"}
+             })
+
+    assert {:ok, invite_event} =
+             Audit.record_user_event(user, %{
+               action: "invite.create",
+               pool_id: pool.id,
+               target_type: "invite",
+               target_id: Ecto.UUID.generate(),
+               details: %{"invited_email" => "guest@example.com"}
+             })
+
+    assert {:ok, status_event} =
+             Audit.record_user_event(user, %{
+               action: "pool.status_update",
+               pool_id: pool.id,
+               target_type: "pool",
+               target_id: pool.id,
+               details: %{"status" => "paused"}
+             })
+
+    assert {:ok, keyed_event} =
+             Audit.record_user_event(user, %{
+               action: "api_key.create",
+               pool_id: pool.id,
+               target_type: "api_key",
+               target_id: Ecto.UUID.generate(),
+               details: %{"label" => "clause-key"}
+             })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/audit-logs")
+
+    # A role move reads with the Operators-page label; an update that kept the
+    # role (previous nil) stays silent.
+    assert has_element?(
+             view,
+             "#audit-log-row-#{role_change_event.id} [data-role='audit-prose-role-tail']",
+             "Instance owner"
+           )
+
+    refute has_element?(
+             view,
+             "#audit-log-row-#{role_kept_event.id} [data-role='audit-prose-role-tail']"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-row-#{invite_event.id} [data-role='audit-prose-invited-email']",
+             "guest@example.com"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-row-#{status_event.id} [data-role='audit-prose-detail-tail']",
+             "paused"
+           )
+
+    # A labeled record belonging to a Pool says so, and the Pool still acts on
+    # the page filter.
+    assert has_element?(
+             view,
+             "#audit-log-row-#{keyed_event.id} [data-role='audit-prose-in-pool']",
+             "Clause Pool"
+           )
+
+    view
+    |> element("#audit-log-row-#{keyed_event.id} [data-role='audit-prose-in-pool'] button")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/audit-logs?pool_id=#{pool.id}")
+    assert has_element?(view, "#filters_pool_id[value='#{pool.id}']")
+
+    # The trailing chevron opens the same drawer as the timestamp.
+    view
+    |> element("#audit-log-details-#{keyed_event.id}")
+    |> render_click()
+
+    assert has_element?(view, "#audit-event-details-close")
+    assert has_element?(view, "#audit-event-detail-metadata", "clause-key")
   end
 
   defp session_token(user) do

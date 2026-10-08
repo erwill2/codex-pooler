@@ -96,9 +96,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Channels do
                   id={"alert-channel-row-#{channel.id}-secret"}
                   class="text-xs text-base-content/70"
                 >
-                  Signing secret {AlertChannelForm.secret_status_label(
-                    channel.webhook_signing_secret_key_version
-                  )}
+                  Signing secret {AlertChannelForm.secret_status_label(channel.webhook_signing_secret_key_version)}
                 </td>
                 <td class="text-right">
                   <div class="flex justify-end gap-2">
@@ -261,7 +259,6 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Channels do
           <div class="flex flex-wrap justify-end gap-2">
             <AdminComponents.action_button
               id="alert-channel-cancel"
-              icon="hero-x-mark"
               label="Cancel"
               phx-click="cancel_channel_form"
             />

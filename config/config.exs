@@ -17,6 +17,19 @@ config :codex_pooler,
   ecto_repos: [CodexPooler.Repo],
   generators: [timestamp_type: :utc_datetime]
 
+config :codex_pooler, CodexPooler.Repo,
+  migration_lock: :pg_advisory_lock,
+  migration_advisory_lock_retry_interval_ms: 1_000,
+  migration_advisory_lock_max_tries: 10
+
+config :codex_pooler,
+       CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace,
+       mode: :off
+
+config :codex_pooler, CodexPooler.Upstreams.CodexClientIdentity,
+  # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.+)$
+  default_client_version: "0.155.1"
+
 jobs_schedule = [
   %{
     key: :catalog_sync,
@@ -92,7 +105,7 @@ jobs_schedule = [
       CodexPooler.Jobs.DailyRollupRebuildEnqueueWorker
     ],
     scheduled_worker: CodexPooler.Jobs.DailyRollupRebuildEnqueueWorker,
-    cadence: %{label: "Daily at 00:17 UTC", cron: "17 0 * * *"}
+    cadence: %{label: "Hourly at :17", cron: "17 * * * *"}
   },
   %{
     key: :runtime_cleanup,
@@ -100,9 +113,39 @@ jobs_schedule = [
     title: "Runtime cleanup",
     description: "Expired state cleanup",
     icon: "hero-sparkles",
-    workers: [CodexPooler.Jobs.RuntimeStateCleanupWorker],
+    workers: [CodexPooler.Jobs.RuntimeStateCleanupWorker, CodexPooler.Jobs.ExpiredQuotaPruningWorker],
     scheduled_worker: CodexPooler.Jobs.RuntimeStateCleanupWorker,
     cadence: %{label: "Every 15 min", cron: "*/15 * * * *"}
+  },
+  %{
+    key: :request_replay_cleanup,
+    id: "request-replay-cleanup",
+    title: "Request replay cleanup",
+    description: "Expired replay cleanup",
+    icon: "hero-sparkles",
+    workers: [CodexPooler.Jobs.RequestReplayCleanupWorker],
+    scheduled_worker: CodexPooler.Jobs.RequestReplayCleanupWorker,
+    cadence: %{label: "Every minute", cron: "* * * * *"}
+  },
+  %{
+    key: :openai_status_sync,
+    id: "openai-status-sync",
+    title: "OpenAI status polling",
+    description: "OpenAI incident feed refresh",
+    icon: "hero-signal",
+    workers: [CodexPooler.Jobs.OpenAIStatusSyncWorker],
+    scheduled_worker: CodexPooler.Jobs.OpenAIStatusSyncWorker,
+    cadence: %{label: "Every 5 min", cron: "*/5 * * * *"}
+  },
+  %{
+    key: :openai_status_cleanup,
+    id: "openai-status-cleanup",
+    title: "OpenAI status retention",
+    description: "Retired incident cleanup",
+    icon: "hero-trash",
+    workers: [CodexPooler.Jobs.OpenAIStatusCleanupWorker],
+    scheduled_worker: CodexPooler.Jobs.OpenAIStatusCleanupWorker,
+    cadence: %{label: "Daily at 00:00 UTC", cron: "0 0 * * *"}
   }
 ]
 
@@ -118,11 +161,9 @@ config :codex_pooler, Oban,
   repo: CodexPooler.Repo,
   queues: [jobs: 8],
   shutdown_grace_period: :timer.seconds(55),
-  plugins: [
-    {Oban.Plugins.Cron, crontab: jobs_crontab},
-    Oban.Plugins.Lifeline,
-    {Oban.Plugins.Pruner, max_age: 24 * 60 * 60}
-  ]
+  cron: [crontab: jobs_crontab],
+  lifeline: [],
+  pruner: [max_age: {1, :day}]
 
 config :codex_pooler, CodexPooler.Accounts,
   session_ttl_seconds: 14 * 24 * 60 * 60,
@@ -149,8 +190,7 @@ config :codex_pooler, CodexPooler.Mailer, adapter: Swoosh.Adapters.Local
 config :esbuild,
   version: "0.25.4",
   codex_pooler: [
-    args:
-      ~w(js/app.js --bundle --target=es2022 --outdir=../priv/static/assets/js --external:/fonts/* --external:/images/* --alias:@=.),
+    args: ~w(js/app.js --bundle --target=es2022 --outdir=../priv/static/assets/js --external:/fonts/* --external:/images/* --alias:@=.),
     cd: Path.expand("../assets", __DIR__),
     env: %{"NODE_PATH" => [Path.expand("../deps", __DIR__), Mix.Project.build_path()]}
   ]
@@ -171,16 +211,16 @@ config :logger, :default_formatter,
     :request_id,
     :admin_surface,
     :loader,
-    :error_code,
-    :request_compression_reason,
-    :request_compression_exception,
-    :request_compression_route_class,
-    :request_compression_transport
+    :error_code
   ]
 
 config :phoenix, :logger, false
 
-config :phoenix, :json_library, Jason
+config :phoenix, :json_library, CodexPooler.JSON
+config :postgrex, :json_library, CodexPooler.JSON
+config :swoosh, :json_library, CodexPooler.JSON
+
+config :req, :default_options, decoders: [json: &CodexPooler.JSON.decode/1, json_api: &CodexPooler.JSON.decode/1]
 
 config :phoenix, :filter_parameters, [
   "access_token",

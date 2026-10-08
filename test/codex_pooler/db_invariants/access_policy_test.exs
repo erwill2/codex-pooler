@@ -132,6 +132,18 @@ defmodule CodexPooler.DBInvariants.AccessPolicyTest do
       )
     end)
 
+    assert_db_constraint("api_keys_enforced_service_tier_check", fn ->
+      Repo.query!(
+        """
+        INSERT INTO api_keys (
+          pool_id, display_name, key_prefix, key_hash, status, created_by_user_id,
+          enforced_service_tier
+        ) VALUES ($1, 'Raw fast service tier', 'sk_policy_raw_fast_tier', $2, 'active', $3, 'fast')
+        """,
+        [pool_id, <<"policy-raw-fast-tier">>, user_id]
+      )
+    end)
+
     api_key_id = create_api_key!(pool_id, user_id, "sk_policy_binding_weekly")
 
     assert_db_error(:check_violation, fn ->
@@ -143,6 +155,18 @@ defmodule CodexPooler.DBInvariants.AccessPolicyTest do
         """,
         [api_key_id]
       )
+    end)
+  end
+
+  test "database accepts enforced ultrafast and rejects unknown tiers" do
+    user_id = create_user!("ultrafast-policy@example.com")
+    pool_id = create_pool!(user_id, "ultrafast-policy", "Ultrafast policy")
+    key_id = create_api_key!(pool_id, user_id, "sk_ultrafast_policy")
+    assert %{num_rows: 1} = Repo.query!("UPDATE api_keys SET enforced_service_tier = 'ultrafast' WHERE id = $1", [key_id])
+    assert [["ultrafast"]] = Repo.query!("SELECT enforced_service_tier FROM api_keys WHERE id = $1", [key_id]).rows
+
+    assert_db_constraint("api_keys_enforced_service_tier_check", fn ->
+      Repo.query!("UPDATE api_keys SET enforced_service_tier = 'ultrafaster' WHERE id = $1", [key_id])
     end)
   end
 

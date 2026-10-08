@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
   alias CodexPooler.InstanceSettings
   alias CodexPooler.MCP
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.SettingsPageComponents
   alias CodexPoolerWeb.DateTimeDisplay
   alias CodexPoolerWeb.UserAuth
@@ -43,7 +44,8 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
      socket
      |> assign_datetime_preferences()
      |> assign_browser_sessions()
-     |> assign_mcp_panel()}
+     |> assign_mcp_panel()
+     |> NotificationCenterHooks.follow_viewer_visibility()}
   end
 
   @impl true
@@ -147,8 +149,7 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
   end
 
   def handle_event("cancel_delete_mcp_key", _params, socket) do
-    {:noreply,
-     socket |> assign(:mcp_delete_key, nil) |> assign(:mcp_delete_form, mcp_delete_form(nil))}
+    {:noreply, socket |> assign(:mcp_delete_key, nil) |> assign(:mcp_delete_form, mcp_delete_form(nil))}
   end
 
   def handle_event("confirm_delete_mcp_key", %{"mcp_key_delete" => %{"id" => key_id}}, socket) do
@@ -198,8 +199,7 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
              socket.assigns.current_user_token
            ) do
       UserAuth.disconnect_user_sessions(user.id,
-        except_live_socket_id:
-          UserAuth.live_socket_id_for_token(socket.assigns.current_user_token)
+        except_live_socket_id: UserAuth.live_socket_id_for_token(socket.assigns.current_user_token)
       )
 
       {:noreply,
@@ -293,6 +293,13 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
     end
   end
 
+  # These settings are the viewer's own and do not depend on its role or
+  # Pools; only the shell's owner-only navigation does, and it follows the
+  # scope the notification center re-read before sending this (findings#206
+  # row 206-410).
+  @impl true
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket), do: {:noreply, socket}
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -301,12 +308,13 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
       current_scope={@current_scope}
       active_nav={:settings}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-settings-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="settings-page-header"
           title="Settings"
-          description="Manage this browser session, your operator profile, and account security."
+          description="Your operator account: profile, password, two-factor, and browser sessions."
         />
 
         <section id="settings-workspace" class="grid gap-4">

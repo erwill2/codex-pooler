@@ -126,9 +126,26 @@ defmodule CodexPoolerWeb.DateTimeDisplay do
 
   @spec timezone_options() :: [{String.t(), String.t()}]
   def timezone_options do
+    key = {__MODULE__, :timezone_options}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        options = build_timezone_options()
+        :persistent_term.put(key, options)
+        options
+
+      options ->
+        options
+    end
+  end
+
+  # Host zoneinfo supplies names; bundled Tz rules validate and convert them.
+  # Both are fixed for the lifetime of the release VM.
+  defp build_timezone_options do
     zones =
       Zoneinfo.time_zones()
       |> Enum.uniq()
+      |> Enum.filter(&match?({:ok, _datetime}, DateTime.shift_zone(DateTime.utc_now(), &1, Tz.TimeZoneDatabase)))
       |> Enum.reject(&(&1 == @default_timezone))
       |> Enum.sort()
 
@@ -149,7 +166,7 @@ defmodule CodexPoolerWeb.DateTimeDisplay do
   defp shift_for_display(datetime, timezone) do
     timezone = normalize_timezone_value(timezone)
 
-    case DateTime.shift_zone(datetime, timezone, Zoneinfo.TimeZoneDatabase) do
+    case DateTime.shift_zone(datetime, timezone, Tz.TimeZoneDatabase) do
       {:ok, shifted} ->
         shifted
 

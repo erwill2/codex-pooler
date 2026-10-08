@@ -22,30 +22,34 @@ defmodule CodexPooler.CatalogTest do
       %{assignment: hidden} = upstream_assignment_fixture(hidden_pool)
       sentinel = "provider-private-value-#{System.unique_integer([:positive])}"
 
-      model_fixture(pool, %{
-        exposed_model_id: "gpt-example-alpha",
-        metadata: %{
-          "source_assignment_models" => %{
-            first.id => %{
-              "supports_responses" => true,
-              "supports_streaming" => false,
-              "supports_tools" => sentinel,
-              "capabilities" => %{"reasoning" => true},
-              "provider" => %{"private" => sentinel}
+      observed_model =
+        model_fixture(pool, %{
+          exposed_model_id: "gpt-example-alpha",
+          metadata: %{
+            "source_assignment_models" => %{
+              first.id => %{
+                "description" => "Synthetic assignment model.",
+                "visibility" => "hide",
+                "supported_in_api" => false,
+                "supports_responses" => true,
+                "supports_streaming" => false,
+                "supports_tools" => sentinel,
+                "capabilities" => %{"reasoning" => true},
+                "provider" => %{"private" => sentinel}
+              },
+              second.id => %{
+                "capabilities" => %{
+                  "responses" => false,
+                  "streaming" => true,
+                  "tools" => true,
+                  "reasoning" => false
+                }
+              },
+              hidden.id => %{"supports_responses" => true}
             },
-            second.id => %{
-              "capabilities" => %{
-                "responses" => false,
-                "streaming" => true,
-                "tools" => true,
-                "reasoning" => false
-              }
-            },
-            hidden.id => %{"supports_responses" => true}
-          },
-          "source_assignment_missing_sync_run_ids" => %{second.id => Ecto.UUID.generate()}
-        }
-      })
+            "source_assignment_missing_sync_run_ids" => %{second.id => Ecto.UUID.generate()}
+          }
+        })
 
       model_fixture(pool, %{
         exposed_model_id: "gpt-example-stale",
@@ -89,6 +93,13 @@ defmodule CodexPooler.CatalogTest do
               tools: :unknown,
               reasoning: true
             },
+            model_info: %{
+              description: "Synthetic assignment model.",
+              description_state: :available,
+              visibility: :hidden,
+              api_support: :unsupported,
+              catalog_updated_at: observed_model.last_seen_at
+            },
             provenance: :observed
           },
           %{
@@ -100,6 +111,12 @@ defmodule CodexPooler.CatalogTest do
               streaming: true,
               tools: true,
               reasoning: false
+            },
+            model_info: %{
+              description: nil,
+              description_state: :missing,
+              visibility: :unknown,
+              api_support: :unknown
             },
             provenance: :preserved
           }
@@ -139,6 +156,62 @@ defmodule CodexPooler.CatalogTest do
         assert Map.get(queries, "models", 0) == 1
         assert Enum.sum(Map.values(queries)) == 1
       end
+    end
+  end
+
+  describe "list_visible_models_for_pools/2" do
+    test "batches model and assignment visibility as the Pool count grows" do
+      entries =
+        for index <- 1..10 do
+          pool = pool_fixture(%{name: "Visible model batch #{index}"})
+          %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+          model =
+            model_fixture(pool, %{
+              exposed_model_id: "gpt-visible-batch-#{index}",
+              metadata: %{"source_assignment_ids" => [assignment.id]}
+            })
+
+          {pool, model}
+        end
+
+      {first_pool, first_model} = hd(entries)
+
+      %{assignment: hidden_assignment} =
+        upstream_assignment_fixture(first_pool, %{health_status: "errored"})
+
+      hidden_model =
+        model_fixture(first_pool, %{
+          exposed_model_id: "gpt-hidden-batch",
+          metadata: %{"source_assignment_ids" => [hidden_assignment.id]}
+        })
+
+      {one_pool_models, one_pool_queries} =
+        count_repo_sources(fn -> Catalog.list_visible_models_for_pools([first_pool]) end)
+
+      pools = Enum.map(entries, &elem(&1, 0))
+
+      {all_pool_models, all_pool_queries} =
+        count_repo_sources(fn -> Catalog.list_visible_models_for_pools(pools) end)
+
+      assert Enum.map(one_pool_models[first_pool.id], & &1.id) == [first_model.id]
+      refute Enum.any?(one_pool_models[first_pool.id], &(&1.id == hidden_model.id))
+
+      assert Map.keys(all_pool_models) |> MapSet.new() ==
+               pools |> Enum.map(& &1.id) |> MapSet.new()
+
+      assert Enum.all?(entries, fn {pool, model} ->
+               Enum.any?(all_pool_models[pool.id], &(&1.id == model.id))
+             end)
+
+      assert one_pool_queries == %{"models" => 1, "pool_upstream_assignments" => 1}
+      assert all_pool_queries == one_pool_queries
+
+      assert {empty_models, empty_queries} =
+               count_repo_sources(fn -> Catalog.list_visible_models_for_pools([]) end)
+
+      assert empty_models == %{}
+      assert empty_queries == %{}
     end
   end
 
@@ -195,8 +268,8 @@ defmodule CodexPooler.CatalogTest do
           FakeUpstream.json_response(%{
             "data" => [
               %{
-                "id" => "gpt-5.4-mini",
-                "display_name" => "GPT 5.4 Mini",
+                "id" => "gpt-6-luna",
+                "display_name" => "GPT 6 Luna",
                 "owned_by" => "upstream",
                 "capabilities" => %{"responses" => true, "streaming" => true}
               }
@@ -211,8 +284,10 @@ defmodule CodexPooler.CatalogTest do
       assert sync_run.status == "succeeded"
       assert sync_run.discovered_model_count == 1
       assert sync_run.upserted_model_count == 1
-      assert sync_run.retired_count == 0
-      assert model.exposed_model_id == "gpt-5.4-mini"
+      # SyncRun no longer maps `retired_count`, but older releases still read
+      # the retained column (findings#261), so the row keeps the value 0.
+      assert %{rows: [[0]]} = Repo.query!("SELECT retired_count FROM sync_runs WHERE id = $1", [Ecto.UUID.dump!(sync_run.id)])
+      assert model.exposed_model_id == "gpt-6-luna"
       assert model.supports_responses
       assert model.supports_streaming
       assert model.metadata["source_assignment_ids"] == [assignment.id]
@@ -222,9 +297,41 @@ defmodule CodexPooler.CatalogTest do
       assert Repo.get!(Model, model.id).last_sync_run_id == sync_run.id
     end
 
+    test "persists each assignment model entry without reconstructing its schema" do
+      pool = pool_fixture()
+
+      {_pool, assignment} =
+        active_assignment_fixture(pool, %{}, %{
+          account_label: "Schema source",
+          assignment_label: "Schema assignment"
+        })
+
+      source = %{
+        "id" => "gpt-schema-persistence",
+        "description" => "Synthetic compatibility model",
+        "multi_agent_version" => "v2",
+        "supported_reasoning_levels" => [
+          %{"effort" => "future", "description" => "Future effort"}
+        ],
+        "service_tiers" => [
+          %{"id" => "priority", "name" => "Priority", "description" => "Synthetic tier"}
+        ],
+        "future_schema_field" => %{"nested" => [true, 7, nil]}
+      }
+
+      assignment_id = assignment.id
+
+      assert {:ok, %{models: [model]}} =
+               Catalog.sync_pool_catalog(pool,
+                 fetcher: fn %{assignment: %{id: ^assignment_id}} -> {:ok, [source]} end
+               )
+
+      assert get_in(model.metadata, ["source_assignment_models", assignment.id]) == source
+    end
+
     test "sync is idempotent and marks missing active models stale" do
       upstream =
-        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-5.4-mini"}]}))
+        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-6-luna"}]}))
 
       {pool, _assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
       stale_candidate = model_fixture(pool, %{exposed_model_id: "stale-model", status: "active"})
@@ -237,12 +344,12 @@ defmodule CodexPooler.CatalogTest do
       assert Repo.get!(Model, stale_candidate.id).status == "stale"
 
       assert [visible_model] = Catalog.list_visible_models(pool)
-      assert visible_model.exposed_model_id == "gpt-5.4-mini"
+      assert visible_model.exposed_model_id == "gpt-6-luna"
     end
 
     test "sync preserves smoke-provisioned manual models" do
       upstream =
-        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-5.4-mini"}]}))
+        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-6-luna"}]}))
 
       {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
 
@@ -338,9 +445,14 @@ defmodule CodexPooler.CatalogTest do
                 "id" => "gpt-shared",
                 "additional_speed_tiers" => [],
                 "service_tiers" => [],
+                "visibility" => "hide",
+                "upgrade" => %{
+                  "model" => "gpt-source-a-replacement",
+                  "migration_markdown" => "Use the replacement model."
+                },
                 "capabilities" => %{"responses" => true, "streaming" => true}
               },
-              %{"id" => "gpt-masterkain-only"}
+              %{"id" => "gpt-free-only"}
             ]
           })
         )
@@ -353,6 +465,8 @@ defmodule CodexPooler.CatalogTest do
                 "id" => "gpt-shared",
                 "additional_speed_tiers" => ["fast"],
                 "tool_mode" => "code_mode_only",
+                "visibility" => "list",
+                "upgrade" => nil,
                 "service_tiers" => [
                   %{
                     "id" => "priority",
@@ -362,17 +476,17 @@ defmodule CodexPooler.CatalogTest do
                 ],
                 "capabilities" => %{"tools" => true, "reasoning" => true}
               },
-              %{"id" => "gpt-5.5"}
+              %{"id" => "gpt-6-sol"}
             ]
           })
         )
 
       pool = pool_fixture()
 
-      {_pool, masterkain_assignment} =
+      {_pool, free_assignment} =
         active_assignment_fixture(pool, %{"base_url" => FakeUpstream.url(shared_upstream)}, %{
-          account_label: "masterkain@gmail.com",
-          assignment_label: "Masterkain Free"
+          account_label: "free-account@example.com",
+          assignment_label: "Codex Free"
         })
 
       {_pool, pro_assignment} =
@@ -385,15 +499,15 @@ defmodule CodexPooler.CatalogTest do
       assert length(models) == 3
 
       shared = Catalog.get_model_by_exposed_id(pool, "gpt-shared")
-      pro_only = Catalog.get_model_by_exposed_id(pool, "gpt-5.5")
-      masterkain_only = Catalog.get_model_by_exposed_id(pool, "gpt-masterkain-only")
+      pro_only = Catalog.get_model_by_exposed_id(pool, "gpt-6-sol")
+      free_only = Catalog.get_model_by_exposed_id(pool, "gpt-free-only")
 
       assert shared.source_assignment_count == 2
 
       assert shared.metadata["source_assignment_ids"] ==
-               Enum.sort([masterkain_assignment.id, pro_assignment.id])
+               Enum.sort([free_assignment.id, pro_assignment.id])
 
-      assert shared.metadata["source_assignment_models"][masterkain_assignment.id][
+      assert shared.metadata["source_assignment_models"][free_assignment.id][
                "service_tiers"
              ] == []
 
@@ -404,6 +518,22 @@ defmodule CodexPooler.CatalogTest do
                  "description" => "1.5x speed, increased usage"
                }
              ]
+
+      assert shared.metadata["source_assignment_models"][free_assignment.id]["visibility"] ==
+               "hide"
+
+      assert get_in(shared.metadata, [
+               "source_assignment_models",
+               free_assignment.id,
+               "upgrade",
+               "model"
+             ]) == "gpt-source-a-replacement"
+
+      assert shared.metadata["source_assignment_models"][pro_assignment.id]["visibility"] ==
+               "list"
+
+      assert Map.fetch!(shared.metadata["source_assignment_models"][pro_assignment.id], "upgrade") ==
+               nil
 
       assert shared.metadata["upstream_model"]["additional_speed_tiers"] == ["fast"]
       assert shared.metadata["upstream_model"]["tool_mode"] == "code_mode_only"
@@ -426,8 +556,8 @@ defmodule CodexPooler.CatalogTest do
       assert pro_only.source_assignment_count == 1
       assert pro_only.metadata["source_assignment_ids"] == [pro_assignment.id]
 
-      assert masterkain_only.source_assignment_count == 1
-      assert masterkain_only.metadata["source_assignment_ids"] == [masterkain_assignment.id]
+      assert free_only.source_assignment_count == 1
+      assert free_only.metadata["source_assignment_ids"] == [free_assignment.id]
     end
 
     test "persists successful assignment results when another assignment fails" do
@@ -599,6 +729,62 @@ defmodule CodexPooler.CatalogTest do
       assert model.source_assignment_count == 1
       assert model.metadata["source_assignment_ids"] == [source_b.id]
       assert model.metadata["source_assignment_models"][source_b.id]["source_marker"] == "b-third"
+    end
+
+    test "preserves per-assignment Lite evidence shapes through partial catalog churn" do
+      pool = pool_fixture()
+
+      assignments =
+        for label <- ~w(true false absent malformed partial anchor) do
+          {_pool, assignment} =
+            active_assignment_fixture(pool, %{}, %{
+              account_label: "Synthetic #{label} Lite evidence source",
+              assignment_label: "Synthetic #{label} Lite evidence assignment"
+            })
+
+          {label, assignment}
+        end
+        |> Map.new()
+
+      first_models = %{
+        assignments["true"].id => [shared_sync_model(%{"use_responses_lite" => true})],
+        assignments["false"].id => [shared_sync_model(%{"use_responses_lite" => false})],
+        assignments["absent"].id => [shared_sync_model(%{"source_marker" => "absent"})],
+        assignments["malformed"].id => [shared_sync_model(%{"use_responses_lite" => "true"})],
+        assignments["partial"].id => [
+          shared_sync_model(%{"use_responses_lite" => true, "partial_marker" => true})
+        ],
+        assignments["anchor"].id => [shared_sync_model(%{"source_marker" => "anchor-first"})]
+      }
+
+      assert {:ok, %{models: [_model]}} = sync_catalog_step(pool, first_models)
+
+      assert {:ok, %{models: [_model]}} =
+               sync_catalog_step(pool, %{
+                 assignments["true"].id => [],
+                 assignments["false"].id => [],
+                 assignments["absent"].id => [],
+                 assignments["malformed"].id => [],
+                 assignments["partial"].id => [],
+                 assignments["anchor"].id => [
+                   shared_sync_model(%{"source_marker" => "anchor-current"})
+                 ]
+               })
+
+      source_models =
+        pool
+        |> Catalog.get_model_by_exposed_id("gpt-preserved-shared")
+        |> then(& &1.metadata["source_assignment_models"])
+
+      assert source_models[assignments["true"].id]["use_responses_lite"] == true
+      assert source_models[assignments["false"].id]["use_responses_lite"] == false
+      refute Map.has_key?(source_models[assignments["absent"].id], "use_responses_lite")
+      assert source_models[assignments["malformed"].id]["use_responses_lite"] == "true"
+
+      assert source_models[assignments["partial"].id] ==
+               Map.fetch!(first_models, assignments["partial"].id) |> hd()
+
+      assert source_models[assignments["anchor"].id]["source_marker"] == "anchor-current"
     end
 
     test "does not preserve disabled absent sources" do
@@ -856,6 +1042,9 @@ defmodule CodexPooler.CatalogTest do
     parent = self()
     handler_id = "catalog-query-count-#{System.unique_integer([:positive])}"
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -898,7 +1087,6 @@ defmodule CodexPooler.CatalogTest do
       discovered_model_count: Map.get(attrs, :discovered_model_count, 0),
       upserted_model_count: Map.get(attrs, :upserted_model_count, 0),
       stale_marked_count: Map.get(attrs, :stale_marked_count, 0),
-      retired_count: Map.get(attrs, :retired_count, 0),
       error_message: Map.get(attrs, :error_message),
       stats: Map.get(attrs, :stats, %{})
     })

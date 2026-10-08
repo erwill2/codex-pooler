@@ -5,11 +5,13 @@ defmodule CodexPooler.Upstreams.Quota.PrimingState do
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
-  @active UpstreamIdentity.active_status()
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @eligible PoolUpstreamAssignment.eligible_status()
-  @health_active PoolUpstreamAssignment.active_health_status()
+  @active IdentityStatus.active_status()
+  @assignment_active AssignmentStatus.active_status()
+  @eligible AssignmentStatus.eligible_status()
+  @health_active AssignmentStatus.active_health_status()
 
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type assignment_ref :: PoolUpstreamAssignment.t() | Ecto.UUID.t()
@@ -40,8 +42,7 @@ defmodule CodexPooler.Upstreams.Quota.PrimingState do
         |> tap_priming_change(pool_id)
 
       nil ->
-        {:error,
-         lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
+        {:error, lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
     end
   end
 

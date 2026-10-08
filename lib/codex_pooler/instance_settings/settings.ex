@@ -5,7 +5,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
   import Ecto.Changeset
 
-  alias CodexPooler.InstanceSettings.{AppSecretCrypto, Defaults}
+  alias CodexPooler.Gateway.OperationalSettings.IPRules
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
+  alias CodexPooler.InstanceSettings.{AppSecretCrypto, Defaults, StaticDefaults}
   alias CodexPooler.RouteClass
 
   @primary_key {:singleton, :boolean, autogenerate: false}
@@ -13,8 +15,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
   @tls_values ~w(always if_available never)
   @decompression_algorithms ~w(gzip deflate zstd)
-  @default_openai_pricing_url Defaults.catalog()["openai_pricing_url"]
-  @default_development Defaults.development()
+  @default_openai_pricing_url StaticDefaults.catalog()["openai_pricing_url"]
+  @default_development StaticDefaults.development()
+  @bulkhead_fields MapSet.new(~w(max_concurrency queue_limit queue_timeout_ms))
 
   @gateway_embed_fields [
     :gateway_debug,
@@ -24,6 +27,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
     :upstream_connect_timeout_ms,
     :upstream_pool_timeout_ms,
     :upstream_receive_timeout_ms,
+    :upstream_conn_max_idle_time_ms,
+    :upstream_token_refresh_margin_seconds,
+    :upstream_token_refresh_proactive_enabled,
     :expired_alias_ttl_seconds,
     :bridge_owner_lease_ttl_seconds,
     :bridge_owner_lease_renewal_seconds,
@@ -46,6 +52,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
       field :upstream_connect_timeout_ms, :integer
       field :upstream_pool_timeout_ms, :integer
       field :upstream_receive_timeout_ms, :integer
+      field :upstream_conn_max_idle_time_ms, :integer
+      field :upstream_token_refresh_margin_seconds, :integer
+      field :upstream_token_refresh_proactive_enabled, :boolean
       field :expired_alias_ttl_seconds, :integer
       field :bridge_owner_lease_ttl_seconds, :integer
       field :bridge_owner_lease_renewal_seconds, :integer
@@ -60,6 +69,12 @@ defmodule CodexPooler.InstanceSettings.Settings do
     embeds_one :ingress, Ingress, on_replace: :update, primary_key: false do
       field :firewall_allowlist, {:array, :string}
       field :trusted_proxies, {:array, :string}
+
+      field :forwarded_client_ip_source, Ecto.Enum,
+        values: [:peer, :x_forwarded_for, :x_real_ip],
+        default: :x_forwarded_for
+
+      field :forwarded_proxy_depth, :integer, default: 0
       field :decompression_algorithms, {:array, :string}
       field :max_compressed_body_bytes, :integer
       field :max_decompressed_body_bytes, :integer
@@ -79,6 +94,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
     embeds_one :operator, Operator, on_replace: :update, primary_key: false do
       field :login_base_url, :string
+      field :openai_status_polling_enabled, :boolean, default: true
     end
 
     embeds_one :catalog, Catalog, on_replace: :update, primary_key: false do
@@ -98,7 +114,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
       field :bearer_token_hmac_digest, :string
       field :bearer_token_fingerprint, :string
       field :bearer_token_key_version, :string
-      field :bearer_token, :string, virtual: true
+      field :bearer_token, :string, virtual: true, redact: true
       field :bearer_token_action, :string, virtual: true
 
       field :bearer_token_status, Ecto.Enum,
@@ -115,11 +131,11 @@ defmodule CodexPooler.InstanceSettings.Settings do
       field :ssl, :boolean
       field :tls, :string
       field :retries, :integer
-      field :password_ciphertext, :string
-      field :password_nonce, :string
+      field :password_ciphertext, :string, redact: true
+      field :password_nonce, :string, redact: true
       field :password_aad, :map
       field :password_key_version, :string
-      field :password, :string, virtual: true
+      field :password, :string, virtual: true, redact: true
       field :password_action, :string, virtual: true
 
       field :password_status, Ecto.Enum,
@@ -225,6 +241,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
       :upstream_connect_timeout_ms,
       :upstream_pool_timeout_ms,
       :upstream_receive_timeout_ms,
+      :upstream_conn_max_idle_time_ms,
+      :upstream_token_refresh_margin_seconds,
+      :upstream_token_refresh_proactive_enabled,
       :expired_alias_ttl_seconds,
       :bridge_owner_lease_ttl_seconds,
       :bridge_owner_lease_renewal_seconds,
@@ -243,6 +262,9 @@ defmodule CodexPooler.InstanceSettings.Settings do
       :upstream_connect_timeout_ms,
       :upstream_pool_timeout_ms,
       :upstream_receive_timeout_ms,
+      :upstream_conn_max_idle_time_ms,
+      :upstream_token_refresh_margin_seconds,
+      :upstream_token_refresh_proactive_enabled,
       :expired_alias_ttl_seconds,
       :bridge_owner_lease_ttl_seconds,
       :bridge_owner_lease_renewal_seconds,
@@ -265,9 +287,27 @@ defmodule CodexPooler.InstanceSettings.Settings do
     |> validate_positive_integer(:upstream_connect_timeout_ms)
     |> validate_positive_integer(:upstream_pool_timeout_ms)
     |> validate_positive_integer(:upstream_receive_timeout_ms)
+    |> validate_number(:upstream_conn_max_idle_time_ms,
+      greater_than_or_equal_to: 1_000,
+      less_than_or_equal_to: 3_600_000
+    )
+    # The lower bound keeps the proactive refresh margin far above the
+    # 15-minute recovery cadence, so a pass can still act before the deadline.
+    # The upper bound sits above the observed access-token lifetime, which lets
+    # an operator hold every idle identity permanently inside the margin, paced
+    # only by the recovery cooldown, without accepting an unbounded value.
+    |> validate_number(:upstream_token_refresh_margin_seconds,
+      greater_than_or_equal_to: 3_600,
+      less_than_or_equal_to: 1_209_600
+    )
     |> validate_positive_integer(:expired_alias_ttl_seconds)
-    |> validate_positive_integer(:bridge_owner_lease_ttl_seconds)
+    # A lease shorter than this cannot outlive one full pre-dispatch database
+    # statement plus the synchronous renewal; `OwnerRenewalSchedule` derives it.
+    |> validate_number(:bridge_owner_lease_ttl_seconds,
+      greater_than_or_equal_to: OwnerRenewalSchedule.minimum_lease_ttl_seconds()
+    )
     |> validate_positive_integer(:bridge_owner_lease_renewal_seconds)
+    |> validate_owner_lease_renewal_within_ttl()
     |> validate_positive_integer(:circuit_failure_threshold)
     |> validate_positive_integer(:circuit_open_seconds)
     |> validate_positive_integer(:circuit_half_open_probe_limit)
@@ -281,6 +321,8 @@ defmodule CodexPooler.InstanceSettings.Settings do
     |> cast(attrs, [
       :firewall_allowlist,
       :trusted_proxies,
+      :forwarded_client_ip_source,
+      :forwarded_proxy_depth,
       :decompression_algorithms,
       :max_compressed_body_bytes,
       :max_decompressed_body_bytes,
@@ -290,6 +332,8 @@ defmodule CodexPooler.InstanceSettings.Settings do
     |> validate_required([
       :firewall_allowlist,
       :trusted_proxies,
+      :forwarded_client_ip_source,
+      :forwarded_proxy_depth,
       :max_compressed_body_bytes,
       :max_decompressed_body_bytes,
       :max_decompression_ratio,
@@ -297,11 +341,31 @@ defmodule CodexPooler.InstanceSettings.Settings do
     ])
     |> validate_change(:firewall_allowlist, &validate_cidr_rules/2)
     |> validate_change(:trusted_proxies, &validate_cidr_rules/2)
+    |> validate_number(:forwarded_proxy_depth,
+      greater_than_or_equal_to: 0,
+      less_than_or_equal_to: 16
+    )
+    |> validate_forwarded_proxy_depth()
     |> validate_subset(:decompression_algorithms, @decompression_algorithms)
     |> validate_positive_integer(:max_compressed_body_bytes)
     |> validate_positive_integer(:max_decompressed_body_bytes)
     |> validate_positive_integer(:max_decompression_ratio)
     |> validate_positive_integer(:decompression_timeout_ms)
+  end
+
+  defp validate_forwarded_proxy_depth(changeset) do
+    source = get_field(changeset, :forwarded_client_ip_source)
+    depth = get_field(changeset, :forwarded_proxy_depth)
+
+    if is_integer(depth) and depth > 0 and source != :x_forwarded_for do
+      add_error(
+        changeset,
+        :forwarded_proxy_depth,
+        "must be 0 unless forwarded client IP source is X-Forwarded-For"
+      )
+    else
+      changeset
+    end
   end
 
   defp files_changeset(files, attrs) do
@@ -330,8 +394,8 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
   defp operator_changeset(operator, attrs) do
     operator
-    |> cast(attrs, [:login_base_url])
-    |> validate_required([:login_base_url])
+    |> cast(attrs, [:login_base_url, :openai_status_polling_enabled])
+    |> validate_required([:login_base_url, :openai_status_polling_enabled])
     |> update_change(:login_base_url, &normalize_operator_app_url/1)
     |> validate_format(:login_base_url, ~r/^https?:\/\//)
     |> validate_change(:login_base_url, &validate_operator_app_url/2)
@@ -567,39 +631,40 @@ defmodule CodexPooler.InstanceSettings.Settings do
     validate_number(changeset, field, greater_than: 0)
   end
 
-  defp validate_cidr_rules(field, rules) when is_list(rules) do
-    if Enum.all?(rules, &valid_ip_rule?/1),
-      do: [],
-      else: [{field, "contains an invalid IP or CIDR rule"}]
-  end
+  # Every owner (HTTP heartbeat and websocket owner) renews at most every
+  # ttl / 3, so a live owner gets at least two renewal attempts before its
+  # lease expires; a renewal setting above that is refused here and lowered at
+  # read time (findings#206 row 206-499). The ttl compared is the one in
+  # effect, raised to its minimum. Checked only when either field changes,
+  # like every other gateway validation, so an unrelated save still succeeds.
+  defp validate_owner_lease_renewal_within_ttl(changeset) do
+    renewal = get_field(changeset, :bridge_owner_lease_renewal_seconds)
+    ttl = get_field(changeset, :bridge_owner_lease_ttl_seconds)
 
-  defp validate_cidr_rules(field, _rules), do: [{field, "must be a list"}]
+    changed? =
+      changed?(changeset, :bridge_owner_lease_renewal_seconds) or
+        changed?(changeset, :bridge_owner_lease_ttl_seconds)
 
-  defp valid_ip_rule?(rule) when is_binary(rule) do
-    case String.split(String.trim(rule), "/", parts: 2) do
-      [address] -> valid_ip?(address)
-      [address, prefix] -> valid_cidr?(address, prefix)
-    end
-  end
+    maximum =
+      if is_integer(ttl) and ttl > 0,
+        do: OwnerRenewalSchedule.maximum_renewal_seconds(max(ttl, OwnerRenewalSchedule.minimum_lease_ttl_seconds()))
 
-  defp valid_ip_rule?(_rule), do: false
-
-  defp valid_cidr?(address, prefix) do
-    with {:ok, ip} <- parse_ip(address),
-         {prefix, ""} <- Integer.parse(prefix) do
-      prefix >= 0 and prefix <= tuple_size(ip) * if(tuple_size(ip) == 4, do: 8, else: 16)
+    if changed? and is_integer(renewal) and is_integer(maximum) and renewal > maximum do
+      add_error(changeset, :bridge_owner_lease_renewal_seconds, "must be less than or equal to %{number}, a third of the owner lease TTL",
+        validation: :number,
+        kind: :less_than_or_equal_to,
+        number: maximum
+      )
     else
-      _invalid -> false
+      changeset
     end
   end
 
-  defp valid_ip?(address), do: match?({:ok, _ip}, parse_ip(address))
-
-  defp parse_ip(address) do
-    address
-    |> String.trim()
-    |> String.to_charlist()
-    |> :inet.parse_address()
+  defp validate_cidr_rules(field, rules) do
+    case IPRules.compile(rules) do
+      {:ok, _compiled} -> []
+      {:error, :invalid_rule} -> [{field, "contains an invalid IP or CIDR rule"}]
+    end
   end
 
   defp validate_bulkheads(:bulkheads, value) when is_map(value) do
@@ -615,8 +680,7 @@ defmodule CodexPooler.InstanceSettings.Settings do
 
       true ->
         [
-          bulkheads:
-            "must contain positive max_concurrency, non-negative queue_limit, and positive queue_timeout_ms"
+          bulkheads: "must contain positive max_concurrency, non-negative queue_limit, and positive queue_timeout_ms"
         ]
     end
   end
@@ -624,11 +688,13 @@ defmodule CodexPooler.InstanceSettings.Settings do
   defp validate_bulkheads(:bulkheads, _value), do: [bulkheads: "must be a map"]
 
   defp valid_bulkhead?(config) when is_map(config) do
+    fields = config |> Map.keys() |> Enum.map(&to_string/1) |> MapSet.new()
     max_concurrency = map_get(config, "max_concurrency")
     queue_limit = map_get(config, "queue_limit")
     queue_timeout_ms = map_get(config, "queue_timeout_ms")
 
-    positive_integer?(max_concurrency) and non_negative_integer?(queue_limit) and
+    map_size(config) == MapSet.size(@bulkhead_fields) and fields == @bulkhead_fields and
+      positive_integer?(max_concurrency) and non_negative_integer?(queue_limit) and
       positive_integer?(queue_timeout_ms)
   end
 

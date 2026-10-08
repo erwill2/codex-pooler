@@ -31,6 +31,9 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     assert has_element?(view, "#alert-rule-model")
     assert has_element?(view, "#alert-rule-model-scope-field", "Model scope")
     assert has_element?(view, "#alert-rule-model[placeholder='All models']")
+    assert has_element?(view, "#alert-rule-route-class")
+    assert has_element?(view, "#alert-rule-route-class option[value='']", "All route classes")
+    assert has_element?(view, "#alert-rule-route-class-help", "worst-wins")
 
     assert has_element?(
              view,
@@ -50,7 +53,8 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
         "severity" => "warning",
         "state" => AlertRule.active_state(),
         "cooldown_minutes" => "45",
-        "model" => "gpt-5.5",
+        "model" => "gpt-6-sol",
+        "route_class" => "proxy_stream",
         "min_usable_assignments" => "3"
       }
     })
@@ -59,12 +63,14 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     assert rule.display_name == "Low assignment coverage"
     assert rule.rule_kind == "pool_low_usable_assignments"
     assert rule.min_usable_assignments == 3
-    assert rule.model == "gpt-5.5"
+    assert rule.model == "gpt-6-sol"
+    assert Map.get(rule, :route_class) == "proxy_stream"
 
     assert has_element?(view, "#alert-rule-row-#{rule.id}", "Low assignment coverage")
     assert has_element?(view, "#alert-rule-row-#{rule.id}-pool", pool.name)
     assert has_element?(view, "#alert-rule-row-#{rule.id}-state", "Enabled")
     assert has_element?(view, "#alert-rule-row-#{rule.id}-threshold", "Minimum 3")
+    assert has_element?(view, "#alert-rule-row-#{rule.id}-route-class", "proxy_stream")
     assert has_element?(view, "#alert-rule-edit-#{rule.id}")
     assert has_element?(view, "#alert-rule-disable-#{rule.id}")
     assert has_element?(view, "#alert-rule-delete-#{rule.id}")
@@ -102,6 +108,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     })
 
     assert has_element?(view, "#alert-rule-no-extra-fields", "banked saved reset")
+    refute has_element?(view, "#alert-rule-route-class-field")
     refute has_element?(view, "#alert-rule-target-state")
     refute has_element?(view, "#alert-rule-window-selector")
     refute has_element?(view, "#alert-rule-threshold-used-percent")
@@ -212,7 +219,8 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
         created_by_user_id: scope.user.id,
         display_name: "Original alert rule",
         cooldown_minutes: 30,
-        model: "gpt-4.1"
+        model: "gpt-4.1",
+        route_class: "proxy_stream"
       )
 
     {:ok, view, _html} = live(conn, ~p"/admin/alerts")
@@ -223,6 +231,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
 
     assert has_element?(view, "#alerts-rule-form-panel", "Edit rule")
     assert has_element?(view, "#alert-rule-model[value='gpt-4.1']")
+    assert has_element?(view, "#alert-rule-route-class option[selected][value='proxy_stream']")
 
     view
     |> element("#alerts-rule-form")
@@ -234,15 +243,18 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
         "severity" => "critical",
         "state" => AlertRule.active_state(),
         "cooldown_minutes" => "60",
-        "model" => "gpt-5.5"
+        "model" => "gpt-6-sol",
+        "route_class" => "proxy_compact"
       }
     })
 
     updated_rule = Repo.get!(AlertRule, rule.id)
     assert updated_rule.display_name == "Updated alert rule"
     assert updated_rule.cooldown_minutes == 60
-    assert updated_rule.model == "gpt-5.5"
+    assert updated_rule.model == "gpt-6-sol"
+    assert Map.get(updated_rule, :route_class) == "proxy_compact"
     assert has_element?(view, "#alert-rule-row-#{rule.id}", "Updated alert rule")
+    assert has_element?(view, "#alert-rule-row-#{rule.id}-route-class", "proxy_compact")
     assert has_element?(view, "#alerts-rule-form-panel", "Create rule")
   end
 
@@ -284,7 +296,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     |> element("#alert-rule-delete-#{rule.id}")
     |> render_click()
 
-    assert has_element?(view, "#alert-rule-delete-dialog[open]", "Delete alert rule")
+    assert has_element?(view, "#alert-rule-delete-dialog[open]", "Delete ")
     assert has_element?(view, "#alert-rule-delete-form")
 
     view
@@ -519,7 +531,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     |> element("#alert-channel-delete-#{channel.id}")
     |> render_click()
 
-    assert has_element?(view, "#alert-channel-delete-dialog[open]", "Delete alert channel")
+    assert has_element?(view, "#alert-channel-delete-dialog[open]", "Delete ")
     assert has_element?(view, "#alert-channel-delete-form")
 
     view
@@ -651,9 +663,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     refute html =~ raw_header
 
     view
-    |> element(
-      "#alerts-incident-severity-filter [data-role='severity-filter-option'][data-filter-value='warning']"
-    )
+    |> element("#alerts-incident-severity-filter [data-role='severity-filter-option'][data-filter-value='warning']")
     |> render_click()
 
     assert_patch(view, ~p"/admin/alerts?#{%{"tab" => "incidents", "severity" => "warning"}}")
@@ -995,13 +1005,9 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
                ]
              })
 
-    delivery_attempt_fixture(incident, visible_channel,
-      status: AlertDeliveryAttempt.sent_status()
-    )
+    delivery_attempt_fixture(incident, visible_channel, status: AlertDeliveryAttempt.sent_status())
 
-    delivery_attempt_fixture(incident, hidden_channel,
-      status: AlertDeliveryAttempt.failed_status()
-    )
+    delivery_attempt_fixture(incident, hidden_channel, status: AlertDeliveryAttempt.failed_status())
 
     assert {:ok, %{token: token}} =
              Accounts.login_user(%{"email" => admin.email, "password" => temporary_password})

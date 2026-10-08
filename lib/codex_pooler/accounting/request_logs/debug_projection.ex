@@ -1,18 +1,27 @@
 defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
   @moduledoc false
 
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.{Attempt, ModelObservation, Request}
 
   alias CodexPooler.Accounting.RequestLogs.DebugProjection.{
+    DownstreamDelivery,
     TransportFailure,
     UpstreamWebsocketConnection
   }
 
   alias CodexPooler.Gateway.Persistence.SessionReadModel
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
 
   @bounded_detail_attempts 10
-  @upstream_error_param_max_bytes 160
-  @upstream_error_param_pattern ~r/\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]{0,3})\])*\z/
+  @rejection_token_max_bytes 80
+  @rejection_token_pattern ~r/\A[A-Za-z0-9_.-]+\z/
+  @rejection_param_max_bytes 160
+  @rejection_param_pattern ~r/\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]{0,3})\])*\z/
+  @rejection_supported_values_states ~w(present none unparseable)
+  @rejection_supported_values_max 12
+  @rejection_supported_value_pattern ~r/\A[A-Za-z0-9_.-]+\z/
 
   @type surface :: :default | :admin
 
@@ -225,6 +234,9 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
     %{
       attempt_ref: attempt_ref(request_id, attempt.attempt_number),
       attempt_number: attempt.attempt_number,
+      upstream_model: attempt.upstream_model_id,
+      served_model: attempt.served_model,
+      model_observation: ModelObservation.normalize(attempt.model_observation, attempt.served_model),
       status: attempt.status,
       retryable: attempt.retryable,
       pool_upstream_assignment_id: attempt.pool_upstream_assignment_id,
@@ -234,9 +246,34 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
       final: maybe_field(turn, :final_attempt_id) == attempt.id
     }
     |> maybe_put_transport_failure(attempt)
-    |> maybe_put_upstream_error_param(attempt)
+    |> maybe_put_terminal_failure_diagnostics(attempt)
+    |> maybe_put_rejection_metadata(attempt)
+    |> maybe_put_model_serving_mode(attempt, surface)
     |> maybe_put_upstream_websocket_connection(attempt, surface)
+    |> maybe_put_downstream_delivery(attempt, surface)
   end
+
+  defp maybe_put_model_serving_mode(projection, %Attempt{} = attempt, :admin) do
+    metadata = attempt.response_metadata || %{}
+
+    case metadata |> Accounting.sanitize_metadata() |> Map.get("routing") do
+      %{
+        "model_serving_mode_configured" => configured_mode,
+        "model_serving_mode" => effective_mode,
+        "model_serving_mode_source" => source
+      } ->
+        Map.put(projection, :model_serving_mode, %{
+          configured_mode: configured_mode,
+          effective_mode: effective_mode,
+          source: source
+        })
+
+      _invalid ->
+        projection
+    end
+  end
+
+  defp maybe_put_model_serving_mode(projection, _attempt, _surface), do: projection
 
   defp maybe_put_upstream_websocket_connection(projection, %Attempt{} = attempt, :admin) do
     case UpstreamWebsocketConnection.build(attempt.response_metadata) do
@@ -246,6 +283,15 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
   end
 
   defp maybe_put_upstream_websocket_connection(projection, _attempt, :default), do: projection
+
+  defp maybe_put_downstream_delivery(projection, %Attempt{} = attempt, :admin) do
+    case DownstreamDelivery.build(attempt.response_metadata) do
+      nil -> projection
+      receipt -> Map.put(projection, :downstream_delivery, receipt)
+    end
+  end
+
+  defp maybe_put_downstream_delivery(projection, _attempt, :default), do: projection
 
   defp maybe_put_transport_failure(projection, %Attempt{} = attempt) do
     case TransportFailure.build(attempt) do
@@ -257,26 +303,144 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
     end
   end
 
-  defp maybe_put_upstream_error_param(projection, %Attempt{status: status} = attempt)
+  defp maybe_put_terminal_failure_diagnostics(projection, %Attempt{status: status} = attempt)
        when status in ["failed", "retryable_failed"] do
-    case valid_upstream_error_param(attempt.response_metadata) do
+    metadata = attempt.response_metadata
+
+    projection
+    |> maybe_put_terminal_identifier(:upstream_error_code, metadata)
+    |> maybe_put_terminal_identifier(:stream_terminal_type, metadata)
+    |> maybe_put_terminal_identifier(:compaction_invalid_reason, metadata)
+    |> maybe_put_terminal_param(metadata)
+  end
+
+  defp maybe_put_terminal_failure_diagnostics(projection, _attempt), do: projection
+
+  defp maybe_put_terminal_identifier(projection, key, metadata) when is_map(metadata) do
+    case Map.get(metadata, Atom.to_string(key)) do
+      nil -> projection
+      value -> maybe_put_identifier(projection, key, DiagnosticTaxonomy.identifier(value))
+    end
+  end
+
+  defp maybe_put_terminal_identifier(projection, _key, _metadata), do: projection
+
+  defp maybe_put_identifier(projection, _key, nil), do: projection
+  defp maybe_put_identifier(projection, key, value), do: Map.put(projection, key, value)
+
+  defp maybe_put_terminal_param(projection, metadata) when is_map(metadata) do
+    case UpstreamErrorParam.sanitize(Map.get(metadata, "upstream_error_param")) do
       nil -> projection
       value -> Map.put(projection, :upstream_error_param, value)
     end
   end
 
-  defp maybe_put_upstream_error_param(projection, _attempt), do: projection
+  defp maybe_put_terminal_param(projection, _metadata), do: projection
 
-  defp valid_upstream_error_param(%{"upstream_error_param" => value}) when is_binary(value) do
-    value = String.trim(value)
-
-    if byte_size(value) in 1..@upstream_error_param_max_bytes and
-         Regex.match?(@upstream_error_param_pattern, value) do
-      value
-    end
+  defp maybe_put_rejection_metadata(projection, %Attempt{status: status} = attempt)
+       when status in ["failed", "retryable_failed"] do
+    Map.merge(projection, valid_rejection_metadata(attempt.response_metadata))
   end
 
-  defp valid_upstream_error_param(_metadata), do: nil
+  defp maybe_put_rejection_metadata(projection, _attempt), do: projection
+
+  defp valid_rejection_metadata(metadata) when is_map(metadata) do
+    %{}
+    |> maybe_put_valid_rejection(
+      :rejection_error_code,
+      valid_rejection_token(metadata["rejection_error_code"])
+    )
+    |> maybe_put_valid_rejection(
+      :rejection_error_type,
+      valid_rejection_token(metadata["rejection_error_type"])
+    )
+    |> maybe_put_valid_rejection(
+      :rejection_error_param,
+      valid_rejection_param(metadata["rejection_error_param"])
+    )
+    |> maybe_put_valid_rejection_message(metadata)
+    |> maybe_put_valid_supported_values(metadata)
+  end
+
+  defp valid_rejection_metadata(_metadata), do: %{}
+
+  defp maybe_put_valid_rejection(projection, _key, nil), do: projection
+  defp maybe_put_valid_rejection(projection, key, value), do: Map.put(projection, key, value)
+
+  # The state and the list are projected separately on purpose: an operator must
+  # be able to tell a provider that named no alternatives from a list this
+  # parser refused, and both from a rejection the field never applied to
+  # (codex-pooler-findings#177). The values are re-validated against the same
+  # bounds the parser applied, so a hand-edited row cannot widen the surface.
+  defp maybe_put_valid_supported_values(
+         projection,
+         %{"rejection_supported_values_state" => state} = metadata
+       )
+       when state in @rejection_supported_values_states do
+    projection
+    |> Map.put(:rejection_supported_values_state, state)
+    |> maybe_put_valid_rejection(
+      :rejection_supported_values,
+      valid_supported_values(metadata["rejection_supported_values"])
+    )
+  end
+
+  defp maybe_put_valid_supported_values(projection, _metadata), do: projection
+
+  defp valid_supported_values(values) when is_list(values) do
+    valid = Enum.filter(values, &valid_supported_value?/1)
+
+    if valid != [] and length(valid) == length(values) and
+         length(valid) <= @rejection_supported_values_max,
+       do: valid,
+       else: nil
+  end
+
+  defp valid_supported_values(_values), do: nil
+
+  defp valid_supported_value?(value) when is_binary(value),
+    do: byte_size(value) in 1..32 and Regex.match?(@rejection_supported_value_pattern, value)
+
+  defp valid_supported_value?(_value), do: false
+
+  defp valid_rejection_token(value) when is_binary(value) do
+    if byte_size(value) in 1..@rejection_token_max_bytes and
+         Regex.match?(@rejection_token_pattern, value),
+       do: value,
+       else: nil
+  end
+
+  defp valid_rejection_token(_value), do: nil
+
+  defp valid_rejection_param(value) when is_binary(value) do
+    if byte_size(value) in 1..@rejection_param_max_bytes and
+         Regex.match?(@rejection_param_pattern, value),
+       do: value,
+       else: nil
+  end
+
+  defp valid_rejection_param(_value), do: nil
+
+  defp maybe_put_valid_rejection_message(
+         projection,
+         %{"rejection_message_present" => true, "rejection_message_bytes" => bytes}
+       )
+       when is_integer(bytes) and bytes in 1..1_024 do
+    projection
+    |> Map.put(:rejection_message_present, true)
+    |> Map.put(:rejection_message_bytes, bytes)
+  end
+
+  defp maybe_put_valid_rejection_message(
+         projection,
+         %{"rejection_message_present" => false, "rejection_message_bytes" => 0}
+       ) do
+    projection
+    |> Map.put(:rejection_message_present, false)
+    |> Map.put(:rejection_message_bytes, 0)
+  end
+
+  defp maybe_put_valid_rejection_message(projection, _metadata), do: projection
 
   defp metadata_session_id(metadata) when is_map(metadata) do
     case Map.fetch(metadata, "codex_session_id") do

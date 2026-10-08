@@ -7,8 +7,13 @@ defmodule CodexPooler.InstanceSettingsTest do
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.AccountsFixtures
   alias CodexPooler.Audit.AuditEvent
+  alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.{Cache, Settings}
+  alias CodexPooler.PeerRegistry
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.Firewall
+  alias Ecto.Adapters.SQL.Sandbox
 
   defmodule FailingRepo do
     def insert(_struct, _opts),
@@ -18,16 +23,172 @@ defmodule CodexPooler.InstanceSettingsTest do
       do: raise(DBConnection.ConnectionError, message: "settings db unavailable")
   end
 
+  defmodule ScriptedRepo do
+    def insert(settings, _opts) do
+      notify(:insert)
+      maybe_fail!(:load)
+      {:ok, settings}
+    end
+
+    def get!(Settings, true) do
+      notify(:get)
+      maybe_fail!(:load)
+      Keyword.fetch!(config(), :settings)
+    end
+
+    def one(_query) do
+      notify(:lock_version)
+      maybe_fail!(:lock_version)
+      config() |> Keyword.fetch!(:settings) |> Map.fetch!(:lock_version)
+    end
+
+    defp maybe_fail!(operation) do
+      if Keyword.fetch!(config(), :failure) in [:all, operation] do
+        raise DBConnection.ConnectionError, message: "settings db unavailable"
+      end
+    end
+
+    defp notify(operation), do: send(Keyword.fetch!(config(), :owner), {__MODULE__, operation})
+    defp config, do: Application.fetch_env!(:codex_pooler, __MODULE__)
+  end
+
+  defmodule TestTimer do
+    def send_after(destination, message, delay) do
+      ref = make_ref()
+      send(owner(), {__MODULE__, :scheduled, ref, destination, message, delay})
+      ref
+    end
+
+    def cancel_timer(ref) do
+      send(owner(), {__MODULE__, :cancelled, ref})
+      false
+    end
+
+    defp owner do
+      :codex_pooler
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.fetch!(:owner)
+    end
+  end
+
+  defmodule PeerRepo do
+    def insert(settings, _opts), do: {:ok, settings}
+
+    def get!(Settings, true) do
+      case Application.fetch_env!(:codex_pooler, __MODULE__) do
+        %{settings: settings, observer: observer, barrier_ref: barrier_ref} ->
+          send(observer, {:peer_settings_load_blocked, node(), barrier_ref})
+
+          receive do
+            {:release_peer_settings_load, ^barrier_ref} -> settings
+          end
+
+        %Settings{} = settings ->
+          settings
+      end
+    end
+
+    def one(_query), do: current_settings().lock_version
+
+    defp current_settings do
+      case Application.fetch_env!(:codex_pooler, __MODULE__) do
+        %{settings: settings} -> settings
+        %Settings{} = settings -> settings
+      end
+    end
+  end
+
+  defmodule PeerHarness do
+    def start(settings) do
+      Application.put_env(:codex_pooler, InstanceSettings, repo: PeerRepo)
+      Application.put_env(:codex_pooler, PeerRepo, settings)
+
+      {:ok, supervisor} =
+        Supervisor.start_link(
+          [
+            {Phoenix.PubSub, name: CodexPooler.PubSub},
+            Cache
+          ],
+          strategy: :one_for_one
+        )
+
+      Process.unlink(supervisor)
+      supervisor
+    end
+
+    def replace_repo_settings(settings) do
+      Application.put_env(:codex_pooler, PeerRepo, settings)
+    end
+
+    def block_next_repo_load(settings, observer, barrier_ref) do
+      Application.put_env(:codex_pooler, PeerRepo, %{
+        settings: settings,
+        observer: observer,
+        barrier_ref: barrier_ref
+      })
+    end
+
+    def release_repo_load(barrier_ref) do
+      send(Process.whereis(Cache), {:release_peer_settings_load, barrier_ref})
+      :ok
+    end
+
+    def firewall_decision(client_ip) do
+      settings =
+        InstanceSettings.current()
+        |> OperationalSettings.from_instance_settings()
+
+      client_ip
+      |> Firewall.evaluate_client_ip(settings)
+      |> Map.take([:outcome, :reason])
+    end
+
+    def current_lock_version do
+      InstanceSettings.current().lock_version
+    end
+
+    def hide_cache_name do
+      Process.unregister(Cache)
+    end
+
+    def start_applied_forwarder(observer) do
+      spawn(fn ->
+        :ok = Cache.subscribe_applied()
+        send(observer, {:peer_applied_subscribed, node()})
+        forward_applied(observer)
+      end)
+    end
+
+    defp forward_applied(observer) do
+      receive do
+        {Cache, {:applied, lock_version}} ->
+          current_lock_version = InstanceSettings.current().lock_version
+          send(observer, {:peer_applied, node(), lock_version, current_lock_version})
+          forward_applied(observer)
+      end
+    end
+  end
+
   setup do
-    previous = Application.get_env(:codex_pooler, InstanceSettings, [])
-    Application.put_env(:codex_pooler, InstanceSettings, Keyword.delete(previous, :repo))
-    Repo.delete_all(Settings)
-    InstanceSettings.reset_cache_for_test()
+    # `nil` when absent, so `restore_application_env/2` deletes the key instead of writing `[]`.
+    # The env restores stay ahead of the cache reset, as before: the cache reads `InstanceSettings`
+    # when it reloads and `Cache` when it restarts.
+    previous = Application.get_env(:codex_pooler, InstanceSettings)
+    previous_cache = Application.get_env(:codex_pooler, Cache)
+    previous_test_timer = Application.get_env(:codex_pooler, TestTimer)
+    previous_scripted_repo = Application.get_env(:codex_pooler, ScriptedRepo)
 
     on_exit(fn ->
-      Application.put_env(:codex_pooler, InstanceSettings, previous)
+      restore_application_env(InstanceSettings, previous)
+      restore_application_env(Cache, previous_cache)
       InstanceSettings.reset_cache_for_test()
+      restore_application_env(TestTimer, previous_test_timer)
+      restore_application_env(ScriptedRepo, previous_scripted_repo)
     end)
+
+    Application.put_env(:codex_pooler, InstanceSettings, Keyword.delete(previous || [], :repo))
+    Repo.delete_all(Settings)
+    InstanceSettings.reset_cache_for_test()
 
     :ok
   end
@@ -47,8 +208,12 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert settings.gateway.circuit_success_threshold == 1
     assert settings.gateway.websocket_idle_timeout_ms == 1_800_000
     assert Map.get(settings.gateway, :websocket_owner_idle_timeout_ms) == 1_800_000
+    assert Map.get(settings.gateway, :upstream_conn_max_idle_time_ms) == 45_000
+    assert Map.get(settings.gateway, :upstream_token_refresh_margin_seconds) == 172_800
     assert settings.files.max_size_bytes == 25 * 1024 * 1024
     assert settings.transcription.max_upload_bytes == 26_214_400
+    assert settings.ingress.max_compressed_body_bytes == 128 * 1024 * 1024
+    assert settings.ingress.max_decompressed_body_bytes == 256 * 1024 * 1024
 
     assert settings.catalog.openai_pricing_url ==
              "https://icoretech.github.io/openai-json-pricing/pricing.json"
@@ -74,6 +239,122 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert updated.gateway.websocket_idle_timeout_ms == 444_000
     assert InstanceSettings.get!().gateway.websocket_idle_timeout_ms == 444_000
     assert InstanceSettings.current().gateway.websocket_idle_timeout_ms == 444_000
+  end
+
+  test "baseline characterization publishes a cache put before its distributed invalidation" do
+    settings = InstanceSettings.current()
+    :ok = Cache.subscribe()
+    updated = %{settings | lock_version: settings.lock_version + 1}
+
+    assert {:ok, published} = Cache.put(updated)
+    assert InstanceSettings.current().lock_version == published.lock_version
+
+    assert :ok = Cache.broadcast_update(updated)
+    assert_receive {Cache, {:updated, lock_version}}
+    assert lock_version == updated.lock_version
+  end
+
+  test "distributed invalidation does not reload the local writer cache" do
+    settings = InstanceSettings.current()
+    updated = %{settings | lock_version: settings.lock_version + 1}
+    :ok = Cache.subscribe()
+
+    assert :ok = Cache.put_for_test(updated)
+
+    Application.put_env(:codex_pooler, InstanceSettings, repo: ScriptedRepo)
+    configure_scripted_repo(updated, :none)
+    flush_scripted_repo_calls()
+
+    assert :ok = Cache.broadcast_update(updated)
+    assert_receive {Cache, {:updated, lock_version}}
+    assert lock_version == updated.lock_version
+    _ = :sys.get_state(Cache)
+
+    refute_received {ScriptedRepo, _operation}
+  end
+
+  test "a settings update notifies every role through postgres with its lock version" do
+    settings = InstanceSettings.ensure_singleton!()
+    test_pid = self()
+    telemetry_ref = make_ref()
+    telemetry_id = "instance-settings-postgres-notify-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        telemetry_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if self() == test_pid, do: send(test_pid, {telemetry_ref, metadata.query, metadata.params})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(telemetry_id) end)
+
+    assert {:ok, updated} = InstanceSettings.update_system_settings(settings, %{"files" => %{"upload_ttl_seconds" => 86_401}})
+
+    channel = Cache.postgres_channel()
+    expected_payload = Integer.to_string(updated.lock_version)
+    assert_received {^telemetry_ref, "SELECT pg_notify($1, $2)", [^channel, ^expected_payload]}
+  end
+
+  # A committed NOTIFY is the only path that reaches an unclustered worker or
+  # scheduler VM; this drives it through the real Postgres LISTEN connection with no
+  # PubSub message, and the scripted repo proves the cache reloaded from it.
+  test "a committed postgres notification reloads the cache without a PubSub broadcast" do
+    settings = InstanceSettings.current()
+    newer = %{settings | lock_version: settings.lock_version + 7}
+    assert %{postgres_listen: %{ref: listen_ref}} = :sys.get_state(Cache)
+    assert is_reference(listen_ref)
+
+    Application.put_env(:codex_pooler, InstanceSettings, repo: ScriptedRepo)
+    configure_scripted_repo(newer, :none)
+    :ok = Cache.subscribe_applied()
+    flush_scripted_repo_calls()
+    flush_applied_events()
+
+    Sandbox.unboxed_run(Repo, fn -> assert :ok = Cache.notify_update(newer) end)
+
+    expected_lock_version = newer.lock_version
+    assert_receive {Cache, {:applied, ^expected_lock_version}}, 5_000
+    assert_received {ScriptedRepo, :get}
+    assert InstanceSettings.current().lock_version == expected_lock_version
+  end
+
+  test "the cache listens again on the next reconciliation after its notification listener goes down" do
+    assert %{postgres_listen: %{ref: first_ref, monitor_ref: monitor_ref}} = :sys.get_state(Cache)
+    notifications = Process.whereis(CodexPooler.Events.PostgresNotifications)
+
+    send(Process.whereis(Cache), {:DOWN, monitor_ref, :process, notifications, :simulated})
+    assert %{postgres_listen: nil, reconciliation_timer: %{generation: generation}} = :sys.get_state(Cache)
+
+    send(Process.whereis(Cache), {Cache, {:reconcile, generation}})
+    assert %{postgres_listen: %{ref: second_ref}} = :sys.get_state(Cache)
+    assert is_reference(second_ref)
+    refute second_ref == first_ref
+
+    settings = InstanceSettings.current()
+    newer = %{settings | lock_version: settings.lock_version + 11}
+    Application.put_env(:codex_pooler, InstanceSettings, repo: ScriptedRepo)
+    configure_scripted_repo(newer, :none)
+    :ok = Cache.subscribe_applied()
+    flush_applied_events()
+
+    Sandbox.unboxed_run(Repo, fn -> assert :ok = Cache.notify_update(newer) end)
+
+    expected_lock_version = newer.lock_version
+    assert_receive {Cache, {:applied, ^expected_lock_version}}, 5_000
+  end
+
+  test "new ingress defaults preserve existing operator limits including the former default pair" do
+    for {compressed, decompressed} <- [{32 * 1024 * 1024, 64 * 1024 * 1024}, {1_234_567, 7_654_321}] do
+      settings = InstanceSettings.ensure_singleton!()
+      assert {:ok, saved} = InstanceSettings.update_system_settings(settings, %{"ingress" => %{"max_compressed_body_bytes" => compressed, "max_decompressed_body_bytes" => decompressed}})
+      current = InstanceSettings.ensure_singleton!()
+      assert current.ingress.max_compressed_body_bytes == compressed
+      assert current.ingress.max_decompressed_body_bytes == decompressed
+      assert current.lock_version == saved.lock_version
+    end
   end
 
   test "duplicate singleton rows are rejected by the database and ensure_singleton!/0 is idempotent" do
@@ -134,6 +415,22 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert errors_on(changeset).gateway != []
   end
 
+  test "changeset rejects unknown fields inside a route-class bulkhead" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    bulkheads =
+      settings.gateway.bulkheads
+      |> put_in(["proxy_http", "unexpected_limit"], 99)
+
+    assert {:error, changeset} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"bulkheads" => bulkheads}
+             })
+
+    assert errors_on(changeset).gateway.bulkheads != []
+    assert InstanceSettings.get!().lock_version == settings.lock_version
+  end
+
   test "changeset rejects websocket idle timeout values outside the bounded range" do
     settings = InstanceSettings.ensure_singleton!()
 
@@ -181,6 +478,155 @@ defmodule CodexPooler.InstanceSettingsTest do
 
       assert Map.get(errors_on(changeset).gateway, :websocket_owner_idle_timeout_ms) != []
     end
+  end
+
+  test "changeset accepts inclusive upstream connection idle bound limits" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    assert {:ok, minimum} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"upstream_conn_max_idle_time_ms" => 1_000}
+             })
+
+    assert Map.get(minimum.gateway, :upstream_conn_max_idle_time_ms) == 1_000
+
+    assert {:ok, maximum} =
+             InstanceSettings.update_system_settings(InstanceSettings.get!(), %{
+               "gateway" => %{"upstream_conn_max_idle_time_ms" => 3_600_000}
+             })
+
+    assert Map.get(maximum.gateway, :upstream_conn_max_idle_time_ms) == 3_600_000
+    assert maximum.gateway.upstream_connect_timeout_ms == 15_000
+  end
+
+  test "changeset rejects upstream connection idle bound values outside the bounded range" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    for invalid <- [0, 999, 3_600_001, "infinity", "not-a-number", nil] do
+      assert {:error, changeset} =
+               InstanceSettings.update_system_settings(settings, %{
+                 "gateway" => %{"upstream_conn_max_idle_time_ms" => invalid}
+               })
+
+      assert Map.get(errors_on(changeset).gateway, :upstream_conn_max_idle_time_ms) != []
+    end
+
+    assert InstanceSettings.get!().lock_version == settings.lock_version
+  end
+
+  test "changeset accepts inclusive proactive token refresh margin limits" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    assert {:ok, minimum} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"upstream_token_refresh_margin_seconds" => 3_600}
+             })
+
+    assert Map.get(minimum.gateway, :upstream_token_refresh_margin_seconds) == 3_600
+
+    assert {:ok, maximum} =
+             InstanceSettings.update_system_settings(InstanceSettings.get!(), %{
+               "gateway" => %{"upstream_token_refresh_margin_seconds" => 1_209_600}
+             })
+
+    assert Map.get(maximum.gateway, :upstream_token_refresh_margin_seconds) == 1_209_600
+    assert maximum.gateway.upstream_connect_timeout_ms == 15_000
+  end
+
+  test "owner lease ttl keeps its 45 s default and refuses values below the derived minimum" do
+    settings = InstanceSettings.ensure_singleton!()
+    minimum = OwnerRenewalSchedule.minimum_lease_ttl_seconds()
+
+    # One 15 s pre-dispatch statement plus the synchronous renewal's interval
+    # (at most ttl / 3) and its 1 s reply allowance: ttl >= 3 / 2 * 16 s.
+    assert minimum == 24
+    assert settings.gateway.bridge_owner_lease_ttl_seconds == 45
+    assert Settings.default().gateway.bridge_owner_lease_ttl_seconds == 45
+
+    for invalid <- [minimum - 1, 3, 1, 0, -1] do
+      assert {:error, changeset} =
+               InstanceSettings.update_system_settings(settings, %{
+                 "gateway" => %{"bridge_owner_lease_ttl_seconds" => invalid}
+               })
+
+      assert "must be greater than or equal to #{minimum}" in errors_on(changeset).gateway.bridge_owner_lease_ttl_seconds
+    end
+
+    assert InstanceSettings.get!().lock_version == settings.lock_version
+
+    # The renewal must fit a third of the new ttl (findings#206 row 206-499).
+    assert {:ok, at_minimum} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"bridge_owner_lease_ttl_seconds" => minimum, "bridge_owner_lease_renewal_seconds" => div(minimum, 3)}
+             })
+
+    assert at_minimum.gateway.bridge_owner_lease_ttl_seconds == minimum
+  end
+
+  test "owner lease renewal keeps its 15 s default and refuses values above a third of the ttl" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    assert settings.gateway.bridge_owner_lease_renewal_seconds == 15
+    assert Settings.default().gateway.bridge_owner_lease_renewal_seconds == 15
+
+    # Renewal alone against the stored 45 s ttl, the ttl alone against the
+    # stored 15 s renewal, and both at once.
+    for {attrs, maximum} <- [
+          {%{"bridge_owner_lease_renewal_seconds" => 16}, 15},
+          {%{"bridge_owner_lease_renewal_seconds" => 45}, 15},
+          {%{"bridge_owner_lease_renewal_seconds" => 60}, 15},
+          {%{"bridge_owner_lease_ttl_seconds" => 44}, 14},
+          {%{"bridge_owner_lease_ttl_seconds" => 24, "bridge_owner_lease_renewal_seconds" => 24}, 8}
+        ] do
+      assert {:error, changeset} = InstanceSettings.update_system_settings(settings, %{"gateway" => attrs})
+
+      assert "must be less than or equal to #{maximum}, a third of the owner lease TTL" in errors_on(changeset).gateway.bridge_owner_lease_renewal_seconds
+    end
+
+    assert InstanceSettings.get!().lock_version == settings.lock_version
+
+    assert {:ok, bounded} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"bridge_owner_lease_ttl_seconds" => 24, "bridge_owner_lease_renewal_seconds" => 8}
+             })
+
+    assert {bounded.gateway.bridge_owner_lease_ttl_seconds, bounded.gateway.bridge_owner_lease_renewal_seconds} == {24, 8}
+
+    assert {:ok, raised} =
+             InstanceSettings.update_system_settings(bounded, %{
+               "gateway" => %{"bridge_owner_lease_ttl_seconds" => 90, "bridge_owner_lease_renewal_seconds" => 30}
+             })
+
+    assert {raised.gateway.bridge_owner_lease_ttl_seconds, raised.gateway.bridge_owner_lease_renewal_seconds} == {90, 30}
+  end
+
+  test "proactive refresh defaults on and can be disabled without changing its margin" do
+    settings = InstanceSettings.ensure_singleton!()
+    assert Map.get(settings.gateway, :upstream_token_refresh_proactive_enabled) == true
+
+    assert {:ok, changed} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"upstream_token_refresh_proactive_enabled" => false}
+             })
+
+    assert changed.gateway.upstream_token_refresh_proactive_enabled == false
+    assert changed.gateway.upstream_token_refresh_margin_seconds == 172_800
+    assert InstanceSettings.current().gateway.upstream_token_refresh_proactive_enabled == false
+  end
+
+  test "changeset rejects proactive token refresh margin values outside the bounded range" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    for invalid <- [0, 3_599, 1_209_601, "forever", "not-a-number", nil] do
+      assert {:error, changeset} =
+               InstanceSettings.update_system_settings(settings, %{
+                 "gateway" => %{"upstream_token_refresh_margin_seconds" => invalid}
+               })
+
+      assert Map.get(errors_on(changeset).gateway, :upstream_token_refresh_margin_seconds) != []
+    end
+
+    assert InstanceSettings.get!().lock_version == settings.lock_version
   end
 
   test "development helper setting is boolean-only and rejects stored script URLs" do
@@ -313,6 +759,27 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert updated.mcp.enabled == false
   end
 
+  test "legacy singleton settings rows backfill forwarded client policy without losing updates" do
+    legacy = InstanceSettings.ensure_singleton!()
+
+    Repo.query!("UPDATE instance_settings SET ingress = ingress - 'forwarded_client_ip_source' - 'forwarded_proxy_depth'")
+
+    InstanceSettings.reset_cache_for_test()
+
+    current = InstanceSettings.current()
+    assert current.ingress.forwarded_client_ip_source == :x_forwarded_for
+    assert current.ingress.forwarded_proxy_depth == 0
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
+               "files" => %{"upload_ttl_seconds" => 600}
+             })
+
+    assert updated.files.upload_ttl_seconds == 600
+    assert updated.ingress.forwarded_client_ip_source == :x_forwarded_for
+    assert updated.ingress.forwarded_proxy_depth == 0
+  end
+
   test "legacy singleton settings rows backfill the websocket idle timeout without losing updates" do
     legacy = InstanceSettings.ensure_singleton!()
 
@@ -333,9 +800,7 @@ defmodule CodexPooler.InstanceSettingsTest do
   test "legacy singleton settings rows backfill the websocket owner idle timeout without losing updates" do
     legacy = InstanceSettings.ensure_singleton!()
 
-    Repo.query!(
-      "UPDATE instance_settings SET gateway = gateway - 'websocket_owner_idle_timeout_ms'"
-    )
+    Repo.query!("UPDATE instance_settings SET gateway = gateway - 'websocket_owner_idle_timeout_ms'")
 
     InstanceSettings.reset_cache_for_test()
 
@@ -353,12 +818,47 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert updated.gateway.websocket_idle_timeout_ms == 1_800_000
   end
 
+  test "legacy singleton settings rows backfill the upstream connection idle bound without losing updates" do
+    legacy = InstanceSettings.ensure_singleton!()
+
+    Repo.query!("UPDATE instance_settings SET gateway = gateway - 'upstream_conn_max_idle_time_ms'")
+
+    InstanceSettings.reset_cache_for_test()
+
+    assert Map.get(InstanceSettings.current().gateway, :upstream_conn_max_idle_time_ms) == 45_000
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
+               "files" => %{"upload_ttl_seconds" => 600}
+             })
+
+    assert updated.files.upload_ttl_seconds == 600
+    assert Map.get(updated.gateway, :upstream_conn_max_idle_time_ms) == 45_000
+  end
+
+  test "legacy singleton settings rows backfill the proactive token refresh margin without losing updates" do
+    legacy = InstanceSettings.ensure_singleton!()
+
+    Repo.query!("UPDATE instance_settings SET gateway = gateway - 'upstream_token_refresh_margin_seconds'")
+
+    InstanceSettings.reset_cache_for_test()
+
+    assert Map.get(InstanceSettings.current().gateway, :upstream_token_refresh_margin_seconds) ==
+             172_800
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
+               "files" => %{"upload_ttl_seconds" => 600}
+             })
+
+    assert updated.files.upload_ttl_seconds == 600
+    assert Map.get(updated.gateway, :upstream_token_refresh_margin_seconds) == 172_800
+  end
+
   test "legacy singleton settings rows backfill development helper flags without losing updates" do
     legacy = InstanceSettings.ensure_singleton!()
 
-    Repo.query!(
-      "UPDATE instance_settings SET development = '{\"impeccable_live_enabled\": false}'::jsonb"
-    )
+    Repo.query!("UPDATE instance_settings SET development = '{\"impeccable_live_enabled\": false}'::jsonb")
 
     InstanceSettings.reset_cache_for_test()
 
@@ -391,7 +891,56 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert InstanceSettings.current().files.upload_ttl_seconds == 120
   end
 
-  test "cache ignores its own already-applied update broadcast without noisy reload" do
+  @tag :failure_modes
+  test "update/2 returns committed success and broadcasts when the local cache reload fails" do
+    settings = InstanceSettings.current()
+    :ok = Cache.subscribe()
+    Application.put_env(:codex_pooler, InstanceSettings, repo: FailingRepo)
+
+    log =
+      capture_log(fn ->
+        assert {:ok, updated} =
+                 InstanceSettings.update_system_settings(settings, %{
+                   "gateway" => %{"gateway_debug" => true}
+                 })
+
+        assert updated.gateway.gateway_debug
+        assert InstanceSettings.get!().gateway.gateway_debug
+        assert_receive {Cache, {:updated, lock_version}}
+        assert lock_version == updated.lock_version
+      end)
+
+    assert log =~ "instance settings db load failed warm_cache=true"
+    assert :sys.get_state(Cache).health == :degraded
+  end
+
+  @tag :failure_modes
+  test "update/2 returns committed success and broadcasts when the cache process is unavailable" do
+    settings = InstanceSettings.current()
+    :ok = Cache.subscribe()
+    assert :ok = Supervisor.terminate_child(CodexPooler.Supervisor, Cache)
+
+    try do
+      assert {:error, :cache_unavailable} = Cache.put(settings)
+
+      assert {:ok, updated} =
+               InstanceSettings.update_system_settings(settings, %{
+                 "gateway" => %{"gateway_debug" => true}
+               })
+
+      assert updated.gateway.gateway_debug
+      assert InstanceSettings.get!().gateway.gateway_debug
+      assert_receive {Cache, {:updated, lock_version}}
+      assert lock_version == updated.lock_version
+      refute_received {Cache, {:updated, ^lock_version}}
+    after
+      assert {:ok, restarted} = Supervisor.restart_child(CodexPooler.Supervisor, Cache)
+      assert is_pid(restarted)
+      _ = :sys.get_state(restarted)
+    end
+  end
+
+  test "cache reloads its own already-applied update broadcast without failure" do
     settings = InstanceSettings.current()
 
     log =
@@ -408,10 +957,250 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert InstanceSettings.current().gateway.gateway_debug == true
   end
 
+  test "primed current/0 reads do not require a synchronous cache process call" do
+    expected = InstanceSettings.current()
+    cache = Process.whereis(Cache)
+    hide_cache_name_until_exit!(cache)
+
+    try do
+      assert InstanceSettings.current() == expected
+    after
+      if is_pid(cache), do: Process.register(cache, Cache)
+    end
+  end
+
+  test "cache publication clears virtual secret inputs and actions" do
+    settings = InstanceSettings.current()
+
+    candidate = %{
+      settings
+      | metrics: %{
+          settings.metrics
+          | bearer_token: "transient-metrics-token",
+            bearer_token_action: "set"
+        },
+        smtp: %{settings.smtp | password: "transient-smtp-password", password_action: "set"}
+    }
+
+    assert :ok = Cache.put_for_test(candidate)
+
+    published = InstanceSettings.current()
+    assert published.metrics.bearer_token == nil
+    assert published.metrics.bearer_token_action == nil
+    assert published.smtp.password == nil
+    assert published.smtp.password_action == nil
+  end
+
+  test "local applied events observe the published writer snapshot" do
+    settings = InstanceSettings.current()
+    updated = %{settings | lock_version: settings.lock_version + 1}
+    parent = self()
+
+    observer =
+      spawn(fn ->
+        :ok = Cache.subscribe_applied()
+        send(parent, {:applied_observer_ready, self()})
+
+        receive do
+          {Cache, {:applied, lock_version}} ->
+            send(
+              parent,
+              {:applied_observer_result, lock_version, InstanceSettings.current().lock_version}
+            )
+        end
+      end)
+
+    assert_receive {:applied_observer_ready, ^observer}
+    assert :ok = Cache.put_for_test(updated)
+
+    assert_receive {:applied_observer_result, lock_version, current_lock_version}
+    assert lock_version == updated.lock_version
+    assert current_lock_version == updated.lock_version
+  end
+
+  test "cache put reloads the authoritative database row before publishing delayed updates" do
+    version_1 = InstanceSettings.current()
+    :ok = Cache.subscribe_applied()
+
+    assert {:ok, version_2} =
+             InstanceSettings.update_system_settings(version_1, %{
+               "ingress" => %{"firewall_allowlist" => ["198.51.100.0/24"]}
+             })
+
+    assert_receive {Cache, {:applied, 2}}
+
+    assert {:ok, version_3} =
+             InstanceSettings.update_system_settings(version_2, %{
+               "ingress" => %{"firewall_allowlist" => ["203.0.113.0/24"]}
+             })
+
+    assert_receive {Cache, {:applied, 3}}
+    assert Repo.get!(Settings, true).lock_version == 3
+
+    assert {:ok, published_version_3} = Cache.put(version_3)
+    assert published_version_3.lock_version == 3
+    assert_receive {Cache, {:applied, 3}}
+    assert_published_snapshot(3, ["203.0.113.0/24"])
+
+    assert {:ok, republished_version_3} = Cache.put(version_2)
+    assert republished_version_3.lock_version == 3
+    assert_receive {Cache, {:applied, applied_version}}
+    assert applied_version == 3
+    assert_published_snapshot(3, ["203.0.113.0/24"])
+  end
+
+  test "cache accepts recreated singleton versions before publishing a later denial" do
+    :ok = Cache.subscribe_applied()
+    version_1 = InstanceSettings.current()
+
+    version_7 =
+      Enum.reduce(2..7, version_1, fn expected_version, settings ->
+        allowlist = ["198.51.100.#{expected_version}/32"]
+
+        assert {:ok, updated} =
+                 InstanceSettings.update_system_settings(settings, %{
+                   "ingress" => %{"firewall_allowlist" => allowlist}
+                 })
+
+        assert updated.lock_version == expected_version
+        assert_receive {Cache, {:applied, ^expected_version}}
+        assert_published_snapshot(expected_version, allowlist)
+        updated
+      end)
+
+    assert InstanceSettings.current().lock_version == version_7.lock_version
+    _ = :sys.get_state(Cache)
+    assert {1, nil} = Repo.delete_all(Settings)
+    assert Repo.aggregate(Settings, :count) == 0
+
+    recreated_version_1 = InstanceSettings.ensure_singleton!()
+    assert recreated_version_1.lock_version == 1
+    assert Repo.aggregate(Settings, :count) == 1
+
+    assert {:ok, published_recreated_version_1} = Cache.put(recreated_version_1)
+    assert published_recreated_version_1.lock_version == 1
+    assert_receive {Cache, {:applied, 1}}
+    assert_published_snapshot(1, [])
+
+    assert {:ok, denied_version_2} =
+             InstanceSettings.update_system_settings(recreated_version_1, %{
+               "ingress" => %{"firewall_allowlist" => ["203.0.113.10/32"]}
+             })
+
+    assert denied_version_2.lock_version == 2
+    assert_receive {Cache, {:applied, 2}}
+    assert_published_snapshot(2, ["203.0.113.10/32"])
+    assert Repo.aggregate(Settings, :count) == 1
+  end
+
+  test "cache misses and incompatible publication versions reload through the writer" do
+    settings = InstanceSettings.current()
+    :persistent_term.put({Cache, :current}, {0, %{settings | lock_version: 999}})
+
+    assert InstanceSettings.current().lock_version == settings.lock_version
+
+    cache = Process.whereis(Cache)
+    hide_cache_name_until_exit!(cache)
+
+    try do
+      assert InstanceSettings.current().lock_version == settings.lock_version
+    after
+      if is_pid(cache), do: Process.register(cache, Cache)
+    end
+  end
+
+  test "cache reset erases the published value" do
+    _settings = InstanceSettings.current()
+    assert :ok = InstanceSettings.reset_cache_for_test()
+
+    cache = Process.whereis(Cache)
+    hide_cache_name_until_exit!(cache)
+
+    try do
+      assert InstanceSettings.current().source == :fallback_defaults
+    after
+      if is_pid(cache), do: Process.register(cache, Cache)
+    end
+  end
+
+  @tag :distributed
+  test "PubSub invalidation converges a peer only after its local snapshot is applied" do
+    settings = InstanceSettings.current()
+    peer = start_instance_settings_peer!(settings)
+
+    on_exit(fn -> stop_instance_settings_peer(peer) end)
+
+    assert forwarder =
+             :erpc.call(peer.node, PeerHarness, :start_applied_forwarder, [self()])
+
+    assert is_pid(forwarder)
+    assert_receive {:peer_applied_subscribed, peer_node}
+    assert peer_node == peer.node
+
+    updated = %{settings | lock_version: settings.lock_version + 1}
+    assert :ok = :erpc.call(peer.node, PeerHarness, :replace_repo_settings, [updated])
+    assert :ok = Cache.broadcast_update(updated)
+
+    assert_receive {:peer_applied, peer_node, applied_lock_version, current_lock_version}, 2_000
+    assert peer_node == peer.node
+    assert applied_lock_version == updated.lock_version
+    assert current_lock_version == updated.lock_version
+  end
+
+  @tag :distributed
+  test "a peer enforces a firewall update only after publishing its local applied snapshot" do
+    client_ip = {198, 51, 100, 20}
+    settings = InstanceSettings.current()
+    initial = %{settings | ingress: %{settings.ingress | firewall_allowlist: ["198.51.100.20"]}}
+    peer = start_instance_settings_peer!(initial)
+
+    on_exit(fn -> stop_instance_settings_peer(peer) end)
+
+    assert %{outcome: :allow, reason: nil} =
+             :erpc.call(peer.node, PeerHarness, :firewall_decision, [client_ip])
+
+    forwarder = :erpc.call(peer.node, PeerHarness, :start_applied_forwarder, [self()])
+    assert is_pid(forwarder)
+    assert_receive {:peer_applied_subscribed, peer_node}
+    assert peer_node == peer.node
+
+    updated = %{
+      initial
+      | lock_version: initial.lock_version + 1,
+        ingress: %{initial.ingress | firewall_allowlist: ["203.0.113.10"]}
+    }
+
+    barrier_ref = make_ref()
+
+    assert :ok =
+             :erpc.call(peer.node, PeerHarness, :block_next_repo_load, [
+               updated,
+               self(),
+               barrier_ref
+             ])
+
+    assert :ok = Cache.broadcast_update(updated)
+    assert_receive {:peer_settings_load_blocked, peer_node, ^barrier_ref}
+    assert peer_node == peer.node
+
+    assert %{outcome: :allow, reason: nil} =
+             :erpc.call(peer.node, PeerHarness, :firewall_decision, [client_ip])
+
+    assert :ok = :erpc.call(peer.node, PeerHarness, :release_repo_load, [barrier_ref])
+
+    assert_receive {:peer_applied, peer_node, applied_version, current_version}, 2_000
+    assert peer_node == peer.node
+    assert applied_version == updated.lock_version
+    assert current_version == updated.lock_version
+
+    assert %{outcome: :deny, reason: :not_allowed} =
+             :erpc.call(peer.node, PeerHarness, :firewall_decision, [client_ip])
+  end
+
   @tag :failure_modes
   test "current/0 returns fallback defaults before the cache process starts" do
     cache = Process.whereis(Cache)
-    Process.unregister(Cache)
+    hide_cache_name_until_exit!(cache)
 
     try do
       settings = InstanceSettings.current()
@@ -422,6 +1211,7 @@ defmodule CodexPooler.InstanceSettingsTest do
       assert settings.files.max_size_bytes == 25 * 1024 * 1024
       assert settings.metrics.bearer_token_status == :unavailable
       assert settings.smtp.password_status == :unavailable
+      assert :persistent_term.get({Cache, :current}) == {1, settings}
     after
       if is_pid(cache), do: Process.register(cache, Cache)
     end
@@ -429,11 +1219,15 @@ defmodule CodexPooler.InstanceSettingsTest do
 
   @tag :failure_modes
   test "warm-cache DB failure returns last-known-good settings" do
+    settings = Settings.default() |> Map.put(:lock_version, 7)
+    configure_scripted_cache(settings)
     settings = InstanceSettings.current()
     assert settings.source == :database
     assert settings.mcp.enabled == false
+    assert_receive {ScriptedRepo, :insert}
+    assert_receive {ScriptedRepo, :get}
 
-    Application.put_env(:codex_pooler, InstanceSettings, repo: FailingRepo)
+    configure_scripted_repo(settings, :load)
 
     log =
       capture_log(fn ->
@@ -448,12 +1242,20 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert fallback.db_available? == true
     assert fallback.files.max_size_bytes == settings.files.max_size_bytes
     assert fallback.metrics.bearer_token_status == :intentionally_unset
+
+    state = :sys.get_state(Cache)
+    assert state.health == :degraded
+    assert state.cached.lock_version == settings.lock_version
+    assert state.desired_lock_version == settings.lock_version + 1
+    assert %{attempt: 0} = state.retry_timer
+    assert_receive {TestTimer, :scheduled, _ref, _cache, {Cache, {:retry, _generation}}, 10}
   end
 
   @tag :failure_modes
-  test "cold-cache DB failure returns fallback defaults with unavailable secret statuses" do
-    Application.put_env(:codex_pooler, InstanceSettings, repo: FailingRepo)
-    InstanceSettings.reset_cache_for_test()
+  test "cold-cache DB failure publishes unavailable defaults and one retry recovers" do
+    database_settings = Settings.default() |> Map.put(:lock_version, 11)
+    configure_scripted_cache(database_settings, :load)
+    :ok = Cache.subscribe_applied()
 
     {settings, log} = capture_instance_settings_db_failure(fn -> InstanceSettings.current() end)
 
@@ -465,6 +1267,143 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert settings.mcp.enabled == false
     assert settings.metrics.bearer_token_status == :unavailable
     assert settings.smtp.password_status == :unavailable
+    assert :persistent_term.get({Cache, :current}) == {1, settings}
+
+    assert_receive {TestTimer, :scheduled, _ref, cache, {Cache, {:retry, generation}}, 10}
+    assert cache == Process.whereis(Cache)
+
+    configure_scripted_repo(database_settings, :none)
+    send(Cache, {Cache, {:retry, generation}})
+
+    assert_receive {Cache, {:applied, lock_version}}
+    assert lock_version == database_settings.lock_version
+    assert InstanceSettings.current().lock_version == database_settings.lock_version
+    assert InstanceSettings.current().source == :database
+
+    state = :sys.get_state(Cache)
+    assert state.health == :ready
+    assert state.retry_timer == nil
+    assert state.retry_attempt == 0
+    assert %{generation: _generation} = state.reconciliation_timer
+  end
+
+  @tag :failure_modes
+  @tag :capture_log
+  test "retry backoff caps, keeps one timer, and resets after success" do
+    database_settings = Settings.default() |> Map.put(:lock_version, 15)
+    configure_scripted_cache(database_settings, :load)
+
+    _fallback = InstanceSettings.current()
+
+    assert_receive {TestTimer, :scheduled, _ref1, _cache, {Cache, {:retry, generation1}}, 10}
+    assert %{attempt: 0, generation: ^generation1} = :sys.get_state(Cache).retry_timer
+
+    send(Cache, {Cache, {:retry, generation1}})
+    assert_receive {TestTimer, :scheduled, _ref2, _cache, {Cache, {:retry, generation2}}, 20}
+    assert %{attempt: 1, generation: ^generation2} = :sys.get_state(Cache).retry_timer
+
+    send(Cache, {Cache, {:retry, generation2}})
+    assert_receive {TestTimer, :scheduled, _ref3, _cache, {Cache, {:retry, generation3}}, 30}
+    assert %{attempt: 2, generation: ^generation3} = :sys.get_state(Cache).retry_timer
+
+    send(Cache, {Cache, {:retry, generation3}})
+    assert_receive {TestTimer, :scheduled, _ref4, _cache, {Cache, {:retry, generation4}}, 30}
+    assert %{attempt: 3, generation: ^generation4} = :sys.get_state(Cache).retry_timer
+
+    refute_received {TestTimer, :scheduled, _ref, _destination, {Cache, {:retry, _generation}}, _delay}
+
+    configure_scripted_repo(database_settings, :none)
+    send(Cache, {Cache, {:retry, generation4}})
+    _ = :sys.get_state(Cache)
+
+    state = :sys.get_state(Cache)
+    assert state.retry_timer == nil
+    assert state.retry_attempt == 0
+    assert state.health == :ready
+    assert %{generation: _generation} = state.reconciliation_timer
+  end
+
+  @tag :failure_modes
+  @tag :capture_log
+  test "stale retry generations cannot reload or schedule another timer" do
+    database_settings = Settings.default() |> Map.put(:lock_version, 21)
+    configure_scripted_cache(database_settings, :load)
+    _fallback = InstanceSettings.current()
+
+    assert_receive {TestTimer, :scheduled, retry_ref, _cache, {Cache, {:retry, stale_generation}}, 10}
+
+    send(Cache, {Cache, {:updated, database_settings.lock_version + 1}})
+    _ = :sys.get_state(Cache)
+
+    assert_receive {TestTimer, :cancelled, ^retry_ref}
+
+    assert_receive {TestTimer, :scheduled, _new_ref, _cache, {Cache, {:retry, current_generation}}, 10}
+
+    refute current_generation == stale_generation
+    flush_scripted_repo_calls()
+
+    send(Cache, {Cache, {:retry, stale_generation}})
+    _ = :sys.get_state(Cache)
+
+    refute_received {ScriptedRepo, _operation}
+
+    refute_received {TestTimer, :scheduled, _ref, _destination, {Cache, {:retry, _generation}}, _delay}
+
+    assert %{generation: ^current_generation} = :sys.get_state(Cache).retry_timer
+  end
+
+  test "reconciliation repairs a missed invalidation using the persisted lock version" do
+    initial = Settings.default() |> Map.put(:lock_version, 31)
+    configure_scripted_cache(initial)
+    :ok = Cache.subscribe_applied()
+    assert InstanceSettings.current().lock_version == initial.lock_version
+    flush_scripted_repo_calls()
+    flush_applied_events()
+
+    updated = %{initial | lock_version: initial.lock_version + 1}
+    configure_scripted_repo(updated, :none)
+    %{generation: generation} = :sys.get_state(Cache).reconciliation_timer
+
+    send(Cache, {Cache, {:reconcile, generation}})
+
+    assert_receive {ScriptedRepo, :lock_version}
+    assert_receive {ScriptedRepo, :insert}
+    assert_receive {ScriptedRepo, :get}
+    assert_receive {Cache, {:applied, lock_version}}
+    assert lock_version == updated.lock_version
+    assert InstanceSettings.current().lock_version == updated.lock_version
+  end
+
+  @tag :failure_modes
+  test "cache process absence publishes cold fallback and restart recovers from the database" do
+    database_settings = Settings.default() |> Map.put(:lock_version, 41)
+    configure_scripted_cache(database_settings)
+    assert InstanceSettings.current().lock_version == database_settings.lock_version
+    :ok = Cache.subscribe_applied()
+    flush_applied_events()
+
+    # Also on_exit, where it runs before the sandbox teardown restores the cache through this
+    # process: the ExUnit timeout kills the test before the restart below, and every later test
+    # in the run would find the cache stopped.
+    on_exit(fn ->
+      if is_nil(Process.whereis(Cache)),
+        do: Supervisor.restart_child(CodexPooler.Supervisor, Cache)
+    end)
+
+    assert :ok = Supervisor.terminate_child(CodexPooler.Supervisor, Cache)
+    :persistent_term.erase({Cache, :current})
+
+    fallback = InstanceSettings.current()
+    assert fallback.source == :fallback_defaults
+    assert fallback.db_available? == false
+    assert :persistent_term.get({Cache, :current}) == {1, fallback}
+
+    assert {:ok, restarted} = Supervisor.restart_child(CodexPooler.Supervisor, Cache)
+    assert is_pid(restarted)
+    assert_receive {Cache, {:applied, lock_version}}
+    assert lock_version == database_settings.lock_version
+    assert InstanceSettings.current().lock_version == database_settings.lock_version
+    assert InstanceSettings.current().source == :database
   end
 
   @tag :sensitive
@@ -745,9 +1684,7 @@ defmodule CodexPooler.InstanceSettingsTest do
 
     assert {:ok, updated} =
              settings
-             |> InstanceSettings.update_system_settings(
-               InstanceSettings.put_metrics_bearer_token(%{}, token)
-             )
+             |> InstanceSettings.update_system_settings(InstanceSettings.put_metrics_bearer_token(%{}, token))
 
     assert updated.metrics.bearer_token_status == :configured
     assert updated.metrics.bearer_token_fingerprint =~ "sha256:"
@@ -785,6 +1722,275 @@ defmodule CodexPooler.InstanceSettingsTest do
 
     assert_received {^ref, result}
     {result, log}
+  end
+
+  defp assert_published_snapshot(lock_version, firewall_allowlist) do
+    published = InstanceSettings.current()
+
+    assert published.lock_version == lock_version
+    assert published.ingress.firewall_allowlist == firewall_allowlist
+    assert published.metrics.bearer_token == nil
+    assert published.metrics.bearer_token_action == nil
+    assert published.smtp.password == nil
+    assert published.smtp.password_action == nil
+  end
+
+  defp configure_scripted_cache(settings, failure \\ :none) do
+    Application.put_env(:codex_pooler, InstanceSettings, repo: ScriptedRepo)
+    configure_scripted_repo(settings, failure)
+    Application.put_env(:codex_pooler, TestTimer, owner: self())
+
+    Application.put_env(:codex_pooler, Cache,
+      timer_module: TestTimer,
+      retry_initial_interval_ms: 10,
+      retry_max_interval_ms: 30,
+      reconciliation_interval_ms: 100
+    )
+
+    assert :ok = InstanceSettings.reset_cache_for_test()
+
+    assert_receive {TestTimer, :scheduled, _ref, cache, {Cache, {:reconcile, _generation}}, 100}
+    assert cache == Process.whereis(Cache)
+    flush_timer_cancellations()
+    :ok
+  end
+
+  defp configure_scripted_repo(settings, failure) do
+    Application.put_env(:codex_pooler, ScriptedRepo,
+      owner: self(),
+      settings: settings,
+      failure: failure
+    )
+  end
+
+  defp flush_scripted_repo_calls do
+    receive do
+      {ScriptedRepo, _operation} -> flush_scripted_repo_calls()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp flush_applied_events do
+    receive do
+      {Cache, {:applied, _lock_version}} -> flush_applied_events()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp flush_timer_cancellations do
+    receive do
+      {TestTimer, :cancelled, _ref} -> flush_timer_cancellations()
+    after
+      0 -> :ok
+    end
+  end
+
+  # Also on_exit: the ExUnit timeout or a linked crash kills the test before its `after` re-registers
+  # the cache, and every later test in the run would find the cache process without its name.
+  defp hide_cache_name_until_exit!(cache) do
+    on_exit(fn ->
+      if is_pid(cache) and Process.alive?(cache) and is_nil(Process.whereis(Cache)),
+        do: Process.register(cache, Cache)
+    end)
+
+    Process.unregister(Cache)
+  end
+
+  defp restore_application_env(module, nil), do: Application.delete_env(:codex_pooler, module)
+
+  defp restore_application_env(module, value),
+    do: Application.put_env(:codex_pooler, module, value)
+
+  defp start_instance_settings_peer!(settings) do
+    distribution = ensure_test_distribution_started!()
+    peer_name = String.to_atom("instance_settings_peer_#{System.unique_integer([:positive])}")
+
+    assert {:ok, peer_pid, peer_node} =
+             :peer.start_link(%{
+               name: peer_name,
+               args: [~c"-kernel", ~c"prevent_overlapping_partitions", ~c"false"]
+             })
+
+    Process.unlink(peer_pid)
+    assert :ok = :erpc.call(peer_node, :code, :add_paths, [:code.get_path()])
+
+    assert {:ok, _applications} =
+             :erpc.call(peer_node, Application, :ensure_all_started, [:elixir])
+
+    assert [{PeerRepo, _repo_beam}, {PeerHarness, _harness_beam}] =
+             :erpc.call(peer_node, Code, :compile_string, [peer_harness_source()])
+
+    assert {:ok, _applications} =
+             :erpc.call(peer_node, Application, :ensure_all_started, [:phoenix_pubsub])
+
+    supervisor = :erpc.call(peer_node, PeerHarness, :start, [settings])
+    assert is_pid(supervisor)
+
+    %{
+      distribution: distribution,
+      node: peer_node,
+      pid: peer_pid,
+      supervisor: supervisor
+    }
+  end
+
+  defp stop_instance_settings_peer(%{pid: peer_pid, distribution: distribution}) do
+    if Process.alive?(peer_pid), do: :peer.stop(peer_pid)
+
+    if distribution.node_started? do
+      :ok = :net_kernel.stop()
+      restore_partition_guard(distribution.previous_partition_guard)
+    end
+
+    :ok
+  end
+
+  defp ensure_test_distribution_started! do
+    case Node.alive?() do
+      true ->
+        %{node_started?: false, previous_partition_guard: :unchanged}
+
+      false ->
+        ensure_epmd_started!()
+        previous_partition_guard = Application.fetch_env(:kernel, :prevent_overlapping_partitions)
+        Application.put_env(:kernel, :prevent_overlapping_partitions, false)
+        node_name = String.to_atom("instance_settings_test_#{System.unique_integer([:positive])}")
+        assert {:ok, _pid} = :net_kernel.start([node_name, :shortnames])
+
+        %{
+          node_started?: true,
+          previous_partition_guard: previous_partition_guard
+        }
+    end
+  end
+
+  defp ensure_epmd_started! do
+    case :erl_epmd.names() do
+      {:ok, _names} ->
+        false
+
+      {:error, _reason} ->
+        assert {_output, 0} = System.cmd("epmd", ["-daemon"])
+        PeerRegistry.assert_epmd_ready!()
+        true
+    end
+  end
+
+  defp restore_partition_guard({:ok, value}) do
+    Application.put_env(:kernel, :prevent_overlapping_partitions, value)
+  end
+
+  defp restore_partition_guard(:error) do
+    Application.delete_env(:kernel, :prevent_overlapping_partitions)
+  end
+
+  defp restore_partition_guard(:unchanged), do: :ok
+
+  defp peer_harness_source do
+    """
+    defmodule #{inspect(PeerRepo)} do
+      def insert(settings, _opts), do: {:ok, settings}
+
+      def get!(CodexPooler.InstanceSettings.Settings, true) do
+        case Application.fetch_env!(:codex_pooler, __MODULE__) do
+          %{settings: settings, observer: observer, barrier_ref: barrier_ref} ->
+            send(observer, {:peer_settings_load_blocked, node(), barrier_ref})
+
+            receive do
+              {:release_peer_settings_load, ^barrier_ref} -> settings
+            end
+
+          %CodexPooler.InstanceSettings.Settings{} = settings ->
+            settings
+        end
+      end
+
+      def one(_query), do: current_settings().lock_version
+
+      defp current_settings do
+        case Application.fetch_env!(:codex_pooler, __MODULE__) do
+          %{settings: settings} -> settings
+          %CodexPooler.InstanceSettings.Settings{} = settings -> settings
+        end
+      end
+    end
+
+    defmodule #{inspect(PeerHarness)} do
+      alias CodexPooler.InstanceSettings
+      alias CodexPooler.InstanceSettings.Cache
+      alias #{inspect(PeerRepo)}
+
+      def start(settings) do
+        Application.put_env(:codex_pooler, InstanceSettings, repo: PeerRepo)
+        Application.put_env(:codex_pooler, PeerRepo, settings)
+
+        {:ok, supervisor} =
+          Supervisor.start_link(
+            [{Phoenix.PubSub, name: CodexPooler.PubSub}, Cache],
+            strategy: :one_for_one
+          )
+
+        Process.unlink(supervisor)
+        supervisor
+      end
+
+      def replace_repo_settings(settings) do
+        Application.put_env(:codex_pooler, PeerRepo, settings)
+      end
+
+      def block_next_repo_load(settings, observer, barrier_ref) do
+        Application.put_env(:codex_pooler, PeerRepo, %{
+          settings: settings,
+          observer: observer,
+          barrier_ref: barrier_ref
+        })
+      end
+
+      def release_repo_load(barrier_ref) do
+        send(Process.whereis(Cache), {:release_peer_settings_load, barrier_ref})
+        :ok
+      end
+
+      def firewall_decision(client_ip) do
+        settings =
+          InstanceSettings.current()
+          |> CodexPooler.Gateway.OperationalSettings.from_instance_settings()
+
+        client_ip
+        |> CodexPoolerWeb.Plugs.RuntimeIngress.Firewall.evaluate_client_ip(
+          settings
+        )
+        |> Map.take([:outcome, :reason])
+      end
+
+      def current_lock_version do
+        InstanceSettings.current().lock_version
+      end
+
+      def hide_cache_name do
+        Process.unregister(Cache)
+      end
+
+      def start_applied_forwarder(observer) do
+        spawn(fn ->
+          :ok = Cache.subscribe_applied()
+          send(observer, {:peer_applied_subscribed, node()})
+          forward_applied(observer)
+        end)
+      end
+
+      defp forward_applied(observer) do
+        receive do
+          {Cache, {:applied, lock_version}} ->
+            current_lock_version = InstanceSettings.current().lock_version
+            send(observer, {:peer_applied, node(), lock_version, current_lock_version})
+            forward_applied(observer)
+        end
+      end
+    end
+    """
   end
 
   defp free_port do

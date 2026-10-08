@@ -12,6 +12,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
     RequestHealth
   }
 
+  alias CodexPooler.Admin.UpstreamQuotaReadiness
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
@@ -35,6 +36,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
           required(:state) => String.t(),
           required(:state_label) => String.t(),
           required(:routing_usable?) => boolean(),
+          optional(:routing_conditional?) => boolean(),
           required(:routing_readiness_state) => String.t(),
           required(:routing_readiness_label) => String.t(),
           required(:routing_readiness_reason) => String.t(),
@@ -55,6 +57,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
   @type quota_health_kpis :: %{
           required(:assignment_count) => non_neg_integer(),
           required(:routing_usable_count) => non_neg_integer(),
+          optional(:routing_conditional_count) => non_neg_integer(),
           required(:stale_or_missing_count) => non_neg_integer(),
           required(:exhausted_count) => non_neg_integer(),
           required(:blocked_count) => non_neg_integer(),
@@ -77,6 +80,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
           required(:date) => String.t(),
           required(:success_count) => non_neg_integer(),
           required(:failure_count) => non_neg_integer(),
+          required(:client_cancelled_count) => non_neg_integer(),
           required(:total_count) => non_neg_integer()
         }
   @type request_error_breakdown_entry :: %{
@@ -87,6 +91,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
   @type request_health_kpis :: %{
           required(:total_requests_24h) => non_neg_integer(),
           required(:failed_requests_24h) => non_neg_integer(),
+          required(:client_cancelled_requests_24h) => non_neg_integer(),
           required(:failure_rate_24h) => float(),
           required(:total_requests_7d) => non_neg_integer(),
           required(:p50_latency_ms_24h) => non_neg_integer() | nil,
@@ -148,6 +153,10 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
           required(:last_error_code) => String.t() | nil,
           required(:attempt_count) => non_neg_integer()
         }
+  @type recent_request_events :: %{
+          required(:rows) => [recent_request_event_row()],
+          required(:searched_attempt_limit) => pos_integer() | nil
+        }
 
   @spec request_health(Scope.t(), identity_ref()) :: request_health()
   def request_health(%Scope{} = scope, identity_or_id) do
@@ -174,6 +183,23 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
     QuotaHealth.quota_health(scope, identity_or_id, assignments, Common.now())
   end
 
+  @spec quota_health_from_readiness(
+          Scope.t(),
+          identity_ref(),
+          [assignment_summary()],
+          UpstreamQuotaReadiness.t()
+        ) :: quota_health()
+  def quota_health_from_readiness(%Scope{} = scope, identity_or_status, assignments, readiness)
+      when is_list(assignments) and is_map(readiness) do
+    QuotaHealth.quota_health_from_readiness(
+      scope,
+      identity_or_status,
+      assignments,
+      readiness,
+      Common.now()
+    )
+  end
+
   @spec quota_health_without_quota_data([assignment_summary()]) :: quota_health()
   def quota_health_without_quota_data(assignments) when is_list(assignments) do
     QuotaHealth.without_quota_data(assignments, Common.now())
@@ -186,17 +212,37 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics do
     PoolContribution.pool_contribution(scope, identity_or_id, assignments, Common.now())
   end
 
+  @spec pool_contribution_from_readiness(
+          Scope.t(),
+          identity_ref(),
+          [assignment_summary()],
+          UpstreamQuotaReadiness.t()
+        ) :: pool_contribution()
+  def pool_contribution_from_readiness(
+        %Scope{} = scope,
+        identity_or_status,
+        assignments,
+        readiness
+      )
+      when is_list(assignments) and is_map(readiness) do
+    PoolContribution.pool_contribution_from_readiness(
+      scope,
+      identity_or_status,
+      assignments,
+      readiness,
+      Common.now()
+    )
+  end
+
   @spec pool_contribution_without_request_data([assignment_summary()]) :: pool_contribution()
   def pool_contribution_without_request_data(assignments) when is_list(assignments) do
     PoolContribution.without_request_data(assignments, Common.now())
   end
 
-  @spec recent_request_event_rows(Scope.t(), identity_ref(), pos_integer()) :: [
-          recent_request_event_row()
-        ]
-  def recent_request_event_rows(%Scope{} = scope, identity_or_id, limit) when is_integer(limit) do
-    RequestHealth.recent_request_event_rows(scope, identity_or_id, max(limit, 0))
+  @spec recent_request_events(Scope.t(), identity_ref(), pos_integer()) :: recent_request_events()
+  def recent_request_events(%Scope{} = scope, identity_or_id, limit) when is_integer(limit) do
+    RequestHealth.recent_request_events(scope, identity_or_id, max(limit, 0))
   end
 
-  def recent_request_event_rows(_scope, _identity_or_id, _limit), do: []
+  def recent_request_events(_scope, _identity_or_id, _limit), do: %{rows: [], searched_attempt_limit: nil}
 end

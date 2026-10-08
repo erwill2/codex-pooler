@@ -3,7 +3,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
 
   import Plug.Conn
 
-  alias CodexPooler.Gateway.OperationalSettings
   alias Plug.Conn.Query
   alias Plug.Conn.Utils
 
@@ -20,11 +19,21 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
   alias __MODULE__.DecompressionState
 
   @decompression_chunk_bytes 16_384
+  @settings_private_key :codex_pooler_runtime_ingress_settings
 
   @type error_reason :: %{
           required(:status) => pos_integer(),
           required(:code) => String.t(),
           required(:message) => String.t()
+        }
+  @type settings :: %{
+          required(:decompression_algorithms) => [String.t()],
+          required(:zstd_supported?) => boolean(),
+          required(:max_compressed_body_bytes) => pos_integer(),
+          required(:max_decompressed_body_bytes) => pos_integer(),
+          required(:max_decompression_ratio) => pos_integer(),
+          required(:decompression_timeout_ms) => pos_integer(),
+          optional(atom()) => term()
         }
   @type read_result ::
           {:ok, binary(), Plug.Conn.t()}
@@ -39,7 +48,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
 
   @spec read_plain_json_body(Plug.Conn.t(), keyword()) :: read_result()
   def read_plain_json_body(conn, opts) do
-    settings = OperationalSettings.current()
+    settings = Map.fetch!(conn.private, @settings_private_key)
 
     read_opts =
       opts
@@ -50,7 +59,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
     Plug.Conn.read_body(conn, read_opts)
   end
 
-  @spec decode(Plug.Conn.t(), OperationalSettings.t()) :: decode_result()
+  @spec decode(Plug.Conn.t(), settings()) :: decode_result()
   def decode(conn, settings) do
     with {:ok, encoding} <- content_encoding(conn),
          :ok <- supported_encoding?(settings, encoding),
@@ -127,7 +136,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
     remaining_bytes = settings.max_compressed_body_bytes - total_bytes
 
     if remaining_bytes <= 0 do
-      compressed_body_too_large(conn)
+      compressed_body_too_large(conn, settings)
     else
       read_opts = [
         length: remaining_bytes,
@@ -156,17 +165,16 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
          }, conn}
 
       {:error, _reason} ->
-        {:error,
-         %{status: 400, code: "invalid_request", message: "request body could not be read"}, conn}
+        {:error, %{status: 400, code: "invalid_request", message: "request body could not be read"}, conn}
     end
   end
 
-  defp compressed_body_too_large(conn) do
+  defp compressed_body_too_large(conn, settings) do
     {:error,
      %{
        status: 413,
        code: "compressed_request_too_large",
-       message: "compressed request body is too large"
+       message: "compressed request body exceeds the #{settings.max_compressed_body_bytes}-byte limit; ask the operator to increase ingress.max_compressed_body_bytes in System > Firewall before retrying"
      }, conn}
   end
 
@@ -272,7 +280,10 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
           zstream,
           compressed,
           settings,
-          %DecompressionState{state | pending: IO.iodata_to_binary([remainder, state.pending])},
+          %DecompressionState{
+            state
+            | pending: remainder |> IO.iodata_to_binary() |> :binary.copy()
+          },
           output
         )
 
@@ -296,12 +307,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
          } = state
        )
        when byte_size(pending) > 0 do
-    chunk_size = min(@decompression_chunk_bytes, byte_size(pending))
-    chunk = binary_part(pending, 0, chunk_size)
-    rest = binary_part(pending, chunk_size, byte_size(pending) - chunk_size)
-
-    {chunk,
-     %DecompressionState{state | offset: offset, compressed_size: compressed_size, pending: rest}}
+    {pending, %DecompressionState{state | offset: offset, compressed_size: compressed_size, pending: <<>>}}
   end
 
   defp zstd_next_chunk(
@@ -438,7 +444,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
        %{
          status: 413,
          code: "decompressed_request_too_large",
-         message: "decompressed request body is too large"
+         message: "decompressed request body exceeds the #{settings.max_decompressed_body_bytes}-byte limit; ask the operator to increase ingress.max_decompressed_body_bytes in System > Firewall before retrying"
        }}
     end
   end
@@ -475,7 +481,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
   defp decode_json_body(conn, body) do
     case content_type(conn) do
       {:json, _content_type} ->
-        case Jason.decode(body) do
+        case CodexPooler.JSON.decode(body) do
           {:ok, params} when is_map(params) ->
             {:ok, params}
 
@@ -488,8 +494,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody do
              }}
 
           {:error, _reason} ->
-            {:error,
-             %{status: 400, code: "invalid_request", message: "request body must be JSON"}}
+            {:error, %{status: 400, code: "invalid_request", message: "request body must be JSON"}}
         end
 
       {:other, content_type} ->

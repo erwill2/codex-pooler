@@ -7,6 +7,7 @@ defmodule CodexPooler.Alerts.Rules.RuleManagement do
   alias CodexPooler.Alerts.AuditLog, as: AlertAudit
   alias CodexPooler.Alerts.Authorization
   alias CodexPooler.Alerts.ChannelManagement
+  alias CodexPooler.Alerts.Incidents.NotificationEvents
 
   alias CodexPooler.Alerts.Schemas.{
     AlertRule,
@@ -111,8 +112,11 @@ defmodule CodexPooler.Alerts.Rules.RuleManagement do
     end
   end
 
+  # The rule's incident targets go with it by database cascade.
   defp delete_rule_transaction(rule) do
-    Repo.transaction(fn -> delete_rule_in_transaction(rule) end)
+    NotificationEvents.invalidate_after_cascade({:rule, rule.id}, fn ->
+      Repo.transaction(fn -> delete_rule_in_transaction(rule) end)
+    end)
   end
 
   defp delete_rule_in_transaction(rule) do
@@ -135,8 +139,7 @@ defmodule CodexPooler.Alerts.Rules.RuleManagement do
     |> Map.merge(%{
       pool_id: pool_id,
       created_by_user_id: scope.user.id,
-      disabled_at:
-        disabled_at_for_state(Map.get(attrs, :state) || Map.get(attrs, "state"), timestamp),
+      disabled_at: disabled_at_for_state(Map.get(attrs, :state) || Map.get(attrs, "state"), timestamp),
       metadata: Map.get(attrs, :metadata) || Map.get(attrs, "metadata") || %{},
       created_at: timestamp,
       updated_at: timestamp
@@ -147,6 +150,7 @@ defmodule CodexPooler.Alerts.Rules.RuleManagement do
   defp rule_update_attrs(%AlertRule{} = rule, attrs, target_pool_id, timestamp) do
     attrs
     |> normalize_attrs(rule_update_attribute_keys())
+    |> maybe_clear_unsupported_route_class(rule, attrs)
     |> Map.put(:pool_id, target_pool_id)
     |> maybe_put_disabled_at(attrs, timestamp)
     |> maybe_put_saved_reset_first_seen_enable_baseline(rule, timestamp)
@@ -220,6 +224,7 @@ defmodule CodexPooler.Alerts.Rules.RuleManagement do
       :cooldown_minutes,
       :state,
       :model,
+      :route_class,
       :min_usable_assignments,
       :target_state,
       :window_selector,
@@ -249,6 +254,27 @@ defmodule CodexPooler.Alerts.Rules.RuleManagement do
       :error -> acc
     end
   end
+
+  defp maybe_clear_unsupported_route_class(normalized_attrs, rule, raw_attrs) do
+    final_rule_kind = Map.get(normalized_attrs, :rule_kind, rule.rule_kind)
+
+    cond do
+      final_rule_kind in AlertRule.route_class_rule_kinds() ->
+        normalized_attrs
+
+      route_class_submitted?(raw_attrs) ->
+        normalized_attrs
+
+      final_rule_kind != rule.rule_kind ->
+        Map.put(normalized_attrs, :route_class, nil)
+
+      true ->
+        normalized_attrs
+    end
+  end
+
+  defp route_class_submitted?(attrs),
+    do: Map.has_key?(attrs, :route_class) or Map.has_key?(attrs, "route_class")
 
   defp maybe_put_disabled_at(attrs, raw_attrs, timestamp) do
     case Map.get(raw_attrs, :state) || Map.get(raw_attrs, "state") do

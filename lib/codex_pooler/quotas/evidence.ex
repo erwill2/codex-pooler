@@ -67,13 +67,13 @@ defmodule CodexPooler.Quotas.Evidence do
 
   @type errors :: %{optional(atom()) => [String.t()]}
   @type persistence_identity_key ::
-          {String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), pos_integer(),
-           String.t(), String.t(), String.t(), String.t()}
+          {String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), pos_integer(), String.t(), String.t(), String.t(), String.t()}
   @type descriptor_key ::
-          {String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t(),
-           String.t(), String.t()}
+          {String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t()}
   @type logical_window_key ::
           {String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), pos_integer()}
+  @type additional_window_group_key ::
+          {:legacy, logical_window_key()} | {:metered, logical_window_key(), String.t()}
   @type t :: %__MODULE__{
           quota_key: String.t(),
           window_kind: String.t(),
@@ -139,12 +139,6 @@ defmodule CodexPooler.Quotas.Evidence do
   @spec parse_rate_limit_error(term(), DateTime.t()) :: [t()]
   def parse_rate_limit_error(payload, observed_at \\ now()),
     do: CodexParsers.parse_rate_limit_error(payload, observed_at)
-
-  @spec routing_usable?(t(), DateTime.t()) :: boolean()
-  def routing_usable?(%__MODULE__{} = evidence, timestamp \\ now()) do
-    current_freshness_state(evidence, timestamp) == "fresh" and not exhausted?(evidence) and
-      reset_bearing?(evidence) and not expired?(evidence, timestamp)
-  end
 
   @spec current_freshness_state(t() | map(), DateTime.t()) :: String.t()
   def current_freshness_state(evidence_or_window, timestamp \\ now())
@@ -265,10 +259,8 @@ defmodule CodexPooler.Quotas.Evidence do
   def descriptor_key(evidence) when is_map(evidence) do
     evidence
     |> identity_key()
-    |> then(fn {scope, family, model, upstream_model, quota_key, _kind, _minutes, source,
-                raw_limit_id, raw_limit_name, raw_metered_feature} ->
-      {scope, family, model, upstream_model, quota_key, source, raw_limit_id, raw_limit_name,
-       raw_metered_feature}
+    |> then(fn {scope, family, model, upstream_model, quota_key, _kind, _minutes, source, raw_limit_id, raw_limit_name, raw_metered_feature} ->
+      {scope, family, model, upstream_model, quota_key, source, raw_limit_id, raw_limit_name, raw_metered_feature}
     end)
   end
 
@@ -276,10 +268,44 @@ defmodule CodexPooler.Quotas.Evidence do
   def logical_window_key(evidence) when is_map(evidence) do
     evidence
     |> identity_key()
-    |> then(fn {scope, family, model, upstream_model, quota_key, kind, minutes, _source,
-                _raw_limit_id, _raw_limit_name, _raw_metered_feature} ->
+    |> then(fn {scope, family, model, upstream_model, quota_key, kind, minutes, _source, _raw_limit_id, _raw_limit_name, _raw_metered_feature} ->
       {scope, family, model, upstream_model, quota_key, kind, minutes}
     end)
+  end
+
+  @doc """
+  Returns the richer grouping identity used only when selecting additional windows.
+
+  The stable seven-element `logical_window_key/1` remains the account, reset,
+  and saved-reset identity. Additional provider rows may carry a canonical
+  meter token; those rows add the token to selection grouping so observations
+  from different sources fold without collapsing distinct meters. Rows without
+  a token retain the legacy group identity.
+  """
+  @spec additional_window_group_key(t() | map()) :: additional_window_group_key()
+  def additional_window_group_key(evidence) when is_map(evidence) do
+    logical_key = logical_window_key(evidence)
+
+    case additional_meter_token(evidence) do
+      nil -> {:legacy, logical_key}
+      token -> {:metered, logical_key, token}
+    end
+  end
+
+  @spec additional_meter_token(t() | map()) :: String.t() | nil
+  def additional_meter_token(evidence) when is_map(evidence) do
+    case evidence |> logical_window_key() |> Descriptors.canonical_logical_window_key() do
+      {"account", _family, _model, _upstream_model, "account", _kind, _minutes} ->
+        nil
+
+      {scope, _family, _model, _upstream_model, "codex_spark", _kind, _minutes}
+      when scope in ["model", "upstream_model"] ->
+        nil
+
+      _additional_key ->
+        present_string(fetch(evidence, :raw_metered_feature)) ||
+          present_string(fetch(evidence, :raw_limit_id))
+    end
   end
 
   # Reason: evidence normalization preserves all optional upstream quota identity fields.
@@ -319,9 +345,7 @@ defmodule CodexPooler.Quotas.Evidence do
     |> put(:source_precision, normalize_token(fetch(attrs, :source_precision) || "observed"))
     |> put(
       :quota_scope,
-      normalize_token(
-        fetch(attrs, :quota_scope) || Descriptors.infer_scope(model, upstream_model, quota_key)
-      )
+      normalize_token(fetch(attrs, :quota_scope) || Descriptors.infer_scope(model, upstream_model, quota_key))
     )
     |> put(
       :quota_family,
@@ -369,15 +393,6 @@ defmodule CodexPooler.Quotas.Evidence do
   defp future_observed_at?(observed_at, timestamp) do
     DateTime.diff(observed_at, timestamp, :second) > future_observed_skew_seconds()
   end
-
-  defp exhausted?(%__MODULE__{used_percent: %Decimal{} = used_percent}) do
-    Decimal.compare(used_percent, Decimal.new(100)) != :lt
-  end
-
-  defp exhausted?(%__MODULE__{active_limit: 0}), do: true
-  defp exhausted?(%__MODULE__{credits: 0}), do: true
-
-  defp exhausted?(_evidence), do: false
 
   defp fetch(attrs, key), do: Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
 

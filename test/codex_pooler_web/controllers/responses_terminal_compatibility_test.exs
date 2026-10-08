@@ -1,0 +1,555 @@
+defmodule CodexPoolerWeb.ResponsesTerminalCompatibilityTest do
+  use CodexPoolerWeb.ConnCase, async: false
+
+  import Ecto.Query
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport
+
+  alias CodexPooler.CompatibilityMatrix
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
+
+  @terminal_shapes [
+    {:done, ~s({"type":"response.done","response":{"id":"resp_terminal_done","custom":{"kept":true}}})},
+    {:legacy, ~s({ "id" : "resp_terminal_legacy", "custom" : { "kept" : true } })}
+  ]
+
+  @failure_shapes [
+    {:failure_coded_incomplete,
+     %{
+       "type" => "response.incomplete",
+       "response" => %{
+         "id" => "resp_terminal_incomplete",
+         "status" => "incomplete",
+         "incomplete_details" => %{"reason" => "context_length_exceeded"}
+       }
+     }, "context_length_exceeded"},
+    {:coded_error,
+     %{
+       "type" => "error",
+       "error" => %{
+         "type" => "invalid_request_error",
+         "code" => "context_length_exceeded",
+         "message" => "synthetic upstream detail"
+       }
+     }, "context_length_exceeded"},
+    {:failed_without_nested_code,
+     %{
+       "type" => "response.failed",
+       "headers" => %{
+         "authorization" => "Bearer provider-secret-sentinel",
+         "x-provider-debug" => "provider-header-sentinel"
+       },
+       "code" => "flat-code-sentinel",
+       "message" => "flat-message-sentinel",
+       "param" => "flat.param.sentinel",
+       "debug" => %{"credential" => "event-debug-sentinel"},
+       "prompt" => "event-prompt-sentinel",
+       "response" => %{
+         "id" => "resp_terminal_failed",
+         "created_at" => 123,
+         "status" => "failed",
+         "error" => %{
+           "message" => "synthetic upstream detail",
+           "type" => "provider_type_must_not_become_public_code"
+         },
+         "incomplete_details" => %{"reason" => "content_filter", "extra" => true},
+         "model" => "provider-model-sentinel",
+         "object" => "provider-object-sentinel",
+         "output" => [%{"content" => "response-output-sentinel"}],
+         "output_text" => "response-output-text-sentinel",
+         "instructions" => "response-instructions-sentinel",
+         "metadata" => %{"credential" => "response-metadata-sentinel"},
+         "parallel_tool_calls" => true,
+         "tool_choice" => %{"type" => "provider-tool-choice"},
+         "tools" => [%{"name" => "provider-tool-sentinel"}],
+         "usage" => %{
+           "input_tokens" => 9,
+           "input_tokens_details" => %{
+             "cache_write_tokens" => 1,
+             "cached_tokens" => 2,
+             "unknown" => "usage-detail-sentinel"
+           },
+           "output_tokens" => 4,
+           "output_tokens_details" => %{
+             "reasoning_tokens" => 3,
+             "unknown" => "usage-output-detail-sentinel"
+           },
+           "total_tokens" => 13,
+           "unknown" => "usage-sentinel"
+         },
+         "temperature" => 0.5,
+         "top_p" => 0.8,
+         "prompt" => "response-prompt-sentinel",
+         "user" => "response-user-sentinel",
+         "safety_identifier" => "response-safety-sentinel",
+         "service_tier" => "response-tier-sentinel",
+         "ordinary_response_sibling" => %{"credential" => "response-sibling-sentinel"}
+       },
+       "ordinary_sibling" => %{"credential" => "event-sibling-sentinel"}
+     }, "upstream_error"},
+    {:typeless_detail, %{"detail" => "synthetic upstream detail"}, "upstream_terminal_failure"}
+  ]
+
+  setup do
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+
+    :ok
+  end
+
+  @tag :t9_contract_red
+  test "upstream websocket bridge exposes the structured terminal contract" do
+    fixture = CompatibilityMatrix.fixture!(:upstream_websocket_bridge)
+
+    assert fixture.fallback == %{
+             boundary: "first_downstream_visible_public_event",
+             precommit_buffer_event_types: [
+               "response.created",
+               "response.in_progress",
+               "response.queued",
+               "codex.rate_limits"
+             ],
+             unknown_typed_event: :commit,
+             legacy_typeless_success: :completed_preserve_raw,
+             backend_done_event: :preserve,
+             public_http_done_event: :response_completed,
+             public_websocket_done_event: :response_completed,
+             synthetic_missing_terminal_surfaces: ["public_post_http_sse"],
+             target: "websocket_failure_without_resubmission",
+             settlements: 1,
+             upstream_committed: "no_http_fallback_or_automatic_replay",
+             post_visible_upstream_death: "failed_request",
+             cache_locality: "heuristic_never_guarantee"
+           }
+
+    refute Map.has_key?(fixture.fallback, :internal_events)
+  end
+
+  test "backend POST SSE preserves done and legacy decoded payloads", %{conn: conn} do
+    for {shape, frame} <- @terminal_shapes do
+      setup = http_terminal_setup(frame)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/backend-api/codex/responses", stream_payload(setup, shape))
+
+      assert response.status == 200
+      assert [payload] = decoded_sse_payloads(response.resp_body)
+      assert payload == CodexPooler.JSON.decode!(frame)
+    end
+  end
+
+  test "public POST SSE normalizes done and legacy success fields", %{conn: conn} do
+    for {shape, frame} <- @terminal_shapes do
+      setup = http_terminal_setup(frame)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", stream_payload(setup, shape))
+
+      assert response.status == 200
+
+      assert payload =
+               Enum.find(
+                 decoded_sse_payloads(response.resp_body),
+                 &(&1["type"] == "response.completed")
+               )
+
+      assert_public_completed(payload, shape)
+    end
+  end
+
+  test "GET websocket direct chunks preserve backend frames and normalize public fields" do
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, false)
+
+    for {shape, frame} <- @terminal_shapes do
+      assert websocket_terminal("/backend-api/codex/responses", frame, shape) == frame
+
+      "/v1/responses"
+      |> websocket_terminal(frame, shape)
+      |> CodexPooler.JSON.decode!()
+      |> assert_public_completed(shape)
+    end
+  end
+
+  test "GET websocket owner forwarding preserves backend frames and normalizes public fields" do
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+
+    for {shape, frame} <- @terminal_shapes do
+      assert websocket_terminal("/backend-api/codex/responses", frame, shape) == frame
+
+      "/v1/responses"
+      |> websocket_terminal(frame, shape)
+      |> CodexPooler.JSON.decode!()
+      |> assert_public_completed(shape)
+    end
+  end
+
+  test "public POST SSE keeps canonical terminal error transformations", %{conn: conn} do
+    for {shape, payload, expected_code} <- @failure_shapes, shape != :typeless_detail do
+      setup = http_failure_terminal_setup(shape, payload)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", stream_payload(setup, shape))
+
+      assert response.status == 200
+
+      events = decoded_sse_payloads(response.resp_body)
+
+      assert terminal =
+               Enum.find(events, fn event -> event["type"] in ["response.failed", "error"] end),
+             "missing canonical POST terminal for #{shape}: #{inspect(events)}"
+
+      assert terminal_error_code(terminal) == post_terminal_error_code(shape, expected_code)
+      refute response.resp_body =~ "synthetic upstream detail"
+
+      if shape == :failed_without_nested_code do
+        assert hd(events)["type"] == "response.created"
+        assert terminal == Map.put(expected_failed_terminal(), "sequence_number", 1)
+        assert_hostile_failed_sentinels_absent(response.resp_body)
+      end
+    end
+  end
+
+  test "backend POST SSE relays only bounded misalignment details", %{conn: conn} do
+    source = misalignment_terminal_sse("Synthetic provider wording", valid_misalignment())
+
+    setup =
+      source
+      |> then(&FakeUpstream.sse_stream([&1], done: false))
+      |> start_upstream()
+      |> gateway_setup()
+
+    for path <- ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"] do
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(path, stream_payload(setup, :misalignment))
+
+      assert response.status == 200
+      assert [terminal] = decoded_sse_payloads(response.resp_body)
+
+      assert terminal["response"]["status"] == "failed"
+
+      assert terminal["response"]["error"]["misalignment"] == %{
+               "error_type" => "synthetic_error_type",
+               "detailed_explanation" => "synthetic detailed explanation",
+               "steer" => %{"message" => "synthetic steer message"}
+             }
+
+      refute response.resp_body =~ "unknown-misalignment-sibling"
+      refute response.resp_body =~ "unknown-steer-sibling"
+    end
+  end
+
+  test "backend POST SSE omits all misalignment details when one known field is malformed", %{
+    conn: conn
+  } do
+    source =
+      misalignment_terminal_sse("Synthetic provider wording", %{
+        "error_type" => "synthetic_error_type",
+        "detailed_explanation" => 17,
+        "steer" => %{"message" => "synthetic steer message"}
+      })
+
+    setup =
+      source
+      |> then(&FakeUpstream.sse_stream([&1], done: false))
+      |> start_upstream()
+      |> gateway_setup()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", stream_payload(setup, :misalignment))
+
+    assert response.status == 200
+    assert [terminal] = decoded_sse_payloads(response.resp_body)
+    refute Map.has_key?(terminal["response"]["error"], "misalignment")
+  end
+
+  test "public POST SSE safely projects misalignment messages", %{conn: conn} do
+    for {provider_message, expected_message} <- [
+          {"Synthetic safe provider wording", "Synthetic safe provider wording"},
+          {" \t\n", MisalignmentPolicyViolation.fallback_message()}
+        ] do
+      setup =
+        provider_message
+        |> misalignment_terminal_sse(valid_misalignment())
+        |> then(&FakeUpstream.sse_stream([&1], done: false))
+        |> start_upstream()
+        |> gateway_setup()
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", stream_payload(setup, :misalignment))
+
+      assert response.status == 200
+
+      assert terminal =
+               Enum.find(decoded_sse_payloads(response.resp_body), fn event ->
+                 event["type"] == "response.failed"
+               end)
+
+      assert terminal["response"]["error"] == %{
+               "code" => MisalignmentPolicyViolation.code(),
+               "message" => expected_message,
+               "type" => "invalid_request_error"
+             }
+
+      refute Map.has_key?(terminal["response"]["error"], "param")
+      refute Map.has_key?(terminal["response"]["error"], "misalignment")
+    end
+  end
+
+  for owner_forwarding? <- [false, true],
+      {shape, payload, expected_code} <- @failure_shapes do
+    @tag terminal_shape: shape, terminal_payload: payload, terminal_code: expected_code, owner_forwarding: owner_forwarding?
+    test "public GET websocket keeps #{shape} terminal transformation with forwarding=#{owner_forwarding?}", %{terminal_shape: shape, terminal_payload: payload, terminal_code: expected_code, owner_forwarding: owner_forwarding?} do
+      Application.put_env(
+        :codex_pooler,
+        :websocket_owner_forwarding_enabled,
+        owner_forwarding?
+      )
+
+      terminal =
+        "/v1/responses"
+        |> websocket_terminal(CodexPooler.JSON.encode!(payload), shape)
+        |> CodexPooler.JSON.decode!()
+
+      assert terminal_error_code(terminal) == expected_code,
+             "unexpected websocket terminal for #{shape}: #{inspect(terminal)}"
+
+      if shape == :failed_without_nested_code do
+        assert terminal == expected_failed_terminal()
+        assert_hostile_failed_sentinels_absent(CodexPooler.JSON.encode!(terminal))
+      end
+    end
+  end
+
+  defp websocket_terminal_setup(frame) do
+    frame
+    |> then(&FakeUpstream.websocket_text_frames([&1]))
+    |> start_upstream()
+    |> gateway_setup()
+  end
+
+  defp http_terminal_setup(frame) do
+    frame
+    |> then(&("data: " <> &1 <> "\n\n"))
+    |> then(&FakeUpstream.sse_stream([&1], done: false))
+    |> start_upstream()
+    |> gateway_setup()
+  end
+
+  defp http_failure_terminal_setup(shape, payload) do
+    shape
+    |> failure_event_name()
+    |> then(&FakeUpstream.sse_stream([{&1, payload}], done: false))
+    |> start_upstream()
+    |> gateway_setup()
+  end
+
+  defp failure_event_name(:failure_coded_incomplete), do: "response.incomplete"
+  defp failure_event_name(:coded_error), do: "error"
+  defp failure_event_name(:failed_without_nested_code), do: "response.failed"
+  defp failure_event_name(:typeless_detail), do: "error"
+
+  defp stream_payload(setup, shape) do
+    %{
+      "model" => setup.model.exposed_model_id,
+      "input" => native_text_input("synthetic #{shape} terminal compatibility request"),
+      "stream" => true
+    }
+  end
+
+  defp websocket_terminal(path, frame, shape) do
+    setup = websocket_terminal_setup(frame)
+    port = start_public_endpoint!()
+    turn_state = "t9-#{shape}-#{System.unique_integer([:positive])}"
+    {conn, websocket, ref} = public_websocket_connect!(port, setup, turn_state, path)
+
+    try do
+      payload =
+        setup
+        |> stream_payload(shape)
+        |> Map.merge(%{"type" => "response.create", "generate" => true})
+        |> CodexPooler.JSON.encode!()
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {_conn, _websocket, terminal_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      # The terminal frame reaches the client before the response task commits
+      # its settlement; callers loop over shapes, so the next setup must not race
+      # that task for the shared sandbox connection.
+      await_settled_pool_requests!(setup.pool.id)
+      terminal_frame
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  defp await_settled_pool_requests!(pool_id, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+
+    statuses =
+      CodexPooler.Repo.all(
+        from(request in CodexPooler.Accounting.Request,
+          where: request.pool_id == ^pool_id,
+          select: request.status
+        )
+      )
+
+    cond do
+      statuses != [] and "in_progress" not in statuses ->
+        :ok
+
+      System.monotonic_time(:millisecond) < deadline ->
+        receive do
+        after
+          5 -> await_settled_pool_requests!(pool_id, deadline)
+        end
+
+      true ->
+        flunk("expected settled websocket requests, got #{inspect(statuses)}")
+    end
+  end
+
+  defp decoded_sse_payloads(body) do
+    body
+    |> String.split("\n\n", trim: true)
+    |> Enum.flat_map(fn block ->
+      case Regex.run(~r/^data: (.+)$/m, block, capture: :all_but_first) do
+        ["[DONE]"] -> []
+        [data] -> [CodexPooler.JSON.decode!(data)]
+        _missing -> []
+      end
+    end)
+  end
+
+  defp misalignment_terminal_sse(message, misalignment) do
+    error =
+      %{
+        "code" => MisalignmentPolicyViolation.code(),
+        "message" => message,
+        "param" => "private.param",
+        "provider_sibling" => "private-sibling"
+      }
+      |> maybe_put_misalignment(misalignment)
+
+    ~s(event: response.failed\ndata: #{CodexPooler.JSON.encode!(%{"type" => "response.failed", "error" => error, "response" => %{"status" => "failed", "error" => error}})}\n\n)
+  end
+
+  defp valid_misalignment do
+    %{
+      "error_type" => "synthetic_error_type",
+      "detailed_explanation" => "synthetic detailed explanation",
+      "steer" => %{
+        "message" => "synthetic steer message",
+        "unknown" => "unknown-steer-sibling"
+      },
+      "unknown" => "unknown-misalignment-sibling"
+    }
+  end
+
+  defp maybe_put_misalignment(error, nil), do: error
+  defp maybe_put_misalignment(error, details), do: Map.put(error, "misalignment", details)
+
+  defp assert_public_completed(payload, shape) do
+    expected_id = if shape == :done, do: "resp_terminal_done", else: "resp_terminal_legacy"
+
+    assert payload["type"] == "response.completed"
+    assert payload["response"]["id"] == expected_id
+    assert payload["response"]["status"] == "completed"
+    assert payload["response"]["custom"] == %{"kept" => true}
+
+    payload
+  end
+
+  defp terminal_error_code(payload) do
+    get_in(payload, ["error", "code"]) ||
+      get_in(payload, ["response", "error", "code"]) ||
+      get_in(payload, ["response", "incomplete_details", "reason"])
+  end
+
+  defp post_terminal_error_code(:failed_without_nested_code, _websocket_code),
+    do: "upstream_error"
+
+  defp post_terminal_error_code(_shape, shared_code), do: shared_code
+
+  defp expected_failed_terminal do
+    %{
+      "type" => "response.failed",
+      "sequence_number" => 0,
+      "response" => %{
+        "id" => "resp_terminal_failed",
+        "created_at" => 0,
+        "status" => "failed",
+        "error" => %{
+          "code" => "upstream_error",
+          "message" => "upstream request failed",
+          "type" => "server_error"
+        },
+        "incomplete_details" => %{"reason" => "content_filter"},
+        "model" => "unknown",
+        "object" => "response",
+        "output" => [],
+        "output_text" => "",
+        "instructions" => nil,
+        "metadata" => nil,
+        "parallel_tool_calls" => false,
+        "tool_choice" => "auto",
+        "tools" => [],
+        "usage" => %{
+          "input_tokens" => 9,
+          "input_tokens_details" => %{"cache_write_tokens" => 1, "cached_tokens" => 2},
+          "output_tokens" => 4,
+          "output_tokens_details" => %{"reasoning_tokens" => 3},
+          "total_tokens" => 13
+        },
+        "temperature" => nil,
+        "top_p" => nil
+      }
+    }
+  end
+
+  defp assert_hostile_failed_sentinels_absent(wire) do
+    for sentinel <- [
+          "provider-secret-sentinel",
+          "provider-header-sentinel",
+          "flat-code-sentinel",
+          "flat-message-sentinel",
+          "flat.param.sentinel",
+          "event-debug-sentinel",
+          "event-prompt-sentinel",
+          "event-sibling-sentinel",
+          "provider_type_must_not_become_public_code",
+          "provider-model-sentinel",
+          "provider-object-sentinel",
+          "response-output-sentinel",
+          "response-output-text-sentinel",
+          "response-instructions-sentinel",
+          "response-metadata-sentinel",
+          "provider-tool-choice",
+          "provider-tool-sentinel",
+          "usage-detail-sentinel",
+          "usage-output-detail-sentinel",
+          "usage-sentinel",
+          "response-prompt-sentinel",
+          "response-user-sentinel",
+          "response-safety-sentinel",
+          "response-tier-sentinel",
+          "response-sibling-sentinel"
+        ] do
+      refute wire =~ sentinel
+    end
+  end
+end

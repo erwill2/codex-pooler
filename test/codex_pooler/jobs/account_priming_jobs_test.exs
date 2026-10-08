@@ -4,13 +4,15 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Jobs
   alias CodexPooler.Jobs.{AccountReconciliationWorker, SavedResetRedemptionWorker}
+  alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Reconciliation.AccountReconciliation
-  alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   import CodexPooler.PoolerFixtures
 
@@ -48,7 +50,8 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
                  "primary_window" => %{
                    "used_percent" => 25,
                    "limit_window_seconds" => 18_000,
-                   "reset_at" => DateTime.to_iso8601(future_reset)
+                   "reset_after_seconds" => 900,
+                   "reset_at" => DateTime.to_unix(future_reset)
                  }
                }
              }},
@@ -132,21 +135,37 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
           "primary_window" => %{
             "used_percent" => 25,
             "limit_window_seconds" => 18_000,
-            "reset_at" => DateTime.to_iso8601(future_reset)
+            "reset_after_seconds" => 900,
+            "reset_at" => DateTime.to_unix(future_reset)
           }
         }
       }
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             {:path_json, %{"/backend-api/wham/usage" => {401, %{"error" => "expired"}}}},
-             {:path_json, %{"/oauth/token" => {200, %{"access_token" => new_access_token}}}},
-             {:path_json, %{"/backend-api/wham/usage" => {200, usage_payload}}},
-             {:path_json,
-              %{"/backend-api/codex/models" => {200, %{"models" => [%{"id" => "gpt-refreshed"}]}}}}
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond: FakeUpstream.json_response(%{"error" => "expired"}, 401)
+            ),
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/oauth/token",
+              respond: FakeUpstream.json_response(%{"access_token" => new_access_token})
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              headers: [required: %{"authorization" => "Bearer " <> new_access_token}],
+              respond: FakeUpstream.json_response(usage_payload)
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/models",
+              respond: FakeUpstream.json_response(%{"models" => [%{"id" => "gpt-refreshed"}]})
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -177,6 +196,7 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
       assert token_refresh.path == "/oauth/token"
       assert usage_retry.path == "/backend-api/wham/usage"
       assert catalog.path == "/backend-api/codex/models"
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "account reconciliation does not report stale existing quota as refreshed after auth failure" do
@@ -269,7 +289,8 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
                  "primary_window" => %{
                    "used_percent" => 67,
                    "limit_window_seconds" => 604_800,
-                   "reset_at" => DateTime.to_iso8601(future_reset)
+                   "reset_after_seconds" => 300,
+                   "reset_at" => DateTime.to_unix(future_reset)
                  }
                }
              }},
@@ -298,8 +319,7 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
     test "failed account-link priming records sanitized failure and discards without retry" do
       upstream =
         start_path_upstream(%{
-          "/backend-api/wham/usage" =>
-            {500, %{"error" => %{"message" => "Bearer secret-token failed"}}},
+          "/backend-api/wham/usage" => {500, %{"error" => %{"message" => "Bearer secret-token failed"}}},
           "/codex/models" => {200, %{"models" => [%{"id" => "gpt-failure"}]}}
         })
 
@@ -389,6 +409,137 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
       assert result.assignment.metadata["quota_priming"]["stale_window_count"] == 1
       assert result.assignment.metadata["quota_priming"]["usable_window_count"] == 0
     end
+
+    # A rate-limit-event row that still describes a cycle which ended days ago
+    # is superseded by the Usage API row of the running weekly cycle: it is not
+    # the account's state, so it must not turn a weekly-only probe into
+    # `expired` (every read surface folds it away the same way).
+    test "priming ignores an expired row superseded by the running cycle of its window" do
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      {pool, assignment} =
+        active_assignment_fixture(%{
+          "quota_windows" => [
+            %{
+              "window_kind" => "secondary",
+              "window_minutes" => 10_080,
+              "used_percent" => 30,
+              "reset_at" => now |> DateTime.add(3, :day) |> DateTime.to_iso8601(),
+              "source" => "codex_usage_api",
+              "source_precision" => "observed",
+              "freshness_state" => "fresh"
+            }
+          ]
+        })
+
+      ended_cycle_at = DateTime.add(now, -9, :day)
+
+      %AccountQuotaWindow{}
+      |> AccountQuotaWindow.changeset(%{
+        upstream_identity_id: assignment.upstream_identity_id,
+        quota_key: "account",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("100"),
+        reset_at: DateTime.add(now, -2, :day),
+        source: "codex_rate_limit_event",
+        source_precision: "observed",
+        freshness_state: "fresh",
+        last_sync_at: ended_cycle_at,
+        observed_at: ended_cycle_at,
+        metadata: %{},
+        created_at: ended_cycle_at,
+        updated_at: ended_cycle_at
+      })
+      |> Repo.insert!()
+
+      assert {:ok, result} =
+               AccountReconciliation.run(pool.id, assignment.id, "classification_test")
+
+      priming = result.assignment.metadata["quota_priming"]
+      assert priming["status"] == "weekly_only_probe"
+      assert priming["expired_window_count"] == 0
+      assert priming["window_count"] == 2
+    end
+
+    test "account reconciliation threads its operation timestamp through priming reads and writes" do
+      # July 25, 2026 is past/historical relative to Monday, July 27, 2026.
+      historical_operation_timestamp = ~U[2026-07-25 12:00:00.000000Z]
+      observed_at = DateTime.add(historical_operation_timestamp, -900, :second)
+      reset_at = DateTime.add(historical_operation_timestamp, 1, :microsecond)
+      current_date_contract_at = ~U[2026-07-27 00:00:00.000000Z]
+
+      {pool, assignment} =
+        active_assignment_fixture(%{
+          "quota_windows" => [
+            %{
+              "quota_key" => "account",
+              "window_kind" => "primary",
+              "window_minutes" => 300,
+              "used_percent" => 25,
+              "reset_at" => DateTime.to_iso8601(reset_at),
+              "observed_at" => DateTime.to_iso8601(observed_at),
+              "last_sync_at" => DateTime.to_iso8601(observed_at),
+              "source" => "local_reconciliation",
+              "source_precision" => "observed",
+              "quota_scope" => "account",
+              "quota_family" => "account",
+              "freshness_state" => "fresh"
+            }
+          ]
+        })
+
+      identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+      parent = self()
+
+      operation_clock = fn ->
+        persisted_windows = QuotaWindows.list_evidence(identity)
+        send(parent, {:terminal_operation_clock, persisted_windows})
+        historical_operation_timestamp
+      end
+
+      assert {:module, AccountReconciliation} = Code.ensure_loaded(AccountReconciliation)
+      assert function_exported?(AccountReconciliation, :run, 4)
+
+      assert {:ok, result} =
+               AccountReconciliation.run(
+                 pool.id,
+                 assignment.id,
+                 "timestamp_contract",
+                 operation_clock: operation_clock
+               )
+
+      assert_receive {:terminal_operation_clock, [persisted_window]}
+      refute_received {:terminal_operation_clock, _other_windows}
+
+      assert persisted_window.reset_at == reset_at
+      assert persisted_window.observed_at == observed_at
+
+      assert QuotaWindows.effective_quota_windows(
+               [persisted_window],
+               historical_operation_timestamp
+             ) == [persisted_window]
+
+      assert QuotaWindows.fresh_window?(persisted_window, historical_operation_timestamp)
+      assert QuotaWindows.usable_window?(persisted_window, historical_operation_timestamp)
+      refute Evidence.expired?(persisted_window, historical_operation_timestamp)
+
+      refute QuotaWindows.fresh_window?(persisted_window, current_date_contract_at)
+      refute QuotaWindows.usable_window?(persisted_window, current_date_contract_at)
+      assert Evidence.expired?(persisted_window, current_date_contract_at)
+
+      priming = result.assignment.metadata["quota_priming"]
+      reconciliation = result.assignment.metadata["last_reconciliation"]
+
+      assert priming["status"] == "known"
+      assert priming["usable_window_count"] == 1
+      assert priming["stale_window_count"] == 0
+      assert priming["expired_window_count"] == 0
+      assert priming["finished_at"] == DateTime.to_iso8601(historical_operation_timestamp)
+
+      assert reconciliation["finished_at"] ==
+               DateTime.to_iso8601(historical_operation_timestamp)
+    end
   end
 
   describe "saved reset redemption jobs" do
@@ -409,20 +560,125 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
       assert job.id == first_job.id
       assert job.args["pool_upstream_assignment_id"] == assignment.id
       assert job.args["trigger_kind"] == "admin_manual"
+
+      assert job.args["manual_request_target"] == %{
+               "pool_id" => assignment.pool_id,
+               "upstream_identity_id" => assignment.upstream_identity_id
+             }
+
+      refute Map.has_key?(job.args, "upstream_identity_id")
       refute Map.has_key?(job.args, "credit_id")
       refute Map.has_key?(job.args, "redeem_request_id")
+    end
+
+    test "manual enqueue retains the original persisted target after assignment retargeting" do
+      fake = start_path_upstream(%{})
+      %{assignment: assignment} = upstream_assignment_fixture(pool_fixture(), %{identity_metadata: %{"base_url" => FakeUpstream.url(fake)}})
+
+      assert {:ok, job} = Jobs.enqueue_saved_reset_redemption(assignment.id)
+
+      replacement_pool = pool_fixture()
+      replacement_identity = upstream_identity_fixture(%{metadata: %{"base_url" => FakeUpstream.url(fake)}})
+
+      assert {:ok, _retargeted} =
+               PoolAssignments.update_pool_assignment(assignment, %{
+                 pool_id: replacement_pool.id,
+                 upstream_identity_id: replacement_identity.id
+               })
+
+      assert Repo.get!(Oban.Job, job.id).args == %{
+               "pool_upstream_assignment_id" => assignment.id,
+               "trigger_kind" => "admin_manual",
+               "manual_request_target" => %{
+                 "pool_id" => assignment.pool_id,
+                 "upstream_identity_id" => assignment.upstream_identity_id
+               }
+             }
+
+      assert FakeUpstream.requests(fake) == []
+    end
+
+    test "manual enqueue resolves stale structs and supplied target fields from persisted assignment" do
+      fake = start_path_upstream(%{})
+
+      for ref_kind <- [:struct, :map] do
+        %{assignment: stale_assignment} = upstream_assignment_fixture(pool_fixture(), %{identity_metadata: %{"base_url" => FakeUpstream.url(fake)}})
+        replacement_pool = pool_fixture()
+        replacement_identity = upstream_identity_fixture(%{metadata: %{"base_url" => FakeUpstream.url(fake)}})
+
+        assert {:ok, current_assignment} =
+                 PoolAssignments.update_pool_assignment(stale_assignment, %{
+                   pool_id: replacement_pool.id,
+                   upstream_identity_id: replacement_identity.id
+                 })
+
+        stale_ref =
+          case ref_kind do
+            :struct -> stale_assignment
+            :map -> Map.take(stale_assignment, [:id, :pool_id, :upstream_identity_id])
+          end
+
+        assert {:ok, job} = Jobs.enqueue_saved_reset_redemption(stale_ref)
+
+        assert Repo.get!(Oban.Job, job.id).args == %{
+                 "pool_upstream_assignment_id" => current_assignment.id,
+                 "trigger_kind" => "admin_manual",
+                 "manual_request_target" => %{
+                   "pool_id" => current_assignment.pool_id,
+                   "upstream_identity_id" => current_assignment.upstream_identity_id
+                 }
+               }
+      end
+
+      assert FakeUpstream.requests(fake) == []
+    end
+
+    test "nonmanual enqueue preserves its existing args" do
+      fake = start_path_upstream(%{})
+      %{assignment: assignment} = upstream_assignment_fixture(pool_fixture(), %{identity_metadata: %{"base_url" => FakeUpstream.url(fake)}})
+
+      assert {:ok, job} = Jobs.enqueue_saved_reset_redemption(assignment, trigger_kind: "operator_retry")
+
+      assert Repo.get!(Oban.Job, job.id).args == %{
+               "pool_upstream_assignment_id" => assignment.id,
+               "trigger_kind" => "operator_retry"
+             }
+
+      assert FakeUpstream.requests(fake) == []
+    end
+
+    test "invalid refs keep existing errors and missing binary targets remain unbound" do
+      for invalid <- [nil, 42, %{}, %{id: nil}, %{id: 42}] do
+        assert {:error, :pool_upstream_assignment_id_required} = Jobs.enqueue_saved_reset_redemption(invalid)
+      end
+
+      assert all_enqueued(worker: SavedResetRedemptionWorker) == []
+
+      for missing_id <- [Ecto.UUID.generate(), "missing-assignment", ""] do
+        assert {:ok, job} = Jobs.enqueue_saved_reset_redemption(%{id: missing_id, pool_id: Ecto.UUID.generate(), upstream_identity_id: Ecto.UUID.generate()})
+
+        assert Repo.get!(Oban.Job, job.id).args == %{
+                 "pool_upstream_assignment_id" => missing_id,
+                 "trigger_kind" => "admin_manual"
+               }
+      end
     end
   end
 
   defp active_assignment_fixture(metadata) do
     pool = pool_fixture()
 
+    # Reconciliation still runs its catalog-sync step against the identity's
+    # base URL; without one it would leave the test and reach the production
+    # default host. A route-less local fake answers 404 instantly instead.
+    upstream = start_path_upstream(%{})
+
     assert {:ok, identity} =
              IdentityLifecycle.create_upstream_identity(%{
                chatgpt_account_id: "acct_#{System.unique_integer([:positive])}",
                account_label: "Job account",
                onboarding_method: "import",
-               metadata: %{}
+               metadata: %{"base_url" => FakeUpstream.url(upstream)}
              })
 
     assert {:ok, identity} =
@@ -486,9 +742,7 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
 
     unless skip_activation_priming do
       assert {:ok, _job} =
-               Jobs.enqueue_assignment_priming(assignment.pool_id, assignment,
-                 trigger_kind: "assignment_activated"
-               )
+               Jobs.enqueue_assignment_priming(assignment.pool_id, assignment, trigger_kind: "assignment_activated")
     end
 
     {pool, assignment, identity}

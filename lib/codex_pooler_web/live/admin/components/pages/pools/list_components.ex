@@ -19,6 +19,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   attr :pool_filter_form, Phoenix.HTML.Form, required: true
   attr :pools, :list, required: true
   attr :can_manage_pools?, :boolean, required: true
+  attr :can_operate_pools?, :boolean, required: true
   attr :compat_panel_views, :map, default: %{}
 
   def pool_inventory(assigns) do
@@ -58,6 +59,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         :if={@pools != []}
         pools={@pools}
         can_manage_pools?={@can_manage_pools?}
+        can_operate_pools?={@can_operate_pools?}
         compat_panel_views={@compat_panel_views}
       />
     </section>
@@ -68,15 +70,22 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   attr :delete_form, Phoenix.HTML.Form, required: true
   attr :delete_form_version, :integer, required: true
 
-  defp pool_delete_dialog(assigns) do
+  def pool_delete_dialog(assigns) do
     ~H"""
-    <dialog :if={@deleting_pool} id="pool-delete-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-error">Hard delete</p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete archived Pool</h2>
+    <dialog
+      :if={@deleting_pool}
+      id="pool-delete-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">Pool</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">
+            Delete {@deleting_pool.name}?
+          </h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Hard deletion is available only for archived Pools and requires the exact slug confirmation.
+            Only an archived Pool can be deleted, and this one leaves for good. This cannot be undone.
           </p>
         </div>
 
@@ -85,31 +94,26 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           for={@delete_form}
           phx-submit="confirm_delete_pool"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@delete_form[:id]} type="hidden" />
-          <div class="alert alert-warning items-start">
-            <.icon name="hero-exclamation-triangle" class="size-5" />
-            <div class="grid gap-1">
-              <p class="font-semibold">This removes {@deleting_pool.name} permanently.</p>
-              <p class="text-sm">
-                Type <span class="break-all font-semibold">{@deleting_pool.slug}</span> to confirm.
-              </p>
-            </div>
-          </div>
           <.input
             field={@delete_form[:confirmation_slug]}
             id={"pool_delete_confirmation_slug_#{@delete_form_version}"}
             type="text"
-            label="Confirm slug"
+            pattern={Regex.escape(@deleting_pool.slug)}
             placeholder={@deleting_pool.slug}
             required
-          />
+          >
+            <:label_content>
+              Type <span class="font-semibold text-base-content">{@deleting_pool.slug}</span> to confirm
+            </:label_content>
+          </.input>
         </.form>
 
         <AdminComponents.dialog_footer
           id="pool-delete-dialog-footer"
-          docs_url="https://docs.codex-pooler.com/operators/pools/"
+          docs_url="https://www.codex-pooler.com/docs/operators/pools/"
         >
           <:actions>
             <AdminComponents.action_button
@@ -121,13 +125,11 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             <AdminComponents.action_button
               id="pool-delete-submit"
               icon="hero-trash"
-              label="Delete Pool"
+              label="Delete"
               type="submit"
               form="pool-delete-form"
               variant={:danger}
-              phx-click={
-                JS.dispatch("blur", to: "#pool_delete_confirmation_slug_#{@delete_form_version}")
-              }
+              phx-click={JS.dispatch("blur", to: "#pool_delete_confirmation_slug_#{@delete_form_version}")}
               disabled={@deleting_pool.status != "archived"}
             />
           </:actions>
@@ -221,7 +223,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       >
         <summary
           data-role="status-filter-trigger"
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name={@selected.icon} class={["size-4 shrink-0", @selected.icon_class]} />
           <span class="truncate">{@selected.label}</span>
@@ -313,7 +315,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       >
         <summary
           data-role="traffic-window-filter-trigger"
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
           <span class="truncate">{@selected.label}</span>
@@ -365,6 +367,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
 
   attr :pools, :list, required: true
   attr :can_manage_pools?, :boolean, required: true
+  attr :can_operate_pools?, :boolean, required: true
   attr :compat_panel_views, :map, required: true
 
   defp pool_grid(assigns) do
@@ -377,6 +380,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         :for={pool_row <- @pools}
         pool_row={pool_row}
         can_manage_pools?={@can_manage_pools?}
+        can_operate_pools?={@can_operate_pools?}
         compat_panel_flag={compat_panel_flag(@compat_panel_views, pool_row)}
       />
     </div>
@@ -385,6 +389,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
 
   attr :pool_row, :map, required: true
   attr :can_manage_pools?, :boolean, required: true
+  attr :can_operate_pools?, :boolean, required: true
   attr :compat_panel_flag, :any, default: nil
 
   defp pool_card(assigns) do
@@ -417,7 +422,27 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
               >
                 {@pool_row.pool.status}
               </span>
-              <.pool_action_menu pool_row={@pool_row} can_manage_pools?={@can_manage_pools?} />
+              <span
+                :if={Map.get(@pool_row, :deletion) == :in_progress}
+                id={"pool-row-#{@pool_row.pool.id}-deletion"}
+                class={AdminBadges.lifecycle_chip_class("paused")}
+                title="A background job is removing this Pool's history; the Pool disappears when it finishes"
+              >
+                deleting
+              </span>
+              <span
+                :if={Map.get(@pool_row, :deletion) == :failed}
+                id={"pool-row-#{@pool_row.pool.id}-deletion"}
+                class={AdminBadges.lifecycle_chip_class("deleted")}
+                title="The last deletion attempt gave up; delete the Pool again to resume"
+              >
+                deletion failed
+              </span>
+              <.pool_action_menu
+                pool_row={@pool_row}
+                can_manage_pools?={@can_manage_pools?}
+                can_operate_pools?={@can_operate_pools?}
+              />
             </div>
           </div>
         </div>
@@ -552,6 +577,8 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     <div
       id={"pool-row-#{@pool_row.pool.id}-activity"}
       data-role="pool-activity-panel"
+      data-pool-id={@pool_row.pool.id}
+      phx-hook="PoolTrafficVisibility"
       class="pool-activity-panel"
     >
       <section
@@ -564,7 +591,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             <h3>
               <span class="pool-token-histogram-label">Traffic</span>
               <span class="pool-token-histogram-value">
-                {@traffic_histogram_card.window_label}
+                {@pool_row.traffic_window_label}
               </span>
             </h3>
           </div>
@@ -586,7 +613,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           </span>
         </div>
         <div
-          :if={!@traffic_histogram_card.empty?}
+          :if={@pool_row.histogram_state == :ready && !@traffic_histogram_card.empty?}
           id={"pool-row-#{@pool_row.pool.id}-traffic-histogram-plot"}
           class="pool-token-histogram-plot admin-apex-bar-chart"
           phx-hook="ApexTimeSeriesChart"
@@ -604,7 +631,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         >
         </div>
         <div
-          :if={@traffic_histogram_card.empty?}
+          :if={@pool_row.histogram_state == :ready && @traffic_histogram_card.empty?}
           class="pool-activity-empty-state"
           data-role="pool-traffic-empty-state"
         >
@@ -619,7 +646,28 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             No traffic in the last {@traffic_histogram_card.window_label}
           </p>
         </div>
-        <ul class="sr-only">
+        <div
+          :if={@pool_row.histogram_state == :loading}
+          class="pool-activity-empty-state"
+          data-role="pool-traffic-loading-placeholder"
+          role="status"
+        >
+          <span
+            class="pool-activity-empty-state-icon"
+            data-role="pool-traffic-loading-icon"
+            aria-hidden="true"
+          >
+            <.icon name="hero-arrow-path" class="admin-loading-icon size-4" />
+          </span>
+          <p class="pool-activity-empty-copy">Loading traffic</p>
+        </div>
+        <div
+          :if={@pool_row.histogram_state in [:unobserved, :error]}
+          class="pool-token-histogram-plot admin-apex-bar-chart"
+          aria-hidden="true"
+        >
+        </div>
+        <ul :if={@pool_row.histogram_state == :ready} class="sr-only">
           <li :for={point <- @traffic_histogram_card.points}>
             {point.label}: {point.tokens} tokens, {point.requests} requests
           </li>
@@ -631,6 +679,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
 
   attr :pool_row, :map, required: true
   attr :can_manage_pools?, :boolean, required: true
+  attr :can_operate_pools?, :boolean, required: true
 
   defp pool_action_menu(assigns) do
     ~H"""
@@ -662,17 +711,38 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             aria-label={"Copy ID for #{@pool_row.pool.name}"}
           />
         </li>
-        <li>
+        <li :if={@can_manage_pools?}>
           <AdminComponents.dropdown_action_item
             id={"edit-pool-#{@pool_row.pool.id}"}
             icon="hero-pencil-square"
             label="Edit"
             phx-click="edit_pool"
             phx-value-id={@pool_row.pool.id}
-            disabled={!@can_manage_pools?}
+            disabled={@pool_row.pool.status != "active"}
+            title={PoolForm.edit_title(@pool_row.pool)}
           />
         </li>
-        <li>
+        <li :if={@can_manage_pools? && @pool_row.pool.status != "active"}>
+          <AdminComponents.dropdown_action_item
+            id={"reactivate-pool-#{@pool_row.pool.id}"}
+            icon="hero-play"
+            label="Reactivate"
+            variant={:positive}
+            phx-click="reactivate_pool"
+            phx-value-id={@pool_row.pool.id}
+            disabled={Map.get(@pool_row, :deletion) == :in_progress}
+          />
+        </li>
+        <li :if={!@can_manage_pools? && @can_operate_pools?}>
+          <AdminComponents.dropdown_action_item
+            id={"models-pool-#{@pool_row.pool.id}"}
+            icon="hero-adjustments-horizontal"
+            label="Models"
+            phx-click="edit_pool_models"
+            phx-value-id={@pool_row.pool.id}
+          />
+        </li>
+        <li :if={@can_manage_pools?}>
           <AdminComponents.dropdown_action_item
             id={"delete-pool-#{@pool_row.pool.id}"}
             icon="hero-trash"
@@ -680,7 +750,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             variant={:danger}
             phx-click="delete_pool"
             phx-value-id={@pool_row.pool.id}
-            disabled={!@can_manage_pools? || @pool_row.pool.status != "archived"}
+            disabled={@pool_row.pool.status != "archived" or Map.get(@pool_row, :deletion) == :in_progress}
             title={PoolForm.delete_title(@pool_row.pool)}
           />
         </li>
@@ -695,26 +765,24 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       id_suffix: "v1",
       icon: "hero-code-bracket",
       label: "/v1 compatibility",
-      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
+      docs_url: "https://www.codex-pooler.com/docs/operators/pools/#compatibility",
       description: "OpenAI-style /v1 compatibility routes."
     },
     %{
-      key: :request_compression_enabled,
-      id_suffix: "compression",
-      icon: "hero-arrows-pointing-in",
-      label: "Request compression",
-      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
-      description: "Shrinks eligible Responses tool outputs before upstream dispatch."
+      key: :allow_image_generation,
+      id_suffix: "image-generation",
+      icon: "hero-photo",
+      label: "Allow Image Generation",
+      docs_url: "https://www.codex-pooler.com/docs/operators/pools/#compatibility",
+      description: "Permits image generation and edits for requests using this Pool."
     },
     %{
-      key: :upstream_websocket_bridge_enabled,
-      id_suffix: "ws-bridge",
-      icon: "hero-link",
-      label: "Upstream websocket bridge",
-      experimental: true,
-      issue_number: 171,
-      description:
-        "Carries public streaming turns upstream over the session's Codex websocket to reuse the provider prompt cache."
+      key: :allow_audio_transcription,
+      id_suffix: "audio-transcription",
+      icon: "hero-microphone",
+      label: "Allow Audio Transcription",
+      docs_url: "https://www.codex-pooler.com/docs/operators/pools/#compatibility",
+      description: "Permits speech-to-text transcription for requests using this Pool."
     }
   ]
 
@@ -887,25 +955,23 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       token_total_label: Format.token_count(token_total),
       request_total_label: format_integer(request_total),
       request_total_unit: request_total_unit(request_total),
-      total_label:
-        "#{Format.token_count(token_total)} tokens / #{format_request_count(request_total)}",
-      categories: Jason.encode!(Enum.map(points, & &1.label)),
+      total_label: "#{Format.token_count(token_total)} tokens / #{format_request_count(request_total)}",
+      categories: CodexPooler.JSON.encode!(Enum.map(points, & &1.label)),
       series:
-        Jason.encode!([
+        CodexPooler.JSON.encode!([
           %{name: "Tokens", type: "column", data: token_values},
           %{name: "Requests", type: "line", data: request_values}
         ]),
-      units: Jason.encode!(["tokens", "requests"]),
+      units: CodexPooler.JSON.encode!(["tokens", "requests"]),
       yaxis:
-        Jason.encode!([
+        CodexPooler.JSON.encode!([
           %{seriesName: "Tokens", title: "tokens"},
           %{seriesName: "Requests", title: "requests", opposite: true}
         ]),
-      colors: Jason.encode!(["var(--color-primary)", "var(--color-info)"]),
+      colors: CodexPooler.JSON.encode!(["var(--color-primary)", "var(--color-info)"]),
       points: points,
       empty?: token_total == 0 and request_total == 0,
-      aria_label:
-        "Traffic in the last #{window_label}: #{Format.token_count(token_total)} tokens and #{format_request_count(request_total)}"
+      aria_label: "Traffic in the last #{window_label}: #{Format.token_count(token_total)} tokens and #{format_request_count(request_total)}"
     }
   end
 

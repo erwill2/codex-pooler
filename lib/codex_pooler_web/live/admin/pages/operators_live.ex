@@ -5,6 +5,8 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
   alias CodexPooler.Accounts.User
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.OperatorComponents
   alias CodexPoolerWeb.Admin.OperatorComponents.Dialogs
   alias CodexPoolerWeb.Admin.OperatorForm
@@ -18,6 +20,7 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
        page_title: "Operators",
        operator_filters: OperatorForm.filter(),
        operator_filter_form: OperatorForm.filter_form(),
+       operator_panel_views: %{},
        subscribed_operator_events?: false,
        creating_operator: false,
        create_form: OperatorForm.create_form(),
@@ -32,6 +35,7 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
        temporary_password_receipt: nil
      )
      |> maybe_subscribe_operator_events()
+     |> NotificationCenterHooks.follow_viewer_visibility()
      |> assign_operator_management()
      |> operator_management_socket()}
   end
@@ -86,6 +90,16 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
 
   def handle_event("cancel_create_operator", _params, socket) do
     {:noreply, close_create_dialog(socket)}
+  end
+
+  def handle_event("toggle_operator_pools_panel", %{"id" => operator_id}, socket) do
+    {:noreply,
+     update(socket, :operator_panel_views, fn panel_views ->
+       case Map.get(panel_views, operator_id) do
+         :pools -> Map.delete(panel_views, operator_id)
+         _view -> Map.put(panel_views, operator_id, :pools)
+       end
+     end)}
   end
 
   def handle_event("filter_operators", %{"operator_filters" => filter_params}, socket) do
@@ -259,9 +273,39 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
     {:noreply, socket}
   end
 
+  # Operator events are their own domain, so the shared gate never sees them.
+  # A background reload that finds the viewer is no longer an owner shows the
+  # page's owner-only notice without an error flash: the viewer did nothing
+  # that failed (findings#206 row 206-410).
   def handle_info({CodexPooler.Accounts.OperatorEvents, _event}, socket) do
-    {:noreply, reload_operators(socket)}
+    LiveUpdatesHooks.unless_paused(socket, &reload_operators_in_background/1)
   end
+
+  def handle_info(:live_updates_resumed, socket) do
+    {:noreply, reload_operators_in_background(socket)}
+  end
+
+  # Operator management belongs to owners. When the viewer's own role changes
+  # the page re-reads at once, even while live updates are paused, and a
+  # demoted owner's create, edit and password dialogs close with the list; a
+  # temporary password already shown stays (findings#206 row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    case assign_operator_management(socket) do
+      {:ok, socket} ->
+        {:noreply, socket}
+
+      {:error, :operator_management_denied, socket} ->
+        socket = socket |> clear_editing() |> close_reset_form()
+
+        if is_nil(socket.assigns.temporary_password_receipt),
+          do: {:noreply, close_create_dialog(socket)},
+          else: {:noreply, socket}
+    end
+  end
+
+  # The password dialog closes unless it already shows a temporary password.
+  defp close_reset_form(%{assigns: %{password_dialog_receipt: nil}} = socket), do: clear_resetting(socket)
+  defp close_reset_form(socket), do: socket
 
   @impl true
   def render(assigns) do
@@ -278,12 +322,13 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
       current_scope={@current_scope}
       active_nav={:operators}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-operators-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="operators-page-header"
           title="Operators"
-          description="Invite and manage the people who can access this admin area, reset passwords, and deactivate accounts."
+          description="The accounts that can sign in to this admin area, with their roles and assigned Pools."
         >
           <:actions>
             <AdminComponents.action_button
@@ -332,10 +377,11 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
           reset_operation={@reset_operation}
           reset_form={@reset_form}
         />
-        <OperatorComponents.operators_table
+        <OperatorComponents.operator_cards
           :if={!@operator_management_denied?}
           filter_form={@operator_filter_form}
-          operators={@streams.operators}
+          operators={@operators}
+          panel_views={@operator_panel_views}
           current_scope={@current_scope}
           active_operator_count={@active_operator_count}
           datetime_preferences={@datetime_preferences}
@@ -354,6 +400,8 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
         put_flash(socket, :error, error_message(:operator_management_denied))
     end
   end
+
+  defp reload_operators_in_background(socket), do: socket |> assign_operator_management() |> operator_management_socket()
 
   defp operator_management_socket({:ok, socket}), do: socket
   defp operator_management_socket({:error, :operator_management_denied, socket}), do: socket
@@ -457,8 +505,10 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
   defp assign_operator_management(socket) do
     case Accounts.list_operators_for_management(socket.assigns.current_scope) do
       {:ok, operators} ->
-        filtered_operators =
-          OperatorForm.filter_operators(operators, socket.assigns.operator_filters)
+        entries =
+          operators
+          |> OperatorForm.filter_operators(socket.assigns.operator_filters)
+          |> operator_card_entries(socket.assigns.current_scope)
 
         socket =
           socket
@@ -466,7 +516,8 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
           |> assign_pool_options()
           |> assign(:operator_count, length(operators))
           |> assign(:active_operator_count, OperatorForm.active_operator_count(operators))
-          |> stream(:operators, filtered_operators, reset: true, dom_id: &"operator-row-#{&1.id}")
+          |> assign(:operators, entries)
+          |> prune_operator_panel_views(entries)
 
         {:ok, socket}
 
@@ -477,10 +528,36 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
           |> assign(:pool_options, [])
           |> assign(:operator_count, 0)
           |> assign(:active_operator_count, 0)
-          |> stream(:operators, [], reset: true, dom_id: &"operator-row-#{&1.id}")
+          |> assign(:operators, [])
+          |> assign(:operator_panel_views, %{})
 
         {:error, :operator_management_denied, socket}
     end
+  end
+
+  defp operator_card_entries(operators, current_scope) do
+    pool_names_by_id =
+      current_scope
+      |> management_pool_options()
+      |> Map.new(&{&1.id, &1.name})
+
+    Enum.map(operators, fn operator ->
+      lifecycle = Accounts.operator_lifecycle(operator)
+
+      pool_names =
+        lifecycle.assigned_pool_ids
+        |> Enum.map(&Map.get(pool_names_by_id, &1))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.sort_by(&String.downcase/1)
+
+      %{operator: operator, role: lifecycle.role, pool_names: pool_names}
+    end)
+  end
+
+  defp prune_operator_panel_views(socket, entries) do
+    operator_ids = Enum.map(entries, & &1.operator.id)
+
+    update(socket, :operator_panel_views, &Map.take(&1, operator_ids))
   end
 
   defp operator_management_denied?(socket), do: socket.assigns.operator_management_denied?

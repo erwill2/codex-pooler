@@ -19,6 +19,10 @@ defmodule CodexPooler.Alerts.SavedResetDeliveryDedupeTest do
   @rule_kind "upstream_saved_reset_banked_first_seen"
   @next_expires_at "2026-06-01T00:00:00Z"
   @latest_expires_at "2026-06-08T00:00:00Z"
+  # Every record in this file is the same two banked grants seen again, so the
+  # first-seen times are the grants' own, fixed, as the evaluator reads them
+  # from the first-seen ledger; a later first-seen time would be a new grant.
+  @first_seen_at "2026-05-30T12:00:00Z"
 
   @tag :saved_reset_banked_first_seen_authorization
   test "records one delivery attempt per due channel across aggregate targets and repeats" do
@@ -152,24 +156,24 @@ defmodule CodexPooler.Alerts.SavedResetDeliveryDedupeTest do
       severity: "info",
       upstream_identity_id: identity.id,
       matched_at: matched_at,
-      safe_evidence_snapshot: saved_reset_evidence(rule, identity, matched_at, source),
+      safe_evidence_snapshot: saved_reset_evidence(rule, identity, source),
       targets: [
         %{
           rule_id: rule.id,
           pool_id: rule.pool_id,
-          metadata: saved_reset_evidence(rule, identity, matched_at, source)
+          metadata: saved_reset_evidence(rule, identity, source)
         }
       ]
     }
   end
 
-  defp saved_reset_evidence(rule, identity, matched_at, source) do
+  defp saved_reset_evidence(rule, identity, source) do
     %{
       "reason_code" => "saved_reset_banked_first_seen",
       "available_count" => 2,
       "new_reset_count" => 2,
-      "earliest_reset_first_seen_at" => DateTime.to_iso8601(matched_at),
-      "latest_reset_first_seen_at" => DateTime.to_iso8601(matched_at),
+      "earliest_reset_first_seen_at" => @first_seen_at,
+      "latest_reset_first_seen_at" => @first_seen_at,
       "next_reset_expires_at" => @next_expires_at,
       "latest_reset_expires_at" => @latest_expires_at,
       "path_style" => "available_expirations",
@@ -222,11 +226,19 @@ defmodule CodexPooler.Alerts.SavedResetDeliveryDedupeTest do
     end
   end
 
+  # Restoring an absent key means deleting it, not writing back the `nil` that `get_env/2`
+  # returns for one: a present `nil` is not the same as unset for anything that reads through
+  # `get_env/3` with a default.
   defp use_test_mailer do
-    mailer_config = Application.get_env(:codex_pooler, Mailer)
+    mailer_config = Application.fetch_env(:codex_pooler, Mailer)
     Application.put_env(:codex_pooler, Mailer, adapter: Swoosh.Adapters.Test)
-    on_exit(fn -> Application.put_env(:codex_pooler, Mailer, mailer_config) end)
+    on_exit(fn -> restore_mailer_config(mailer_config) end)
   end
+
+  defp restore_mailer_config({:ok, config}),
+    do: Application.put_env(:codex_pooler, Mailer, config)
+
+  defp restore_mailer_config(:error), do: Application.delete_env(:codex_pooler, Mailer)
 
   defp delivery_job_count, do: length(all_enqueued(worker: AlertDeliveryWorker))
 

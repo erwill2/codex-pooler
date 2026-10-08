@@ -9,11 +9,16 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
       auth: 2,
       gateway_setup: 1,
       gateway_setup: 2,
+      prime_routing_quota!: 1,
+      pricing_config: 1,
+      pricing_snapshot!: 2,
       start_upstream: 1
     ]
 
   alias CodexPooler.Accounting.Request
+  alias CodexPooler.AccountingBoundaryTrace
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Pools.ModelServingOverride
   alias CodexPooler.Repo
 
   test "GET /v1/models returns an OpenAI-compatible list without upstream dispatch", %{conn: conn} do
@@ -44,6 +49,29 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     assert request.request_metadata["model_source"]["upstream_identity_id"] == setup.identity.id
   end
 
+  test "GET /v1/models omits the raw idempotency key at the accounting boundary", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    raw_key = "models-private-key-#{System.unique_integer([:positive])}"
+
+    {conn, [_auth, attrs]} =
+      AccountingBoundaryTrace.capture_call(
+        {CodexPooler.Accounting, :record_metadata_request, 2},
+        fn ->
+          conn
+          |> auth(setup)
+          |> put_req_header("idempotency-key", raw_key)
+          |> get("/v1/models")
+        end
+      )
+
+    assert %{"object" => "list"} = json_response(conn, 200)
+    refute Map.has_key?(attrs, :idempotency_key)
+    refute inspect(attrs, limit: :infinity, printable_limit: :infinity) =~ raw_key
+  end
+
   test "GET /v1/models keeps its schema unchanged for reasoning-restricted API keys", %{
     conn: conn
   } do
@@ -69,6 +97,31 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     refute Map.has_key?(model, "default_reasoning_level")
   end
 
+  @tag :model_serving_modes
+  test "GET /v1/models is unchanged while the Pool model mode switches", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+
+    baseline = conn |> auth(setup) |> get("/v1/models")
+
+    assert %{"object" => "list", "data" => [%{"id" => exposed_model_id} = baseline_model]} =
+             json_response(baseline, 200)
+
+    for mode <- ["full", "lite"] do
+      put_models_model_serving_mode!(setup, mode)
+      response = conn |> recycle() |> auth(setup) |> get("/v1/models")
+
+      assert %{"object" => "list", "data" => [model]} = json_response(response, 200)
+      assert model == baseline_model
+      assert model["id"] == exposed_model_id
+      refute Map.has_key?(model, "use_responses_lite")
+      refute model["id"] =~ "-lite"
+      refute model["id"] =~ "-full"
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
   test "GET /v1/models only exposes policy-authorized visible models", %{conn: conn} do
     upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
     setup = gateway_setup(upstream)
@@ -83,7 +136,15 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
         exposed_model_id: "gpt-visible-allowed",
         upstream_model_id: "provider-gpt-visible-allowed",
         display_name: "Visible Allowed",
-        metadata: %{"source_assignment_ids" => [allowed_assignment.id]}
+        metadata: %{
+          "source_assignment_ids" => [allowed_assignment.id],
+          "source_assignment_models" => %{
+            allowed_assignment.id => %{
+              "slug" => "gpt-visible-allowed",
+              "input_modalities" => ["text"]
+            }
+          }
+        }
       })
 
     %{assignment: hidden_assignment} =
@@ -198,5 +259,277 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     refute Map.has_key?(model, "max_context_window")
     refute Map.has_key?(model, "auto_compact_token_limit")
     refute Map.has_key?(model, "comp_hash")
+  end
+
+  test "GET /v1/models resolves context from the selected native maximum when context is absent",
+       %{
+         conn: conn
+       } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{
+            "max_context_window" => 200_000,
+            "effective_context_window_percent" => 90
+          }
+        }
+      )
+
+    backend_conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+    assert %{"models" => [native_model]} = json_response(backend_conn, 200)
+    assert native_model["context_window"] == nil
+    assert native_model["max_context_window"] == 200_000
+
+    public_conn = conn |> auth(setup) |> get("/v1/models")
+    assert %{"data" => [public_model]} = json_response(public_conn, 200)
+    assert public_model["context_length"] == 180_000
+    refute Map.has_key?(public_model, "max_context_window")
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "catalogs preserve the native client schema across Full and Lite serving modes", %{
+    conn: conn
+  } do
+    # The released Codex client uses this ModelsResponse/ModelInfo wire schema.
+    source = %{
+      "slug" => "gpt-test-model",
+      "display_name" => "Sample model",
+      "supported_reasoning_levels" => [%{"effort" => "medium", "description" => ""}],
+      "default_reasoning_level" => "medium",
+      "shell_type" => "unified_exec",
+      "visibility" => "list",
+      "supported_in_api" => true,
+      "priority" => 0,
+      "support_verbosity" => false,
+      "truncation_policy" => %{"mode" => "tokens", "limit" => 10_000},
+      "experimental_supported_tools" => [],
+      "model_messages" => %{"instructions_template" => ""},
+      "context_window" => 200_000,
+      "max_context_window" => 300_000,
+      "effective_context_window_percent" => 90,
+      "input_modalities" => ["text", "image"],
+      "supports_image_detail_original" => true,
+      "supports_reasoning_summary_parameter" => false,
+      "service_tiers" => [],
+      "use_responses_lite" => true
+    }
+
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream, model_metadata: %{"upstream_model" => source})
+
+    for mode <- ["full", "lite"] do
+      put_models_model_serving_mode!(setup, mode)
+      native_conn = conn |> recycle() |> auth(setup) |> get("/backend-api/codex/models")
+      assert %{"models" => [native]} = json_response(native_conn, 200)
+
+      expected = Map.put(source, "use_responses_lite", mode == "lite")
+      assert Map.take(native, Map.keys(source)) == expected
+
+      public_conn = conn |> recycle() |> auth(setup) |> get("/v1/models")
+      assert %{"data" => [public]} = json_response(public_conn, 200)
+      assert public["id"] == source["slug"]
+      assert public["context_length"] == 180_000
+      assert public["input_modalities"] == ["text", "image"]
+      refute Map.has_key?(public, "model_messages")
+      refute Map.has_key?(public, "use_responses_lite")
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "GET /v1/models preserves the default effective window when long-context pricing exists", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{
+            "context_window" => 272_000,
+            "max_context_window" => 872_000,
+            "effective_context_window_percent" => 95,
+            "auto_compact_token_limit" => nil
+          }
+        }
+      )
+
+    pricing_snapshot!(setup.model, %{config: pricing_config(%{"price_bucket" => "long_context"})})
+
+    conn = conn |> auth(setup) |> get("/v1/models")
+
+    assert %{"object" => "list", "data" => [model]} = json_response(conn, 200)
+    assert model["context_length"] == 258_400
+    refute Map.has_key?(model, "max_context_window")
+    refute Map.has_key?(model, "auto_compact_token_limit")
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "pricing changes preserve both catalogs and the native ETag in Full and Lite", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{
+            "context_window" => 300_000,
+            "max_context_window" => 900_000,
+            "auto_compact_token_limit" => 180_000,
+            "effective_context_window_percent" => 90
+          }
+        }
+      )
+
+    for mode <- ["full", "lite"] do
+      put_models_model_serving_mode!(setup, mode)
+      before = conn |> recycle() |> auth(setup) |> get("/backend-api/codex/models")
+      before_body = json_response(before, 200)
+      etag = get_resp_header(before, "etag")
+      assert [_] = etag
+
+      for bucket <- ["short_context", "long_context"] do
+        pricing_snapshot!(setup.model, %{config: pricing_config(%{"price_bucket" => bucket})})
+        after_price_change = conn |> recycle() |> auth(setup) |> get("/backend-api/codex/models")
+        assert json_response(after_price_change, 200) == before_body
+        assert get_resp_header(after_price_change, "etag") == etag
+        assert %{"models" => [native]} = before_body
+        assert native["context_window"] == 300_000
+        assert native["max_context_window"] == 900_000
+        assert native["auto_compact_token_limit"] == 180_000
+        assert native["use_responses_lite"] == (mode == "lite")
+
+        public = conn |> recycle() |> auth(setup) |> get("/v1/models") |> json_response(200)
+        assert %{"data" => [%{"context_length" => 270_000}]} = public
+      end
+    end
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "GET /v1/models uses the same canonical context source as native Codex", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        exposed_model_id: "gpt-6-sol",
+        model_metadata: %{
+          "upstream_model" => %{
+            "context_window" => 272_000,
+            "max_context_window" => 272_000,
+            "auto_compact_token_limit" => nil
+          }
+        }
+      )
+
+    %{assignment: long_assignment_a, identity: long_identity_a} =
+      active_upstream_assignment_fixture(setup.pool, %{account_label: "Long context A"})
+
+    %{assignment: long_assignment_b, identity: long_identity_b} =
+      active_upstream_assignment_fixture(setup.pool, %{account_label: "Long context B"})
+
+    prime_routing_quota!(long_identity_a)
+    prime_routing_quota!(long_identity_b)
+
+    short_source = setup.model.metadata["source_assignment_models"][setup.assignment.id]
+
+    long_source =
+      short_source
+      |> Map.put("max_context_window", 872_000)
+
+    setup.model
+    |> Ecto.Changeset.change(%{
+      source_assignment_count: 3,
+      metadata:
+        setup.model.metadata
+        |> Map.put("upstream_model", short_source)
+        |> Map.put("source_assignment_ids", [
+          setup.assignment.id,
+          long_assignment_a.id,
+          long_assignment_b.id
+        ])
+        |> Map.put("source_assignment_models", %{
+          setup.assignment.id => short_source,
+          long_assignment_a.id => long_source,
+          long_assignment_b.id => long_source
+        })
+    })
+    |> Repo.update!()
+
+    pricing_snapshot!(setup.model, %{config: pricing_config(%{"price_bucket" => "long_context"})})
+
+    backend_conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+    public_conn = conn |> recycle() |> auth(setup) |> get("/v1/models")
+
+    assert %{"models" => [backend_model]} = json_response(backend_conn, 200)
+    assert %{"object" => "list", "data" => [public_model]} = json_response(public_conn, 200)
+
+    assert backend_model["slug"] == "gpt-6-sol"
+    assert backend_model["context_window"] == 272_000
+    assert backend_model["max_context_window"] == 872_000
+    assert backend_model["effective_context_window_percent"] == 95
+    assert public_model["context_length"] == 258_400
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "GET /v1/models flattens the native Codex context percentage exactly once", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "upstream_model" => %{
+            "context_window" => 272_000,
+            "max_context_window" => 272_000,
+            "effective_context_window_percent" => 95,
+            "auto_compact_token_limit" => nil
+          }
+        }
+      )
+
+    backend_conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+    public_conn = conn |> recycle() |> auth(setup) |> get("/v1/models")
+
+    assert %{"models" => [backend_model]} = json_response(backend_conn, 200)
+    assert %{"object" => "list", "data" => [public_model]} = json_response(public_conn, 200)
+
+    assert backend_model["context_window"] == 272_000
+    assert backend_model["max_context_window"] == 272_000
+    assert is_nil(backend_model["auto_compact_token_limit"])
+    assert backend_model["effective_context_window_percent"] == 95
+    assert public_model["context_length"] == 258_400
+
+    assert public_model["context_length"] ==
+             div(
+               backend_model["context_window"] *
+                 backend_model["effective_context_window_percent"],
+               100
+             )
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  defp put_models_model_serving_mode!(setup, mode) do
+    timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    case Repo.get_by(ModelServingOverride,
+           pool_id: setup.pool.id,
+           exposed_model_id: setup.model.exposed_model_id
+         ) do
+      nil ->
+        Repo.insert!(%ModelServingOverride{
+          pool_id: setup.pool.id,
+          exposed_model_id: setup.model.exposed_model_id,
+          mode: mode,
+          created_at: timestamp,
+          updated_at: timestamp
+        })
+
+      override ->
+        override
+        |> Ecto.Changeset.change(mode: mode, updated_at: timestamp)
+        |> Repo.update!()
+    end
   end
 end

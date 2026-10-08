@@ -1,7 +1,11 @@
 defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
   use CodexPooler.DataCase, async: false
 
+  import Ecto.Query
+
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Audit.AuditEvent
+  alias CodexPooler.Events
   alias CodexPooler.FakeOpenAIAuthProvider
   alias CodexPooler.Jobs.AccountReconciliationWorker
   alias CodexPooler.Repo
@@ -49,6 +53,7 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
 
     state = authorization_state(authorization_url)
     callback_url = callback_url(state, "browser-code-success")
+    observer = start_event_observer(pool.id)
 
     assert {:ok,
             %{
@@ -72,6 +77,7 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
     assert identity.workspace_label == "Browser Workspace"
     assert identity.seat_type == "team-seat"
     assert identity.onboarding_method == "browser"
+    assert identity.credential_provenance == "codex_chatgpt_oauth"
     assert identity.plan_family == "team"
     assert identity.plan_label == "team"
     assert assignment.pool_id == pool.id
@@ -80,10 +86,28 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
 
     assert active_secret_count("access_token") == 1
     assert active_secret_count("refresh_token") == 1
-    jobs = all_enqueued(worker: AccountReconciliationWorker)
-    assert job = Enum.find(jobs, &(&1.args["pool_upstream_assignment_id"] == assignment.id))
+
+    matching_jobs =
+      all_enqueued(worker: AccountReconciliationWorker)
+      |> Enum.filter(&(&1.args["pool_upstream_assignment_id"] == assignment.id))
+
+    assert [job] = matching_jobs
     assert job.args["pool_id"] == pool.id
     assert job.args["trigger_kind"] == "account_link"
+
+    assert 1 ==
+             Repo.aggregate(
+               from(event in AuditEvent,
+                 where:
+                   event.pool_id == ^pool.id and
+                     event.action == "upstream_account.oauth_browser_link" and
+                     event.target_id == ^identity.id
+               ),
+               :count
+             )
+
+    events = event_snapshot(observer)
+    assert Enum.count(events, &(&1.reason == "upstream_account_oauth_linked")) == 1
 
     assert [request] = FakeOpenAIAuthProvider.requests(provider)
     form = FakeOpenAIAuthProvider.decode_form_request(request)
@@ -100,6 +124,60 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
       access_token,
       refresh_token
     ])
+  end
+
+  test "browser callback preserves the canonical enterprise automation plan label" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    id_token = browser_id_token("acct_browser_enterprise_automation", "enterprise_cbp_automation")
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "browser-enterprise-automation-access-token",
+           refresh_token: "browser-enterprise-automation-refresh-token",
+           id_token: id_token
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool)
+
+    assert {:ok,
+            %{
+              status: :completed,
+              link_status: :created,
+              flow: completed_flow,
+              identity: identity,
+              assignment: assignment,
+              secret_status: :present
+            }} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(
+                 authorization_state(authorization_url),
+                 "browser-code-enterprise-automation"
+               )
+             )
+
+    assert completed_flow.status == "completed"
+    assert completed_flow.result_upstream_identity_id == identity.id
+
+    persisted_identity = Repo.get!(UpstreamIdentity, identity.id)
+    assert persisted_identity.plan_label == "enterprise_cbp_automation"
+    assert persisted_identity.plan_family == "enterprise-cbp-automation"
+    assert assignment.pool_id == pool.id
+    assert assignment.upstream_identity_id == identity.id
+    assert assignment.status == "active"
+    assert active_secret_count("access_token") == 1
+    assert active_secret_count("refresh_token") == 1
+
+    jobs = all_enqueued(worker: AccountReconciliationWorker)
+    assert job = Enum.find(jobs, &(&1.args["pool_upstream_assignment_id"] == assignment.id))
+    assert job.args["pool_id"] == pool.id
+    assert job.args["trigger_kind"] == "account_link"
   end
 
   test "duplicate browser callback completion returns completed success without re-exchanging tokens" do
@@ -226,8 +304,7 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
     assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
              Upstreams.start_browser_oauth(scope, pool)
 
-    assert {:error,
-            %{code: :token_exchange_failed, message: "OAuth token exchange failed"} = error} =
+    assert {:error, %{code: :token_exchange_failed, message: "OAuth token exchange failed"} = error} =
              Upstreams.complete_browser_oauth(
                scope,
                flow.id,
@@ -291,6 +368,51 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
     end
   end
 
+  test "browser completion persists a failed flow while rejecting an expired access token without credentials" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    expired_access_token = access_token_with_exp(DateTime.utc_now() |> DateTime.add(-60, :second))
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: expired_access_token,
+           refresh_token: "expired-refresh-token-must-not-persist",
+           id_token: browser_id_token("acct_browser_expired")
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool)
+
+    observer = start_event_observer(pool.id)
+
+    assert {:error, %{code: :token_exchange_failed, message: "OAuth token exchange failed"}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "browser-code-expired")
+             )
+
+    persisted = Repo.get!(OAuthFlow, flow.id)
+    assert persisted.status == "failed"
+    assert persisted.error_code == "token_exchange_failed"
+    assert Repo.aggregate(UpstreamIdentity, :count) == 0
+    assert Repo.aggregate(PoolUpstreamAssignment, :count) == 0
+    assert Repo.aggregate(EncryptedSecret, :count) == 0
+
+    assert Repo.aggregate(from(event in AuditEvent, where: event.pool_id == ^pool.id), :count) ==
+             0
+
+    assert [] ==
+             all_enqueued(worker: AccountReconciliationWorker)
+             |> Enum.filter(&(&1.args["pool_id"] == pool.id))
+
+    assert event_snapshot(observer) == []
+    refute inspect(persisted) =~ expired_access_token
+  end
+
   defp fixture_owner_scope do
     %{user: user} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
     Scope.for_user(user, ["instance_owner"])
@@ -303,13 +425,49 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
     provider
   end
 
-  defp browser_id_token(account_id) do
+  defp start_event_observer(pool_id) do
+    parent = self()
+
+    observer =
+      spawn_link(fn ->
+        :ok = Events.subscribe_pool(pool_id, "upstreams")
+        send(parent, {:event_observer_ready, self()})
+        observe_events([])
+      end)
+
+    assert_receive {:event_observer_ready, ^observer}
+    on_exit(fn -> send(observer, :stop) end)
+    observer
+  end
+
+  defp observe_events(events) do
+    receive do
+      {Events, event} ->
+        observe_events([event | events])
+
+      {:snapshot, caller, ref} ->
+        send(caller, {ref, Enum.reverse(events)})
+        observe_events(events)
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp event_snapshot(observer) do
+    ref = make_ref()
+    send(observer, {:snapshot, self(), ref})
+    assert_receive {^ref, events}
+    events
+  end
+
+  defp browser_id_token(account_id, plan_type \\ "team") do
     FakeOpenAIAuthProvider.id_token(%{
       "email" => "browser-#{account_id}@example.com",
       "https://api.openai.com/auth" => %{
         "chatgpt_account_id" => account_id,
         "chatgpt_user_id" => "user_#{account_id}",
-        "chatgpt_plan_type" => "team",
+        "chatgpt_plan_type" => plan_type,
         "workspace_id" => "workspace-browser",
         "workspace_label" => "Browser Workspace",
         "seat_type" => "team-seat"
@@ -328,6 +486,17 @@ defmodule CodexPooler.Upstreams.OAuthBrowserLinkingTest do
   defp callback_url(state, code) do
     "http://localhost:1455/auth/callback?" <>
       URI.encode_query(%{"state" => state, "code" => code})
+  end
+
+  defp access_token_with_exp(%DateTime{} = expiry) do
+    header = Base.url_encode64(~s({"alg":"none"}), padding: false)
+
+    payload =
+      Base.url_encode64(CodexPooler.JSON.encode!(%{"exp" => DateTime.to_unix(expiry)}),
+        padding: false
+      )
+
+    header <> "." <> payload <> ".signature"
   end
 
   defp active_secret_count(secret_kind) do

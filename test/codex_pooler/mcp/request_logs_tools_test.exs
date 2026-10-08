@@ -99,7 +99,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
 
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     structured = result["structuredContent"]
 
@@ -108,10 +108,12 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
              "limit",
              "nextOffset",
              "offset",
-             "total"
+             "total",
+             "totalExact"
            ]
 
     assert structured["total"] == 1
+    assert structured["totalExact"] == true
     assert structured["limit"] == 1
     assert structured["offset"] == 0
     assert structured["nextOffset"] == nil
@@ -260,7 +262,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
 
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     items_by_id = Map.new(result["structuredContent"]["items"], &{&1["id"], &1})
 
@@ -394,6 +396,51 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
            ]) == ["continuity", "failure", "attempt"]
   end
 
+  test "request-log detail attempt schema stays closed with terminal diagnostic keys" do
+    request_logs_tool =
+      Enum.find(LogMetadata.tools(), &(&1.name == "codex_pooler_get_request_log"))
+
+    attempt_schema =
+      get_in(request_logs_tool.output_schema, [
+        "properties",
+        "item",
+        "properties",
+        "debug",
+        "properties",
+        "attempts",
+        "items"
+      ])
+
+    assert attempt_schema["additionalProperties"] == false
+
+    assert attempt_schema["properties"]["upstream_error_code"] == %{
+             "type" => ["string", "null"]
+           }
+
+    assert attempt_schema["properties"]["stream_terminal_type"] == %{
+             "type" => ["string", "null"]
+           }
+  end
+
+  test "request-log detail compaction bridge schema is optional and closed" do
+    request_logs_tool =
+      Enum.find(LogMetadata.tools(), &(&1.name == "codex_pooler_get_request_log"))
+
+    item_schema = get_in(request_logs_tool.output_schema, ["properties", "item"])
+    bridge_schema = item_schema["properties"]["compaction_bridge"]
+
+    refute "compaction_bridge" in Map.get(item_schema, "required", [])
+    assert bridge_schema["type"] == "object"
+    assert bridge_schema["required"] == ["applied", "result_transport"]
+    assert bridge_schema["additionalProperties"] == false
+    assert bridge_schema["properties"]["applied"] == %{"const" => true}
+
+    assert bridge_schema["properties"]["result_transport"] == %{
+             "type" => "string",
+             "enum" => ["buffered", "sse"]
+           }
+  end
+
   test "request-log list text handles empty results without echoing caller filters", %{auth: auth} do
     sentinels = caller_filter_sentinels()
 
@@ -409,6 +456,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert result["structuredContent"] == %{
              "items" => [],
              "total" => 0,
+             "totalExact" => true,
              "limit" => 50,
              "offset" => 5,
              "nextOffset" => nil
@@ -444,6 +492,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert result["structuredContent"] == %{
              "items" => [],
              "total" => 0,
+             "totalExact" => true,
              "limit" => 20,
              "offset" => 0,
              "nextOffset" => nil
@@ -645,7 +694,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       |> Enum.count(&String.starts_with?(&1, "- admitted_at="))
 
     assert row_count == 10
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
   end
 
   test "request-log tool rejects malformed semantic filters without echoing date sentinels", %{
@@ -712,7 +761,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert result["isError"] == false
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     assert %{"status" => "ok", "kind" => "request_log", "item" => item} =
              result["structuredContent"]
@@ -760,7 +809,189 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert_no_unsafe_request_log_text(result)
   end
 
-  test "gets only valid failed-attempt upstream error parameters in structured detail and readable text",
+  test "request-log compaction bridge is detail-only and list output remains byte-compatible", %{
+    auth: auth
+  } do
+    pool = pool_fixture(%{slug: "mcp-compaction-list-golden", name: "MCP Compaction List Golden"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-mcp-compaction-list-golden",
+        transport: "websocket",
+        correlation_id: "mcp-compaction-list-golden",
+        request_metadata: %{"safe" => "stable"}
+      })
+
+    assert {:ok, before_result} =
+             ToolDispatch.call(
+               "codex_pooler_list_request_logs",
+               %{"pool_id" => pool.id, "limit" => 10},
+               %{auth: auth}
+             )
+
+    request
+    |> Ecto.Changeset.change(
+      request_metadata: %{
+        "safe" => "stable",
+        "compaction_bridge" => %{"applied" => true, "result_transport" => "buffered"}
+      }
+    )
+    |> Repo.update!()
+
+    assert {:ok, after_result} =
+             ToolDispatch.call(
+               "codex_pooler_list_request_logs",
+               %{"pool_id" => pool.id, "limit" => 10},
+               %{auth: auth}
+             )
+
+    assert after_result == before_result
+    refute deep_key?(after_result, "compaction_bridge")
+    refute inspect(after_result) =~ "buffered"
+    assert :ok = Redaction.assert_mcp_output_safe!(after_result)
+  end
+
+  test "request-log generic metadata recursively omits compaction bridge maps and lists", %{
+    auth: auth
+  } do
+    pool = pool_fixture(%{slug: "mcp-compaction-nested", name: "MCP Compaction Nested"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    sentinel = Redaction.forbidden_sentinel!(:request_body)
+
+    _request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-mcp-compaction-nested",
+        correlation_id: "mcp-compaction-nested",
+        request_metadata: %{
+          "safe_root" => "kept",
+          "nested" => %{
+            "safe_map" => "kept",
+            "children" => [
+              %{
+                "safe_list_map" => "kept",
+                "compaction_bridge" => %{
+                  "applied" => true,
+                  "result_transport" => "buffered",
+                  "raw" => sentinel
+                }
+              },
+              %{compaction_bridge: [%{"raw" => sentinel}], safe_atom_sibling: "kept"}
+            ]
+          }
+        }
+      })
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_request_logs",
+               %{"pool_id" => pool.id, "limit" => 10},
+               %{auth: auth}
+             )
+
+    assert [item] = result["structuredContent"]["items"]
+    assert item["metadata"]["safe_root"] == "kept"
+    assert item["metadata"]["nested"]["safe_map"] == "kept"
+    assert [first_child, second_child] = item["metadata"]["nested"]["children"]
+    assert first_child["safe_list_map"] == "kept"
+    assert second_child["safe_atom_sibling"] == "kept"
+    refute deep_key?(result, "compaction_bridge")
+    refute inspect(result) =~ sentinel
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "request-log detail exposes only strict compaction bridge diagnostics", %{auth: auth} do
+    for result_transport <- ["buffered", "sse"] do
+      pool =
+        pool_fixture(%{
+          slug: "mcp-compaction-detail-#{result_transport}",
+          name: "MCP Compaction Detail #{result_transport}"
+        })
+
+      %{api_key: api_key} = active_api_key_fixture(pool)
+
+      request =
+        request_fixture(%{pool: pool, api_key: api_key}, %{
+          requested_model: "gpt-mcp-compaction-detail",
+          transport: "websocket",
+          correlation_id: "mcp-compaction-detail-#{result_transport}",
+          request_metadata: %{
+            "compaction_bridge" => %{
+              "applied" => true,
+              "result_transport" => result_transport
+            }
+          }
+        })
+
+      assert {:ok, result} =
+               ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{
+                 auth: auth
+               })
+
+      assert %{"status" => "ok", "item" => item} = result["structuredContent"]
+
+      assert item["compaction_bridge"] == %{
+               "applied" => true,
+               "result_transport" => result_transport
+             }
+
+      refute Map.has_key?(item["metadata"], "compaction_bridge")
+      assert [%{"type" => "text", "text" => text}] = result["content"]
+      assert text =~ "compaction_bridge_applied=true"
+      assert text =~ "compaction_result_transport=#{result_transport}"
+      assert :ok = Redaction.assert_mcp_output_safe!(result)
+    end
+  end
+
+  test "request-log detail omits absent malformed unknown and sentinel compaction bridge shapes",
+       %{
+         auth: auth
+       } do
+    sentinel = Redaction.forbidden_sentinel!(:request_body)
+
+    shapes = [
+      nil,
+      %{"applied" => false, "result_transport" => "buffered"},
+      %{"applied" => "true", "result_transport" => "buffered"},
+      %{"applied" => true, "result_transport" => "unknown"},
+      %{"applied" => true, "result_transport" => "sse", "raw" => sentinel},
+      [%{"applied" => true, "result_transport" => "buffered", "raw" => sentinel}]
+    ]
+
+    for {shape, index} <- Enum.with_index(shapes) do
+      pool =
+        pool_fixture(%{
+          slug: "mcp-compaction-invalid-#{index}",
+          name: "MCP Compaction Invalid #{index}"
+        })
+
+      %{api_key: api_key} = active_api_key_fixture(pool)
+      metadata = if is_nil(shape), do: %{}, else: %{"compaction_bridge" => shape}
+
+      request =
+        request_fixture(%{pool: pool, api_key: api_key}, %{
+          requested_model: "gpt-mcp-compaction-invalid",
+          correlation_id: "mcp-compaction-invalid-#{index}",
+          request_metadata: metadata
+        })
+
+      assert {:ok, result} =
+               ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{
+                 auth: auth
+               })
+
+      assert %{"status" => "ok", "item" => item} = result["structuredContent"]
+      refute Map.has_key?(item, "compaction_bridge")
+      refute Map.has_key?(item["metadata"], "compaction_bridge")
+      assert [%{"type" => "text", "text" => text}] = result["content"]
+      refute text =~ "compaction_bridge"
+      refute text =~ "compaction_result_transport"
+      refute inspect(result) =~ sentinel
+      assert :ok = Redaction.assert_mcp_output_safe!(result)
+    end
+  end
+
+  test "gets only valid failed-attempt terminal diagnostics in structured detail and readable text",
        %{
          auth: auth
        } do
@@ -769,6 +1000,8 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     %{assignment: assignment} = upstream_assignment_fixture(pool)
     raw_message = "raw upstream message must stay out of MCP"
     raw_value = "https://example.com/raw-upstream-value"
+    malformed_provider_code = "https://example.invalid/provider-code"
+    malformed_terminal_type = "https://example.invalid/terminal-event"
     raw_frame = ~s({"type":"error","message":"raw websocket frame"})
     raw_header = "Bearer raw-upstream-header"
     raw_prompt = "raw upstream prompt must stay out of MCP"
@@ -785,6 +1018,8 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       attempt_number: 1,
       status: "failed",
       response_metadata: %{
+        "upstream_error_code" => "context_length_exceeded",
+        "stream_terminal_type" => "response.failed",
         "upstream_error_param" => "reasoning.summary",
         "raw_message" => raw_message,
         "value" => raw_value,
@@ -798,13 +1033,45 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     attempt_fixture(request, assignment, %{
       attempt_number: 2,
       status: "failed",
-      response_metadata: %{"upstream_error_param" => raw_value}
+      response_metadata: %{
+        "upstream_error_code" => malformed_provider_code,
+        "stream_terminal_type" => malformed_terminal_type,
+        "upstream_error_param" => raw_value
+      }
     })
 
+    final_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 3,
+        status: "failed",
+        response_metadata: %{
+          "upstream_error_code" => "bearer_expired",
+          "stream_terminal_type" => "invalid_authorization_value"
+        }
+      })
+
     attempt_fixture(request, assignment, %{
-      attempt_number: 3,
+      attempt_number: 4,
       status: "succeeded",
-      response_metadata: %{"upstream_error_param" => "reasoning.effort"}
+      response_metadata: %{
+        "upstream_error_code" => "server_error",
+        "stream_terminal_type" => "response.incomplete",
+        "upstream_error_param" => "reasoning.effort"
+      }
+    })
+
+    debug_turn_fixture(request, %{
+      session:
+        debug_session_fixture(
+          pool,
+          api_key,
+          assignment,
+          "session-key-terminal-diagnostics"
+        ),
+      status: "failed",
+      error_code: "invalid_compaction_response",
+      final_attempt_id: final_attempt.id,
+      turn_sequence: 1
     })
 
     assert {:ok, result} =
@@ -816,17 +1083,196 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     assert [%{"type" => "text", "text" => text}] = result["content"]
     assert %{"status" => "ok", "item" => item} = result["structuredContent"]
-    assert [first_attempt, second_attempt, third_attempt] = item["debug"]["attempts"]
-    assert first_attempt["upstream_error_param"] == "reasoning.summary"
-    refute Map.has_key?(second_attempt, "upstream_error_param")
-    refute Map.has_key?(third_attempt, "upstream_error_param")
-    assert text =~ "upstream_error_param=reasoning.summary"
 
-    for forbidden <- [raw_message, raw_value, raw_frame, raw_header, raw_prompt, raw_body] do
+    assert [first_attempt, second_attempt, third_attempt, fourth_attempt] =
+             item["debug"]["attempts"]
+
+    assert first_attempt["upstream_error_code"] == "context_length_exceeded"
+    assert first_attempt["stream_terminal_type"] == "response.failed"
+    assert first_attempt["upstream_error_param"] == "reasoning.summary"
+    assert second_attempt["upstream_error_code"] == "sha256_b68ae8589ac9"
+    assert second_attempt["stream_terminal_type"] == "sha256_4a302a48caea"
+    refute Map.has_key?(second_attempt, "upstream_error_param")
+    assert third_attempt["upstream_error_code"] == "bearer_expired"
+    assert third_attempt["stream_terminal_type"] == "invalid_authorization_value"
+    refute Map.has_key?(fourth_attempt, "upstream_error_code")
+    refute Map.has_key?(fourth_attempt, "stream_terminal_type")
+    refute Map.has_key?(fourth_attempt, "upstream_error_param")
+    assert text =~ "upstream_error_code=bearer_expired"
+    assert text =~ "stream_terminal_type=invalid_authorization_value"
+    refute text =~ "sha256_b68ae8589ac9"
+    refute text =~ "sha256_4a302a48caea"
+    refute text =~ "upstream_error_code=context_length_exceeded"
+    refute text =~ "stream_terminal_type=response.failed"
+
+    for forbidden <- [
+          raw_message,
+          raw_value,
+          malformed_provider_code,
+          malformed_terminal_type,
+          raw_frame,
+          raw_header,
+          raw_prompt,
+          raw_body
+        ] do
       refute text =~ forbidden
-      refute Jason.encode!(result["structuredContent"]) =~ forbidden
+      refute CodexPooler.JSON.encode!(result["structuredContent"]) =~ forbidden
       refute inspect(result) =~ forbidden
     end
+  end
+
+  test "characterizes semantic failure and current readable upstream parameter precedence", %{
+    auth: auth
+  } do
+    pool = pool_fixture(%{slug: "mcp-terminal-baseline", name: "MCP Terminal Baseline"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    %{request: request} =
+      failed_debug_request_fixture(pool, api_key, assignment, %{
+        correlation_id: "mcp-terminal-baseline",
+        codex_session_id: "session-terminal-baseline",
+        codex_session_key: "session-key-terminal-baseline",
+        request_error: "invalid_compaction_response",
+        attempt_error: "upstream_status",
+        response_metadata: %{
+          "upstream_error_code" => "server_error",
+          "stream_terminal_type" => "response.incomplete",
+          "upstream_error_param" => "input[0].content"
+        }
+      })
+
+    final_attempt =
+      request
+      |> attempt_fixture(assignment, %{
+        attempt_number: 2,
+        status: "failed",
+        response_metadata: %{
+          "upstream_error_code" => "context_length_exceeded",
+          "stream_terminal_type" => "response.failed",
+          "upstream_error_param" => "reasoning.summary"
+        }
+      })
+      |> Ecto.Changeset.change(network_error_code: "invalid_compaction_response")
+      |> Repo.update!()
+
+    debug_turn_fixture(request, %{
+      session:
+        debug_session_fixture(
+          pool,
+          api_key,
+          assignment,
+          "session-key-terminal-baseline"
+        ),
+      status: "failed",
+      error_code: "invalid_compaction_response",
+      final_attempt_id: final_attempt.id,
+      turn_sequence: 1
+    })
+
+    request
+    |> attempt_fixture(assignment, %{
+      attempt_number: 3,
+      status: "retryable_failed",
+      retryable: true,
+      response_metadata: %{
+        "upstream_error_code" => "stale_later_retry",
+        "stream_terminal_type" => "response.stale_retry",
+        "upstream_error_param" => "stale.retry"
+      }
+    })
+    |> Ecto.Changeset.change(network_error_code: "upstream_status")
+    |> Repo.update!()
+
+    assert {:ok, result} =
+             ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{
+               auth: auth
+             })
+
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert %{"status" => "ok", "item" => item} = result["structuredContent"]
+
+    assert Enum.any?(item["errors"], fn error ->
+             error["source"] == "request" and
+               error["code"] == "invalid_compaction_response"
+           end)
+
+    assert text =~ "upstream_error_code=context_length_exceeded"
+    assert text =~ "stream_terminal_type=response.failed"
+    assert text =~ "upstream_error_param=reasoning.summary"
+    refute text =~ "upstream_error_code=server_error"
+    refute text =~ "upstream_error_code=stale_later_retry"
+    refute text =~ "stream_terminal_type=response.stale_retry"
+    refute text =~ "upstream_error_param=stale.retry"
+    refute text =~ "stream_terminal_type=response.incomplete"
+    refute text =~ "upstream_error_param=input[0].content"
+  end
+
+  test "gets bounded rejection metadata in structured detail and readable text without raw message",
+       %{
+         auth: auth
+       } do
+    pool = pool_fixture(%{slug: "mcp-rejection-metadata", name: "MCP Rejection Metadata"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    raw_message = "raw-rejection-message-sentinel"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-mcp-rejection-metadata",
+        status: "failed",
+        correlation_id: "mcp-rejection-metadata"
+      })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      response_metadata: %{
+        "rejection_error_code" => "invalid_request",
+        "rejection_error_type" => "invalid_request_error",
+        "rejection_error_param" => "input[0].content",
+        "rejection_message_present" => true,
+        "rejection_message_bytes" => byte_size(raw_message),
+        "rejection_supported_values_state" => "present",
+        "rejection_supported_values" => ~w(low medium high)
+      }
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      status: "failed",
+      response_metadata: %{
+        "rejection_error_code" => "invalid_request",
+        # A provider that named no alternatives, and a stored list that no
+        # longer satisfies the parser's bounds, must not read alike
+        # (codex-pooler-findings#177).
+        "rejection_supported_values_state" => "none",
+        "rejection_supported_values" => ["an invalid value"]
+      }
+    })
+
+    assert {:ok, result} =
+             ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{
+               auth: auth
+             })
+
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert %{"item" => item} = result["structuredContent"]
+    assert [attempt, none_attempt] = item["debug"]["attempts"]
+    assert attempt["rejection_error_code"] == "invalid_request"
+    assert attempt["rejection_error_type"] == "invalid_request_error"
+    assert attempt["rejection_error_param"] == "input[0].content"
+    assert attempt["rejection_message_present"] == true
+    assert attempt["rejection_message_bytes"] == byte_size(raw_message)
+    assert attempt["rejection_supported_values_state"] == "present"
+    assert attempt["rejection_supported_values"] == ~w(low medium high)
+    assert none_attempt["rejection_supported_values_state"] == "none"
+    refute Map.has_key?(none_attempt, "rejection_supported_values")
+    assert text =~ "rejection_error_code=invalid_request"
+    assert text =~ "rejection_message_present=true"
+    refute inspect(result) =~ raw_message
   end
 
   test "request id inputs are exact for full UUIDs and fuzzy for fragments", %{auth: auth} do
@@ -939,7 +1385,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
 
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     assert %{"status" => "ok", "kind" => "request_log", "item" => item} =
              result["structuredContent"]
@@ -1005,6 +1451,9 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert_ref_prefix(attempt_debug["attempt_ref"], "attempt_")
 
     assert anonymize_refs(attempt_debug) == %{
+             "upstream_model" => "upstream-gpt-6-luna",
+             "served_model" => nil,
+             "model_observation" => nil,
              "attempt_ref" => :attempt_ref,
              "attempt_number" => 1,
              "status" => "failed",
@@ -1102,13 +1551,13 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert %{"status" => "ok", "item" => item} = result["structuredContent"]
     assert [attempt_debug] = item["debug"]["attempts"]
 
+    # The attempt records no `stream_text_frame_count`, so the visibility keys
+    # are absent rather than fabricated (findings#165).
     assert attempt_debug["transport_failure"] == %{
              "reason_class" => "upstream_stream_interrupted",
              "reason" => "closed_before_terminal",
              "phase" => "upstream_close",
-             "pre_visible_output" => false,
-             "terminal_seen" => false,
-             "text_frame_count" => 1
+             "terminal_seen" => false
            }
 
     assert text =~ "1 request log returned"
@@ -1699,7 +2148,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
 
     assert [presented] = list_result["structuredContent"]["items"]
     assert presented["id"] == visible_request.id
-    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_request.id
+    refute CodexPooler.JSON.encode!(list_result["structuredContent"]) =~ hidden_request.id
 
     assert {:ok, hidden_result} =
              ToolDispatch.call("codex_pooler_get_request_log", %{"id" => hidden_request.id}, %{
@@ -1971,8 +2420,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       |> Ecto.Changeset.change(%{
         latency_ms: 321,
         network_error_code: Map.fetch!(attrs, :attempt_error),
-        error_message:
-          Map.get(attrs, :error_message, "raw attempt error message must stay out of MCP output"),
+        error_message: Map.get(attrs, :error_message, "raw attempt error message must stay out of MCP output"),
         response_metadata:
           Map.merge(
             %{"websocket_frame" => "raw debug websocket frame"},
@@ -1991,7 +2439,6 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       pool_id: pool.id,
       api_key_id: api_key.id,
       session_key: session_key,
-      conversation_key: "conversation-#{session_key}",
       pool_upstream_assignment_id: assignment.id,
       status: "active",
       owner_instance_id: "test-instance",
@@ -2103,14 +2550,14 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
   defp assert_output_omits_adversarial_debug_values(result) do
     assert [%{"type" => "text", "text" => text}] = result["content"]
     structured = result["structuredContent"]
-    encoded = Jason.encode!(result)
+    encoded = CodexPooler.JSON.encode!(result)
     inspected = inspect(result)
 
-    refute text =~ Jason.encode!(structured)
+    refute text =~ CodexPooler.JSON.encode!(structured)
 
     for forbidden <- adversarial_forbidden_strings() do
       refute text =~ forbidden
-      refute Jason.encode!(structured) =~ forbidden
+      refute CodexPooler.JSON.encode!(structured) =~ forbidden
       refute encoded =~ forbidden
       refute inspected =~ forbidden
     end
@@ -2164,6 +2611,92 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     item["debug"]
   end
 
+  test "request-log items name the model the upstream served next to the one sent", %{auth: auth} do
+    pool = pool_fixture(%{slug: "mcp-served-model", name: "MCP Served Model"})
+    %{api_key: api_key} = active_api_key_fixture(pool, %{display_name: "MCP served key"})
+
+    %{assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "served-model-upstream",
+        assignment_label: "served-model-assignment"
+      })
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-6-astra",
+        endpoint: "/backend-api/codex/responses",
+        transport: "websocket",
+        status: "succeeded",
+        usage_status: "usage_known",
+        correlation_id: "mcp-served-model",
+        response_status_code: 200
+      })
+
+    attempt_fixture(request, assignment, %{
+      upstream_model_id: "gpt-6-astra",
+      served_model: "gpt-6-luna",
+      model_observation: %{"version" => 1, "coverage" => "full", "conflict" => true, "first_conflicting_model" => "model-other", "terminal_model" => "gpt-6-luna", "terminal_status" => "completed"},
+      latency_ms: 120
+    })
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_request_logs",
+               %{"pool_id" => pool.id, "limit" => 5},
+               %{auth: auth}
+             )
+
+    assert result["isError"] == false
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+    assert [item] = result["structuredContent"]["items"]
+    assert item["requested_model"] == "gpt-6-astra"
+    assert item["upstream_model"] == "gpt-6-astra"
+    assert item["served_model"] == "gpt-6-luna"
+    assert item["model_conflict_attempts"] == [1]
+
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text =~ "gpt-6-luna"
+
+    assert {:ok, detail} =
+             ToolDispatch.call(
+               "codex_pooler_get_request_log",
+               %{"id" => request.id},
+               %{auth: auth}
+             )
+
+    assert detail["isError"] == false
+    assert :ok = Redaction.assert_mcp_output_safe!(detail)
+    assert detail["structuredContent"]["item"]["served_model"] == "gpt-6-luna"
+    assert detail["structuredContent"]["item"]["upstream_model"] == "gpt-6-astra"
+    assert [observed_attempt] = detail["structuredContent"]["item"]["debug"]["attempts"]
+    assert observed_attempt["model_observation"]["first_conflicting_model"] == "model-other"
+    assert observed_attempt["model_observation"]["conflict"] == true
+    assert [%{"type" => "text", "text" => detail_text}] = detail["content"]
+    assert detail_text =~ "gpt-6-luna"
+    assert detail_text =~ "gpt-6-astra"
+    assert detail_text =~ "first_conflicting_model=model-other"
+  end
+
+  @tag model_provenance: true
+  test "model placeholders in historical public failures are absent in both MCP representations", %{auth: auth} do
+    setup = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(setup.pool)
+    request = request_fixture(setup, %{status: "failed"})
+    attempt_fixture(request, assignment, %{status: "failed", transport: "websocket", upstream_model_id: "model-a", served_model: "unknown", response_metadata: %{"upstream_websocket_bridge" => true, "public_openai_responses_stream" => %{"mode" => "normalized", "created_seen" => false, "visible_seen" => false, "delta_count" => 0, "terminal_seen" => true, "terminal_kind" => "failed"}}})
+
+    assert {:ok, listed} = ToolDispatch.call("codex_pooler_list_request_logs", %{"pool_id" => setup.pool.id}, %{auth: auth})
+    assert [item] = listed["structuredContent"]["items"]
+    assert item["served_model"] == nil
+    refute hd(listed["content"])["text"] =~ "served_model=unknown"
+
+    assert {:ok, detail} = ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{auth: auth})
+    assert detail["structuredContent"]["item"]["served_model"] == nil
+    assert [attempt] = detail["structuredContent"]["item"]["debug"]["attempts"]
+    assert attempt["served_model"] == nil
+    assert attempt["model_observation"] == nil
+    refute hd(detail["content"])["text"] =~ "served_model=unknown"
+  end
+
   defp attempt_with_latency(request, assignment, latency_ms, response_metadata \\ %{}) do
     attempt_fixture(request, assignment, %{
       latency_ms: latency_ms,
@@ -2193,6 +2726,14 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       extra
     )
   end
+
+  defp deep_key?(value, key) when is_map(value) do
+    Map.has_key?(value, key) or
+      Enum.any?(value, fn {_child_key, child} -> deep_key?(child, key) end)
+  end
+
+  defp deep_key?(value, key) when is_list(value), do: Enum.any?(value, &deep_key?(&1, key))
+  defp deep_key?(_value, _key), do: false
 
   defp caller_filter_sentinels do
     %{

@@ -158,6 +158,12 @@ defmodule CodexPooler.InstanceSettings do
   @spec reset_cache_for_test() :: :ok
   def reset_cache_for_test, do: Cache.reset_for_test()
 
+  @spec snapshot_cache_for_test() :: term()
+  def snapshot_cache_for_test, do: Cache.snapshot_for_test()
+
+  @spec restore_cache_for_test(term()) :: :ok
+  def restore_cache_for_test(snapshot), do: Cache.restore_for_test(snapshot)
+
   defp ensure_scoped_settings(%Scope{}), do: ensure_singleton!()
 
   defp do_update(%Settings{} = settings, attrs) when is_map(attrs) do
@@ -165,25 +171,25 @@ defmodule CodexPooler.InstanceSettings do
     attrs = attrs |> strip_context_attrs() |> put_updated_by(scope)
     before = Settings.mark_loaded(settings, :database)
 
-    settings
-    |> Settings.changeset(attrs)
-    |> Repo.update(
-      stale_error_field: :lock_version,
-      stale_error_message: "was updated by another operator"
-    )
-    |> tap(fn
+    result =
+      settings
+      |> Settings.changeset(attrs)
+      |> Repo.update(
+        stale_error_field: :lock_version,
+        stale_error_message: "was updated by another operator"
+      )
+
+    case result do
       {:ok, updated} ->
         updated = Settings.mark_loaded(updated, :database)
-        Cache.put(updated)
+        _cache_result = Cache.put(updated)
         _ = Cache.broadcast_update(updated)
+        _ = Cache.notify_update(updated)
         record_update_audit(scope, before, updated)
+        {:ok, updated}
 
-      _result ->
-        :ok
-    end)
-    |> case do
-      {:ok, updated} -> {:ok, Settings.mark_loaded(updated, :database)}
-      {:error, changeset} -> {:error, changeset}
+      {:error, changeset} ->
+        {:error, changeset}
     end
   end
 
@@ -343,8 +349,7 @@ defmodule CodexPooler.InstanceSettings do
           before.metrics.bearer_token_hmac_digest,
           after_update.metrics.bearer_token_hmac_digest
         ),
-      smtp_auth_state:
-        credential_change(before.smtp.password_ciphertext, after_update.smtp.password_ciphertext),
+      smtp_auth_state: credential_change(before.smtp.password_ciphertext, after_update.smtp.password_ciphertext),
       metrics_fingerprint: after_update.metrics.bearer_token_fingerprint,
       smtp_key_version: after_update.smtp.password_key_version
     }

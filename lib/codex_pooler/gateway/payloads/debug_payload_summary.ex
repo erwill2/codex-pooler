@@ -12,6 +12,9 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
     if enabled?() do
       summary = summary(endpoint, payload, upstream_payload, opts, transport)
 
+      previous_response_id_clear_preview =
+        previous_response_id_clear_preview(Map.get(payload, "previous_response_id"))
+
       Logger.info(fn ->
         [
           "codex_pooler gateway_debug payload",
@@ -20,6 +23,7 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
           "endpoint=#{summary["endpoint"] || "unknown"}",
           "previous_response_id_action=#{summary["previous_response_id_summary"]["action"]}",
           "previous_response_id_preview=#{summary["previous_response_id_summary"]["preview"] || "none"}",
+          "previous_response_id_clear_preview=#{previous_response_id_clear_preview || "none"}",
           "client_json_bytes=#{summary["shape"]["client"]["json"]["bytes"]}",
           "client_approx_tokens=#{summary["shape"]["client"]["json"]["approx_tokens"]}",
           "upstream_json_bytes=#{summary["shape"]["upstream"]["json"]["bytes"]}",
@@ -104,7 +108,7 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
       },
       "routing" => %{
         "model_present" => is_binary(Map.get(payload, "model")),
-        "reasoning_effort" => get_in(payload, ["reasoning", "effort"]),
+        "reasoning_effort" => reasoning_effort(payload),
         "service_tier" => Map.get(payload, "service_tier")
       }
     }
@@ -121,7 +125,7 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
   end
 
   defp json_bytes(payload) do
-    case Jason.encode(payload) do
+    case CodexPooler.JSON.encode(payload) do
       {:ok, encoded} -> byte_size(encoded)
       {:error, _reason} -> 0
     end
@@ -257,6 +261,17 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
 
   defp enabled?, do: OperationalSettings.current().gateway_debug?
 
+  # The only provider response identifier available at request time is the
+  # continuation anchor the client sent, so the field is named for it rather
+  # than implying the identifier of the response this turn will produce.
+  defp previous_response_id_clear_preview("resp_" <> suffix = response_id)
+       when byte_size(suffix) in 13..1020 do
+    if response_id =~ ~r/\Aresp_[A-Za-z0-9_-]+\z/,
+      do: "resp_" <> binary_part(suffix, 0, 12)
+  end
+
+  defp previous_response_id_clear_preview(_response_id), do: nil
+
   defp secret_preview(nil), do: nil
 
   defp secret_preview(value) when is_binary(value) do
@@ -272,4 +287,8 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
   end
 
   defp clean_string(_value), do: nil
+
+  # The client's `reasoning` may be any JSON value; only an object's text effort is summarized (findings#339).
+  defp reasoning_effort(%{"reasoning" => %{"effort" => effort}}) when is_binary(effort), do: effort
+  defp reasoning_effort(_payload), do: nil
 end

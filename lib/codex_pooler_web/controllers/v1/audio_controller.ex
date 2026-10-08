@@ -9,9 +9,7 @@ defmodule CodexPoolerWeb.V1.AudioController do
     PublicGatewayDispatch.coerced_multipart(
       conn,
       fn -> Audio.coerce_transcription(params, GatewayHelpers.request_opts(conn)) end,
-      &normalize_success/2
+      fn decoded, coerced -> Audio.normalize_response(decoded, Map.get(coerced.audio_payload, "response_format", "json")) end
     )
   end
-
-  defp normalize_success(decoded, _coerced), do: decoded
 end
