@@ -95,6 +95,7 @@ defmodule CodexPoolerWeb.Layouts do
         target="_blank"
         rel="noopener noreferrer"
         aria-label="Codex Pooler on GitHub"
+        title="Codex Pooler on GitHub"
         class="btn btn-ghost btn-circle btn-sm text-base-content/65 hover:text-base-content"
       >
         <.github_icon class="size-4 fill-current" />
@@ -192,14 +193,14 @@ defmodule CodexPoolerWeb.Layouts do
 
   def theme_toggle(assigns) do
     ~H"""
-    <div id={@id} class={@class}>
+    <div id={@id} class={@class} role="group" aria-label={gettext("Theme")}>
       <div class="absolute w-1/3 h-full rounded-full border-1 border-base-200 bg-base-100 brightness-200 left-0 [[data-theme=light]_&]:left-1/3 [[data-theme=dark]_&]:left-2/3 transition-[left]" />
 
       <button
         type="button"
         aria-label={gettext("Match system theme")}
         title={gettext("Match system theme")}
-        class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
+        class="flex h-full w-1/3 cursor-pointer items-center justify-center rounded-full p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="system"
       >
@@ -210,7 +211,7 @@ defmodule CodexPoolerWeb.Layouts do
         type="button"
         aria-label={gettext("Light theme")}
         title={gettext("Light theme")}
-        class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
+        class="flex h-full w-1/3 cursor-pointer items-center justify-center rounded-full p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="light"
       >
@@ -221,7 +222,7 @@ defmodule CodexPoolerWeb.Layouts do
         type="button"
         aria-label={gettext("Dark theme")}
         title={gettext("Dark theme")}
-        class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
+        class="flex h-full w-1/3 cursor-pointer items-center justify-center rounded-full p-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="dark"
       >
