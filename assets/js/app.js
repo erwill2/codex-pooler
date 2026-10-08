@@ -8,6 +8,7 @@ import { LiveSocket } from "phoenix_live_view";
 import { hooks as colocatedHooks } from "phoenix-colocated/codex_pooler";
 import topbar from "topbar";
 import { renderSVG } from "uqr";
+import { ClipboardCopy } from "./clipboard_copy.mjs";
 import {
 	adminEscapeTarget,
 	shouldDismissOpenPopoverFromPointer,
@@ -285,37 +286,6 @@ const ModelServingTools = {
 	},
 	destroyed() {
 		this.el.removeEventListener("click", this.onClick);
-	},
-};
-const ClipboardCopy = {
-	mounted() {
-		this.el.addEventListener("click", async () => {
-			const icon = this.el.querySelector(".copy-icon");
-			const label = this.el.querySelector("[data-copy-label]");
-			window.clearTimeout(this.timeout);
-			await navigator.clipboard.writeText(this.el.dataset.copyText);
-
-			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
-			}
-
-			icon?.classList.remove("hero-clipboard-document");
-			icon?.classList.add("hero-check");
-			this.el.classList.add("btn-success");
-
-			this.timeout = window.setTimeout(() => {
-				icon?.classList.remove("hero-check");
-				icon?.classList.add("hero-clipboard-document");
-				this.el.classList.remove("btn-success");
-
-				if (label) {
-					label.textContent = this.el.dataset.copyLabel || "Copy";
-				}
-			}, 1400);
-		});
-	},
-	destroyed() {
-		window.clearTimeout(this.timeout);
 	},
 };
 const WorkerFailureMarker = {
