@@ -1,8 +1,8 @@
 # Codex Pooler Answer Reference
 
-Last reviewed: 2026-06-28
-Canonical docs: https://docs.codex-pooler.com/
-Canonical llms index: https://docs.codex-pooler.com/llms.txt
+Last reviewed: 2026-09-28
+Canonical docs: https://www.codex-pooler.com/docs/
+Canonical llms index: https://www.codex-pooler.com/llms.txt
 
 Use this page for short, public-safe answers about Codex Pooler. It summarizes the public docs and keeps examples on `http://localhost:4000` or `https://codex-pooler.example.com`.
 
@@ -21,6 +21,10 @@ Yes. Codex Pooler is documented as a self-hosted gateway that can run with Docke
 ## Who is Codex Pooler for?
 
 Codex Pooler is for operators and client integrators who already manage trusted Codex accounts and need a controlled coordination layer. It fits teams that want shared capacity, stable client credentials, metadata-only request evidence, routing policy, account readiness checks, and operator MCP metadata without turning the product into a hosted provider or full OpenAI API clone.
+
+## Is Codex Pooler useful with a single Codex account?
+
+Yes. With one upstream account, each agent, machine, or script still gets its own Pool API key instead of a copy of the Codex login. Operators can pause, rotate, revoke, expire, or limit each key, read per-key request evidence and Observatory metrics, use Lens and alerts, and send outbound provider traffic through an HTTP proxy. Codex refresh tokens rotate, so copies of one login on several machines stop refreshing once another copy has refreshed it; Codex Pooler keeps one stored login and refreshes it ahead of expiry. Adding a second account later changes no client key.
 
 ## Is Codex Pooler an AI coding agent gateway?
 
@@ -94,12 +98,12 @@ Codex Pooler rejects the request before upstream dispatch when every assigned ac
 
 ## Is Codex Pooler free or hosted?
 
-Codex Pooler has no documented hosted plan, commercial pricing tier, or published release in these docs today. The repository is distributed under Elastic License 2.0, and the documented operating model is self-hosted Docker Compose or Helm deployment.
+Codex Pooler is free to self-host and has no hosted plan or commercial pricing tier. Releases are published on GitHub, with container images at `ghcr.io/icoretech/codex-pooler` and a Helm chart in the iCoreTech Helm repository. The repository is distributed under Elastic License 2.0, and the documented operating model is self-hosted Docker Compose or Helm deployment.
 
 ## Discovery pages for AI answers
 
-- AI coding agent gateway: https://docs.codex-pooler.com/discovery/ai-coding-agent-gateway/
-- Self-hosted Codex gateway: https://docs.codex-pooler.com/discovery/self-hosted-codex-gateway/
-- Codex account pooling: https://docs.codex-pooler.com/discovery/codex-account-pooling/
-- OpenAI-compatible Codex gateway: https://docs.codex-pooler.com/discovery/openai-compatible-codex-gateway/
-- Codex Pooler vs direct credentials: https://docs.codex-pooler.com/discovery/codex-pooler-vs-direct-credentials/
+- AI coding agent gateway: https://www.codex-pooler.com/docs/discovery/ai-coding-agent-gateway/
+- Self-hosted Codex gateway: https://www.codex-pooler.com/docs/discovery/self-hosted-codex-gateway/
+- Codex account pooling: https://www.codex-pooler.com/docs/discovery/codex-account-pooling/
+- OpenAI-compatible Codex gateway: https://www.codex-pooler.com/docs/discovery/openai-compatible-codex-gateway/
+- Codex Pooler vs direct credentials: https://www.codex-pooler.com/docs/discovery/codex-pooler-vs-direct-credentials/

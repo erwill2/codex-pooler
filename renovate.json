@@ -16,8 +16,9 @@
     "npm"
   ],
   "constraints": {
-    "elixir": "1.19.5",
-    "erlang": "28.5.0.2"
+    "elixir": "1.20.4",
+    "erlang": "29.1.1.0",
+    "node": ">=26 <27"
   },
   "labels": [
     "dependencies"
@@ -52,11 +53,9 @@
     },
     {
       "description": "Automerge stable Codex client updates immediately",
-      "matchManagers": [
-        "custom.regex"
-      ],
       "matchPackageNames": [
-        "openai/codex"
+        "openai/codex",
+        "ghcr.io/icoretech/codex-docker"
       ],
       "automerge": true,
       "automergeType": "pr",
@@ -72,7 +71,7 @@
       "rangeStrategy": "pin"
     },
     {
-      "description": "Keep Erlang/Elixir runtime and toolchain updates together",
+      "description": "Create Elixir toolchain PRs only when Dockerfile, Drone, mise, and Mix lockfile runtimes can update together",
       "matchManagers": [
         "custom.regex",
         "dockerfile",
@@ -87,10 +86,10 @@
       ],
       "groupName": "Elixir/Erlang toolchain",
       "groupSlug": "elixir-erlang-toolchain",
-      "minimumGroupSize": 2
+      "minimumGroupSize": 4
     },
     {
-      "description": "Use Docker-compatible custom updates for mise Elixir pins",
+      "description": "Use Docker-tag-compatible custom updates for mise Elixir OTP 29 pins",
       "matchManagers": [
         "mise"
       ],
@@ -100,14 +99,13 @@
       "enabled": false
     },
     {
-      "description": "Keep Renovate Mix artifacts on Elixir releases installable by containerbase",
-      "matchManagers": [
-        "custom.regex"
-      ],
+      "description": "Keep the project on Erlang/OTP 29",
       "matchPackageNames": [
-        "elixir-lang/elixir"
+        "containerbase/erlang-prebuild",
+        "erlang",
+        "erlang/otp"
       ],
-      "allowedVersions": "<1.20.0"
+      "allowedVersions": "<30"
     },
     {
       "description": "Keep Node runtime image updates together",
@@ -141,6 +139,19 @@
       ],
       "groupName": "Tailwind CSS CLI",
       "groupSlug": "tailwind-css-cli"
+    },
+    {
+      "description": "Keep Astro check on the TypeScript JavaScript API until native compiler support is available",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchFileNames": [
+        "docs-site/package.json"
+      ],
+      "matchPackageNames": [
+        "typescript"
+      ],
+      "allowedVersions": "<7"
     }
   ],
   "customManagers": [
@@ -148,10 +159,10 @@
       "customType": "regex",
       "description": "Update Codex client version used for upstream identity and model discovery",
       "managerFilePatterns": [
-        "/(^|/)lib/codex_pooler/upstreams/codex_client_identity\\.ex$/"
+        "/(^|/)config/config\\.exs$/"
       ],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+) extractVersion=(?<extractVersion>\\S+)\\s+@default_client_version \"(?<currentValue>[^\"]+)\""
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+) extractVersion=(?<extractVersion>\\S+)\\s+default_client_version: \"(?<currentValue>[^\"]+)\""
       ],
       "versioningTemplate": "semver"
     },
@@ -166,8 +177,7 @@
       ],
       "depNameTemplate": "codex-pooler",
       "datasourceTemplate": "helm",
-      "registryUrlTemplate": "https://icoretech.github.io/helm",
-      "autoReplaceStringTemplate": "{{{prefix}}}{{{newValue}}}{{{suffix}}}"
+      "registryUrlTemplate": "https://icoretech.github.io/helm"
     },
     {
       "customType": "regex",
@@ -197,16 +207,15 @@
     },
     {
       "customType": "regex",
-      "description": "Update mise Elixir OTP 28 version from Docker tag compatibility",
+      "description": "Update mise Elixir OTP 29 version from Docker tag compatibility",
       "managerFilePatterns": [
         "/(^|/)mise\\.toml$/"
       ],
       "matchStrings": [
-        "(?<prefix>elixir\\s*=\\s*\")(?<currentValue>\\d+\\.\\d+\\.\\d+-otp-28)(?<suffix>\")"
+        "(?<prefix>elixir\\s*=\\s*\")(?<currentValue>\\d+\\.\\d+\\.\\d+-otp-29)(?<suffix>\")"
       ],
       "depNameTemplate": "elixir",
-      "datasourceTemplate": "docker",
-      "autoReplaceStringTemplate": "{{{prefix}}}{{{newValue}}}{{{suffix}}}"
+      "datasourceTemplate": "docker"
     },
     {
       "customType": "regex",
@@ -219,8 +228,7 @@
       ],
       "depNameTemplate": "elixir-lang/elixir",
       "datasourceTemplate": "github-releases",
-      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$",
-      "autoReplaceStringTemplate": "{{{prefix}}}{{{newValue}}}{{{suffix}}}"
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$"
     },
     {
       "customType": "regex",
@@ -233,8 +241,7 @@
       ],
       "depNameTemplate": "containerbase/erlang-prebuild",
       "datasourceTemplate": "github-releases",
-      "versioningTemplate": "semver-coerced",
-      "autoReplaceStringTemplate": "{{{prefix}}}{{{newValue}}}{{{suffix}}}"
+      "versioningTemplate": "semver-coerced"
     },
     {
       "customType": "regex",

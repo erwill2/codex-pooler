@@ -53,6 +53,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Rules do
                 <th>Rule</th>
                 <th>Pool</th>
                 <th class="text-center">State</th>
+                <th>Route class</th>
                 <th>Threshold</th>
                 <th class="text-center">Cooldown</th>
                 <th class="text-right">Actions</th>
@@ -94,6 +95,12 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Rules do
                   >
                     {AlertRuleForm.state_label(rule.state)}
                   </span>
+                </td>
+                <td
+                  id={"alert-rule-row-#{rule.id}-route-class"}
+                  class="font-mono text-xs text-base-content/70"
+                >
+                  {rule.route_class || "any"}
                 </td>
                 <td
                   id={"alert-rule-row-#{rule.id}-threshold"}
@@ -230,6 +237,26 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Rules do
                 {model_scope_help(AlertRuleForm.value(@rule_form[:rule_kind]))}
               </p>
             </div>
+            <div
+              :if={AlertRuleForm.value(@rule_form[:rule_kind]) in AlertRule.route_class_rule_kinds()}
+              id="alert-rule-route-class-field"
+              class="grid gap-1"
+            >
+              <.input
+                id="alert-rule-route-class"
+                field={@rule_form[:route_class]}
+                type="select"
+                label="Route class"
+                options={AlertRuleForm.route_class_options()}
+                prompt="All route classes"
+              />
+              <p
+                id="alert-rule-route-class-help"
+                class="px-1 text-xs leading-5 text-base-content/55"
+              >
+                Leave blank for all route classes. This uses worst-wins evaluation across every class.
+              </p>
+            </div>
           </div>
 
           <div
@@ -258,9 +285,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Rules do
               field={@rule_form[:target_state]}
               type="select"
               label="Target state"
-              options={
-                AlertRuleForm.target_state_options(AlertRuleForm.value(@rule_form[:rule_kind]))
-              }
+              options={AlertRuleForm.target_state_options(AlertRuleForm.value(@rule_form[:rule_kind]))}
             />
 
             <.input
@@ -305,7 +330,6 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Rules do
           <div class="flex flex-wrap justify-end gap-2">
             <AdminComponents.action_button
               id="alert-rule-cancel"
-              icon="hero-x-mark"
               label="Cancel"
               phx-click="cancel_rule_form"
             />
@@ -372,8 +396,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Rules do
     do: "All assignments #{AlertRuleForm.target_state_label(rule.target_state)}"
 
   defp threshold_summary(%AlertRule{rule_kind: "upstream_quota_threshold"} = rule),
-    do:
-      "#{AlertRuleForm.window_selector_label(rule.window_selector)} at #{AlertRuleForm.threshold_label(rule.threshold_used_percent)}"
+    do: "#{AlertRuleForm.window_selector_label(rule.window_selector)} at #{AlertRuleForm.threshold_label(rule.threshold_used_percent)}"
 
   defp threshold_summary(%AlertRule{rule_kind: "upstream_auth_state"} = rule),
     do: "Assigned upstream #{AlertRuleForm.target_state_label(rule.target_state)}"

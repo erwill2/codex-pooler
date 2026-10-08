@@ -7,13 +7,17 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
 
   alias CodexPooler.Accounting.UsageResponses
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @assignment_eligible PoolUpstreamAssignment.eligible_status()
-  @assignment_health_active PoolUpstreamAssignment.active_health_status()
-  @identity_active UpstreamIdentity.active_status()
+  @assignment_active AssignmentStatus.active_status()
+  @assignment_eligible AssignmentStatus.eligible_status()
+  @assignment_health_active AssignmentStatus.active_health_status()
+  @identity_active IdentityStatus.active_status()
 
   @type accounting_error :: %{required(:code) => atom(), required(:message) => String.t()}
 
@@ -23,8 +27,8 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     pool_id = id_for(pool_or_id)
 
     case best_codex_usage_identity_for_pool(pool_id, opts) do
-      {%UpstreamIdentity{} = identity, _assignment, windows} ->
-        build_codex_usage_for_identity(identity, windows, opts)
+      {%UpstreamIdentity{} = identity, _assignment, snapshot} ->
+        build_codex_usage_for_identity(identity, snapshot, opts)
 
       nil ->
         {:error, accounting_error(:no_upstream_usage, "no upstream usage is available")}
@@ -57,8 +61,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
         build_codex_usage_for_upstream_identity(identity, opts)
 
       [] ->
-        {:error,
-         accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
+        {:error, accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
 
       [_first, _second | _rest] ->
         {:error,
@@ -70,9 +73,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   end
 
   def build_codex_usage_for_chatgpt_account(_chatgpt_account_id, _opts),
-    do:
-      {:error,
-       accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
+    do: {:error, accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
 
   @spec build_codex_usage_for_upstream_identity(UpstreamIdentity.t(), keyword()) ::
           {:ok, map()} | {:error, accounting_error()}
@@ -80,15 +81,15 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     if active_assigned_identity?(identity) do
       build_codex_usage_for_identity(identity, opts)
     else
-      {:error,
-       accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
+      {:error, accounting_error(:invalid_chatgpt_account, "unknown or inactive chatgpt-account-id")}
     end
   end
 
   @spec v1_upstream_limits_for_pool(term(), DateTime.t(), keyword()) :: [map()]
   def v1_upstream_limits_for_pool(pool_id, as_of, opts) when is_binary(pool_id) do
     case best_codex_usage_identity_for_pool(pool_id, Keyword.put(opts, :as_of, as_of)) do
-      {%UpstreamIdentity{}, %PoolUpstreamAssignment{}, windows} ->
+      {%UpstreamIdentity{}, %PoolUpstreamAssignment{}, snapshot} ->
+        windows = RoutingQuotaSnapshot.effective_windows(snapshot)
         {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
 
         [primary, secondary]
@@ -104,23 +105,50 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
 
   defp build_codex_usage_for_identity(%UpstreamIdentity{} = identity, opts) do
     as_of = Keyword.get(opts, :as_of, now())
-    windows = quota_windows_for_identity(identity.id, as_of)
 
-    build_codex_usage_for_identity(identity, windows, Keyword.put(opts, :as_of, as_of))
+    snapshot =
+      [identity.id]
+      |> RoutingQuotaSnapshot.load_by_identity_ids(as_of)
+      |> Map.fetch!(identity.id)
+
+    if explicit_usage_snapshot_available?(snapshot) do
+      build_codex_usage_for_identity(identity, snapshot, Keyword.put(opts, :as_of, as_of))
+    else
+      {:error, accounting_error(:no_upstream_usage, "no upstream usage is available")}
+    end
   end
 
-  defp build_codex_usage_for_identity(%UpstreamIdentity{} = identity, windows, opts) do
+  defp build_codex_usage_for_identity(%UpstreamIdentity{} = identity, snapshot, opts) do
     as_of = Keyword.get(opts, :as_of, now())
+    windows = RoutingQuotaSnapshot.effective_windows(snapshot)
     {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
     additional_rate_limits = UsageResponses.additional_codex_rate_limits(windows, as_of)
 
-    {:ok,
-     %{
-       plan_type: identity.plan_family || "unknown",
-       rate_limit: UsageResponses.codex_rate_limit(primary, secondary),
-       credits: UsageResponses.codex_credits(primary, secondary),
-       additional_rate_limits: additional_rate_limits
-     }}
+    credits =
+      case {snapshot.credit_balance_reported?, snapshot.credit_balance} do
+        {false, _unreported} ->
+          UsageResponses.codex_credits(primary, secondary)
+
+        {true, %{balance: balance, has_credits: has_credits, unlimited: unlimited}}
+        when is_boolean(has_credits) and is_boolean(unlimited) ->
+          %{
+            balance: Integer.to_string(balance),
+            has_credits: has_credits,
+            unlimited: unlimited
+          }
+
+        _unavailable ->
+          nil
+      end
+
+    usage =
+      %{
+        plan_type: public_plan_type(identity),
+        rate_limit: account_rate_limit(snapshot, primary, secondary),
+        additional_rate_limits: additional_rate_limits
+      }
+
+    {:ok, if(is_nil(credits), do: usage, else: Map.put(usage, :credits, credits))}
   end
 
   defp active_assigned_identity?(%UpstreamIdentity{id: identity_id, status: @identity_active}) do
@@ -138,15 +166,24 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     as_of = Keyword.get(opts, :as_of, now())
     candidates = codex_usage_candidates(pool_id)
 
-    windows_by_identity_id =
-      quota_windows_by_identity_id(Enum.map(candidates, &elem(&1, 0).id), as_of)
+    snapshots_by_identity_id =
+      candidates
+      |> Enum.map(&elem(&1, 0).id)
+      |> RoutingQuotaSnapshot.load_by_identity_ids(as_of)
 
     candidates
     |> Enum.map(fn {%UpstreamIdentity{} = identity, assignment} ->
-      {identity, assignment, Map.get(windows_by_identity_id, identity.id, [])}
+      {identity, assignment, Map.get(snapshots_by_identity_id, identity.id)}
     end)
     |> Enum.filter(&codex_usage_candidate_has_quota?/1)
     |> Enum.max_by(&codex_usage_candidate_rank(&1, opts), fn -> nil end)
+    |> case do
+      {identity, assignment, snapshot} ->
+        {identity, assignment, snapshot}
+
+      nil ->
+        nil
+    end
   end
 
   defp best_codex_usage_identity_for_pool(_pool_id, _opts), do: nil
@@ -167,59 +204,77 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   end
 
   defp codex_usage_candidate_rank(
-         {%UpstreamIdentity{} = identity, %PoolUpstreamAssignment{}, windows},
+         {%UpstreamIdentity{} = identity, %PoolUpstreamAssignment{}, snapshot},
          opts
        ) do
     as_of = Keyword.get(opts, :as_of, now())
+    windows = RoutingQuotaSnapshot.effective_windows(snapshot)
     {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
-    rate_limit = UsageResponses.codex_rate_limit(primary, secondary)
+    rate_limit = account_rate_limit(snapshot, primary, secondary)
 
     {
       if(rate_limit.allowed, do: 1, else: 0),
-      usage_routing_state_rank(windows, as_of),
+      usage_routing_state_rank(snapshot),
       plan_rank(identity),
       usage_remaining_score(primary, secondary),
       usage_percent_score(primary, secondary)
     }
   end
 
-  defp codex_usage_candidate_has_quota?({%UpstreamIdentity{}, %PoolUpstreamAssignment{}, windows}) do
-    Enum.any?(windows, &(&1.quota_key == "account"))
+  defp codex_usage_candidate_has_quota?({%UpstreamIdentity{}, %PoolUpstreamAssignment{}, snapshot}) do
+    Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn window ->
+      window.quota_scope == "account"
+    end) or
+      QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true).eligible?
   end
 
-  defp quota_windows_by_identity_id([], _as_of), do: %{}
-
-  # candidate selection must reason about the effective window view: an
-  # identity whose only rows are superseded or future-dated has no usable
-  # quota knowledge, and must neither pass the has-quota filter nor outrank
-  # a genuinely exhausted identity with an empty (allowed-looking) payload
-  defp quota_windows_by_identity_id(identity_ids, as_of) do
-    QuotaWindows.list_quota_windows_by_identity_ids(identity_ids, as_of)
+  defp explicit_usage_snapshot_available?(snapshot) do
+    Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn window ->
+      window.quota_scope == "account"
+    end) or
+      QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true).eligible?
   end
 
-  defp quota_windows_for_identity(identity_id, as_of) do
-    QuotaWindows.list_quota_windows(identity_id, as_of)
-  end
-
-  defp usage_routing_state_rank(windows, as_of) do
-    case QuotaWindows.routing_quota_eligibility_from_windows(windows,
-           at: as_of
-         ) do
+  defp usage_routing_state_rank(snapshot) do
+    case QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true) do
       %{routing_state: :precise} -> 3
+      %{routing_state: :provider_available} -> 3
       %{routing_state: :credit_backed_probe} -> 2
       %{routing_state: :weekly_only_probe} -> 1
+      %{routing_state: :windowless_provider_available} -> 1
       _state -> 0
     end
   end
 
-  defp plan_rank(%UpstreamIdentity{} = identity) do
-    plan = identity.plan_family || plan_label(identity.plan_label) || ""
+  defp account_rate_limit(snapshot, primary, secondary) do
+    rate_limit = UsageResponses.codex_rate_limit(primary, secondary)
+    routing = QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true)
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      AccountAvailabilityStore.blocked?(
+        snapshot.availability,
+        snapshot.credential_epoch,
+        snapshot.as_of
+      ) ->
+        %{rate_limit | allowed: false, limit_reached: true}
+
+      routing.routing_state == :provider_available ->
+        %{rate_limit | allowed: true, limit_reached: false}
+
+      true ->
+        rate_limit
+    end
+  end
+
+  defp plan_rank(%UpstreamIdentity{} = identity) do
+    plan = (identity.plan_family || plan_label(identity.plan_label) || "") |> String.downcase() |> String.replace("_", "-")
+
+    # Presentation precedence for the representative usage account, not quota or pricing entitlement.
+    cond do
+      plan in ~w(team business ent26 enterprise enterprise-cbp-automation enterprise-cbp-usage-based self-serve-business-prolite self-serve-business-usage-based edu edu-plus edu-pro hc education) -> 4
+      plan in ~w(pro prolite promax chatgpt-pro) -> 3
+      plan in ~w(plus chatgpt-plus) -> 2
+      plan in ~w(free go) -> 1
       true -> 0
     end
   end
@@ -255,6 +310,13 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   defp id_for(id) when is_binary(id), do: id
   defp id_for(_), do: nil
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  defp public_plan_type(%UpstreamIdentity{plan_family: plan_family, plan_label: plan_label})
+       when is_binary(plan_family),
+       do: plan_label || plan_family
+
+  defp public_plan_type(%UpstreamIdentity{}), do: "unknown"
+
   defp plan_label(nil), do: "unknown"
   defp plan_label(label), do: label |> String.downcase() |> String.replace(" ", "_")
   defp accounting_error(code, message), do: %{code: code, message: message}

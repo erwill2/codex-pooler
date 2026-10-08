@@ -9,7 +9,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.PoolContribution do
   alias CodexPooler.Admin.UpstreamCockpitMetrics.Common
   alias CodexPooler.Admin.UpstreamQuotaReadiness
   alias CodexPooler.Repo
-  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
 
   @spec pool_contribution(
           Scope.t(),
@@ -33,6 +33,33 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.PoolContribution do
     from_rows(identity_or_id, visible_assignments, rows, quota_readiness)
   end
 
+  @spec pool_contribution_from_readiness(
+          Scope.t(),
+          term(),
+          [UpstreamCockpitMetrics.assignment_summary()],
+          UpstreamQuotaReadiness.t(),
+          DateTime.t()
+        ) :: UpstreamCockpitMetrics.pool_contribution()
+  def pool_contribution_from_readiness(
+        %Scope{} = scope,
+        identity_or_status,
+        assignments,
+        readiness,
+        %DateTime{} = as_of
+      )
+      when is_list(assignments) and is_map(readiness) do
+    pool_ids = Common.visible_pool_ids(scope)
+    visible_assignments = Common.filter_assignments_by_pool_ids(assignments, pool_ids)
+    start_7d = Common.seven_day_window_start(as_of)
+
+    rows =
+      identity_or_status
+      |> Common.identity_id()
+      |> pool_contribution_rows(pool_ids, start_7d, as_of)
+
+    from_rows(identity_or_status, visible_assignments, rows, readiness)
+  end
+
   @spec without_request_data([UpstreamCockpitMetrics.assignment_summary()], DateTime.t()) ::
           UpstreamCockpitMetrics.pool_contribution()
   def without_request_data(assignments, %DateTime{} = as_of) when is_list(assignments) do
@@ -54,8 +81,8 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.PoolContribution do
   end
 
   defp from_rows(identity_or_status, assignments, rows, quota_readiness) do
-    successful_requests_7d = length(rows)
-    request_counts_by_pool_id = Enum.frequencies_by(rows, & &1.pool_id)
+    successful_requests_7d = Enum.sum_by(rows, & &1.successful_request_count_7d)
+    request_counts_by_pool_id = Map.new(rows, &{&1.pool_id, &1.successful_request_count_7d})
 
     items =
       assignments
@@ -94,15 +121,33 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.PoolContribution do
 
   defp pool_contribution_rows(_identity_id, _pool_ids, _start_7d, _as_of), do: []
 
+  # Each successful request of the window is probed once for an attempt of
+  # this identity through `attempts_upstream_identity_request_idx`, so the
+  # rows read stay linear in the window whatever the planner statistics say.
+  # `offset: 0` keeps the probe a per-request subplan: the planner may not turn
+  # it into a join. A join against the identity's grouped request ids, or a
+  # plain EXISTS it is free to unnest, took a nested loop that rescans the
+  # identity's attempts for every request when a table had no statistics yet
+  # (about 4 s over 10k fresh rows), and with production statistics the
+  # grouped join read the identity's whole history on every cockpit load
+  # (findings#206 row 206-452).
   defp pool_contribution_rows_for_pools(identity_id, pool_ids, start_7d, as_of) do
-    Request
-    |> join(:inner, [request], attempt in Attempt, on: attempt.request_id == request.id)
+    identity_attempt =
+      from attempt in Attempt,
+        where: attempt.request_id == parent_as(:request).id and attempt.upstream_identity_id == ^identity_id,
+        select: 1,
+        offset: 0
+
+    from(request in Request, as: :request)
     |> where([request], request.pool_id in ^pool_ids)
-    |> where([request, attempt], attempt.upstream_identity_id == ^identity_id)
     |> where([request], request.status == "succeeded")
     |> where([request], request.admitted_at >= ^start_7d and request.admitted_at <= ^as_of)
-    |> group_by([request], [request.id, request.pool_id])
-    |> select([request], %{pool_id: request.pool_id})
+    |> where([request], exists(identity_attempt))
+    |> group_by([request], request.pool_id)
+    |> select([request], %{
+      pool_id: request.pool_id,
+      successful_request_count_7d: count(request.id)
+    })
     |> Repo.all()
   end
 
@@ -175,9 +220,10 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetrics.PoolContribution do
     do: "Disabled or unusable assignment"
 
   defp quota_readiness_for_identity(identity_id, as_of) when is_binary(identity_id) do
-    identity_id
-    |> QuotaWindows.list_quota_windows(as_of)
-    |> UpstreamQuotaReadiness.from_windows(as_of)
+    [identity_id]
+    |> RoutingQuotaSnapshot.load_by_identity_ids(as_of)
+    |> Map.fetch!(identity_id)
+    |> UpstreamQuotaReadiness.from_snapshot()
   end
 
   defp quota_readiness_for_identity(_identity_id, as_of),

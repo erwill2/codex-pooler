@@ -2,8 +2,7 @@ defmodule CodexPooler.Gateway.Persistence.CodexSession do
   @moduledoc false
   use CodexPooler.Schema
 
-  @statuses ~w(active interrupted closed)
-  @reconnectable_statuses ~w(active interrupted)
+  alias CodexPooler.Gateway.Persistence.StatusVocabulary.Session, as: SessionStatus
 
   @type t :: %__MODULE__{}
   @type status :: String.t()
@@ -12,33 +11,56 @@ defmodule CodexPooler.Gateway.Persistence.CodexSession do
     field :pool_id, :binary_id
     field :api_key_id, :binary_id
     field :session_key, :string
-    field :conversation_key, :string
+    # The table keeps the never-written `conversation_key` column and its
+    # CHECK, unmapped here: retained-column debt, see
+    # https://github.com/icoretech/codex-pooler-findings/issues/261
     field :pool_upstream_assignment_id, :binary_id
     field :status, :string
     field :owner_instance_id, :string
-    field :owner_lease_token, :binary_id
+    field :owner_instance_boot_id, :string
+    field :owner_lease_token, :binary_id, redact: true
     field :owner_lease_expires_at, :utc_datetime_usec
     field :last_heartbeat_at, :utc_datetime_usec
     field :disconnected_at, :utc_datetime_usec
     field :closed_at, :utc_datetime_usec
+    field :close_reason, :string
     field :created_at, :utc_datetime_usec
     field :updated_at, :utc_datetime_usec
+
+    # Soft routing preference carried only by the struct returned from the
+    # recreation that computed it: the assignment of the session that was just
+    # closed for this same (pool, api key, session key) because its owner lease
+    # had expired. It is deliberately virtual. Nothing is persisted, so a later
+    # request that loads this row reads nil, which is what keeps the preference
+    # a one-shot hint for the recreating request instead of durable state.
+    #
+    # It is never written to `pool_upstream_assignment_id`: that column is the
+    # durable pin that routing may filter on, and binding it before dispatch
+    # would turn a preference into a filter.
+    field :recreated_from_assignment_id, :binary_id, virtual: true
+
+    # The same kind of one-shot preference for a session a native websocket
+    # upgrade opened on a window no session knew yet, while the live session of
+    # its thread's previous window serves on this assignment (findings#270 row
+    # 270-283). The upgrade does not join that session, whose owner may serve
+    # another live socket of the thread; it only asks for the same account.
+    field :previous_window_assignment_id, :binary_id, virtual: true
   end
 
   @spec statuses() :: [status()]
-  def statuses, do: @statuses
+  defdelegate statuses(), to: SessionStatus
 
   @spec active_status() :: status()
-  def active_status, do: "active"
+  defdelegate active_status(), to: SessionStatus
 
   @spec interrupted_status() :: status()
-  def interrupted_status, do: "interrupted"
+  defdelegate interrupted_status(), to: SessionStatus
 
   @spec closed_status() :: status()
-  def closed_status, do: "closed"
+  defdelegate closed_status(), to: SessionStatus
 
   @spec reconnectable_statuses() :: [status()]
-  def reconnectable_statuses, do: @reconnectable_statuses
+  defdelegate reconnectable_statuses(), to: SessionStatus
 
   @spec reconnectable?(t() | status() | nil) :: boolean()
   def reconnectable?(%__MODULE__{status: status}), do: reconnectable?(status)

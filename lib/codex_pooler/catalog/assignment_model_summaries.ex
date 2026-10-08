@@ -4,6 +4,7 @@ defmodule CodexPooler.Catalog.AssignmentModelSummaries do
   import Ecto.Query
 
   alias CodexPooler.Catalog.Model
+  alias CodexPooler.Catalog.ModelInfo
   alias CodexPooler.Catalog.Sync.PreservedSources
   alias CodexPooler.Repo
 
@@ -24,12 +25,14 @@ defmodule CodexPooler.Catalog.AssignmentModelSummaries do
           required(:assignment_id) => Ecto.UUID.t(),
           required(:exposed_model_id) => String.t(),
           required(:capabilities) => capabilities(),
+          required(:model_info) => ModelInfo.t(),
           required(:provenance) => provenance()
         }
   @type model_projection :: %{
           required(:pool_id) => Ecto.UUID.t(),
           required(:exposed_model_id) => String.t(),
-          required(:metadata) => map()
+          required(:metadata) => map(),
+          required(:last_seen_at) => DateTime.t() | nil
         }
 
   @spec list(term()) :: [summary()]
@@ -50,7 +53,8 @@ defmodule CodexPooler.Catalog.AssignmentModelSummaries do
     |> select([model], %{
       pool_id: model.pool_id,
       exposed_model_id: model.exposed_model_id,
-      metadata: model.metadata
+      metadata: model.metadata,
+      last_seen_at: model.last_seen_at
     })
     |> Repo.all()
     |> Enum.flat_map(&summaries_for_model(&1, authorized_set))
@@ -74,8 +78,11 @@ defmodule CodexPooler.Catalog.AssignmentModelSummaries do
               assignment_id: assignment_id,
               exposed_model_id: model.exposed_model_id,
               capabilities: capabilities(source_metadata),
-              provenance:
-                if(Map.has_key?(preserved, assignment_id), do: :preserved, else: :observed)
+              model_info:
+                source_metadata
+                |> then(&ModelInfo.from_sources([&1]))
+                |> maybe_attach_catalog_updated_at(model.last_seen_at, preserved, assignment_id),
+              provenance: if(Map.has_key?(preserved, assignment_id), do: :preserved, else: :observed)
             }
           ]
         else
@@ -86,6 +93,14 @@ defmodule CodexPooler.Catalog.AssignmentModelSummaries do
         []
     end)
     |> Enum.sort_by(&{&1.assignment_id, &1.exposed_model_id})
+  end
+
+  defp maybe_attach_catalog_updated_at(info, updated_at, preserved, assignment_id) do
+    if Map.has_key?(preserved, assignment_id) do
+      info
+    else
+      ModelInfo.with_catalog_updated_at(info, updated_at)
+    end
   end
 
   @spec capabilities(map()) :: capabilities()

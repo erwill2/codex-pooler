@@ -5,21 +5,24 @@ defmodule CodexPooler.Accounting.Reporting do
 
   import Ecto.Query
 
-  alias CodexPooler.Accounting.{DailyRollup, HourlyModelUsageRollup, LedgerEntry}
-  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Accounting.{DailyRollup, DailyRollupCoverage, LedgerEntry}
+  alias CodexPooler.Accounting.Reporting.ModelUsage
   alias CodexPooler.Repo
 
   @settlement "settlement"
   @recorded "recorded"
   @usage_known "usage_known"
-  @model_dimension "model"
-  @unknown_model_code "Unknown model"
-
-  @type model_usage_source :: :hourly_model_usage_rollups | :daily_model_rollups
+  @type model_usage_source ::
+          :hourly_model_usage_rollups_with_exact_edges
+          | :daily_model_rollups_with_exact_edges
   @type model_usage_bucket :: %{
           required(:bucket) => Date.t() | DateTime.t(),
           required(:model_code) => String.t(),
+          required(:series_rank) => pos_integer(),
           required(:request_count) => non_neg_integer(),
+          required(:success_count) => non_neg_integer(),
+          required(:failure_count) => non_neg_integer(),
+          required(:retry_count) => non_neg_integer(),
           required(:input_tokens) => non_neg_integer(),
           required(:cached_input_tokens) => non_neg_integer(),
           required(:output_tokens) => non_neg_integer(),
@@ -30,9 +33,24 @@ defmodule CodexPooler.Accounting.Reporting do
         }
   @type model_usage_bucket_result :: %{
           required(:source) => model_usage_source(),
+          required(:rollup_source) => :hourly_model_usage_rollups | :daily_model_rollups,
+          required(:edge_source) => :raw_settlement_edges,
+          required(:confidence) => :temporal_containment_only,
           required(:rows) => [model_usage_bucket()]
         }
   @type settlement_bucket_granularity :: :hour | :day
+  @type daily_rollup_coverage_status :: :complete | :incomplete | :missing | :incompatible
+  @type covered_pool_daily_usage_row :: %{
+          required(:pool_id) => Ecto.UUID.t(),
+          required(:rollup_date) => Date.t(),
+          required(:admitted_request_count) => non_neg_integer(),
+          required(:input_tokens) => non_neg_integer(),
+          required(:cached_input_tokens) => non_neg_integer(),
+          required(:output_tokens) => non_neg_integer(),
+          required(:reasoning_tokens) => non_neg_integer(),
+          required(:total_tokens) => non_neg_integer(),
+          required(:rounded_settled_cost_micros) => non_neg_integer()
+        }
   @type settlement_usage_bucket :: %{
           required(:pool_id) => Ecto.UUID.t(),
           required(:bucket) => DateTime.t(),
@@ -44,6 +62,39 @@ defmodule CodexPooler.Accounting.Reporting do
           required(:total_tokens) => non_neg_integer(),
           required(:settled_cost_micros) => non_neg_integer()
         }
+
+  @spec daily_rollup_coverage_statuses([Date.t()]) :: %{
+          optional(Date.t()) => daily_rollup_coverage_status()
+        }
+  def daily_rollup_coverage_statuses(dates) when is_list(dates) do
+    requested_dates = dates |> Enum.filter(&match?(%Date{}, &1)) |> Enum.uniq()
+
+    coverage_by_date =
+      DailyRollupCoverage
+      |> where([coverage], coverage.rollup_date in ^requested_dates)
+      |> select([coverage], {
+        coverage.rollup_date,
+        {coverage.contract_version, coverage.completed_at}
+      })
+      |> Repo.all()
+      |> Map.new()
+
+    expected_contract_version = DailyRollupCoverage.contract_version()
+
+    Map.new(requested_dates, fn date ->
+      status =
+        case Map.get(coverage_by_date, date) do
+          nil -> :missing
+          {^expected_contract_version, nil} -> :incomplete
+          {^expected_contract_version, %DateTime{}} -> :complete
+          {_version, _completed_at} -> :incompatible
+        end
+
+      {date, status}
+    end)
+  end
+
+  def daily_rollup_coverage_statuses(_dates), do: %{}
 
   @spec settlements_for_pool_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: [map()]
   def settlements_for_pool_ids([], _started_at, _ended_at), do: []
@@ -174,6 +225,33 @@ defmodule CodexPooler.Accounting.Reporting do
     |> Map.new(fn {pool_id, total} -> {pool_id, non_negative_integer(total)} end)
   end
 
+  @spec settled_cost_totals_by_pool_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: %{
+          optional(Ecto.UUID.t()) => non_neg_integer()
+        }
+  def settled_cost_totals_by_pool_ids([], _started_at, _ended_at), do: %{}
+
+  def settled_cost_totals_by_pool_ids(pool_ids, started_at, ended_at) do
+    Repo.all(
+      from entry in LedgerEntry,
+        where:
+          entry.pool_id in ^pool_ids and entry.entry_kind == ^@settlement and
+            entry.amount_status == ^@recorded and entry.occurred_at >= ^started_at and
+            entry.occurred_at <= ^ended_at,
+        group_by: entry.pool_id,
+        select:
+          {entry.pool_id,
+           sum(
+             fragment(
+               "CASE WHEN ? = ? THEN ROUND(?, 0) ELSE 0 END",
+               entry.usage_status,
+               ^@usage_known,
+               entry.settled_cost_micros
+             )
+           )}
+    )
+    |> Map.new(fn {pool_id, total} -> {pool_id, non_negative_integer(total)} end)
+  end
+
   @spec token_totals_by_upstream_identity_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: %{
           optional(Ecto.UUID.t()) => non_neg_integer()
         }
@@ -204,29 +282,36 @@ defmodule CodexPooler.Accounting.Reporting do
   end
 
   @type model_usage_total :: %{
+          required(:pool_id) => Ecto.UUID.t() | nil,
           required(:model_id) => Ecto.UUID.t() | nil,
           required(:total_tokens) => non_neg_integer(),
           required(:request_count) => non_neg_integer(),
+          required(:known_request_count) => non_neg_integer(),
+          required(:unknown_request_count) => non_neg_integer(),
           required(:settled_cost_micros) => non_neg_integer()
         }
 
-  @spec token_totals_by_upstream_identity_and_model_ids(
+  @spec token_totals_by_upstream_identity_pool_and_model_ids(
           [Ecto.UUID.t()],
           DateTime.t(),
           DateTime.t()
         ) :: %{optional(Ecto.UUID.t()) => [model_usage_total()]}
-  def token_totals_by_upstream_identity_and_model_ids([], _started_at, _ended_at), do: %{}
+  def token_totals_by_upstream_identity_pool_and_model_ids([], _started_at, _ended_at), do: %{}
 
-  def token_totals_by_upstream_identity_and_model_ids(upstream_identity_ids, started_at, ended_at) do
+  def token_totals_by_upstream_identity_pool_and_model_ids(
+        upstream_identity_ids,
+        started_at,
+        ended_at
+      ) do
     Repo.all(
       from entry in LedgerEntry,
         where:
           entry.upstream_identity_id in ^upstream_identity_ids and
             entry.entry_kind == ^@settlement and entry.amount_status == ^@recorded and
             entry.occurred_at >= ^started_at and entry.occurred_at <= ^ended_at,
-        group_by: [entry.upstream_identity_id, entry.model_id],
+        group_by: [entry.upstream_identity_id, entry.pool_id, entry.model_id],
         select:
-          {entry.upstream_identity_id, entry.model_id,
+          {entry.upstream_identity_id, entry.pool_id, entry.model_id,
            sum(
              fragment(
                "CASE WHEN ? = ? THEN ? ELSE 0 END",
@@ -240,15 +325,34 @@ defmodule CodexPooler.Accounting.Reporting do
                "CASE WHEN ? = ? THEN ? ELSE 0 END",
                entry.usage_status,
                ^@usage_known,
+               entry.request_count
+             )
+           ),
+           sum(
+             fragment(
+               "CASE WHEN ? = ? THEN 0 ELSE ? END",
+               entry.usage_status,
+               ^@usage_known,
+               entry.request_count
+             )
+           ),
+           sum(
+             fragment(
+               "CASE WHEN ? = ? THEN ? ELSE 0 END",
+               entry.usage_status,
+               ^@usage_known,
                entry.settled_cost_micros
              )
            )}
     )
-    |> Enum.reduce(%{}, fn {upstream_identity_id, model_id, total, requests, cost}, acc ->
+    |> Enum.reduce(%{}, fn {upstream_identity_id, pool_id, model_id, total, requests, known_requests, unknown_requests, cost}, acc ->
       row = %{
+        pool_id: pool_id,
         model_id: model_id,
         total_tokens: non_negative_integer(total),
         request_count: non_negative_integer(requests),
+        known_request_count: non_negative_integer(known_requests),
+        unknown_request_count: non_negative_integer(unknown_requests),
         settled_cost_micros: non_negative_integer(cost)
       }
 
@@ -349,6 +453,25 @@ defmodule CodexPooler.Accounting.Reporting do
     )
   end
 
+  @spec covered_pool_daily_usage_snapshot([Ecto.UUID.t()], [Date.t()]) ::
+          {:ok, [covered_pool_daily_usage_row()]}
+          | {:fallback, :incomplete_coverage}
+          | {:error, :unavailable}
+  def covered_pool_daily_usage_snapshot(pool_ids, dates)
+      when is_list(pool_ids) and is_list(dates) do
+    pool_ids = valid_pool_ids(pool_ids)
+    dates = dates |> Enum.filter(&match?(%Date{}, &1)) |> Enum.uniq()
+
+    if pool_ids == [] or length(dates) != 6 do
+      {:fallback, :incomplete_coverage}
+    else
+      query_covered_pool_daily_usage_snapshot(pool_ids, dates)
+    end
+  end
+
+  def covered_pool_daily_usage_snapshot(_pool_ids, _dates),
+    do: {:fallback, :incomplete_coverage}
+
   @spec model_usage_buckets_for_pool_ids(
           [Ecto.UUID.t()],
           atom(),
@@ -357,70 +480,25 @@ defmodule CodexPooler.Accounting.Reporting do
         ) :: model_usage_bucket_result()
   def model_usage_buckets_for_pool_ids(pool_ids, window, started_at, ended_at)
 
-  def model_usage_buckets_for_pool_ids([], window, _started_at, _ended_at),
-    do: %{source: model_usage_source(window), rows: []}
-
-  def model_usage_buckets_for_pool_ids(pool_ids, :seven_days, started_at, ended_at) do
-    start_date = DateTime.to_date(started_at)
-    end_date = DateTime.to_date(ended_at)
+  def model_usage_buckets_for_pool_ids(pool_ids, window, started_at, ended_at) do
+    granularity = model_usage_granularity(window)
+    pool_ids = valid_pool_ids(pool_ids)
+    source = model_usage_source(granularity)
 
     rows =
-      Repo.all(
-        from rollup in DailyRollup,
-          left_join: model in Model,
-          on: model.id == rollup.model_id and model.pool_id == rollup.pool_id,
-          where:
-            rollup.pool_id in ^pool_ids and rollup.dimension_kind == ^@model_dimension and
-              not is_nil(rollup.model_id) and rollup.rollup_date >= ^start_date and
-              rollup.rollup_date <= ^end_date,
-          order_by: [asc: rollup.rollup_date, asc: model.exposed_model_id],
-          select: %{
-            bucket: rollup.rollup_date,
-            model_code:
-              fragment(
-                "COALESCE(NULLIF(BTRIM(?), ''), ?)",
-                model.exposed_model_id,
-                ^@unknown_model_code
-              ),
-            request_count: rollup.request_count,
-            input_tokens: rollup.input_tokens,
-            cached_input_tokens: rollup.cached_input_tokens,
-            output_tokens: rollup.output_tokens,
-            reasoning_tokens: rollup.reasoning_tokens,
-            total_tokens: rollup.total_tokens,
-            estimated_cost_micros: rollup.estimated_cost_micros,
-            settled_cost_micros: rollup.settled_cost_micros
-          }
-      )
-      |> Enum.map(&normalize_model_usage_bucket/1)
+      if granularity && pool_ids != [] && valid_bounds?(started_at, ended_at) do
+        ModelUsage.query(pool_ids, granularity, started_at, ended_at)
+      else
+        []
+      end
 
-    %{source: :daily_model_rollups, rows: rows}
-  end
-
-  def model_usage_buckets_for_pool_ids(pool_ids, _window, started_at, ended_at) do
-    rows =
-      Repo.all(
-        from rollup in HourlyModelUsageRollup,
-          where:
-            rollup.pool_id in ^pool_ids and rollup.bucket_started_at > ^started_at and
-              rollup.bucket_started_at <= ^ended_at,
-          order_by: [asc: rollup.bucket_started_at, asc: rollup.model_code],
-          select: %{
-            bucket: rollup.bucket_started_at,
-            model_code: rollup.model_code,
-            request_count: rollup.request_count,
-            input_tokens: rollup.input_tokens,
-            cached_input_tokens: rollup.cached_input_tokens,
-            output_tokens: rollup.output_tokens,
-            reasoning_tokens: rollup.reasoning_tokens,
-            total_tokens: rollup.total_tokens,
-            estimated_cost_micros: rollup.estimated_cost_micros,
-            settled_cost_micros: rollup.settled_cost_micros
-          }
-      )
-      |> Enum.map(&normalize_model_usage_bucket/1)
-
-    %{source: :hourly_model_usage_rollups, rows: rows}
+    %{
+      source: source,
+      rollup_source: model_usage_rollup_source(granularity),
+      edge_source: :raw_settlement_edges,
+      confidence: :temporal_containment_only,
+      rows: rows
+    }
   end
 
   defp normalize_token_usage(usage) when is_map(usage) do
@@ -554,6 +632,102 @@ defmodule CodexPooler.Accounting.Reporting do
     }
   end
 
+  defp query_covered_pool_daily_usage_snapshot(pool_ids, dates) do
+    sql = """
+    WITH requested_pools(pool_id) AS (
+      SELECT DISTINCT unnest($1::uuid[])
+    ),
+    requested_dates(rollup_date) AS (
+      SELECT DISTINCT unnest($2::date[])
+    ),
+    coverage AS (
+      SELECT COUNT(coverage.rollup_date) = 6 AS complete
+      FROM requested_dates AS requested
+      LEFT JOIN daily_rollup_coverages AS coverage
+        ON coverage.rollup_date = requested.rollup_date
+       AND coverage.contract_version = $3
+       AND coverage.completed_at IS NOT NULL
+    ),
+    covered_rows AS (
+      SELECT
+        pools.pool_id,
+        dates.rollup_date,
+        COALESCE(rollups.admitted_request_count, 0)::bigint AS admitted_request_count,
+        COALESCE(rollups.input_tokens, 0)::bigint AS input_tokens,
+        COALESCE(rollups.cached_input_tokens, 0)::bigint AS cached_input_tokens,
+        COALESCE(rollups.output_tokens, 0)::bigint AS output_tokens,
+        COALESCE(rollups.reasoning_tokens, 0)::bigint AS reasoning_tokens,
+        COALESCE(rollups.total_tokens, 0)::bigint AS total_tokens,
+        COALESCE(rollups.rounded_settled_cost_micros, 0)::numeric AS rounded_settled_cost_micros
+      FROM requested_pools AS pools
+      CROSS JOIN requested_dates AS dates
+      CROSS JOIN coverage
+      LEFT JOIN daily_rollups AS rollups
+        ON rollups.dimension_kind = 'pool'
+       AND rollups.pool_id = pools.pool_id
+       AND rollups.rollup_date = dates.rollup_date
+      WHERE coverage.complete
+    )
+    SELECT
+      coverage.complete,
+      covered_rows.pool_id,
+      covered_rows.rollup_date,
+      covered_rows.admitted_request_count,
+      covered_rows.input_tokens,
+      covered_rows.cached_input_tokens,
+      covered_rows.output_tokens,
+      covered_rows.reasoning_tokens,
+      covered_rows.total_tokens,
+      covered_rows.rounded_settled_cost_micros
+    FROM coverage
+    LEFT JOIN covered_rows ON coverage.complete
+    ORDER BY covered_rows.rollup_date, covered_rows.pool_id
+    """
+
+    dumped_pool_ids = Enum.map(pool_ids, &Ecto.UUID.dump!/1)
+
+    case Repo.query(sql, [dumped_pool_ids, dates, DailyRollupCoverage.contract_version()], telemetry_options: [reporting_projection: :covered_pool_daily_usage_snapshot]) do
+      {:ok, %{rows: [[false | _rest]]}} ->
+        {:fallback, :incomplete_coverage}
+
+      {:ok, %{rows: rows}} ->
+        {:ok, Enum.map(rows, &normalize_covered_pool_daily_usage_row/1)}
+
+      {:error, _error} ->
+        {:error, :unavailable}
+    end
+  rescue
+    _error in [DBConnection.ConnectionError, DBConnection.OwnershipError] ->
+      {:error, :unavailable}
+  end
+
+  defp normalize_covered_pool_daily_usage_row([
+         true,
+         pool_id,
+         rollup_date,
+         admitted_request_count,
+         input_tokens,
+         cached_input_tokens,
+         output_tokens,
+         reasoning_tokens,
+         total_tokens,
+         rounded_settled_cost_micros
+       ]) do
+    {:ok, loaded_pool_id} = Ecto.UUID.load(pool_id)
+
+    %{
+      pool_id: loaded_pool_id,
+      rollup_date: rollup_date,
+      admitted_request_count: non_negative_integer(admitted_request_count),
+      input_tokens: non_negative_integer(input_tokens),
+      cached_input_tokens: non_negative_integer(cached_input_tokens),
+      output_tokens: non_negative_integer(output_tokens),
+      reasoning_tokens: non_negative_integer(reasoning_tokens),
+      total_tokens: non_negative_integer(total_tokens),
+      rounded_settled_cost_micros: non_negative_integer(rounded_settled_cost_micros)
+    }
+  end
+
   defp valid_pool_ids(pool_ids) when is_list(pool_ids) do
     pool_ids
     |> Enum.filter(&(is_binary(&1) and match?({:ok, _binary}, Ecto.UUID.dump(&1))))
@@ -562,32 +736,24 @@ defmodule CodexPooler.Accounting.Reporting do
 
   defp valid_pool_ids(_pool_ids), do: []
 
-  defp normalize_model_usage_bucket(row) do
-    %{
-      bucket: row.bucket,
-      model_code: normalize_model_code(row.model_code),
-      request_count: non_negative_integer(row.request_count),
-      input_tokens: non_negative_integer(row.input_tokens),
-      cached_input_tokens: non_negative_integer(row.cached_input_tokens),
-      output_tokens: non_negative_integer(row.output_tokens),
-      reasoning_tokens: non_negative_integer(row.reasoning_tokens),
-      total_tokens: non_negative_integer(row.total_tokens),
-      estimated_cost_micros: non_negative_integer(row.estimated_cost_micros),
-      settled_cost_micros: non_negative_integer(row.settled_cost_micros)
-    }
-  end
+  defp model_usage_granularity(:seven_days), do: :day
 
-  defp model_usage_source(:seven_days), do: :daily_model_rollups
-  defp model_usage_source(_window), do: :hourly_model_usage_rollups
+  defp model_usage_granularity(window)
+       when window in [:one_hour, :five_hours, :twenty_four_hours],
+       do: :hour
 
-  defp normalize_model_code(model_code) when is_binary(model_code) do
-    case String.trim(model_code) do
-      "" -> @unknown_model_code
-      trimmed -> trimmed
-    end
-  end
+  defp model_usage_granularity(_window), do: nil
 
-  defp normalize_model_code(_model_code), do: @unknown_model_code
+  defp model_usage_source(:day), do: :daily_model_rollups_with_exact_edges
+  defp model_usage_source(_granularity), do: :hourly_model_usage_rollups_with_exact_edges
+
+  defp model_usage_rollup_source(:day), do: :daily_model_rollups
+  defp model_usage_rollup_source(_granularity), do: :hourly_model_usage_rollups
+
+  defp valid_bounds?(%DateTime{} = started_at, %DateTime{} = ended_at),
+    do: DateTime.compare(started_at, ended_at) != :gt
+
+  defp valid_bounds?(_started_at, _ended_at), do: false
 
   defp non_negative_integer(%Decimal{} = value),
     do: value |> Decimal.round(0) |> Decimal.to_integer()

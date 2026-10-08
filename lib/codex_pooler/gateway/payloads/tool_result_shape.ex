@@ -1,35 +1,34 @@
 defmodule CodexPooler.Gateway.Payloads.ToolResultShape do
   @moduledoc false
 
-  @type item :: %{type: String.t(), call_id: String.t()}
+  @type item :: %{type: String.t(), call_id: String.t() | nil}
 
   @spec items(term()) :: [item()]
-  def items(input) when is_list(input), do: Enum.flat_map(input, &items/1)
+  def items(input), do: input |> collect_items([]) |> Enum.reverse()
 
-  def items(%{} = item) do
-    nested = item |> Map.values() |> Enum.flat_map(&items/1)
+  @spec any?(term()) :: boolean()
+  def any?(%{} = item),
+    do: tool_result?(item) or Enum.any?(Map.values(item), &any?/1)
 
-    if tool_result?(item) do
-      [
-        %{
-          type: clean_string(Map.get(item, "type")) || "unknown_tool_output",
-          call_id: call_id(item)
-        }
-        | nested
-      ]
-    else
-      nested
-    end
-  end
-
-  def items(_input), do: []
+  def any?(items) when is_list(items), do: Enum.any?(items, &any?/1)
+  def any?(_input), do: false
 
   @spec tool_result?(term()) :: boolean()
   def tool_result?(%{} = item) do
-    is_binary(call_id(item)) and tool_result_type?(Map.get(item, "type"), item)
+    paired_tool_result?(item) or standalone_function_output?(item)
   end
 
   def tool_result?(_item), do: false
+
+  defp paired_tool_result?(item),
+    do: is_binary(call_id(item)) and tool_result_type?(Map.get(item, "type"), item)
+
+  defp standalone_function_output?(item) do
+    is_nil(Map.get(item, "call_id")) and
+      Map.get(item, "type") == "function_call_output" and
+      is_binary(clean_string(Map.get(item, "name"))) and
+      Map.has_key?(item, "output")
+  end
 
   defp tool_result_type?(type, item) when is_binary(type) do
     normalized = type |> String.trim() |> String.downcase()
@@ -42,6 +41,28 @@ defmodule CodexPooler.Gateway.Payloads.ToolResultShape do
     do: Map.has_key?(item, "output") or Map.has_key?(item, "result")
 
   defp call_id(%{} = item), do: clean_string(Map.get(item, "call_id"))
+
+  defp collect_items(%{} = item, acc) do
+    acc =
+      if tool_result?(item) do
+        [
+          %{
+            type: clean_string(Map.get(item, "type")) || "unknown_tool_output",
+            call_id: call_id(item)
+          }
+          | acc
+        ]
+      else
+        acc
+      end
+
+    Enum.reduce(Map.values(item), acc, &collect_items/2)
+  end
+
+  defp collect_items(items, acc) when is_list(items),
+    do: Enum.reduce(items, acc, &collect_items/2)
+
+  defp collect_items(_input, acc), do: acc
 
   defp clean_string(value) when is_binary(value) do
     value = String.trim(value)

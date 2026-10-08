@@ -9,7 +9,6 @@ defmodule CodexPooler.Catalog do
     AssignmentModelSummaries,
     Model,
     ModelSelectorState,
-    PricingSnapshot,
     Sync,
     SyncRun
   }
@@ -19,17 +18,19 @@ defmodule CodexPooler.Catalog do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
   @active "active"
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @assignment_eligible PoolUpstreamAssignment.eligible_status()
-  @identity_active UpstreamIdentity.active_status()
+  @assignment_active AssignmentStatus.active_status()
+  @assignment_eligible AssignmentStatus.eligible_status()
+  @identity_active IdentityStatus.active_status()
   @failed "failed"
   @fresh_catalog_seconds 86_400
   @health_excluded [
-    PoolUpstreamAssignment.cooldown_health_status(),
-    PoolUpstreamAssignment.disabled_health_status(),
-    PoolUpstreamAssignment.errored_health_status()
+    AssignmentStatus.cooldown_health_status(),
+    AssignmentStatus.disabled_health_status(),
+    AssignmentStatus.errored_health_status()
   ]
   @running "running"
   @succeeded "succeeded"
@@ -42,7 +43,7 @@ defmodule CodexPooler.Catalog do
           | {:error, catalog_error() | Ecto.Changeset.t() | term()}
           | {:error, term(), catalog_error() | Ecto.Changeset.t() | term()}
   @type pool_ref :: Pool.t() | Ecto.UUID.t()
-  @type pricing_bucket_map :: %{optional(String.t()) => [String.t()]}
+  @type visible_models_by_pool_id :: %{optional(Ecto.UUID.t()) => [Model.t()]}
 
   @spec list_assignment_model_summaries(term()) :: [AssignmentModelSummaries.summary()]
   @spec exposed_model_ids_by_ids([Ecto.UUID.t() | nil]) :: %{
@@ -87,11 +88,30 @@ defmodule CodexPooler.Catalog do
 
   @spec list_visible_models(pool_ref(), keyword()) :: [Model.t()]
   def list_visible_models(pool_or_id, opts \\ []) do
+    pool_id = pool_id(pool_or_id)
+
+    [pool_id]
+    |> list_visible_models_for_pools(opts)
+    |> Map.get(pool_id, [])
+  end
+
+  @spec list_visible_models_for_pools([pool_ref()], keyword()) :: visible_models_by_pool_id()
+  def list_visible_models_for_pools(pools, opts \\ []) when is_list(pools) do
     timestamp = Keyword.get(opts, :at, now())
 
-    pool_or_id
-    |> list_models(status: @active)
-    |> Enum.filter(&visible_model?(&1, timestamp))
+    pool_ids =
+      pools
+      |> Enum.map(&pool_id/1)
+      |> Enum.filter(&is_binary/1)
+      |> Enum.uniq()
+
+    visible_models_by_pool_id =
+      pool_ids
+      |> list_models_for_pool_ids(@active)
+      |> visible_models(timestamp)
+      |> Enum.group_by(& &1.pool_id)
+
+    Map.new(pool_ids, &{&1, Map.get(visible_models_by_pool_id, &1, [])})
   end
 
   @spec model_source_identity([Model.t()] | nil) :: UpstreamIdentity.t() | nil
@@ -110,9 +130,7 @@ defmodule CodexPooler.Catalog do
 
       _ ->
         PoolUpstreamAssignment
-        |> join(:inner, [assignment], identity in UpstreamIdentity,
-          on: identity.id == assignment.upstream_identity_id
-        )
+        |> join(:inner, [assignment], identity in UpstreamIdentity, on: identity.id == assignment.upstream_identity_id)
         |> where(
           [assignment, identity],
           assignment.id in ^assignment_ids and assignment.status == ^@assignment_active and
@@ -140,37 +158,6 @@ defmodule CodexPooler.Catalog do
       "upstream_account_plan_label" => identity.plan_label
     }
   end
-
-  @spec pricing_buckets_by_identifier([Model.t()]) :: pricing_bucket_map()
-  def pricing_buckets_by_identifier(models) when is_list(models) do
-    identifiers = models |> Enum.flat_map(&pricing_identifiers/1) |> Enum.uniq()
-
-    if identifiers == [] do
-      %{}
-    else
-      PricingSnapshot
-      |> where([snapshot], snapshot.model_identifier in ^identifiers)
-      |> where([snapshot], fragment("?->>'pricing_type'", snapshot.config) == "per_1m_tokens")
-      |> select([snapshot], {
-        snapshot.model_identifier,
-        snapshot.effective_at,
-        fragment("?->>'price_bucket'", snapshot.config)
-      })
-      |> Repo.all()
-      |> latest_pricing_buckets()
-    end
-  end
-
-  def pricing_buckets_by_identifier(_models), do: %{}
-
-  @spec pricing_buckets_for_model(Model.t(), pricing_bucket_map()) :: [String.t()]
-  def pricing_buckets_for_model(%Model{} = model, pricing_buckets) when is_map(pricing_buckets) do
-    model
-    |> pricing_identifiers()
-    |> Enum.find_value([], &Map.get(pricing_buckets, &1))
-  end
-
-  def pricing_buckets_for_model(_model, _pricing_buckets), do: []
 
   @spec api_key_model_selector_state(pool_ref(), map(), keyword()) :: map()
   def api_key_model_selector_state(pool_or_id, attrs \\ %{}, opts \\ []) do
@@ -333,20 +320,44 @@ defmodule CodexPooler.Catalog do
   @spec catalog_error(atom(), String.t()) :: catalog_error()
   def catalog_error(code, message), do: %{code: code, message: message}
 
-  defp visible_model?(%Model{} = model, timestamp) do
-    ids = get_in(model.metadata || %{}, ["source_assignment_ids"]) || []
+  defp list_models_for_pool_ids([], _status), do: []
 
-    Repo.exists?(
-      from assignment in PoolUpstreamAssignment,
-        join: identity in UpstreamIdentity,
-        on: identity.id == assignment.upstream_identity_id,
-        where:
-          assignment.id in ^ids and assignment.status == ^@assignment_active and
-            assignment.eligibility_status == ^@assignment_eligible and
-            identity.status == ^@identity_active and
-            assignment.health_status not in ^@health_excluded and
-            (is_nil(assignment.cooldown_until) or assignment.cooldown_until <= ^timestamp)
+  defp list_models_for_pool_ids(pool_ids, status) do
+    Model
+    |> where([model], model.pool_id in ^pool_ids)
+    |> maybe_where_status(status)
+    |> order_by([model], asc: model.pool_id, asc: model.exposed_model_id)
+    |> Repo.all()
+  end
+
+  defp visible_models([], _timestamp), do: []
+
+  defp visible_models(models, timestamp) do
+    visible_assignment_ids = visible_assignment_ids(models, timestamp)
+
+    Enum.filter(models, fn model ->
+      model
+      |> source_assignment_ids()
+      |> Enum.any?(&MapSet.member?(visible_assignment_ids, &1))
+    end)
+  end
+
+  defp visible_assignment_ids(models, timestamp) do
+    assignment_ids = models |> Enum.flat_map(&source_assignment_ids/1) |> Enum.uniq()
+
+    PoolUpstreamAssignment
+    |> join(:inner, [assignment], identity in UpstreamIdentity, on: identity.id == assignment.upstream_identity_id)
+    |> where(
+      [assignment, identity],
+      assignment.id in ^assignment_ids and assignment.status == ^@assignment_active and
+        assignment.eligibility_status == ^@assignment_eligible and
+        identity.status == ^@identity_active and
+        assignment.health_status not in ^@health_excluded and
+        (is_nil(assignment.cooldown_until) or assignment.cooldown_until <= ^timestamp)
     )
+    |> select([assignment, _identity], assignment.id)
+    |> Repo.all()
+    |> MapSet.new()
   end
 
   defp source_assignment_ids(%Model{} = model) do
@@ -415,36 +426,6 @@ defmodule CodexPooler.Catalog do
   defp maybe_where_status(query, nil), do: query
   defp maybe_where_status(query, status), do: from(model in query, where: model.status == ^status)
 
-  defp latest_pricing_buckets(rows) do
-    rows
-    |> Enum.group_by(fn {identifier, _effective_at, _bucket} -> identifier end)
-    |> Map.new(fn {identifier, rows} ->
-      {_identifier, latest_effective_at, _bucket} =
-        Enum.max_by(rows, fn {_identifier, effective_at, _bucket} ->
-          DateTime.to_unix(effective_at, :microsecond)
-        end)
-
-      buckets =
-        rows
-        |> Enum.filter(fn {_identifier, effective_at, _bucket} ->
-          DateTime.compare(effective_at, latest_effective_at) == :eq
-        end)
-        |> Enum.map(fn {_identifier, _effective_at, bucket} -> bucket end)
-        |> Enum.reject(&blank?/1)
-        |> Enum.uniq()
-
-      {identifier, buckets}
-    end)
-  end
-
-  defp pricing_identifiers(%Model{} = model) do
-    [model.pricing_ref, model.upstream_model_id, model.exposed_model_id]
-    |> Enum.reject(&blank?/1)
-    |> Enum.uniq()
-  end
-
-  defp pricing_identifiers(_model), do: []
-
   defp pool_id(%Pool{id: id}), do: id
   defp pool_id(id) when is_binary(id), do: id
   defp pool_id(_id), do: nil
@@ -458,8 +439,6 @@ defmodule CodexPooler.Catalog do
       {key, value} -> {key, value}
     end)
   end
-
-  defp blank?(value), do: not is_binary(value) or String.trim(value) == ""
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
 end

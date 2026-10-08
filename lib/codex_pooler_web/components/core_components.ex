@@ -32,7 +32,7 @@ defmodule CodexPoolerWeb.CoreComponents do
       {@rest}
     >
       <div class={[
-        "alert w-80 sm:w-96 max-w-80 sm:max-w-96 text-wrap border shadow-xl",
+        "alert w-80 sm:w-96 max-w-[min(20rem,calc(100vw_-_6rem))] sm:max-w-96 text-wrap border shadow-xl",
         @kind == :info && "border-success/25 bg-success/10 text-base-content",
         @kind == :error && "border-error/25 bg-error/10 text-base-content"
       ]}>
@@ -51,7 +51,7 @@ defmodule CodexPoolerWeb.CoreComponents do
           <p>{msg}</p>
         </div>
         <div class="flex-1" />
-        <button type="button" class="group self-start cursor-pointer" aria-label={gettext("close")}>
+        <button type="button" class="group self-start cursor-pointer" aria-label={gettext("Dismiss notification")} title={gettext("Dismiss notification")}>
           <.icon name="hero-x-mark" class="size-5 opacity-40 group-hover:opacity-70" />
         </button>
       </div>
@@ -103,6 +103,13 @@ defmodule CodexPoolerWeb.CoreComponents do
 
   attr :field, FormField
 
+  slot :label_content,
+    doc: """
+    Label markup, for the cases a string cannot carry: a confirmation field
+    whose label has to emphasise the value being typed. Takes precedence over
+    the `label` attribute when given.
+    """
+
   attr :errors, :list, default: []
   attr :checked, :boolean
   attr :prompt, :string, default: nil
@@ -111,9 +118,7 @@ defmodule CodexPoolerWeb.CoreComponents do
   attr :class, :any, default: nil
   attr :error_class, :any, default: nil
 
-  attr :rest, :global,
-    include:
-      ~w(accept autocomplete capture cols disabled form inputmode list max maxlength min minlength
+  attr :rest, :global, include: ~w(accept autocomplete capture cols disabled form inputmode list max maxlength min minlength
                 multiple pattern placeholder readonly required rows size step)
 
   def input(%{field: %FormField{} = field} = assigns) do
@@ -157,11 +162,15 @@ defmodule CodexPoolerWeb.CoreComponents do
             value="true"
             checked={@checked}
             class={@class || "checkbox checkbox-sm"}
+            aria-invalid={if @errors != [], do: "true"}
+            aria-describedby={if @errors != [], do: "#{@id}-error"}
             {@rest}
           />{@label}
         </span>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -170,19 +179,24 @@ defmodule CodexPoolerWeb.CoreComponents do
     ~H"""
     <div class="fieldset mb-2">
       <label for={@id}>
-        <span :if={@label} class="label mb-1">{@label}</span>
+        <span :if={@label_content != []} class="label mb-1">{render_slot(@label_content)}</span>
+        <span :if={@label && @label_content == []} class="label mb-1">{@label}</span>
         <select
           id={@id}
           name={@name}
           class={[@class || "w-full select", @errors != [] && (@error_class || "select-error")]}
           multiple={@multiple}
+          aria-invalid={if @errors != [], do: "true"}
+          aria-describedby={if @errors != [], do: "#{@id}-error"}
           {@rest}
         >
           <option :if={@prompt} value="">{@prompt}</option>
           {Form.options_for_select(@options, @value)}
         </select>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -191,7 +205,8 @@ defmodule CodexPoolerWeb.CoreComponents do
     ~H"""
     <div class="fieldset mb-2">
       <label for={@id}>
-        <span :if={@label} class="label mb-1">{@label}</span>
+        <span :if={@label_content != []} class="label mb-1">{render_slot(@label_content)}</span>
+        <span :if={@label && @label_content == []} class="label mb-1">{@label}</span>
         <textarea
           id={@id}
           name={@name}
@@ -199,10 +214,14 @@ defmodule CodexPoolerWeb.CoreComponents do
             @class || "w-full textarea",
             @errors != [] && (@error_class || "textarea-error")
           ]}
+          aria-invalid={if @errors != [], do: "true"}
+          aria-describedby={if @errors != [], do: "#{@id}-error"}
           {@rest}
         >{Form.normalize_value("textarea", @value)}</textarea>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -211,7 +230,8 @@ defmodule CodexPoolerWeb.CoreComponents do
     ~H"""
     <div class="fieldset mb-2">
       <label for={@id}>
-        <span :if={@label} class="label mb-1">{@label}</span>
+        <span :if={@label_content != []} class="label mb-1">{render_slot(@label_content)}</span>
+        <span :if={@label && @label_content == []} class="label mb-1">{@label}</span>
         <input
           type={@type}
           name={@name}
@@ -221,10 +241,14 @@ defmodule CodexPoolerWeb.CoreComponents do
             @class || "w-full input",
             @errors != [] && (@error_class || "input-error")
           ]}
+          aria-invalid={if @errors != [], do: "true"}
+          aria-describedby={if @errors != [], do: "#{@id}-error"}
           {@rest}
         />
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -242,9 +266,7 @@ defmodule CodexPoolerWeb.CoreComponents do
   attr :class, :any, default: nil
   attr :errors, :list, default: []
 
-  attr :rest, :global,
-    include:
-      ~w(autocomplete disabled form inputmode maxlength pattern placeholder readonly required)
+  attr :rest, :global, include: ~w(autocomplete disabled form inputmode maxlength pattern placeholder readonly required)
 
   def otp_input(%{field: %FormField{} = field} = assigns) do
     errors = if Phoenix.Component.used_input?(field), do: field.errors, else: []
@@ -354,61 +376,6 @@ defmodule CodexPoolerWeb.CoreComponents do
     """
   end
 
-  @doc """
-  Accepts regular rows or a `Phoenix.LiveView.LiveStream`; streams get
-  `phx-update="stream"` and default row ids from the stream tuple.
-  """
-  attr :id, :string, required: true
-  attr :rows, :any, required: true
-  attr :row_id, :any, default: nil
-  attr :row_click, :any, default: nil
-
-  attr :row_item, :any, default: &Function.identity/1
-
-  slot :col, required: true do
-    attr :label, :string
-  end
-
-  slot :action
-
-  def table(assigns) do
-    assigns =
-      with %{rows: %Phoenix.LiveView.LiveStream{}} <- assigns do
-        assign(assigns, row_id: assigns.row_id || fn {id, _item} -> id end)
-      end
-
-    ~H"""
-    <table class="table table-zebra">
-      <thead>
-        <tr>
-          <th :for={col <- @col}>{col[:label]}</th>
-          <th :if={@action != []}>
-            <span class="sr-only">{gettext("Actions")}</span>
-          </th>
-        </tr>
-      </thead>
-      <tbody id={@id} phx-update={is_struct(@rows, Phoenix.LiveView.LiveStream) && "stream"}>
-        <tr :for={row <- @rows} id={@row_id && @row_id.(row)}>
-          <td
-            :for={col <- @col}
-            phx-click={@row_click && @row_click.(row)}
-            class={@row_click && "hover:cursor-pointer"}
-          >
-            {render_slot(col, @row_item.(row))}
-          </td>
-          <td :if={@action != []} class="w-0 font-semibold">
-            <div class="flex gap-4">
-              <%= for action <- @action do %>
-                {render_slot(action, @row_item.(row))}
-              <% end %>
-            </div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
-    """
-  end
-
   slot :item, required: true do
     attr :title, :string, required: true
   end
@@ -457,10 +424,7 @@ defmodule CodexPoolerWeb.CoreComponents do
     JS.show(js,
       to: selector,
       time: 300,
-      transition:
-        {"transition-all ease-out duration-300",
-         "opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95",
-         "opacity-100 translate-y-0 sm:scale-100"}
+      transition: {"transition-all ease-out duration-300", "opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95", "opacity-100 translate-y-0 sm:scale-100"}
     )
   end
 
@@ -468,9 +432,7 @@ defmodule CodexPoolerWeb.CoreComponents do
     JS.hide(js,
       to: selector,
       time: 200,
-      transition:
-        {"transition-all ease-in duration-200", "opacity-100 translate-y-0 sm:scale-100",
-         "opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95"}
+      transition: {"transition-all ease-in duration-200", "opacity-100 translate-y-0 sm:scale-100", "opacity-0 translate-y-4 sm:translate-y-0 sm:scale-95"}
     )
   end
 

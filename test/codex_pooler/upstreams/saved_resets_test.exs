@@ -2,8 +2,307 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
   use CodexPooler.DataCase, async: true
 
   alias CodexPooler.Upstreams.SavedResets
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+
+  describe "expiration_priority_hint/2" do
+    @now ~U[2026-10-05 10:00:00.123456Z]
+
+    test "qualifies raw authoritative collections and retains microseconds across offsets" do
+      expiry = "2026-10-05T14:00:00.123457+02:00"
+      metadata = priority_metadata([expiry, expiry])
+      assert {:known, ~U[2026-10-05 12:00:00.123457Z]} = SavedResets.expiration_priority_hint(metadata, @now)
+      assert {:known, _} = SavedResets.expiration_priority_hint(%{"saved_resets" => metadata}, @now)
+      assert {:known, _} = SavedResets.expiration_priority_hint(%UpstreamIdentity{metadata: %{"saved_resets" => metadata}}, @now)
+      assert metadata["available_count"] == 3
+    end
+
+    test "uses the minimum deadline for exact near and ordinary freshness boundaries" do
+      for {seconds, ttl} <- [{7200, 1800}, {172_800, 21_600}] do
+        expiry = @now |> DateTime.add(seconds, :second) |> DateTime.to_iso8601()
+        metadata = priority_metadata([expiry]) |> Map.put("next_expires_at", "2099-01-01T00:00:00Z")
+        fresh = Map.put(metadata, "expires_observed_at", @now |> DateTime.add(-(ttl - 1), :second) |> DateTime.to_iso8601())
+        stale = Map.put(metadata, "expires_observed_at", @now |> DateTime.add(-ttl, :second) |> DateTime.to_iso8601())
+        assert {:known, _} = SavedResets.expiration_priority_hint(fresh, @now)
+        assert :unknown = SavedResets.expiration_priority_hint(stale, @now)
+      end
+    end
+
+    test "refuses corrupt partial scalar nonfuture and unreliable provenance without repairing it" do
+      good = priority_metadata(["2026-10-05T12:00:00Z"])
+
+      for bad <- [
+            nil,
+            %{},
+            Map.delete(good, "expires_detail_status"),
+            Map.put(good, "expires_detail_status", "incomplete"),
+            Map.put(good, "expires_detail_status", "authoritative_zero"),
+            Map.put(good, "status", "unavailable"),
+            Map.put(good, "available_count", 0),
+            Map.put(good, "expires_observed_at", "2026-10-05T10:00:01Z"),
+            Map.put(good, "expires_observed_at", "invalid"),
+            Map.put(good, "available_expires_at", ["2026-10-05T12:00:00Z", "invalid"]),
+            Map.put(good, "available_expirations", [%{"expires_at" => "invalid"}]),
+            Map.put(good, "available_expirations", [%{"expires_at" => "2026-10-05T13:00:00Z"}]),
+            Map.put(good, "available_expires_at", []),
+            Map.put(good, "available_expirations", "invalid"),
+            Map.drop(good, ["available_expires_at", "available_expirations"]),
+            priority_metadata([DateTime.to_iso8601(@now)]),
+            priority_metadata(["2026-10-04T12:00:00Z"])
+          ] do
+        assert :unknown = SavedResets.expiration_priority_hint(bad, @now), inspect(bad)
+      end
+    end
+
+    test "one valid collection suffices but supplied collections must agree by unique instants" do
+      good = priority_metadata(["2026-10-05T12:00:00Z"])
+      assert {:known, _} = SavedResets.expiration_priority_hint(Map.delete(good, "available_expirations"), @now)
+      assert {:known, _} = SavedResets.expiration_priority_hint(Map.delete(good, "available_expires_at"), @now)
+      good = Map.put(good, "available_expirations", [%{"expires_at" => "2026-10-05T14:00:00.000000+02:00"}])
+      assert {:known, _} = SavedResets.expiration_priority_hint(good, @now)
+    end
+  end
+
+  defp priority_metadata(expiries) do
+    %{
+      "status" => "reported",
+      "available_count" => 3,
+      "expires_detail_status" => "authoritative_rows",
+      "expires_observed_at" => DateTime.to_iso8601(@now),
+      "available_expires_at" => expiries,
+      "available_expirations" => Enum.map(expiries, &%{"expires_at" => &1})
+    }
+  end
 
   describe "count_from_usage_payload/1" do
+    test "baseline characterization preserves count coercion and current detail freshness" do
+      observed_at = ~U[2026-06-23 10:00:00Z]
+
+      metadata =
+        SavedResets.usage_snapshot(
+          %{
+            "rate_limit_reset_credits" => %{
+              "available_count" => "2.9",
+              "credits" => [
+                %{
+                  "status" => "available",
+                  "expires_at" => "2026-07-20T02:40:11.968726+02:00"
+                },
+                %{
+                  "status" => "available",
+                  "expires_at" => "2026-07-18T00:40:11.968726Z"
+                }
+              ]
+            }
+          },
+          observed_at,
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["available_count"] == 2
+
+      assert metadata["available_expires_at"] == [
+               "2026-07-18T00:40:11.968726Z",
+               "2026-07-20T00:40:11.968726Z"
+             ]
+
+      assert metadata["expires_observed_at"] == "2026-06-23T10:00:00Z"
+      assert metadata["expires_refresh_attempted_at"] == "2026-06-23T10:00:00Z"
+    end
+
+    test "forces detail within the refresh TTL when a current expiration lacks granted_at" do
+      timestamp = ~U[2026-07-24 10:00:00Z]
+      observed_at = timestamp |> DateTime.add(-5, :minute) |> DateTime.to_iso8601()
+
+      metadata = %{
+        "saved_resets" => %{
+          "status" => "reported",
+          "available_count" => 1,
+          "available_expires_at" => ["2026-08-20T00:40:11.968726Z"],
+          "available_expirations" => [
+            %{
+              "expires_at" => "2026-08-20T00:40:11.968726Z",
+              "first_seen_at" => "2026-07-23T10:00:00Z"
+            }
+          ],
+          "next_expires_at" => "2026-08-20T00:40:11.968726Z",
+          "expires_observed_at" => observed_at,
+          "expires_refresh_attempted_at" => observed_at
+        }
+      }
+
+      assert SavedResets.reset_credit_list_refresh_due?(metadata, 1, timestamp)
+    end
+
+    test "uses the inclusive expiration horizon for successful observation freshness" do
+      timestamp = ~U[2026-07-29 12:00:00.500000Z]
+
+      for {expires_in, observation_age, expected_fresh?} <- [
+            {86_399, 1_799, true},
+            {86_399, 1_800, false},
+            {86_399, 1_801, false},
+            {86_400, 1_799, true},
+            {86_400, 1_800, false},
+            {86_400, 1_801, false},
+            {86_401, 1_800, true},
+            {86_401, 21_599, true},
+            {86_401, 21_600, false},
+            {86_401, 21_601, false},
+            {-1, 21_599, true},
+            {-1, 21_600, false},
+            {nil, 21_599, true},
+            {nil, 21_600, false},
+            {:invalid, 21_599, true},
+            {:invalid, 21_600, false}
+          ] do
+        snapshot =
+          expiration_snapshot(timestamp,
+            expires_in: expires_in,
+            observed_at: DateTime.add(timestamp, -observation_age, :second)
+          )
+
+        assert SavedResets.expiration_observation_fresh?(snapshot, timestamp) ==
+                 expected_fresh?,
+               "expires_in=#{inspect(expires_in)} observation_age=#{observation_age}"
+      end
+    end
+
+    test "rejects missing invalid and strictly future successful observations" do
+      timestamp = ~U[2026-07-29 12:00:00.500000Z]
+
+      for observed_at <- [
+            nil,
+            "not-a-timestamp",
+            DateTime.add(timestamp, 1, :microsecond),
+            DateTime.add(timestamp, 1, :second)
+          ] do
+        snapshot = expiration_snapshot(timestamp, observed_at: observed_at)
+
+        refute SavedResets.expiration_observation_fresh?(snapshot, timestamp),
+               "observed_at=#{inspect(observed_at)}"
+      end
+    end
+
+    test "expires soon compares the horizon at whole-second precision" do
+      timestamp = ~U[2026-07-29 12:00:00.900000Z]
+      whole_second_timestamp = DateTime.truncate(timestamp, :second)
+
+      for {expires_in_seconds, expected?} <- [
+            {86_399, true},
+            {86_400, true},
+            {86_401, false}
+          ] do
+        expires_at =
+          whole_second_timestamp
+          |> DateTime.add(expires_in_seconds, :second)
+          |> DateTime.add(100_000, :microsecond)
+
+        metadata = %{
+          "saved_resets" => %{"next_expires_at" => DateTime.to_iso8601(expires_at)}
+        }
+
+        assert SavedResets.expires_soon?(metadata, timestamp, 86_400) == expected?,
+               "expires_in_seconds=#{expires_in_seconds}"
+      end
+    end
+
+    test "applies adaptive failed-refresh backoff at exact equality" do
+      timestamp = ~U[2026-07-29 12:00:00.500000Z]
+
+      for {expires_in, backoff} <- [
+            {2 * 60 * 60, 15 * 60},
+            {90 * 60 + 1, 15 * 60},
+            {90 * 60, 5 * 60},
+            {90 * 60 - 1, 5 * 60},
+            {15 * 60 + 1, 5 * 60},
+            {15 * 60, 60},
+            {15 * 60 - 1, 60},
+            {0, 60},
+            {86_400, 15 * 60},
+            {86_401, 6 * 60 * 60},
+            {-1, 6 * 60 * 60},
+            {nil, 6 * 60 * 60},
+            {:invalid, 6 * 60 * 60}
+          ] do
+        for {attempt_age, expected_due?} <- [
+              {backoff - 1, false},
+              {backoff, true},
+              {backoff + 1, true}
+            ] do
+          metadata =
+            expiration_metadata(timestamp,
+              expires_in: expires_in,
+              observed_at: DateTime.add(timestamp, -(backoff + 60), :second),
+              attempted_at: DateTime.add(timestamp, -attempt_age, :second)
+            )
+
+          assert SavedResets.reset_credit_list_refresh_due?(metadata, 2, timestamp) ==
+                   expected_due?,
+                 "expires_in=#{inspect(expires_in)} attempt_age=#{attempt_age}"
+        end
+      end
+    end
+
+    test "failed-refresh suppression precedes positive-count structural triggers" do
+      timestamp = ~U[2026-07-29 12:00:00Z]
+
+      for {expires_in, backoff} <- [
+            {2 * 60 * 60, 15 * 60},
+            {45 * 60, 5 * 60},
+            {10 * 60, 60},
+            {5 * 24 * 60 * 60, 6 * 60 * 60}
+          ],
+          structural_trigger <- [:count_mismatch, :missing_granted_at] do
+        for {attempt_age, expected_due?} <- [{backoff - 1, false}, {backoff, true}] do
+          metadata =
+            expiration_metadata(timestamp,
+              expires_in: expires_in,
+              observed_at: DateTime.add(timestamp, -(backoff + 60), :second),
+              attempted_at: DateTime.add(timestamp, -attempt_age, :second),
+              granted_at?: structural_trigger != :missing_granted_at
+            )
+
+          available_count = if structural_trigger == :count_mismatch, do: 2, else: 1
+
+          assert SavedResets.reset_credit_list_refresh_due?(
+                   metadata,
+                   available_count,
+                   timestamp
+                 ) == expected_due?,
+                 "expires_in=#{expires_in} trigger=#{structural_trigger} age=#{attempt_age}"
+        end
+      end
+    end
+
+    test "only a valid failed attempt newer than success suppresses refresh" do
+      timestamp = ~U[2026-07-29 12:00:00.500000Z]
+      observed_at = DateTime.add(timestamp, -120, :second)
+
+      for attempted_at <- [
+            DateTime.add(observed_at, -1, :second),
+            observed_at,
+            DateTime.add(timestamp, 1, :microsecond),
+            "not-a-timestamp"
+          ] do
+        metadata =
+          expiration_metadata(timestamp,
+            observed_at: observed_at,
+            attempted_at: attempted_at
+          )
+
+        assert SavedResets.reset_credit_list_refresh_due?(metadata, 2, timestamp),
+               "attempted_at=#{inspect(attempted_at)}"
+      end
+
+      metadata =
+        expiration_metadata(timestamp,
+          observed_at: nil,
+          attempted_at: DateTime.add(timestamp, -59, :second),
+          expires_in: 10 * 60
+        )
+
+      refute SavedResets.reset_credit_list_refresh_due?(metadata, 1, timestamp)
+    end
+
     test "parses reported saved reset counts" do
       assert {:reported, 2} =
                SavedResets.count_from_usage_payload(%{
@@ -113,13 +412,14 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
 
       assert metadata["next_expires_at"] == "2026-07-18T00:40:11.968726Z"
 
-      encoded = Jason.encode!(metadata)
+      encoded = CodexPooler.JSON.encode!(metadata)
 
       refute encoded =~ "provider-credit"
       refute encoded =~ "Provider Title"
       refute encoded =~ "Provider description"
       refute encoded =~ "provider-request"
-      refute encoded =~ "granted_at"
+      assert encoded =~ "\"granted_at\":null"
+      refute encoded =~ "2026-06-20T00:00:00Z"
     end
 
     test "stores sanitized available expiration rows with first seen timestamps" do
@@ -176,23 +476,221 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
       assert metadata["available_expirations"] == [
                %{
                  "expires_at" => "2026-07-18T00:40:11.968726Z",
-                 "first_seen_at" => "2026-06-23T10:00:00Z"
+                 "first_seen_at" => "2026-06-23T10:00:00Z",
+                 "granted_at" => nil
                },
                %{
                  "expires_at" => "2026-07-20T00:40:11.968726Z",
-                 "first_seen_at" => "2026-06-23T10:00:00Z"
+                 "first_seen_at" => "2026-06-23T10:00:00Z",
+                 "granted_at" => nil
                }
              ]
 
-      encoded = Jason.encode!(metadata)
+      encoded = CodexPooler.JSON.encode!(metadata)
 
       refute encoded =~ "provider-credit"
       refute encoded =~ "Provider Title"
       refute encoded =~ "Provider description"
       refute encoded =~ "provider-request"
       refute encoded =~ "raw_payload"
-      refute encoded =~ "granted_at"
       refute encoded =~ "2026-06-20T00:00:00Z"
+    end
+
+    test "classifies an empty detail with a normalized zero count as authoritative" do
+      observed_at = ~U[2026-06-23 10:00:00Z]
+
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{"available_count" => "-1.2", "credits" => []},
+          observed_at,
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["expires_detail_status"] == "authoritative_zero"
+      assert metadata["available_expires_at"] == []
+      assert metadata["available_expirations"] == []
+      assert metadata["expires_observed_at"] == "2026-06-23T10:00:00Z"
+    end
+
+    test "classifies a positive detail with usable rows as authoritative" do
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{
+            "available_count" => "2.9",
+            "credits" => [
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z"),
+              available_credit("2026-07-18T00:40:11.968726Z", "2026-06-18T00:00:00Z")
+            ]
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["expires_detail_status"] == "authoritative_rows"
+
+      assert metadata["available_expirations"] == [
+               expiration_row("2026-07-18T00:40:11.968726Z", "2026-06-18T00:00:00Z"),
+               expiration_row("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+             ]
+    end
+
+    test "classifies a detail without count and with usable rows as authoritative" do
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{
+            "credits" => [
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+            ]
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["expires_detail_status"] == "authoritative_rows"
+      assert metadata["available_count"] == 1
+
+      assert metadata["available_expirations"] == [
+               expiration_row("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+             ]
+    end
+
+    test "keeps authoritative expirations but clears every grant when the declared count mismatches" do
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{
+            "available_count" => 3,
+            "credits" => [
+              available_credit("2026-07-18T00:40:11.968726Z", "2026-06-18T00:00:00Z"),
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+            ]
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["expires_detail_status"] == "authoritative_rows"
+
+      assert metadata["available_expirations"] == [
+               expiration_row("2026-07-18T00:40:11.968726Z", nil),
+               expiration_row("2026-07-20T00:40:11.968726Z", nil)
+             ]
+    end
+
+    test "keeps one grant only when every equivalent-expiration credit agrees" do
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{
+            "available_count" => 2,
+            "credits" => [
+              available_credit("2026-07-20T02:40:11.968726+02:00", "2026-06-20T02:00:00+02:00"),
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+            ]
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["available_expirations"] == [
+               expiration_row("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+             ]
+    end
+
+    test "clears a grouped grant when it is ambiguous, missing, or malformed" do
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{
+            "available_count" => 4,
+            "credits" => [
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z"),
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-19T00:00:00Z"),
+              available_credit("2026-07-18T00:40:11.968726Z", nil),
+              available_credit("2026-07-18T00:40:11.968726Z", "not-a-date")
+            ]
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["available_expirations"] == [
+               expiration_row("2026-07-18T00:40:11.968726Z", nil),
+               expiration_row("2026-07-20T00:40:11.968726Z", nil)
+             ]
+
+      assert Enum.all?(metadata["available_expirations"], &Map.has_key?(&1, "granted_at"))
+    end
+
+    test "marks missing, non-list, and contradictory detail payloads incomplete" do
+      previous_metadata = existing_expiration_metadata()
+      observed_at = ~U[2026-06-23 10:00:00Z]
+
+      for payload <- [
+            %{"available_count" => 1},
+            %{"available_count" => 1, "credits" => %{}},
+            %{
+              "available_count" => 0,
+              "credits" => [
+                available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+              ]
+            },
+            %{
+              "available_count" => 1,
+              "credits" => [available_credit("not-a-date", "2026-06-20T00:00:00Z")]
+            },
+            %{"available_count" => "not-a-number", "credits" => []}
+          ] do
+        metadata =
+          SavedResets.credit_list_snapshot(
+            payload,
+            observed_at,
+            "https://chatgpt.com/backend-api/wham/usage",
+            previous_metadata
+          )
+
+        assert metadata["expires_detail_status"] == "incomplete"
+
+        assert metadata["available_expirations"] ==
+                 previous_metadata["saved_resets"]["available_expirations"]
+
+        assert metadata["expires_observed_at"] == "2026-06-22T10:00:00Z"
+        assert metadata["expires_refresh_attempted_at"] == "2026-06-23T10:00:00Z"
+      end
+    end
+
+    test "does not treat a provider detail-status string as an internal classification marker" do
+      metadata =
+        SavedResets.usage_snapshot(
+          %{
+            "rate_limit_reset_credits" => %{
+              "available_count" => 1,
+              "expires_detail_status" => "incomplete",
+              "available_expires_at" => ["2026-07-20T00:40:11.968726Z"]
+            }
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage"
+        )
+
+      assert metadata["available_expires_at"] == ["2026-07-20T00:40:11.968726Z"]
+      refute Map.has_key?(metadata, "expires_detail_status")
+    end
+
+    test "authoritative details replace prior expiration rows instead of merging departed grants" do
+      metadata =
+        SavedResets.credit_list_snapshot(
+          %{
+            "available_count" => 1,
+            "credits" => [
+              available_credit("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+            ]
+          },
+          ~U[2026-06-23 10:00:00Z],
+          "https://chatgpt.com/backend-api/wham/usage",
+          existing_expiration_metadata()
+        )
+
+      assert metadata["available_expirations"] == [
+               expiration_row("2026-07-20T00:40:11.968726Z", "2026-06-20T00:00:00Z")
+             ]
     end
 
     test "projects available expiration rows and keeps legacy expiration metadata" do
@@ -283,11 +781,13 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
       assert metadata["available_expirations"] == [
                %{
                  "expires_at" => "2026-07-18T00:40:11.968726Z",
-                 "first_seen_at" => "2026-06-20T09:00:00Z"
+                 "first_seen_at" => "2026-06-20T09:00:00Z",
+                 "granted_at" => nil
                },
                %{
                  "expires_at" => "2026-07-20T00:40:11.968726Z",
-                 "first_seen_at" => "2026-06-23T10:00:00Z"
+                 "first_seen_at" => "2026-06-23T10:00:00Z",
+                 "granted_at" => nil
                }
              ]
     end
@@ -355,7 +855,7 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
                row |> Map.keys() |> Enum.sort() == ["expires_at", "first_seen_at"]
              end)
 
-      encoded = Jason.encode!(metadata)
+      encoded = CodexPooler.JSON.encode!(metadata)
 
       refute encoded =~ "1999-01-01T00:00:00Z"
       refute encoded =~ "1998-01-01T00:00:00Z"
@@ -408,7 +908,71 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
                |> saved_reset_snapshot_metadata()
                |> SavedResets.snapshot()
     end
+
+    test "projects legacy redemption freshness at the strict timeout boundary" do
+      timestamp = ~U[2026-07-29 12:00:00.000000Z]
+
+      assert SavedResets.redemption_receive_timeout_ms() == 15_000
+      assert SavedResets.redemption_stale_grace_ms() == 60_000
+
+      assert %{in_progress?: true, redemption_stale?: false} =
+               timestamp
+               |> DateTime.add(-74_999, :millisecond)
+               |> saved_reset_snapshot_metadata()
+               |> SavedResets.snapshot(timestamp)
+
+      assert %{in_progress?: false, redemption_stale?: true} =
+               timestamp
+               |> DateTime.add(-75_000, :millisecond)
+               |> saved_reset_snapshot_metadata()
+               |> SavedResets.snapshot(timestamp)
+    end
   end
+
+  defp expiration_snapshot(timestamp, opts) do
+    timestamp
+    |> expiration_metadata(opts)
+    |> SavedResets.snapshot(timestamp)
+  end
+
+  defp expiration_metadata(timestamp, opts) do
+    expires_at = expiration_value(timestamp, Keyword.get(opts, :expires_in, 60 * 60))
+    observed_at = timestamp_value(Keyword.get(opts, :observed_at, timestamp))
+    attempted_at = timestamp_value(Keyword.get(opts, :attempted_at, observed_at))
+
+    expiration = %{
+      "expires_at" => expires_at || "2026-08-01T00:00:00Z",
+      "first_seen_at" => "2026-07-01T00:00:00Z"
+    }
+
+    expiration =
+      if Keyword.get(opts, :granted_at?, true) do
+        Map.put(expiration, "granted_at", "2026-07-01T00:00:00Z")
+      else
+        expiration
+      end
+
+    %{
+      "saved_resets" => %{
+        "status" => "reported",
+        "available_count" => 1,
+        "available_expires_at" => if(is_binary(expires_at), do: [expires_at], else: []),
+        "available_expirations" => [expiration],
+        "next_expires_at" => expires_at,
+        "expires_observed_at" => observed_at,
+        "expires_refresh_attempted_at" => attempted_at
+      }
+    }
+  end
+
+  defp expiration_value(_timestamp, nil), do: nil
+  defp expiration_value(_timestamp, :invalid), do: "not-a-timestamp"
+
+  defp expiration_value(timestamp, seconds),
+    do: timestamp |> DateTime.add(seconds, :second) |> DateTime.to_iso8601()
+
+  defp timestamp_value(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp timestamp_value(value), do: value
 
   defp saved_reset_snapshot_metadata(started_at) do
     %{
@@ -429,6 +993,43 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
         "started_at" => DateTime.to_iso8601(started_at),
         "finished_at" => nil,
         "result" => nil
+      }
+    }
+  end
+
+  defp available_credit(expires_at, granted_at) do
+    %{
+      "status" => "available",
+      "expires_at" => expires_at,
+      "granted_at" => granted_at,
+      "id" => "provider-credit",
+      "title" => "provider title",
+      "raw_payload" => %{"ignored" => true}
+    }
+  end
+
+  defp expiration_row(expires_at, granted_at) do
+    %{
+      "expires_at" => expires_at,
+      "first_seen_at" => "2026-06-23T10:00:00Z",
+      "granted_at" => granted_at
+    }
+  end
+
+  defp existing_expiration_metadata do
+    %{
+      "saved_resets" => %{
+        "available_expires_at" => ["2026-07-18T00:40:11.968726Z"],
+        "available_expirations" => [
+          %{
+            "expires_at" => "2026-07-18T00:40:11.968726Z",
+            "first_seen_at" => "2026-06-22T10:00:00Z",
+            "granted_at" => "2026-06-18T00:00:00Z"
+          }
+        ],
+        "next_expires_at" => "2026-07-18T00:40:11.968726Z",
+        "expires_observed_at" => "2026-06-22T10:00:00Z",
+        "expires_refresh_attempted_at" => "2026-06-22T10:00:00Z"
       }
     }
   end

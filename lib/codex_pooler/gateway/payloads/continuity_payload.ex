@@ -1,7 +1,11 @@
 defmodule CodexPooler.Gateway.Payloads.ContinuityPayload do
   @moduledoc false
 
+  alias CodexPooler.Gateway.Payloads.NativeCodexTurnMetadata
   alias CodexPooler.Gateway.Payloads.RequestOptions
+
+  @http_transports ["http_json", "http_sse", "http_compact_json"]
+  @backend_codex_agent_path ~r/\A(?:\/morpheus|\/root(?:\/[a-z0-9_]+)*)\z/
 
   @spec put_previous_response_id(RequestOptions.t(), map()) :: RequestOptions.t()
   def put_previous_response_id(%RequestOptions{} = request_options, payload)
@@ -24,6 +28,118 @@ defmodule CodexPooler.Gateway.Payloads.ContinuityPayload do
     |> Kernel.||(Map.get(payload, :previous_response_id))
     |> blank_to_nil()
   end
+
+  @doc """
+  The session header a native HTTP request falls back to when its own window
+  has no live session: the previous window of its thread (findings#289).
+
+  The released Codex client moves `x-codex-window-id` to the next window of its
+  thread after every compaction it completes and keeps `session-id`,
+  `thread-id` and the turn ids, so over HTTP the request that resumes after a
+  compaction names a window no session knows yet. On the websocket the socket's
+  session carries the thread across windows (findings#206, P115); over HTTP
+  only the previous window's alias does. Only a native HTTP request keyed by
+  its window header qualifies, and only while no client turn state or
+  response anchor names a session instead; a `/v1` request, a websocket
+  upgrade and anything else answer `nil`.
+  """
+  @spec previous_window_session_header(RequestOptions.t()) :: String.t() | nil
+  def previous_window_session_header(%RequestOptions{
+        transport: %{transport: transport},
+        openai_compatibility: %{source_endpoint: nil},
+        continuity: %{session_header_source: "x-codex-window-id", session_header: window} = continuity
+      })
+      when transport in @http_transports and is_binary(window) do
+    with nil <- blank_to_nil(continuity.accepted_turn_state),
+         nil <- blank_to_nil(continuity.previous_response_id),
+         true <- continuity.authenticated_owner_attach != true,
+         window when is_binary(window) <- blank_to_nil(window),
+         {:ok, previous} <- NativeCodexTurnMetadata.previous_window(window) do
+      previous
+    else
+      _other -> nil
+    end
+  end
+
+  def previous_window_session_header(%RequestOptions{}), do: nil
+
+  @doc """
+  The previous window of a native websocket upgrade's thread, whose live
+  session's assignment the session the upgrade opens prefers when the
+  upgrade's own window has no live session (findings#270 row 270-283).
+
+  A process that compacts on its socket (a manual `thread/compact`, or the
+  post-turn compaction) and loses the socket before any frame named the next
+  window leaves that window without an alias (findings#206, P115): the next
+  turn's upgrade names a window no session knows. Unlike the native HTTP
+  request of `previous_window_session_header/1`, the upgrade does not join the
+  previous window's session: an owner serves one socket, the one that
+  attached last, and two live processes on one thread each keep a session
+  (a stale resumed process reconnecting on the old window would otherwise
+  displace the one that joined). The new session only prefers the same
+  account, so the provider's cache follows the thread. The same eligibility
+  applies: a native upgrade keyed by its window header, on a canonical window
+  above zero, with no turn state the client sent (the one the Pooler issues
+  on the upgrade names only that connection) and no response anchor. A `/v1`
+  upgrade and anything else answer `nil`.
+  """
+  @spec previous_window_preference_header(RequestOptions.t()) :: String.t() | nil
+  def previous_window_preference_header(%RequestOptions{
+        transport: %{transport: "websocket"},
+        openai_compatibility: %{source_endpoint: nil},
+        continuity: %{session_header_source: "x-codex-window-id", session_header: window} = continuity
+      })
+      when is_binary(window) do
+    with nil <- client_turn_state(continuity),
+         nil <- blank_to_nil(continuity.previous_response_id),
+         window when is_binary(window) <- blank_to_nil(window),
+         {:ok, previous} <- NativeCodexTurnMetadata.previous_window(window) do
+      previous
+    else
+      _other -> nil
+    end
+  end
+
+  def previous_window_preference_header(%RequestOptions{}), do: nil
+
+  defp client_turn_state(%{pooler_issued_turn_state?: true}), do: nil
+  defp client_turn_state(continuity), do: blank_to_nil(continuity.accepted_turn_state)
+
+  @spec current_encrypted_reasoning?(term()) :: boolean()
+  def current_encrypted_reasoning?(
+        %{
+          "type" => "reasoning",
+          "encrypted_content" => encrypted_content
+        } = item
+      )
+      when is_binary(encrypted_content),
+      do: Map.get(item, "content") in [nil, []] and String.trim(encrypted_content) != ""
+
+  def current_encrypted_reasoning?(_item), do: false
+
+  @spec v2_encrypted_handoff?(term()) :: boolean()
+  def v2_encrypted_handoff?(%{
+        "type" => "agent_message",
+        "author" => author,
+        "recipient" => recipient,
+        "content" => [
+          %{"type" => "input_text", "text" => text},
+          %{"type" => "encrypted_content", "encrypted_content" => encrypted_content}
+        ]
+      })
+      when is_binary(author) and is_binary(recipient) and is_binary(text) and
+             is_binary(encrypted_content) do
+    backend_codex_agent_path?(author) and backend_codex_agent_path?(recipient) and
+      String.trim(encrypted_content) != "" and
+      text in [
+        "Message Type: NEW_TASK\nTask name: #{recipient}\nSender: #{author}\nPayload:\n",
+        "Message Type: MESSAGE\nTask name: #{recipient}\nSender: #{author}\nPayload:\n"
+      ]
+  end
+
+  def v2_encrypted_handoff?(_item), do: false
+
+  defp backend_codex_agent_path?(path), do: Regex.match?(@backend_codex_agent_path, path)
 
   defp blank_to_nil(value) when is_binary(value) do
     value = String.trim(value)

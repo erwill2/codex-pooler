@@ -37,6 +37,7 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   @confirmed_by_quota "confirmed_by_quota"
   @reblocked "reblocked"
   @expired "expired"
+  @consume_not_applied "consume_not_applied"
 
   @phases [
     @consuming,
@@ -44,17 +45,32 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
     @confirmed_by_upstream,
     @confirmed_by_quota,
     @reblocked,
-    @expired
+    @expired,
+    @consume_not_applied
   ]
 
   # Nonterminal phases still hold the consume/probe claim: they must block any
   # further credit consumption or probe on the same identity.
   @nonterminal [@consuming, @consumed_pending_probe]
-  @terminal [@confirmed_by_upstream, @confirmed_by_quota, @reblocked, @expired]
+  @terminal [
+    @confirmed_by_upstream,
+    @confirmed_by_quota,
+    @reblocked,
+    @expired,
+    @consume_not_applied
+  ]
 
   # The single bounded post-consume window. Long enough for scheduler
   # convergence, strictly fail-closed afterwards.
   @probe_grace_ms 15 * 60 * 1000
+
+  # Minimum spacing between an applied consume and the next automatic consume.
+  # Deliberately larger than the probe window: the provider has been observed
+  # re-serving pre-reset quota values with fresh observation timestamps for
+  # ~18 minutes after a reset, and post-consume classification can settle a
+  # threshold-mode record to `confirmed_by_quota` on exactly that stale data.
+  @gateway_auto_consume_cooldown_ms 30 * 60 * 1000
+  @future_consume_tolerance_ms 60 * 1000
 
   @legacy_status_by_phase %{
     @consuming => "redeeming",
@@ -62,7 +78,8 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
     @confirmed_by_upstream => "succeeded",
     @confirmed_by_quota => "succeeded",
     @reblocked => "failed",
-    @expired => "failed"
+    @expired => "failed",
+    @consume_not_applied => "failed"
   }
 
   # Allowed compare-and-set transitions. A transition is valid only from one of
@@ -71,7 +88,7 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   # record: fresh provider evidence may still settle it, otherwise one elapsed
   # confirmation window would disable saved resets on the identity forever.
   @transitions %{
-    @consuming => [@consumed_pending_probe, @reblocked, @expired],
+    @consuming => [@consumed_pending_probe, @reblocked, @expired, @consume_not_applied],
     @consumed_pending_probe => [
       @confirmed_by_upstream,
       @confirmed_by_quota,
@@ -79,6 +96,7 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
       @expired
     ],
     @confirmed_by_upstream => [@confirmed_by_quota, @reblocked, @expired],
+    @reblocked => [@confirmed_by_upstream, @confirmed_by_quota],
     @expired => [@confirmed_by_quota, @reblocked]
   }
 
@@ -103,11 +121,17 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   @spec expired() :: phase()
   def expired, do: @expired
 
+  @spec consume_not_applied() :: phase()
+  def consume_not_applied, do: @consume_not_applied
+
   @spec phases() :: [phase()]
   def phases, do: @phases
 
   @spec probe_grace_ms() :: pos_integer()
   def probe_grace_ms, do: @probe_grace_ms
+
+  @spec gateway_auto_consume_cooldown_ms() :: pos_integer()
+  def gateway_auto_consume_cooldown_ms, do: @gateway_auto_consume_cooldown_ms
 
   @doc """
   Returns the recognized lifecycle phase carried by a redemption metadata map,
@@ -159,22 +183,193 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   probe because a prior redemption is unconfirmed or fail-closed.
 
   Fail-closed by construction: a consumed-but-unconfirmed credit blocks even
-  past its window, the `expired` phase blocks (recovery is only via fresh
-  evidence through convergence), and an unrecognized phase blocks. The
-  `consuming` phase is deliberately NOT blocked here: it keeps the legacy
-  `redeeming` status, so the pre-existing freshness gates govern the in-flight
-  window and the stale-recovery path can resume the attempt after a crash.
-  Legacy records without a phase also return `false` for the same reason.
+  past its window, a consumed credit that fresh evidence reblocked remains
+  one-shot, the `expired` phase blocks (recovery is only via fresh evidence
+  through convergence), and an unrecognized phase blocks. The
+  Phase-bearing `consuming` records stay blocked regardless of age. Recovery of
+  their exact attempt is owned by the explicit recovery entrypoint rather than
+  an ordinary claim. Legacy records without a phase retain their pre-lifecycle
+  stale-admin behavior.
   """
   @spec blocks_new_redemption?(redemption() | term(), DateTime.t()) :: boolean()
   def blocks_new_redemption?(redemption, %DateTime{} = _now) do
     case phase(redemption) do
+      @consuming -> true
       @consumed_pending_probe -> true
+      @reblocked -> consumed_credit?(redemption)
       @expired -> true
       :unknown -> true
       _absent_in_flight_or_settled -> false
     end
   end
+
+  defp consumed_credit?(%{"result" => %{"applied" => true}}), do: true
+  defp consumed_credit?(_redemption), do: false
+
+  @doc """
+  True when the record represents a consume that actually spent a credit —
+  regardless of who triggered it. Any applied consume arms the automatic
+  latch below: a manual redemption is the operator's own spend, and a
+  follow-on automatic spend against the same not-yet-converged evidence is
+  still an automatic spend the operator did not ask for.
+  """
+  @spec applied_consume?(redemption() | term()) :: boolean()
+  def applied_consume?(redemption), do: consumed_credit?(redemption)
+
+  @spec applied_reblocked?(redemption() | term()) :: boolean()
+  def applied_reblocked?(%{} = redemption) do
+    phase(redemption) == @reblocked and
+      Map.get(redemption, "status") == legacy_status_for(@reblocked) and
+      consumed_credit?(redemption) and valid_reblocked_probe_identity?(redemption)
+  end
+
+  def applied_reblocked?(_redemption), do: false
+
+  @doc """
+  At most one automatic consume per exhaustion episode. After any applied
+  consume, another automatic consume is not allowed to trust quota evidence
+  the provider may still be serving from the pre-reset cycle (observation
+  timestamps refresh even while the values stay stale, so recency alone
+  proves nothing — and in threshold mode that same stale data can settle the
+  record to `confirmed_by_quota` within seconds of the consume):
+
+    * `:blocked_awaiting_quota` — the credit was spent but fresh post-consume
+      provider evidence has not superseded the stale state (`confirmed_by_quota`
+      not reached). This closes the `confirmed_by_upstream` gap; the other
+      spent phases already block through `blocks_new_redemption?/2`.
+    * `:cooldown` — evidence converged (or the record predates the lifecycle),
+      but the consume is younger than the automatic-consume cooldown. This is
+      the load-bearing floor for threshold mode, where stale sub-exhausted
+      values self-confirm; it is sized above the observed provider staleness.
+    * `:clear` — no applied consume is latching automatic redemption.
+
+  Legacy records without a phase can never reach `confirmed_by_quota`, so they
+  get only the temporal floor — a latch that never lifts would disable saved
+  resets on the identity forever. Manual redemption never consults this latch:
+  it is the operator override.
+  """
+  @spec gateway_auto_latch(redemption() | term(), DateTime.t()) ::
+          :blocked_awaiting_quota | :cooldown | :clear
+  def gateway_auto_latch(redemption, %DateTime{} = now) do
+    cond do
+      not applied_consume?(redemption) ->
+        if within_carried_consume_cooldown?(redemption, now), do: :cooldown, else: :clear
+
+      phase(redemption) in [nil, @confirmed_by_quota] ->
+        if within_consume_cooldown?(redemption, now), do: :cooldown, else: :clear
+
+      true ->
+        :blocked_awaiting_quota
+    end
+  end
+
+  @doc """
+  Classifies whether a cohort sibling permits a new gateway-auto consume.
+
+  Any applied or carried consume retains the existing temporal floor. Once that
+  floor elapses, only resolved phases clear; phases whose provider outcome or
+  quota convergence remains ambiguous stay blocked regardless of age.
+  """
+  @spec gateway_auto_sibling_fence(redemption() | term(), DateTime.t()) ::
+          :blocked_awaiting_quota | :cooldown | :clear
+  def gateway_auto_sibling_fence(redemption, %DateTime{} = now) do
+    cond do
+      within_consume_cooldown?(redemption, now) and applied_consume?(redemption) ->
+        :cooldown
+
+      within_carried_consume_cooldown?(redemption, now) ->
+        :cooldown
+
+      phase(redemption) in [
+        @consuming,
+        @consumed_pending_probe,
+        @confirmed_by_upstream,
+        @expired,
+        :unknown
+      ] ->
+        :blocked_awaiting_quota
+
+      true ->
+        :clear
+    end
+  end
+
+  @doc """
+  The applied-consume timestamp a replacement claim must carry so an
+  unapplied overwrite (for example a failed manual attempt) cannot disarm
+  the cooldown inside the same provider-staleness window.
+  """
+  @spec carried_applied_consume_at(redemption() | term()) :: String.t() | nil
+  def carried_applied_consume_at(redemption) do
+    if applied_consume?(redemption) do
+      case consumed_or_started_at(redemption) do
+        %DateTime{} = consumed_at -> DateTime.to_iso8601(consumed_at)
+        nil -> carried_consume_value(redemption)
+      end
+    else
+      carried_consume_value(redemption)
+    end
+  end
+
+  defp carried_consume_value(%{"last_applied_consume_at" => value}) when is_binary(value),
+    do: value
+
+  defp carried_consume_value(_redemption), do: nil
+
+  defp within_carried_consume_cooldown?(redemption, now) do
+    case redemption do
+      %{"last_applied_consume_at" => value} when is_binary(value) ->
+        case parse_datetime(value) do
+          %DateTime{} = carried_at -> within_cooldown_window?(carried_at, now)
+          nil -> false
+        end
+
+      _redemption ->
+        false
+    end
+  end
+
+  defp within_consume_cooldown?(redemption, now) do
+    case consumed_or_started_at(redemption) do
+      %DateTime{} = consumed_at ->
+        within_cooldown_window?(consumed_at, now)
+
+      nil ->
+        false
+    end
+  end
+
+  # A grossly future-dated consume timestamp (broken writer clock) must not
+  # hold the latch until the reader's clock catches up; small skew keeps the
+  # cooldown, anything beyond the tolerance fails open per the
+  # no-permanent-latch rule.
+  defp within_cooldown_window?(%DateTime{} = consumed_at, now) do
+    elapsed_ms = DateTime.diff(now, consumed_at, :millisecond)
+
+    elapsed_ms >= -@future_consume_tolerance_ms and
+      elapsed_ms < @gateway_auto_consume_cooldown_ms
+  end
+
+  defp consumed_or_started_at(%{"consumed_at" => consumed_at} = redemption)
+       when is_binary(consumed_at) do
+    parse_datetime(consumed_at) || started_at(redemption)
+  end
+
+  defp consumed_or_started_at(redemption), do: started_at(redemption)
+
+  defp started_at(%{"started_at" => started_at}) when is_binary(started_at),
+    do: parse_datetime(started_at)
+
+  defp started_at(_redemption), do: nil
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _invalid -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
 
   @doc """
   Whether the identity is currently routeable on the strength of the lifecycle
@@ -213,9 +408,32 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   """
   @spec probe_claimable?(redemption() | term(), DateTime.t()) :: boolean()
   def probe_claimable?(redemption, %DateTime{} = now) do
-    phase(redemption) == @consumed_pending_probe and probe_holder(redemption) == nil and
-      not expired?(redemption, now)
+    (pending_probe?(redemption) or applied_reblocked?(redemption)) and
+      probe_holder(redemption) == nil and not expired?(redemption, now)
   end
+
+  defp pending_probe?(%{} = redemption) do
+    phase(redemption) == @consumed_pending_probe and
+      Map.get(redemption, "status") == legacy_status_for(@consumed_pending_probe) and
+      consumed_credit?(redemption) and valid_pending_probe_identity?(redemption)
+  end
+
+  defp pending_probe?(_redemption), do: false
+
+  defp valid_reblocked_probe_identity?(redemption) do
+    valid_attempt_id?(Map.get(redemption, "attempt_id")) and
+      is_integer(Map.get(redemption, "generation")) and
+      match?(%DateTime{}, parse_datetime(Map.get(redemption, "consumed_at")))
+  end
+
+  defp valid_pending_probe_identity?(redemption) do
+    present_binary?(Map.get(redemption, "attempt_id")) and
+      is_integer(Map.get(redemption, "generation")) and
+      match?(%DateTime{}, parse_datetime(Map.get(redemption, "consumed_at")))
+  end
+
+  defp present_binary?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_binary?(_value), do: false
 
   @doc """
   Compare-and-set guard for a lifecycle transition. The move is permitted only
@@ -227,17 +445,66 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   def can_transition?(redemption, to_phase, expected_generation, expected_attempt_id) do
     to_phase in @phases and
       matches_identity?(redemption, expected_generation, expected_attempt_id) and
-      allowed_transition?(phase(redemption), to_phase)
+      allowed_transition?(
+        redemption,
+        phase(redemption),
+        to_phase,
+        expected_generation,
+        expected_attempt_id
+      )
   end
 
-  defp allowed_transition?(nil, @consuming), do: true
-  defp allowed_transition?(nil, _to_phase), do: false
-  defp allowed_transition?(:unknown, _to_phase), do: false
+  defp allowed_transition?(_redemption, nil, @consuming, _generation, _attempt_id), do: true
+  defp allowed_transition?(_redemption, nil, _to_phase, _generation, _attempt_id), do: false
+  defp allowed_transition?(_redemption, :unknown, _to_phase, _generation, _attempt_id), do: false
 
-  defp allowed_transition?(from_phase, to_phase) when from_phase in @phases,
-    do: to_phase in Map.get(@transitions, from_phase, [])
+  defp allowed_transition?(
+         redemption,
+         @consuming,
+         @consume_not_applied,
+         expected_generation,
+         expected_attempt_id
+       ) do
+    exact_transition_identity?(redemption, expected_generation, expected_attempt_id) and
+      (match?(
+         %{"version" => 1, "provider_dispatches" => 0},
+         Map.get(redemption, "provider_replay")
+       ) or
+         match?(
+           %{"mode" => "observe_only"},
+           Map.get(redemption, "provider_replay")
+         ))
+  end
 
-  defp allowed_transition?(_from_phase, _to_phase), do: false
+  defp allowed_transition?(
+         redemption,
+         @reblocked,
+         to_phase,
+         expected_generation,
+         expected_attempt_id
+       )
+       when to_phase in [@confirmed_by_upstream, @confirmed_by_quota] do
+    applied_reblocked?(redemption) and
+      exact_transition_identity?(redemption, expected_generation, expected_attempt_id)
+  end
+
+  defp allowed_transition?(_redemption, from_phase, to_phase, _generation, _attempt_id)
+       when from_phase in @phases,
+       do: to_phase in Map.get(@transitions, from_phase, [])
+
+  defp allowed_transition?(_redemption, _from_phase, _to_phase, _generation, _attempt_id),
+    do: false
+
+  defp exact_transition_identity?(redemption, expected_generation, expected_attempt_id) do
+    is_integer(expected_generation) and is_binary(expected_attempt_id) and
+      Map.get(redemption, "generation") == expected_generation and
+      Map.get(redemption, "attempt_id") == expected_attempt_id
+  end
+
+  defp valid_attempt_id?(attempt_id) when is_binary(attempt_id),
+    do: Ecto.UUID.cast(attempt_id) == {:ok, attempt_id}
+
+  defp valid_attempt_id?(_attempt_id), do: false
 
   defp matches_identity?(%{} = redemption, expected_generation, expected_attempt_id) do
     generation_matches?(Map.get(redemption, "generation"), expected_generation) and

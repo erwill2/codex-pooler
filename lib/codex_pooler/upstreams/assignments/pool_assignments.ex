@@ -7,19 +7,21 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   alias CodexPooler.Repo
 
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
-  @active UpstreamIdentity.active_status()
-  @deleted UpstreamIdentity.deleted_status()
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @assignment_deleted PoolUpstreamAssignment.deleted_status()
-  @assignment_disabled PoolUpstreamAssignment.disabled_status()
-  @eligible PoolUpstreamAssignment.eligible_status()
-  @ineligible PoolUpstreamAssignment.ineligible_status()
-  @health_unknown PoolUpstreamAssignment.unknown_health_status()
-  @health_active PoolUpstreamAssignment.active_health_status()
-  @health_cooldown PoolUpstreamAssignment.cooldown_health_status()
-  @health_disabled PoolUpstreamAssignment.disabled_health_status()
-  @pending PoolUpstreamAssignment.pending_status()
+  @active IdentityStatus.active_status()
+  @deleted IdentityStatus.deleted_status()
+  @assignment_active AssignmentStatus.active_status()
+  @assignment_deleted AssignmentStatus.deleted_status()
+  @assignment_disabled AssignmentStatus.disabled_status()
+  @eligible AssignmentStatus.eligible_status()
+  @ineligible AssignmentStatus.ineligible_status()
+  @health_unknown AssignmentStatus.unknown_health_status()
+  @health_active AssignmentStatus.active_health_status()
+  @health_cooldown AssignmentStatus.cooldown_health_status()
+  @health_disabled AssignmentStatus.disabled_health_status()
+  @pending AssignmentStatus.pending_status()
 
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type lifecycle_result :: {:ok, map()} | {:error, lifecycle_error()}
@@ -32,7 +34,38 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   def create_pool_assignment(pool, identity_or_id, attrs \\ %{})
 
   def create_pool_assignment(%Pool{} = pool, identity_or_id, attrs) when is_map(attrs) do
-    case normalize_identity(identity_or_id) do
+    Repo.transact(fn -> create_locked_pool_assignment(pool, identity_or_id, attrs) end)
+  end
+
+  def create_pool_assignment(_pool, _identity_or_id, _attrs),
+    do: {:error, lifecycle_error(:pool_not_found, "pool was not found")}
+
+  @doc """
+  Assigns an existing upstream identity to a pool as an active assignment.
+
+  Pending or deleted assignments for the same pool and identity are restored.
+  """
+  @spec assign_pool_assignment(Pool.t(), identity_ref(), map()) :: assignment_result()
+  def assign_pool_assignment(pool, identity_or_id, attrs \\ %{})
+
+  def assign_pool_assignment(%Pool{} = pool, identity_or_id, attrs) when is_map(attrs) do
+    case identity_id(identity_or_id) do
+      identity_id when is_binary(identity_id) ->
+        assign_pool_assignment_transaction(pool, identity_id, attrs)
+
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+    end
+  end
+
+  def assign_pool_assignment(_pool, _identity_or_id, _attrs),
+    do: {:error, lifecycle_error(:pool_not_found, "pool was not found")}
+
+  defp create_locked_pool_assignment(pool, identity_or_id, attrs) do
+    case lock_attachable_identity(identity_or_id) do
+      {:error, reason} ->
+        {:error, reason}
+
       %UpstreamIdentity{} = identity ->
         now = now()
         attrs = atomize_attrs(attrs)
@@ -56,34 +89,6 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
     end
   end
-
-  def create_pool_assignment(_pool, _identity_or_id, _attrs),
-    do: {:error, lifecycle_error(:pool_not_found, "pool was not found")}
-
-  @doc """
-  Assigns an already-linked upstream identity to a Pool as an operational
-  assignment.
-
-  `create_pool_assignment/3` intentionally defaults to `pending` for
-  onboarding. The admin "Assign to Pool" workflow must instead create an
-  active assignment and restore an older pending/deleted row when one already
-  occupies the Pool/identity slot.
-  """
-  @spec assign_pool_assignment(Pool.t(), identity_ref(), map()) :: assignment_result()
-  def assign_pool_assignment(pool, identity_or_id, attrs \\ %{})
-
-  def assign_pool_assignment(%Pool{} = pool, identity_or_id, attrs) when is_map(attrs) do
-    case identity_id(identity_or_id) do
-      identity_id when is_binary(identity_id) ->
-        assign_pool_assignment_transaction(pool, identity_id, attrs)
-
-      nil ->
-        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
-    end
-  end
-
-  def assign_pool_assignment(_pool, _identity_or_id, _attrs),
-    do: {:error, lifecycle_error(:pool_not_found, "pool was not found")}
 
   @spec sync_pool_assignments_for_pool_edit(Pool.t(), [Ecto.UUID.t()], keyword()) ::
           :ok | {:error, term()}
@@ -117,7 +122,14 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
 
   @spec activate_pool_assignment(assignment_ref(), map()) :: assignment_result()
   def activate_pool_assignment(assignment_or_id, attrs \\ %{}) do
-    case normalize_assignment(assignment_or_id) do
+    Repo.transact(fn -> activate_locked_pool_assignment(assignment_or_id, attrs) end)
+  end
+
+  defp activate_locked_pool_assignment(assignment_or_id, attrs) do
+    case fresh_attachable_assignment(assignment_or_id) do
+      {:error, reason} ->
+        {:error, reason}
+
       %PoolUpstreamAssignment{} = assignment ->
         attrs = atomize_attrs(attrs)
 
@@ -137,8 +149,7 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         result
 
       nil ->
-        {:error,
-         lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
+        {:error, lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
     end
   end
 
@@ -154,8 +165,7 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         })
 
       nil ->
-        {:error,
-         lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
+        {:error, lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
     end
   end
 
@@ -169,8 +179,7 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         {:error, lifecycle_error(:pool_not_found, "pool was not found")}
 
       is_nil(assignment_id) ->
-        {:error,
-         lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
+        {:error, lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
 
       true ->
         Repo.transaction(fn ->
@@ -210,8 +219,7 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         )
 
       nil ->
-        {:error,
-         lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
+        {:error, lifecycle_error(:pool_upstream_assignment_not_found, "pool assignment was not found")}
     end
   end
 
@@ -227,6 +235,23 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   end
 
   def list_pool_assignments(_pool_id), do: []
+
+  @spec list_pool_assignments_for_pool_ids([Ecto.UUID.t()]) :: [PoolUpstreamAssignment.t()]
+  def list_pool_assignments_for_pool_ids(pool_ids) when is_list(pool_ids) do
+    pool_ids = pool_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    if pool_ids == [] do
+      []
+    else
+      Repo.all(
+        from assignment in PoolUpstreamAssignment,
+          where: assignment.pool_id in ^pool_ids,
+          order_by: [asc: assignment.pool_id, asc: assignment.created_at, asc: assignment.id]
+      )
+    end
+  end
+
+  def list_pool_assignments_for_pool_ids(_pool_ids), do: []
 
   @spec count_pool_assignments_by_pool_ids([Ecto.UUID.t()]) ::
           %{optional(Ecto.UUID.t()) => non_neg_integer()}
@@ -325,6 +350,31 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
 
   def list_canonical_active_assignments_for_pools(_pool_refs), do: []
 
+  @spec canonical_active_assignment_for_identity(identity_ref()) ::
+          PoolUpstreamAssignment.t() | nil
+  def canonical_active_assignment_for_identity(identity_or_id) do
+    case identity_id(identity_or_id) do
+      nil ->
+        nil
+
+      identity_id ->
+        Repo.one(
+          from assignment in PoolUpstreamAssignment,
+            join: identity in UpstreamIdentity,
+            on: identity.id == assignment.upstream_identity_id,
+            join: pool in Pool,
+            on: pool.id == assignment.pool_id,
+            where:
+              assignment.upstream_identity_id == ^identity_id and
+                assignment.status == ^@assignment_active and identity.status == ^@active and
+                pool.status == "active",
+            order_by: [asc: assignment.created_at, asc: assignment.id],
+            limit: 1,
+            select: assignment
+        )
+    end
+  end
+
   @spec list_pool_assignments_for_identity(identity_ref()) :: [PoolUpstreamAssignment.t()]
   def list_pool_assignments_for_identity(identity_or_id) do
     case identity_id(identity_or_id) do
@@ -378,6 +428,8 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         pool
         |> list_pool_assignments()
         |> Map.new(&{&1.upstream_identity_id, &1})
+
+      lock_selected_identities!(MapSet.to_list(upstream_identity_ids))
 
       with :ok <-
              retain_or_create_selected_pool_assignments(
@@ -495,6 +547,21 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   end
 
   defp update_known_pool_assignments(pool, assignment_lookup, selected_assignment_ids, opts) do
+    Repo.transaction(fn ->
+      assignment_lookup
+      |> Enum.filter(fn {id, _assignment} -> MapSet.member?(selected_assignment_ids, id) end)
+      |> Enum.map(fn {_id, assignment} -> assignment.upstream_identity_id end)
+      |> lock_selected_identities!()
+
+      case update_locked_known_pool_assignments(pool, assignment_lookup, selected_assignment_ids, opts) do
+        :ok -> :ok
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> normalize_sync_transaction_result()
+  end
+
+  defp update_locked_known_pool_assignments(pool, assignment_lookup, selected_assignment_ids, opts) do
     Enum.reduce_while(assignment_lookup, :ok, fn {assignment_id, assignment}, :ok ->
       selected? = MapSet.member?(selected_assignment_ids, assignment_id)
 
@@ -597,9 +664,42 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   defp normalize_sync_transaction_result({:error, reason}), do: {:error, reason}
   defp normalize_sync_transaction_result({:ok, other}), do: other
 
-  defp normalize_identity(%UpstreamIdentity{id: id}), do: Repo.get(UpstreamIdentity, id)
-  defp normalize_identity(id) when is_binary(id), do: Repo.get(UpstreamIdentity, id)
-  defp normalize_identity(_id), do: nil
+  defp lock_selected_identities!(ids) do
+    ids
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.each(fn id ->
+      case lock_attachable_identity(id) do
+        %UpstreamIdentity{} -> :ok
+        {:error, reason} -> Repo.rollback(reason)
+        nil -> Repo.rollback(lifecycle_error(:upstream_identity_not_found, "upstream identity was not found"))
+      end
+    end)
+  end
+
+  defp lock_attachable_identity(identity_or_id) do
+    case identity_id(identity_or_id) do
+      nil ->
+        nil
+
+      id ->
+        case Repo.one(from identity in UpstreamIdentity, where: identity.id == ^id, lock: "FOR KEY SHARE") do
+          %UpstreamIdentity{metadata: %{"permanent_deletion_requested_at" => _}} ->
+            {:error, lifecycle_error(:upstream_account_deleting, "upstream account is being deleted")}
+
+          identity ->
+            identity
+        end
+    end
+  end
+
+  defp fresh_attachable_assignment(assignment_or_id) do
+    with id when is_binary(id) <- assignment_id(assignment_or_id),
+         %PoolUpstreamAssignment{} = assignment <- Repo.get(PoolUpstreamAssignment, id),
+         %UpstreamIdentity{} <- lock_attachable_identity(assignment.upstream_identity_id) do
+      Repo.one(from row in PoolUpstreamAssignment, where: row.id == ^id and row.upstream_identity_id == ^assignment.upstream_identity_id, lock: "FOR UPDATE")
+    end
+  end
 
   defp normalize_assignment(%PoolUpstreamAssignment{} = assignment), do: assignment
   defp normalize_assignment(id) when is_binary(id), do: Repo.get(PoolUpstreamAssignment, id)

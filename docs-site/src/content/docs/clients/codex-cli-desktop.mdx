@@ -1,0 +1,275 @@
+---
+title: Codex CLI / Desktop on Codex Pooler
+sidebar:
+  label: Codex CLI / Desktop
+description: "Point Codex CLI and Codex Desktop at Codex Pooler: one shared config.toml provider, a Pool API key, HTTP/SSE fallback and optional operator MCP access."
+---
+
+Codex is OpenAI's coding agent for exploring a codebase, making changes and running checks. Use it from the terminal or the desktop app, with Codex Pooler providing access to your Pool's models through one API key. The configuration below is shared by both clients.
+
+![Codex Pooler integration for Codex CLI and Codex Desktop](/codex-pooler-codex.webp)
+
+## Before you start
+
+- Install [Codex CLI](https://developers.openai.com/codex/cli/) or [Codex Desktop](https://developers.openai.com/codex/app/) using the official instructions for your operating system.
+- Have a Codex Pooler URL reachable from the client.
+- Create a [Pool API key](/getting-started/quick-start/) and choose a model available to that Pool.
+- Have Codex signed in with ChatGPT or an OpenAI API key. The provider below keeps `requires_openai_auth = true`, and without a local login Codex CLI opens its sign-in screen even when the Pool API key is set. With only a Pool API key, set `requires_openai_auth = false` instead; [Troubleshooting](#troubleshooting) explains what that turns off.
+
+## Configure the connection
+
+Use the commands for the terminal that starts the client. Environment-variable assignments below apply to that terminal; desktop apps and services need the variables in their own launch environment.
+
+### Config file path
+
+Use `/backend-api/codex` for Codex CLI and Desktop. Put provider and auth settings in the user-level config file; project-local `.codex/config.toml` layers are trust-gated and do not override machine-local provider keys such as `model_provider` or `model_providers`.
+
+Codex resolves `CODEX_HOME` first. If `CODEX_HOME` is unset, current Codex sources default it to `$HOME/.codex` on every OS, so the user config file is `CODEX_HOME/config.toml`.
+
+| OS | Default config file |
+| --- | --- |
+| macOS | `~/.codex/config.toml` |
+| Linux | `~/.codex/config.toml` |
+| Windows | `%USERPROFILE%\.codex\config.toml` |
+
+These are the default locations. On Windows, paste the `%USERPROFILE%`, `%APPDATA%` or `%LOCALAPPDATA%` path into File Explorer's address bar. For a client installed inside WSL, use the Linux paths and commands inside WSL. Keep any custom configuration folder or profile you already use.
+
+Codex Desktop and the IDE extension open the same file from **Codex Settings > Open config.toml**.
+
+For a deployed instance, the Codex backend base URL is:
+
+```text
+https://codex-pooler.example.com/backend-api/codex
+```
+
+For local setup and local connection checks, use:
+
+```text
+http://localhost:4000/backend-api/codex
+```
+
+Keep your Pool API key in the environment that starts Codex. Don't paste raw keys into `CODEX_HOME/config.toml`.
+
+**macOS / Linux / WSL**
+
+```bash
+export CODEX_POOLER_API_KEY="<pool-api-key>"
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:CODEX_POOLER_API_KEY = "<pool-api-key>"
+```
+
+For Codex Desktop, make the same variable available to the app process; setting it in an unrelated terminal does not update an already-running app.
+
+### Websocket provider for Codex CLI and Desktop
+
+Use the websocket-capable provider for normal Codex backend behavior in Codex CLI and Codex Desktop. Keep the provider id as `codex-pooler-ws`, but keep `name = "OpenAI"` exactly. In current Codex sources, `name` is not just a display label: exact `OpenAI` matching enables OpenAI-family behavior such as remote compaction, web search/image availability, and Codex backend request-body compression.
+
+```toml title="CODEX_HOME/config.toml" frame="code"
+model_provider = "codex-pooler-ws"
+
+[model_providers.codex-pooler-ws]
+name = "OpenAI"
+base_url = "https://codex-pooler.example.com/backend-api/codex"
+model_catalog_url = "https://codex-pooler.example.com/backend-api/codex/models"
+env_key = "CODEX_POOLER_API_KEY"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+
+[features]
+api_key_model_discovery = true
+```
+
+With a local Codex Pooler instance, change `base_url` to `http://localhost:4000/backend-api/codex` and `model_catalog_url` to `http://localhost:4000/backend-api/codex/models`. If your config file already has a `[features]` table, add `api_key_model_discovery = true` to it instead of starting a second one.
+
+Leave `requires_openai_auth = true` unless you are deliberately running Codex Pooler as a gateway-only provider. With `true`, Codex still shows the local OpenAI/ChatGPT account as signed in, which keeps Codex Desktop and app-server features that depend on account state available. The Pool API key in `env_key` still authenticates requests to Codex Pooler.
+
+### Model catalog discovery
+
+`model_catalog_url` and `api_key_model_discovery` are what let Codex 0.156.0 and later read the Pool's model catalog. Starting with 0.156.0 (first shipped in the 0.156.0-alpha.7 prerelease), Codex treats any provider with `env_key` as API-key authentication and, for a custom `base_url`, does not request `<base_url>/models` on its own. Without both settings it keeps the catalog bundled with the Codex release: models that only your Pool serves are missing from the model picker, and context window, automatic compaction, and reasoning defaults come from Codex's built-in metadata instead of the Pool. Signing in with a ChatGPT account does not change this.
+
+Earlier Codex releases ignore both settings and keep reading the Pool catalog from `base_url` while a ChatGPT account is signed in, so the same configuration works across the version boundary. Codex Desktop and the IDE extension run their own bundled Codex core and read the same `CODEX_HOME/config.toml`; they follow the same rule once that core reaches 0.156.0. The core version is the number after the client name in the user agent those apps send, which Codex Pooler request logs show.
+
+When you set `model_catalog_url`:
+
+- Use the absolute URL of the Pool catalog, `/backend-api/codex/models` under the same host as `base_url`. Codex adds its `client_version` query parameter itself and authenticates with the same Pool API key.
+- Point it at the final URL. Codex refuses redirects on this request, so an `http://` URL that the ingress redirects to `https://` fails.
+- Codex refuses a catalog response larger than 1 MiB and then keeps its bundled catalog. The upstream catalog repeats each model's instructions in a legacy `base_instructions` field for older Codex releases; Codex Pooler leaves that copy out for Codex 0.148.0 and later, which read the same text from `model_messages`, and keeps it for older releases and for any client whose `User-Agent` is not a Codex build's. The release is read from the Codex `User-Agent`, the same header every Responses turn carries, so the catalog `ETag` a turn announces always matches the catalog that client fetched and Codex never refetches the catalog after each turn. For current releases that makes the catalog about a third smaller, and entries are typically 25 to 65 KB each (40 to 90 KB with the legacy copy), so a Pool that exposes many models can still reach the limit.
+- Codex discards the whole catalog when one entry fails to decode. For Codex releases 0.154.0 through 0.161.0, an entry that release cannot decode is left out instead: that model is missing from the picker but still works when requested by name. Operators see a `codex catalog entry left out` warning; see [Codex Catalog Entries Left Out](/operators/pools/#codex-catalog-entries-left-out).
+
+`api_key_model_discovery` is marked as under development in Codex. Codex prints an under-development warning at startup while it is enabled; set `suppress_unstable_features_warning = true` at the top level of the config file to hide it. Because the feature is still under development, a later Codex release may rename or change it; recheck this page when you upgrade Codex.
+
+## Choose a model
+
+Select a model available to your Pool in Codex's model picker.
+
+Because the provider keeps `name = "OpenAI"` with a Codex Pooler `base_url`, the Codex CLI `/model` picker shows a red "OpenAI base URL is overridden to `<base_url>`. Selecting models may not be supported or work properly." warning. It is expected with this configuration, and selecting a model still works.
+
+When Codex reads the Pool catalog (see [Model catalog discovery](#model-catalog-discovery)), Codex CLI and Codex Desktop derive their effective context window and automatic compaction boundary from that metadata. Leave context sizing automatic so the client follows per-model catalog changes without stale local overrides. Pooler preserves the selected upstream's default `context_window`, supported `max_context_window`, and compaction metadata. A larger supported maximum does not activate that window, and pricing categories do not change any of these values. When the upstream leaves `auto_compact_token_limit` absent or null, Codex derives its compaction threshold from the active window.
+
+Provider catalog rollout can be account-scoped: different accounts can report different defaults or maximums for the same model. Pooler selects one canonical source cohort for the Pool and exposes its raw default plus `effective_context_window_percent`; Codex applies the percentage once. With a 95% effective percentage, a default of 272000 and maximum of 872000 provides 258400 usable tokens automatically. An upstream default of 872000 provides 828400. The narrow `/v1/models` surface publishes the selected default's effective value directly as `context_length` for SDK-style clients. Existing explicit operator context overrides still take precedence; they are not needed for automatic sizing.
+
+## Verify the connection
+
+Start a new Codex CLI or Desktop conversation with `codex-pooler-ws` selected and send a short request. Confirm that it completes, then check the request time, API key, model, and final status in Codex Pooler's request logs.
+
+To check catalog discovery without sending a model request, run `codex debug models` with the same configuration. It prints the catalog Codex will use, which should list your Pool's models rather than only the models bundled with Codex.
+
+In a disposable project, also try a small file edit and a follow-up request to check tool use and continuation. Existing conversations may retain their original provider; use the migration instructions below only when you need to move them.
+
+## Advanced configuration
+
+### HTTP/SSE provider
+
+Keep an HTTP/SSE provider when you need to force non-websocket behavior for a client check or when a Codex runtime cannot open backend websocket streams.
+
+```toml title="CODEX_HOME/config.toml" frame="code"
+model_provider = "codex-pooler-http"
+
+[model_providers.codex-pooler-http]
+name = "OpenAI"
+base_url = "https://codex-pooler.example.com/backend-api/codex"
+model_catalog_url = "https://codex-pooler.example.com/backend-api/codex/models"
+env_key = "CODEX_POOLER_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+requires_openai_auth = true
+```
+
+`api_key_model_discovery = true` under `[features]`, shown with the websocket provider above, applies to every provider in the file; keep one `[features]` table even when both providers are configured.
+
+Both providers use the same Pool API key and the same Codex backend compatibility route in Codex CLI and Codex Desktop. Codex Pooler routes each request through Pool policy, account eligibility, limits, session continuity, and request accounting.
+
+### Tool-output preservation
+
+Codex Pooler preserves accepted tool-output text on Codex backend Responses, compatible aliases, native compact and supported websocket requests. No client or Pool compression switch is required. Full/Lite normalization and provider or client compaction are separate features.
+
+Raw tool outputs are not stored in request logs, and compression savings are not displayed. During a rolling upgrade, serving nodes that are not yet replaced keep the behavior of their own version; changing the serialized upstream prefix can also change prompt-cache reuse.
+
+### Existing session migration
+
+Codex filters resumable conversations by `model_provider` in local Codex state. If you already have Codex CLI or Codex Desktop sessions created with the built-in `openai` provider and want them to appear under `codex-pooler-ws`, re-tag both the JSONL transcripts and the newer SQLite state database.
+
+Close Codex first; these commands edit local Codex state in place. If you made the HTTP provider your default, replace only the destination value `codex-pooler-ws` with `codex-pooler-http` before copying.
+
+#### macOS (zsh)
+
+Run these two zsh one-liners:
+
+```zsh
+if [ -d "${CODEX_HOME:-$HOME/.codex}/sessions" ]; then find "${CODEX_HOME:-$HOME/.codex}/sessions" -type f -name '*.jsonl' -exec perl -0pi -e 's/("model_provider"\s*:\s*)"openai"/$1"codex-pooler-ws"/g' {} +; fi
+```
+
+```zsh
+for db in "${CODEX_HOME:-$HOME/.codex}"/state_*.sqlite(N); do sqlite3 "$db" "UPDATE threads SET model_provider = 'codex-pooler-ws' WHERE model_provider = 'openai';"; done
+```
+
+#### Linux (bash)
+
+Run these two bash one-liners:
+
+```bash
+if [ -d "${CODEX_HOME:-$HOME/.codex}/sessions" ]; then find "${CODEX_HOME:-$HOME/.codex}/sessions" -type f -name '*.jsonl' -exec perl -0pi -e 's/("model_provider"\s*:\s*)"openai"/$1"codex-pooler-ws"/g' {} +; fi
+```
+
+```bash
+for db in "${CODEX_HOME:-$HOME/.codex}"/state_*.sqlite; do [ -e "$db" ] || continue; sqlite3 "$db" "UPDATE threads SET model_provider = 'codex-pooler-ws' WHERE model_provider = 'openai';"; done
+```
+
+#### Windows (PowerShell)
+
+Run the same migration from PowerShell. This expects `sqlite3` to be available on `PATH`.
+
+```powershell
+$ErrorActionPreference = "Stop"
+
+$FromProvider = "openai"
+$ToProvider = "codex-pooler-ws"
+$CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+
+$FromJson = '"model_provider":"' + $FromProvider + '"'
+$ToJson = '"model_provider":"' + $ToProvider + '"'
+
+Get-ChildItem -Path (Join-Path $CodexHome "sessions") -Recurse -Filter "*.jsonl" |
+  ForEach-Object {
+    $Path = $_.FullName
+    $TempPath = "$Path.tmp"
+    $Reader = [System.IO.StreamReader]::new($Path)
+    $Writer = [System.IO.StreamWriter]::new(
+      $TempPath,
+      $false,
+      [System.Text.UTF8Encoding]::new($false)
+    )
+
+    try {
+      while (($Line = $Reader.ReadLine()) -ne $null) {
+        $Writer.WriteLine($Line.Replace($FromJson, $ToJson))
+      }
+    } finally {
+      $Reader.Dispose()
+      $Writer.Dispose()
+    }
+
+    Move-Item -Force $TempPath $Path
+  }
+
+Get-ChildItem -Path $CodexHome -Filter "state_*.sqlite" |
+  ForEach-Object {
+    sqlite3 $_.FullName `
+      "UPDATE threads SET model_provider = '$ToProvider' WHERE model_provider = '$FromProvider';"
+  }
+```
+
+<a id="optional-operator-mcp-endpoint"></a>
+
+## Operator MCP (optional)
+
+Codex Pooler also exposes an operator MCP endpoint at `/mcp`. This is an optional operator-only metadata add-on. Omit it for normal Codex runtime use. MCP uses an operator-owned MCP token, not a Pool API key.
+
+```toml title="CODEX_HOME/config.toml" frame="code"
+[mcp_servers.codex_pooler]
+url = "https://codex-pooler.example.com/mcp"
+bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
+```
+
+Set the token separately:
+
+**macOS / Linux / WSL**
+
+```bash
+export CODEX_POOLER_MCP_KEY="<operator-mcp-token>"
+```
+
+**Windows PowerShell**
+
+```powershell
+$env:CODEX_POOLER_MCP_KEY = "<operator-mcp-token>"
+```
+
+Use `http://localhost:4000/mcp` only for local setup.
+
+## Troubleshooting
+
+Codex CLI 0.158.0 keeps its app server running in the background after you quit, with the environment and sign-in state it started with. After you change `CODEX_POOLER_API_KEY` or sign in, run `codex app-server daemon restart` from a terminal that has the new value, or `codex app-server daemon stop` to let the next `codex` start a fresh one; changes to the provider block in `config.toml`, such as `base_url`, apply to the next session without a restart.
+
+When every account in the Pool has used up its quota, Codex CLI names the time the Pool resets in its usage-limit message. Codex Desktop shows Codex Pooler's own message instead, for example `The Pool's usage limit is reached. Try again at 01:28 UTC (in about 1 h 24 min).`, because its built-in usage-limit screen reads the ChatGPT account and cannot know the Pool's reset. See [When every upstream account is exhausted](/clients/openai-compatible/#when-every-upstream-account-is-exhausted).
+
+An account running out of quota does not exhaust a Pool that still has compatible capacity. If that happens during an anchored native websocket continuation, Codex Pooler returns a retryable error so the client can reconnect and resend its full history to another account. The previous response anchor stays bound to the original connection.
+
+If Codex repeatedly enters a broken login/account state with a Pooler provider, advanced users can change the provider to `requires_openai_auth = false`. That makes Codex treat the provider as gateway-only and use only `env_key` for runtime auth, but Codex does not appear signed in for that provider and account-dependent features, including mobile/app-server features, may be unavailable.
+
+<a id="route-boundaries"></a>
+
+## Compatibility notes
+
+`/backend-api/codex/*` is an authenticated Codex backend compatibility surface for Codex CLI and Codex Desktop. It is not a wildcard proxy and it is not the OpenAI-compatible `/v1` SDK surface.
+
+The backend route family includes `GET /backend-api/codex/models`, `POST /backend-api/codex/responses`, backend websocket response-stream compatibility on `GET /backend-api/codex/responses`, and `POST /backend-api/codex/responses/compact`. The public `POST /v1/responses/compact` route remains unsupported.
+
+Codex can stop a response while the model is still generating it, for example when you send new input during a turn; in Codex 0.159.0 this is an opt-in client feature, off by default. It sends `response.interrupt` on the websocket that carries the turn. Codex Pooler hands it to the upstream connection serving that turn. The response ends as interrupted, the tokens it generated until then are recorded and billed like any served request, and your input continues the turn on the same connection. A request to stop a response that has already ended is ignored.
+
+Codex Pooler supports Codex model-provider traffic only. Do not point `chatgpt_base_url` at Codex Pooler for account, realtime, identity, or other app-server helper calls.

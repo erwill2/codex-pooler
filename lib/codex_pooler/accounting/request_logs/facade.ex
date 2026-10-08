@@ -3,22 +3,29 @@ defmodule CodexPooler.Accounting.RequestLogs do
   Request-log read model and safe error shaping for admin reporting.
 
   The list projection intentionally keeps the legacy request-log contract stable:
-  totals count the exact filtered visible request rows before pagination, rows are
+  totals count the exact filtered visible request rows before pagination (at most
+  `:count_limit` of them when a reader bounds the count), rows are
   ordered by `requests.admitted_at DESC, requests.id DESC`, offset pagination is
   preserved, upstream filters apply to the latest attempt only, latest attempts
   are selected by highest `attempt_number`, and settlement presentation uses the
   newest recorded settlement by `occurred_at`, `created_at`, then `id`.
+
+  Two cursor filters bound a page in the list's own sort key rather than in time
+  alone: `:at_or_before` selects rows at or behind an `{admitted_at, id}` cursor
+  and `:after` selects rows ahead of it. They exist because `admitted_at` is the
+  transaction timestamp, so rows admitted together share it exactly and only
+  `id` orders them.
   """
 
   import Ecto.Query
 
   alias CodexPooler.Accounting
-  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogFact}
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, ModelObservation, Request, RequestLogFact, RequestOutcome}
 
   alias CodexPooler.Accounting.RequestLogs.{
+    CompactionBridgeProjection,
     DebugProjection,
     ErrorSummaries,
-    PayloadCompressionProjection,
     SettlementPresentation
   }
 
@@ -31,6 +38,13 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   @proxy_control_route_class RouteClass.proxy_control()
   @usage_known "usage_known"
+  @doc """
+  One page of request logs and the number of rows that match.
+
+  `total` is exact unless `:count_limit` is given: then at most that many rows
+  are counted, and when more match `total` is `count_limit` and `total_exact?`
+  is `false`, so a reader can say "more than" instead of a wrong number.
+  """
   @spec list(term(), keyword()) :: map()
   def list(pool_or_id, opts \\ []) do
     pool_id = id_for(pool_or_id)
@@ -43,9 +57,15 @@ defmodule CodexPooler.Accounting.RequestLogs do
     list_for_pool_filter(nil, Keyword.put(opts, :visible_pool_ids, visible_pool_ids))
   end
 
-  @spec get_for_scope(CodexPooler.Accounts.Scope.t(), Ecto.UUID.t(), keyword()) :: map() | nil
-  def get_for_scope(%CodexPooler.Accounts.Scope{} = scope, request_id, opts \\ [])
-      when is_binary(request_id) do
+  @spec get_for_scope(CodexPooler.Accounts.Scope.t(), term(), keyword()) :: map() | nil
+  def get_for_scope(%CodexPooler.Accounts.Scope{} = scope, request_id, opts \\ []) do
+    case Ecto.UUID.cast(request_id) do
+      {:ok, request_id} -> get_valid_request_for_scope(scope, request_id, opts)
+      :error -> nil
+    end
+  end
+
+  defp get_valid_request_for_scope(scope, request_id, opts) do
     visible_pool_ids = scope |> Pools.list_log_filter_pools() |> Enum.map(& &1.id)
 
     item =
@@ -59,20 +79,62 @@ defmodule CodexPooler.Accounting.RequestLogs do
     enrich_detail_settlement(item)
   end
 
+  # Every requested model a Pool's request history holds, read as a loose index
+  # scan over `requests_pool_listed_model_idx`: each step asks the index for the
+  # first model after the previous one, so the work grows with the number of
+  # distinct models per Pool, not with the history. A plain `DISTINCT` read the
+  # whole table on every request-log load (findings#206 row 206-373).
+  # Blank models and endpoint paths recorded as the model of a metadata request
+  # (`/backend-api/...`) are not models. The index is partial on exactly that
+  # row condition, so every step repeats it word for word: without it PostgreSQL
+  # cannot prove the step's rows are in the index and falls back to reading the
+  # Pool's history. The partial index is also what keeps it away from queries
+  # that filter by Pool alone, such as the Observatory aggregate (row 206-389).
+  @request_models_sql """
+  WITH RECURSIVE models(pool_id, requested_model) AS (
+    SELECT pool.id,
+           (SELECT r.requested_model FROM requests r
+             WHERE r.pool_id = pool.id
+               AND r.requested_model > '' AND r.requested_model NOT LIKE '/%'
+             ORDER BY r.requested_model LIMIT 1)
+      FROM unnest($1::uuid[]) AS pool(id)
+    UNION ALL
+    SELECT models.pool_id,
+           (SELECT r.requested_model FROM requests r
+             WHERE r.pool_id = models.pool_id AND r.requested_model > models.requested_model
+               AND r.requested_model > '' AND r.requested_model NOT LIKE '/%'
+             ORDER BY r.requested_model LIMIT 1)
+      FROM models
+     WHERE models.requested_model IS NOT NULL
+  )
+  SELECT DISTINCT requested_model FROM models
+   WHERE requested_model IS NOT NULL
+  """
+
   @spec list_models(term(), keyword()) :: [String.t()]
   def list_models(pool_or_id, opts \\ []) do
-    pool_id = id_for(pool_or_id)
-    visible_pool_ids = Keyword.get(opts, :visible_pool_ids)
+    pool_ids =
+      pool_or_id
+      |> model_pool_id()
+      |> request_model_pool_ids(Keyword.get(opts, :visible_pool_ids))
+      |> Enum.flat_map(fn pool_id ->
+        case Ecto.UUID.dump(pool_id) do
+          {:ok, uuid} -> [uuid]
+          :error -> []
+        end
+      end)
 
-    Request
-    |> maybe_filter_request_model_visible_pools(visible_pool_ids)
-    |> maybe_filter_request_model_pool(pool_id)
-    |> where([request], not is_nil(request.requested_model) and request.requested_model != "")
-    |> where([request], not like(request.requested_model, "/%"))
-    |> distinct(true)
-    |> select([request], request.requested_model)
-    |> Repo.all()
-    |> Enum.sort_by(&String.downcase/1)
+    case pool_ids do
+      [] ->
+        []
+
+      pool_ids ->
+        %{rows: rows} = Repo.query!(@request_models_sql, [pool_ids])
+
+        rows
+        |> Enum.map(fn [model] -> model end)
+        |> Enum.sort_by(&String.downcase/1)
+    end
   end
 
   @spec list_models_for_scope(CodexPooler.Accounts.Scope.t()) :: [String.t()]
@@ -97,11 +159,30 @@ defmodule CodexPooler.Accounting.RequestLogs do
       |> maybe_filter_request_log_pool(pool_id)
       |> apply_request_log_filters(filters)
 
-    total = Repo.aggregate(query, :count, :id)
+    {total, total_exact?} = count_request_log_rows(query, Keyword.get(opts, :count_limit))
     rows = request_log_rows(query, limit, offset)
 
-    %{items: request_log_items(rows, surface), total: total, limit: limit, offset: offset}
+    %{items: request_log_items(rows, surface), total: total, total_exact?: total_exact?, limit: limit, offset: offset}
   end
+
+  # The exact total reads every matching row: for an all-Pools page that is the
+  # whole `requests` history through an index-only scan, 600 loads cost 10M
+  # blocks on production (findings#206 row 206-385). With a `count_limit` the
+  # count stops one row past the limit, so a reader learns either the exact
+  # total or that more than `count_limit` rows match, and never pays for more.
+  # The count selects only the request id, so the planner drops every unused
+  # left join (facts, key, assignment, identity) as it does for the exact count.
+  defp count_request_log_rows(query, nil), do: {Repo.aggregate(query, :count, :id), true}
+
+  defp count_request_log_rows(query, count_limit) when is_integer(count_limit) do
+    count_limit = max(count_limit, 0)
+    bounded = from([request, ...] in query, select: %{id: request.id}, limit: ^(count_limit + 1))
+    counted = Repo.one(from(row in subquery(bounded), select: count()))
+
+    if counted > count_limit, do: {count_limit, false}, else: {counted, true}
+  end
+
+  defp count_request_log_rows(query, _count_limit), do: count_request_log_rows(query, nil)
 
   defp request_log_options(opts) do
     %{
@@ -119,6 +200,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   defp request_log_query do
     from r in Request,
+      as: :request,
       join: pool in Pool,
       on: pool.id == r.pool_id,
       left_join: key in CodexPooler.Access.APIKey,
@@ -145,9 +227,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   defp request_log_items(rows, surface) do
     attempts_by_request =
-      request_log_attempts_by_request(
-        Enum.map(rows, fn {request, _, _, _, _, _, _} -> request.id end)
-      )
+      request_log_attempts_by_request(Enum.map(rows, fn {request, _, _, _, _, _, _} -> request.id end))
 
     turns_by_request =
       rows
@@ -167,7 +247,13 @@ defmodule CodexPooler.Accounting.RequestLogs do
        ) do
     request_attempts = Map.get(attempts, request.id, [])
     turn = Map.get(turns_by_request, request.id)
-    metadata = safe_request_log_metadata(request.request_metadata || %{}, request_attempts)
+
+    metadata =
+      request.request_metadata
+      |> Kernel.||(%{})
+      |> safe_request_log_metadata()
+      |> put_attempt_quota_lane(request_attempts)
+
     reasoning_metadata = latest_attempt_reasoning_metadata(request_attempts)
 
     %{
@@ -187,10 +273,12 @@ defmodule CodexPooler.Accounting.RequestLogs do
       upstream_account_plan_label: request.upstream_account_plan_label,
       upstream_account_plan_family: request.upstream_account_plan_family,
       requested_model: request.requested_model,
+      upstream_model: latest_attempt_model(request_attempts, :upstream_model_id),
+      served_model: latest_attempt_model(request_attempts, :served_model),
+      model_conflict_attempts: request_attempts |> Enum.filter(&ModelObservation.conflict?(&1.model_observation)) |> Enum.map(& &1.attempt_number),
       reasoning_effort: request.reasoning_effort,
       applied_reasoning_effort: reasoning_metadata_field(reasoning_metadata, "applied_effort"),
-      effective_reasoning_effort:
-        reasoning_metadata_field(reasoning_metadata, "effective_effort"),
+      effective_reasoning_effort: reasoning_metadata_field(reasoning_metadata, "effective_effort"),
       reasoning_effort_source: reasoning_metadata_field(reasoning_metadata, "source"),
       reasoning_effort_rewrite: reasoning_metadata_field(reasoning_metadata, "rewrite"),
       service_tier: request.service_tier,
@@ -200,6 +288,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
       transport: request.transport,
       user_agent: request.user_agent,
       status: request.status,
+      display_status: RequestOutcome.display_status(request.status, request.last_error_code),
       usage_status: request.usage_status,
       correlation_id: request.correlation_id,
       response_status_code: request.response_status_code,
@@ -209,7 +298,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
       settlement_entry_id: maybe_field(settlement, :settlement_entry_id),
       token_counts: SettlementPresentation.token_counts(settlement),
       cost: SettlementPresentation.cost(settlement),
-      payload_compression: PayloadCompressionProjection.build(metadata),
+      compaction_bridge: CompactionBridgeProjection.build(metadata),
       errors: ErrorSummaries.build(request, metadata, request_attempts),
       debug: DebugProjection.build(request, metadata, turn, request_attempts, surface),
       admitted_at: request.admitted_at,
@@ -218,11 +307,19 @@ defmodule CodexPooler.Accounting.RequestLogs do
     }
   end
 
-  defp safe_request_log_metadata(metadata, attempts) do
+  defp safe_request_log_metadata(metadata) do
     metadata
     |> Accounting.sanitize_metadata()
-    |> PayloadCompressionProjection.normalize_metadata(attempts)
     |> control_plane_metadata_only()
+  end
+
+  defp put_attempt_quota_lane(metadata, attempts) do
+    case Enum.find_value(attempts, fn attempt ->
+           get_in(attempt.response_metadata || %{}, ["routing", "quota_lane"])
+         end) do
+      "gpt_reserve" -> put_in(metadata, ["routing", "quota_lane"], "gpt_reserve")
+      _ -> metadata
+    end
   end
 
   defp control_plane_metadata_only(%{"routing" => %{"route_class" => route_class}} = metadata)
@@ -408,11 +505,14 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
     query
     |> maybe_filter_request_log_status(Map.get(filters, :status))
+    |> maybe_filter_request_log_client_cancelled(Map.get(filters, :client_cancelled))
     |> maybe_filter_request_log_upstream(Map.get(filters, :upstream_identity_id))
     |> maybe_filter_request_log_model(Map.get(filters, :model))
     |> maybe_filter_request_log_request_id(Map.get(filters, :request_id))
     |> maybe_filter_request_log_date_from(Map.get(filters, :date_from))
     |> maybe_filter_request_log_date_to(Map.get(filters, :date_to))
+    |> maybe_filter_request_log_at_or_before(Map.get(filters, :at_or_before))
+    |> maybe_filter_request_log_after(Map.get(filters, :after))
   end
 
   defp maybe_filter_request_log_pool(query, nil), do: query
@@ -425,20 +525,34 @@ defmodule CodexPooler.Accounting.RequestLogs do
   defp maybe_filter_request_log_visible_pools(query, pool_ids) when is_list(pool_ids),
     do: from([request, ...] in query, where: request.pool_id in ^pool_ids)
 
-  defp maybe_filter_request_model_pool(query, nil), do: query
+  defp model_pool_id(nil), do: nil
+  defp model_pool_id(value), do: id_for(value) || :invalid_pool_id
 
-  defp maybe_filter_request_model_pool(query, pool_id),
-    do: from(request in query, where: request.pool_id == ^pool_id)
+  # The Pools whose history the model list reads: the selected Pool, only when
+  # the viewer can see it, else every visible Pool, else every Pool.
+  defp request_model_pool_ids(nil, nil), do: Repo.all(from(pool in Pool, select: pool.id))
+  defp request_model_pool_ids(nil, visible_pool_ids) when is_list(visible_pool_ids), do: Enum.uniq(visible_pool_ids)
+  defp request_model_pool_ids(pool_id, nil), do: [pool_id]
 
-  defp maybe_filter_request_model_visible_pools(query, nil), do: query
-
-  defp maybe_filter_request_model_visible_pools(query, pool_ids) when is_list(pool_ids),
-    do: from(request in query, where: request.pool_id in ^pool_ids)
+  defp request_model_pool_ids(pool_id, visible_pool_ids) when is_list(visible_pool_ids),
+    do: if(pool_id in visible_pool_ids, do: [pool_id], else: [])
 
   defp maybe_filter_request_log_status(query, nil), do: query
 
   defp maybe_filter_request_log_status(query, status),
     do: from([request, ...] in query, where: request.status == ^status)
+
+  # `true` keeps only client cancellations, `false` drops them and keeps every
+  # other row, failed rows without an error code included.
+  # `:status` stays the recorded status: a reader that wants failures without
+  # client cancellations combines `status: "failed"` with `client_cancelled: false`.
+  defp maybe_filter_request_log_client_cancelled(query, nil), do: query
+
+  defp maybe_filter_request_log_client_cancelled(query, true),
+    do: where(query, ^RequestOutcome.client_cancelled_condition(:request))
+
+  defp maybe_filter_request_log_client_cancelled(query, false),
+    do: where(query, ^RequestOutcome.not_client_cancelled_condition(:request))
 
   defp maybe_filter_request_log_upstream(query, nil), do: query
 
@@ -453,7 +567,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
   defp maybe_filter_request_log_model(query, nil), do: query
 
   defp maybe_filter_request_log_model(query, model) do
-    pattern = "%#{model}%"
+    pattern = CodexPooler.SearchPattern.contains(model)
 
     from([request, ...] in query,
       where: ilike(request.requested_model, ^pattern)
@@ -474,7 +588,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
         )
 
       :error ->
-        pattern = "%#{trimmed}%"
+        pattern = CodexPooler.SearchPattern.contains(trimmed)
 
         from([request, ...] in query,
           where:
@@ -496,15 +610,54 @@ defmodule CodexPooler.Accounting.RequestLogs do
   defp maybe_filter_request_log_date_to(query, date_to),
     do: from([request, ...] in query, where: request.admitted_at <= ^date_to)
 
+  # Cursor bounds are expressed in the list's own sort key, not in time alone.
+  # `admitted_at` is the transaction timestamp, so two requests admitted in one
+  # transaction carry the same value and `id DESC` is what separates them: a
+  # bound of `admitted_at <= t` would admit a row inserted after the cursor and
+  # sorting above it, which is precisely the drift a cursor exists to prevent.
+  defp maybe_filter_request_log_at_or_before(query, nil), do: query
+
+  defp maybe_filter_request_log_at_or_before(query, {admitted_at, id}) do
+    from([request, ...] in query,
+      where:
+        request.admitted_at < ^admitted_at or
+          (request.admitted_at == ^admitted_at and request.id <= ^id)
+    )
+  end
+
+  defp maybe_filter_request_log_after(query, nil), do: query
+
+  defp maybe_filter_request_log_after(query, {admitted_at, id}) do
+    from([request, ...] in query,
+      where:
+        request.admitted_at > ^admitted_at or
+          (request.admitted_at == ^admitted_at and request.id > ^id)
+    )
+  end
+
   defp request_log_attempts_by_request([]), do: %{}
 
   defp request_log_attempts_by_request(request_ids) do
     Attempt
     |> where([attempt], attempt.request_id in ^request_ids)
     |> order_by([attempt], asc: attempt.request_id, asc: attempt.attempt_number)
+    |> ModelObservation.provider_models()
     |> Repo.all()
     |> Enum.group_by(& &1.request_id)
   end
+
+  # The model the latest attempt sent upstream and the one the provider
+  # declared on its response object; a difference is a provider-side
+  # substitution, which `requested_model` alone cannot show.
+  defp latest_attempt_model(attempts, field) do
+    case List.last(attempts) do
+      %Attempt{} = attempt -> attempt |> Map.get(field) |> present_string()
+      _attempt -> nil
+    end
+  end
+
+  defp present_string(value) when is_binary(value), do: value |> String.trim() |> blank_to_nil()
+  defp present_string(_value), do: nil
 
   defp latest_attempt_reasoning_metadata(attempts) do
     case List.last(attempts) do
@@ -516,6 +669,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
   defp reasoning_metadata_field(metadata, key) do
     case Map.get(metadata, key) do
       value when is_binary(value) -> value |> String.trim() |> blank_to_nil()
+      value when is_integer(value) and value >= 0 and value <= 18_446_744_073_709_551_615 -> Integer.to_string(value)
       _value -> nil
     end
   end

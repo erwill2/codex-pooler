@@ -1,17 +1,29 @@
 defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   @moduledoc false
 
+  alias CodexPooler.Accounting.ClientRetry
+  alias CodexPooler.Accounting.NativeHttpToolObservation
   alias CodexPooler.Gateway.OpenAICompatibility.ChatCompletions
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+  alias CodexPooler.Gateway.Runtime.Streaming.NativeSSEBlock
+  alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponses
 
   @type state :: map()
+  @type source :: :http | :websocket_bridge
 
   @spec initial_state(term(), RequestOptions.t()) :: state()
-  def initial_state(target, %RequestOptions{} = opts) do
+  def initial_state(target, %RequestOptions{} = opts), do: initial_state(target, opts, :http)
+
+  @spec initial_state(term(), RequestOptions.t(), source()) :: state()
+  def initial_state(target, %RequestOptions{} = opts, source)
+      when source in [:http, :websocket_bridge] do
     state = %{target: target}
+
+    state =
+      if source == :websocket_bridge, do: Map.put(state, :bridge_committed?, true), else: state
 
     cond do
       public_openai_chat_stream?(opts) ->
@@ -25,7 +37,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
         state
         |> Map.put(
           :public_openai_responses,
-          StreamProtocol.public_openai_responses_stream_state()
+          StreamProtocol.public_openai_responses_stream_state(opts.openai_compatibility.custom_tool_namespaces)
         )
 
       true ->
@@ -45,18 +57,45 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   @spec normalize_data(iodata(), String.t() | nil, RequestOptions.t(), state()) ::
           {iodata(), state()}
   def normalize_data(data, endpoint, %RequestOptions{} = opts, state) do
+    {data, state, _delivery} = normalize_delivery(data, endpoint, opts, state)
+    {data, state}
+  end
+
+  @doc false
+  @spec normalize_delivery(iodata(), String.t() | nil, RequestOptions.t(), state()) ::
+          {iodata(), state(), NativeSSEBlock.delivery() | nil}
+  def normalize_delivery(data, endpoint, %RequestOptions{} = opts, state) do
     cond do
       public_openai_chat_stream?(opts) ->
-        normalize_public_openai_chat_stream_data(data, state)
+        {data, state} = normalize_public_openai_chat_stream_data(data, state)
+        {data, state, nil}
 
       public_openai_responses_stream?(opts) ->
-        normalize_public_openai_responses_stream_data(data, state)
+        {data, state} = normalize_public_openai_responses_stream_data(data, state)
+        {data, state, nil}
 
       codex_responses_stream_endpoint?(endpoint) ->
         normalize_codex_responses_stream_data(data, endpoint, opts, state)
 
       true ->
-        {normalize_endpoint_data(endpoint, data), state}
+        {normalize_endpoint_data(endpoint, data), state, nil}
+    end
+  end
+
+  @spec flush_eof_data(String.t() | nil, RequestOptions.t(), state()) :: {iodata(), state()}
+  def flush_eof_data(endpoint, %RequestOptions{} = opts, state) do
+    {data, state, _delivery} = flush_eof_delivery(endpoint, opts, state)
+    {data, state}
+  end
+
+  @doc false
+  @spec flush_eof_delivery(String.t() | nil, RequestOptions.t(), state()) ::
+          {iodata(), state(), NativeSSEBlock.delivery() | nil}
+  def flush_eof_delivery(endpoint, %RequestOptions{} = opts, state) do
+    if codex_responses_stream_endpoint?(endpoint) do
+      flush_codex_responses_sse_eof(opts, state)
+    else
+      {"", state, nil}
     end
   end
 
@@ -94,6 +133,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
     end
   end
 
+  def terminal_outcome(%{public_openai_chat: stream_state}) do
+    if ChatCompletions.reconciliation_failed?(stream_state), do: {:failed, nil}
+  end
+
+  def terminal_outcome(%{native_terminal_outcome: :completed}), do: :completed
   def terminal_outcome(_state), do: nil
 
   @spec synthetic_terminal_failure(state(), term()) :: {binary() | nil, state()}
@@ -101,15 +145,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
         %{public_openai_responses: stream_state} = state,
         reason
       ) do
-    if PublicResponses.visible_seen?(stream_state) and
-         is_nil(PublicResponses.terminal_kind(stream_state)) do
-      data =
-        StreamProtocol.synthetic_public_openai_responses_failure_sse(
-          PublicResponses.response_id(stream_state),
-          reason
-        )
+    if emit_public_openai_responses_synthetic_terminal?(state, stream_state, reason) do
+      {sequence_number, stream_state} =
+        PublicResponses.track_synthetic_terminal_failure(stream_state)
 
-      stream_state = PublicResponses.mark_synthetic_terminal_failure(stream_state)
+      data =
+        StreamProtocol.synthetic_public_openai_responses_error_sse(reason, sequence_number)
 
       {data, %{state | public_openai_responses: stream_state}}
     else
@@ -117,18 +158,100 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
     end
   end
 
+  def synthetic_terminal_failure(%{public_openai_chat: stream_state} = state, reason) do
+    # Chat streams cannot use the websocket bridge. Keep this gate byte-identical
+    # to terminal_missing_interruption_reason/2 so emission and settlement agree.
+    if (owner_drain_reason?(reason) or ChatCompletions.visible_seen?(stream_state)) and
+         not ChatCompletions.terminal_seen?(stream_state) do
+      message = StreamProtocol.synthetic_public_openai_responses_failure_message()
+
+      {data, stream_state} =
+        ChatCompletions.synthetic_terminal_failure_chunk(stream_state, message)
+
+      {data, %{state | public_openai_chat: stream_state}}
+    else
+      {nil, state}
+    end
+  end
+
   def synthetic_terminal_failure(state, _reason), do: {nil, state}
+
+  # The ordinary gate asks whether the client already holds bytes this terminal
+  # would have to be consistent with: after visible output, or on a committed
+  # bridge, an interruption owes the client an explicit failure. Before any
+  # byte it deliberately stays silent, because an upstream that produced
+  # nothing may still be retried at a higher layer and a fabricated terminal
+  # would foreclose that.
+  #
+  # A drain is not that case. It is our own lifecycle event, the relay cancels
+  # upstream and finalizes once with no retry, and the response is already
+  # committed as `200 text/event-stream` by `send_chunked/2` before the
+  # deferred closure runs. Staying silent therefore hands the client a
+  # zero-byte body that is byte-identical to a successful empty response;
+  # findings 159 measured six such turns. Emit for a drain regardless of
+  # visibility.
+  #
+  # The client-visible code stays `server_error`, the same frame the
+  # post-visible drain and an ordinary interruption already send:
+  #   * It is truthful. The turn failed on our side, not on the caller's input,
+  #     and not because the account ran out of anything.
+  #   * It is the only honest *retryable* signal available in the public
+  #     OpenAI vocabulary, and retryability is the property the caller needs
+  #     here: we deliberately do not retry a drained turn ourselves, and a
+  #     pre-visible drain is the safest possible retry in the system, because
+  #     zero delivered bytes means a client retry cannot duplicate output. The
+  #     post-visible drain already uses this code in the strictly weaker case.
+  #   * A drain-specific code (`owner_drained`) would be worse on both counts:
+  #     it is not in any SDK's vocabulary, so clients would classify it as an
+  #     unknown hard failure rather than retry, and it would leak our own
+  #     rollout vocabulary onto the public wire. Drain provenance stays where
+  #     it belongs, in the request row's `owner_drained` / 499 and the attempt
+  #     metadata.
+  #
+  # This is the one place the emission gate is deliberately wider than
+  # `terminal_missing_interruption_reason/2`'s tagging gate. Tagging exists to
+  # turn a missing terminal into `{:upstream_stream_interrupted, reason}`, and
+  # for a drain that changes nothing: `Finalization.Streaming.error_code/1`
+  # maps the tagged and untagged drain to the same `owner_drained`, the same
+  # 499, and the same health-neutral completion. Widening the tagging gate as
+  # well would only make a pre-visible drain claim the upstream interrupted it.
+  defp emit_public_openai_responses_synthetic_terminal?(state, stream_state, reason) do
+    (owner_drain_reason?(reason) or PublicResponses.visible_seen?(stream_state) or
+       bridge_committed?(state)) and is_nil(PublicResponses.terminal_kind(stream_state))
+  end
+
+  defp owner_drain_reason?(:owner_drained), do: true
+
+  defp owner_drain_reason?({:upstream_stream_interrupted, reason}),
+    do: owner_drain_reason?(reason)
+
+  defp owner_drain_reason?({:upstream_websocket_bridge, reason}),
+    do: owner_drain_reason?(reason)
+
+  defp owner_drain_reason?(_reason), do: false
 
   @spec terminal_missing_interruption_reason(state(), term()) :: term()
   def terminal_missing_interruption_reason(_state, {:upstream_idle_timeout, _reason} = reason),
     do: reason
 
   def terminal_missing_interruption_reason(
-        %{public_openai_responses: stream_state},
+        %{public_openai_responses: stream_state} = state,
         original_reason
       ) do
-    if PublicResponses.visible_seen?(stream_state) and
+    if (PublicResponses.visible_seen?(stream_state) or bridge_committed?(state)) and
          is_nil(PublicResponses.terminal_kind(stream_state)) do
+      {:upstream_stream_interrupted, original_reason}
+    else
+      original_reason
+    end
+  end
+
+  def terminal_missing_interruption_reason(
+        %{public_openai_chat: stream_state},
+        original_reason
+      ) do
+    if (owner_drain_reason?(original_reason) or ChatCompletions.visible_seen?(stream_state)) and
+         not ChatCompletions.terminal_seen?(stream_state) do
       {:upstream_stream_interrupted, original_reason}
     else
       original_reason
@@ -145,6 +268,73 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   end
 
   def public_openai_responses_stream_metadata(_state), do: %{}
+
+  @spec enable_native_http_tool_observation(state()) :: state()
+  def enable_native_http_tool_observation(state),
+    do: Map.put(state, :native_http_tool_observation, NativeHttpToolObservation.new())
+
+  @spec native_http_tool_metadata(state()) :: map()
+  def native_http_tool_metadata(%{native_http_tool_observation: observation} = state) do
+    complete? = get_in(state, [:codex_responses_sse_block_state, :buffer]) == ""
+    %{"native_http_partial_tool" => NativeHttpToolObservation.metadata(observation, complete?)}
+  end
+
+  def native_http_tool_metadata(_state), do: %{}
+
+  @spec native_http_tool_started?(state()) :: boolean()
+  def native_http_tool_started?(%{native_http_tool_observation: %{call_type: type}}),
+    do: type in ["custom_tool_call", "function_call"]
+
+  def native_http_tool_started?(_state), do: false
+
+  @spec native_http_progress_metadata(state()) :: map()
+  def native_http_progress_metadata(%{native_http_progress: progress}) do
+    case ClientRetry.native_http_progress_metadata(progress) do
+      %{"output_item_done_count" => count} = metadata when count >= 0 ->
+        %{"native_http_resume_progress" => metadata, "native_http_mailbox_prefix" => ClientRetry.native_http_mailbox_prefix_metadata(progress)}
+
+      _empty ->
+        %{}
+    end
+  end
+
+  def native_http_progress_metadata(_state), do: %{}
+
+  @spec enable_native_http_progress(state()) :: state()
+  def enable_native_http_progress(state) when is_map(state),
+    do: state |> Map.put(:native_http_progress, ClientRetry.new_native_http_progress()) |> Map.put(:native_content_filter_observation, ClientRetry.new_observation())
+
+  @spec commit_native_http_progress(state()) :: state()
+  def commit_native_http_progress(
+        %{
+          native_http_progress: progress,
+          native_http_pending_output_items: pending
+        } = state
+      )
+      when is_list(pending) do
+    progress =
+      Enum.reduce_while(pending, progress, fn item, progress ->
+        case ClientRetry.observe_native_http_output_item(progress, item) do
+          %ClientRetry.NativeHttpProgress{} = next -> {:cont, next}
+          nil -> {:halt, nil}
+        end
+      end)
+
+    state
+    |> Map.put(:native_http_progress, progress)
+    |> Map.delete(:native_http_pending_output_items)
+  end
+
+  def commit_native_http_progress(state), do: state
+
+  @spec bridge_commitment_metadata(state()) :: map()
+  def bridge_commitment_metadata(%{bridge_committed?: value}) when is_boolean(value),
+    do: %{"bridge_committed" => value}
+
+  def bridge_commitment_metadata(_state), do: %{}
+
+  defp bridge_committed?(%{bridge_committed?: true}), do: true
+  defp bridge_committed?(_state), do: false
 
   defp normalize_public_openai_chat_stream_data(
          data,
@@ -173,36 +363,152 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   defp normalize_public_openai_responses_stream_data(data, state), do: {data, state}
 
   defp normalize_codex_responses_stream_data(data, endpoint, opts, state) when is_binary(data) do
-    buffer = Map.get(state, :codex_responses_sse_buffer, "")
+    sse_block_state =
+      Map.get(state, :codex_responses_sse_block_state, StreamProtocol.new_sse_block_state())
 
-    if buffer == "" and not codex_responses_sse_chunk?(data) do
-      {data, state}
+    buffer = sse_block_state.buffer
+
+    if not Map.has_key?(state, :native_http_tool_observation) and
+         buffer == "" and not sse_block_state.skip_leading_lf? and
+         not codex_responses_sse_chunk?(data) do
+      {data, state, nil}
     else
-      buffered_data = buffer <> data
-      {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffered_data, bounded?: true)
+      previous_buffer = buffer
+      buffered_size = byte_size(previous_buffer) + byte_size(data)
 
-      data =
-        if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_data) do
+      {blocks, sse_block_state} =
+        StreamProtocol.complete_sse_blocks(sse_block_state, data, bounded?: true)
+
+      buffer = sse_block_state.buffer
+      parsed = Enum.map(blocks, &NativeSSEBlock.parse/1)
+
+      {data, delivery} =
+        if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_size) do
           BufferTelemetry.record_oversized_incomplete(
             "codex_responses_sse",
-            byte_size(buffered_data),
+            buffered_size,
             StreamProtocol.max_incomplete_sse_block_bytes(),
             request_options: opts,
             endpoint: endpoint
           )
 
-          buffered_data
+          {previous_buffer <> data, nil}
         else
-          blocks
-          |> Enum.map(&StreamProtocol.normalize_codex_responses_sse_block/1)
-          |> IO.iodata_to_binary()
+          normalize_native_blocks(parsed, opts, state)
         end
 
-      {data, Map.put(state, :codex_responses_sse_buffer, buffer)}
+      state =
+        state
+        |> Map.put(:codex_responses_sse_block_state, sse_block_state)
+        |> observe_native_http_tool_blocks(parsed, buffered_size > StreamProtocol.max_incomplete_sse_block_bytes())
+        |> observe_content_filter_blocks(parsed, buffered_size > StreamProtocol.max_incomplete_sse_block_bytes())
+        |> stage_native_http_progress(parsed)
+        |> track_native_completion(parsed)
+
+      {data, state, delivery}
     end
   end
 
-  defp normalize_codex_responses_stream_data(data, _endpoint, _opts, state), do: {data, state}
+  defp normalize_codex_responses_stream_data(data, _endpoint, _opts, state),
+    do: {data, state, nil}
+
+  # An upstream EOF can supply the only missing SSE blank line. The ordinary
+  # incremental path retains that structurally complete final block while it
+  # waits for the separator; at EOF, feed just the terminator into the same
+  # bounded parser and normalization path. Incomplete residue remains withheld.
+  defp flush_codex_responses_sse_eof(
+         opts,
+         %{codex_responses_sse_block_state: %{buffer: buffer} = sse_block_state} = state
+       )
+       when is_binary(buffer) and buffer != "" do
+    {blocks, sse_block_state} =
+      StreamProtocol.complete_sse_blocks(sse_block_state, "\n\n", bounded?: true)
+
+    if blocks != [] and String.trim(sse_block_state.buffer) == "" do
+      parsed = Enum.map(blocks, &NativeSSEBlock.parse/1)
+      {data, delivery} = normalize_native_blocks(parsed, opts, state)
+
+      state =
+        state
+        |> Map.put(:codex_responses_sse_block_state, sse_block_state)
+        |> observe_native_http_tool_blocks(parsed, false)
+        |> observe_content_filter_blocks(parsed, false)
+        |> stage_native_http_progress(parsed)
+        |> track_native_completion(parsed)
+
+      {data, state, delivery}
+    else
+      {"", state, nil}
+    end
+  end
+
+  defp flush_codex_responses_sse_eof(_opts, state), do: {"", state, nil}
+
+  defp observe_content_filter_blocks(%{native_content_filter_observation: observation} = state, blocks, oversized?) do
+    observation = if oversized?, do: ClientRetry.observe_frame(observation, nil, DateTime.utc_now()), else: observation
+    observation = Enum.reduce(blocks, observation, fn block, acc -> if comment_block?(block.raw), do: acc, else: ClientRetry.observe_frame(acc, block.decoded, DateTime.utc_now()) end)
+    Map.put(state, :native_content_filter_observation, observation)
+  end
+
+  defp observe_content_filter_blocks(state, _blocks, _oversized?), do: state
+
+  defp track_native_completion(%{target: :websocket} = state, _blocks), do: state
+
+  defp track_native_completion(state, blocks) do
+    Enum.reduce(blocks, state, fn block, state ->
+      case NativeSSEBlock.outcome(block) do
+        {:ok, %{kind: :incomplete} = outcome} -> Map.put_new(state, :native_content_filter_outcome, {:ok, outcome})
+        {:ok, %{kind: :completed}} -> Map.put(state, :native_terminal_outcome, :completed)
+        _outcome -> state
+      end
+    end)
+  end
+
+  defp stage_native_http_progress(%{native_http_progress: _progress} = state, blocks) do
+    pending =
+      Enum.flat_map(blocks, fn block ->
+        case block do
+          %{event_type: "response.output_item.done", decoded: %{"item" => %{} = item}} -> [item]
+          _other -> []
+        end
+      end)
+
+    if pending == [] do
+      state
+    else
+      Map.update(state, :native_http_pending_output_items, pending, &(&1 ++ pending))
+    end
+  end
+
+  defp stage_native_http_progress(state, _blocks), do: state
+
+  defp observe_native_http_tool_blocks(%{native_http_tool_observation: observation} = state, blocks, oversized?) do
+    observation = if oversized?, do: NativeHttpToolObservation.poison(observation), else: observation
+
+    observation =
+      Enum.reduce(blocks, observation, fn block, observation ->
+        if comment_block?(block.raw) do
+          observation
+        else
+          NativeHttpToolObservation.observe(observation, block.event_type, block.decoded)
+        end
+      end)
+
+    Map.put(state, :native_http_tool_observation, observation)
+  end
+
+  defp observe_native_http_tool_blocks(state, _blocks, _oversized?), do: state
+
+  defp comment_block?(raw),
+    do: raw |> String.split(["\r\n", "\n", "\r"]) |> Enum.all?(&(&1 == "" or String.starts_with?(&1, ":")))
+
+  defp normalize_native_blocks(blocks, opts, %{target: target}) do
+    private_details? = target != :websocket and MisalignmentPolicyViolation.details_allowed?(opts)
+    outputs = Enum.map(blocks, &NativeSSEBlock.normalize(&1, private_details?))
+    data = outputs |> Enum.map(&elem(&1, 0)) |> IO.iodata_to_binary()
+    delivery = if target != :websocket, do: NativeSSEBlock.delivery(outputs)
+    {data, delivery}
+  end
 
   defp normalize_endpoint_data("/backend-api/codex/responses", data) when is_binary(data) do
     StreamProtocol.normalize_codex_responses_sse_data(data)
@@ -228,14 +534,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   defp codex_responses_sse_chunk?(data) when is_binary(data) do
     String.starts_with?(data, "event: ") or String.starts_with?(data, "data: ") or
-      String.contains?(data, "\nevent: ") or String.contains?(data, "\ndata: ") or
-      String.contains?(data, "\n\n")
+      String.contains?(data, ["\nevent: ", "\revent: "]) or
+      String.contains?(data, ["\ndata: ", "\rdata: "]) or
+      String.contains?(data, ["\n\n", "\n\r", "\r\r"])
   end
 
-  defp oversized_incomplete_sse_prefix?([], "", data),
-    do: StreamProtocol.oversized_incomplete_sse_block?(data)
+  defp oversized_incomplete_sse_prefix?([], "", buffered_size),
+    do: buffered_size > StreamProtocol.max_incomplete_sse_block_bytes()
 
-  defp oversized_incomplete_sse_prefix?(_blocks, _buffer, _data), do: false
+  defp oversized_incomplete_sse_prefix?(_blocks, _buffer, _buffered_size), do: false
 
   defp public_openai_chat_stream?(%RequestOptions{
          openai_compatibility: %{public_openai_chat_stream: true}

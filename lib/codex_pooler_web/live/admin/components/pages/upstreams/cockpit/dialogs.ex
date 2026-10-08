@@ -4,28 +4,49 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
   use CodexPoolerWeb, :html
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.UpstreamOAuthDialogComponents
 
-  @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
-  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+  @oauth_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#openai-oauth-upstream-linking"
+  @upstream_actions_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
+
+  attr :account_label, :string, required: true
+  attr :oauth_relinking, :boolean, required: true
+  attr :oauth_relink_form, :any, required: true
+  attr :oauth_relink_flow, :map, default: nil
+  attr :oauth_relink_authorization_url, :string, default: nil
+  attr :oauth_relink_result, :map, default: nil
+  attr :oauth_relink_error, :map, default: nil
+  attr :datetime_preferences, :map, default: %{}
 
   def oauth_relink_dialog(assigns) do
     assigns = assign(assigns, :oauth_docs_url, @oauth_docs_url)
 
     ~H"""
-    <dialog :if={@oauth_relinking} id="oauth-relink-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-primary">
+    <dialog
+      :if={@oauth_relinking}
+      id="oauth-relink-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-xs font-semibold uppercase tracking-wide text-primary">
             OpenAI OAuth
           </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Relink OpenAI account</h2>
-          <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Reconnect this upstream identity with browser authorization or a device code.
+          <h2 class="mt-1 text-xl font-bold text-base-content sm:text-2xl">
+            {oauth_relink_title(@account_label, @oauth_relink_flow)}
+          </h2>
+          <p class="mt-1.5 max-w-xl text-sm leading-5 text-base-content/65">
+            {oauth_relink_description(@oauth_relink_flow)}
           </p>
         </div>
 
-        <div class="grid gap-5 p-6">
-          <div :if={@oauth_relink_result} id="oauth-relink-status" class="alert alert-success">
+        <div class="grid gap-5 p-5 sm:p-6">
+          <div
+            :if={@oauth_relink_result && !oauth_relink_pending?(@oauth_relink_flow)}
+            id="oauth-relink-status"
+            class="alert alert-success"
+          >
             <.icon name="hero-check-circle" class="size-5" />
             <span>{@oauth_relink_result.message}</span>
           </div>
@@ -35,103 +56,51 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
             <span>{@oauth_relink_error.message}</span>
           </div>
 
-          <div :if={oauth_relink_start_visible?(@oauth_relink_flow)} class="flex flex-wrap gap-2">
-            <AdminComponents.action_button
-              id="oauth-relink-browser-start"
-              icon="hero-arrow-top-right-on-square"
-              label="Browser"
-              phx-click="start_oauth_relink_browser"
-              variant={:primary}
+          <UpstreamOAuthDialogComponents.method_doors
+            :if={oauth_relink_start_visible?(@oauth_relink_flow)}
+            id_prefix="oauth-relink"
+            browser_event="start_oauth_relink_browser"
+            device_event="start_oauth_relink_device"
+          />
+
+          <section :if={oauth_relink_browser_flow?(@oauth_relink_flow, @oauth_relink_authorization_url)}>
+            <UpstreamOAuthDialogComponents.browser_authorization_step
+              id_prefix="oauth-relink"
+              authorization_url={@oauth_relink_authorization_url}
+              form={@oauth_relink_form}
+              submit_event="submit_oauth_relink_callback"
+              submit_label="Complete relink"
             />
-            <AdminComponents.action_button
-              id="oauth-relink-device-start"
-              icon="hero-device-phone-mobile"
-              label="Device code"
-              phx-click="start_oauth_relink_device"
-            />
-          </div>
-
-          <section
-            :if={oauth_relink_browser_flow?(@oauth_relink_flow, @oauth_relink_authorization_url)}
-            class="grid gap-4 rounded-lg border border-base-300 bg-base-200/40 p-4"
-          >
-            <a
-              id="oauth-relink-authorization-url"
-              href={@oauth_relink_authorization_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="btn btn-primary w-full justify-start gap-2 text-left"
-            >
-              <.icon name="hero-arrow-top-right-on-square" class="size-4 shrink-0" />
-              <span class="truncate">Open OpenAI authorization</span>
-            </a>
-
-            <.form
-              id="oauth-relink-callback-form"
-              for={@oauth_relink_form}
-              phx-submit="submit_oauth_relink_callback"
-              autocomplete="off"
-              class="grid gap-3"
-            >
-              <div class="grid gap-2">
-                <label
-                  for="oauth-relink-callback-url"
-                  class="text-xs font-semibold uppercase tracking-wide text-base-content/60"
-                >
-                  Callback URL
-                </label>
-                <input
-                  id="oauth-relink-callback-url"
-                  name={@oauth_relink_form[:callback_url].name}
-                  value=""
-                  type="url"
-                  autocomplete="off"
-                  class="input input-bordered w-full"
-                />
-              </div>
-
-              <AdminComponents.action_button
-                id="oauth-relink-submit-callback"
-                icon="hero-check"
-                label="Complete relink"
-                type="submit"
-                variant={:primary}
-              />
-            </.form>
           </section>
 
-          <section
+          <UpstreamOAuthDialogComponents.device_authorization_step
             :if={oauth_relink_device_flow?(@oauth_relink_flow)}
-            id="oauth-relink-device-code"
-            class="grid gap-3 rounded-lg border border-base-300 bg-base-200/40 p-4"
-          >
-            <div class="grid gap-1">
-              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-                Device code
-              </p>
-              <p class="font-mono text-2xl font-bold tracking-widest text-base-content">
-                {@oauth_relink_flow.device_user_code}
-              </p>
-            </div>
-            <a
-              :if={@oauth_relink_flow.verification_uri}
-              href={@oauth_relink_flow.verification_uri}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="link link-primary break-all text-sm"
-            >
-              {@oauth_relink_flow.verification_uri}
-            </a>
-          </section>
+            id_prefix="oauth-relink"
+            user_code={@oauth_relink_flow.device_user_code}
+            verification_uri={@oauth_relink_flow.verification_uri}
+            interval_seconds={Map.get(@oauth_relink_flow, :interval_seconds)}
+            expires_at={Map.get(@oauth_relink_flow, :expires_at)}
+            datetime_preferences={@datetime_preferences}
+            status={oauth_relink_pending_status(@oauth_relink_result, @oauth_relink_flow)}
+          />
         </div>
 
         <AdminComponents.dialog_footer id="oauth-relink-dialog-footer" docs_url={@oauth_docs_url}>
           <:actions>
             <AdminComponents.action_button
               id="oauth-relink-cancel"
-              icon="hero-x-mark"
               label={oauth_relink_dialog_dismiss_label(@oauth_relink_flow)}
               phx-click="cancel_oauth_relink"
+              variant={:ghost}
+            />
+            <AdminComponents.action_button
+              :if={oauth_relink_browser_flow?(@oauth_relink_flow, @oauth_relink_authorization_url)}
+              id={UpstreamOAuthDialogComponents.callback_submit_id("oauth-relink")}
+              icon="hero-check"
+              label="Complete relink"
+              type="submit"
+              form={UpstreamOAuthDialogComponents.callback_form_id("oauth-relink")}
+              variant={:primary}
             />
           </:actions>
         </AdminComponents.dialog_footer>
@@ -150,9 +119,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
     assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
 
     ~H"""
-    <dialog :if={@account && @form} id="cockpit-rename-upstream-account-dialog" class="modal" open>
-      <div class="modal-box max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+    <dialog
+      :if={@account && @form}
+      id="cockpit-rename-upstream-account-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">Upstream account</p>
           <h2 class="mt-1 text-2xl font-bold text-base-content">Rename upstream account</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
@@ -165,7 +139,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           phx-change="validate_rename_account"
           phx-submit="rename_account"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@form[:account_label]} type="text" label="Label" required />
         </.form>
@@ -206,15 +180,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
     assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
 
     ~H"""
-    <dialog :if={@account} id="cockpit-delete-upstream-account-dialog" class="modal" open>
-      <div class="modal-box max-w-xl border border-error/30 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-error/20 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-error">
-            Delete upstream account
-          </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Confirm upstream account deletion</h2>
+    <dialog
+      :if={@account}
+      id="cockpit-delete-upstream-account-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">Upstream account</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete {@account.label}?</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Type the account label exactly to remove this upstream account from operator routing surfaces.
+            This permanently removes the account, credentials, quotas, Pool assignments, and account-specific statistics from the database.
+            Shared request accounting remains without an account association. This cannot be undone.
           </p>
         </div>
         <.form
@@ -222,19 +200,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           for={@form}
           phx-submit="confirm_delete_account"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@form[:id]} type="hidden" />
-          <p class="rounded-box border border-base-300 bg-base-200/60 p-3 text-sm text-base-content/70">
-            Confirmation label: <span class="font-semibold text-base-content">{@account.label}</span>
-          </p>
           <.input
             field={@form[:confirmation_label]}
             type="text"
-            label="Account label confirmation"
+            pattern={Regex.escape(@account.label)}
             placeholder={@account.label}
             required
-          />
+          >
+            <:label_content>
+              Type <span class="font-semibold text-base-content">{@account.label}</span> to confirm
+            </:label_content>
+          </.input>
         </.form>
 
         <AdminComponents.dialog_footer
@@ -279,6 +258,42 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
 
   defp oauth_relink_device_flow?(%{flow_kind: "device", status: "pending"}), do: true
   defp oauth_relink_device_flow?(_flow), do: false
+
+  # The pending message belongs to the running flow, so it renders inside that
+  # flow's section instead of floating above the dialog body.
+  defp oauth_relink_pending_status(%{message: message}, %{status: "pending"})
+       when is_binary(message) and message != "",
+       do: message
+
+  defp oauth_relink_pending_status(_result, _flow), do: nil
+
+  defp oauth_relink_pending?(%{status: "pending"}), do: true
+  defp oauth_relink_pending?(_flow), do: false
+
+  # Mirrors the link dialog: once the flow completes the header states the
+  # outcome instead of repeating the instructions. This dialog needs no cockpit
+  # link of its own - `OAuthRelinkWorkflow.complete/3` refreshes the page already
+  # underneath it.
+  defp oauth_relink_title(account_label, %{status: "completed"}),
+    do: "#{account_label} reauthorized"
+
+  defp oauth_relink_title(account_label, _flow), do: "Relink #{account_label}"
+
+  defp oauth_relink_description(%{status: "completed"}) do
+    "This page already shows the refreshed authorization."
+  end
+
+  defp oauth_relink_description(%{flow_kind: "browser", status: "pending"}) do
+    "Authorize with OpenAI, then paste the returned callback URL to finish."
+  end
+
+  defp oauth_relink_description(%{flow_kind: "device", status: "pending"}) do
+    "Finish the device authorization in your browser. This dialog updates when the account is ready."
+  end
+
+  defp oauth_relink_description(_flow) do
+    "Reconnect this upstream identity with browser authorization or a device code."
+  end
 
   defp oauth_relink_dialog_dismiss_label(%{status: "completed"}), do: "Close"
   defp oauth_relink_dialog_dismiss_label(_flow), do: "Cancel"

@@ -5,12 +5,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   alias CodexPooler.Gateway.Metadata
   alias CodexPooler.Gateway.OpenAICompatibility.{Chat, ChatCompletions}
   alias CodexPooler.Gateway.Payloads.{CompactionTrigger, RequestOptions}
+  alias CodexPooler.Gateway.Payloads.RequestOptions.CompactionProjectionContext
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
   alias CodexPoolerWeb.PublicGatewayDispatch
 
+  # The Codex turn routes, whose Pool-exhausted refusal the Codex Desktop app
+  # reads as `GatewayHelpers.native_usage_limit_answer/2` renders it
+  # (findings#279 point 2).
+  @codex_turn_endpoints ["/backend-api/codex/responses", "/backend-api/codex/v1/responses", "/backend-api/codex/responses/compact", "/backend-api/codex/v1/responses/compact"]
+
   def models(conn, _params) do
-    serve_models(conn, "/backend-api/codex/models")
+    serve_models(conn, "/backend-api/codex/models", "/backend-api/codex/models")
   end
 
   def v1_models(conn, _params) do
@@ -18,11 +24,23 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   end
 
   def image_generations(conn, _params) do
-    proxy(conn, "/backend-api/codex/images/generations", "/backend-api/codex/images/generations")
+    proxy(
+      conn,
+      "/backend-api/codex/images/generations",
+      "/backend-api/codex/images/generations",
+      native_image_request?: true,
+      image_generation_permission_required?: true
+    )
   end
 
   def image_edits(conn, _params) do
-    proxy(conn, "/backend-api/codex/images/edits", "/backend-api/codex/images/edits")
+    proxy(
+      conn,
+      "/backend-api/codex/images/edits",
+      "/backend-api/codex/images/edits",
+      native_image_request?: true,
+      image_generation_permission_required?: true
+    )
   end
 
   def responses(conn, _params) do
@@ -95,10 +113,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   end
 
   defp proxy(conn, local_endpoint, upstream_endpoint) do
-    proxy(conn, local_endpoint, upstream_endpoint, local_endpoint)
+    proxy(conn, local_endpoint, upstream_endpoint, local_endpoint, [])
   end
 
-  defp proxy(conn, local_endpoint, upstream_endpoint, accounting_endpoint) do
+  defp proxy(conn, local_endpoint, upstream_endpoint, private_opts) when is_list(private_opts) do
+    proxy(conn, local_endpoint, upstream_endpoint, local_endpoint, private_opts)
+  end
+
+  defp proxy(conn, local_endpoint, upstream_endpoint, accounting_endpoint)
+       when is_binary(accounting_endpoint) do
+    proxy(conn, local_endpoint, upstream_endpoint, accounting_endpoint, [])
+  end
+
+  defp proxy(conn, local_endpoint, upstream_endpoint, accounting_endpoint, private_opts) do
     result =
       with {:ok, auth} <- GatewayHelpers.authenticate(conn),
            {:ok, payload} <- GatewayHelpers.read_json_body(conn) do
@@ -108,10 +135,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
           upstream_endpoint,
           accounting_endpoint,
           auth,
-          payload
+          payload,
+          private_opts
         )
       end
 
+    result = if local_endpoint in @codex_turn_endpoints, do: GatewayHelpers.native_usage_limit_answer(conn, result), else: result
     GatewayHelpers.send_or_error(conn, result)
   end
 
@@ -121,11 +150,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
          upstream_endpoint,
          accounting_endpoint,
          auth,
-         payload
+         payload,
+         private_opts
        ) do
     opts =
       conn
       |> GatewayHelpers.request_opts()
+      |> Map.merge(Map.new(private_opts))
 
     case CompactionTrigger.prepare_bridge(local_endpoint, payload) do
       :passthrough ->
@@ -140,31 +171,51 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
         )
 
       {:ok, compact_payload} ->
-        proxy_compaction_trigger_bridge(conn, local_endpoint, auth, compact_payload, opts)
+        proxy_compaction_trigger_bridge(
+          conn,
+          local_endpoint,
+          auth,
+          payload,
+          compact_payload,
+          opts,
+          CompactionTrigger.compaction_result_transport(payload)
+        )
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp proxy_compaction_trigger_bridge(conn, local_endpoint, auth, compact_payload, opts) do
+  defp proxy_compaction_trigger_bridge(
+         conn,
+         local_endpoint,
+         auth,
+         downstream_payload,
+         compact_payload,
+         opts,
+         result_transport
+       ) do
     compact_endpoint = "/backend-api/codex/responses/compact"
+    compact_payload = CompactionTrigger.put_client_fields(compact_payload, downstream_payload)
 
     conn
     |> PublicGatewayDispatch.dispatch_json_payload(
       auth,
       compact_endpoint,
-      compact_endpoint,
+      "/backend-api/codex/responses",
       compact_endpoint,
       compact_payload,
       admission_endpoint: local_endpoint,
-      request_opts: opts
+      request_opts:
+        opts
+        |> Map.put(:compaction_trigger_bridge?, true)
+        |> Map.put(:compaction_result_transport, result_transport)
+        |> Map.put(
+          :compaction_projection_context,
+          CompactionProjectionContext.new(downstream_payload, compact_payload)
+        )
     )
     |> CompactionTrigger.adapt_gateway_result()
-  end
-
-  defp serve_models(conn, endpoint) do
-    serve_models(conn, endpoint, endpoint)
   end
 
   defp serve_models(conn, endpoint, accounting_endpoint) do
@@ -176,10 +227,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
             RouteClass.proxy_http(),
             %{endpoint: endpoint},
             fn ->
-              Metadata.serve_codex_models(
-                auth,
-                metadata_request_options(conn, accounting_endpoint)
-              )
+              Metadata.serve_codex_models(auth, metadata_request_options(conn, accounting_endpoint))
             end
           )
 

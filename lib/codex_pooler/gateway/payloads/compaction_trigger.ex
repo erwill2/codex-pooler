@@ -2,32 +2,103 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   @moduledoc false
 
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.OpenAICompatibility.Error
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+
+  @public_response_endpoint "/v1/responses"
 
   @backend_response_endpoints [
     "/backend-api/codex/responses",
     "/backend-api/codex/v1/responses"
   ]
 
+  @compact_endpoints [
+    "/backend-api/codex/responses/compact",
+    "/backend-api/codex/v1/responses/compact"
+  ]
+
   @compact_payload_keys ~w(
     model
     instructions
     input
+    tools
+    parallel_tool_calls
     reasoning
     service_tier
     prompt_cache_key
-    previous_response_id
-    conversation
+    prompt_cache_options
+    text
   )
+
+  # What a native Codex client's compaction carries besides the compaction's
+  # own fields, and what it reaches the provider with: its metadata (turn
+  # metadata among it), `include` and `tool_choice`, as every other request of
+  # its turn does (findings#270 row 270-368).
+  @client_fields ~w(client_metadata include tool_choice)
 
   @stream_headers [{"content-type", "text/event-stream"}]
 
   @type payload :: %{optional(String.t()) => term()}
   @type bridge_decision :: :passthrough | {:ok, payload()} | {:error, Contracts.gateway_error()}
+  @type compaction_input_mode :: :incremental | :full_history
+  @type compaction_result_transport :: :buffered | :sse
+
+  @spec compaction_input_mode(payload()) :: compaction_input_mode()
+  def compaction_input_mode(%{"previous_response_id" => response_id})
+      when is_binary(response_id) do
+    if String.trim(response_id) == "", do: :full_history, else: :incremental
+  end
+
+  def compaction_input_mode(%{}), do: :full_history
+
+  @spec compaction_result_transport(payload()) :: compaction_result_transport()
+  def compaction_result_transport(%{"stream" => true}), do: :sse
+
+  def compaction_result_transport(%{"input" => input} = payload) when is_list(input) do
+    if Enum.any?(input, &match?(%{"type" => "compaction_trigger"}, &1)),
+      do: :sse,
+      else: declared_result_transport(payload)
+  end
+
+  def compaction_result_transport(payload), do: declared_result_transport(payload)
+
+  defp declared_result_transport(%{"client_metadata" => %{} = metadata}) do
+    case metadata["x-codex-turn-metadata"] do
+      %{"compaction" => %{"implementation" => "responses_compaction_v2"}} ->
+        :sse
+
+      turn_metadata when is_binary(turn_metadata) ->
+        case CodexPooler.JSON.decode(turn_metadata) do
+          {:ok, %{"compaction" => %{"implementation" => "responses_compaction_v2"}}} -> :sse
+          _result -> :buffered
+        end
+
+      _value ->
+        :buffered
+    end
+  end
+
+  defp declared_result_transport(%{}), do: :buffered
+
+  @spec v2_streaming?(payload()) :: boolean()
+  def v2_streaming?(payload), do: declared_result_transport(payload) == :sse
+
+  @type result_mode :: :sse | :public_sse | :response | :websocket | :native_websocket
 
   @spec prepare_bridge(String.t(), payload()) :: bridge_decision()
+  def prepare_bridge(@public_response_endpoint, %{"input" => input} = payload)
+      when is_list(input) do
+    prepare_input_bridge(payload, require_visible?: true)
+  end
+
+  def prepare_bridge(@public_response_endpoint, payload) when is_map(payload), do: :passthrough
+
   def prepare_bridge(local_endpoint, payload)
       when is_binary(local_endpoint) and is_map(payload) do
     cond do
+      local_endpoint in @compact_endpoints ->
+        validate_direct_compact_payload(payload)
+
       local_endpoint not in @backend_response_endpoints ->
         :passthrough
 
@@ -38,32 +109,107 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
         :passthrough
 
       true ->
-        prepare_input_bridge(payload)
+        prepare_input_bridge(payload, require_visible?: false)
     end
   end
+
+  @spec validate_projection(payload()) :: :ok | {:error, Contracts.gateway_error()}
+  def validate_projection(payload) when is_map(payload) do
+    cond do
+      Map.has_key?(payload, "tools") and not is_list(payload["tools"]) ->
+        {:error, Error.invalid_request("tools must be an array", "tools")}
+
+      Map.has_key?(payload, "parallel_tool_calls") and
+          not is_boolean(payload["parallel_tool_calls"]) ->
+        {:error, Error.invalid_request("parallel_tool_calls must be a boolean", "parallel_tool_calls")}
+
+      Map.has_key?(payload, "text") and not is_map(payload["text"]) ->
+        {:error, Error.invalid_request("text must be an object", "text")}
+
+      true ->
+        :ok
+    end
+  end
+
+  @spec project_native_payload(payload()) :: payload()
+  def project_native_payload(payload) when is_map(payload) do
+    payload
+    |> Map.take(@compact_payload_keys)
+    |> maybe_put_prompt_cache_key(payload)
+    |> remove_compaction_triggers()
+  end
+
+  @spec project_responses_payload(payload(), :buffered | :sse) :: payload()
+  def project_responses_payload(payload, result_transport \\ :buffered)
+
+  def project_responses_payload(payload, result_transport)
+      when is_map(payload) and result_transport in [:buffered, :sse] do
+    payload
+    |> Map.take(["store" | @compact_payload_keys])
+    |> maybe_put_prompt_cache_key(payload)
+    |> Map.put("store", false)
+    |> maybe_put_stream(result_transport)
+    |> maybe_put_previous_response_id(payload)
+  end
+
+  @doc """
+  Restores the native client's metadata, include and tool choice after compact projection.
+
+  The released client sends these fields on remote compaction Responses requests.
+  Native bridges preserve them with the same normalization as ordinary turns;
+  direct compact aliases and public `/v1` compaction keep the narrow projection.
+  """
+  @spec put_client_fields(payload(), payload()) :: payload()
+  def put_client_fields(compact_payload, source) when is_map(compact_payload) and is_map(source) do
+    source
+    |> Map.take(@client_fields)
+    |> Enum.reject(fn {_field, value} -> is_nil(value) end)
+    |> Enum.into(compact_payload)
+  end
+
+  @doc "The fields `put_client_fields/2` puts back, which no claim over a bridged compaction binds."
+  @spec client_fields() :: [String.t()]
+  def client_fields, do: @client_fields
+
+  @spec streaming_result?(RequestOptions.t()) :: boolean()
+  def streaming_result?(%RequestOptions{
+        payload_context: %{
+          compaction_trigger_bridge?: true,
+          compaction_result_transport: :sse
+        }
+      }),
+      do: true
+
+  def streaming_result?(%RequestOptions{}), do: false
 
   @spec adapt_gateway_result(
           {:ok, Contracts.gateway_result()}
           | {:error, Contracts.gateway_error()}
         ) ::
           {:ok, Contracts.gateway_result()} | {:error, Contracts.gateway_error()}
-  def adapt_gateway_result({:ok, %{status: status} = result})
-      when is_integer(status) and status >= 200 and status < 300 do
+  def adapt_gateway_result(result), do: adapt_gateway_result(result, :sse)
+
+  @spec adapt_gateway_result(
+          {:ok, Contracts.gateway_result()}
+          | {:error, Contracts.gateway_error()},
+          result_mode()
+        ) ::
+          {:ok, Contracts.gateway_result()} | {:error, Contracts.gateway_error()}
+  def adapt_gateway_result({:ok, %{status: status} = result}, mode)
+      when mode in [:sse, :public_sse, :response, :websocket, :native_websocket] and
+             is_integer(status) and
+             status >= 200 and status < 300 do
     with {:ok, decoded} <- decode_result(result),
-         {:ok, encrypted_content} <- encrypted_content(decoded) do
-      {:ok,
-       %{
-         status: 200,
-         headers: stream_headers(result),
-         raw_body: sse_body(decoded, encrypted_content)
-       }}
+         {:ok, item} <- compaction_item(decoded, mode) do
+      {:ok, adapted_result(result, decoded, item, mode)}
     else
       {:error, :invalid_json} ->
         {:error,
          %{
            status: 502,
            code: "invalid_compaction_response",
-           message: "upstream compact response was not valid JSON"
+           message: "upstream compact response was not valid JSON",
+           compaction_invalid_reason: "invalid_json"
          }}
 
       {:error, :missing_encrypted_content} ->
@@ -71,14 +217,24 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
          %{
            status: 502,
            code: "invalid_compaction_response",
-           message: "upstream compact response did not include encrypted compaction content"
+           message: "upstream compact response did not include encrypted compaction content",
+           compaction_invalid_reason: "missing_encrypted_content"
          }}
     end
   end
 
-  def adapt_gateway_result(result), do: result
+  def adapt_gateway_result(result, _mode), do: result
 
-  defp prepare_input_bridge(%{"input" => input} = payload) do
+  defp prepare_input_bridge(
+         %{"input" => [%{"type" => "compaction_trigger"}]} = payload,
+         require_visible?: false
+       ) do
+    payload
+    |> compact_payload()
+    |> validate_compact_payload()
+  end
+
+  defp prepare_input_bridge(%{"input" => input} = payload, require_visible?: require_visible?) do
     trigger_indexes = trigger_indexes(input)
 
     cond do
@@ -91,11 +247,27 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
       length(input) < 2 ->
         {:error, invalid_trigger_error()}
 
-      not visible_input_before_trigger?(input) ->
+      require_visible? and compaction_input_mode(payload) != :incremental and
+          not visible_input_before_trigger?(input) ->
         {:error, invalid_trigger_error()}
 
       true ->
-        {:ok, compact_payload(payload)}
+        compact_payload(payload)
+        |> validate_compact_payload()
+    end
+  end
+
+  defp validate_direct_compact_payload(payload) do
+    case validate_projection(payload) do
+      :ok -> :passthrough
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp validate_compact_payload(payload) do
+    case validate_projection(payload) do
+      :ok -> {:ok, payload}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -148,6 +320,10 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     visible_text?(Map.get(part, "image_url")) or visible_text?(Map.get(part, "file_id"))
   end
 
+  defp visible_part?(%{"type" => "input_audio"} = part) do
+    visible_text?(Map.get(part, "audio_url"))
+  end
+
   defp visible_part?(%{"type" => "input_file"} = part) do
     visible_text?(Map.get(part, "file_id"))
   end
@@ -157,12 +333,14 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   defp visible_text?(value) when is_binary(value), do: String.trim(value) != ""
   defp visible_text?(_value), do: false
 
-  defp compact_payload(payload) do
-    payload
-    |> Map.take(@compact_payload_keys)
-    |> Map.put("input", payload["input"] |> Enum.drop(-1))
-    |> maybe_put_prompt_cache_key(payload)
+  defp compact_payload(payload),
+    do: project_responses_payload(payload, compaction_result_transport(payload))
+
+  defp remove_compaction_triggers(%{"input" => input} = payload) when is_list(input) do
+    Map.put(payload, "input", Enum.reject(input, &match?(%{"type" => "compaction_trigger"}, &1)))
   end
+
+  defp remove_compaction_triggers(payload), do: payload
 
   defp maybe_put_prompt_cache_key(compact_payload, %{"prompt_cache_key" => value}) do
     Map.put(compact_payload, "prompt_cache_key", value)
@@ -174,8 +352,22 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
 
   defp maybe_put_prompt_cache_key(compact_payload, _payload), do: compact_payload
 
+  defp maybe_put_previous_response_id(compact_payload, %{"previous_response_id" => response_id})
+       when is_binary(response_id) do
+    if String.trim(response_id) == "" do
+      compact_payload
+    else
+      Map.put(compact_payload, "previous_response_id", response_id)
+    end
+  end
+
+  defp maybe_put_previous_response_id(compact_payload, _payload), do: compact_payload
+
+  defp maybe_put_stream(payload, :sse), do: Map.put(payload, "stream", true)
+  defp maybe_put_stream(payload, :buffered), do: Map.delete(payload, "stream")
+
   defp decode_result(%{raw_body: body}) when is_binary(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       _result -> {:error, :invalid_json}
     end
@@ -184,42 +376,145 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   defp decode_result(%{body: body}) when is_map(body), do: {:ok, body}
   defp decode_result(_result), do: {:error, :invalid_json}
 
-  defp encrypted_content(%{"output" => output} = decoded) when is_list(output) do
+  defp compaction_item(%{"output" => output} = decoded) when is_list(output) do
     output
     |> Enum.find_value(fn
-      %{"type" => type, "encrypted_content" => content}
+      %{"type" => type, "encrypted_content" => content} = item
       when type in ["compaction", "compaction_summary"] and is_binary(content) ->
-        content
+        validate_native_compaction_item(item)
 
       _item ->
         nil
     end)
     |> case do
-      nil -> encrypted_content_from_summary(decoded)
-      content -> {:ok, content}
+      nil -> compaction_item_from_summary(decoded)
+      result -> result
     end
   end
 
-  defp encrypted_content(decoded), do: encrypted_content_from_summary(decoded)
+  defp compaction_item(decoded), do: compaction_item_from_summary(decoded)
 
-  defp encrypted_content_from_summary(%{
-         "compaction_summary" => %{"encrypted_content" => content}
-       })
-       when is_binary(content),
-       do: {:ok, content}
+  defp compaction_item(decoded, :sse), do: compaction_item(decoded)
 
-  defp encrypted_content_from_summary(_decoded), do: {:error, :missing_encrypted_content}
+  defp compaction_item(decoded, :native_websocket), do: compaction_item(decoded)
 
-  defp sse_body(decoded, encrypted_content) do
-    item = %{"type" => "compaction", "encrypted_content" => encrypted_content}
+  defp compaction_item(decoded, mode) when mode in [:public_sse, :response, :websocket],
+    do: public_compaction_item(decoded)
 
-    response =
-      %{
-        "id" => response_id(decoded),
-        "status" => "completed",
-        "output" => [item]
-      }
-      |> maybe_put_usage(decoded)
+  defp compaction_item_from_summary(%{"compaction_summary" => item}) when is_map(item),
+    do: validate_native_compaction_item(item)
+
+  defp compaction_item_from_summary(_decoded), do: {:error, :missing_encrypted_content}
+
+  defp validate_native_compaction_item(%{"encrypted_content" => content} = source_item)
+       when is_binary(content) do
+    if nonblank_compaction_content?(content) do
+      {:ok, normalize_native_item(source_item)}
+    else
+      {:error, :missing_encrypted_content}
+    end
+  end
+
+  defp validate_native_compaction_item(_source_item),
+    do: {:error, :missing_encrypted_content}
+
+  defp public_compaction_item(%{"output" => output} = decoded) when is_list(output) do
+    case Enum.find(output, &public_compaction_candidate?/1) do
+      nil -> public_compaction_item_from_summary(decoded)
+      candidate -> validate_public_compaction_item(candidate)
+    end
+  end
+
+  defp public_compaction_item(decoded), do: public_compaction_item_from_summary(decoded)
+
+  defp public_compaction_candidate?(%{"type" => type})
+       when type in ["compaction", "compaction_summary"],
+       do: true
+
+  defp public_compaction_candidate?(_item), do: false
+
+  defp public_compaction_item_from_summary(%{"compaction_summary" => item}) when is_map(item),
+    do: validate_public_compaction_item(item)
+
+  defp public_compaction_item_from_summary(_decoded), do: {:error, :missing_encrypted_content}
+
+  defp validate_public_compaction_item(%{"encrypted_content" => content} = source_item)
+       when is_binary(content) do
+    if nonblank_compaction_content?(content) do
+      {:ok, normalize_public_compaction_item(source_item)}
+    else
+      {:error, :missing_encrypted_content}
+    end
+  end
+
+  defp validate_public_compaction_item(_source_item),
+    do: {:error, :missing_encrypted_content}
+
+  defp nonblank_compaction_content?(content), do: String.trim(content) != ""
+
+  # Every public compaction output item carries a string id: the SDK stream
+  # helpers and types require one (openai-node refuses an empty id, and
+  # `@ai-sdk/openai` and openai-python type it as a string), and the provider's
+  # own public stream always sends a `cmp_` id. When the upstream item has
+  # none, the id is derived from the encrypted content, so it is stable for the
+  # item and recognizable on replay, where the `/v1` input adapter drops it
+  # again and the upstream receives the item as it produced it (findings#254).
+  defp normalize_public_compaction_item(source_item) do
+    encrypted_content = source_item["encrypted_content"]
+
+    id =
+      case Map.get(source_item, "id") do
+        id when is_binary(id) -> if String.trim(id) == "", do: public_compaction_item_id(encrypted_content), else: id
+        _absent_or_null -> public_compaction_item_id(encrypted_content)
+      end
+
+    %{"type" => "compaction", "encrypted_content" => encrypted_content, "id" => id}
+  end
+
+  @doc false
+  @spec public_compaction_item_id(String.t()) :: String.t()
+  def public_compaction_item_id(encrypted_content) when is_binary(encrypted_content) do
+    digest =
+      :crypto.hash(:sha256, ["codex-pooler/public-compaction-item/v1\n", encrypted_content])
+      |> Base.encode16(case: :lower)
+
+    "cmp_" <> binary_part(digest, 0, 40)
+  end
+
+  @doc false
+  @spec derived_public_compaction_item_id?(term(), term()) :: boolean()
+  def derived_public_compaction_item_id?(id, encrypted_content)
+      when is_binary(id) and is_binary(encrypted_content),
+      do: id == public_compaction_item_id(encrypted_content)
+
+  def derived_public_compaction_item_id?(_id, _encrypted_content), do: false
+
+  @doc false
+  @spec normalize_native_item(payload()) :: payload()
+  def normalize_native_item(source_item) when is_map(source_item) do
+    %{
+      "type" => "compaction",
+      "encrypted_content" => source_item["encrypted_content"]
+    }
+    |> maybe_put_item_id(source_item)
+    |> maybe_put_turn_id(source_item)
+  end
+
+  defp maybe_put_item_id(item, %{"id" => id}) when is_binary(id), do: Map.put(item, "id", id)
+  defp maybe_put_item_id(item, _source_item), do: item
+
+  defp maybe_put_turn_id(
+         item,
+         %{"internal_chat_message_metadata_passthrough" => %{"turn_id" => turn_id}}
+       )
+       when is_binary(turn_id) do
+    Map.put(item, "internal_chat_message_metadata_passthrough", %{"turn_id" => turn_id})
+  end
+
+  defp maybe_put_turn_id(item, _source_item), do: item
+
+  defp sse_body(decoded, item, response_builder \\ &response/2) do
+    response = response_builder.(decoded, item)
 
     [
       sse_block("response.output_item.done", %{
@@ -235,6 +530,115 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     |> IO.iodata_to_binary()
   end
 
+  defp adapted_result(result, decoded, item, :sse) do
+    %{
+      status: 200,
+      headers: stream_headers(result),
+      raw_body: sse_body(decoded, item)
+    }
+  end
+
+  defp adapted_result(result, decoded, item, :public_sse) do
+    %{
+      status: 200,
+      headers: stream_headers(result),
+      raw_body: public_sse_body(decoded, item)
+    }
+  end
+
+  defp adapted_result(result, decoded, item, :response) do
+    response = public_response(decoded, item)
+
+    %{
+      status: 200,
+      headers: json_headers(result),
+      raw_body: CodexPooler.JSON.encode!(response)
+    }
+  end
+
+  # The same item grammar as the public SSE body; the downstream socket stamps
+  # sequence numbers and the stream id on each message itself (findings#254).
+  defp adapted_result(result, decoded, item, :websocket) do
+    %{
+      status: 200,
+      headers: json_headers(result),
+      websocket_messages: Enum.map(public_stream_events(decoded, item), fn {type, event} -> Map.put(event, "type", type) end)
+    }
+  end
+
+  defp adapted_result(result, decoded, item, :native_websocket) do
+    %{
+      status: 200,
+      headers: json_headers(result),
+      websocket_messages: [
+        %{"type" => "response.output_item.done", "item" => item},
+        %{"type" => "response.completed", "response" => response(decoded, item)}
+      ]
+    }
+  end
+
+  # The public stream follows the Responses streaming grammar the official
+  # SDK stream helpers enforce, as the provider's own compaction stream does:
+  # the response opens with an empty output, the item is announced at its
+  # output index before it is closed, and one response id runs throughout.
+  # Public SSE and the public websocket emit the same events.
+  defp public_stream_events(decoded, item) do
+    response = public_response(decoded, item)
+    opening = %{response | "status" => "in_progress", "output" => []} |> Map.delete("usage")
+
+    [
+      {"response.created", %{"response" => opening}},
+      {"response.output_item.added", %{"output_index" => 0, "item" => item}},
+      {"response.output_item.done", %{"output_index" => 0, "item" => item}},
+      {"response.completed", %{"response" => response}}
+    ]
+  end
+
+  defp public_sse_body(decoded, item) do
+    decoded
+    |> public_stream_events(item)
+    |> Enum.with_index()
+    |> Enum.map(fn {{type, event}, sequence_number} ->
+      sse_block(type, event |> Map.put("type", type) |> Map.put("sequence_number", sequence_number))
+    end)
+    |> Kernel.++(["data: [DONE]\n\n"])
+    |> IO.iodata_to_binary()
+  end
+
+  defp public_response(decoded, item) do
+    decoded
+    |> response(item)
+    |> Map.put("object", "response")
+    |> maybe_put_response_identity(decoded)
+  end
+
+  # The creation time and model the upstream response states, when it states
+  # them; neither is invented.
+  defp maybe_put_response_identity(response, decoded) do
+    response
+    |> then(fn response ->
+      case Map.get(decoded, "created_at") do
+        created_at when is_integer(created_at) and created_at >= 0 -> Map.put(response, "created_at", created_at)
+        _absent -> response
+      end
+    end)
+    |> then(fn response ->
+      case Map.get(decoded, "model") do
+        model when is_binary(model) and model != "" -> Map.put(response, "model", model)
+        _absent -> response
+      end
+    end)
+  end
+
+  defp response(decoded, item) do
+    %{
+      "id" => response_id(decoded),
+      "status" => "completed",
+      "output" => [item]
+    }
+    |> maybe_put_usage(decoded)
+  end
+
   defp response_id(%{"id" => id}) when is_binary(id), do: id
   defp response_id(_decoded), do: "resp_compaction"
 
@@ -244,7 +648,7 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   defp maybe_put_usage(response, _decoded), do: response
 
   defp sse_block(event, data) do
-    ["event: ", event, "\n", "data: ", Jason.encode!(data), "\n\n"]
+    ["event: ", event, "\n", "data: ", CodexPooler.JSON.encode!(data), "\n\n"]
   end
 
   defp stream_headers(result) do
@@ -255,5 +659,15 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
       normalized in ["content-type", "content-length"]
     end)
     |> Kernel.++(@stream_headers)
+  end
+
+  defp json_headers(result) do
+    result
+    |> Map.get(:headers, [])
+    |> Enum.reject(fn {key, _value} ->
+      normalized = String.downcase(key)
+      normalized in ["content-type", "content-length"]
+    end)
+    |> Kernel.++([{"content-type", "application/json"}])
   end
 end

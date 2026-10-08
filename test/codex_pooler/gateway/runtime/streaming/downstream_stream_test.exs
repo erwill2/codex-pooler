@@ -14,6 +14,77 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
   end
 
   describe "initial_state/2 and normalize_data/4" do
+    test "marks only websocket bridge response sources as committed" do
+      opts = public_responses_stream_opts()
+
+      assert %{bridge_committed?: true, target: :relay} =
+               DownstreamStream.initial_state(:relay, opts, :websocket_bridge)
+
+      refute Map.has_key?(DownstreamStream.initial_state(:relay, opts, :http), :bridge_committed?)
+      refute Map.has_key?(DownstreamStream.initial_state(:relay, opts), :bridge_committed?)
+    end
+
+    test "synthesizes a terminal after a hidden bridge commit" do
+      opts = public_responses_stream_opts()
+      initial_state = DownstreamStream.initial_state(:relay, opts, :websocket_bridge)
+
+      reason = %Finch.TransportError{reason: :closed}
+
+      assert DownstreamStream.terminal_missing_interruption_reason(initial_state, reason) ==
+               {:upstream_stream_interrupted, reason}
+
+      assert {failure, state} =
+               DownstreamStream.synthetic_terminal_failure(initial_state, :upstream_interrupted)
+
+      assert [%{"event" => "error", "data" => data}] = public_sse_events(failure)
+      assert data["type"] == "error"
+      assert data["code"] == "server_error"
+      assert data["error"]["code"] == "server_error"
+      refute Map.has_key?(data, "response")
+      assert DownstreamStream.terminal_missing_interruption_reason(state, reason) == reason
+    end
+
+    test "emits one unnormalized D1 hybrid error SSE block for a synthetic terminal failure" do
+      opts = public_responses_stream_opts()
+      initial_state = DownstreamStream.initial_state(:relay, opts, :websocket_bridge)
+
+      assert {failure, _state} =
+               DownstreamStream.synthetic_terminal_failure(initial_state, :upstream_interrupted)
+
+      assert [block] = String.split(failure, "\n\n", trim: true)
+      assert failure == block <> "\n\n"
+      assert ["event: error", "data: " <> data] = String.split(block, "\n")
+
+      assert %{
+               "code" => "server_error",
+               "error" => nested_error,
+               "message" => message,
+               "param" => nil,
+               "sequence_number" => sequence_number,
+               "type" => "error"
+             } = payload = CodexPooler.JSON.decode!(data)
+
+      assert Enum.sort(Map.keys(payload)) == [
+               "code",
+               "error",
+               "message",
+               "param",
+               "sequence_number",
+               "type"
+             ]
+
+      assert is_integer(sequence_number)
+
+      assert %{
+               "code" => "server_error",
+               "message" => ^message,
+               "param" => nil,
+               "type" => "server_error"
+             } = nested_error
+
+      assert Enum.sort(Map.keys(nested_error)) == ["code", "message", "param", "type"]
+    end
+
     test "keep public OpenAI chat stream parser state beside the relay target" do
       opts =
         RequestOptions.build(
@@ -34,7 +105,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.output_text.delta\n",
           "data: ",
-          Jason.encode!(%{"type" => "response.output_text.delta", "delta" => "split answer"})
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.output_text.delta",
+            "delta" => "split answer"
+          })
         ]
         |> IO.iodata_to_binary()
 
@@ -65,7 +139,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.output_text.delta\n",
           "data: ",
-          Jason.encode!(%{"type" => "response.output_text.delta", "delta" => "split answer"})
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.output_text.delta",
+            "delta" => "split answer"
+          })
         ]
         |> IO.iodata_to_binary()
 
@@ -108,14 +185,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.output_text.delta\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.output_text.delta",
             "delta" => String.duplicate("synthetic chat delta ", 5_000)
           })
         ]
         |> IO.iodata_to_binary()
 
-      split_at = StreamProtocol.max_incomplete_sse_block_bytes() + 1
+      split_at = div(byte_size(oversized), 2)
       first = binary_part(oversized, 0, split_at)
       second = binary_part(oversized, split_at, byte_size(oversized) - split_at)
 
@@ -206,14 +283,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
       assert terminal_chunk
              |> chat_sse_chunks()
-             |> Enum.any?(&match?(%{"choices" => [%{"finish_reason" => "stop"}]}, &1))
+             |> Enum.any?(&match?(%{"choices" => [%{"finish_reason" => "tool_calls"}]}, &1))
     end
 
     test "passes through non-SSE JSON bodies on backend codex responses stream relay" do
       opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
       state = DownstreamStream.initial_state(:relay, opts)
 
-      json_body = Jason.encode!(%{"id" => "resp_sparse_metadata", "object" => "response"})
+      json_body =
+        CodexPooler.JSON.encode!(%{"id" => "resp_sparse_metadata", "object" => "response"})
 
       assert {^json_body, ^state} =
                DownstreamStream.normalize_data(
@@ -224,11 +302,127 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                )
     end
 
+    test "relays bounded misalignment details only to private native HTTP SSE" do
+      details = %{
+        "error_type" => "synthetic_error_type",
+        "detailed_explanation" => "synthetic detailed explanation",
+        "steer" => %{
+          "message" => "synthetic steer message",
+          "unknown" => "unknown-steer-sibling"
+        },
+        "unknown" => "unknown-detail-sibling"
+      }
+
+      event =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "status" => "failed",
+            "error" => %{
+              "code" => "misalignment_policy_violation",
+              "message" => "synthetic policy wording",
+              "misalignment" => details
+            }
+          }
+        })
+
+      opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
+
+      for target <- [:relay, :websocket] do
+        state = DownstreamStream.initial_state(target, opts)
+
+        assert {chunk, _state} =
+                 DownstreamStream.normalize_data(
+                   event,
+                   "/backend-api/codex/responses",
+                   opts,
+                   state
+                 )
+
+        assert [%{"data" => terminal}] = public_sse_events(chunk)
+
+        if target == :relay do
+          assert terminal["response"]["error"]["misalignment"] == %{
+                   "error_type" => "synthetic_error_type",
+                   "detailed_explanation" => "synthetic detailed explanation",
+                   "steer" => %{"message" => "synthetic steer message"}
+                 }
+        else
+          refute Map.has_key?(terminal["response"]["error"], "misalignment")
+        end
+
+        refute chunk =~ "unknown-detail-sibling"
+        refute chunk =~ "unknown-steer-sibling"
+      end
+    end
+
+    test "omits all private native SSE details when one known field is malformed" do
+      event =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "status" => "failed",
+            "error" => %{
+              "code" => "misalignment_policy_violation",
+              "message" => "synthetic policy wording",
+              "misalignment" => %{
+                "error_type" => "synthetic_error_type",
+                "detailed_explanation" => 17,
+                "steer" => %{"message" => "synthetic steer message"}
+              }
+            }
+          }
+        })
+
+      opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      assert {chunk, _state} =
+               DownstreamStream.normalize_data(
+                 event,
+                 "/backend-api/codex/responses",
+                 opts,
+                 state
+               )
+
+      assert [%{"data" => terminal}] = public_sse_events(chunk)
+      refute Map.has_key?(terminal["response"]["error"], "misalignment")
+    end
+
+    test "normalizes standalone-CR backend Responses events on normal and compact endpoints" do
+      payload = %{
+        "type" => "response.completed",
+        "response" => %{"id" => "resp_backend_cr", "status" => "completed"}
+      }
+
+      source = "event: response.completed\rdata: " <> CodexPooler.JSON.encode!(payload) <> "\r\r"
+
+      for endpoint <- [
+            "/backend-api/codex/responses",
+            "/backend-api/codex/responses/compact"
+          ] do
+        opts = RequestOptions.build(%{}, endpoint, %{"stream" => true})
+        state = DownstreamStream.initial_state(:relay, opts)
+
+        assert {normalized, state} =
+                 DownstreamStream.normalize_data(source, endpoint, opts, state)
+
+        assert normalized ==
+                 "event: response.completed\ndata: " <>
+                   CodexPooler.JSON.encode!(payload) <> "\n\n"
+
+        assert state.codex_responses_sse_block_state.skip_leading_lf?
+
+        assert {"", state} = DownstreamStream.normalize_data("\n", endpoint, opts, state)
+        assert state.codex_responses_sse_block_state == StreamProtocol.new_sse_block_state()
+      end
+    end
+
     test "passes through oversized incomplete backend codex SSE prefixes without retaining them" do
       attach_stream_buffer_telemetry()
       opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
       state = DownstreamStream.initial_state(:relay, opts)
-      oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
+      oversized = String.duplicate("data: unavailable-upstream-prefix", 260_000)
 
       assert {^oversized, state} =
                DownstreamStream.normalize_data(
@@ -238,17 +432,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                  state
                )
 
-      assert state.codex_responses_sse_buffer == ""
+      assert state.codex_responses_sse_block_state == StreamProtocol.new_sse_block_state()
 
-      assert_receive {[:codex_pooler, :gateway, :stream_buffer, :oversized],
-                      %{bytes: bytes, count: 1, max_bytes: 65_536},
+      assert_receive {[:codex_pooler, :gateway, :stream_buffer, :oversized], %{bytes: bytes, count: 1, max_bytes: 8_388_608},
                       %{
                         buffer: "codex_responses_sse",
                         endpoint: "/backend-api/codex/responses",
                         route_class: route_class
                       }}
 
-      assert bytes > 65_536
+      assert bytes > 8_388_608
       assert is_binary(route_class)
     end
 
@@ -266,7 +459,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.created\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.created",
             "response" => %{
               "id" => "resp_public_incomplete_keepalive",
@@ -295,7 +488,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert DownstreamStream.keepalive_allowed?(state)
     end
 
-    test "blocks keepalive comments during oversized public OpenAI Responses passthrough" do
+    test "latches oversized public OpenAI Responses without entering passthrough" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -309,7 +502,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.created\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.created",
             "response" => %{
               "id" => "resp_public_oversized_keepalive",
@@ -317,7 +510,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                 %{
                   "type" => "function",
                   "name" => "synthetic_tool",
-                  "description" => String.duplicate("synthetic description ", 5_000)
+                  "description" => String.duplicate("synthetic description ", 450_000)
                 }
               ]
             }
@@ -329,23 +522,26 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       first = binary_part(oversized, 0, split_at)
       second = binary_part(oversized, split_at, byte_size(oversized) - split_at)
 
-      assert {^first, state} =
+      assert {failure, state} =
                DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
 
-      refute DownstreamStream.keepalive_allowed?(state)
+      assert [%{"event" => "error"}] = public_sse_events(failure)
+      refute failure =~ "synthetic description"
+      assert DownstreamStream.keepalive_allowed?(state)
+      assert DownstreamStream.terminal_outcome(state) == {:failed, nil}
 
-      assert {^second, state} =
+      assert {"", state} =
                DownstreamStream.normalize_data(second, "/v1/responses", opts, state)
 
-      refute DownstreamStream.keepalive_allowed?(state)
+      assert DownstreamStream.keepalive_allowed?(state)
 
-      assert {"\n\n", state} =
+      assert {"", state} =
                DownstreamStream.normalize_data("\n\n", "/v1/responses", opts, state)
 
       assert DownstreamStream.keepalive_allowed?(state)
     end
 
-    test "tracks oversized public OpenAI Responses terminal passthrough" do
+    test "buffers large public OpenAI Responses terminal output until complete" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -359,7 +555,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.completed\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{
               "id" => "resp_public_large_terminal",
@@ -370,7 +566,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                   "content" => [
                     %{
                       "type" => "output_text",
-                      "text" => String.duplicate("large terminal text ", 4_000)
+                      "text" => String.duplicate("large terminal text ", 450_000)
                     }
                   ]
                 }
@@ -387,14 +583,28 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       first = binary_part(terminal, 0, split_at)
       second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
 
-      assert {^first, state} =
+      assert {"", state} =
                DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
 
-      assert is_nil(DownstreamStream.terminal_outcome(state))
+      assert DownstreamStream.terminal_outcome(state) == nil
 
-      assert {^second, state} =
+      assert {chunk, state} =
                DownstreamStream.normalize_data(second, "/v1/responses", opts, state)
 
+      # A terminal-only stream is opened and its message announced before the
+      # terminal, in the order the SDK stream helpers require (findings#254).
+      assert Enum.map(public_sse_events(chunk), & &1["event"]) == [
+               "response.created",
+               "response.output_item.added",
+               "response.content_part.added",
+               "response.output_text.delta",
+               "response.output_text.done",
+               "response.content_part.done",
+               "response.output_item.done",
+               "response.completed"
+             ]
+
+      assert chunk =~ "large terminal text"
       assert DownstreamStream.terminal_outcome(state) == :completed
       assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
     end
@@ -451,7 +661,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
     end
 
-    test "tracks failure-coded oversized public OpenAI Responses incomplete passthrough" do
+    test "buffers failure-coded large public OpenAI Responses safely until complete" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -465,7 +675,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.incomplete\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.incomplete",
             "response" => %{
               "id" => "resp_public_large_failed_incomplete",
@@ -476,7 +686,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                   "content" => [
                     %{
                       "type" => "output_text",
-                      "text" => String.duplicate("large incomplete text ", 4_000)
+                      "text" => String.duplicate("large incomplete text ", 450_000)
                     }
                   ]
                 }
@@ -493,21 +703,26 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       first = binary_part(terminal, 0, split_at)
       second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
 
-      assert {^first, state} =
+      assert {"", state} =
                DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
 
-      assert is_nil(DownstreamStream.terminal_outcome(state))
+      assert DownstreamStream.terminal_outcome(state) == nil
 
-      assert {^second, state} =
+      assert {chunk, state} =
                DownstreamStream.normalize_data(second, "/v1/responses", opts, state)
 
-      assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
-      assert failure.code == "context_length_exceeded"
-      assert failure.event_type == "response.incomplete"
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      assert data["error"]["code"] == "context_length_exceeded"
+      assert data["error"]["message"] == "upstream request failed"
+      refute chunk =~ "large incomplete text"
+
+      assert {:failed, %{code: "context_length_exceeded"}} =
+               DownstreamStream.terminal_outcome(state)
+
       assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
     end
 
-    test "prefers specific error.code in oversized public OpenAI Responses failures" do
+    test "sanitizes specific provider errors after buffering large Responses failures" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -521,7 +736,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.failed\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.failed",
             "response" => %{
               "id" => "resp_public_large_failed_with_specific_code",
@@ -532,7 +747,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                   "content" => [
                     %{
                       "type" => "output_text",
-                      "text" => String.duplicate("large failed text ", 4_000)
+                      "text" => String.duplicate("large failed text ", 500_000)
                     }
                   ]
                 }
@@ -556,21 +771,26 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       first = binary_part(terminal, 0, split_at)
       second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
 
-      assert {^first, state} =
+      assert {"", state} =
                DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
 
-      assert is_nil(DownstreamStream.terminal_outcome(state))
+      assert DownstreamStream.terminal_outcome(state) == nil
 
-      assert {^second, state} =
+      assert {chunk, state} =
                DownstreamStream.normalize_data(second, "/v1/responses", opts, state)
 
-      assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
-      assert failure.code == "context_length_exceeded"
-      assert failure.upstream_code == "context_length_exceeded"
-      assert failure.event_type == "response.failed"
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      assert data["error"]["code"] == "context_length_exceeded"
+      assert data["error"]["message"] == "upstream request failed"
+      refute chunk =~ "invalid_request_error"
+
+      assert {:failed, %{code: "context_length_exceeded"}} =
+               DownstreamStream.terminal_outcome(state)
+
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
     end
 
-    test "copies top-level public Responses terminal error into response failure" do
+    test "keeps a top-level public Responses terminal error independent from the nested fallback" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -596,17 +816,163 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert {chunk, state} =
                DownstreamStream.normalize_data(failed, "/v1/responses", opts, state)
 
-      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
       assert data["error"]["code"] == "context_length_exceeded"
 
       assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
       assert failure.event_type == "response.failed"
 
-      assert {data["response"]["error"]["code"], failure.code} ==
-               {"context_length_exceeded", "context_length_exceeded"}
+      assert data["response"]["error"] == %{
+               "code" => "upstream_error",
+               "message" => "upstream request failed",
+               "type" => "server_error"
+             }
+
+      assert failure.code == "context_length_exceeded"
     end
 
-    test "synthesizes a sanitized terminal failure with the observed public response id" do
+    test "keeps a headerless top-level public Responses terminal error independent from the nested fallback" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      failed =
+        "data: " <>
+          CodexPooler.JSON.encode!(%{
+            "type" => "response.failed",
+            "response" => %{
+              "id" => "resp_public_failed_headerless_top_level_error",
+              "status" => "failed"
+            },
+            "error" => %{
+              "type" => "invalid_request_error",
+              "code" => "context_length_exceeded"
+            }
+          }) <> "\n\n"
+
+      assert {chunk, state} =
+               DownstreamStream.normalize_data(failed, "/v1/responses", opts, state)
+
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+
+      assert data == %{
+               "type" => "response.failed",
+               "sequence_number" => 1,
+               "error" => %{
+                 "code" => "context_length_exceeded",
+                 "message" => "upstream request failed",
+                 "type" => "server_error"
+               },
+               "response" => %{
+                 "id" => "resp_public_failed_headerless_top_level_error",
+                 "created_at" => 0,
+                 "status" => "failed",
+                 "error" => %{
+                   "code" => "upstream_error",
+                   "message" => "upstream request failed",
+                   "type" => "server_error"
+                 },
+                 "incomplete_details" => nil,
+                 "model" => "unknown",
+                 "object" => "response",
+                 "output" => [],
+                 "output_text" => "",
+                 "instructions" => nil,
+                 "metadata" => nil,
+                 "parallel_tool_calls" => false,
+                 "tool_choice" => "auto",
+                 "tools" => [],
+                 "usage" => nil,
+                 "temperature" => nil,
+                 "top_p" => nil
+               }
+             }
+
+      assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
+      assert failure.code == "context_length_exceeded"
+      assert failure.upstream_code == "context_length_exceeded"
+    end
+
+    test "keeps nested-only public Responses failure classification nested-first" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      failed =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "id" => "resp_public_failed_nested_only",
+            "status" => "failed",
+            "error" => %{
+              "type" => "invalid_request_error",
+              "code" => "nested_safe_code"
+            }
+          }
+        })
+
+      assert {chunk, state} =
+               DownstreamStream.normalize_data(failed, "/v1/responses", opts, state)
+
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      refute Map.has_key?(data, "error")
+      assert data["response"]["error"]["code"] == "nested_safe_code"
+
+      assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
+      assert failure.code == "nested_safe_code"
+      assert failure.upstream_code == "nested_safe_code"
+    end
+
+    test "keeps genuine dual public Responses failure classification nested-first" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      failed =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "error" => %{
+            "type" => "invalid_request_error",
+            "code" => "top_safe_code"
+          },
+          "response" => %{
+            "id" => "resp_public_failed_dual",
+            "status" => "failed",
+            "error" => %{
+              "type" => "invalid_request_error",
+              "code" => "nested_safe_code"
+            }
+          }
+        })
+
+      assert {chunk, state} =
+               DownstreamStream.normalize_data(failed, "/v1/responses", opts, state)
+
+      assert [%{"event" => "response.created"}, %{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      assert data["error"]["code"] == "top_safe_code"
+      assert data["response"]["error"]["code"] == "nested_safe_code"
+
+      assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
+      assert failure.code == "nested_safe_code"
+      assert failure.upstream_code == "nested_safe_code"
+    end
+
+    test "synthesizes a sanitized terminal failure without a public response object" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -633,16 +999,19 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                  "cookie=raw-upstream-reason"
                )
 
-      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(failure)
-      assert data["type"] == "response.failed"
-      assert data["response"]["id"] == "resp_public_interrupted"
-      assert data["response"]["status"] == "failed"
-      assert data["error"]["code"] == "upstream_stream_error"
+      assert [%{"event" => "error", "data" => data}] = public_sse_events(failure)
+      assert data["type"] == "error"
+      assert data["code"] == "server_error"
+      assert data["error"]["type"] == "server_error"
+      assert data["error"]["code"] == "server_error"
+      assert data["param"] == nil
+      assert data["error"]["param"] == nil
+      refute Map.has_key?(data, "response")
 
       assert data["error"]["message"] ==
                "upstream request failed: stream interrupted before terminal response event"
 
-      refute Jason.encode!(data) =~ "raw-upstream-reason"
+      refute CodexPooler.JSON.encode!(data) =~ "raw-upstream-reason"
 
       assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
     end
@@ -710,7 +1079,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
         [
           "event: response.created\n",
           "data: ",
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "type" => "response.created",
             "response" => %{"id" => "resp_public_incomplete", "status" => "in_progress"}
           })
@@ -784,7 +1153,152 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                reason
     end
 
-    test "reuses a response id observed on a response-bearing nonterminal event" do
+    test "tags terminal-missing interruptions after visible public Chat data" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_chat_stream: true, openai_chat_payload: %{"model" => "gpt-example"}},
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      reason = %Finch.TransportError{reason: :closed}
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      delta =
+        sse_event("response.output_text.delta", %{
+          "type" => "response.output_text.delta",
+          "delta" => "visible chat answer"
+        })
+
+      assert {_chunk, state} =
+               DownstreamStream.normalize_data(delta, "/v1/chat/completions", opts, state)
+
+      assert DownstreamStream.terminal_missing_interruption_reason(state, reason) ==
+               {:upstream_stream_interrupted, reason}
+    end
+
+    test "synthesizes one nested public Chat terminal after visible data" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_chat_stream: true, openai_chat_payload: %{"model" => "gpt-example"}},
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      reason = %Finch.TransportError{reason: :closed}
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      delta =
+        sse_event("response.output_text.delta", %{
+          "type" => "response.output_text.delta",
+          "delta" => "visible chat answer"
+        })
+
+      assert {_chunk, state} =
+               DownstreamStream.normalize_data(delta, "/v1/chat/completions", opts, state)
+
+      assert DownstreamStream.terminal_missing_interruption_reason(state, reason) ==
+               {:upstream_stream_interrupted, reason}
+
+      assert {failure, state} =
+               DownstreamStream.synthetic_terminal_failure(state, reason)
+
+      assert chat_sse_chunks(failure) == [
+               %{
+                 "error" => %{
+                   "message" => "upstream request failed: stream interrupted before terminal response event",
+                   "type" => "server_error",
+                   "code" => "server_error",
+                   "param" => nil
+                 }
+               }
+             ]
+
+      refute failure =~ "data: [DONE]"
+      refute failure =~ "finish_reason"
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, reason)
+    end
+
+    test "does not synthesize public Chat terminals before visible data even with bridge state" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_chat_stream: true, openai_chat_payload: %{"model" => "gpt-example"}},
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      reason = %Finch.TransportError{reason: :closed}
+      state = DownstreamStream.initial_state(:relay, opts, :websocket_bridge)
+
+      assert DownstreamStream.terminal_missing_interruption_reason(state, reason) == reason
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, reason)
+    end
+
+    test "tags terminal-missing interruptions after public Chat tool and moderation chunks" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_chat_stream: true, openai_chat_payload: %{"model" => "gpt-example"}},
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      reason = %Finch.TransportError{reason: :closed}
+
+      visible_events = [
+        sse_event("response.output_item.added", %{
+          "type" => "response.output_item.added",
+          "item" => %{"type" => "function_call", "name" => "lookup", "arguments" => ""}
+        }),
+        sse_event("response.moderation.completed", %{
+          "type" => "response.moderation.completed",
+          "moderation" => %{"input" => %{}, "output" => %{}}
+        })
+      ]
+
+      for event <- visible_events do
+        state = DownstreamStream.initial_state(:relay, opts)
+
+        assert {chunk, state} =
+                 DownstreamStream.normalize_data(event, "/v1/chat/completions", opts, state)
+
+        assert chunk != ""
+
+        assert DownstreamStream.terminal_missing_interruption_reason(state, reason) ==
+                 {:upstream_stream_interrupted, reason}
+      end
+    end
+
+    test "does not tag terminal-missing interruptions after a public Chat terminal" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_chat_stream: true, openai_chat_payload: %{"model" => "gpt-example"}},
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      reason = %Finch.TransportError{reason: :closed}
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      stream =
+        [
+          sse_event("response.output_text.delta", %{
+            "type" => "response.output_text.delta",
+            "delta" => "visible chat answer"
+          }),
+          sse_event("response.failed", %{
+            "type" => "response.failed",
+            "response" => %{"status" => "failed"}
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      assert {_chunk, state} =
+               DownstreamStream.normalize_data(stream, "/v1/chat/completions", opts, state)
+
+      assert DownstreamStream.terminal_missing_interruption_reason(state, reason) == reason
+    end
+
+    test "does not reuse a response id observed on a response-bearing nonterminal event" do
       opts =
         RequestOptions.build(
           %{public_openai_responses_stream: true},
@@ -807,10 +1321,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert {failure, _state} =
                DownstreamStream.synthetic_terminal_failure(state, :upstream_interrupted)
 
-      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(failure)
-      assert data["response"]["id"] == "resp_from_delta"
-      assert data["error"]["code"] == "upstream_stream_error"
-      assert data["error"]["message"] =~ "upstream request failed"
+      assert [%{"event" => "error", "data" => data}] = public_sse_events(failure)
+      assert data["type"] == "error"
+      assert data["code"] == "server_error"
+      assert data["error"]["code"] == "server_error"
+      refute Map.has_key?(data, "response")
+      refute CodexPooler.JSON.encode!(data) =~ "resp_from_delta"
+
+      assert data["error"]["message"] ==
+               "upstream request failed: stream interrupted before terminal response event"
     end
 
     test "does not synthesize after an upstream terminal has already been observed" do
@@ -925,7 +1444,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
       assert stream_bytes == byte_size(stream)
       assert relay_bytes > 0
-      refute Jason.encode!(summary) =~ "visible answer"
+      refute CodexPooler.JSON.encode!(summary) =~ "visible answer"
     end
 
     test "summarizes terminal-only public Responses completion" do
@@ -1077,7 +1596,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert summary["delta_bytes"] == 20 * byte_size(delta)
       assert summary["stream_bytes"] == byte_size(stream)
       assert map_size(summary) == 18
-      refute Jason.encode!(summary) =~ "bounded-delta"
+      refute CodexPooler.JSON.encode!(summary) =~ "bounded-delta"
     end
 
     test "keeps malformed and incomplete stream summaries bounded and safe" do
@@ -1100,7 +1619,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
       assert stream_bytes == byte_size(incomplete)
       assert map_size(summary) == 18
-      refute Jason.encode!(summary) =~ "raw hidden"
+      refute CodexPooler.JSON.encode!(summary) =~ "raw hidden"
 
       malformed = "event: response.unknown\ndata: {not-json}\n\n"
 
@@ -1116,7 +1635,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
       assert stream_bytes == byte_size(incomplete) + byte_size(malformed)
       assert map_size(summary) == 18
-      refute Jason.encode!(summary) =~ "not-json"
+      refute CodexPooler.JSON.encode!(summary) =~ "not-json"
     end
   end
 
@@ -1137,7 +1656,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
     data = lines |> Enum.find(&String.starts_with?(&1, "data: ")) |> strip_sse_prefix("data: ")
 
     if is_binary(event) and is_binary(data) and data != "[DONE]" do
-      %{"event" => event, "data" => Jason.decode!(data)}
+      %{"event" => event, "data" => CodexPooler.JSON.decode!(data)}
     end
   end
 
@@ -1149,13 +1668,13 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
     |> String.split("\n\n", trim: true)
     |> Enum.flat_map(fn
       "data: [DONE]" -> []
-      "data: " <> data -> [Jason.decode!(data)]
+      "data: " <> data -> [CodexPooler.JSON.decode!(data)]
       _block -> []
     end)
   end
 
   defp sse_event(event, payload) do
-    "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
+    "event: " <> event <> "\n" <> "data: " <> CodexPooler.JSON.encode!(payload) <> "\n\n"
   end
 
   defp public_responses_stream_opts do

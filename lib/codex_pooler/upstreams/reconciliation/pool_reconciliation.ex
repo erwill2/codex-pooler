@@ -3,25 +3,36 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   import Ecto.Query
 
+  require Logger
+
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Repo
   alias CodexPooler.TransportFailureReason
+  alias CodexPooler.Upstreams.Auth.LegacyAccessTokenExpiry
   alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Quota.CapacityFactsStore
+  alias CodexPooler.Upstreams.Quota.CreditBalanceStore
   alias CodexPooler.Upstreams.Reconciliation.UsageProbe
   alias CodexPooler.Upstreams.SavedResets
+  alias CodexPooler.Upstreams.SavedResets.AutomaticConfirmation
   alias CodexPooler.Upstreams.SavedResets.Convergence
+  alias CodexPooler.Upstreams.SavedResets.FirstSeenLedger
+  alias CodexPooler.Upstreams.SavedResets.ObservationOrdering
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
-  @active UpstreamIdentity.active_status()
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @eligible PoolUpstreamAssignment.eligible_status()
-  @assignment_ineligible PoolUpstreamAssignment.ineligible_status()
-  @health_active PoolUpstreamAssignment.active_health_status()
-  @refresh_failed UpstreamIdentity.refresh_failed_status()
-  @reauth_required UpstreamIdentity.reauth_required_status()
+  @active IdentityStatus.active_status()
+  @assignment_active AssignmentStatus.active_status()
+  @eligible AssignmentStatus.eligible_status()
+  @assignment_ineligible AssignmentStatus.ineligible_status()
+  @health_active AssignmentStatus.active_health_status()
+  @refresh_failed IdentityStatus.refresh_failed_status()
+  @reauth_required IdentityStatus.reauth_required_status()
   # Auth-shaped rejections must surface instead of silently reusing
   # persisted windows. A 429 is deliberately absent: being told to slow
   # down does not invalidate a snapshot refreshed within its usable window,
@@ -39,7 +50,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
              required(:identity_attrs) => map(),
              required(:payload) => map() | nil,
              required(:usage_url) => String.t() | nil,
-             required(:covered_descriptors) => MapSet.t()
+             required(:covered_descriptors) => MapSet.t(),
+             required(:account_availability) => CodexPooler.Quotas.AccountAvailability.t() | nil,
+             required(:capacity_facts) => CodexPooler.Quotas.CapacityFacts.t() | nil,
+             required(:capacity_observations) => [CodexPooler.Quotas.CapacityFacts.t()],
+             required(:observed_at) => DateTime.t()
            },
            required(:credential_fence) => map() | nil,
            required(:expected_credential_epoch) => pos_integer() | nil
@@ -52,13 +67,18 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         ) ::
           lifecycle_result()
   def reconcile_pool_account(pool_or_id, assignment_or_id, opts \\ []) do
+    persisted_window_reuse_at = persisted_window_reuse_timestamp(opts)
     pool_id = pool_id(pool_or_id)
     assignment_id = assignment_id(assignment_or_id)
 
     case load_active_assignment_with_identity(pool_id, assignment_id) do
       {%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity} ->
-        quota_step = refresh_reconciliation_quota(identity, assignment, opts)
-        finalize_reconciliation(assignment, identity, quota_step, opts)
+        with {:ok, identity} <- LegacyAccessTokenExpiry.repair(identity) do
+          quota_step =
+            refresh_reconciliation_quota(identity, assignment, opts, persisted_window_reuse_at)
+
+          finalize_reconciliation(assignment, identity, quota_step, opts)
+        end
 
       nil ->
         {:error,
@@ -361,8 +381,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   defp eligibility_after_reconciliation(assignment, _quota_step),
     do: assignment.eligibility_status
 
-  defp refresh_reconciliation_quota(identity, assignment, opts) do
-    source = reconciliation_quota_source(identity, assignment, opts)
+  defp refresh_reconciliation_quota(identity, assignment, opts, persisted_window_reuse_at) do
+    source =
+      reconciliation_quota_source(identity, assignment, opts, persisted_window_reuse_at)
 
     case source do
       :auth_unavailable ->
@@ -382,6 +403,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
       {:definitive_provider_auth_rejected, fence} ->
         promote_definitive_provider_auth_rejection(identity, fence)
+
+      {:usage_unavailable_capacity, %UsageProbe.Result{} = probe, fence} ->
+        persist_unusable_capacity(identity, probe, fence)
+
+        step_result(:failed, "quota_refresh_unavailable", "quota windows were not available (upstream_quota_unusable)")
+        |> put_credential_fence(fence)
 
       {:usage_unavailable, reason, fence} ->
         step_result(
@@ -406,7 +433,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
             identity_attrs: identity_attrs,
             payload: nil,
             usage_url: nil,
-            covered_descriptors: MapSet.new()
+            covered_descriptors: MapSet.new(),
+            account_availability: nil,
+            capacity_facts: nil,
+            capacity_observations: [],
+            observed_at: now()
           },
           credential_fence: nil,
           expected_credential_epoch: expected_credential_epoch
@@ -421,7 +452,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
             identity_attrs: identity_attrs_from_codex_usage_payload(probe.payload),
             payload: probe.payload,
             usage_url: probe.usage_url,
-            covered_descriptors: probe.covered_descriptors
+            covered_descriptors: probe.covered_descriptors,
+            account_availability: probe.account_availability,
+            capacity_facts: probe.capacity_facts,
+            capacity_observations: probe.capacity_observations,
+            observed_at: probe.observed_at
           },
           credential_fence: probe.credential_fence,
           expected_credential_epoch: nil
@@ -429,11 +464,10 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
-  defp reconciliation_quota_source(identity, assignment, opts) do
+  defp reconciliation_quota_source(identity, assignment, opts, persisted_window_reuse_at) do
     cond do
       Keyword.has_key?(opts, :quota_windows) ->
-        {:windows, Keyword.get(opts, :quota_windows), Keyword.get(opts, :identity_attrs, %{}),
-         CredentialFencing.credential_epoch(identity)}
+        {:windows, Keyword.get(opts, :quota_windows), Keyword.get(opts, :identity_attrs, %{}), CredentialFencing.credential_epoch(identity)}
 
       windows = metadata_quota_windows(identity, assignment) ->
         {:windows, windows, %{}, CredentialFencing.credential_epoch(identity)}
@@ -441,7 +475,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       true ->
         identity
         |> codex_usage_quota_windows(assignment, opts)
-        |> maybe_reuse_persisted_quota_windows(identity)
+        |> maybe_reuse_persisted_quota_windows(identity, persisted_window_reuse_at)
     end
   end
 
@@ -474,27 +508,33 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
              identity_attrs: identity_attrs,
              payload: payload,
              usage_url: usage_url,
-             covered_descriptors: covered_descriptors
+             covered_descriptors: covered_descriptors,
+             account_availability: account_availability,
+             capacity_facts: capacity_facts,
+             capacity_observations: capacity_observations,
+             observed_at: provider_observed_at
            },
            credential_fence: credential_fence
          } = context
        )
        when is_list(windows) do
-    observed_at = now()
+    observed_at = provider_observed_at
 
     result =
       if credential_fence do
         CredentialFencing.apply_usage_success(identity, credential_fence, fn locked_identity ->
-          persist_reconciliation_quota(
-            locked_identity,
-            windows,
-            identity_attrs,
-            payload,
-            observed_at,
-            usage_url,
-            covered_descriptors,
-            false
-          )
+          persist_reconciliation_quota(locked_identity, %{
+            windows: windows,
+            identity_attrs: identity_attrs,
+            payload: payload,
+            observed_at: observed_at,
+            usage_url: usage_url,
+            covered_descriptors: covered_descriptors,
+            account_availability: account_availability,
+            capacity_facts: capacity_facts,
+            capacity_observations: capacity_observations,
+            broadcast?: false
+          })
         end)
         |> case do
           {:ok, :applied, updated_identity, persisted} ->
@@ -513,10 +553,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     result =
       case result do
         {:ok, %{windows: refreshed, identity: updated_identity}} ->
-          # Fresh quota is now persisted: converge any pending saved-reset
-          # redemption on this identity from that evidence (self-healing). Best
-          # effort and a no-op for identities without a pending lifecycle.
-          Convergence.converge(updated_identity, observed_at)
+          converge_refreshed_identity(updated_identity, observed_at)
 
           step_result(:succeeded, "quota_refreshed", "quota windows refreshed", %{
             "window_count" => length(refreshed)
@@ -550,6 +587,24 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
          |> put_credential_fence(credential_fence)
          |> put_expected_credential_epoch(expected_credential_epoch)
 
+  # Fresh quota is now persisted: converge any pending saved-reset redemption
+  # on this identity from that evidence (self-healing). Best effort and a no-op
+  # for identities without a pending lifecycle, but a genuine convergence error
+  # must not stay invisible.
+  defp converge_refreshed_identity(identity, observed_at) do
+    case Convergence.converge(identity, observed_at, "reconciliation") do
+      {:ok, _outcome} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "saved reset convergence failed " <>
+            "upstream_identity_id=#{identity.id} " <>
+            "reason=#{safe_error_message(reason)}"
+        )
+    end
+  end
+
   @spec persist_unfenced_reconciliation_quota(quota_refresh_context(), DateTime.t()) ::
           {:ok, map()} | {:superseded, UpstreamIdentity.t()} | {:error, term()}
   defp persist_unfenced_reconciliation_quota(
@@ -561,7 +616,10 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
              identity_attrs: identity_attrs,
              payload: payload,
              usage_url: usage_url,
-             covered_descriptors: covered_descriptors
+             covered_descriptors: covered_descriptors,
+             account_availability: account_availability,
+             capacity_facts: capacity_facts,
+             capacity_observations: capacity_observations
            },
            expected_credential_epoch: expected_credential_epoch
          },
@@ -574,16 +632,18 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
               expected_credential_epoch
             ), Repo.get(PoolUpstreamAssignment, assignment.id)} do
         {true, %PoolUpstreamAssignment{status: @assignment_active}} ->
-          persist_reconciliation_quota(
-            locked_identity,
-            windows,
-            identity_attrs,
-            payload,
-            observed_at,
-            usage_url,
-            covered_descriptors,
-            false
-          )
+          persist_reconciliation_quota(locked_identity, %{
+            windows: windows,
+            identity_attrs: identity_attrs,
+            payload: payload,
+            observed_at: observed_at,
+            usage_url: usage_url,
+            covered_descriptors: covered_descriptors,
+            account_availability: account_availability,
+            capacity_facts: capacity_facts,
+            capacity_observations: capacity_observations,
+            broadcast?: false
+          })
 
         {false, _assignment} ->
           {:ok, :credential_superseded}
@@ -617,32 +677,62 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         %PoolUpstreamAssignment{} = assignment,
         opts \\ []
       ) do
-    observed_at = now()
+    case refresh_quota_and_probe_from_usage(identity, assignment, opts) do
+      {:ok, updated_identity, _probe} -> {:ok, updated_identity}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The same refresh, also returning the Usage API receipt it persisted. The
+  # saved-reset redemption records the receipt's first post-consume reading as
+  # the provider reported it, because the evidence store can keep that reading
+  # out of the stored window.
+  @doc false
+  @spec refresh_quota_and_probe_from_usage(UpstreamIdentity.t(), PoolUpstreamAssignment.t(), keyword()) ::
+          {:ok, UpstreamIdentity.t(), UsageProbe.Result.t()} | {:error, term()}
+  def refresh_quota_and_probe_from_usage(%UpstreamIdentity{} = identity, %PoolUpstreamAssignment{} = assignment, opts \\ []) do
+    observed_at = Keyword.get(opts, :observed_at, now())
 
     case UsageProbe.fetch_from_identity(identity, assignment, observed_at, opts) do
       {:ok, %UsageProbe.Result{credential_fence: fence} = probe} when not is_nil(fence) ->
-        apply_refresh_usage_success(identity, probe, observed_at, fence)
+        with {:ok, updated_identity} <- apply_refresh_usage_success(identity, probe, fence),
+             do: {:ok, updated_identity, probe}
 
       {:error, {:definitive_provider_auth_rejected, fence}} ->
         apply_refresh_usage_rejection(identity, fence)
+
+      {:error, {:capacity_observation_unusable, %UsageProbe.Result{} = probe, fence}} ->
+        persist_unusable_capacity(identity, probe, fence)
+        {:error, %{code: :upstream_quota_unusable, message: "upstream quota payload had no usable windows"}}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp apply_refresh_usage_success(identity, probe, observed_at, fence) do
+  defp persist_unusable_capacity(identity, %UsageProbe.Result{capacity_facts: facts, capacity_observations: observations}, fence) do
+    CredentialFencing.apply_usage_success(identity, fence, fn locked ->
+      epoch = CredentialFencing.credential_epoch(locked)
+      metadata = CapacityFactsStore.transition(locked.metadata, facts, epoch)
+      metadata = CapacityFactsStore.record_observations(metadata, observations, epoch)
+      {:ok, Repo.update!(Ecto.Changeset.change(locked, metadata: metadata))}
+    end)
+  end
+
+  defp apply_refresh_usage_success(identity, probe, fence) do
     CredentialFencing.apply_usage_success(identity, fence, fn locked_identity ->
-      persist_reconciliation_quota(
-        locked_identity,
-        probe.windows,
-        identity_attrs_from_codex_usage_payload(probe.payload),
-        probe.payload,
-        observed_at,
-        probe.usage_url,
-        probe.covered_descriptors,
-        false
-      )
+      persist_reconciliation_quota(locked_identity, %{
+        windows: probe.windows,
+        identity_attrs: identity_attrs_from_codex_usage_payload(probe.payload),
+        payload: probe.payload,
+        observed_at: probe.observed_at,
+        usage_url: probe.usage_url,
+        covered_descriptors: probe.covered_descriptors,
+        account_availability: probe.account_availability,
+        capacity_facts: probe.capacity_facts,
+        capacity_observations: probe.capacity_observations,
+        broadcast?: false
+      })
     end)
     |> case do
       {:ok, :applied, updated_identity, _persisted} -> {:ok, updated_identity}
@@ -659,16 +749,25 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
-  defp persist_reconciliation_quota(
-         identity,
-         windows,
-         identity_attrs,
-         payload,
-         observed_at,
-         usage_url,
-         covered_descriptors,
-         broadcast?
-       ) do
+  defp persist_reconciliation_quota(identity, %{
+         windows: windows,
+         identity_attrs: identity_attrs,
+         payload: payload,
+         observed_at: observed_at,
+         usage_url: usage_url,
+         covered_descriptors: covered_descriptors,
+         account_availability: account_availability,
+         capacity_facts: capacity_facts,
+         capacity_observations: capacity_observations,
+         broadcast?: broadcast?
+       }) do
+    credential_epoch = CredentialFencing.credential_epoch(identity)
+
+    windows =
+      Enum.map(windows, fn attrs ->
+        Map.update(attrs, :metadata, %{"credential_epoch" => credential_epoch}, &Map.put(&1 || %{}, "credential_epoch", credential_epoch))
+      end)
+
     case Quota.Windows.upsert_quota_windows(identity, windows,
            delete_missing?: true,
            covered_descriptors: covered_descriptors,
@@ -678,10 +777,44 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       {:ok, refreshed} ->
         if is_map(payload), do: maybe_update_identity_plan(identity, payload)
 
+        identity = maybe_update_saved_reset_snapshot(identity, payload, observed_at, usage_url)
+
+        identity =
+          persist_account_availability(identity, windows, account_availability, observed_at)
+
+        metadata =
+          CreditBalanceStore.transition(
+            identity.metadata,
+            payload,
+            observed_at,
+            CredentialFencing.credential_epoch(identity)
+          )
+
+        metadata =
+          if capacity_facts,
+            do: CapacityFactsStore.transition(metadata, capacity_facts, CredentialFencing.credential_epoch(identity)),
+            else: metadata
+
+        metadata = CapacityFactsStore.record_observations(metadata, capacity_observations, credential_epoch)
+
+        identity = identity |> Ecto.Changeset.change(metadata: metadata) |> Repo.update!()
+
+        # Automatic saved-reset corroboration reads the saved-reset snapshot and
+        # account availability persisted above from this same provider receipt.
+        Enum.each(windows, fn attrs ->
+          AutomaticConfirmation.persist_provider_observation(
+            identity,
+            attrs,
+            account_availability,
+            usage_url,
+            observed_at
+          )
+        end)
+
         {:ok,
          %{
            windows: refreshed,
-           identity: maybe_update_saved_reset_snapshot(identity, payload, observed_at, usage_url)
+           identity: identity
          }}
 
       {:error, reason} ->
@@ -691,23 +824,178 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   defp maybe_update_saved_reset_snapshot(identity, payload, observed_at, usage_url)
        when is_map(payload) do
-    identity
-    |> UpstreamIdentity.changeset(%{
-      metadata:
-        identity.metadata
-        |> Kernel.||(%{})
-        |> Map.put(
-          "saved_resets",
-          SavedResets.usage_snapshot(payload, observed_at, usage_url, identity)
-        ),
-      updated_at: observed_at
-    })
-    |> Repo.update!()
-    |> Repo.reload!()
+    persisted_observed_at = get_in(identity.metadata || %{}, ["saved_resets", "observed_at"])
+
+    case ObservationOrdering.authorize(observed_at, persisted_observed_at) do
+      {:apply, _canonical_observed_at} ->
+        snapshot = SavedResets.usage_snapshot(payload, observed_at, usage_url, identity)
+        {snapshot, ledger_change} = compose_saved_reset_state(identity, snapshot, observed_at)
+        {microsecond, _precision} = observed_at.microsecond
+
+        attrs = %{
+          metadata: Map.put(identity.metadata || %{}, "saved_resets", snapshot),
+          updated_at: %{observed_at | microsecond: {microsecond, 6}}
+        }
+
+        attrs =
+          case ledger_change do
+            {:put, ledger} -> Map.put(attrs, :saved_reset_first_seen_ledger, ledger)
+            :omit -> attrs
+          end
+
+        identity
+        |> Ecto.Changeset.change(attrs)
+        |> Repo.update!()
+        |> Repo.reload!()
+
+      :skip ->
+        identity
+    end
   end
 
   defp maybe_update_saved_reset_snapshot(identity, _payload, _observed_at, _usage_url),
     do: identity
+
+  defp persist_account_availability(identity, windows, account_availability, observed_at) do
+    identity = Repo.reload!(identity)
+    metadata = identity.metadata || %{}
+    credential_epoch = CredentialFencing.credential_epoch(identity)
+
+    metadata =
+      if ordinary_account_window?(windows) and
+           not match?(
+             %CodexPooler.Quotas.AccountAvailability{state: state}
+             when state in [:available, :blocked],
+             account_availability
+           ) do
+        AccountAvailabilityStore.clear(metadata)
+      else
+        AccountAvailabilityStore.transition(
+          metadata,
+          account_availability,
+          observed_at,
+          credential_epoch
+        )
+      end
+
+    if metadata == identity.metadata do
+      identity
+    else
+      identity
+      |> Ecto.Changeset.change(metadata: metadata)
+      |> Repo.update!()
+      |> Repo.reload!()
+    end
+  end
+
+  defp ordinary_account_window?(windows) do
+    Enum.any?(windows, fn window ->
+      Map.get(window, :quota_scope) == "account" and
+        Map.get(window, :quota_family) == "account" and
+        Map.get(window, :quota_key) == "account"
+    end)
+  end
+
+  defp compose_saved_reset_state(
+         _identity,
+         %{"expires_detail_status" => "incomplete"} = snapshot,
+         _observed_at
+       ) do
+    {snapshot, :omit}
+  end
+
+  defp compose_saved_reset_state(identity, snapshot, observed_at) do
+    candidate_rows = saved_reset_expiration_rows(snapshot)
+    current_expirations = Enum.map(candidate_rows, &Map.get(&1, "expires_at"))
+    ledger = identity.saved_reset_first_seen_ledger || FirstSeenLedger.empty()
+
+    if oversized_legacy_seed_source?(identity, ledger) do
+      case Map.get(snapshot, "expires_detail_status") do
+        status when status in ["authoritative_zero", "authoritative_rows"] ->
+          merge_saved_reset_state(
+            snapshot,
+            ledger,
+            candidate_rows,
+            current_expirations,
+            observed_at
+          )
+
+        _reused_or_incomplete ->
+          {Map.get(identity.metadata || %{}, "saved_resets", snapshot), :omit}
+      end
+    else
+      merge_saved_reset_state(
+        snapshot,
+        ledger,
+        saved_reset_expiration_rows(identity.metadata) ++ candidate_rows,
+        current_expirations,
+        observed_at
+      )
+    end
+  end
+
+  defp oversized_legacy_seed_source?(identity, ledger) do
+    ledger == FirstSeenLedger.empty() and
+      saved_reset_expiration_rows(identity.metadata) != [] and
+      not persisted_expiration_seed_source_within_bound?(identity.id)
+  end
+
+  defp persisted_expiration_seed_source_within_bound?(identity_id) do
+    Repo.one(
+      from identity in UpstreamIdentity,
+        where: identity.id == ^identity_id,
+        select:
+          fragment(
+            "COALESCE(pg_column_size(?->'saved_resets'->'available_expirations') <= ?, TRUE)",
+            identity.metadata,
+            ^SavedResets.detail_payload_max_bytes()
+          )
+    )
+  end
+
+  defp merge_saved_reset_state(
+         snapshot,
+         ledger,
+         incoming_rows,
+         current_expirations,
+         observed_at
+       ) do
+    case FirstSeenLedger.merge(
+           ledger,
+           incoming_rows,
+           current_expirations,
+           observed_at
+         ) do
+      {:ok, merged_ledger} ->
+        {materialize_first_seen(snapshot, merged_ledger), {:put, merged_ledger}}
+
+      {:opaque, _original} ->
+        {snapshot, :omit}
+    end
+  end
+
+  defp saved_reset_expiration_rows(%{"saved_resets" => saved_resets}),
+    do: saved_reset_expiration_rows(saved_resets)
+
+  defp saved_reset_expiration_rows(%{"available_expirations" => rows}) when is_list(rows),
+    do: rows
+
+  defp saved_reset_expiration_rows(_metadata), do: []
+
+  defp materialize_first_seen(snapshot, ledger) do
+    rows =
+      snapshot
+      |> saved_reset_expiration_rows()
+      |> Enum.map(fn row ->
+        case FirstSeenLedger.lookup(ledger, Map.get(row, "expires_at")) do
+          {:ok, first_seen_at} -> Map.put(row, "first_seen_at", first_seen_at)
+          :error -> row
+          {:opaque, _original} -> row
+        end
+      end)
+
+    Map.put(snapshot, "available_expirations", rows)
+  end
 
   defp metadata_quota_windows(identity, assignment) do
     identity_windows = Quota.Windows.quota_windows_from_metadata(identity.metadata)
@@ -732,26 +1020,27 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   defp maybe_reuse_persisted_quota_windows(
          {:usage_unavailable, {:upstream_status, status}, _fence} = unavailable,
-         _identity
+         _identity,
+         _timestamp
        )
        when status in @fallback_denied_usage_statuses,
        do: unavailable
 
   defp maybe_reuse_persisted_quota_windows(
          {:usage_unavailable, {:mixed_auth_rejection, _reason}, _fence} = unavailable,
-         _identity
+         _identity,
+         _timestamp
        ),
        do: unavailable
 
   defp maybe_reuse_persisted_quota_windows(
          {:usage_unavailable, _reason, fence} = unavailable,
-         identity
+         identity,
+         timestamp
        ) do
-    timestamp = now()
-
     windows =
       identity
-      |> Quota.Windows.list_quota_windows()
+      |> Quota.Windows.list_quota_windows(timestamp)
       |> Enum.filter(&reusable_persisted_quota_window?(&1, timestamp))
 
     if windows != [] do
@@ -761,7 +1050,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
-  defp maybe_reuse_persisted_quota_windows(result, _identity), do: result
+  defp maybe_reuse_persisted_quota_windows(result, _identity, _timestamp), do: result
 
   # The weekly account window counts as reusable: since the provider
   # suspended the anchored 5h windows (announced as temporary), it is the
@@ -863,8 +1152,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     assignment
     |> PoolUpstreamAssignment.changeset(%{
       metadata: Map.put(metadata, "last_reconciliation", summary),
-      last_successful_refresh_at:
-        if(status == :succeeded, do: timestamp, else: assignment.last_successful_refresh_at),
+      last_successful_refresh_at: if(status == :succeeded, do: timestamp, else: assignment.last_successful_refresh_at),
       updated_at: timestamp
     })
     |> Repo.update!()
@@ -928,6 +1216,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     identity
     |> UpstreamIdentity.changeset(attrs)
     |> Repo.update()
+  end
+
+  defp persisted_window_reuse_timestamp(opts) do
+    opts
+    |> Keyword.get_lazy(:as_of, &now/0)
+    |> DateTime.truncate(:microsecond)
   end
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)

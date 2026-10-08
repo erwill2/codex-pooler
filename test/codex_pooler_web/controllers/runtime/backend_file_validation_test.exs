@@ -13,10 +13,12 @@ defmodule CodexPoolerWeb.Runtime.BackendFileValidationTest do
   alias CodexPooler.Files.FileRecord
   alias CodexPooler.Gateway.Transports.FileBridge
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Plugs.BackendFilesMultipartGuard
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.Path, as: IngressPath
 
   setup do
     old_config = Application.get_env(:codex_pooler, Files, [])
-    old_bridge_config = Application.get_env(:codex_pooler, FileBridge, [])
+    CodexPooler.TestAppEnv.restore_on_exit(FileBridge)
 
     Application.put_env(:codex_pooler, Files,
       max_file_size_bytes: 64,
@@ -28,10 +30,7 @@ defmodule CodexPoolerWeb.Runtime.BackendFileValidationTest do
       finalize_retry_interval_ms: 0
     )
 
-    on_exit(fn ->
-      Application.put_env(:codex_pooler, Files, old_config)
-      Application.put_env(:codex_pooler, FileBridge, old_bridge_config)
-    end)
+    on_exit(fn -> Application.put_env(:codex_pooler, Files, old_config) end)
 
     :ok
   end
@@ -356,6 +355,54 @@ defmodule CodexPoolerWeb.Runtime.BackendFileValidationTest do
     end)
   end
 
+  test "encoded multipart file create reaches the same guard without parser side effects" do
+    setup = active_api_key_fixture()
+
+    with_isolated_plug_tmpdir(fn tmp_root ->
+      file_count_before = Repo.aggregate(FileRecord, :count)
+      request_count_before = Repo.aggregate(Request, :count)
+
+      conn =
+        Plug.Test.conn("POST", "/backend-api/%66iles", "invalid multipart fixture")
+        |> put_req_header("content-type", "multipart/form-data; boundary=example")
+        |> auth(setup)
+        |> @endpoint.call(@endpoint.init([]))
+
+      assert json_response(conn, 400)["error"]["code"] ==
+               "unsupported_multipart_file_create"
+
+      assert Repo.aggregate(FileRecord, :count) == file_count_before
+      assert Repo.aggregate(Request, :count) == request_count_before
+      assert tmpdir_paths(tmp_root) == []
+    end)
+  end
+
+  test "multipart guard consumes the populated canonical path view" do
+    setup = active_api_key_fixture()
+
+    conn =
+      Plug.Test.conn("POST", "/backend-api/%66iles", "invalid multipart fixture")
+      |> put_req_header("content-type", "multipart/form-data; boundary=example")
+      |> auth(setup)
+      |> IngressPath.populate()
+      |> Map.put(:path_info, ["unrelated"])
+      |> BackendFilesMultipartGuard.call([])
+
+    assert json_response(conn, 400)["error"]["code"] == "unsupported_multipart_file_create"
+  end
+
+  test "multipart guard reconstructs the canonical path when called directly" do
+    setup = active_api_key_fixture()
+
+    conn =
+      Plug.Test.conn("POST", "/backend-api/%66iles", "invalid multipart fixture")
+      |> put_req_header("content-type", "multipart/form-data; boundary=example")
+      |> auth(setup)
+      |> BackendFilesMultipartGuard.call([])
+
+    assert json_response(conn, 400)["error"]["code"] == "unsupported_multipart_file_create"
+  end
+
   test "cleanup marks expired file metadata rows", %{conn: conn} do
     setup = active_api_key_fixture()
 
@@ -424,6 +471,14 @@ defmodule CodexPoolerWeb.Runtime.BackendFileValidationTest do
     File.mkdir_p!(tmp_root)
 
     previous_upload_term = :persistent_term.get(Plug.Upload)
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs, and
+    # every later upload in the run would target the directory this test removes.
+    on_exit(fn ->
+      :persistent_term.put(Plug.Upload, previous_upload_term)
+      File.rm_rf!(tmp_root)
+    end)
+
     :persistent_term.put(Plug.Upload, {[tmp_root], "test-upload-suffix"})
     :ets.delete(Plug.Upload.Dir, self())
     :ets.delete(Plug.Upload.Path, self())

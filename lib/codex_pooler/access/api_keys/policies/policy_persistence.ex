@@ -4,6 +4,7 @@ defmodule CodexPooler.Access.APIKeys.PolicyPersistence do
   import Ecto.Query
 
   alias CodexPooler.Access.{APIKey, APIKeyPolicyBinding}
+  alias CodexPooler.Access.APIKeys.RuntimeAuthorization
   alias CodexPooler.Repo
 
   @type create_result ::
@@ -36,21 +37,53 @@ defmodule CodexPooler.Access.APIKeys.PolicyPersistence do
     end)
   end
 
-  @spec update_api_key_policy(APIKey.t(), map(), [map()], DateTime.t()) :: update_policy_result()
-  def update_api_key_policy(api_key, update_attrs, policy_inputs, timestamp) do
-    Repo.transaction(fn ->
-      with {:ok, updated_api_key} <- Repo.update(APIKey.changeset(api_key, update_attrs)),
+  @spec update_api_key_policy_in_transaction(
+          APIKey.t(),
+          map(),
+          [map()],
+          DateTime.t(),
+          non_neg_integer()
+        ) :: update_policy_result()
+  def update_api_key_policy_in_transaction(
+        api_key,
+        update_attrs,
+        policy_inputs,
+        timestamp,
+        runtime_revocation_epoch
+      ) do
+    if Repo.in_transaction?() do
+      changeset = APIKey.changeset(api_key, update_attrs)
+
+      changeset =
+        Ecto.Changeset.put_change(
+          changeset,
+          :runtime_revocation_epoch,
+          RuntimeAuthorization.epoch_for_policy_change(runtime_revocation_epoch, api_key, changeset)
+        )
+
+      with {:ok, updated_api_key} <- Repo.update(changeset),
            {_count, _rows} <-
-             Repo.delete_all(
-               from(binding in APIKeyPolicyBinding, where: binding.api_key_id == ^api_key.id)
-             ),
+             Repo.delete_all(from(binding in APIKeyPolicyBinding, where: binding.api_key_id == ^api_key.id)),
            {:ok, bindings} <-
              insert_api_key_policy_bindings(Repo, policy_inputs, updated_api_key, timestamp) do
-        %{api_key: updated_api_key, policy_bindings: bindings}
-      else
-        {:error, reason} -> Repo.rollback(reason)
+        {:ok, %{api_key: updated_api_key, policy_bindings: bindings}}
       end
-    end)
+    else
+      raise ArgumentError, "API key policy update requires an active transaction"
+    end
+  end
+
+  @doc """
+  Reads a key's policy bindings. An update reads them after it takes the key's
+  writer lock, which every binding write also holds.
+  """
+  @spec list_policy_bindings(Ecto.UUID.t()) :: [APIKeyPolicyBinding.t()]
+  def list_policy_bindings(api_key_id) do
+    Repo.all(
+      from binding in APIKeyPolicyBinding,
+        where: binding.api_key_id == ^api_key_id,
+        order_by: [asc: binding.binding_scope, asc: binding.model_identifier]
+    )
   end
 
   @spec normalize_transaction_result(transaction_result(value)) :: {:ok, value} | {:error, term()}

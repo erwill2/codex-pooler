@@ -13,10 +13,12 @@ defmodule CodexPooler.Catalog.Sync do
   alias CodexPooler.Upstreams.Schemas.EncryptedSecret
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
-  @assignment_active PoolUpstreamAssignment.active_status()
-  @assignment_eligible PoolUpstreamAssignment.eligible_status()
-  @identity_active UpstreamIdentity.active_status()
+  @assignment_active AssignmentStatus.active_status()
+  @assignment_eligible AssignmentStatus.eligible_status()
+  @identity_active IdentityStatus.active_status()
   @secret_active "active"
   @secret_kind "access_token"
   @cancelled "cancelled"
@@ -61,9 +63,7 @@ defmodule CodexPooler.Catalog.Sync do
     pool_id = pool_id(pool_or_id)
 
     PoolUpstreamAssignment
-    |> join(:inner, [assignment], identity in UpstreamIdentity,
-      on: identity.id == assignment.upstream_identity_id
-    )
+    |> join(:inner, [assignment], identity in UpstreamIdentity, on: identity.id == assignment.upstream_identity_id)
     |> join(:inner, [_assignment, identity], secret in EncryptedSecret,
       on:
         secret.upstream_identity_id == identity.id and secret.secret_kind == ^@secret_kind and
@@ -186,7 +186,6 @@ defmodule CodexPooler.Catalog.Sync do
       discovered_model_count: 0,
       upserted_model_count: 0,
       stale_marked_count: 0,
-      retired_count: 0,
       stats: %{}
     })
     |> Repo.insert()
@@ -205,7 +204,6 @@ defmodule CodexPooler.Catalog.Sync do
           discovered_model_count: 0,
           upserted_model_count: 0,
           stale_marked_count: 0,
-          retired_count: 0,
           stats: %{}
         },
         attrs

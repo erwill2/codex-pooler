@@ -4,7 +4,9 @@ defmodule CodexPooler.Gateway.Persistence.BridgeOwnerLease do
 
   import Ecto.Changeset
 
-  @statuses ~w(active expired released)
+  alias CodexPooler.Gateway.Persistence.StatusVocabulary.OwnerLease, as: OwnerLeaseStatus
+
+  @statuses OwnerLeaseStatus.statuses()
 
   @type t :: %__MODULE__{}
   @type attrs :: map()
@@ -16,7 +18,8 @@ defmodule CodexPooler.Gateway.Persistence.BridgeOwnerLease do
     field :api_key_id, :binary_id
     field :pool_upstream_assignment_id, :binary_id
     field :owner_instance_id, :string
-    field :lease_token, :binary_id
+    field :owner_instance_boot_id, :string
+    field :lease_token, :binary_id, redact: true
     field :status, :string
     field :acquired_at, :utc_datetime_usec
     field :renewed_at, :utc_datetime_usec
@@ -36,6 +39,7 @@ defmodule CodexPooler.Gateway.Persistence.BridgeOwnerLease do
       :api_key_id,
       :pool_upstream_assignment_id,
       :owner_instance_id,
+      :owner_instance_boot_id,
       :lease_token,
       :status,
       :acquired_at,
@@ -64,14 +68,14 @@ defmodule CodexPooler.Gateway.Persistence.BridgeOwnerLease do
   end
 
   @spec statuses() :: [status()]
-  def statuses, do: @statuses
+  defdelegate statuses(), to: OwnerLeaseStatus
 
   @spec active_status() :: status()
-  def active_status, do: "active"
+  defdelegate active_status(), to: OwnerLeaseStatus
 
   @spec expired_status() :: status()
-  def expired_status, do: "expired"
+  defdelegate expired_status(), to: OwnerLeaseStatus
 
   @spec released_status() :: status()
-  def released_status, do: "released"
+  defdelegate released_status(), to: OwnerLeaseStatus
 end

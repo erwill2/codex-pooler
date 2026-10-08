@@ -11,6 +11,7 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanTest do
 
   test "representative API-key Observatory plans avoid full fact-table scans" do
     Fixture.set_statement_timeout()
+    Fixture.start_from_empty_relations!()
 
     %{principal: principal, upper_bound: upper_bound, row_count: row_count} =
       Fixture.insert_representative_rows!()
@@ -67,7 +68,7 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanTest do
 
   defp without_required_scope_index(plans) do
     Support.map_plan_nodes(plans, fn
-      %{"Index Name" => "requests_api_key_pool_admitted_idx"} = node ->
+      %{"Index Name" => "requests_api_key_pool_admitted_id_idx"} = node ->
         %{node | "Index Name" => "unscoped_test_index"}
 
       node ->

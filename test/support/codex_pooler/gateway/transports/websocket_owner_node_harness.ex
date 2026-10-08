@@ -2,7 +2,105 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
   @moduledoc false
 
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Runtime.Finalization.Interruption
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+
+  # How long a fixture barrier waits for the test's release before it raises.
+  # The test releases each barrier itself, so this is a fixture timer, not a
+  # detection budget: it stays beyond the tests' 15 s detection budgets, or a
+  # test stalled between its barrier notification and its release sees the
+  # fixture raise first (findings#206 row 206-320, the two-sender harness under
+  # stacked holds).
+  @release_timeout_ms 60_000
+
+  @controlled_stages [
+    :nonterminal_frames,
+    :terminal_frames,
+    :task_result,
+    :downstream_send_result,
+    :invalidation_result,
+    :timer_message
+  ]
+
+  @spec two_sender_controls() :: %{required(atom()) => reference()}
+  def two_sender_controls do
+    Map.new(@controlled_stages, &{&1, make_ref()})
+  end
+
+  @spec two_sender_upstream_boundary(pid(), map(), keyword()) :: map()
+  def two_sender_upstream_boundary(test_pid, controls, opts \\ [])
+      when is_pid(test_pid) and is_map(controls) and is_list(opts) do
+    nonterminal_frames = Keyword.get(opts, :nonterminal_frames, [])
+    terminal_frames = Keyword.get(opts, :terminal_frames, [])
+    task_result = Keyword.get(opts, :task_result, :ok)
+
+    %{
+      start: fn -> start_fake_upstream(test_pid) end,
+      send: fn upstream_pid, payload, writer ->
+        record_frame(upstream_pid, payload, test_pid)
+
+        start_controlled_frame_sender(
+          test_pid,
+          controls,
+          writer,
+          nonterminal_frames,
+          terminal_frames
+        )
+
+        await_controlled_release(test_pid, controls, :task_result)
+        task_result
+      end,
+      close: fn upstream_pid -> stop_fake_upstream(upstream_pid, test_pid) end
+    }
+  end
+
+  @spec controlled_result(pid(), map(), atom(), term()) :: term()
+  def controlled_result(test_pid, controls, stage, result)
+      when is_pid(test_pid) and is_map(controls) and stage in @controlled_stages do
+    await_controlled_release(test_pid, controls, stage)
+    result
+  end
+
+  @spec terminal_barrier_downstream_sender(pid(), binary(), reference()) ::
+          (pid(), term() -> :ok)
+  def terminal_barrier_downstream_sender(test_pid, terminal, release_ref)
+      when is_pid(test_pid) and is_binary(terminal) and is_reference(release_ref) do
+    fn downstream_pid, message ->
+      if terminal_downstream_message?(message, terminal) do
+        send(test_pid, {:websocket_owner_harness_terminal_delivery_barrier, self(), release_ref})
+
+        receive do
+          {:websocket_owner_harness_release_terminal_delivery, ^release_ref} -> :ok
+        after
+          @release_timeout_ms -> raise "timed out waiting for websocket owner terminal delivery release"
+        end
+
+        send(downstream_pid, message)
+        send(test_pid, {:websocket_owner_harness_terminal_delivered, release_ref})
+        :ok
+      else
+        send(downstream_pid, message)
+        :ok
+      end
+    end
+  end
+
+  @spec controlled_timer_message(pid(), pid(), map(), term()) :: :ok
+  def controlled_timer_message(test_pid, target, controls, message)
+      when is_pid(test_pid) and is_pid(target) and is_map(controls) do
+    await_controlled_release(test_pid, controls, :timer_message)
+    send(target, message)
+    :ok
+  end
+
+  @spec release_controlled(pid(), map(), atom()) :: :ok
+  def release_controlled(barrier_pid, controls, stage)
+      when is_pid(barrier_pid) and is_map(controls) and stage in @controlled_stages do
+    send(barrier_pid, {:websocket_owner_harness_release_controlled, Map.fetch!(controls, stage)})
+    :ok
+  end
 
   def fake_upstream_boundary(test_pid, opts \\ []) when is_pid(test_pid) do
     block_ref = Keyword.get(opts, :block_ref)
@@ -53,9 +151,45 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
       renew_owner_token: fn _session_id, _owner_lease_token, _opts ->
         {:error, :stale_owner}
       end,
+      close_request_replays: fn _session_id, _owner_lease_token, :owner_shutdown ->
+        {:ok, %{armed_closed: 0, consumed_closed: 0}}
+      end,
       release_owner_lease: fn _session_id, _owner_lease_token, _reason -> :ok end,
       interrupt_codex_session: fn _session_id, _opts -> :ok end
     }
+  end
+
+  def real_persistence_boundary do
+    %{
+      release_owner_lease: &SessionContinuity.release_owner_lease/4,
+      renew_owner_token: &SessionContinuity.renew_owner_token/3,
+      interrupt_codex_session: &Interruption.interrupt_codex_session/2
+    }
+  end
+
+  def stop_owner(codex_session_id, timeout_ms)
+      when is_binary(codex_session_id) and is_integer(timeout_ms) and timeout_ms > 0 do
+    case WebsocketOwnerSession.lookup(codex_session_id) do
+      {:ok, owner_pid} ->
+        owner_ref = Process.monitor(owner_pid)
+        GenServer.stop(owner_pid, :shutdown, timeout_ms)
+
+        receive do
+          {:DOWN, ^owner_ref, :process, ^owner_pid, _reason} -> :ok
+        after
+          timeout_ms -> {:error, :owner_stop_timeout}
+        end
+
+      {:error, :owner_unavailable} ->
+        :ok
+    end
+  catch
+    :exit, {:noproc, _details} -> :ok
+    :exit, {:normal, _details} -> :ok
+  end
+
+  def owner_absent?(codex_session_id) when is_binary(codex_session_id) do
+    Registry.lookup(WebsocketOwnerSession.Registry, codex_session_id) == []
   end
 
   def start_owner_runtime do
@@ -74,9 +208,10 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
           )
 
         {:ok, _task_supervisor} =
-          Task.Supervisor.start_link(
-            name: CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor
-          )
+          Task.Supervisor.start_link(name: CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor)
+
+        {:ok, _abandoned_submissions} =
+          Registry.start_link(keys: :unique, name: CodexPooler.Gateway.Transports.Websocket.AbandonedSubmissions.Registry)
 
         send(caller, {ready_ref, :ready})
 
@@ -88,16 +223,34 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
     receive do
       {^ready_ref, :ready} -> {:ok, runtime}
     after
-      2_000 -> {:error, :owner_runtime_start_timeout}
+      10_000 -> {:error, :owner_runtime_start_timeout}
     end
+  end
+
+  def start_repo(repo_config) when is_list(repo_config) do
+    Application.put_env(:codex_pooler, CodexPooler.Repo, repo_config)
+    {:ok, _applications} = Application.ensure_all_started(:ecto_sql)
+    {:ok, repo_pid} = CodexPooler.Repo.start_link()
+    Process.unlink(repo_pid)
+    repo_pid
+  end
+
+  # The production PubSub (`{Phoenix.PubSub, name: CodexPooler.PubSub}`) on a harness peer that runs real persistence. Accounting
+  # finalization and the quota evidence observer publish events, and the interrupt a retiring owner writes on exit runs the
+  # finalization inside its own transaction, so without the registry it raised `ArgumentError: unknown registry:
+  # CodexPooler.PubSub` and rolled back (`interrupt_accounting_failed`), a path production never takes. Started by the caller
+  # and kept alive past the erpc worker that starts it, like the Repo.
+  def start_pubsub do
+    {:ok, _applications} = Application.ensure_all_started(:phoenix_pubsub)
+    {:ok, pubsub} = Supervisor.start_link([{Phoenix.PubSub, name: CodexPooler.PubSub}], strategy: :one_for_one)
+    Process.unlink(pubsub)
+    {:ok, pubsub}
   end
 
   def put_owner_idle_timeout(timeout) when is_integer(timeout) do
     settings = OperationalSettings.current()
 
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: %{settings | websocket_owner_idle_timeout_ms: timeout}
-    )
+    Application.put_env(:codex_pooler, OperationalSettings, settings: %{settings | websocket_owner_idle_timeout_ms: timeout})
   end
 
   def start_owner_with_local_idle_timeout(opts) when is_list(opts) do
@@ -141,6 +294,14 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
 
   defp drop_connection_metadata(result), do: result
 
+  defp terminal_downstream_message?(
+         {:websocket_owner_frame, _correlation_id, _epoch, {:data, terminal}},
+         terminal
+       ),
+       do: true
+
+  defp terminal_downstream_message?(_message, _terminal), do: false
+
   defp start_fake_upstream(test_pid) do
     Agent.start_link(fn -> %{frames: [], closed?: false} end)
     |> tap(fn
@@ -157,23 +318,54 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
     send(test_pid, {:websocket_owner_harness_upstream_sent, upstream_pid})
   end
 
+  defp start_controlled_frame_sender(
+         test_pid,
+         controls,
+         writer,
+         nonterminal_frames,
+         terminal_frames
+       ) do
+    spawn_link(fn ->
+      await_controlled_release(test_pid, controls, :nonterminal_frames)
+      Enum.each(nonterminal_frames, &emit_frame(writer, &1))
+      await_controlled_release(test_pid, controls, :terminal_frames)
+      Enum.each(terminal_frames, &emit_frame(writer, &1))
+    end)
+  end
+
+  defp await_controlled_release(test_pid, controls, stage) do
+    release_ref = Map.fetch!(controls, stage)
+    send(test_pid, {:websocket_owner_harness_controlled_barrier, stage, self(), release_ref})
+
+    receive do
+      {:websocket_owner_harness_release_controlled, ^release_ref} -> :ok
+    after
+      @release_timeout_ms -> raise "timed out waiting for websocket owner controlled release"
+    end
+  end
+
   defp emit_messages(messages, writer, nil, _test_pid) do
-    Enum.each(messages, writer)
+    Enum.each(messages, &emit_frame(writer, &1))
   end
 
   defp emit_messages(messages, writer, block_ref, test_pid) when is_reference(block_ref) do
     {before_barrier, after_barrier} = Enum.split(messages, 1)
-    Enum.each(before_barrier, writer)
+    Enum.each(before_barrier, &emit_frame(writer, &1))
     send(test_pid, {:websocket_owner_harness_barrier, self(), block_ref})
 
     receive do
       {:websocket_owner_harness_release, ^block_ref} -> :ok
     after
-      5_000 -> raise "timed out waiting for websocket owner harness release"
+      @release_timeout_ms -> raise "timed out waiting for websocket owner harness release"
     end
 
-    Enum.each(after_barrier, writer)
+    Enum.each(after_barrier, &emit_frame(writer, &1))
   end
+
+  defp emit_frame(writer, frame) when is_function(writer, 2),
+    do: writer.(frame, TerminalDiscriminator.classify(frame))
+
+  defp emit_frame(writer, frame) when is_function(writer, 1), do: writer.(frame)
 
   defp stop_fake_upstream(upstream_pid, test_pid) do
     Agent.update(upstream_pid, fn state -> %{state | closed?: true} end)
@@ -186,28 +378,45 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
   def node_client_opts(nodes, opts \\ []) when is_list(nodes) do
     previous = Process.get(__MODULE__)
 
-    Process.put(__MODULE__, %{
-      nodes: nodes,
-      calls: Keyword.get(opts, :calls, %{}),
-      roles: Keyword.get(opts, :roles, %{})
-    })
+    Process.put(__MODULE__, node_client_state(nodes, opts))
 
     ExUnit.Callbacks.on_exit(fn ->
-      case previous do
-        nil -> Process.delete(__MODULE__)
-        value -> Process.put(__MODULE__, value)
-      end
+      restore_node_client_state(previous)
     end)
 
     [node_client: __MODULE__]
+  end
+
+  @spec with_node_client([node()], keyword(), (keyword() -> term())) :: term()
+  def with_node_client(nodes, opts \\ [], fun)
+      when is_list(nodes) and is_list(opts) and is_function(fun, 1) do
+    previous = Process.get(__MODULE__)
+    Process.put(__MODULE__, node_client_state(nodes, opts))
+
+    try do
+      fun.(node_client: __MODULE__)
+    after
+      restore_node_client_state(previous)
+    end
+  end
+
+  # Supervised cleanup tasks retain their test caller through Task's caller chain.
+  # Read only this harness entry; never copy the caller's process dictionary.
+  defp current_node_client_state do
+    Process.get(__MODULE__) ||
+      Enum.find_value(Process.get(:"$callers", []), %{}, fn caller ->
+        case Process.info(caller, :dictionary) do
+          {:dictionary, dictionary} -> Keyword.get(dictionary, __MODULE__)
+          nil -> nil
+        end
+      end)
   end
 
   @behaviour CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder.NodeClient
 
   @impl true
   def connected_app_nodes do
-    __MODULE__
-    |> Process.get(%{})
+    current_node_client_state()
     |> Map.get(:nodes, [])
   end
 
@@ -228,6 +437,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
   def call_owner(node, module, function, args, timeout) do
     mode = call_mode(node)
     send_call_observation(node, module, function, args, timeout, mode)
+    send_request_observation(function, args)
     dispatch_call_mode(mode, node, module, function, args)
   end
 
@@ -255,13 +465,37 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
   defp dispatch_call_mode(:crash, _node, _module, _function, _args),
     do: raise("simulated remote owner crash")
 
+  defp dispatch_call_mode(
+         {:barrier_success, notify, release_ref},
+         _node,
+         module,
+         function,
+         args
+       )
+       when is_pid(notify) and is_reference(release_ref) do
+    await_call_barrier(notify, release_ref, function)
+    apply(module, function, args)
+  end
+
+  defp dispatch_call_mode(
+         {:barrier_return, notify, release_ref, result},
+         _node,
+         _module,
+         function,
+         _args
+       )
+       when is_pid(notify) and is_reference(release_ref) do
+    await_call_barrier(notify, release_ref, function)
+    result
+  end
+
   # Emulates an owner node still running the previous release: it exports
-  # remote_attach_downstream/2 but not /3, so the option-carrying bridge
-  # attach raises the same {:exception, :undef, _} error :erpc.call surfaces
-  # for a missing remote function, while every other forward works unchanged.
+  # remote_attach_downstream/2 but not /3 and has no versioned request entrypoint.
   defp dispatch_call_mode(:old_release, _node, module, function, args) do
-    if function == :remote_attach_downstream and length(args) == 3 do
-      :erlang.error({:exception, :undef, [{module, function, args, []}]})
+    if (function == :remote_attach_downstream and length(args) == 3) or
+         (function == :remote_submit_request_v8 and length(args) == 3) or
+         (function == :remote_cancel_downstream_v1 and length(args) == 3) do
+      {:error, {:exception, :undef, [{module, function, args, []}]}}
     else
       apply(module, function, args)
     end
@@ -297,7 +531,10 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
           result = apply(module, function, args)
           send(parent, {:websocket_owner_harness_delayed_result, release_ref, result})
       after
-        5_000 ->
+        # A fixture timer like every other harness release: the test sends the
+        # release only after its own detection waits, so a shorter fallback
+        # answers `{:error, :timeout}` to a test that was merely slow to release.
+        @release_timeout_ms ->
           send(
             parent,
             {:websocket_owner_harness_delayed_result, release_ref, {:error, :timeout}}
@@ -308,8 +545,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
 
   defp node_role(node) do
     roles =
-      __MODULE__
-      |> Process.get(%{})
+      current_node_client_state()
       |> Map.get(:roles, %{})
 
     Map.get(roles, node)
@@ -317,26 +553,75 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
 
   defp call_mode(node) do
     calls =
-      __MODULE__
-      |> Process.get(%{})
+      current_node_client_state()
       |> Map.get(:calls, %{})
 
     Map.get(calls, node, :success)
   end
 
   defp send_call_observation(node, module, function, args, timeout, mode) do
-    send(self(), {
+    notify = current_node_client_state() |> Map.get(:notify, self())
+
+    send(notify, {
       :websocket_owner_harness_node_call,
-      %{
-        node: node,
-        module: module,
-        function: function,
-        arity: length(args),
-        timeout: timeout,
-        mode: mode
-      }
+      Map.merge(
+        %{
+          node: node,
+          module: module,
+          function: function,
+          arity: length(args),
+          timeout: timeout,
+          mode: mode
+        },
+        request_call_metadata(function, args)
+      )
     })
   end
+
+  defp request_call_metadata(
+         function,
+         [codex_session_id, downstream, _request]
+       )
+       when function == :remote_submit_request_v8 do
+    %{codex_session_id: codex_session_id, downstream: downstream}
+  end
+
+  defp request_call_metadata(_function, _args), do: %{}
+
+  defp send_request_observation(:remote_submit_request_v8, [_session_id, _downstream, request]) do
+    case current_node_client_state() |> Map.get(:capture_request_to) do
+      pid when is_pid(pid) -> send(pid, {:websocket_owner_harness_request, request})
+      _not_configured -> :ok
+    end
+  end
+
+  defp send_request_observation(_function, _args), do: :ok
+
+  defp await_call_barrier(notify, release_ref, function) do
+    send(
+      notify,
+      {:websocket_owner_harness_call_barrier, self(), release_ref, function}
+    )
+
+    receive do
+      {:websocket_owner_harness_release_call, ^release_ref} -> :ok
+    after
+      @release_timeout_ms -> raise "timed out waiting for websocket owner RPC harness release"
+    end
+  end
+
+  defp node_client_state(nodes, opts) do
+    %{
+      nodes: nodes,
+      calls: Keyword.get(opts, :calls, %{}),
+      roles: Keyword.get(opts, :roles, %{}),
+      notify: Keyword.get(opts, :notify, self()),
+      capture_request_to: Keyword.get(opts, :capture_request_to)
+    }
+  end
+
+  defp restore_node_client_state(nil), do: Process.delete(__MODULE__)
+  defp restore_node_client_state(previous), do: Process.put(__MODULE__, previous)
 end
 
 defmodule CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseCaller do

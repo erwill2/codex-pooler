@@ -2,26 +2,15 @@ import { rm } from "node:fs/promises";
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import starlightPageActions from "starlight-page-actions";
+import sitemap from "@astrojs/sitemap";
+import docsLinks from "./plugins/docs-links.mjs";
+import docsImages from "./plugins/docs-images.mjs";
 
-const siteUrl = "https://docs.codex-pooler.com";
+// The landing page is the site root (src/pages/index.astro) and the docs are
+// served under /docs (see src/content.config.ts).
+const siteOrigin = "https://www.codex-pooler.com";
 const siteDescription =
   "Codex Pooler docs for self-hosted Codex account pooling, Pool API keys, backend compatibility, narrow /v1 SDK routes, MCP metadata, routing, and deployment.";
-
-const softwareStructuredData = {
-  "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  name: "Codex Pooler",
-  applicationCategory: "DeveloperApplication",
-  applicationSubCategory: "AI developer tooling",
-  operatingSystem: "Docker Compose and Kubernetes",
-  url: `${siteUrl}/`,
-  description: siteDescription,
-  softwareRequirements: "Docker Compose or Kubernetes for self-hosted deployments",
-  softwareHelp: {
-    "@type": "CreativeWork",
-    url: `${siteUrl}/`,
-  },
-};
 
 const autogenerateGroup = (label, directory) => ({
   label,
@@ -33,20 +22,39 @@ const removePrivateMarkdownAssets = () => ({
   hooks: {
     "astro:build:done": async ({ dir }) => {
       await rm(new URL("_docs-contract.md", dir), { force: true });
+      // The page-actions Markdown copy of the 404 page is only its title.
+      await rm(new URL("404.md", dir), { force: true });
     },
   },
 });
 
 export default defineConfig({
-  site: siteUrl,
+  site: siteOrigin,
   redirects: {
-    "/reference/endpoint-routing/": "/reference/runtime-routes/",
+    "/docs/clients/kilo/": "/docs/clients/kilo-code/",
+    "/docs/clients/codex-cli/": "/docs/clients/codex-cli-desktop/",
+    "/docs/reference/endpoint-routing/": "/docs/reference/runtime-routes/",
   },
   integrations: [
+    // Starlight's default sitemap, minus a noindex page kept only for old bookmarks and their anchors.
+    sitemap({ filter: (page) => !page.endsWith("/docs/operators/monitoring/") }),
     starlight({
       title: "Codex Pooler",
       description: siteDescription,
+      favicon: "/icon.svg",
       head: [
+        {
+          tag: "link",
+          attrs: { rel: "icon", href: "/favicon-32.png", sizes: "32x32", type: "image/png" },
+        },
+        {
+          tag: "link",
+          attrs: { rel: "icon", href: "/icon-192.png", sizes: "192x192", type: "image/png" },
+        },
+        {
+          tag: "link",
+          attrs: { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
+        },
         {
           tag: "meta",
           attrs: {
@@ -82,11 +90,6 @@ export default defineConfig({
         },
         {
           tag: "script",
-          attrs: { type: "application/ld+json" },
-          content: JSON.stringify(softwareStructuredData),
-        },
-        {
-          tag: "script",
           attrs: {
             async: true,
             src: "https://analytics.icorete.ch/js/pa-5Klr1c-TW2X9D5KwXBBis.js",
@@ -104,6 +107,8 @@ export default defineConfig({
           label: "GitHub",
           href: "https://github.com/icoretech/codex-pooler",
         },
+        { icon: "x.com", label: "X", href: "https://x.com/icoretech_inc" },
+        { icon: "reddit", label: "Reddit", href: "https://reddit.com/r/CodexPooler" },
       ],
       editLink: {
         baseUrl: "https://github.com/icoretech/codex-pooler/edit/main/docs-site/",
@@ -111,8 +116,11 @@ export default defineConfig({
       lastUpdated: true,
       pagefind: true,
       disable404Route: true,
+      // Titles, social cards and structured data per page (src/routeData.ts).
+      routeMiddleware: "./src/routeData.ts",
       components: {
         PageTitle: "./src/components/PageTitle.astro",
+        Sidebar: "./src/components/Sidebar.astro",
       },
       plugins: [
         starlightPageActions({
@@ -129,21 +137,25 @@ export default defineConfig({
           },
         }),
       ],
-      customCss: ["/src/styles/starlight.css"],
+      customCss: ["@fontsource-variable/roboto-condensed", "/src/styles/starlight.css"],
       sidebar: [
         {
           label: "Getting Started",
           items: [
-            { slug: "getting-started/quick-start" },
-            { slug: "getting-started/configuration" },
+            { label: "Overview", slug: "docs" },
+            { slug: "docs/getting-started/quick-start" },
+            { slug: "docs/getting-started/configuration" },
           ],
         },
         autogenerateGroup("Clients", "clients"),
         autogenerateGroup("Reference", "reference"),
         autogenerateGroup("Operators", "operators"),
         autogenerateGroup("Deployment", "deployment"),
+        autogenerateGroup("Monitoring", "monitoring"),
       ],
     }),
+    docsLinks({ prefix: "/docs" }),
+    docsImages(),
     removePrivateMarkdownAssets(),
   ],
 });

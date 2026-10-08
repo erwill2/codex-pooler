@@ -3,10 +3,14 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
 
   require Logger
 
+  alias CodexPooler.Files.UploadUrlPolicy
+  alias CodexPooler.Files.UploadUrlPolicy.Target
   alias CodexPooler.Gateway.OpenAICompatibility.Error
   alias CodexPooler.Gateway.Payloads.{RequestOptions, TransportEnvelope}
   alias CodexPooler.Gateway.Routing.RoutingSelection
+  alias CodexPooler.Gateway.Transports.PinnedUpload
   alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.Upstreams.EndpointMetadata
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.Secrets
@@ -21,6 +25,8 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
   @finalize_retry_interval_ms 250
   @upload_req_option_allowlist [:adapter, :plug]
   @upload_request_step_denylist [:put_user_agent]
+  @upload_timeout_ms :timer.minutes(5)
+  @upload_max_attempts 5
 
   @type auth :: CodexPooler.Access.auth_context()
   @type payload :: map()
@@ -59,31 +65,118 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
     create_file_with_selection(payload, request_options, selection)
   end
 
-  @spec upload_file(String.t(), map(), bridge_opts()) :: :ok | {:error, map()}
+  @spec prepare_upload(term()) :: {:ok, Target.t()} | {:error, UploadUrlPolicy.file_error()}
+  def prepare_upload(upload_url), do: UploadUrlPolicy.resolve(upload_url)
+
+  @spec upload_file(String.t() | Target.t(), map(), bridge_opts()) :: :ok | {:error, map()}
   def upload_file(upload_url, file, opts \\ %{})
 
-  def upload_file(upload_url, %{"path" => path, "content_type" => content_type}, opts)
-      when is_binary(upload_url) do
-    with {:ok, body} <- readable_file_stream(path) do
-      upload_url
-      |> upload_request()
-      |> Req.put(upload_req_options(body, content_type))
-      |> normalize_upload_response(opts)
+  def upload_file(upload_url, file, opts) when is_binary(upload_url) do
+    with {:ok, target} <- prepare_upload(upload_url), do: upload_file(target, file, opts)
+  end
+
+  def upload_file(%Target{} = target, %{"path" => path, "content_type" => content_type}, opts) do
+    timeout = config() |> Keyword.get(:upload_timeout_ms, @upload_timeout_ms) |> max(0) |> min(@upload_timeout_ms)
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    # The HTTP response timeout starts after sending the body. This linked task
+    # bounds file reads, sending, receiving and backoff together, and cannot
+    # outlive an abnormally terminated request process.
+    task = Task.async(fn -> upload_attempt(target, path, content_type, deadline, 1) end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> normalize_upload_response(result, opts)
+      _expired -> normalize_upload_response({:error, :upload_timeout}, opts)
     end
-  rescue
-    exception in [
-      Req.TransportError,
-      Req.HTTPError,
-      Finch.TransportError,
-      Finch.HTTPError,
-      Mint.TransportError,
-      Mint.HTTPError
-    ] ->
-      normalize_upload_response({:error, exception}, opts)
   end
 
   def upload_file(_upload_url, _file, _opts) do
     {:error, Error.reason(400, "invalid_request", "file upload is not readable", "file")}
+  end
+
+  defp upload_attempt(url, path, content_type, deadline, attempt) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, :upload_timeout}
+    else
+      result = upload_once(url, path, content_type, remaining) |> classify_upload_attempt(attempt)
+      delay = upload_retry_delay(result, attempt)
+
+      if attempt < @upload_max_attempts and retryable_upload?(result) and
+           delay < deadline - System.monotonic_time(:millisecond) do
+        Process.sleep(delay)
+        upload_attempt(url, path, content_type, deadline, attempt + 1)
+      else
+        result
+      end
+    end
+  end
+
+  defp classify_upload_attempt({:error, %{code: "invalid_request"}}, attempt) when attempt > 1,
+    do: {:error, :upload_file_unavailable}
+
+  defp classify_upload_attempt(result, _attempt), do: result
+
+  defp upload_once(%Target{url: url, address: address}, path, content_type, remaining) do
+    with {:ok, body, byte_size} <- readable_file_stream(path) do
+      options =
+        upload_req_options(body, content_type, byte_size)
+        |> Keyword.put_new(:adapter, PinnedUpload)
+
+      url |> upload_request(address, remaining) |> OutboundHTTP.put(options)
+    end
+  rescue
+    exception in [Req.TransportError, Req.HTTPError, Finch.TransportError, Finch.HTTPError, Mint.TransportError, Mint.HTTPError] ->
+      {:error, exception}
+
+    _exception in [File.Error] ->
+      {:error, Error.reason(400, "invalid_request", "file upload is not readable", "file")}
+  end
+
+  defp retryable_upload?({:ok, %Req.Response{status: 503}}), do: true
+
+  defp retryable_upload?({:error, %{__struct__: module, reason: reason}})
+       when module in [Req.TransportError, Finch.TransportError, Mint.TransportError] and
+              reason in [:timeout, :closed, :econnrefused, :econnreset, :econnaborted, :epipe],
+       do: true
+
+  defp retryable_upload?({:error, %Req.HTTPError{protocol: :http1, reason: :closed}}), do: true
+  defp retryable_upload?(_result), do: false
+
+  defp upload_retry_delay({:ok, %Req.Response{} = response}, attempt) do
+    upload_delay_header(response, "x-ms-retry-after-ms", 1) ||
+      upload_delay_header(response, "retry-after", 1_000) || upload_backoff(attempt)
+  end
+
+  defp upload_retry_delay(_result, attempt), do: upload_backoff(attempt)
+
+  defp upload_backoff(attempt) do
+    base = config() |> Keyword.get(:upload_retry_interval_ms, 250) |> max(0) |> min(1_000)
+    base * Integer.pow(2, attempt - 1)
+  end
+
+  defp upload_delay_header(response, name, multiplier) do
+    case Req.Response.get_header(response, name) do
+      [value] when byte_size(value) <= 128 -> parse_upload_delay(value, name, multiplier)
+      [_oversized] -> @upload_timeout_ms
+      _invalid -> nil
+    end
+  end
+
+  defp parse_upload_delay(value, name, multiplier) do
+    case Integer.parse(value) do
+      {delay, ""} when delay >= 0 -> delay * multiplier
+      _invalid when name == "retry-after" -> upload_http_date_delay(value)
+      _invalid -> nil
+    end
+  end
+
+  defp upload_http_date_delay(value) do
+    case Req.Utils.parse_http_date(value) do
+      {:ok, date} -> max(DateTime.diff(date, DateTime.utc_now(), :millisecond), 0)
+      {:error, _reason} -> nil
+    end
   end
 
   defp create_file_with_selection(payload, opts, %RoutingSelection{} = selection) do
@@ -102,6 +195,7 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
     end
   end
 
+  @doc "Finalizes within one absolute retry budget; a zero budget refuses before dispatch."
   @spec finalize_file(String.t(), bridge_opts(), RoutingSelection.t()) ::
           bridge_result()
   def finalize_file(file_id, opts, %RoutingSelection{} = selection) when is_binary(file_id) do
@@ -124,19 +218,31 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
   end
 
   defp poll_finalize(url, identity, token, %{deadline: deadline} = retry_opts, last_retry) do
-    if retry_budget_exhausted?(deadline, last_retry) do
-      {:retry_timeout, last_retry}
-    else
-      dispatch_finalize_poll(url, identity, token, retry_opts)
+    remaining = deadline - System.monotonic_time(:millisecond)
+    if remaining <= 0, do: finalize_deadline_result(last_retry), else: dispatch_finalize_poll(url, identity, token, retry_opts, last_retry, remaining)
+  end
+
+  defp dispatch_finalize_poll(url, identity, token, retry_opts, last_retry, remaining) do
+    timeouts = TransportEnvelope.timeout_config(retry_opts.opts, @timeout_defaults)
+    bounded = %{timeouts | connect_timeout_ms: min(timeouts.connect_timeout_ms, remaining), pool_timeout_ms: min(timeouts.pool_timeout_ms, remaining), receive_timeout_ms: min(timeouts.receive_timeout_ms, remaining)}
+    opts = %{retry_opts.opts | timeout_config: bounded}
+    task = Task.async(fn -> post_json(url, identity, token, %{}, opts) end)
+    result = Task.yield(task, remaining) || Task.shutdown(task, :brutal_kill)
+
+    case result do
+      {:ok, {:ok, response}} ->
+        with {:ok, body} <- json_success(response, :finalize), do: handle_finalize_body(body, url, identity, token, retry_opts)
+
+      {:ok, {:error, _error} = error} ->
+        if System.monotonic_time(:millisecond) >= retry_opts.deadline, do: finalize_deadline_result(last_retry), else: error
+
+      _expired ->
+        finalize_deadline_result(last_retry)
     end
   end
 
-  defp dispatch_finalize_poll(url, identity, token, retry_opts) do
-    with {:ok, response} <- post_json(url, identity, token, %{}, retry_opts.opts),
-         {:ok, body} <- json_success(response, :finalize) do
-      handle_finalize_body(body, url, identity, token, retry_opts)
-    end
-  end
+  defp finalize_deadline_result(nil), do: {:error, safe_error(502, :upstream_request_failed, "upstream file bridge request failed")}
+  defp finalize_deadline_result(last_retry), do: {:retry_timeout, last_retry}
 
   defp handle_finalize_body(body, url, identity, token, retry_opts) do
     if retry_status?(body) do
@@ -199,8 +305,7 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
         {:ok, url}
 
       {:error, :invalid_upstream_base_url} ->
-        {:error,
-         safe_error(502, :invalid_upstream_base_url, "upstream file bridge is misconfigured")}
+        {:error, safe_error(502, :invalid_upstream_base_url, "upstream file bridge is misconfigured")}
     end
   end
 
@@ -209,14 +314,14 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
 
     request_options =
       [
-        json: payload,
+        body: CodexPooler.JSON.encode_to_iodata!(payload),
         retry: false,
         headers: headers(identity, token, forwarded_headers(opts))
       ]
-      |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts))
+      |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts, url))
 
     url
-    |> Req.post(request_options)
+    |> OutboundHTTP.post(request_options)
     |> normalize_transport_result(identity, opts)
   rescue
     exception in [
@@ -266,35 +371,40 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
     path == root or String.starts_with?(path, root <> "/")
   end
 
-  defp upload_req_options(body, content_type) do
+  defp upload_req_options(body, content_type, byte_size) do
     configured_upload_req_options()
     |> Keyword.merge(
       body: body,
       headers: [
+        {"content-length", Integer.to_string(byte_size)},
         {"content-type", content_type || "application/octet-stream"},
         {"x-ms-blob-type", "BlockBlob"}
       ],
       redirect: false,
-      retry: false
+      retry: false,
+      raw: true
     )
   end
 
-  @spec upload_request(String.t()) :: Req.Request.t()
-  defp upload_request(upload_url) do
+  @spec upload_request(String.t(), :inet.ip_address(), pos_integer()) :: Req.Request.t()
+  defp upload_request(upload_url, address, remaining) do
     [url: upload_url]
     |> Req.new()
-    |> without_request_steps(@upload_request_step_denylist)
+    |> Req.Request.put_private(:codex_pooler_pinned_upload, {address, remaining})
+    |> disable_request_steps(@upload_request_step_denylist)
   end
 
-  @spec without_request_steps(Req.Request.t(), [atom()]) :: Req.Request.t()
-  defp without_request_steps(%Req.Request{} = request, step_names) when is_list(step_names) do
-    %{
-      request
-      | request_steps: Keyword.drop(request.request_steps, step_names),
-        current_request_steps:
-          Enum.reject(request.current_request_steps, fn step_name -> step_name in step_names end)
-    }
+  @spec disable_request_steps(Req.Request.t(), [atom()]) :: Req.Request.t()
+  defp disable_request_steps(%Req.Request{} = request, step_names) when is_list(step_names) do
+    request_steps =
+      Enum.reduce(step_names, request.request_steps, fn step_name, request_steps ->
+        Keyword.replace!(request_steps, step_name, &passthrough_request_step/1)
+      end)
+
+    %{request | request_steps: request_steps}
   end
+
+  defp passthrough_request_step(request), do: request
 
   defp configured_upload_req_options do
     case Keyword.get(config(), :upload_req_options, []) do
@@ -309,7 +419,14 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
     case File.open(path, [:read]) do
       {:ok, file} ->
         File.close(file)
-        {:ok, File.stream!(path, 2048, [])}
+
+        case File.stat(path) do
+          {:ok, %File.Stat{size: byte_size}} ->
+            {:ok, File.stream!(path, 64 * 1024, []), byte_size}
+
+          {:error, _reason} ->
+            {:error, Error.reason(400, "invalid_request", "file upload is not readable", "file")}
+        end
 
       {:error, _reason} ->
         {:error, Error.reason(400, "invalid_request", "file upload is not readable", "file")}
@@ -334,6 +451,12 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
 
       {:error, exception} when transport_exception?(exception) ->
         upload_transport_error(exception, opts)
+
+      {:error, %File.Error{}} ->
+        {:error, Error.reason(400, "invalid_request", "file upload is not readable", "file")}
+
+      {:error, %{code: "invalid_request"} = error} ->
+        {:error, error}
 
       {:error, _reason} ->
         {:error, Error.reason(502, "upstream_file_upload_failed", "upstream file upload failed")}
@@ -393,11 +516,9 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
       exception: exception |> TransportFailureReason.safe_exception() |> safe_log_value(),
       reason: exception |> TransportFailureReason.safe_reason() |> safe_log_value(),
       pool_upstream_assignment_id: safe_log_value(file_bridge.pool_upstream_assignment_id),
-      upstream_identity_id:
-        safe_log_value(file_bridge.upstream_identity_id || identity_id(identity)),
+      upstream_identity_id: safe_log_value(file_bridge.upstream_identity_id || identity_id(identity)),
       route_class: safe_log_value(route_metadata[:route_class] || route_metadata["route_class"]),
-      routing_strategy:
-        safe_log_value(route_metadata[:routing_strategy] || route_metadata["routing_strategy"])
+      routing_strategy: safe_log_value(route_metadata[:routing_strategy] || route_metadata["routing_strategy"])
     ]
     |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
   end
@@ -429,6 +550,14 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
     )
   end
 
+  # The captured headers go to `TransportEnvelope.headers/4` as they were
+  # captured; the envelope itself applies the closed metadata allowlist and
+  # value bounds shared with native Responses and compact dispatch, so a
+  # client routing hint, beta feature key or unbounded flag never reaches the
+  # upstream files endpoint. The Codex client sends only its auth headers on
+  # `/backend-api/files` (openai/codex main c11ed24c2, codex-api/src/files.rs
+  # `authorized_request`), so nothing an upload needs lies outside that list
+  # (findings#240).
   defp forwarded_headers(%RequestOptions{} = request_options),
     do: request_options.file_bridge.forwarded_headers
 
@@ -448,8 +577,7 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
   end
 
   defp json_success(%Req.Response{status: status}, operation) do
-    {:error,
-     safe_error(status, :upstream_file_bridge_failed, "upstream file #{operation} failed")}
+    {:error, safe_error(status, :upstream_file_bridge_failed, "upstream file #{operation} failed")}
   end
 
   defp retry_options(opts) do
@@ -472,11 +600,6 @@ defmodule CodexPooler.Gateway.Transports.FileBridge do
       opts: opts
     }
   end
-
-  defp retry_budget_exhausted?(_deadline, nil), do: false
-
-  defp retry_budget_exhausted?(deadline, _last_retry),
-    do: System.monotonic_time(:millisecond) >= deadline
 
   defp sleep_until_next_retry(%{interval_ms: 0}), do: :ok
 

@@ -16,7 +16,14 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.EncryptedSecret
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPoolerWeb.OnboardingLive.Invite.Components
 
+  setup do
+    reset_bootstrap_state_fixture!()
+    :ok
+  end
+
+  @tag :relative_countdown_contract
   test "renders a valid invite link without authentication" do
     pool = pool_fixture(%{slug: "team-alpha", name: "Team Alpha"})
     scope = fixture_owner_scope()
@@ -53,6 +60,117 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     refute html =~ "oauth/authorize"
     refute html =~ "The device-code flow keeps browser callbacks out of this public page"
     refute html =~ token
+  end
+
+  @tag :relative_countdown_contract
+  test "public invite countdown preserves fixed future, due, expired, missing, and malformed states" do
+    now = ~U[2026-07-31 12:00:00.000000Z]
+
+    for {expires_at, expected} <- [
+          {~U[2026-07-31 12:00:00.999999Z], "Expires in under 1 minute"},
+          {now, "Expired"},
+          {DateTime.add(now, -1, :second), "Expired"},
+          {nil, "No expiry date"},
+          {"invalid", "Expiry unavailable"}
+        ] do
+      html =
+        render_component(&Components.invite_page/1,
+          flash: %{},
+          current_scope: nil,
+          contract: %{
+            pool_name: "Example Pool",
+            inviter_label: "operator@example.com",
+            invited_email: "invitee@example.com",
+            status: "active",
+            expires_at: expires_at
+          },
+          device_authorization: nil,
+          device_poll_status: "",
+          completed_onboarding: nil,
+          invite_state: :ready,
+          error_message: nil,
+          now: now
+        )
+
+      assert html =~ ~r/id="invite-expiry-countdown"[^>]*>\s*#{Regex.escape(expected)}/s
+    end
+  end
+
+  test "public invite identity values keep an overflow-safe wrapping contract" do
+    long_value = String.duplicate("identity", 20)
+
+    html =
+      render_component(&Components.invite_page/1,
+        flash: %{},
+        current_scope: nil,
+        contract: %{
+          pool_name: long_value,
+          inviter_label: "#{long_value}@example.com",
+          invited_email: "#{long_value}@example.com",
+          status: "active",
+          expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+        },
+        device_authorization: nil,
+        device_poll_status: "",
+        completed_onboarding: nil,
+        invite_state: :ready,
+        error_message: nil,
+        now: DateTime.utc_now()
+      )
+
+    document = LazyHTML.from_fragment(html)
+
+    for selector <- ["#invite-pool-name", "#invite-inviter", "#invite-invited-email"] do
+      classes =
+        document |> LazyHTML.query(selector) |> LazyHTML.attribute("class") |> List.first()
+
+      assert "min-w-0" in String.split(classes)
+      assert "[overflow-wrap:anywhere]" in String.split(classes)
+    end
+  end
+
+  test "refreshes the idle countdown without competing with device polling" do
+    configure_codex_auth_client!(%{
+      poll_result:
+        {:error,
+         %{
+           code: :codex_device_authorization_pending,
+           message: "pending",
+           retry_after_seconds: 7
+         }}
+    })
+
+    {token, _pool} =
+      invite_fixture(%{expires_at: DateTime.utc_now() |> DateTime.add(3_600, :second)})
+
+    {:ok, view, _html} = live(build_conn(), ~p"/onboarding/invites/#{token}")
+
+    countdown_ref = current_device_poll_ref(view)
+    assert is_reference(countdown_ref)
+
+    now_before = current_invite_assign(view, :now)
+    send(view.pid, {:invite_workflow_tick, countdown_ref})
+    _ = :sys.get_state(view.pid)
+    now_after = current_invite_assign(view, :now)
+
+    assert DateTime.compare(now_after, now_before) == :gt
+    next_countdown_ref = current_device_poll_ref(view)
+    assert is_reference(next_countdown_ref)
+    refute next_countdown_ref == countdown_ref
+    assert poll_count() == 0
+
+    view |> element("#device-onboarding-button") |> render_click()
+
+    poll_ref = current_device_poll_ref(view)
+    assert is_reference(poll_ref)
+    refute poll_ref == next_countdown_ref
+
+    send(view.pid, {:invite_workflow_tick, next_countdown_ref})
+    _ = :sys.get_state(view.pid)
+    assert poll_count() == 0
+
+    send_current_device_poll(view)
+    assert poll_count() == 1
   end
 
   test "bootstrap and login use the public auth chrome" do
@@ -206,7 +324,66 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert has_element?(view, "#device-poll-status", "authorization window expired")
     refute has_element?(view, "#device-poll-spinner")
-    refute current_device_poll_ref(view)
+    refute has_element?(view, "#device-authorization")
+    assert has_element?(view, "#device-onboarding-button", "Try device approval again")
+  end
+
+  test "non-pending device poll errors stop polling and expose a retry" do
+    configure_codex_auth_client!(%{
+      poll_result:
+        {:error,
+         %{
+           code: :codex_device_upstream_unavailable,
+           message: "temporary upstream failure"
+         }}
+    })
+
+    {token, _pool} = invite_fixture()
+    {:ok, view, _html} = live(build_conn(), ~p"/onboarding/invites/#{token}")
+
+    view |> element("#device-onboarding-button") |> render_click()
+
+    poll_ref = current_device_poll_ref(view)
+    send_current_device_poll(view)
+
+    assert has_element?(view, "#device-poll-status", "Onboarding could not continue")
+    refute has_element?(view, "#device-poll-spinner")
+    refute has_element?(view, "#device-authorization")
+    assert has_element?(view, "#device-onboarding-button", "Try device approval again")
+
+    send(view.pid, {:invite_workflow_tick, poll_ref})
+    _ = :sys.get_state(view.pid)
+
+    assert poll_count() == 1
+  end
+
+  test "invite state controls device authorization rendering" do
+    now = ~U[2026-08-12 12:00:00Z]
+
+    html =
+      render_component(&Components.invite_page/1,
+        flash: %{},
+        current_scope: nil,
+        contract: %{
+          pool_name: "Example Pool",
+          inviter_label: "operator@example.com",
+          invited_email: "invitee@example.com",
+          status: "active",
+          expires_at: DateTime.add(now, 3_600, :second)
+        },
+        device_authorization: %{
+          url: "https://auth.openai.com/codex/device",
+          user_code: "ABCD-EFGH"
+        },
+        device_poll_status: "Approval is pending.",
+        completed_onboarding: nil,
+        invite_state: :ready,
+        error_message: nil,
+        now: now
+      )
+
+    refute html =~ ~s(id="device-authorization")
+    refute html =~ ~s(id="device-poll-spinner")
   end
 
   test "automatic device polling handles slow down before completion" do
@@ -258,19 +435,19 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     view |> element("#device-onboarding-button") |> render_click()
 
     first_ref = current_device_poll_ref(view)
-    send(view.pid, {:poll_device_authorization, make_ref()})
+    send(view.pid, {:invite_workflow_tick, make_ref()})
     _ = :sys.get_state(view.pid)
 
     assert has_element?(view, "#device-poll-status", "Open the verification page")
     assert poll_count() == 0
 
-    send(view.pid, {:poll_device_authorization, first_ref})
+    send(view.pid, {:invite_workflow_tick, first_ref})
     _ = :sys.get_state(view.pid)
 
     assert has_element?(view, "#device-poll-status", "Checking again in 5 seconds")
     assert poll_count() == 1
 
-    send(view.pid, {:poll_device_authorization, first_ref})
+    send(view.pid, {:invite_workflow_tick, first_ref})
     _ = :sys.get_state(view.pid)
 
     refute has_element?(view, "#invite-accepted")
@@ -310,6 +487,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert Repo.aggregate(InviteAcceptance, :count) == acceptance_count_before + 1
     identity = Repo.one!(UpstreamIdentity)
     assert identity.status == "active"
+    assert identity.credential_provenance == "codex_chatgpt_oauth"
     assert identity.account_email == "codex-user@example.com"
     assert identity.metadata["credential_epoch"] == 1
     assert identity.metadata["usage_probe_sequence"] == 0
@@ -332,6 +510,32 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert job.args["trigger_kind"] == "account_link"
     assert assignment.metadata["quota_priming"]["status"] == "unknown"
+  end
+
+  test "completed onboarding hands out the documented Codex provider config for the deployment's public origin" do
+    CodexPooler.TestAppEnv.restore_on_exit(CodexPoolerWeb.OnboardingLive.Invite)
+    Application.put_env(:codex_pooler, CodexPoolerWeb.OnboardingLive.Invite, public_origin: "https://pooler.example.test/")
+    configure_codex_auth_client!(%{poll_result: {:ok, token_payload()}})
+
+    {token, _pool} = invite_fixture()
+    {:ok, view, _html} = live(build_conn(), ~p"/onboarding/invites/#{token}")
+
+    view
+    |> element("#device-onboarding-button")
+    |> render_click()
+
+    send_current_device_poll(view)
+
+    assert has_element?(view, "#invite-accepted")
+    document = view |> render() |> LazyHTML.from_fragment()
+    [copy_text] = document |> LazyHTML.query("#invite-config-copy") |> LazyHTML.attribute("data-copy-text")
+    shown_text = document |> LazyHTML.query("#invite-config-toml") |> LazyHTML.text()
+
+    expected = documented_codex_provider_config("https://pooler.example.test")
+
+    assert copy_text == expected
+    assert shown_text == expected
+    assert has_element?(view, "#invite-config-features-hint", "[features]")
   end
 
   test "restricted invite rejects a different authorized Codex email without side effects" do
@@ -360,6 +564,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert Repo.aggregate(InviteAcceptance, :count) == acceptance_count_before
     assert Repo.aggregate(Oban.Job, :count) == job_count_before
     assert Repo.one!(UpstreamIdentity).status == "pending"
+    assert Repo.one!(UpstreamIdentity).credential_provenance == nil
     assert Repo.one!(PoolUpstreamAssignment).status == "pending"
     assert active_secret_count("access_token") == 0
     assert active_secret_count("refresh_token") == 0
@@ -411,7 +616,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert {:ok, first_identity} =
              first_completed.identity
-             |> Ecto.Changeset.change(account_label: "codex01")
+             |> Ecto.Changeset.change(account_label: "account-a")
              |> Repo.update()
 
     scope =
@@ -430,19 +635,19 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
       InviteOnboarding.poll_device(second_token, second_start.account.identity.id)
 
     assert second_completed.identity.id == first_completed.identity.id
+    assert second_completed.identity.credential_provenance == "codex_chatgpt_oauth"
+    assert Repo.reload!(second_completed.identity).credential_provenance == "codex_chatgpt_oauth"
     assert second_completed.identity.metadata["credential_epoch"] == first_epoch + 1
     assert second_completed.assignment.id == first_completed.assignment.id
     assert second_completed.identity.account_email == "codex-user@example.com"
-    assert second_completed.identity.account_label == "codex01"
-    assert Repo.get!(UpstreamIdentity, first_identity.id).account_label == "codex01"
+    assert second_completed.identity.account_label == "account-a"
+    assert Repo.get!(UpstreamIdentity, first_identity.id).account_label == "account-a"
 
     assert Repo.aggregate(UpstreamIdentity, :count) == 1
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 1
 
     assert [first_acceptance, second_acceptance] =
-             Repo.all(
-               from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at]
-             )
+             Repo.all(from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at])
 
     assert first_acceptance.upstream_identity_id == first_completed.identity.id
     assert second_acceptance.upstream_identity_id == first_completed.identity.id
@@ -509,8 +714,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     refresh_token = "invite-cross-pool-refresh"
 
     configure_codex_auth_client!(%{
-      poll_result:
-        {:ok, token_payload(%{}, access_token: access_token, refresh_token: refresh_token)}
+      poll_result: {:ok, token_payload(%{}, access_token: access_token, refresh_token: refresh_token)}
     })
 
     {first_token, source_pool} = invite_fixture()
@@ -554,9 +758,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 2
 
     assert [first_acceptance, second_acceptance] =
-             Repo.all(
-               from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at]
-             )
+             Repo.all(from acceptance in InviteAcceptance, order_by: [asc: acceptance.accepted_at])
 
     assert first_acceptance.pool_upstream_assignment_id == first_completed.assignment.id
     assert second_acceptance.pool_upstream_assignment_id == second_completed.assignment.id
@@ -596,6 +798,19 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     {token, pool}
   end
 
+  # The published Codex client page is the contract for the provider block the
+  # invite page hands out; the page's placeholder host becomes the deployment's
+  # public origin.
+  defp documented_codex_provider_config(origin) do
+    page = Path.expand("../../../../docs-site/src/content/docs/clients/codex-cli-desktop.mdx", __DIR__)
+
+    [block] =
+      Regex.run(~r/```toml title="CODEX_HOME\/config\.toml" frame="code"\n(.*?)\n```/s, File.read!(page), capture: :all_but_first)
+
+    assert block =~ "model_provider = \"codex-pooler-ws\""
+    String.replace(block, "https://codex-pooler.example.com", origin)
+  end
+
   defp configure_codex_auth_client!(attrs) do
     start_supervised!(%{
       id: __MODULE__.FakeCodexAuthState,
@@ -604,9 +819,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth)
 
-    Application.put_env(:codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth,
-      client: __MODULE__.FakeCodexAuthClient
-    )
+    Application.put_env(:codex_pooler, CodexPooler.Upstreams.Auth.CodexAuth, client: __MODULE__.FakeCodexAuthClient)
 
     on_exit(fn ->
       if previous do
@@ -629,7 +842,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
 
   defp send_current_device_poll(view) do
-    send(view.pid, {:poll_device_authorization, current_device_poll_ref(view)})
+    send(view.pid, {:invite_workflow_tick, current_device_poll_ref(view)})
     _ = :sys.get_state(view.pid)
     :ok
   end
@@ -638,7 +851,15 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     view.pid
     |> :sys.get_state()
     |> Map.fetch!(:socket)
-    |> then(& &1.assigns.device_poll_ref)
+    |> then(& &1.assigns.invite_timer_ref)
+  end
+
+  defp current_invite_assign(view, key) do
+    view.pid
+    |> :sys.get_state()
+    |> Map.fetch!(:socket)
+    |> Map.fetch!(:assigns)
+    |> Map.fetch!(key)
   end
 
   defp poll_count do
@@ -681,7 +902,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
       )
 
     header = Base.url_encode64(~s({"alg":"none"}), padding: false)
-    payload = Base.url_encode64(Jason.encode!(claims), padding: false)
+    payload = Base.url_encode64(CodexPooler.JSON.encode!(claims), padding: false)
     header <> "." <> payload <> ".signature"
   end
 
@@ -692,8 +913,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
          "device_auth_id" => "dev_123",
          "user_code" => "ABCD-EFGH",
          "verification_url" => "https://auth.openai.com/codex/device",
-         "expires_at" =>
-           DateTime.utc_now() |> DateTime.add(600, :second) |> DateTime.to_iso8601(),
+         "expires_at" => DateTime.utc_now() |> DateTime.add(600, :second) |> DateTime.to_iso8601(),
          "poll_interval_seconds" => 5
        }}
     end
@@ -723,7 +943,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     app_version = :codex_pooler |> Application.spec(:vsn) |> to_string()
 
     assert has_element?(view, selector, "Codex Pooler #{app_version}")
-    assert has_element?(view, "#{selector} a[href='https://docs.codex-pooler.com']")
+    assert has_element?(view, "#{selector} a[href='https://www.codex-pooler.com/']")
     assert has_element?(view, selector, "© #{Date.utc_today().year} iCoreTech, Inc.")
     assert has_element?(view, "#{selector} a[href='https://github.com/icoretech/codex-pooler']")
     assert has_element?(view, "#{selector} a[aria-label='Codex Pooler on GitHub']")

@@ -181,9 +181,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
              "refresh failed"
            )
 
-    render_click(
-      element(view, "#{card} #{failure_panel_selector(job)} [data-role='failure-panel-close']")
-    )
+    render_click(element(view, "#{card} #{failure_panel_selector(job)} [data-role='failure-panel-close']"))
 
     assert_patch(view, ~p"/admin/jobs")
 
@@ -293,7 +291,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     {_result, events} =
       capture_repo_queries(fn ->
-        render_click(element(view, "#admin-jobs-explorer-desktop #job-#{job.id}"))
+        render_click(element(view, "#admin-jobs-explorer-rows #job-#{job.id}"))
         assert_patch(view, ~p"/admin/jobs?job_id=#{job.id}")
       end)
 
@@ -329,7 +327,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     assert has_element?(view, "[data-role='job-detail-drawer-side'] > #job-detail-sidebar")
     refute has_element?(view, "#job-detail-sidebar #job-detail-metadata")
 
-    render_click(element(view, "#admin-jobs-explorer-desktop #job-#{job.id}"))
+    render_click(element(view, "#admin-jobs-explorer-rows #job-#{job.id}"))
     assert_patch(view, ~p"/admin/jobs?job_id=#{job.id}")
 
     assert has_element?(view, "#job-detail-drawer[checked]")
@@ -524,7 +522,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#admin-jobs-explorer-desktop #job-#{job.id} [data-role='failure-title']",
+             "#admin-jobs-explorer-rows #job-#{job.id} [data-role='failure-title']",
              "Attempt 3 · Invalid catalog sync trigger"
            )
 
@@ -599,14 +597,14 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     %{assignment: first_assignment} =
       upstream_assignment_fixture(pool, %{
-        account_label: "codex01@example.com",
-        assignment_label: "codex01@example.com"
+        account_label: "account-a@example.com",
+        assignment_label: "account-a@example.com"
       })
 
     %{assignment: second_assignment} =
       upstream_assignment_fixture(pool, %{
-        account_label: "codex02@example.com",
-        assignment_label: "codex02@example.com"
+        account_label: "account-b@example.com",
+        assignment_label: "account-b@example.com"
       })
 
     first_job =
@@ -651,22 +649,22 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{first_job.id}[aria-label*='codex01@example.com']"
+             "#{card} #job-activity-#{first_job.id}[aria-label*='account-a@example.com']"
            )
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{second_job.id}[aria-label*='codex02@example.com']"
+             "#{card} #job-activity-#{second_job.id}[aria-label*='account-b@example.com']"
            )
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{first_job.id}[data-has-avatar='true'].avatar img[src='#{AvatarComponents.gravatar_url("codex01@example.com", size: 64)}']"
+             "#{card} #job-activity-#{first_job.id}[data-has-avatar='true'].avatar img[src='#{AvatarComponents.gravatar_url("account-a@example.com", size: 64)}']"
            )
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{second_job.id}[data-has-avatar='true'].avatar img[src='#{AvatarComponents.gravatar_url("codex02@example.com", size: 64)}']"
+             "#{card} #job-activity-#{second_job.id}[data-has-avatar='true'].avatar img[src='#{AvatarComponents.gravatar_url("account-b@example.com", size: 64)}']"
            )
 
     refute has_element?(view, "#{card} #job-activity-#{first_job.id} > img")
@@ -683,8 +681,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     refute has_element?(view, "#{card} [data-role='worker-activity-strip'] .loading-spinner")
     refute has_element?(view, "#{card} #job-activity-#{first_job.id}", "AccountReconciliation")
-    refute has_element?(view, "#{card} #job-activity-#{first_job.id}", "codex01@example.com")
-    refute has_element?(view, "#{card} #job-activity-#{second_job.id}", "codex02@example.com")
+    refute has_element?(view, "#{card} #job-activity-#{first_job.id}", "account-a@example.com")
+    refute has_element?(view, "#{card} #job-activity-#{second_job.id}", "account-b@example.com")
   end
 
   test "account reconciliation failure markers use operator avatar status styling", %{conn: conn} do
@@ -799,8 +797,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
           %{
             "attempt" => 1,
             "kind" => "RuntimeError",
-            "error" =>
-              "upstream timeout authorization=Bearer secret-token-123 prompt=raw-prompt-text"
+            "error" => "upstream timeout authorization=Bearer secret-token-123 prompt=raw-prompt-text"
           }
         ],
         args: %{"prompt" => "raw-arg-prompt"},
@@ -819,9 +816,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
              "#{worker_card_selector(:account_reconciliation)} #{failure_panel_selector(job)}[data-open='false'][aria-hidden='true']"
            )
 
-    render_click(
-      element(view, "#{worker_card_selector(:account_reconciliation)} #job-failure-#{job.id}")
-    )
+    render_click(element(view, "#{worker_card_selector(:account_reconciliation)} #job-failure-#{job.id}"))
 
     assert has_element?(
              view,
@@ -869,8 +864,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
         }
       ]
     )
@@ -935,8 +929,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
         }
       ]
     )
@@ -977,8 +970,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
         }
       ]
     )
@@ -1040,8 +1032,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
         errors: [
           %{
             "attempt" => 1,
-            "error" =>
-              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+            "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
           }
         ]
       )
@@ -1083,8 +1074,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.CatalogSyncWorker failed with {:error, %{code: :catalog_sync_failed, message: \"upstream secret could not be decrypted\"}}"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.CatalogSyncWorker failed with {:error, %{code: :catalog_sync_failed, message: \"upstream secret could not be decrypted\"}}"
         }
       ]
     )
@@ -1125,8 +1115,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.TokenRefreshWorker failed with :discard"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.TokenRefreshWorker failed with :discard"
         }
       ]
     )
@@ -1243,6 +1232,9 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
   defp capture_repo_queries(fun) when is_function(fun, 0) do
     test_pid = self()
     handler_id = {__MODULE__, test_pid, System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

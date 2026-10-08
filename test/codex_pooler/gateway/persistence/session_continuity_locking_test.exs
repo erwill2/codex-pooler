@@ -1,0 +1,3010 @@
+defmodule CodexPooler.Gateway.Persistence.SessionContinuityLockingTest do
+  use CodexPooler.DataCase, async: false
+
+  import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures
+  import Ecto.Query
+
+  alias CodexPooler.Access
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+
+  alias CodexPooler.Accounting.{Attempt, ClientRetry, LedgerEntry, Request, RequestClientRetryLink}
+  alias CodexPooler.Gateway.Persistence.CodexTurn
+  alias CodexPoolerWeb.Runtime.{BackendCodexTestSupport, MailboxPrefixRaceSupport}
+
+  alias CodexPooler.Gateway.Persistence.{
+    BridgeOwnerLease,
+    BridgeSessionAlias,
+    CodexSession,
+    SessionContinuity
+  }
+
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.{Aliases, ExpiredSessions}
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
+  alias CodexPooler.Gateway.Runtime.SessionLeaseHeartbeat
+  alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias Ecto.Adapters.SQL
+  alias Ecto.Adapters.SQL.Sandbox
+
+  @contention_context {__MODULE__, :contention_context}
+  @contention_sequence {__MODULE__, :contention_sequence}
+  @contention_paused {__MODULE__, :contention_paused}
+  @frozen_context {__MODULE__, :frozen_context}
+  @frozen_sequence {__MODULE__, :frozen_sequence}
+  @frozen_paused {__MODULE__, :frozen_paused}
+  @direction_iterations 10
+  @start_first_direction "session_lease_start_first"
+  @renewal_first_direction "session_lease_renewal_first"
+  @deadlock_context {__MODULE__, :replacement_deadlock_context}
+  @deadlock_paused {__MODULE__, :replacement_deadlock_paused}
+  # A real PostgreSQL lock_timeout is the behavior under test: each bounded
+  # renewal case waits it out once while the blocker holds its row, so a case
+  # runs for about one second. The same window bounds the blocked observation.
+  @bounded_renewal_lock_timeout_ms 1_000
+
+  for edges <- [1, 2, 3] do
+    @tag mailbox_lock_rediscovery: true, mailbox_peer_graph: true, slow: "boots a real second admission BEAM and observes committed graph rediscovery"
+    test "local and real peer admissions rediscover #{edges} reversed-id historical sessions" do
+      peer = MailboxPrefixRaceSupport.start_http_peer!()
+      observations = for target <- [node(), peer], do: exercise_peer_graph(target, unquote(edges))
+      assert Enum.uniq(Enum.map(observations, & &1.admission_node)) |> length() == 2
+      assert Enum.uniq(Enum.map(observations, & &1.admission_backend)) |> length() == 2
+      CodexPooler.TestDiagnostics.puts(fn -> CodexPooler.JSON.encode!(%{scenario: "two_beam_reversed_graph_rediscovery", inserted_edges: unquote(edges), actual_admission_nodes: 2, actual_postgres_backends: 2, results: Enum.map(observations, &Map.drop(&1, [:admission_node]))}) end)
+    end
+  end
+
+  @tag mailbox_lock_rediscovery: true, mailbox_peer_graph: true, slow: "boots a real second admission BEAM and observes PostgreSQL retry-window crossing"
+  test "local and peer admissions sample a fresh clock after their final-attempt lock wait" do
+    peer = MailboxPrefixRaceSupport.start_http_peer!()
+    observations = for target <- [node(), peer], do: exercise_peer_clock(target)
+    assert Enum.uniq(Enum.map(observations, & &1.admission_backend)) |> length() == 2
+    CodexPooler.TestDiagnostics.puts(fn -> CodexPooler.JSON.encode!(%{scenario: "two_beam_postlock_retry_clock", actual_admission_nodes: 2, actual_postgres_backends: 2, results: observations}) end)
+  end
+
+  defp peer_graph_fixture do
+    owner = committed_bootstrap_owner_fixture!().user
+
+    Sandbox.unboxed_run(Repo, fn ->
+      pool = pool_fixture(%{created_by_user_id: owner.id})
+      %{api_key: key} = active_api_key_fixture(pool, %{created_by_user_id: owner.id})
+      model = model_fixture(pool)
+      upstream = upstream_assignment_fixture(pool)
+      setup = Map.merge(upstream, %{pool: pool, api_key: key, model: model, pricing: BackendCodexTestSupport.pricing_snapshot!(model)})
+      BackendCodexTestSupport.register_unboxed_pool_cleanup!(setup)
+      auth = %{pool: pool, api_key: key}
+
+      sessions =
+        Enum.map(1..4, fn _ -> Ecto.UUID.generate() end)
+        |> Enum.sort(:desc)
+        |> Enum.map(fn id ->
+          now = peer_db_now()
+          Repo.insert!(%CodexSession{id: id, pool_id: pool.id, api_key_id: key.id, session_key: "synthetic-peer-graph-#{Ecto.UUID.generate()}", status: "active", created_at: now, updated_at: now})
+        end)
+
+      fixture = %{auth: auth, model: model, assignment: upstream.assignment, sessions: sessions}
+      original = peer_failed_request(fixture, hd(sessions), "codex-request:" <> Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false))
+      Map.merge(fixture, %{original: original, opts: %{endpoint: "/backend-api/codex/responses", correlation_id: original.correlation_id, codex_session: hd(sessions), request_metadata: %{}}})
+    end)
+  end
+
+  defp peer_failed_request(fixture, session, claim) do
+    now = peer_db_now()
+    request = request_fixture(fixture.auth, %{model_id: fixture.model.id, correlation_id: claim, transport: "websocket", status: "failed", usage_status: "usage_unknown", completed_at: now, last_error_code: "server_error"})
+    attempt = attempt_fixture(request, fixture.assignment, %{status: "failed", completed_at: now, network_error_code: "server_error", transport: "websocket", usage_status: "usage_unknown", response_metadata: %{"stream_terminal_type" => "response.failed", "error_kind" => "server_error"}})
+    Repo.insert!(%CodexTurn{codex_session_id: session.id, request_id: request.id, turn_sequence: 1, transport_kind: "websocket", semantic_turn_digest: :crypto.strong_rand_bytes(32), status: "failed", error_code: "server_error", final_attempt_id: attempt.id, started_at: now, completed_at: now, created_at: now, updated_at: now})
+    request
+  end
+
+  defp start_graph_actor(target, fixture, ref) do
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        call_graph_actor(target, fixture, parent, ref)
+      end)
+
+    on_exit(fn -> if Process.alive?(task.pid), do: Task.shutdown(task, :brutal_kill) end)
+    assert_receive {:graph_actor, ^ref, actor, actual_node, backend}, 15_000
+    assert actual_node == target
+
+    on_exit(fn -> stop_graph_actor(target, actor, ref) end)
+
+    {task, actor, backend}
+  end
+
+  defp stop_graph_actor(target, actor, ref) do
+    if target == node() or target in Node.list() do
+      :erpc.call(target, :telemetry, :detach, [{MailboxPrefixRaceSupport, ref}])
+      terminate_graph_actor(target, actor)
+    end
+  end
+
+  defp call_graph_actor(target, fixture, parent, ref) when target == node(),
+    do: Sandbox.unboxed_run(Repo, fn -> MailboxPrefixRaceSupport.graph_claim(fixture.auth, fixture.model, fixture.opts, parent, ref) end)
+
+  defp call_graph_actor(target, fixture, parent, ref),
+    do: :erpc.call(target, MailboxPrefixRaceSupport, :graph_claim, [fixture.auth, fixture.model, fixture.opts, parent, ref], 30_000)
+
+  defp terminate_graph_actor(target, actor) do
+    if :erpc.call(target, Process, :alive?, [actor]), do: :erpc.call(target, Process, :exit, [actor, :kill])
+  end
+
+  defp enter_graph_resend(actor, ref) do
+    for _ <- 1..2 do
+      assert_receive {:runtime_authorization_barrier, ^ref, :claim, :before, ^actor}, 15_000
+      send(actor, {:runtime_authorization_release, ref})
+    end
+  end
+
+  defp exercise_peer_graph(target, count) do
+    fixture = peer_graph_fixture()
+    parent = self()
+    ref = make_ref()
+    {task, actor, backend} = start_graph_actor(target, fixture, ref)
+    assert_receive {:runtime_authorization_barrier, ^ref, :claim, :before, ^actor}, 15_000
+    send(actor, {:runtime_authorization_release, ref})
+    assert_receive {:runtime_authorization_barrier, ^ref, :claim, :before, ^actor}, 15_000
+
+    holders =
+      Enum.map(Enum.take(fixture.sessions, count), fn session ->
+        holder = start_graph_holder(fixture, session, parent, ref)
+
+        on_exit(fn -> stop_owned_task(holder) end)
+        assert_receive {:peer_graph_held, ^ref, session_id, holder_backend}, 15_000
+        assert session_id == session.id
+        assert holder_backend != backend
+        %{task: holder, backend: holder_backend}
+      end)
+
+    send(actor, {:runtime_authorization_release, ref})
+
+    {_tail, waits} =
+      Enum.reduce(Enum.with_index(holders), {fixture.original, []}, fn {holder, index}, {previous, waits} ->
+        observation = await_peer_block(backend, holder.backend)
+        assert observation.relation == "codex_sessions"
+
+        assert_graph_transaction_exited!(fixture)
+
+        send(holder.task.pid, {:append_peer_graph, ref, previous, Enum.at(fixture.sessions, index + 1)})
+        assert {:ok, successor} = Task.await(holder.task, 15_000)
+        {successor, waits ++ [observation]}
+      end)
+
+    result = Task.await(task, 15_000)
+    if count == 3, do: assert({:error, %{code: :duplicate_request, mailbox_check: :session}} = result), else: assert({:ok, %{request: _accepted}} = result)
+    locks = collect_peer_locks(ref, [])
+    assert length(locks) >= count
+    assert Enum.all?(locks, & &1.sorted)
+    assert length(Enum.uniq(Enum.map(waits, & &1.transaction_start))) == count
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^fixture.auth.pool.id), :count) == if(count == 3, do: count + 1, else: count + 2)
+      assert Repo.aggregate(from(l in RequestClientRetryLink, join: r in Request, on: r.id == l.predecessor_request_id, where: r.pool_id == ^fixture.auth.pool.id), :count) == count
+      refute Repo.exists?(from a in BridgeSessionAlias, where: a.pool_id == ^fixture.auth.pool.id)
+      refute Repo.exists?(from l in LedgerEntry, join: r in Request, on: r.id == l.request_id, where: r.pool_id == ^fixture.auth.pool.id)
+    end)
+
+    %{admission_node: target, admission_backend: backend, remote: target != node(), inserted_edges: count, exhaustion: count == 3, fully_exited_transactions: count, waits: waits, sorted_session_lock_receipts: locks, aliases: 0, reservations: 0}
+  end
+
+  defp exercise_peer_clock(target) do
+    fixture = peer_graph_fixture()
+    ref = make_ref()
+    parent = self()
+
+    deadline =
+      Sandbox.unboxed_run(Repo, fn ->
+        deadline = DateTime.add(peer_db_now(), 1_000, :millisecond)
+        completed = DateTime.add(deadline, -30, :second)
+        Repo.update_all(from(r in Request, where: r.id == ^fixture.original.id), set: [completed_at: completed])
+        Repo.update_all(from(a in Attempt, where: a.request_id == ^fixture.original.id), set: [completed_at: completed])
+        deadline
+      end)
+
+    holder =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          hold_peer_attempt_transaction!(fixture.original.id, parent, ref)
+        end)
+      end)
+
+    on_exit(fn -> if Process.alive?(holder.pid), do: Task.shutdown(holder, :brutal_kill) end)
+    assert_receive {:peer_attempt_held, ^ref, holder_backend}, 15_000
+    {task, actor, backend} = start_graph_actor(target, fixture, ref)
+    enter_graph_resend(actor, ref)
+    assert_receive {:graph_clock, ^ref, before}, 15_000
+    assert DateTime.compare(before, deadline) == :lt
+    assert await_peer_block(backend, holder_backend).relation == "attempts"
+    await_peer_deadline(deadline)
+    send(holder.pid, {:release_peer_attempt, ref})
+    assert {:ok, :ok} = Task.await(holder, 15_000)
+    assert {:error, %{resend_disposition: :retry_expired}} = Task.await(task, 15_000)
+    assert_receive {:graph_clock, ^ref, after_wait}, 15_000
+    assert DateTime.compare(after_wait, deadline) != :lt
+    %{admission_backend: backend, blocker_backend: holder_backend, remote: target != node(), before_lock_wait: before, after_lock_wait: after_wait, deadline: deadline, disposition: "retry_expired"}
+  end
+
+  defp peer_db_now, do: Repo.query!("SELECT clock_timestamp()").rows |> hd() |> hd()
+
+  defp assert_graph_transaction_exited!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.transaction(fn ->
+        Repo.one!(from r in Request, where: r.id == ^fixture.original.id, lock: "FOR UPDATE NOWAIT")
+        Repo.one!(from k in CodexPooler.Access.APIKey, where: k.id == ^fixture.auth.api_key.id, lock: "FOR UPDATE NOWAIT")
+      end)
+    end)
+  end
+
+  defp start_graph_holder(fixture, session, parent, ref),
+    do: Task.async(fn -> Sandbox.unboxed_run(Repo, fn -> hold_graph_edge_transaction!(fixture, session, parent, ref) end) end)
+
+  defp hold_graph_edge_transaction!(fixture, session, parent, ref),
+    do: Repo.transaction(fn -> append_graph_edge_under_lock!(fixture, session, parent, ref) end)
+
+  defp hold_peer_attempt_transaction!(request_id, parent, ref),
+    do: Repo.transaction(fn -> hold_peer_attempt!(request_id, parent, ref) end)
+
+  defp stop_owned_task(task), do: if(Process.alive?(task.pid), do: Task.shutdown(task, :brutal_kill))
+
+  defp append_graph_edge_under_lock!(fixture, session, parent, ref) do
+    Repo.one!(from s in CodexSession, where: s.id == ^session.id, lock: "FOR NO KEY UPDATE")
+    send(parent, {:peer_graph_held, ref, session.id, peer_backend()})
+
+    receive do
+      {:append_peer_graph, ^ref, predecessor, next_session} ->
+        {:ok, claim} = ClientRetry.deterministic_failed_predecessor_claim(predecessor.correlation_id, predecessor.id)
+        next = peer_failed_request(fixture, next_session, claim)
+        Repo.insert!(%RequestClientRetryLink{predecessor_request_id: predecessor.id, successor_request_id: next.id, created_at: peer_db_now()})
+        next
+    end
+  end
+
+  defp hold_peer_attempt!(request_id, parent, ref) do
+    Repo.one!(from a in Attempt, where: a.request_id == ^request_id, lock: "FOR UPDATE")
+    send(parent, {:peer_attempt_held, ref, peer_backend()})
+    receive do: ({:release_peer_attempt, ^ref} -> :ok)
+  end
+
+  defp peer_backend, do: Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+  defp await_peer_block(waiter, blocker), do: await_peer_block(waiter, blocker, System.monotonic_time(:millisecond) + 15_000)
+
+  defp await_peer_block(waiter, blocker, deadline) do
+    rows = Sandbox.unboxed_run(Repo, fn -> Repo.query!("SELECT DISTINCT a.xact_start::text, c.relname FROM pg_stat_activity a JOIN pg_locks held ON held.pid=$2 AND held.granted AND held.locktype='relation' JOIN pg_class c ON c.oid=held.relation JOIN pg_locks owning ON owning.pid=a.pid AND owning.granted AND owning.locktype='relation' AND owning.relation=held.relation WHERE a.pid=$1 AND $2=ANY(pg_blocking_pids(a.pid)) AND c.relname IN ('codex_sessions','attempts')", [waiter, blocker]).rows end)
+
+    case rows do
+      [[started, relation]] ->
+        %{transaction_start: started, blocker_backend: blocker, relation: relation}
+
+      [] ->
+        assert System.monotonic_time(:millisecond) < deadline, "peer admission did not wait on its expected independent backend"
+
+        receive do
+        after
+          10 -> await_peer_block(waiter, blocker, deadline)
+        end
+    end
+  end
+
+  defp await_peer_deadline(deadline), do: await_peer_deadline(deadline, System.monotonic_time(:millisecond) + 15_000)
+
+  defp await_peer_deadline(deadline, budget) do
+    now = Sandbox.unboxed_run(Repo, &peer_db_now/0)
+
+    if DateTime.compare(now, deadline) != :gt do
+      assert System.monotonic_time(:millisecond) < budget, "PostgreSQL did not cross the retry deadline"
+
+      receive do
+      after
+        10 -> await_peer_deadline(deadline, budget)
+      end
+    end
+  end
+
+  defp collect_peer_locks(ref, result) do
+    receive do
+      {:graph_session_lock, ^ref, _node, ordered, {:ok, %{columns: columns, rows: rows}}} ->
+        index = Enum.find_index(columns, &(&1 == "id"))
+        ids = Enum.map(rows, &Enum.at(&1, index))
+        assert ordered
+        collect_peer_locks(ref, result ++ [%{sorted: ids == Enum.sort(ids), count: length(ids)}])
+    after
+      0 -> result
+    end
+  end
+
+  test "latency task cleanup leaves its linked caller alive" do
+    parent = self()
+    marker = make_ref()
+
+    {caller, monitor} =
+      spawn_monitor(fn ->
+        task = Task.async(fn -> receive do: (:finish -> :ok) end)
+        send(parent, {:latency_cleanup_started, marker, task.pid})
+        stop_latency_task!(task)
+      end)
+
+    on_exit(fn -> if Process.alive?(caller), do: Process.exit(caller, :kill) end)
+    assert_receive {:latency_cleanup_started, ^marker, task_pid}, 15_000
+    assert_receive {:DOWN, ^monitor, :process, ^caller, reason}, 15_000
+    assert reason == :normal
+    refute Process.alive?(task_pid)
+  end
+
+  test "diagnostic processing cannot keep a renewal connection past its total deadline" do
+    fixture = unboxed_owner_session_fixture("renewal-diagnostic-deadline", 1)
+    parent = self()
+    ref = make_ref()
+    handler = {__MODULE__, ref}
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _, _, metadata, _ ->
+          if Process.get({__MODULE__, :delay_diagnostics}) == ref and
+               metadata.query == "SELECT set_config('statement_timeout', $1, true)" do
+            send(parent, {:diagnostics_started, ref, self()})
+
+            receive do
+              {:release_diagnostics, ^ref} -> :ok
+            after
+              15_000 -> raise "diagnostic barrier was not released"
+            end
+          end
+        end,
+        nil
+      )
+
+    blocker =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            lock_renewal_row!(:session, fixture.session.id)
+            send(parent, {:diagnostic_holder_ready, ref, backend_pid!()})
+
+            receive do
+              {:release_diagnostic_holder, ^ref} -> :ok
+            after
+              15_000 -> raise "diagnostic holder was not released"
+            end
+          end)
+        end)
+      end)
+
+    on_exit(fn -> stop_latency_task!(blocker) end)
+    assert_receive {:diagnostic_holder_ready, ^ref, blocker_backend}, 5_000
+
+    logs =
+      ExUnit.CaptureLog.capture_log(fn ->
+        renewal =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              Process.put({__MODULE__, :delay_diagnostics}, ref)
+              send(parent, {:diagnostic_waiter_ready, ref, backend_pid!()})
+
+              try do
+                SessionContinuity.renew_owner_token(
+                  fixture.session.id,
+                  fixture.token,
+                  request_options(bridge_owner_lease_ttl_seconds: 120),
+                  lock_timeout_ms: 300,
+                  timeout_ms: 600
+                )
+              rescue
+                _ in [DBConnection.ConnectionError, Postgrex.Error] ->
+                  {:error, :database_unavailable}
+              end
+            end)
+          end)
+
+        on_exit(fn -> stop_latency_task!(renewal) end)
+
+        try do
+          assert_receive {:diagnostic_waiter_ready, ^ref, waiter_backend}, 5_000
+          assert observe_renewal_lock_wait!(waiter_backend, blocker_backend) == "codex_sessions"
+          assert_receive {:diagnostics_started, ^ref, diagnostic_pid}, 5_000
+
+          # Delay the client-side diagnostic phase past the total deadline. The
+          # real connection timer must release its backend even while that phase
+          # cannot issue its next statement; release is observed before unblocking.
+          deadline = System.monotonic_time(:millisecond) + 5_000
+          await_latency_backend_released!(waiter_backend, deadline)
+          send(diagnostic_pid, {:release_diagnostics, ref})
+          assert {:error, _} = Task.await(renewal, 5_000)
+        after
+          stop_latency_task!(renewal)
+        end
+      end)
+
+    assert logs =~ "disconnected"
+    send(blocker.pid, {:release_diagnostic_holder, ref})
+    assert {:ok, :ok} = Task.await(blocker, 5_000)
+    stop_latency_task!(blocker)
+    assert unboxed_get_session!(fixture.session.id).owner_lease_token == fixture.token
+  end
+
+  test "the database deadline bounds COMMIT and leaves the old owner state intact" do
+    fixture = unboxed_owner_session_fixture("renewal-commit-deadline", 1)
+    parent = self()
+    ref = make_ref()
+    function = "renewal_commit_deadline_#{System.unique_integer([:positive])}"
+    witness = "#{function}_reached"
+    gate_key = :erlang.phash2({__MODULE__, function}, 2_147_483_647)
+
+    CodexPooler.UnboxedFixture.register_unboxed_cleanup!(fn ->
+      Repo.query!("DROP TRIGGER IF EXISTS #{function} ON codex_sessions")
+      Repo.query!("DROP FUNCTION IF EXISTS #{function}()")
+      Repo.query!("DROP SEQUENCE IF EXISTS #{witness}")
+    end)
+
+    # The deferred trigger runs inside the renewal's COMMIT. It records the
+    # renewal backend in a sequence, which survives the aborted COMMIT, and then
+    # waits on an advisory lock the test holds, with lock_timeout disabled. The
+    # COMMIT can therefore end only by the renewal's deadline (cancel or close),
+    # never by finishing late: a timed trigger let a COMMIT whose disconnect ran
+    # late succeed and return {:ok, session} (findings#206 row 206-433).
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("CREATE SEQUENCE #{witness}")
+
+      Repo.query!("""
+      CREATE FUNCTION #{function}() RETURNS trigger AS $$
+      BEGIN
+        PERFORM setval('#{witness}', pg_backend_pid());
+        PERFORM set_config('lock_timeout', '0', true);
+        PERFORM pg_advisory_xact_lock(#{gate_key});
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+      """)
+
+      Repo.query!("""
+      CREATE CONSTRAINT TRIGGER #{function} AFTER UPDATE ON codex_sessions
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+      WHEN (NEW.id = '#{fixture.session.id}'::uuid)
+      EXECUTE FUNCTION #{function}()
+      """)
+    end)
+
+    gate =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            Repo.query!("SELECT pg_advisory_xact_lock($1)", [gate_key])
+            send(parent, {:commit_gate_held, ref})
+
+            receive do
+              {:release_commit_gate, ^ref} -> :ok
+            after
+              15_000 -> raise "COMMIT gate was not released"
+            end
+          end)
+        end)
+      end)
+
+    on_exit(fn -> stop_latency_task!(gate) end)
+    assert_receive {:commit_gate_held, ^ref}, 5_000
+
+    before_session = unboxed_get_session!(fixture.session.id)
+    before_lease = unboxed_active_lease!(fixture.session.id)
+
+    try do
+      logs =
+        ExUnit.CaptureLog.capture_log(fn ->
+          renewal =
+            Task.async(fn ->
+              Sandbox.unboxed_run(Repo, fn ->
+                # Hold the connection first, so checkout cannot spend the deadline.
+                send(parent, {:commit_deadline_waiter, ref, backend_pid!()})
+
+                try do
+                  {:returned,
+                   SessionContinuity.renew_owner_token(
+                     fixture.session.id,
+                     fixture.token,
+                     request_options(bridge_owner_lease_ttl_seconds: 120),
+                     lock_timeout_ms: 400,
+                     timeout_ms: 700
+                   )}
+                rescue
+                  error in [DBConnection.ConnectionError, Postgrex.Error] -> {:raised, error}
+                end
+              end)
+            end)
+
+          assert_receive {:commit_deadline_waiter, ^ref, waiter_backend}, 5_000
+
+          outcome =
+            case Task.yield(renewal, 5_000) || Task.shutdown(renewal, :brutal_kill) do
+              {:ok, outcome} ->
+                outcome
+
+              nil ->
+                flunk("the renewal was still running 5 s after its 700 ms deadline, so the deadline did not cut it")
+            end
+
+          case commit_witness!(witness) do
+            ^waiter_backend ->
+              assert match?({:raised, %DBConnection.ConnectionError{}}, outcome) or
+                       match?({:raised, %Postgrex.Error{postgres: %{code: :query_canceled}}}, outcome),
+                     "the renewal reached COMMIT, which only its deadline can end, but came back with #{inspect(outcome, limit: 5)}"
+
+            reached_by ->
+              flunk("the renewal never reached COMMIT (trigger witness #{inspect(reached_by)}), so this run could not arm the COMMIT deadline; it came back with #{inspect(outcome, limit: 5)}")
+          end
+
+          # The cut transaction must be gone before the gate opens, or its
+          # COMMIT could still finish once the advisory lock is released.
+          await_latency_backend_released!(waiter_backend, System.monotonic_time(:millisecond) + 5_000)
+        end)
+
+      assert logs =~ "disconnected"
+    after
+      send(gate.pid, {:release_commit_gate, ref})
+    end
+
+    assert {:ok, :ok} = Task.await(gate, 5_000)
+    assert unboxed_get_session!(fixture.session.id) == before_session
+    assert unboxed_active_lease!(fixture.session.id) == before_lease
+
+    assert {:ok, %CodexSession{}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Repo.transaction(fn ->
+                 Repo.one!(
+                   from session in CodexSession,
+                     where: session.id == ^fixture.session.id,
+                     lock: "FOR UPDATE NOWAIT"
+                 )
+               end)
+             end)
+  end
+
+  @tag slow: "real deferred PostgreSQL COMMIT trigger retains the lock beyond the old renewal budget"
+  test "synchronous renewal survives a healthy transaction retaining the session lock during commit" do
+    fixture = unboxed_owner_session_fixture("renewal-commit-latency", 1)
+    parent = self()
+    ref = make_ref()
+    function = "renewal_commit_latency_#{System.unique_integer([:positive])}"
+
+    CodexPooler.UnboxedFixture.register_unboxed_cleanup!(fn ->
+      Repo.query!("DROP TRIGGER IF EXISTS #{function} ON codex_sessions")
+      Repo.query!("DROP FUNCTION IF EXISTS #{function}()")
+    end)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!("""
+      CREATE FUNCTION #{function}() RETURNS trigger AS $$
+      BEGIN
+        PERFORM pg_sleep(3.8);
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+      """)
+
+      Repo.query!("""
+      CREATE CONSTRAINT TRIGGER #{function} AFTER UPDATE ON codex_sessions
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+      WHEN (NEW.id = '#{fixture.session.id}'::uuid AND NEW.updated_at = OLD.updated_at)
+      EXECUTE FUNCTION #{function}()
+      """)
+    end)
+
+    # A deferred PostgreSQL trigger retains the real row lock during COMMIT.
+    # Its 3.8 s work models finite commit latency without altering durability.
+    blocker =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            Repo.query!("UPDATE codex_sessions SET updated_at = updated_at WHERE id = $1", [
+              Ecto.UUID.dump!(fixture.session.id)
+            ])
+
+            send(parent, {:commit_holder_ready, ref, backend_pid!()})
+          end)
+        end)
+      end)
+
+    on_exit(fn -> stop_latency_task!(blocker) end)
+    assert_receive {:commit_holder_ready, ^ref, blocker_backend_pid}, 5_000
+
+    renewal =
+      Task.async(fn ->
+        Process.put({SessionLeaseHeartbeat, :renew}, fn session, token, opts, renewal_opts ->
+          Sandbox.unboxed_run(Repo, fn ->
+            send(parent, {:commit_waiter_ready, ref, backend_pid!()})
+            SessionContinuity.renew_owner_token(session, token, opts, renewal_opts)
+          end)
+        end)
+
+        {:ok, witness} = OwnerWitness.new(fixture.session)
+
+        opts =
+          RequestOptions.build(
+            [codex_session: fixture.session, transport: "http_json"],
+            "/backend-api/codex/responses",
+            %{}
+          )
+
+        opts = RequestOptions.put_session_owner_witness(opts, witness)
+        SessionLeaseHeartbeat.run(opts, fn -> :dispatched end)
+      end)
+
+    on_exit(fn -> stop_latency_task!(renewal) end)
+
+    try do
+      assert_receive {:commit_waiter_ready, ^ref, waiter_backend_pid}, 5_000
+      assert waiter_backend_pid != blocker_backend_pid
+
+      assert observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid) ==
+               "codex_sessions"
+
+      assert [["COMMIT", "Timeout", "PgSleep"]] =
+               Sandbox.unboxed_run(Repo, fn ->
+                 Repo.query!(
+                   "SELECT query, wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+                   [blocker_backend_pid]
+                 ).rows
+               end)
+
+      assert :dispatched = Task.await(renewal, 15_000)
+      assert {:ok, _} = Task.await(blocker, 15_000)
+      session = unboxed_get_session!(fixture.session.id)
+      lease = unboxed_active_lease!(fixture.session.id)
+      assert session.owner_lease_token == fixture.token
+      assert lease.lease_token == fixture.token
+      assert session.owner_lease_expires_at == lease.expires_at
+    after
+      stop_latency_task!(renewal)
+      stop_latency_task!(blocker)
+    end
+  end
+
+  describe "session continuity baseline characterization" do
+    @tag :session_continuity_pin
+    test "missing renewal preserves owner-unavailable nil semantics and rolls back" do
+      session_count = Repo.aggregate(CodexSession, :count)
+      lease_count = Repo.aggregate(BridgeOwnerLease, :count)
+
+      assert {:error, :owner_unavailable} =
+               SessionContinuity.renew_owner_token(
+                 Ecto.UUID.generate(),
+                 Ecto.UUID.generate(),
+                 request_options(bridge_owner_lease_ttl_seconds: 120)
+               )
+
+      assert Repo.aggregate(CodexSession, :count) == session_count
+      assert Repo.aggregate(BridgeOwnerLease, :count) == lease_count
+    end
+
+    @tag :session_continuity_pin
+    test "missing continuity registration returns owner unavailable and rolls back" do
+      missing_session = %CodexSession{id: Ecto.UUID.generate()}
+      alias_count = Repo.aggregate(BridgeSessionAlias, :count)
+      lease_count = Repo.aggregate(BridgeOwnerLease, :count)
+
+      assert {:error, :owner_unavailable} =
+               SessionContinuity.register_codex_session_continuity(
+                 missing_session,
+                 %{},
+                 %{"id" => "response-placeholder"},
+                 request_options([])
+               )
+
+      assert Repo.aggregate(BridgeSessionAlias, :count) == alias_count
+      assert Repo.aggregate(BridgeOwnerLease, :count) == lease_count
+    end
+
+    @tag :session_continuity_pin
+    test "owner release remains a transactional lease-only operation" do
+      %{session: session, token: token} = owner_session_fixture()
+      session_before = Repo.get!(CodexSession, session.id)
+
+      {result, events} =
+        capture_repo_queries(fn ->
+          SessionContinuity.release_owner_lease(session.id, token, "owner_drained")
+        end)
+
+      assert :ok = result
+      refute Enum.any?(events, &(&1.source == "codex_sessions"))
+
+      assert Enum.any?(events, fn event ->
+               event.source == "bridge_owner_leases" and event.command == "SELECT" and
+                 event.for_update? and event.in_transaction?
+             end)
+
+      assert Enum.any?(events, fn event ->
+               event.source == "bridge_owner_leases" and event.command == "UPDATE" and
+                 event.in_transaction?
+             end)
+
+      assert %BridgeOwnerLease{status: "released"} =
+               Repo.get!(BridgeOwnerLease, token_lease_id(token))
+
+      assert Repo.get!(CodexSession, session.id) == session_before
+    end
+
+    @tag :session_continuity_pin
+    test "turn sequence allocation is part of the insert statement" do
+      %{auth: auth, session: session} = owner_session_fixture()
+      request = request_fixture(auth, %{status: "in_progress", completed_at: nil})
+
+      {result, events} =
+        capture_repo_queries(fn ->
+          SessionContinuity.start_codex_turn(
+            session,
+            request,
+            RequestOptions.for_websocket(%{})
+          )
+        end)
+
+      assert {:ok, %CodexTurn{turn_sequence: 1}} = result
+
+      assert Enum.any?(events, fn event ->
+               event.command == "INSERT" and event.in_transaction? and
+                 String.contains?(event.query, "INSERT INTO codex_turns") and
+                 String.contains?(event.query, "MAX(turn_sequence)")
+             end)
+
+      refute Enum.any?(events, fn event ->
+               event.source == "codex_turns" and event.command == "SELECT"
+             end)
+    end
+
+    @tag :session_continuity_pin
+    @tag timeout: 120_000
+    @tag slow: "boots a fresh BEAM runtime to verify returned database columns before their atoms exist"
+    test "turn allocation loads returned columns in a fresh runtime" do
+      fixture = unboxed_fresh_runtime_turn_fixture()
+
+      script = """
+      alias CodexPooler.Accounting.Request
+      alias CodexPooler.Accounting.{Attempt, ClientRetry, LedgerEntry, RequestClientRetryLink}
+      alias CodexTurn
+      alias CodexPoolerWeb.Runtime.{BackendCodexTestSupport, MailboxPrefixRaceSupport}
+      alias CodexPooler.Gateway.Payloads.RequestOptions
+      alias CodexPooler.Gateway.Persistence.{CodexSession, SessionContinuity}
+      alias CodexPooler.Repo
+      alias Ecto.Adapters.SQL.Sandbox
+
+      [session_id, request_id] = System.argv()
+      :ok = Sandbox.mode(Repo, :manual)
+      :ok = Sandbox.checkout(Repo)
+
+      try do
+        :erlang.binary_to_existing_atom("turn_sequence")
+        raise "turn_sequence was already interned"
+      rescue
+        ArgumentError -> :ok
+      end
+
+      session = Repo.get!(CodexSession, session_id)
+      request = Repo.get!(Request, request_id)
+
+      {:ok, turn} =
+        SessionContinuity.start_codex_turn(
+          session,
+          request,
+          RequestOptions.for_websocket(%{})
+        )
+
+      sequence_key = :erlang.binary_to_existing_atom("turn_sequence")
+      1 = Map.fetch!(turn, sequence_key)
+      IO.puts("fresh runtime turn allocation: ok")
+      """
+
+      {output, status} =
+        System.cmd(
+          "mix",
+          [
+            "run",
+            "--no-compile",
+            "-e",
+            script,
+            "--",
+            fixture.session_id,
+            fixture.request_id
+          ],
+          env: [{"MIX_ENV", "test"}],
+          stderr_to_stdout: true
+        )
+
+      assert status == 0, output
+      assert output =~ "fresh runtime turn allocation: ok"
+    end
+
+    test "alias resolution uses one priority-ordered row lock" do
+      auth = auth_fixture()
+      high_priority_alias = "high-priority-#{System.unique_integer([:positive, :monotonic])}"
+      low_priority_alias = "low-priority-#{System.unique_integer([:positive, :monotonic])}"
+
+      assert {:ok, %CodexSession{} = high_priority_session} =
+               Gateway.start_codex_session(
+                 auth,
+                 request_options(accepted_turn_state: high_priority_alias)
+               )
+
+      assert {:ok, %CodexSession{} = low_priority_session} =
+               Gateway.start_codex_session(
+                 auth,
+                 request_options(accepted_turn_state: "unused-#{low_priority_alias}")
+               )
+
+      insert_alias!(low_priority_session, auth, "previous_response_id", low_priority_alias)
+
+      opts =
+        request_options(
+          accepted_turn_state: high_priority_alias,
+          previous_response_id: low_priority_alias
+        )
+
+      {{:ok, resolved_session}, events} =
+        capture_detailed_repo_queries(fn ->
+          Repo.transaction(fn ->
+            Aliases.resolved_session_for_update(
+              auth,
+              opts,
+              high_priority_session.session_key,
+              DateTime.utc_now() |> DateTime.truncate(:microsecond)
+            )
+          end)
+        end)
+
+      assert resolved_session.id == high_priority_session.id
+
+      assert [alias_lookup] =
+               Enum.filter(events, fn event ->
+                 event.operation == "SELECT" and
+                   String.contains?(event.query, ~s(JOIN "bridge_session_aliases"))
+               end)
+
+      assert alias_lookup.for_update?
+      assert String.contains?(alias_lookup.query, "CASE WHEN")
+    end
+
+    test "alias registration uses one batched upsert for all candidates" do
+      %{auth: auth, session: session} = owner_session_fixture()
+
+      opts =
+        request_options(
+          accepted_turn_state: "batch-turn-#{System.unique_integer([:positive, :monotonic])}",
+          previous_response_id: "batch-previous-#{System.unique_integer([:positive, :monotonic])}",
+          response_id: "batch-response-#{System.unique_integer([:positive, :monotonic])}",
+          session_header: "batch-header-#{System.unique_integer([:positive, :monotonic])}"
+        )
+
+      {{:ok, :ok}, events} =
+        capture_detailed_repo_queries(fn ->
+          Repo.transaction(fn ->
+            Aliases.register!(
+              session,
+              auth,
+              opts,
+              DateTime.utc_now() |> DateTime.truncate(:microsecond)
+            )
+          end)
+        end)
+
+      assert [alias_insert] =
+               Enum.filter(events, fn event ->
+                 event.source == "bridge_session_aliases" and event.operation == "INSERT"
+               end)
+
+      assert String.contains?(String.upcase(alias_insert.query), "ON CONFLICT")
+
+      assert Repo.aggregate(
+               from(alias_record in BridgeSessionAlias,
+                 where:
+                   alias_record.codex_session_id == ^session.id and
+                     alias_record.status == "active"
+               ),
+               :count
+             ) >= 5
+    end
+
+    @tag :session_continuity_order_contract
+    test "replacement and continuity registration lock session before owner lease" do
+      %{session: replacement_session} = owner_session_fixture()
+
+      {replacement_result, replacement_events} =
+        capture_detailed_repo_queries(fn ->
+          SessionContinuity.replace_unavailable_owner_lease(
+            replacement_session,
+            request_options(owner_instance_id: "node-b")
+          )
+        end)
+
+      assert {:ok, %CodexSession{}} = replacement_result
+      assert_session_before_lease_lock!(replacement_events)
+
+      %{session: continuity_session} = owner_session_fixture()
+
+      {continuity_result, continuity_events} =
+        capture_detailed_repo_queries(fn ->
+          SessionContinuity.register_codex_session_continuity(
+            continuity_session,
+            %{},
+            %{"id" => "response-placeholder"},
+            request_options([])
+          )
+        end)
+
+      assert :ok = continuity_result
+      assert_session_before_lease_lock!(continuity_events)
+    end
+  end
+
+  describe "session continuity session and owner-lease contention" do
+    @tag :session_continuity_contention
+    @tag timeout: 30_000
+    @tag slow: "holds a real row lock until the owner lease expires"
+    test "renewal cannot revive an owner that expires while waiting for the session lock" do
+      fixture = unboxed_owner_session_fixture("renewal-expiry-wait", 1)
+      fixture = set_unboxed_owner_deadline!(fixture, 1)
+      parent = self()
+      ref = make_ref()
+
+      blocker =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              session =
+                Repo.one!(
+                  from session in CodexSession,
+                    where: session.id == ^fixture.session.id,
+                    lock: "FOR UPDATE"
+                )
+
+              backend_pid = backend_pid!()
+              send(parent, {:renewal_expiry_blocker_ready, ref, backend_pid, session})
+
+              receive do
+                {:release_renewal_expiry_blocker, ^ref} -> :ok
+              after
+                15_000 -> raise "renewal expiry blocker was not released"
+              end
+            end)
+          end)
+        end)
+
+      try do
+        assert_receive {:renewal_expiry_blocker_ready, ^ref, blocker_backend_pid, locked_session},
+                       5_000
+
+        before_session = unboxed_get_session!(fixture.session.id)
+        before_lease = unboxed_active_lease!(fixture.session.id)
+
+        renewal =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              backend_pid = backend_pid!()
+              send(parent, {:renewal_expiry_waiter_ready, ref, backend_pid})
+
+              SessionContinuity.renew_owner_token(
+                fixture.session.id,
+                fixture.token,
+                request_options(bridge_owner_lease_ttl_seconds: 120)
+              )
+            end)
+          end)
+
+        Process.put({__MODULE__, ref, :renewal}, renewal)
+
+        assert_receive {:renewal_expiry_waiter_ready, ^ref, waiter_backend_pid}, 5_000
+        assert waiter_backend_pid != blocker_backend_pid
+
+        observation =
+          Sandbox.unboxed_run(Repo, fn ->
+            observe_session_block(waiter_backend_pid, blocker_backend_pid, "SELECT")
+          end)
+
+        assert observation.wait_event_type == "Lock"
+        assert blocker_backend_pid in observation.blocking_pids
+
+        milliseconds_to_expiry =
+          DateTime.diff(locked_session.owner_lease_expires_at, DateTime.utc_now(), :millisecond)
+
+        assert milliseconds_to_expiry > 0
+
+        receive do
+        after
+          milliseconds_to_expiry + 50 -> :ok
+        end
+
+        send(blocker.pid, {:release_renewal_expiry_blocker, ref})
+
+        assert {:error, :owner_unavailable} = Task.await(renewal, 15_000)
+        assert {:ok, _} = Task.await(blocker, 15_000)
+
+        after_session = unboxed_get_session!(fixture.session.id)
+        after_lease = unboxed_active_lease!(fixture.session.id)
+
+        assert after_session.owner_lease_expires_at == before_session.owner_lease_expires_at
+        assert after_session.last_heartbeat_at == before_session.last_heartbeat_at
+        assert after_session.updated_at == before_session.updated_at
+        assert after_lease.expires_at == before_lease.expires_at
+        assert after_lease.renewed_at == before_lease.renewed_at
+        assert after_lease.updated_at == before_lease.updated_at
+
+        report_atomic_renewal(%{
+          kind: "owner_renewal_expiry_wait",
+          blocking_observed?: true,
+          blocker_count: length(observation.blocking_pids),
+          result: "owner_unavailable",
+          session_deadline_unchanged?: true,
+          lease_deadline_unchanged?: true
+        })
+      after
+        send(blocker.pid, {:release_renewal_expiry_blocker, ref})
+        shutdown_task(blocker)
+
+        case Process.delete({__MODULE__, ref, :renewal}) do
+          %Task{} = renewal -> shutdown_task(renewal)
+          nil -> :ok
+        end
+      end
+    end
+
+    @tag :session_continuity_contention
+    @tag :session_continuity_red
+    test "session_lease_start_first blocks renewal on session before lease" do
+      records =
+        run_direction(@start_first_direction, fn fixture ->
+          {
+            fn ->
+              Gateway.start_codex_session(fixture.auth, %{
+                session_key: fixture.session_key,
+                owner_instance_id: "node-a"
+              })
+            end,
+            fn ->
+              SessionContinuity.renew_owner_token(
+                fixture.session.id,
+                fixture.token,
+                request_options(bridge_owner_lease_ttl_seconds: 120)
+              )
+            end
+          }
+        end)
+
+      assert length(records) == @direction_iterations
+      report_direction(@start_first_direction, records)
+    end
+
+    @tag :session_continuity_contention
+    test "session_lease_renewal_first blocks start on session before lease" do
+      records =
+        run_direction(@renewal_first_direction, fn fixture ->
+          {
+            fn ->
+              SessionContinuity.renew_owner_token(
+                fixture.session.id,
+                fixture.token,
+                request_options(bridge_owner_lease_ttl_seconds: 120)
+              )
+            end,
+            fn ->
+              Gateway.start_codex_session(fixture.auth, %{
+                session_key: fixture.session_key,
+                owner_instance_id: "node-a"
+              })
+            end
+          }
+        end)
+
+      assert length(records) == @direction_iterations
+      report_direction(@renewal_first_direction, records)
+    end
+
+    @tag :session_continuity_contention
+    @tag timeout: 30_000
+    @tag slow: "exercises a real PostgreSQL renewal timeout through a session-to-key mutex wait chain"
+    test "a bounded renewal behind a session holder waiting on the key-wide mutex names that wait" do
+      fixture = unboxed_owner_session_fixture("bounded-renewal-api-key-chain", 1)
+      api_key = fixture.auth.api_key
+      parent = self()
+      ref = make_ref()
+
+      # The key-wide reservation mutex is shared by every session of the key;
+      # this holder takes it the way every runtime reservation does. The
+      # `api_keys` row itself is only read under the reader lock, so the wait
+      # this chain reports is the mutex, not the row.
+      key_holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              {:ok, _authorization} =
+                Access.authorize_api_key_runtime_turn(
+                  api_key.id,
+                  api_key.runtime_revocation_epoch
+                )
+
+              send(parent, {:api_key_holder_ready, ref, backend_pid!()})
+
+              receive do
+                {:release_api_key_holder, ^ref} -> :ok
+              after
+                15_000 -> raise "API key holder was not released"
+              end
+            end)
+          end)
+        end)
+
+      Process.put({__MODULE__, ref, :key_holder}, key_holder)
+
+      try do
+        assert_receive {:api_key_holder_ready, ^ref, key_holder_backend_pid}, 5_000
+
+        # Session first, then the API key: the HTTP reservation's lock order.
+        session_holder =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              Repo.transaction(fn ->
+                _session = SessionContinuity.lock_codex_session_for_turn(fixture.session)
+                send(parent, {:session_holder_locked, ref, backend_pid!()})
+
+                Access.authorize_api_key_runtime_turn(
+                  api_key.id,
+                  api_key.runtime_revocation_epoch
+                )
+              end)
+            end)
+          end)
+
+        Process.put({__MODULE__, ref, :session_holder}, session_holder)
+
+        assert_receive {:session_holder_locked, ^ref, session_holder_backend_pid}, 5_000
+
+        assert observe_session_holder_wait!(session_holder_backend_pid, key_holder_backend_pid) ==
+                 "api_key_reservation_window"
+
+        renewal =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              send(parent, {:bounded_renewal_waiter_ready, ref, backend_pid!()})
+              bounded_renewal(fixture)
+            end)
+          end)
+
+        Process.put({__MODULE__, ref, :renewal}, renewal)
+        assert_receive {:bounded_renewal_waiter_ready, ^ref, waiter_backend_pid}, 5_000
+
+        assert observe_renewal_lock_wait!(waiter_backend_pid, session_holder_backend_pid) ==
+                 "codex_sessions"
+
+        assert {:error, {:lock_timeout, %{relation: :codex_sessions, waiter_pid: ^waiter_backend_pid, blocker: holder}}} =
+                 Task.await(renewal, 15_000)
+
+        assert holder.pid == session_holder_backend_pid
+
+        assert %{
+                 state: "active",
+                 wait_event_type: "Lock",
+                 waiting_relation: "api_key_reservation_window"
+               } = holder
+
+        assert holder.query_fingerprint =~ ~r/\A[0-9a-f]{12}\z/
+        assert is_integer(holder.transaction_age_ms) and holder.transaction_age_ms >= 0
+
+        send(key_holder.pid, {:release_api_key_holder, ref})
+        assert {:ok, :ok} = Task.await(key_holder, 15_000)
+        assert {:ok, {:ok, _authorization}} = Task.await(session_holder, 15_000)
+      after
+        send(key_holder.pid, {:release_api_key_holder, ref})
+
+        for role <- [:renewal, :session_holder, :key_holder] do
+          case Process.delete({__MODULE__, ref, role}) do
+            %Task{} = task -> shutdown_task(task)
+            nil -> :ok
+          end
+        end
+      end
+    end
+
+    for held_row <- [:session, :lease] do
+      @tag :session_continuity_contention
+      @tag timeout: 30_000
+      @tag slow: "exercises actual PostgreSQL statement timeout on a held owner row"
+      test "a bounded renewal ends its wait on a held #{held_row} row inside PostgreSQL" do
+        held_row = unquote(held_row)
+        fixture = unboxed_owner_session_fixture("bounded-renewal-#{held_row}", 1)
+        parent = self()
+        ref = make_ref()
+
+        blocker =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              Repo.transaction(fn ->
+                lock_renewal_row!(held_row, fixture.session.id)
+                send(parent, {:bounded_renewal_blocker_ready, ref, backend_pid!()})
+
+                receive do
+                  {:release_bounded_renewal_blocker, ^ref} -> :ok
+                after
+                  15_000 -> raise "bounded renewal blocker was not released"
+                end
+              end)
+            end)
+          end)
+
+        try do
+          assert_receive {:bounded_renewal_blocker_ready, ^ref, blocker_backend_pid}, 5_000
+          before_session = unboxed_get_session!(fixture.session.id)
+          before_lease = unboxed_active_lease!(fixture.session.id)
+
+          renewal =
+            Task.async(fn ->
+              Sandbox.unboxed_run(Repo, fn ->
+                send(parent, {:bounded_renewal_waiter_ready, ref, backend_pid!()})
+                bounded_renewal(fixture)
+              end)
+            end)
+
+          Process.put({__MODULE__, ref, :renewal}, renewal)
+
+          assert_receive {:bounded_renewal_waiter_ready, ^ref, waiter_backend_pid}, 5_000
+          assert waiter_backend_pid != blocker_backend_pid
+
+          assert observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid) ==
+                   renewal_row_relation(held_row)
+
+          # The blocker still holds its row, so only PostgreSQL can end the wait,
+          # and the still-open renewal transaction names the idle holder.
+          assert {:error, {:lock_timeout, %{relation: relation, waiter_pid: ^waiter_backend_pid} = wait}} =
+                   Task.await(renewal, 15_000)
+
+          holder = wait.blocker
+          assert holder.pid == blocker_backend_pid
+          # The configured Repo application_name names the holder's role.
+          assert holder.application_name == "codex_pooler_test"
+
+          assert Process.alive?(blocker.pid)
+          assert Atom.to_string(relation) == renewal_row_relation(held_row)
+
+          assert %{state: "idle in transaction", waiting_relation: nil} = holder
+          assert holder.query_fingerprint == statement_fingerprint("SELECT pg_backend_pid()")
+          assert is_integer(holder.transaction_age_ms) and holder.transaction_age_ms >= 0
+
+          send(blocker.pid, {:release_bounded_renewal_blocker, ref})
+          assert {:ok, :ok} = Task.await(blocker, 15_000)
+
+          after_session = unboxed_get_session!(fixture.session.id)
+          after_lease = unboxed_active_lease!(fixture.session.id)
+          assert after_session.owner_lease_expires_at == before_session.owner_lease_expires_at
+          assert after_session.last_heartbeat_at == before_session.last_heartbeat_at
+          assert after_lease.expires_at == before_lease.expires_at
+          assert after_lease.renewed_at == before_lease.renewed_at
+
+          assert {:ok, %CodexSession{} = renewed} =
+                   Sandbox.unboxed_run(Repo, fn -> bounded_renewal(fixture) end)
+
+          assert DateTime.compare(
+                   renewed.owner_lease_expires_at,
+                   before_session.owner_lease_expires_at
+                 ) == :gt
+        after
+          send(blocker.pid, {:release_bounded_renewal_blocker, ref})
+          shutdown_task(blocker)
+
+          case Process.delete({__MODULE__, ref, :renewal}) do
+            %Task{} = renewal -> shutdown_task(renewal)
+            nil -> :ok
+          end
+        end
+      end
+    end
+  end
+
+  describe "replacement turn and predecessor interruption lock order" do
+    @tag :session_continuity_deadlock
+    @tag timeout: 120_000
+    test "replacement start locks the session before its claimed request" do
+      fixture = unboxed_replacement_deadlock_fixture()
+
+      with_replacement_deadlock_query_handler(fn ->
+        run_replacement_deadlock_schedule(fixture)
+      end)
+    end
+  end
+
+  describe "session continuity expired-session frozen boundary" do
+    @tag :session_continuity_frozen
+    test "close_for_key freezes the old id while a replacement blocks on the partial unique index" do
+      fixture = unboxed_expired_replacement_fixture()
+
+      record =
+        with_frozen_query_handler(fn ->
+          run_frozen_replacement_schedule(fixture)
+        end)
+
+      assert record.boundary_signature == expired_boundary_signature()
+      report_frozen_schedule(record)
+    end
+
+    @tag :session_continuity_start_boundary
+    test "real start flow invokes the frozen boundary before inserting the replacement" do
+      fixture = unboxed_expired_session_fixture("session_continuity-start-boundary")
+
+      {result, events} =
+        capture_detailed_repo_queries(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Gateway.start_codex_session(fixture.auth, %{
+              session_key: fixture.session_key,
+              owner_instance_id: "node-replacement"
+            })
+          end)
+        end)
+
+      assert {:ok, %CodexSession{} = replacement} = result
+      refute replacement.id == fixture.session.id
+      assert boundary_signature(events) == expired_boundary_signature()
+
+      boundary_close =
+        Enum.find_index(events, fn event ->
+          event.source == "codex_sessions" and event.operation == "UPDATE"
+        end)
+
+      replacement_insert =
+        Enum.find_index(events, fn event ->
+          event.source == "codex_sessions" and event.operation == "INSERT"
+        end)
+
+      assert is_integer(boundary_close)
+      assert is_integer(replacement_insert)
+      assert boundary_close < replacement_insert
+
+      assert %CodexSession{status: "closed"} =
+               Sandbox.unboxed_run(Repo, fn -> Repo.get!(CodexSession, fixture.session.id) end)
+
+      assert %CodexSession{status: "active"} =
+               Sandbox.unboxed_run(Repo, fn -> Repo.get!(CodexSession, replacement.id) end)
+
+      report_start_boundary(events, fixture.session.id)
+    end
+  end
+
+  defp run_frozen_replacement_schedule(fixture) do
+    parent = self()
+    ref = make_ref()
+    observer = start_observer(parent, ref)
+
+    task_a =
+      start_frozen_operation(parent, ref, fn ->
+        Repo.transaction(fn ->
+          ExpiredSessions.close_for_key!(
+            fixture.auth.pool.id,
+            fixture.auth.api_key.id,
+            fixture.session_key,
+            fixture.boundary_now
+          )
+        end)
+      end)
+
+    task_b =
+      start_operation(
+        parent,
+        ref,
+        :b,
+        fn -> update_closed_replacement!(fixture) end,
+        pause?: false
+      )
+
+    try do
+      {_observer_pid, observer_backend_pid} = await_observer_ready!(ref)
+      {_a_pid, a_backend_pid} = await_frozen_ready!(ref)
+      {_b_pid, b_backend_pid} = await_operation_ready!(ref, :b)
+
+      assert MapSet.size(MapSet.new([observer_backend_pid, a_backend_pid, b_backend_pid])) == 3
+
+      send(task_a.pid, {:session_continuity_run_frozen, ref})
+      {events, close_event} = await_frozen_close_barrier!(ref, [])
+
+      send(task_b.pid, {:session_continuity_run, ref})
+
+      observation =
+        observe_blocked_session_operation!(
+          observer,
+          ref,
+          b_backend_pid,
+          a_backend_pid,
+          "UPDATE"
+        )
+
+      send(task_a.pid, {:session_continuity_release_frozen, ref})
+
+      assert {:ok, {:ok, %{closed_count: 1, preferred_assignment_id: nil}}} =
+               Task.await(task_a, 10_000)
+
+      assert {:ok, %CodexSession{status: "interrupted"}} = Task.await(task_b, 10_000)
+
+      send(observer.pid, {:session_continuity_stop_observer, ref})
+      assert :ok = Task.await(observer, 5_000)
+
+      events = drain_frozen_events(ref, events)
+      assert close_event.source == "codex_sessions"
+      assert_frozen_boundary_events!(events, fixture.session.id)
+
+      assert_frozen_replacement_state!(fixture)
+
+      assert {:ok, %{closed_count: 1, preferred_assignment_id: nil}} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 Repo.transaction(fn ->
+                   ExpiredSessions.close_for_key!(
+                     fixture.auth.pool.id,
+                     fixture.auth.api_key.id,
+                     fixture.session_key,
+                     DateTime.add(fixture.boundary_now, 10, :second)
+                   )
+                 end)
+               end)
+
+      assert %CodexSession{status: "closed"} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 Repo.get!(CodexSession, fixture.replacement.id)
+               end)
+
+      %{
+        kind: "expired_sessions_frozen_set",
+        backend_pid_hashes: Enum.map([a_backend_pid, b_backend_pid, observer_backend_pid], &sha256/1),
+        blocked_replacement: sanitize_block(observation),
+        frozen_session_id_sha256: sha256(fixture.session.id),
+        replacement_id_sha256: sha256(fixture.replacement.id),
+        boundary_signature: boundary_signature(events),
+        ordered_id_hashes: ordered_id_hashes(events),
+        replacement_untouched_by_first_boundary: true,
+        replacement_closed_by_second_boundary: true,
+        final_field_names: ["status", "owner_lease_expires_at", "closed_at", "updated_at"]
+      }
+    after
+      send(task_a.pid, {:session_continuity_release_frozen, ref})
+      send(task_b.pid, {:session_continuity_release, ref, :b, :session})
+      send(task_b.pid, {:session_continuity_release, ref, :b, :lease})
+      send(observer.pid, {:session_continuity_stop_observer, ref})
+      shutdown_task(task_a)
+      shutdown_task(task_b)
+      shutdown_task(observer)
+    end
+  end
+
+  defp run_replacement_deadlock_schedule(fixture) do
+    parent = self()
+    ref = make_ref()
+    observer = start_observer(parent, ref)
+
+    replacement =
+      start_deadlock_operation(parent, ref, :replacement, fn ->
+        Repo.transaction(fn ->
+          request =
+            Repo.one!(
+              from request in Request,
+                where: request.id == ^fixture.replacement_request.id,
+                lock: "FOR UPDATE"
+            )
+
+          SessionContinuity.start_codex_turn(
+            fixture.session,
+            request,
+            request_options(pool_upstream_assignment_id: fixture.assignment.id)
+          )
+        end)
+      end)
+
+    predecessor =
+      start_deadlock_operation(parent, ref, :predecessor, fn ->
+        Repo.transaction(fn ->
+          session =
+            Repo.one!(
+              from session in CodexSession,
+                where: session.id == ^fixture.session.id,
+                lock: "FOR UPDATE"
+            )
+
+          request =
+            Repo.one!(
+              from request in Request,
+                where: request.id == ^fixture.predecessor_request.id,
+                lock: "FOR UPDATE"
+            )
+
+          {session, request}
+        end)
+      end)
+
+    try do
+      {_observer_pid, observer_backend_pid} = await_observer_ready!(ref)
+      {_replacement_pid, replacement_backend_pid} = await_deadlock_ready!(ref, :replacement)
+      {_predecessor_pid, predecessor_backend_pid} = await_deadlock_ready!(ref, :predecessor)
+
+      assert MapSet.size(
+               MapSet.new([
+                 observer_backend_pid,
+                 replacement_backend_pid,
+                 predecessor_backend_pid
+               ])
+             ) == 3
+
+      send(replacement.pid, {:replacement_deadlock_run, ref})
+      await_deadlock_barrier!(ref, :replacement, :request)
+
+      send(predecessor.pid, {:replacement_deadlock_run, ref})
+      await_deadlock_barrier!(ref, :predecessor, :session)
+
+      send(replacement.pid, {:replacement_deadlock_release, ref, :replacement, :request})
+
+      replacement_block =
+        observe_relation_block!(
+          observer,
+          ref,
+          replacement_backend_pid,
+          predecessor_backend_pid,
+          "codex_sessions"
+        )
+
+      send(predecessor.pid, {:replacement_deadlock_release, ref, :predecessor, :session})
+
+      assert {:ok, {:ok, {session, request}}} = Task.await(predecessor, 15_000)
+      assert session.id == fixture.session.id
+      assert request.id == fixture.predecessor_request.id
+
+      assert {:ok, {:ok, {:ok, %CodexTurn{} = turn}}} =
+               Task.await(replacement, 15_000)
+
+      assert turn.request_id == fixture.replacement_request.id
+      assert replacement_block.wait_event_type == "Lock"
+      assert replacement_block.relation == "codex_sessions"
+
+      assert Sandbox.unboxed_run(Repo, fn ->
+               Repo.aggregate(
+                 from(turn in CodexTurn,
+                   where: turn.request_id == ^fixture.replacement_request.id
+                 ),
+                 :count
+               )
+             end) == 1
+
+      send(observer.pid, {:session_continuity_stop_observer, ref})
+      assert :ok = Task.await(observer, 5_000)
+    after
+      send(replacement.pid, {:replacement_deadlock_release, ref, :replacement, :request})
+      send(predecessor.pid, {:replacement_deadlock_release, ref, :predecessor, :session})
+
+      if Process.alive?(observer.pid) do
+        send(observer.pid, {:session_continuity_stop_observer, ref})
+      end
+
+      shutdown_task(replacement)
+      shutdown_task(predecessor)
+      shutdown_task(observer)
+    end
+  end
+
+  defp start_deadlock_operation(parent, ref, role, operation) do
+    Task.async(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        backend_pid = backend_pid!()
+        Process.put(@deadlock_context, %{parent: parent, ref: ref, role: role})
+        send(parent, {:replacement_deadlock_ready, ref, role, self(), backend_pid})
+
+        try do
+          receive do
+            {:replacement_deadlock_run, ^ref} -> safely_run(operation)
+          after
+            10_000 -> {:error, :replacement_deadlock_start_timeout}
+          end
+        after
+          Process.delete(@deadlock_context)
+          Process.delete({@deadlock_paused, :request})
+          Process.delete({@deadlock_paused, :session})
+        end
+      end)
+    end)
+  end
+
+  defp with_replacement_deadlock_query_handler(fun) when is_function(fun, 0) do
+    handler_id =
+      {__MODULE__, :replacement_deadlock, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          handle_replacement_deadlock_query(metadata)
+        end,
+        nil
+      )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp handle_replacement_deadlock_query(metadata) do
+    case Process.get(@deadlock_context) do
+      %{parent: parent, ref: ref, role: role} = context ->
+        event = contention_event(metadata, 0)
+
+        family = replacement_deadlock_family(role, event)
+
+        if family && not Process.get({@deadlock_paused, family}, false) do
+          Process.put({@deadlock_paused, family}, true)
+          send(parent, {:replacement_deadlock_barrier, ref, role, family, event})
+
+          receive do
+            {:replacement_deadlock_release, ^ref, ^role, ^family} -> :ok
+          after
+            10_000 -> raise "replacement deadlock #{family} barrier was not released"
+          end
+        end
+
+        context
+
+      _context ->
+        :ok
+    end
+  end
+
+  defp replacement_deadlock_family(:replacement, %{source: "requests", for_update?: true}),
+    do: :request
+
+  defp replacement_deadlock_family(:predecessor, event) do
+    if session_lock_event?(event), do: :session
+  end
+
+  defp replacement_deadlock_family(_role, _event), do: nil
+
+  defp await_deadlock_ready!(ref, role) do
+    receive do
+      {:replacement_deadlock_ready, ^ref, ^role, pid, backend_pid} -> {pid, backend_pid}
+    after
+      5_000 -> flunk("replacement deadlock #{role} connection did not become ready")
+    end
+  end
+
+  defp await_deadlock_barrier!(ref, role, family) do
+    receive do
+      {:replacement_deadlock_barrier, ^ref, ^role, ^family, event} -> event
+    after
+      10_000 -> flunk("replacement deadlock #{role} #{family} barrier was not observed")
+    end
+  end
+
+  defp observe_relation_block!(observer, ref, waiter_pid, blocker_pid, relation) do
+    request_ref = make_ref()
+
+    send(
+      observer.pid,
+      {:session_continuity_observe_block, ref, request_ref, waiter_pid, blocker_pid, "SELECT"}
+    )
+
+    receive do
+      {:session_continuity_block_observed, ^ref, ^request_ref, observation}
+      when is_map(observation) ->
+        assert String.contains?(observation.query, relation)
+        Map.put(observation, :relation, relation)
+
+      {:session_continuity_block_observed, ^ref, ^request_ref, {:error, reason}} ->
+        flunk("PostgreSQL observer failed before positive lock evidence: #{inspect(reason)}")
+    after
+      6_000 -> flunk("PostgreSQL observer did not return a #{relation} blocker observation")
+    end
+  end
+
+  defp start_frozen_operation(parent, ref, operation) do
+    Task.async(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        backend_pid = backend_pid!()
+        Process.put(@frozen_context, %{parent: parent, ref: ref})
+        send(parent, {:session_continuity_frozen_ready, ref, self(), backend_pid})
+
+        try do
+          receive do
+            {:session_continuity_run_frozen, ^ref} -> safely_run(operation)
+          after
+            10_000 -> {:error, :frozen_operation_start_timeout}
+          end
+        after
+          Process.delete(@frozen_context)
+          Process.delete(@frozen_sequence)
+          Process.delete(@frozen_paused)
+        end
+      end)
+    end)
+  end
+
+  defp with_frozen_query_handler(fun) when is_function(fun, 0) do
+    handler_id = {__MODULE__, :frozen, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          handle_frozen_query(metadata)
+        end,
+        nil
+      )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp handle_frozen_query(metadata) do
+    case Process.get(@frozen_context) do
+      %{parent: parent, ref: ref} = context ->
+        handle_frozen_query_context(metadata, context, parent, ref)
+
+      _context ->
+        :ok
+    end
+  end
+
+  defp handle_frozen_query_context(metadata, context, parent, ref) do
+    if metadata[:repo] == Repo do
+      sequence = Process.get(@frozen_sequence, 0) + 1
+      Process.put(@frozen_sequence, sequence)
+      event = contention_event(metadata, sequence)
+      send(parent, {:session_continuity_frozen_query, ref, event})
+
+      maybe_pause_frozen_close(event, context, parent, ref)
+    end
+  end
+
+  defp maybe_pause_frozen_close(event, _context, parent, ref) do
+    if event.source == "codex_sessions" and event.operation == "UPDATE" and
+         not Process.get(@frozen_paused, false) do
+      Process.put(@frozen_paused, true)
+      send(parent, {:session_continuity_frozen_close_barrier, ref, event})
+
+      receive do
+        {:session_continuity_release_frozen, ^ref} -> :ok
+      after
+        10_000 -> raise "session continuity frozen close barrier was not released"
+      end
+    end
+  end
+
+  defp await_frozen_close_barrier!(ref, events) do
+    receive do
+      {:session_continuity_frozen_query, ^ref, event} ->
+        await_frozen_close_barrier!(ref, events ++ [event])
+
+      {:session_continuity_frozen_close_barrier, ^ref, event} ->
+        {events, event}
+    after
+      10_000 -> flunk("session continuity frozen session close barrier was not observed")
+    end
+  end
+
+  defp await_frozen_ready!(ref) do
+    receive do
+      {:session_continuity_frozen_ready, ^ref, pid, backend_pid} -> {pid, backend_pid}
+    after
+      5_000 -> flunk("session continuity frozen boundary connection did not become ready")
+    end
+  end
+
+  defp drain_frozen_events(ref, events) do
+    receive do
+      {:session_continuity_frozen_query, ^ref, event} ->
+        drain_frozen_events(ref, events ++ [event])
+    after
+      0 -> events
+    end
+  end
+
+  defp observe_blocked_session_operation!(
+         observer,
+         ref,
+         waiter_pid,
+         blocker_pid,
+         expected_operation
+       ) do
+    request_ref = make_ref()
+
+    send(
+      observer.pid,
+      {:session_continuity_observe_block, ref, request_ref, waiter_pid, blocker_pid, expected_operation}
+    )
+
+    receive do
+      {:session_continuity_block_observed, ^ref, ^request_ref, {:error, reason}} ->
+        flunk("PostgreSQL observer failed before positive lock evidence: #{inspect(reason)}")
+
+      {:session_continuity_block_observed, ^ref, ^request_ref, observation} ->
+        assert observation.wait_event_type == "Lock"
+        assert observation.state == "active"
+        observation
+    after
+      6_000 -> flunk("PostgreSQL observer did not return a session blocker observation")
+    end
+  end
+
+  defp assert_frozen_boundary_events!(events, frozen_session_id) do
+    assert boundary_signature(events) == expired_boundary_signature()
+
+    dependent_events =
+      Enum.filter(events, fn event ->
+        event.source in ["bridge_owner_leases", "bridge_session_aliases"] or
+          (event.source == "codex_sessions" and event.operation == "UPDATE")
+      end)
+
+    assert dependent_events != []
+
+    Enum.each(dependent_events, fn event ->
+      assert uuid_params(event.params) == [frozen_session_id]
+      refute String.contains?(String.upcase(event.query), " IN (SELECT")
+    end)
+
+    events
+    |> Enum.filter(&(&1.operation == "SELECT" and &1.for_update?))
+    |> Enum.each(fn event -> assert ordered_primary_key_lock?(event.query) end)
+  end
+
+  defp assert_frozen_replacement_state!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      assert %CodexSession{status: "closed"} = Repo.get!(CodexSession, fixture.session.id)
+
+      assert %CodexSession{
+               status: "interrupted",
+               closed_at: nil,
+               owner_lease_expires_at: replacement_expiry,
+               updated_at: replacement_updated_at
+             } = Repo.get!(CodexSession, fixture.replacement.id)
+
+      assert replacement_expiry == fixture.replacement_expires_at
+      assert replacement_updated_at == fixture.replacement_updated_at
+
+      assert %BridgeOwnerLease{status: "expired"} =
+               Repo.get!(BridgeOwnerLease, fixture.lease.id)
+
+      assert Enum.all?(
+               Repo.all(
+                 from alias_record in BridgeSessionAlias,
+                   where: alias_record.codex_session_id == ^fixture.session.id
+               ),
+               &(&1.status == "expired")
+             )
+    end)
+  end
+
+  defp update_closed_replacement!(fixture) do
+    fixture.replacement
+    |> Ecto.Changeset.change(%{
+      status: "interrupted",
+      owner_instance_id: "node-replacement",
+      owner_lease_token: fixture.replacement_token,
+      owner_lease_expires_at: fixture.replacement_expires_at,
+      last_heartbeat_at: fixture.replacement_expires_at,
+      closed_at: nil,
+      updated_at: fixture.replacement_updated_at
+    })
+    |> Repo.update!()
+  end
+
+  defp run_direction(direction_id, operations) do
+    Enum.map(1..@direction_iterations, fn iteration ->
+      run_direction_iteration(direction_id, iteration, operations)
+    end)
+  end
+
+  defp run_direction_iteration(direction_id, iteration, operations) do
+    # No per-iteration teardown: every iteration commits its Pool, key and session under the
+    # test's one committed owner, whose registered removal takes all of them when the test ends.
+    fixture = unboxed_owner_session_fixture(direction_id, iteration)
+
+    with_contention_query_handler(fn ->
+      run_contended_operations(direction_id, iteration, fixture, operations.(fixture))
+    end)
+  end
+
+  defp run_contended_operations(direction_id, iteration, fixture, {a_operation, b_operation}) do
+    parent = self()
+    ref = make_ref()
+    observer = start_observer(parent, ref)
+    task_a = start_operation(parent, ref, :a, a_operation, pause?: true)
+    task_b = start_operation(parent, ref, :b, b_operation, pause?: false)
+
+    try do
+      {_observer_pid, observer_backend_pid} = await_observer_ready!(ref)
+      {_a_pid, a_backend_pid} = await_operation_ready!(ref, :a)
+      {_b_pid, b_backend_pid} = await_operation_ready!(ref, :b)
+
+      assert MapSet.size(MapSet.new([observer_backend_pid, a_backend_pid, b_backend_pid])) == 3
+
+      send(task_a.pid, {:session_continuity_run, ref})
+      {_session_event, traces} = await_barrier!(ref, :a, :session, empty_traces())
+
+      send(task_b.pid, {:session_continuity_run, ref})
+
+      {first_block, traces} =
+        observe_blocked_before_lease!(
+          observer,
+          ref,
+          :b,
+          b_backend_pid,
+          a_backend_pid,
+          traces
+        )
+
+      send(task_a.pid, {:session_continuity_release, ref, :a, :session})
+      {_lease_event, traces} = await_barrier!(ref, :a, :lease, traces)
+
+      {second_block, traces} =
+        observe_blocked_before_lease!(
+          observer,
+          ref,
+          :b,
+          b_backend_pid,
+          a_backend_pid,
+          traces
+        )
+
+      send(task_a.pid, {:session_continuity_release, ref, :a, :lease})
+
+      assert {:ok, {:ok, %CodexSession{}}} = Task.await(task_a, 10_000)
+      assert {:ok, {:ok, %CodexSession{}}} = Task.await(task_b, 10_000)
+
+      send(observer.pid, {:session_continuity_stop_observer, ref})
+      assert :ok = Task.await(observer, 5_000)
+
+      traces = drain_contention_events(ref, traces)
+      assert_canonical_order!(traces.a)
+      assert_canonical_order!(traces.b)
+
+      final = final_owner_snapshot(fixture.session.id)
+      assert final.active_lease_count == 1
+      assert final.session_owner_matches_lease?
+
+      %{
+        direction_id: direction_id,
+        iteration: iteration,
+        backend_pid_hashes: Enum.map([a_backend_pid, b_backend_pid, observer_backend_pid], &sha256/1),
+        blocker_observations: [sanitize_block(first_block), sanitize_block(second_block)],
+        a_order: relation_operation_order(traces.a),
+        b_order: relation_operation_order(traces.b),
+        final: final
+      }
+    after
+      send(task_a.pid, {:session_continuity_release, ref, :a, :session})
+      send(task_a.pid, {:session_continuity_release, ref, :a, :lease})
+      send(task_b.pid, {:session_continuity_release, ref, :b, :session})
+      send(task_b.pid, {:session_continuity_release, ref, :b, :lease})
+      send(observer.pid, {:session_continuity_stop_observer, ref})
+      shutdown_task(task_a)
+      shutdown_task(task_b)
+      shutdown_task(observer)
+    end
+  end
+
+  defp with_contention_query_handler(fun) when is_function(fun, 0) do
+    handler_id = {__MODULE__, :contention, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          handle_contention_query(metadata)
+        end,
+        nil
+      )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp handle_contention_query(metadata) do
+    case Process.get(@contention_context) do
+      %{parent: parent, ref: ref, role: role} = context ->
+        if metadata[:repo] == Repo do
+          sequence = Process.get(@contention_sequence, 0) + 1
+          Process.put(@contention_sequence, sequence)
+          event = contention_event(metadata, sequence)
+          send(parent, {:session_continuity_query, ref, role, event})
+          maybe_pause_contention(context, event)
+        end
+
+      _context ->
+        :ok
+    end
+  end
+
+  defp contention_event(metadata, sequence) do
+    query = Map.get(metadata, :query, "")
+    upcased_query = String.upcase(query)
+
+    %{
+      sequence: sequence,
+      source: metadata[:source],
+      operation: command_name(query),
+      for_update?: String.contains?(upcased_query, "FOR UPDATE"),
+      params: Map.get(metadata, :params, []),
+      query: query,
+      query_sha256: sha256(query)
+    }
+  end
+
+  defp maybe_pause_contention(%{pause?: true} = context, event) do
+    cond do
+      session_lock_event?(event) -> pause_contention(context, :session, event)
+      lease_lock_event?(event) -> pause_contention(context, :lease, event)
+      true -> :ok
+    end
+  end
+
+  defp maybe_pause_contention(_context, _event), do: :ok
+
+  defp pause_contention(context, family, event) do
+    pause_key = {@contention_paused, family}
+
+    unless Process.get(pause_key, false) do
+      Process.put(pause_key, true)
+
+      send(
+        context.parent,
+        {:session_continuity_barrier, context.ref, context.role, family, event}
+      )
+
+      receive do
+        {:session_continuity_release, ref, role, ^family}
+        when ref == context.ref and role == context.role ->
+          :ok
+      after
+        10_000 -> raise "session continuity #{family} barrier was not released"
+      end
+    end
+  end
+
+  defp start_operation(parent, ref, role, operation, opts) do
+    pause? = Keyword.fetch!(opts, :pause?)
+
+    Task.async(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        backend_pid = backend_pid!()
+
+        Process.put(@contention_context, %{
+          parent: parent,
+          ref: ref,
+          role: role,
+          pause?: pause?
+        })
+
+        send(parent, {:session_continuity_operation_ready, ref, role, self(), backend_pid})
+
+        try do
+          receive do
+            {:session_continuity_run, ^ref} -> safely_run(operation)
+          after
+            10_000 -> {:error, :operation_start_timeout}
+          end
+        after
+          Process.delete(@contention_context)
+          Process.delete(@contention_sequence)
+          Process.delete({@contention_paused, :session})
+          Process.delete({@contention_paused, :lease})
+        end
+      end)
+    end)
+  end
+
+  defp safely_run(operation) do
+    {:ok, operation.()}
+  rescue
+    exception -> {:error, exception.__struct__, Exception.message(exception)}
+  catch
+    kind, reason -> {:error, kind, inspect(reason)}
+  end
+
+  defp start_observer(parent, ref) do
+    Task.async(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        backend_pid = backend_pid!()
+        send(parent, {:session_continuity_observer_ready, ref, self(), backend_pid})
+        observer_loop(parent, ref)
+      end)
+    end)
+  end
+
+  defp observer_loop(parent, ref) do
+    receive do
+      {:session_continuity_observe_block, ^ref, request_ref, waiter_pid, blocker_pid, expected_operation} ->
+        observation = observe_session_block(waiter_pid, blocker_pid, expected_operation)
+        send(parent, {:session_continuity_block_observed, ref, request_ref, observation})
+        observer_loop(parent, ref)
+
+      {:session_continuity_stop_observer, ^ref} ->
+        :ok
+    after
+      15_000 -> {:error, :observer_timeout}
+    end
+  end
+
+  defp observe_session_block(waiter_pid, blocker_pid, expected_operation) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    do_observe_session_block(waiter_pid, blocker_pid, expected_operation, deadline)
+  end
+
+  defp do_observe_session_block(waiter_pid, blocker_pid, expected_operation, deadline) do
+    %{rows: rows} =
+      SQL.query!(
+        Repo,
+        """
+        SELECT pg_blocking_pids($1), wait_event_type, wait_event, state, query
+        FROM pg_stat_activity
+        WHERE pid = $1
+        """,
+        [waiter_pid]
+      )
+
+    case rows do
+      [[blocking_pids, "Lock", wait_event, "active", query]] ->
+        if blocker_pid in blocking_pids and
+             blocked_session_operation?(query, expected_operation) do
+          %{
+            blocking_pids: blocking_pids,
+            wait_event_type: "Lock",
+            wait_event: wait_event,
+            state: "active",
+            operation: expected_operation,
+            query: query
+          }
+        else
+          retry_session_block(waiter_pid, blocker_pid, expected_operation, deadline, rows)
+        end
+
+      _rows ->
+        retry_session_block(waiter_pid, blocker_pid, expected_operation, deadline, rows)
+    end
+  end
+
+  defp retry_session_block(waiter_pid, blocker_pid, expected_operation, deadline, last_rows) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {:error, {:session_block_not_observed, last_rows}}
+    else
+      do_observe_session_block(waiter_pid, blocker_pid, expected_operation, deadline)
+    end
+  end
+
+  defp observe_blocked_before_lease!(
+         observer,
+         ref,
+         role,
+         waiter_pid,
+         blocker_pid,
+         traces
+       ) do
+    request_ref = make_ref()
+
+    send(
+      observer.pid,
+      {:session_continuity_observe_block, ref, request_ref, waiter_pid, blocker_pid, "SELECT"}
+    )
+
+    await_blocked_before_lease!(ref, role, request_ref, traces)
+  end
+
+  defp await_blocked_before_lease!(ref, role, request_ref, traces) do
+    receive do
+      {:session_continuity_query, ^ref, ^role, event} ->
+        traces = append_trace(traces, role, event)
+
+        if event.source == "bridge_owner_leases" do
+          flunk("bridge_owner_leases #{event.operation} completed before the blocked codex_sessions SELECT FOR UPDATE")
+        end
+
+        await_blocked_before_lease!(ref, role, request_ref, traces)
+
+      {:session_continuity_query, ^ref, other_role, event} when other_role in [:a, :b] ->
+        await_blocked_before_lease!(
+          ref,
+          role,
+          request_ref,
+          append_trace(traces, other_role, event)
+        )
+
+      {:session_continuity_block_observed, ^ref, ^request_ref, {:error, reason}} ->
+        flunk("PostgreSQL observer failed before positive lock evidence: #{inspect(reason)}")
+
+      {:session_continuity_block_observed, ^ref, ^request_ref, observation} ->
+        assert observation.wait_event_type == "Lock"
+        assert observation.state == "active"
+        {observation, traces}
+    after
+      6_000 -> flunk("PostgreSQL observer did not return a session blocker observation")
+    end
+  end
+
+  defp await_barrier!(ref, role, family, traces) do
+    receive do
+      {:session_continuity_query, ^ref, query_role, event} when query_role in [:a, :b] ->
+        if query_role == :b and family == :lease and event.source == "bridge_owner_leases" do
+          flunk("blocked operation reached bridge_owner_leases before session release")
+        end
+
+        await_barrier!(ref, role, family, append_trace(traces, query_role, event))
+
+      {:session_continuity_barrier, ^ref, ^role, ^family, event} ->
+        {event, traces}
+    after
+      10_000 -> flunk("session continuity #{role} #{family} barrier was not observed")
+    end
+  end
+
+  defp await_observer_ready!(ref) do
+    receive do
+      {:session_continuity_observer_ready, ^ref, pid, backend_pid} -> {pid, backend_pid}
+    after
+      5_000 -> flunk("session continuity observer connection did not become ready")
+    end
+  end
+
+  defp await_operation_ready!(ref, role) do
+    receive do
+      {:session_continuity_operation_ready, ^ref, ^role, pid, backend_pid} -> {pid, backend_pid}
+    after
+      5_000 -> flunk("session continuity #{role} connection did not become ready")
+    end
+  end
+
+  defp drain_contention_events(ref, traces) do
+    receive do
+      {:session_continuity_query, ^ref, role, event} when role in [:a, :b] ->
+        drain_contention_events(ref, append_trace(traces, role, event))
+    after
+      0 -> traces
+    end
+  end
+
+  defp empty_traces, do: %{a: [], b: []}
+
+  defp append_trace(traces, role, event) do
+    Map.update!(traces, role, &(&1 ++ [event]))
+  end
+
+  defp assert_canonical_order!(events) do
+    session_index = Enum.find_index(events, &session_lock_event?/1)
+    lease_index = Enum.find_index(events, &lease_lock_event?/1)
+
+    assert is_integer(session_index)
+    assert is_integer(lease_index)
+    assert session_index < lease_index
+  end
+
+  defp assert_session_before_lease_lock!(events) do
+    assert_canonical_order!(events)
+
+    refute events
+           |> Enum.take_while(&(not session_lock_event?(&1)))
+           |> Enum.any?(&(&1.source == "bridge_owner_leases"))
+  end
+
+  defp relation_operation_order(events) do
+    events
+    |> Enum.filter(&(&1.source in ["codex_sessions", "bridge_owner_leases"]))
+    |> Enum.map(fn event ->
+      %{
+        relation: event.source,
+        operation: event.operation,
+        lock: if(event.for_update?, do: "FOR UPDATE", else: nil),
+        query_sha256: event.query_sha256
+      }
+    end)
+  end
+
+  defp session_lock_event?(event) do
+    event.source == "codex_sessions" and event.operation == "SELECT" and event.for_update?
+  end
+
+  defp lease_lock_event?(event) do
+    event.source == "bridge_owner_leases" and event.operation == "SELECT" and
+      event.for_update?
+  end
+
+  defp blocked_session_operation?(query, operation) when is_binary(query) do
+    upcased_query = String.upcase(query)
+
+    String.starts_with?(String.trim_leading(upcased_query), operation) and
+      String.contains?(upcased_query, "CODEX_SESSIONS")
+  end
+
+  defp blocked_session_operation?(_query, _operation), do: false
+
+  defp final_owner_snapshot(session_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      session = Repo.get!(CodexSession, session_id)
+
+      leases =
+        Repo.all(
+          from lease in BridgeOwnerLease,
+            where: lease.codex_session_id == ^session_id and lease.status == "active",
+            order_by: [asc: lease.id]
+        )
+
+      active_lease = List.first(leases)
+
+      %{
+        active_lease_count: length(leases),
+        session_owner_matches_lease?:
+          match?(%BridgeOwnerLease{}, active_lease) and
+            session.owner_instance_id == active_lease.owner_instance_id and
+            session.owner_lease_token == active_lease.lease_token and
+            session.owner_lease_expires_at == active_lease.expires_at,
+        final_field_names: [
+          "status",
+          "owner_instance_id",
+          "owner_lease_token",
+          "owner_lease_expires_at"
+        ],
+        session_status: session.status,
+        lease_status: if(active_lease, do: active_lease.status)
+      }
+    end)
+  end
+
+  defp sanitize_block(observation) do
+    %{
+      blocking_pid_hashes: Enum.map(observation.blocking_pids, &sha256/1),
+      wait_event_type: observation.wait_event_type,
+      wait_event: observation.wait_event,
+      state: observation.state,
+      relation: "codex_sessions",
+      operation: observation.operation,
+      lock: if(observation.operation == "SELECT", do: "FOR UPDATE", else: "ROW/UNIQUE INDEX"),
+      query_sha256: sha256(observation.query)
+    }
+  end
+
+  defp report_direction(direction_id, records) do
+    if path = System.get_env("SESSION_CONTINUITY_MANUAL_QA_PATH") do
+      record = %{
+        kind: "session_lease_direction",
+        direction_id: direction_id,
+        iterations: length(records),
+        records: records
+      }
+
+      File.write!(path, CodexPooler.JSON.encode!(record) <> "\n", [:append])
+    end
+  end
+
+  defp report_atomic_renewal(record) do
+    if path = System.get_env("SESSION_CONTINUITY_MANUAL_QA_PATH") do
+      File.write!(path, CodexPooler.JSON.encode!(record) <> "\n", [:append])
+    end
+  end
+
+  defp stop_latency_task!(task) do
+    monitor = Process.monitor(task.pid)
+    Process.unlink(task.pid)
+    if Process.alive?(task.pid), do: Process.exit(task.pid, :kill)
+
+    assert_receive {:DOWN, ^monitor, :process, _, _}, 15_000
+  end
+
+  defp await_latency_backend_released!(backend_pid, deadline) do
+    rows =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("SELECT state FROM pg_stat_activity WHERE pid = $1", [backend_pid]).rows
+      end)
+
+    unless rows == [] or rows == [["idle"]] do
+      assert System.monotonic_time(:millisecond) < deadline, "renewal backend remained held"
+      marker = make_ref()
+      Process.send_after(self(), {:observe_latency_backend, marker}, 10)
+      assert_receive {:observe_latency_backend, ^marker}, 5_000
+      await_latency_backend_released!(backend_pid, deadline)
+    end
+  end
+
+  defp shutdown_task(task) do
+    if Process.alive?(task.pid), do: Task.shutdown(task, :brutal_kill)
+  end
+
+  defp bounded_renewal(fixture) do
+    SessionContinuity.renew_owner_token(
+      fixture.session.id,
+      fixture.token,
+      request_options(bridge_owner_lease_ttl_seconds: 120),
+      lock_timeout_ms: @bounded_renewal_lock_timeout_ms
+    )
+  end
+
+  defp lock_renewal_row!(:session, session_id) do
+    Repo.one!(from session in CodexSession, where: session.id == ^session_id, lock: "FOR UPDATE")
+  end
+
+  defp lock_renewal_row!(:lease, session_id) do
+    Repo.one!(
+      from lease in BridgeOwnerLease,
+        where: lease.codex_session_id == ^session_id and lease.status == "active",
+        lock: "FOR UPDATE"
+    )
+  end
+
+  defp statement_fingerprint(statement) do
+    :sha256 |> :crypto.hash(statement) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+  end
+
+  # The session holder itself waits on the API key row, so its blocked
+  # statement is observed before the renewal starts; no lock timeout bounds it.
+  defp observe_session_holder_wait!(waiter_backend_pid, blocker_backend_pid) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    do_observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid, deadline)
+  end
+
+  defp renewal_row_relation(:session), do: "codex_sessions"
+  defp renewal_row_relation(:lease), do: "bridge_owner_leases"
+
+  defp observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid) do
+    deadline = System.monotonic_time(:millisecond) + @bounded_renewal_lock_timeout_ms
+    do_observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid, deadline)
+  end
+
+  defp do_observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid, deadline) do
+    rows =
+      Sandbox.unboxed_run(Repo, fn ->
+        SQL.query!(
+          Repo,
+          """
+          SELECT COALESCE(
+            (
+              SELECT c.relname
+              FROM pg_locks AS l
+              JOIN pg_class AS c ON c.oid = l.relation
+              WHERE l.pid = a.pid AND (l.locktype = 'tuple' OR NOT l.granted)
+              ORDER BY l.granted
+              LIMIT 1
+            ),
+            (
+              SELECT 'api_key_reservation_window'
+              FROM pg_locks AS l
+              WHERE l.pid = a.pid AND l.locktype = 'advisory' AND NOT l.granted
+                AND l.classid = hashtext('api_key_reservation_window')
+              LIMIT 1
+            )
+          )
+          FROM pg_stat_activity AS a
+          WHERE a.pid = $1 AND a.wait_event_type = 'Lock'
+            AND $2 = ANY(pg_blocking_pids(a.pid))
+          """,
+          [waiter_backend_pid, blocker_backend_pid]
+        ).rows
+      end)
+
+    case rows do
+      [[relation]] when is_binary(relation) ->
+        relation
+
+      _not_observed ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("bounded renewal was not observed waiting on the blocker's row lock")
+        else
+          do_observe_renewal_lock_wait!(waiter_backend_pid, blocker_backend_pid, deadline)
+        end
+    end
+  end
+
+  # The backend pid the COMMIT trigger recorded, or nil when it never ran.
+  defp commit_witness!(witness) do
+    Sandbox.unboxed_run(Repo, fn ->
+      case Repo.query!("SELECT last_value, is_called FROM #{witness}").rows do
+        [[backend_pid, true]] -> backend_pid
+        [[_start, false]] -> nil
+      end
+    end)
+  end
+
+  defp backend_pid! do
+    %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+    backend_pid
+  end
+
+  defp capture_detailed_repo_queries(fun) when is_function(fun, 0) do
+    parent = self()
+    handler_id = {__MODULE__, :detailed, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and self() == parent do
+            send(parent, {handler_id, contention_event(metadata, 0)})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_detailed_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_detailed_queries(handler_id, events) do
+    receive do
+      {^handler_id, event} -> drain_detailed_queries(handler_id, events ++ [event])
+    after
+      0 -> events
+    end
+  end
+
+  defp boundary_signature(events) do
+    events
+    |> boundary_events()
+    |> Enum.map(fn event ->
+      %{
+        relation: event.source,
+        operation: event.operation,
+        lock: if(event.for_update?, do: "FOR UPDATE", else: nil),
+        ordered_by_primary_key: event.operation != "SELECT" or ordered_primary_key_lock?(event.query)
+      }
+    end)
+  end
+
+  defp boundary_events(events) do
+    case Enum.split_while(events, &(not expired_session_lock_event?(&1))) do
+      {_before, []} -> []
+      {_before, from_boundary} -> collect_boundary_events(from_boundary)
+    end
+  end
+
+  defp collect_boundary_events(events) do
+    Enum.reduce_while(events, [], &collect_boundary_event/2)
+  end
+
+  defp collect_boundary_event(event, acc) do
+    if boundary_relation_event?(event) do
+      next = acc ++ [event]
+
+      if event.source == "codex_sessions" and event.operation == "UPDATE" do
+        {:halt, next}
+      else
+        {:cont, next}
+      end
+    else
+      {:cont, acc}
+    end
+  end
+
+  defp expired_boundary_signature do
+    [
+      %{
+        relation: "codex_sessions",
+        operation: "SELECT",
+        lock: "FOR UPDATE",
+        ordered_by_primary_key: true
+      },
+      %{
+        relation: "bridge_owner_leases",
+        operation: "SELECT",
+        lock: "FOR UPDATE",
+        ordered_by_primary_key: true
+      },
+      %{
+        relation: "bridge_session_aliases",
+        operation: "SELECT",
+        lock: "FOR UPDATE",
+        ordered_by_primary_key: true
+      },
+      %{
+        relation: "bridge_owner_leases",
+        operation: "UPDATE",
+        lock: nil,
+        ordered_by_primary_key: true
+      },
+      %{
+        relation: "bridge_session_aliases",
+        operation: "UPDATE",
+        lock: nil,
+        ordered_by_primary_key: true
+      },
+      %{
+        relation: "codex_sessions",
+        operation: "UPDATE",
+        lock: nil,
+        ordered_by_primary_key: true
+      }
+    ]
+  end
+
+  defp expired_session_lock_event?(event) do
+    event.source == "codex_sessions" and event.operation == "SELECT" and event.for_update? and
+      String.contains?(String.upcase(event.query), "OWNER_LEASE_EXPIRES_AT") and
+      ordered_primary_key_lock?(event.query)
+  end
+
+  defp boundary_relation_event?(event) do
+    event.source in ["codex_sessions", "bridge_owner_leases", "bridge_session_aliases"] and
+      event.operation in ["SELECT", "UPDATE"]
+  end
+
+  defp ordered_primary_key_lock?(query) do
+    String.contains?(String.upcase(query), "ORDER BY") and
+      Regex.match?(~r/ORDER BY\s+[^;]*\."id"(?:\s+ASC)?/i, query) and
+      String.contains?(String.upcase(query), "FOR UPDATE")
+  end
+
+  defp uuid_params(params) do
+    params
+    |> flatten_params()
+    |> Enum.flat_map(fn value ->
+      case Ecto.UUID.cast(value) do
+        {:ok, id} -> [id]
+        :error -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp flatten_params(values) when is_list(values), do: Enum.flat_map(values, &flatten_params/1)
+  defp flatten_params(value), do: [value]
+
+  defp ordered_id_hashes(events) do
+    events
+    |> boundary_events()
+    |> Enum.reject(&expired_session_lock_event?/1)
+    |> Enum.map(fn event ->
+      %{
+        relation: event.source,
+        operation: event.operation,
+        id_sha256: Enum.map(uuid_params(event.params), &sha256/1)
+      }
+    end)
+  end
+
+  defp report_frozen_schedule(record) do
+    if path = System.get_env("SESSION_CONTINUITY_MANUAL_QA_PATH") do
+      File.write!(path, CodexPooler.JSON.encode!(record) <> "\n", [:append])
+    end
+  end
+
+  defp report_start_boundary(events, frozen_session_id) do
+    if path = System.get_env("SESSION_CONTINUITY_MANUAL_QA_PATH") do
+      record = %{
+        kind: "expired_sessions_start_boundary",
+        boundary_signature: boundary_signature(events),
+        frozen_session_id_sha256: sha256(frozen_session_id),
+        ordered_id_hashes: ordered_id_hashes(events),
+        start_after_close: true
+      }
+
+      File.write!(path, CodexPooler.JSON.encode!(record) <> "\n", [:append])
+    end
+  end
+
+  defp unboxed_expired_replacement_fixture do
+    fixture = unboxed_expired_session_fixture("session_continuity-frozen")
+
+    Sandbox.unboxed_run(Repo, fn ->
+      replacement =
+        %CodexSession{
+          pool_id: fixture.auth.pool.id,
+          api_key_id: fixture.auth.api_key.id,
+          session_key: fixture.session_key,
+          status: "closed",
+          closed_at: fixture.boundary_now,
+          created_at: fixture.boundary_now,
+          updated_at: fixture.boundary_now
+        }
+        |> Repo.insert!()
+
+      Map.merge(fixture, %{
+        replacement: replacement,
+        replacement_token: Ecto.UUID.generate(),
+        replacement_expires_at: DateTime.add(fixture.boundary_now, -30, :second),
+        replacement_updated_at: DateTime.add(fixture.boundary_now, 1, :second)
+      })
+    end)
+  end
+
+  defp unboxed_expired_session_fixture(prefix) do
+    %{user: owner} = committed_bootstrap_owner_fixture!()
+
+    Sandbox.unboxed_run(Repo, fn ->
+      auth = auth_fixture(owner)
+
+      session_key =
+        "#{prefix}-#{System.unique_integer([:positive, :monotonic])}"
+
+      assert {:ok, %CodexSession{} = session} =
+               Gateway.start_codex_session(auth, %{
+                 session_key: session_key,
+                 owner_instance_id: "node-old"
+               })
+
+      boundary_now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      expired_at = DateTime.add(boundary_now, -60, :second)
+      session = Repo.get!(CodexSession, session.id)
+      lease = active_lease!(session.id)
+
+      session
+      |> Ecto.Changeset.change(%{
+        owner_lease_expires_at: expired_at,
+        last_heartbeat_at: expired_at,
+        updated_at: expired_at
+      })
+      |> Repo.update!()
+
+      lease
+      |> Ecto.Changeset.change(%{expires_at: expired_at, updated_at: expired_at})
+      |> Repo.update!()
+
+      %{
+        auth: auth,
+        boundary_now: boundary_now,
+        lease: lease,
+        session: Repo.get!(CodexSession, session.id),
+        session_key: session_key
+      }
+    end)
+  end
+
+  defp active_lease!(session_id) do
+    Repo.one!(
+      from lease in BridgeOwnerLease,
+        where: lease.codex_session_id == ^session_id and lease.status == "active",
+        order_by: [asc: lease.id],
+        limit: 1
+    )
+  end
+
+  defp unboxed_get_session!(session_id) do
+    Sandbox.unboxed_run(Repo, fn -> Repo.get!(CodexSession, session_id) end)
+  end
+
+  defp unboxed_active_lease!(session_id) do
+    Sandbox.unboxed_run(Repo, fn -> active_lease!(session_id) end)
+  end
+
+  defp set_unboxed_owner_deadline!(fixture, seconds) do
+    Sandbox.unboxed_run(Repo, fn ->
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      expires_at = DateTime.add(now, seconds, :second)
+      session = Repo.get!(CodexSession, fixture.session.id)
+      lease = active_lease!(session.id)
+
+      session
+      |> Ecto.Changeset.change(%{
+        owner_lease_expires_at: expires_at,
+        last_heartbeat_at: now,
+        updated_at: now
+      })
+      |> Repo.update!()
+
+      lease
+      |> Ecto.Changeset.change(%{renewed_at: now, expires_at: expires_at, updated_at: now})
+      |> Repo.update!()
+
+      %{fixture | session: Repo.get!(CodexSession, session.id)}
+    end)
+  end
+
+  defp unboxed_owner_session_fixture(direction_id, iteration) do
+    %{user: owner} = committed_bootstrap_owner_fixture!()
+
+    Sandbox.unboxed_run(Repo, fn ->
+      auth = auth_fixture(owner)
+
+      session_key =
+        "session_continuity-#{direction_id}-#{iteration}-#{System.unique_integer([:positive, :monotonic])}"
+
+      assert {:ok, %CodexSession{} = session} =
+               Gateway.start_codex_session(auth, %{
+                 session_key: session_key,
+                 owner_instance_id: "node-a"
+               })
+
+      session = Repo.get!(CodexSession, session.id)
+
+      %{
+        auth: auth,
+        session: session,
+        session_key: session_key,
+        token: session.owner_lease_token
+      }
+    end)
+  end
+
+  defp unboxed_fresh_runtime_turn_fixture do
+    %{user: owner} = committed_bootstrap_owner_fixture!()
+
+    Sandbox.unboxed_run(Repo, fn ->
+      auth = auth_fixture(owner)
+
+      assert {:ok, %CodexSession{} = session} =
+               Gateway.start_codex_session(auth, %{
+                 accepted_turn_state: "session-continuity-fresh-runtime-#{System.unique_integer([:positive, :monotonic])}",
+                 owner_instance_id: "node-a"
+               })
+
+      request = request_fixture(auth, %{status: "in_progress", completed_at: nil})
+      %{request_id: request.id, session_id: session.id}
+    end)
+  end
+
+  defp unboxed_replacement_deadlock_fixture do
+    %{user: owner} = committed_bootstrap_owner_fixture!()
+
+    Sandbox.unboxed_run(Repo, fn ->
+      auth = auth_fixture(owner)
+      %{assignment: assignment} = upstream_assignment_fixture(auth.pool)
+
+      assert {:ok, %CodexSession{} = session} =
+               Gateway.start_codex_session(auth, %{
+                 accepted_turn_state: "replacement-deadlock-#{System.unique_integer([:positive, :monotonic])}",
+                 owner_instance_id: "node-a"
+               })
+
+      predecessor_request =
+        request_fixture(auth, %{
+          status: "in_progress",
+          completed_at: nil,
+          transport: "websocket",
+          usage_status: "usage_pending"
+        })
+
+      replacement_request =
+        request_fixture(auth, %{
+          status: "in_progress",
+          completed_at: nil,
+          transport: "websocket",
+          usage_status: "usage_pending"
+        })
+
+      %{
+        assignment: assignment,
+        predecessor_request: predecessor_request,
+        replacement_request: replacement_request,
+        session: Repo.get!(CodexSession, session.id)
+      }
+    end)
+  end
+
+  # Every unboxed fixture here commits under the test's one owner from
+  # `committed_bootstrap_owner_fixture!/1`, which registers the owner's removal before the commit.
+  # Registered, never scoped: the contention cases run their blockers in linked tasks, so an
+  # assertion failing in one kills the test process before any `after` in it runs, and the ExUnit
+  # timeout kills it the same way. The owner's Pools cascade to every key, session, lease, request
+  # and turn committed under them, and an identity goes with the only Pool that holds it.
+  defp auth_fixture, do: auth_fixture(bootstrap_owner_fixture().user)
+
+  defp auth_fixture(owner) do
+    pool = pool_fixture(%{created_by_user_id: owner.id})
+    %{api_key: api_key} = active_api_key_fixture(pool, %{created_by_user_id: owner.id})
+    %{pool: pool, api_key: api_key}
+  end
+
+  defp owner_session_fixture do
+    auth = auth_fixture()
+
+    assert {:ok, %CodexSession{} = session} =
+             Gateway.start_codex_session(auth, %{
+               accepted_turn_state: "session-continuity-pin-#{System.unique_integer([:positive, :monotonic])}",
+               owner_instance_id: "node-a"
+             })
+
+    session = Repo.get!(CodexSession, session.id)
+    %{auth: auth, session: session, token: session.owner_lease_token}
+  end
+
+  defp insert_alias!(session, auth, kind, value) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    hash = :crypto.hash(:sha256, value)
+
+    %BridgeSessionAlias{}
+    |> BridgeSessionAlias.changeset(%{
+      codex_session_id: session.id,
+      pool_id: auth.pool.id,
+      api_key_id: auth.api_key.id,
+      alias_kind: kind,
+      alias_hash: hash,
+      alias_preview: hash |> Base.encode16(case: :lower) |> String.slice(0, 16),
+      status: "active",
+      expires_at: DateTime.add(now, 300, :second),
+      last_seen_at: now,
+      metadata: %{},
+      created_at: now,
+      updated_at: now
+    })
+    |> Repo.insert!()
+  end
+
+  defp token_lease_id(token) do
+    Repo.one!(
+      from lease in BridgeOwnerLease,
+        where: lease.lease_token == ^token,
+        select: lease.id
+    )
+  end
+
+  defp request_options(opts) do
+    opts
+    |> Map.new()
+    |> RequestOptions.for_websocket()
+  end
+
+  defp capture_repo_queries(fun) when is_function(fun, 0) do
+    parent = self()
+    handler_id = {__MODULE__, System.unique_integer([:positive, :monotonic])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo do
+            query = Map.get(metadata, :query, "")
+
+            send(parent, {
+              handler_id,
+              %{
+                source: metadata[:source],
+                command: command_name(query),
+                query: query,
+                for_update?: String.contains?(String.upcase(query), "FOR UPDATE"),
+                in_transaction?: Repo.in_transaction?()
+              }
+            })
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(handler_id, events) do
+    receive do
+      {^handler_id, event} -> drain_repo_queries(handler_id, [event | events])
+    after
+      0 -> Enum.reverse(events)
+    end
+  end
+
+  defp command_name(query) when is_binary(query) do
+    query
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+    |> String.upcase()
+  end
+
+  defp sha256(value) do
+    value
+    |> to_string()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+end

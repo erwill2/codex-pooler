@@ -1,17 +1,57 @@
 import Config
 
+# An explicit exclusive container slot survives pod IP changes. Never infer it
+# from HOSTNAME: pod names can be reused, while metadata.uid cannot.
+instance_slot_id =
+  case System.get_env("CODEX_POOLER_INSTANCE_SLOT_ID") do
+    value when value in [nil, ""] ->
+      nil
+
+    value ->
+      if byte_size(value) <= 200 and Regex.match?(~r/\A[A-Za-z0-9][A-Za-z0-9_.:\/-]*\z/, value) do
+        value
+      else
+        raise "CODEX_POOLER_INSTANCE_SLOT_ID must be an ASCII slot identifier of at most 200 bytes"
+      end
+  end
+
+config :codex_pooler, :instance_slot_id, instance_slot_id
+
+native_compaction_trace_mode =
+  if config_env() in [:dev, :test] do
+    CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace.runtime_mode(
+      System.get_env("CODEX_POOLER_NATIVE_COMPACTION_TRACE", "off"),
+      config_env()
+    )
+  else
+    :off
+  end
+
+config :codex_pooler,
+       CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace,
+       mode: native_compaction_trace_mode
+
+config :codex_pooler, CodexPooler.Platform.OutboundHTTP, proxy_config: CodexPooler.Platform.OutboundHTTP.proxy_config_from_env!()
+
 if System.get_env("PHX_SERVER") in ~w(true 1) do
   config :codex_pooler, CodexPoolerWeb.Endpoint, server: true
 end
 
-websocket_drain_timeout_ms =
-  CodexPooler.Gateway.Transports.Websocket.RolloutDrain.configured_timeout_ms()
+endpoint_shutdown_timeout_ms = 10_000
 
-endpoint_shutdown_timeout_ms = websocket_drain_timeout_ms + 5_000
+# The listener speaks HTTP/1.1 only. Bandit otherwise accepts cleartext HTTP/2
+# on the same port via the prior-knowledge preface, and a Plug that raises
+# after `send_chunked/2` then drops the stream with neither END_STREAM nor
+# RST_STREAM, leaving the peer waiting for its own timeout. Websockets are
+# unaffected: Bandit does not implement RFC 8441, so an upgrade already
+# requires HTTP/1.1. The mechanism and this restriction are pinned by
+# test/codex_pooler_web/endpoint_http2_half_open_stream_test.exs.
+endpoint_http_2_options = [enabled: false]
 
 config :codex_pooler, CodexPoolerWeb.Endpoint,
   http: [
     port: String.to_integer(System.get_env("PORT", "4000")),
+    http_2_options: endpoint_http_2_options,
     thousand_island_options: [shutdown_timeout: endpoint_shutdown_timeout_ms]
   ]
 
@@ -19,8 +59,7 @@ config :codex_pooler,
        :websocket_owner_forwarding_enabled,
        CodexPooler.Gateway.OperationalSettings.parse_websocket_owner_forwarding_env!()
 
-config :codex_pooler, CodexPoolerWeb.Operations.HealthController,
-  drain_marker_path: System.get_env("CODEX_POOLER_DRAIN_MARKER_PATH")
+config :codex_pooler, CodexPooler.Gateway.OperationalStatus, drain_marker_path: System.get_env("CODEX_POOLER_DRAIN_MARKER_PATH")
 
 if config_env() == :prod do
   database_url =
@@ -32,20 +71,30 @@ if config_env() == :prod do
 
   maybe_ipv6 = if System.get_env("ECTO_IPV6") in ~w(true 1), do: [:inet6], else: []
 
+  oban_mode = System.get_env("OBAN_MODE", "web")
+
+  # PostgreSQL shows the release role in `pg_stat_activity` and in lock-wait
+  # and deadlock log lines. An unknown mode boots with web behavior, so it
+  # carries the web name; the raw value is never echoed.
+  repo_application_name =
+    case oban_mode do
+      mode when mode in ["worker", "scheduler", "all"] -> "codex_pooler_" <> mode
+      _web_or_unknown -> "codex_pooler_web"
+    end
+
   config :codex_pooler, CodexPooler.Repo,
     # ssl: true,
     url: database_url,
     pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
     # For machines with several cores, consider starting multiple pools of `pool_size`
     # pool_count: 4,
-    socket_options: maybe_ipv6
+    socket_options: maybe_ipv6,
+    parameters: [application_name: repo_application_name]
 
-  oban_mode = System.get_env("OBAN_MODE", "web")
-
-  oban_plugins = [
-    {Oban.Plugins.Cron, crontab: CodexPooler.Jobs.Schedule.oban_crontab()},
-    Oban.Plugins.Lifeline,
-    {Oban.Plugins.Pruner, max_age: 24 * 60 * 60}
+  oban_services = [
+    cron: [crontab: CodexPooler.Jobs.Schedule.oban_crontab()],
+    lifeline: [],
+    pruner: [max_age: {1, :day}]
   ]
 
   oban_queues = [jobs: String.to_integer(System.get_env("OBAN_JOBS_QUEUE_LIMIT", "8"))]
@@ -64,13 +113,17 @@ if config_env() == :prod do
         Keyword.merge(base_oban_runtime_config, queues: oban_queues, plugins: false)
 
       "scheduler" ->
-        Keyword.merge(base_oban_runtime_config, queues: false, plugins: oban_plugins)
+        Keyword.merge(base_oban_runtime_config, [queues: false] ++ oban_services)
 
       "all" ->
-        Keyword.merge(base_oban_runtime_config, queues: oban_queues, plugins: oban_plugins)
+        Keyword.merge(base_oban_runtime_config, [queues: oban_queues] ++ oban_services)
 
       _web_or_unknown ->
-        Keyword.merge(base_oban_runtime_config, queues: false, plugins: false)
+        Keyword.merge(base_oban_runtime_config,
+          queues: false,
+          plugins: false,
+          stager: false
+        )
     end
 
   config :codex_pooler, Oban, oban_runtime_config
@@ -111,6 +164,7 @@ if config_env() == :prod do
     http: [
       port: String.to_integer(System.get_env("PORT", "4000")),
       ip: {0, 0, 0, 0},
+      http_2_options: endpoint_http_2_options,
       thousand_island_options: [shutdown_timeout: endpoint_shutdown_timeout_ms]
     ],
     secret_key_base: secret_key_base

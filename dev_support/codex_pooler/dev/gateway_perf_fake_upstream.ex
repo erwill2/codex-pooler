@@ -10,10 +10,20 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
   use Plug.Router
 
   alias __MODULE__.Websocket
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   @default_host "127.0.0.1"
   @default_port 4058
   @default_manifest_path "tmp/gateway-perf/bootstrap/profile-manifest.json"
+
+  # The response header that carries the synthetic upstream request id. The
+  # default is the name other OpenAI surfaces use; the Codex backend itself
+  # names its server-assigned id `x-oai-request-id`, and a lane that only ever
+  # sees `x-request-id` cannot go red when the product stops reading the
+  # backend's real name (findings#218 row 218-44). The accepted names are the
+  # product's own ordered allowlist, so the fake cannot emit a name the Pooler
+  # would never read.
+  @default_upstream_request_id_header "x-request-id"
   @manifest_fields [
     "name",
     "first_event_delay_ms",
@@ -26,6 +36,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     "expected_outcome",
     "allowed_statuses"
   ]
+  @observation_max_entries 8
 
   @profiles [
     %{
@@ -123,6 +134,42 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
       "close_mode" => "http_error",
       "expected_outcome" => "rate_limited",
       "allowed_statuses" => [429]
+    },
+    %{
+      "name" => "opencode-text-ok",
+      "first_event_delay_ms" => 0,
+      "inter_event_delay_ms" => 0,
+      "event_count" => 8,
+      "chunk_bytes" => 2,
+      "http_status" => 200,
+      "failure_phase" => "before_none",
+      "close_mode" => "clean_close",
+      "expected_outcome" => "success",
+      "allowed_statuses" => [200]
+    },
+    %{
+      "name" => "native-compaction-v2-success",
+      "first_event_delay_ms" => 0,
+      "inter_event_delay_ms" => 0,
+      "event_count" => 2,
+      "chunk_bytes" => 0,
+      "http_status" => 200,
+      "failure_phase" => "before_none",
+      "close_mode" => "clean_close",
+      "expected_outcome" => "success",
+      "allowed_statuses" => [200]
+    },
+    %{
+      "name" => "native-compaction-terminal-failure",
+      "first_event_delay_ms" => 0,
+      "inter_event_delay_ms" => 0,
+      "event_count" => 1,
+      "chunk_bytes" => 0,
+      "http_status" => 200,
+      "failure_phase" => "before_none",
+      "close_mode" => "upstream_error",
+      "expected_outcome" => "classified_failure",
+      "allowed_statuses" => [502]
     }
   ]
 
@@ -134,7 +181,8 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
              port: non_neg_integer(),
              run_id: String.t(),
              profile_manifest: String.t(),
-             profiles: [profile()]
+             profiles: [profile()],
+             upstream_request_id_header: String.t()
            }}
           | {:error, String.t()}
   @type server :: %{server: pid(), url: String.t(), profiles: [profile()], run_id: String.t()}
@@ -144,13 +192,40 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
   plug Plug.Parsers,
     parsers: [:json],
     pass: ["*/*"],
-    json_decoder: Jason,
+    json_decoder: CodexPooler.JSON,
     length: 50_000_000
 
   plug :dispatch
 
   get "/healthz" do
     send_resp(conn, 200, "ok")
+  end
+
+  # Bounded metadata-only wire capture. HTTP entries hold lowercased request header
+  # *names*; websocket entries hold `client_metadata` *keys* read from the first text
+  # frame. No header value, payload, prompt, or credential is retained. This is the one
+  # Full-mode fact the correlated Pooler request rows deliberately do not persist.
+  get "/__smoke/wire-capture" do
+    json(conn, wire_captures())
+  end
+
+  get "/__smoke/request-observations" do
+    json(conn, %{"observations" => request_observations()})
+  end
+
+  post "/__smoke/wire-capture/reset" do
+    reset_wire_captures()
+    json(conn, %{"status" => "reset"})
+  end
+
+  # Smallest deterministic Full catalog this control needs. Product discovery calls
+  # GET /backend-api/codex/responses' sibling path with a client_version query and
+  # accepts a 200 body under "data", "models", or a bare list. One Full model with
+  # use_responses_lite=false is enough to provision a loopback-routed pool; no secret,
+  # token, or account value appears here.
+  get "/backend-api/codex/models" do
+    {conn, _fingerprint} = with_upstream_request_id(conn, :http)
+    json(conn, %{"data" => [full_catalog_model()]})
   end
 
   post "/backend-api/codex/responses" do
@@ -186,7 +261,8 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
           host: :string,
           port: :integer,
           profile_manifest: :string,
-          profiles: :string
+          profiles: :string,
+          upstream_request_id_header: :string
         ]
       )
 
@@ -202,14 +278,17 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
 
         with {:ok, run_id} <- fetch_required_string(opts, :run_id, "--run-id"),
              {:ok, profiles} <- profiles_from_selector(Map.get(opts, :profiles, "all")),
-             {:ok, port} <- normalize_port(Map.get(opts, :port, @default_port)) do
+             {:ok, port} <- normalize_port(Map.get(opts, :port, @default_port)),
+             {:ok, upstream_request_id_header} <-
+               normalize_upstream_request_id_header(Map.get(opts, :upstream_request_id_header, @default_upstream_request_id_header)) do
           {:ok,
            %{
              host: Map.get(opts, :host, @default_host),
              port: port,
              run_id: run_id,
              profile_manifest: Map.get(opts, :profile_manifest, @default_manifest_path),
-             profiles: profiles
+             profiles: profiles,
+             upstream_request_id_header: upstream_request_id_header
            }}
         end
     end
@@ -222,10 +301,21 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     host = Keyword.get(opts, :host, @default_host)
     port = Keyword.get(opts, :port, @default_port)
 
+    {:ok, upstream_request_id_header} =
+      normalize_upstream_request_id_header(Keyword.get(opts, :upstream_request_id_header, @default_upstream_request_id_header))
+
+    reset_request_observations()
+
     with {:ok, ip} <- parse_host(host),
          {:ok, server} <-
            Bandit.start_link(
-             plug: {__MODULE__, %{profiles: profiles, run_id: run_id}},
+             plug:
+               {__MODULE__,
+                %{
+                  profiles: profiles,
+                  run_id: run_id,
+                  upstream_request_id_header: upstream_request_id_header
+                }},
              port: port,
              ip: ip,
              startup_log: false
@@ -260,12 +350,11 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
             host: config.host,
             port: config.port,
             profiles: config.profiles,
-            run_id: config.run_id
+            run_id: config.run_id,
+            upstream_request_id_header: config.upstream_request_id_header
           )
 
-        IO.puts(
-          "gateway-perf-fake-upstream listening on #{server.url} run_id=#{config.run_id} profiles=#{profile_selector(config.profiles)} manifest=#{config.profile_manifest}"
-        )
+        IO.puts("gateway-perf-fake-upstream listening on #{server.url} run_id=#{config.run_id} profiles=#{profile_selector(config.profiles)} manifest=#{config.profile_manifest}")
 
         Process.sleep(:infinity)
 
@@ -286,17 +375,17 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     Enum.map(profiles, &Map.take(&1, @manifest_fields))
   end
 
-  @spec stream_event_payloads(profile()) :: [map()]
-  def stream_event_payloads(profile) when is_map(profile) do
+  @spec stream_event_payloads(profile(), map()) :: [map()]
+  def stream_event_payloads(profile, payload \\ %{}) when is_map(profile) and is_map(payload) do
     profile
-    |> stream_events()
+    |> stream_events(payload)
     |> Enum.map(fn {_index, _event, payload} -> payload end)
   end
 
   @spec write_manifest!(String.t(), [profile()]) :: :ok
   def write_manifest!(path, profiles) when is_binary(path) and is_list(profiles) do
     path |> Path.dirname() |> File.mkdir_p!()
-    File.write!(path, Jason.encode_to_iodata!(manifest_entries(profiles), pretty: true))
+    File.write!(path, CodexPooler.JSON.encode_to_iodata!(manifest_entries(profiles), pretty: true))
   end
 
   @spec profiles_from_selector(String.t()) :: {:ok, [profile()]} | {:error, String.t()}
@@ -322,7 +411,470 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     |> super(opts)
   end
 
+  @full_catalog_model_id "gateway-perf-full"
+
+  @doc """
+  Deterministic Full catalog entry served to Pooler catalog discovery.
+
+  `use_responses_lite` is explicitly false so a pool provisioned against this fake is a
+  Full-mode target; the wire capture then proves no Lite marker was actually sent.
+  """
+  @spec full_catalog_model() :: map()
+  def full_catalog_model do
+    %{
+      "id" => @full_catalog_model_id,
+      "slug" => @full_catalog_model_id,
+      "display_name" => "Gateway perf Full",
+      "use_responses_lite" => false,
+      "capabilities" => %{
+        "responses" => true,
+        "streaming" => true,
+        "reasoning" => true,
+        "tools" => true
+      }
+    }
+  end
+
+  @wire_capture_store __MODULE__.WireCapture
+  @wire_capture_correlator_headers ["x-request-id", "x-client-request-id"]
+  @wire_capture_max_correlators 32
+  @wire_capture_max_names 64
+  @upstream_request_id_prefix "perfreq_"
+
+  @doc """
+  The response header names this fake may carry the synthetic upstream request
+  id on: exactly the product's ordered allowlist.
+  """
+  @spec upstream_request_id_header_names() :: [String.t()]
+  def upstream_request_id_header_names,
+    do: StreamProtocol.upstream_request_id_header_names()
+
+  @spec default_upstream_request_id_header() :: String.t()
+  def default_upstream_request_id_header, do: @default_upstream_request_id_header
+
+  @spec normalize_upstream_request_id_header(term()) :: {:ok, String.t()} | {:error, String.t()}
+  def normalize_upstream_request_id_header(name) when is_binary(name) do
+    normalized = name |> String.trim() |> String.downcase()
+
+    if normalized in upstream_request_id_header_names() do
+      {:ok, normalized}
+    else
+      {:error, "--upstream-request-id-header must be one of #{Enum.join(upstream_request_id_header_names(), ", ")}"}
+    end
+  end
+
+  def normalize_upstream_request_id_header(_name),
+    do: {:error, "--upstream-request-id-header must be a header name"}
+
+  @doc """
+  Generates one bounded synthetic upstream request id.
+
+  The id is returned to the caller in the configured upstream request id
+  response header (`x-request-id` by default; HTTP responses and websocket 101
+  upgrades alike), which the product already persists as attempt metadata
+  `upstream_request_id`. Only its 12-character SHA-256 fingerprint is stored
+  beside the wire capture, so the capture entry and the durable Pooler attempt
+  row can be correlated without forwarding any new downstream header.
+  """
+  @spec generate_upstream_request_id() :: String.t()
+  def generate_upstream_request_id do
+    @upstream_request_id_prefix <> Base.encode16(:crypto.strong_rand_bytes(12), case: :lower)
+  end
+
+  @doc "12-character lowercase-hex SHA-256 fingerprint of a request id."
+  @spec upstream_request_id_fingerprint(String.t()) :: String.t()
+  def upstream_request_id_fingerprint(value) when is_binary(value) do
+    :sha256
+    |> :crypto.hash(value)
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 12)
+  end
+
+  @doc """
+  Returns the bounded metadata-only wire capture keyed by request correlator.
+
+  Values are header *names* and derived websocket client-metadata *keys* only.
+  """
+  @spec wire_captures() :: map()
+  def wire_captures do
+    ensure_wire_capture_store()
+    Agent.get(@wire_capture_store, & &1)
+  end
+
+  @spec reset_wire_captures() :: :ok
+  def reset_wire_captures do
+    ensure_wire_capture_store()
+    Agent.update(@wire_capture_store, fn _state -> %{} end)
+  end
+
+  defp ensure_wire_capture_store do
+    case Process.whereis(@wire_capture_store) do
+      nil ->
+        case Agent.start(fn -> %{} end, name: @wire_capture_store) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
+
+      _pid ->
+        :ok
+    end
+  end
+
+  @observation_store __MODULE__.RequestObservation
+
+  @spec request_observations() :: [map()]
+  def request_observations do
+    ensure_observation_store()
+    Agent.get(@observation_store, & &1.observations)
+  end
+
+  @spec reset_request_observations() :: :ok
+  def reset_request_observations do
+    ensure_observation_store()
+    Agent.update(@observation_store, fn _state -> new_observation_store() end)
+  end
+
+  @doc false
+  @spec open_websocket_connection(String.t()) :: %{id: String.t(), ordinal: pos_integer()}
+  def open_websocket_connection(run_id) when is_binary(run_id) do
+    ensure_observation_store()
+
+    Agent.get_and_update(@observation_store, fn state ->
+      ordinal = state.next_connection_ordinal + 1
+      connection = %{id: opaque_connection_id(run_id, ordinal), ordinal: ordinal}
+
+      {connection,
+       %{
+         state
+         | next_connection_ordinal: ordinal,
+           frame_ordinals: Map.put(state.frame_ordinals, connection.id, 0)
+       }}
+    end)
+  end
+
+  @doc false
+  @spec record_websocket_request_observation(
+          %{id: String.t(), ordinal: pos_integer()},
+          map()
+        ) :: :ok
+  def record_websocket_request_observation(
+        %{id: connection_id, ordinal: connection_ordinal},
+        payload
+      )
+      when is_binary(connection_id) and is_integer(connection_ordinal) and is_map(payload) do
+    ensure_observation_store()
+
+    Agent.get_and_update(@observation_store, fn state ->
+      frame_ordinal = Map.fetch!(state.frame_ordinals, connection_id) + 1
+
+      observation =
+        request_observation(
+          "websocket",
+          payload,
+          %{id: connection_id, ordinal: connection_ordinal},
+          frame_ordinal
+        )
+
+      {:ok,
+       %{
+         state
+         | observations: append_observation(state.observations, observation),
+           frame_ordinals: Map.put(state.frame_ordinals, connection_id, frame_ordinal)
+       }}
+    end)
+  end
+
+  defp ensure_observation_store do
+    case Process.whereis(@observation_store) do
+      nil ->
+        case Agent.start(&new_observation_store/0, name: @observation_store) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+        end
+
+      _pid ->
+        :ok
+    end
+  end
+
+  defp record_request_observation(%Plug.Conn{body_params: body_params} = conn)
+       when is_map(body_params) do
+    ensure_observation_store()
+
+    observation = request_observation("http", body_params, nil, nil)
+
+    Agent.update(@observation_store, fn state ->
+      %{state | observations: append_observation(state.observations, observation)}
+    end)
+
+    conn
+  end
+
+  defp new_observation_store do
+    %{observations: [], next_connection_ordinal: 0, frame_ordinals: %{}}
+  end
+
+  defp append_observation(observations, observation),
+    do: Enum.take(observations ++ [observation], -@observation_max_entries)
+
+  defp request_observation(request_class, payload, connection, frame_ordinal) do
+    input = Map.get(payload, "input")
+    input_types = observation_input_types(input)
+    metadata = native_turn_metadata(payload)
+
+    %{
+      "requestClass" => request_class,
+      "connectionId" => connection_id(connection),
+      "connectionOrdinal" => connection_ordinal(connection),
+      "frameOrdinal" => frame_ordinal,
+      "inputTypes" => input_types,
+      "inputCount" => if(is_list(input), do: length(input), else: 0),
+      "anchorPresent" => nonblank_binary?(Map.get(payload, "previous_response_id")),
+      "terminalCompactionTrigger" => List.last(input_types) == "compaction_trigger",
+      "store" => Map.get(payload, "store") == true,
+      "stream" => Map.get(payload, "stream") == true,
+      "compactPhase" => compact_phase(input_types),
+      "requestKind" => metadata_enum(metadata, "request_kind", ~w(turn prewarm compaction memory)),
+      "windowId" => metadata_field_state(metadata, "window_id"),
+      "contextWindowId" => metadata_field_state(metadata, "context_window_id"),
+      "compactionMetadata" => metadata_field_state(metadata, "compaction"),
+      "toolResultContinuation" => tool_result_continuation?(input),
+      "logicalTurnFingerprint" => logical_turn_fingerprint(payload, metadata)
+    }
+  end
+
+  defp native_turn_metadata(%{"client_metadata" => %{"x-codex-turn-metadata" => value}})
+       when is_binary(value) do
+    case CodexPooler.JSON.decode(value) do
+      {:ok, metadata} when is_map(metadata) -> metadata
+      _invalid -> nil
+    end
+  end
+
+  defp native_turn_metadata(_payload), do: nil
+
+  defp metadata_enum(metadata, key, allowed) when is_map(metadata) do
+    value = Map.get(metadata, key)
+    if value in allowed, do: value, else: "unknown"
+  end
+
+  defp metadata_enum(_metadata, _key, _allowed), do: "unknown"
+
+  defp metadata_field_state(metadata, key) when is_map(metadata) do
+    cond do
+      not Map.has_key?(metadata, key) -> "omitted"
+      is_nil(Map.get(metadata, key)) -> "null"
+      true -> "present"
+    end
+  end
+
+  defp metadata_field_state(_metadata, _key), do: "metadata_missing"
+
+  defp tool_result_continuation?(input) when is_list(input),
+    do: Enum.any?(input, &match?(%{"type" => "function_call_output"}, &1))
+
+  defp tool_result_continuation?(_input), do: false
+
+  defp logical_turn_fingerprint(payload, metadata) do
+    turn_id =
+      get_in(payload, ["client_metadata", "turn_id"]) || metadata_value(metadata, "turn_id")
+
+    if is_binary(turn_id) and String.trim(turn_id) != "" do
+      :crypto.hash(:sha256, turn_id)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 16)
+    end
+  end
+
+  defp metadata_value(metadata, key) when is_map(metadata), do: Map.get(metadata, key)
+  defp metadata_value(_metadata, _key), do: nil
+
+  defp connection_id(nil), do: nil
+  defp connection_id(%{id: id}), do: id
+
+  defp connection_ordinal(nil), do: nil
+  defp connection_ordinal(%{ordinal: ordinal}), do: ordinal
+
+  defp observation_input_types(input) when is_list(input) do
+    Enum.map(input, fn
+      %{"type" => type} when is_binary(type) and byte_size(type) <= 80 -> type
+      _item -> "unknown"
+    end)
+  end
+
+  defp observation_input_types(_input), do: []
+
+  defp compact_phase(input_types) do
+    cond do
+      List.last(input_types) == "compaction_trigger" ->
+        "compact"
+
+      Enum.any?(input_types, &(&1 in ["compaction", "compaction_summary", "context_compaction"])) ->
+        "final"
+
+      true ->
+        "lineage"
+    end
+  end
+
+  defp nonblank_binary?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp opaque_connection_id(run_id, ordinal) do
+    digest = :crypto.hash(:sha256, [run_id, ":", Integer.to_string(ordinal)])
+    "ws_" <> (digest |> Base.encode16(case: :lower) |> binary_part(0, 12))
+  end
+
+  @doc """
+  Records bounded websocket `client_metadata` keys observed in a decoded text frame.
+
+  Only the metadata keys are retained, never their values.
+  """
+  @spec record_websocket_client_metadata(String.t(), term()) :: :ok
+  def record_websocket_client_metadata(key, payload) when is_binary(key) do
+    keys = websocket_client_metadata_keys(payload)
+
+    if keys == [] do
+      :ok
+    else
+      ensure_wire_capture_store()
+
+      Agent.update(@wire_capture_store, &update_websocket_wire_capture(&1, key, keys))
+    end
+  end
+
+  defp update_websocket_wire_capture(captures, key, keys) do
+    if map_size(captures) >= @wire_capture_max_correlators and not Map.has_key?(captures, key) do
+      captures
+    else
+      Map.update(
+        captures,
+        key,
+        new_wire_capture(:websocket, keys, nil),
+        &merge_wire_capture(&1, :websocket, keys, nil)
+      )
+    end
+  end
+
+  defp websocket_client_metadata_keys(payload) do
+    case payload do
+      %{"client_metadata" => metadata} when is_map(metadata) ->
+        metadata
+        |> Map.keys()
+        |> Enum.filter(&bounded_wire_name?/1)
+        |> Enum.uniq()
+        |> Enum.take(@wire_capture_max_names)
+
+      _other ->
+        []
+    end
+  end
+
+  # Mints the per-request synthetic upstream request id, returns it in the
+  # configured upstream request id response header, and records the bounded
+  # capture entry keyed by the downstream correlator header when one exists, or
+  # by the id's own fingerprint otherwise (Pooler deliberately forwards no
+  # downstream correlator upstream). The raw id is never stored; only its
+  # fingerprint.
+  defp with_upstream_request_id(conn, transport) do
+    upstream_request_id = generate_upstream_request_id()
+    fingerprint = upstream_request_id_fingerprint(upstream_request_id)
+
+    conn =
+      conn
+      |> put_resp_header(upstream_request_id_header(conn), upstream_request_id)
+      |> record_wire_capture(transport, fingerprint)
+
+    {conn, fingerprint}
+  end
+
+  defp upstream_request_id_header(%Plug.Conn{private: %{gateway_perf_fake_upstream_opts: opts}}),
+    do: Map.get(opts, :upstream_request_id_header, @default_upstream_request_id_header)
+
+  defp upstream_request_id_header(%Plug.Conn{}), do: @default_upstream_request_id_header
+
+  defp record_wire_capture(conn, transport, fingerprint) do
+    ensure_wire_capture_store()
+    key = wire_capture_key(conn, fingerprint)
+    names = wire_capture_names(conn)
+
+    Agent.update(@wire_capture_store, fn captures ->
+      if map_size(captures) >= @wire_capture_max_correlators and
+           not Map.has_key?(captures, key) do
+        captures
+      else
+        Map.update(
+          captures,
+          key,
+          new_wire_capture(transport, names, fingerprint),
+          &merge_wire_capture(&1, transport, names, fingerprint)
+        )
+      end
+    end)
+
+    conn
+  end
+
+  defp new_wire_capture(:http, names, fingerprint) do
+    put_wire_fingerprint(
+      %{"httpHeaderNames" => names, "websocketClientMetadataKeys" => []},
+      fingerprint
+    )
+  end
+
+  defp new_wire_capture(:websocket, names, fingerprint) do
+    put_wire_fingerprint(
+      %{"httpHeaderNames" => [], "websocketClientMetadataKeys" => names},
+      fingerprint
+    )
+  end
+
+  defp merge_wire_capture(capture, :http, names, fingerprint) do
+    capture
+    |> Map.put("httpHeaderNames", merge_wire_names(capture["httpHeaderNames"], names))
+    |> put_wire_fingerprint(fingerprint)
+  end
+
+  defp merge_wire_capture(capture, :websocket, names, fingerprint) do
+    capture
+    |> Map.put(
+      "websocketClientMetadataKeys",
+      merge_wire_names(capture["websocketClientMetadataKeys"], names)
+    )
+    |> put_wire_fingerprint(fingerprint)
+  end
+
+  defp put_wire_fingerprint(capture, nil), do: capture
+
+  defp put_wire_fingerprint(capture, fingerprint) when is_binary(fingerprint),
+    do: Map.put_new(capture, "upstreamRequestIdFingerprint", fingerprint)
+
+  defp merge_wire_names(existing, names),
+    do: (List.wrap(existing) ++ names) |> Enum.uniq() |> Enum.take(@wire_capture_max_names)
+
+  defp wire_capture_key(conn, fingerprint) do
+    Enum.find_value(@wire_capture_correlator_headers, fingerprint, fn name ->
+      value = first_req_header(conn, name)
+      if bounded_wire_name?(value), do: value, else: nil
+    end)
+  end
+
+  defp wire_capture_names(conn) do
+    conn.req_headers
+    |> Enum.map(fn {name, _value} -> String.downcase(name) end)
+    |> Enum.filter(&bounded_wire_name?/1)
+    |> Enum.uniq()
+    |> Enum.take(@wire_capture_max_names)
+  end
+
+  defp bounded_wire_name?(value) do
+    is_binary(value) and byte_size(value) > 0 and byte_size(value) <= 120 and
+      Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, value)
+  end
+
   defp serve_http_stream(conn) do
+    conn = record_request_observation(conn)
+    {conn, _fingerprint} = with_upstream_request_id(conn, :http)
+
     case selected_profile(conn) do
       {:ok, profile} ->
         respond_with_profile(conn, profile)
@@ -335,10 +887,26 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
   end
 
   defp serve_websocket(conn) do
+    # The upgrade request carries ordinary HTTP headers, so they are recorded as such.
+    # Websocket client metadata is not visible here: it arrives inside the first text
+    # frame, and is recorded from that payload rather than inferred from the handshake.
+    # The synthetic upstream request id travels on the 101 upgrade response header and
+    # its fingerprint keys the entry so the later frame metadata joins the same entry.
+    {conn, fingerprint} = with_upstream_request_id(conn, :http)
+    connection = open_websocket_connection(conn.private.gateway_perf_fake_upstream_opts.run_id)
+
     case selected_profile(conn) do
       {:ok, profile} ->
         conn
-        |> WebSockAdapter.upgrade(Websocket, %{profile: profile}, [])
+        |> WebSockAdapter.upgrade(
+          Websocket,
+          %{
+            profile: profile,
+            wire_key: wire_capture_key(conn, fingerprint),
+            connection: connection
+          },
+          []
+        )
         |> halt()
 
       {:error, message} ->
@@ -385,17 +953,21 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
       |> put_resp_content_type("text/event-stream")
       |> send_chunked(200)
 
-    stream_profile(conn, profile)
+    stream_profile(conn, profile, conn.body_params)
   end
 
-  defp stream_profile(conn, %{"close_mode" => "timeout", "first_event_delay_ms" => delay_ms}) do
+  defp stream_profile(
+         conn,
+         %{"close_mode" => "timeout", "first_event_delay_ms" => delay_ms},
+         _payload
+       ) do
     wait_ms(delay_ms)
     conn
   end
 
-  defp stream_profile(conn, profile) do
+  defp stream_profile(conn, profile, payload) do
     profile
-    |> stream_events()
+    |> stream_events(payload)
     |> Enum.reduce_while(conn, fn {index, event, payload}, conn ->
       maybe_wait_for_event(index, profile)
 
@@ -407,7 +979,109 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     |> maybe_send_done(profile)
   end
 
-  defp stream_events(%{"event_count" => count} = profile) do
+  defp stream_events(%{"name" => "opencode-text-ok"}, _payload) do
+    response_id = "resp_perf_opencode_text_ok"
+    item_id = "msg_perf_opencode_text_ok"
+    text = "ok"
+
+    message = %{
+      "id" => item_id,
+      "type" => "message",
+      "status" => "completed",
+      "role" => "assistant",
+      "content" => [output_text(text)]
+    }
+
+    response = %{
+      "id" => response_id,
+      "object" => "response",
+      "status" => "completed",
+      "output" => [message],
+      "usage" => %{
+        "input_tokens" => 1,
+        "input_tokens_details" => %{"cached_tokens" => 0},
+        "output_tokens" => 1,
+        "output_tokens_details" => %{"reasoning_tokens" => 0},
+        "total_tokens" => 2
+      }
+    }
+
+    payloads = [
+      %{
+        "type" => "response.created",
+        "sequence_number" => 0,
+        "response" => %{response | "status" => "in_progress", "output" => [], "usage" => nil}
+      },
+      %{
+        "type" => "response.output_item.added",
+        "sequence_number" => 1,
+        "output_index" => 0,
+        "item" => %{message | "status" => "in_progress", "content" => []}
+      },
+      %{
+        "type" => "response.content_part.added",
+        "sequence_number" => 2,
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "part" => output_text("")
+      },
+      %{
+        "type" => "response.output_text.delta",
+        "sequence_number" => 3,
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "delta" => text,
+        "logprobs" => []
+      },
+      %{
+        "type" => "response.output_text.done",
+        "sequence_number" => 4,
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "text" => text,
+        "logprobs" => []
+      },
+      %{
+        "type" => "response.content_part.done",
+        "sequence_number" => 5,
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "part" => output_text(text)
+      },
+      %{
+        "type" => "response.output_item.done",
+        "sequence_number" => 6,
+        "output_index" => 0,
+        "item" => message
+      },
+      %{
+        "type" => "response.completed",
+        "sequence_number" => 7,
+        "response" => response
+      }
+    ]
+
+    Enum.with_index(payloads, 1)
+    |> Enum.map(fn {payload, index} -> {index, payload["type"], payload} end)
+  end
+
+  defp stream_events(%{"name" => "native-compaction-v2-success"}, payload) do
+    if terminal_compaction_trigger?(payload),
+      do: native_compaction_success_events(),
+      else: app_server_ordinary_events()
+  end
+
+  defp stream_events(%{"name" => "native-compaction-terminal-failure"}, payload) do
+    if terminal_compaction_trigger?(payload),
+      do: native_compaction_failure_events(),
+      else: ordinary_events()
+  end
+
+  defp stream_events(%{"event_count" => count} = profile, _payload) do
     count = max(count, 0)
 
     if count == 0 do
@@ -415,6 +1089,139 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     else
       Enum.map(1..count, fn index -> event_payload(index, profile) end)
     end
+  end
+
+  defp native_compaction_success_events do
+    item = %{
+      "id" => "cmp_synthetic_native_local",
+      "type" => "compaction",
+      "encrypted_content" => "synthetic-encrypted-compaction"
+    }
+
+    response = %{
+      "id" => "resp_native_local",
+      "status" => "completed",
+      "output" => [item],
+      "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+    }
+
+    [
+      {1, "response.output_item.done", %{"type" => "response.output_item.done", "item" => item}},
+      {2, "response.completed", %{"type" => "response.completed", "response" => response}}
+    ]
+  end
+
+  defp native_compaction_failure_events do
+    [
+      {1, "response.failed",
+       %{
+         "type" => "response.failed",
+         "response" => %{
+           "status" => "failed",
+           "error" => %{
+             "code" => "server_error",
+             "message" => "synthetic compaction failure"
+           }
+         }
+       }}
+    ]
+  end
+
+  defp ordinary_events do
+    response = %{
+      "id" => "resp_native_follow_up",
+      "status" => "completed",
+      "output" => [],
+      "usage" => %{"input_tokens" => 1, "output_tokens" => 1, "total_tokens" => 2}
+    }
+
+    [{1, "response.completed", %{"type" => "response.completed", "response" => response}}]
+  end
+
+  defp app_server_ordinary_events do
+    response_id = "resp_native_follow_up"
+    item_id = "msg_native_follow_up"
+    text = "ok"
+
+    message = %{
+      "id" => item_id,
+      "type" => "message",
+      "status" => "completed",
+      "role" => "assistant",
+      "content" => [output_text(text)]
+    }
+
+    response = %{
+      "id" => response_id,
+      "object" => "response",
+      "status" => "completed",
+      "output" => [message],
+      "usage" => %{
+        "input_tokens" => 1,
+        "input_tokens_details" => %{"cached_tokens" => 0},
+        "output_tokens" => 1,
+        "output_tokens_details" => %{"reasoning_tokens" => 0},
+        "total_tokens" => 2
+      }
+    }
+
+    [
+      %{
+        "type" => "response.created",
+        "response" => %{response | "status" => "in_progress", "output" => [], "usage" => nil}
+      },
+      %{
+        "type" => "response.output_item.added",
+        "output_index" => 0,
+        "item" => %{message | "status" => "in_progress", "content" => []}
+      },
+      %{
+        "type" => "response.content_part.added",
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "part" => output_text("")
+      },
+      %{
+        "type" => "response.output_text.delta",
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "delta" => text,
+        "logprobs" => []
+      },
+      %{
+        "type" => "response.output_text.done",
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "text" => text,
+        "logprobs" => []
+      },
+      %{
+        "type" => "response.content_part.done",
+        "item_id" => item_id,
+        "output_index" => 0,
+        "content_index" => 0,
+        "part" => output_text(text)
+      },
+      %{"type" => "response.output_item.done", "output_index" => 0, "item" => message},
+      %{"type" => "response.completed", "response" => response}
+    ]
+    |> Enum.with_index()
+    |> Enum.map(fn {payload, sequence} ->
+      payload = Map.put(payload, "sequence_number", sequence)
+      {sequence + 1, payload["type"], payload}
+    end)
+  end
+
+  defp terminal_compaction_trigger?(%{"input" => input}) when is_list(input),
+    do: List.last(input) == %{"type" => "compaction_trigger"}
+
+  defp terminal_compaction_trigger?(_payload), do: false
+
+  defp output_text(text) do
+    %{"type" => "output_text", "annotations" => [], "logprobs" => [], "text" => text}
   end
 
   defp event_payload(index, %{"event_count" => count} = profile) when index == count do
@@ -453,7 +1260,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
   end
 
   defp sse_chunk(event, payload),
-    do: ["event: ", event, "\n", "data: ", Jason.encode!(payload), "\n\n"]
+    do: ["event: ", event, "\n", "data: ", CodexPooler.JSON.encode!(payload), "\n\n"]
 
   defp delta_payload(index, profile) do
     %{
@@ -515,7 +1322,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
   defp json(conn, payload) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(conn.status || 200, Jason.encode!(payload))
+    |> send_resp(conn.status || 200, CodexPooler.JSON.encode!(payload))
   end
 
   defp wait_ms(0), do: :ok
@@ -575,30 +1382,55 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     def init(state), do: {:ok, state}
 
     @impl WebSock
-    def handle_in({_payload, [opcode: :text]}, %{profile: profile} = state) do
-      case profile["http_status"] do
-        200 ->
-          push_profile(profile, state)
+    def handle_in({payload, [opcode: :text]}, %{profile: profile} = state) do
+      case CodexPooler.JSON.decode(payload) do
+        {:ok, decoded} ->
+          :ok = record_request_observation(state, decoded)
 
-        status ->
-          {:push,
-           {:text,
-            Jason.encode!(%{
-              "type" => "error",
-              "status" => status,
-              "error" => %{"code" => "rate_limit_exceeded"}
-            })}, state}
+          # Websocket client metadata travels in the frame payload, not the handshake.
+          # Only its keys are recorded.
+          record_client_metadata(state, decoded)
+
+          case profile["http_status"] do
+            200 ->
+              push_profile(profile, decoded, state)
+
+            status ->
+              {:push,
+               {:text,
+                CodexPooler.JSON.encode!(%{
+                  "type" => "error",
+                  "status" => status,
+                  "error" => %{"code" => "rate_limit_exceeded"}
+                })}, state}
+          end
+
+        {:error, _reason} ->
+          {:stop, :invalid_json, state}
       end
     end
 
     def handle_in({_payload, [opcode: :binary]}, state), do: {:stop, :unsupported_binary, state}
+
+    defp record_request_observation(%{connection: connection}, payload) do
+      GatewayPerfFakeUpstream.record_websocket_request_observation(connection, payload)
+    end
+
+    defp record_client_metadata(%{wire_key: wire_key}, payload) when is_binary(wire_key),
+      do: GatewayPerfFakeUpstream.record_websocket_client_metadata(wire_key, payload)
+
+    defp record_client_metadata(_state, _payload), do: :ok
 
     @impl WebSock
     def handle_info({:gateway_perf_close_websocket, code, reason}, state) do
       {:stop, :normal, {code, reason}, state}
     end
 
-    defp push_profile(%{"close_mode" => "timeout", "first_event_delay_ms" => delay_ms}, state) do
+    defp push_profile(
+           %{"close_mode" => "timeout", "first_event_delay_ms" => delay_ms},
+           _payload,
+           state
+         ) do
       receive do
       after
         delay_ms -> :ok
@@ -607,11 +1439,11 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
       {:ok, state}
     end
 
-    defp push_profile(profile, state) do
+    defp push_profile(profile, payload, state) do
       messages =
         profile
-        |> GatewayPerfFakeUpstream.stream_event_payloads()
-        |> Enum.map(&Jason.encode!/1)
+        |> GatewayPerfFakeUpstream.stream_event_payloads(payload)
+        |> Enum.map(&CodexPooler.JSON.encode!/1)
 
       messages = maybe_limit_failure_messages(messages, profile)
 
@@ -621,8 +1453,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
           {:push, Enum.map(messages, &{:text, &1}), state}
 
         "upstream_error" ->
-          {:push, Enum.map(messages ++ [Jason.encode!(websocket_error_payload())], &{:text, &1}),
-           state}
+          {:push, Enum.map(messages ++ [CodexPooler.JSON.encode!(websocket_error_payload())], &{:text, &1}), state}
 
         _mode ->
           {:push, Enum.map(messages, &{:text, &1}), state}

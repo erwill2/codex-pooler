@@ -3,6 +3,8 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
 
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.OpenAICompatibility.Chat
+  alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
   alias CodexPoolerWeb.PublicGatewayResult
@@ -21,15 +23,21 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
   @type coercer :: (-> {:ok, coerced_request()} | {:error, Contracts.gateway_error()})
   @type gateway_executor :: (auth(), String.t(), map(), RequestOptions.t() ->
                                gateway_call_result())
-  @type success_normalizer :: (map(), coerced_request() -> map())
+  @type dispatcher :: (auth(), coerced_request() -> gateway_call_result())
+  @type result_adapter :: (gateway_call_result() -> gateway_call_result())
+  @type success_normalizer :: (map(), coerced_request() -> PublicResponse.normalized_body())
   @type auth_opts :: [
           authenticator: authenticator()
         ]
   @type dispatch_opts :: [
           authenticator: authenticator(),
+          admission_endpoint: String.t(),
+          dispatcher: dispatcher(),
           local_endpoint: String.t(),
           accounting_endpoint: String.t(),
-          gateway_executor: gateway_executor()
+          gateway_executor: gateway_executor(),
+          result_adapter: result_adapter(),
+          translated_endpoint: String.t()
         ]
   @type json_payload_dispatch_opts :: [
           admission_endpoint: String.t(),
@@ -134,8 +142,11 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
       {:ok, auth} ->
         case coercer.() do
           {:ok, coerced} ->
-            result = execute_coerced_service(conn, auth, coerced, opts)
-            PublicGatewayResult.send(conn, result, &normalize_success.(&1, coerced))
+            dispatcher = Keyword.get(opts, :dispatcher, default_dispatcher(conn, opts))
+
+            result = dispatcher.(auth, coerced)
+
+            PublicGatewayResult.send(conn, result, &normalize_success.(&1, coerced), validation_param: validation_param_mapper(coerced))
 
           {:error, reason} ->
             GatewayHelpers.send_error(conn, reason)
@@ -146,33 +157,49 @@ defmodule CodexPoolerWeb.PublicGatewayDispatch do
     end
   end
 
-  @spec execute_coerced_service(conn(), auth(), coerced_request(), dispatch_opts()) ::
+  defp validation_param_mapper(%{chat_payload: %{} = chat_payload}),
+    do: &Chat.public_validation_param(&1, chat_payload)
+
+  defp validation_param_mapper(_coerced), do: &Function.identity/1
+
+  defp default_dispatcher(conn, opts) do
+    fn auth, coerced -> dispatch_coerced(conn, auth, coerced, opts) end
+  end
+
+  @spec dispatch_coerced(conn(), auth(), coerced_request(), dispatch_opts()) ::
           gateway_call_result()
-  defp execute_coerced_service(
-         conn,
-         auth,
-         %{
-           endpoint: endpoint,
-           payload: payload,
-           request_options: %RequestOptions{} = request_options
-         },
-         opts
-       ) do
+  def dispatch_coerced(conn, auth, coerced, opts \\ [])
+
+  def dispatch_coerced(
+        conn,
+        auth,
+        %{
+          endpoint: endpoint,
+          payload: payload,
+          request_options: %RequestOptions{} = request_options
+        },
+        opts
+      ) do
     local_endpoint = Keyword.get(opts, :local_endpoint, endpoint)
     accounting_endpoint = Keyword.get(opts, :accounting_endpoint, endpoint)
-    gateway_executor = Keyword.fetch!(opts, :gateway_executor)
+    admission_endpoint = Keyword.get(opts, :admission_endpoint, local_endpoint)
+    translated_endpoint = Keyword.get(opts, :translated_endpoint, endpoint)
+    gateway_executor = Keyword.get(opts, :gateway_executor, &Gateway.execute/4)
+    result_adapter = Keyword.get(opts, :result_adapter, &Function.identity/1)
 
     request_options =
       RequestOptions.mark_openai_compatibility_origin(
         request_options,
         conn.request_path,
-        endpoint
+        translated_endpoint
       )
 
     route_class = RequestOptions.route_class(request_options)
 
-    GatewayHelpers.admit(conn, route_class, %{endpoint: local_endpoint}, fn ->
+    conn
+    |> GatewayHelpers.admit(route_class, %{endpoint: admission_endpoint}, fn ->
       gateway_executor.(auth, accounting_endpoint, payload, request_options)
     end)
+    |> result_adapter.()
   end
 end

@@ -35,11 +35,77 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
     states: :successful,
     period: 60
   ]
+  @scheduled_reconciliation_unique [
+    fields: [:args, :queue, :worker],
+    keys: [:upstream_identity_id],
+    states: :successful,
+    period: 55
+  ]
+  @scheduled_saved_reset_unique [
+    fields: [:args, :queue, :worker],
+    keys: [:upstream_identity_id],
+    states: :incomplete,
+    period: :infinity
+  ]
+  @stale_consuming_recovery_unique [
+    fields: [:args, :queue, :worker],
+    keys: [:upstream_identity_id, :attempt_id, :generation, :recovery_kind],
+    states: :incomplete,
+    period: :infinity
+  ]
   # Oban applies the unique period to incomplete states too, so an
   # executing/available job older than the cooldown would stop blocking new
   # inserts. The untimed incomplete-state guard below keeps at most one
   # non-terminal automatic reconciliation per identity regardless of its age.
   @incomplete_job_states ~w(suspended available scheduled executing retryable)
+  @gateway_reconciliation_gate_seconds 60
+
+  defmodule GatewayReconciliationGate do
+    @moduledoc false
+    use GenServer
+
+    @table __MODULE__
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @impl GenServer
+    def init(_opts) do
+      table =
+        :ets.new(@table, [
+          :named_table,
+          :public,
+          read_concurrency: true,
+          write_concurrency: true
+        ])
+
+      {:ok, %{table: table}}
+    end
+
+    @spec claim(String.t(), pos_integer()) :: :ok | :duplicate
+    def claim(identity_id, ttl_seconds) do
+      now = System.monotonic_time(:second)
+
+      case :ets.lookup(@table, identity_id) do
+        [{^identity_id, expires_at}] when expires_at > now ->
+          :duplicate
+
+        [{^identity_id, _expires_at} = expired_claim] ->
+          :ets.delete_object(@table, expired_claim)
+          insert_claim(identity_id, now + ttl_seconds)
+
+        [] ->
+          insert_claim(identity_id, now + ttl_seconds)
+      end
+    end
+
+    @spec release(String.t()) :: true
+    def release(identity_id), do: :ets.delete(@table, identity_id)
+
+    defp insert_claim(identity_id, expires_at) do
+      if :ets.insert_new(@table, {identity_id, expires_at}), do: :ok, else: :duplicate
+    end
+  end
 
   @spec enqueue_token_refresh(identity_ref(), keyword()) :: job_insert_result()
   def enqueue_token_refresh(identity_or_id, opts \\ []) do
@@ -83,9 +149,7 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
       pool_id
       |> account_reconciliation_args(assignment_id, opts)
       |> maybe_put_recovery_fence(assignment_or_id)
-      |> AccountReconciliationWorker.new(
-        Options.job_options(opts, unique_keys: [:pool_id, :pool_upstream_assignment_id])
-      )
+      |> AccountReconciliationWorker.new(Options.job_options(opts, unique_keys: [:pool_id, :pool_upstream_assignment_id]))
       |> Oban.insert()
       |> tap_job_status_event(pool_id, "account_reconciliation", "scheduled")
     end
@@ -98,11 +162,63 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
         "pool_upstream_assignment_id" => assignment_id,
         "trigger_kind" => Keyword.get(opts, :trigger_kind, "admin_manual")
       }
-      |> SavedResetRedemptionWorker.new(
-        Options.job_options(opts, unique_keys: [:pool_upstream_assignment_id])
-      )
+      |> put_manual_saved_reset_target()
+      |> SavedResetRedemptionWorker.new(Options.job_options(opts, unique_keys: [:pool_upstream_assignment_id]))
       |> Oban.insert()
       |> tap_saved_reset_redemption_enqueue(assignment_or_id)
+    end
+  end
+
+  @spec enqueue_scheduled_saved_reset_redemption(PoolUpstreamAssignment.t()) ::
+          job_insert_result()
+  def enqueue_scheduled_saved_reset_redemption(%PoolUpstreamAssignment{} = assignment) do
+    with {:ok, assignment_id} <- assignment_id(assignment),
+         {:ok, identity_id} <- identity_id(assignment.upstream_identity_id) do
+      %{
+        "pool_upstream_assignment_id" => assignment_id,
+        "upstream_identity_id" => identity_id,
+        "target_kind" => "upstream_identity",
+        "trigger_kind" => "scheduled_expiry_rescue"
+      }
+      |> SavedResetRedemptionWorker.new(unique: @scheduled_saved_reset_unique)
+      |> Oban.insert()
+      |> tap_saved_reset_redemption_enqueue(assignment)
+    end
+  end
+
+  def enqueue_scheduled_saved_reset_redemption(_assignment),
+    do: {:error, :pool_upstream_assignment_id_required}
+
+  @spec enqueue_stale_consuming_saved_reset_recovery(
+          assignment_ref(),
+          identity_ref(),
+          Ecto.UUID.t(),
+          non_neg_integer()
+        ) :: job_insert_result()
+  def enqueue_stale_consuming_saved_reset_recovery(
+        assignment_or_id,
+        identity_or_id,
+        attempt_id,
+        generation
+      ) do
+    with {:ok, assignment_id} <- assignment_id(assignment_or_id),
+         {:ok, identity_id} <- identity_id(identity_or_id),
+         {:ok, attempt_id} <- Ecto.UUID.cast(attempt_id),
+         true <- is_integer(generation) and generation >= 0 do
+      %{
+        "pool_upstream_assignment_id" => assignment_id,
+        "upstream_identity_id" => identity_id,
+        "attempt_id" => attempt_id,
+        "generation" => generation,
+        "recovery_kind" => "stale_consuming"
+      }
+      |> SavedResetRedemptionWorker.new(unique: @stale_consuming_recovery_unique)
+      |> Oban.insert()
+      |> tap_saved_reset_redemption_enqueue(assignment_or_id)
+    else
+      false -> {:error, :saved_reset_recovery_generation_required}
+      :error -> {:error, :saved_reset_recovery_attempt_id_required}
+      {:error, _reason} -> {:error, :saved_reset_recovery_attempt_id_required}
     end
   end
 
@@ -140,12 +256,30 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
     enqueue_identity_account_reconciliation(pool_or_id, assignment, trigger_kind: "gateway")
   end
 
-  # Scheduled, gateway, and admin triggers share one dedup boundary per
-  # upstream identity: an incomplete job of any shape blocks a new insert
-  # regardless of age, a completed job imposes the 60-second inserted-at
-  # cooldown from the Oban unique config, and cancelled/discarded jobs are
-  # replaceable immediately. The check-then-insert pair is deliberately not
-  # serialized here: a racing enqueue falls through to Oban's advisory-locked
+  @spec claim_gateway_reconciliation_gate(UpstreamIdentity.t() | Ecto.UUID.t()) ::
+          :ok | :duplicate
+  def claim_gateway_reconciliation_gate(identity_or_id) do
+    with {:ok, identity_id} <- identity_id(identity_or_id) do
+      GatewayReconciliationGate.claim(identity_id, @gateway_reconciliation_gate_seconds)
+    end
+  end
+
+  @spec release_gateway_reconciliation_gate(UpstreamIdentity.t() | Ecto.UUID.t()) :: true
+  def release_gateway_reconciliation_gate(identity_or_id) do
+    case identity_id(identity_or_id) do
+      {:ok, identity_id} -> GatewayReconciliationGate.release(identity_id)
+      {:error, _reason} -> true
+    end
+  end
+
+  # Scheduled and gateway triggers share one automatic dedup boundary per
+  # upstream identity: an incomplete job of either shape blocks a new insert
+  # regardless of age, and cancelled/discarded jobs are replaceable immediately.
+  # Gateway enqueue attempts retain a 60-second inserted-at cooldown. Scheduled
+  # fanout uses 55 seconds so small cron/queue timing differences do not suppress
+  # the next minute; the untimed incomplete guard still prevents overlap when
+  # reconciliation itself runs longer. The check-then-insert pair is deliberately
+  # not serialized here: a racing enqueue falls through to Oban's advisory-locked
   # unique insert and resolves as conflict?: true.
   defp enqueue_identity_scoped_account_reconciliation(pool_id, assignment, opts) do
     args =
@@ -163,7 +297,7 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
 
       nil ->
         args
-        |> AccountReconciliationWorker.new(identity_reconciliation_job_options(opts))
+        |> AccountReconciliationWorker.new(automatic_reconciliation_job_options(opts))
         |> Oban.insert()
     end
     |> tap_job_status_event(pool_id, "account_reconciliation", "scheduled")
@@ -198,22 +332,22 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
     |> Repo.one()
   end
 
-  defp identity_reconciliation_job_options(opts) do
-    opts
-    |> Keyword.take([:scheduled_at, :schedule_in])
-    |> Keyword.put(:unique, identity_reconciliation_unique(opts))
-  end
+  defp automatic_reconciliation_job_options(opts) do
+    unique =
+      cond do
+        Keyword.get(opts, :bypass_successful_cooldown?, false) ->
+          Keyword.put(@identity_reconciliation_unique, :states, :incomplete)
 
-  # A quota confirmation must run after its evidence span even when another
-  # reconciliation completed inside the normal 60-second enqueue cooldown.
-  # The explicit incomplete-job query above still prevents overlap, while this
-  # narrower Oban boundary retains advisory-lock protection for enqueue races.
-  defp identity_reconciliation_unique(opts) do
-    if Keyword.get(opts, :bypass_successful_cooldown?, false) do
-      Keyword.put(@identity_reconciliation_unique, :states, :incomplete)
-    else
-      @identity_reconciliation_unique
-    end
+        Keyword.get(opts, :trigger_kind) == "scheduled" ->
+          @scheduled_reconciliation_unique
+
+        true ->
+          @identity_reconciliation_unique
+      end
+
+    opts
+    |> Keyword.take([:scheduled_at, :scheduled_in])
+    |> Keyword.put(:unique, unique)
   end
 
   defp tap_job_status_event(
@@ -307,6 +441,20 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
   end
 
   defp maybe_put_recovery_fence(args, _assignment), do: args
+
+  defp put_manual_saved_reset_target(%{"trigger_kind" => "admin_manual", "pool_upstream_assignment_id" => assignment_id} = args) do
+    with {:ok, persisted_id} <- Ecto.UUID.cast(assignment_id),
+         %PoolUpstreamAssignment{} = assignment <- Repo.get(PoolUpstreamAssignment, persisted_id) do
+      Map.put(args, "manual_request_target", %{
+        "pool_id" => assignment.pool_id,
+        "upstream_identity_id" => assignment.upstream_identity_id
+      })
+    else
+      _missing_assignment -> args
+    end
+  end
+
+  defp put_manual_saved_reset_target(args), do: args
 
   defp pool_id(%{id: id}) when is_binary(id), do: {:ok, id}
   defp pool_id(id) when is_binary(id), do: {:ok, id}

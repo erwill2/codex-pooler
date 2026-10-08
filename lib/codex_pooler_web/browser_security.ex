@@ -1,6 +1,8 @@
 defmodule CodexPoolerWeb.BrowserSecurity do
   @moduledoc false
 
+  alias CodexPoolerWeb.Plugs.TrustedProxyRemoteIp
+
   @codex_desktop_browser_script_sources ["'unsafe-eval'", "blob:"]
   @local_browser_hosts ["localhost", "127.0.0.1", "::1"]
 
@@ -40,9 +42,7 @@ defmodule CodexPoolerWeb.BrowserSecurity do
     extra_sources =
       :codex_pooler
       |> Application.get_env(:browser_csp_extra_sources, [])
-      |> Keyword.merge(CodexPoolerWeb.DevFeatures.browser_csp_extra_sources(), fn _directive,
-                                                                                  left,
-                                                                                  right ->
+      |> Keyword.merge(CodexPoolerWeb.DevFeatures.browser_csp_extra_sources(), fn _directive, left, right ->
         List.wrap(left) ++ List.wrap(right)
       end)
       |> Keyword.merge(browser_annotation_csp_extra_sources(conn), fn _directive, left, right ->
@@ -76,22 +76,21 @@ defmodule CodexPoolerWeb.BrowserSecurity do
   defp browser_annotation_csp_extra_sources(_conn), do: []
 
   defp local_browser_request?(%Plug.Conn{} = conn) do
-    local_browser_host?(conn) and local_remote_ip?(conn)
+    local_browser_host?(conn) and local_ip?(conn.remote_ip) and
+      local_ip?(TrustedProxyRemoteIp.immediate_peer_ip(conn))
   end
 
   defp local_browser_host?(%Plug.Conn{host: host}) when is_binary(host) do
     host in @local_browser_hosts or String.ends_with?(host, ".localhost")
   end
 
-  defp local_remote_ip?(%Plug.Conn{remote_ip: {127, 0, 0, 1}}), do: true
-  defp local_remote_ip?(%Plug.Conn{remote_ip: {0, 0, 0, 0, 0, 0, 0, 1}}), do: true
-  defp local_remote_ip?(%Plug.Conn{}), do: false
+  defp local_ip?({127, 0, 0, 1}), do: true
+  defp local_ip?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp local_ip?(_ip), do: false
 
   defp chromium_browser?(%Plug.Conn{} = conn) do
     conn
     |> Plug.Conn.get_req_header("user-agent")
-    |> Enum.any?(
-      &(String.contains?(&1, [" Chrome/", " Chromium/"]) and String.contains?(&1, " Safari/"))
-    )
+    |> Enum.any?(&(String.contains?(&1, [" Chrome/", " Chromium/"]) and String.contains?(&1, " Safari/")))
   end
 end

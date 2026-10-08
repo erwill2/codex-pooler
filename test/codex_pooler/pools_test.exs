@@ -5,12 +5,26 @@ defmodule CodexPooler.PoolsTest do
   alias CodexPooler.Accounts.User
   alias CodexPooler.Admin.PoolWorkflow
   alias CodexPooler.Audit.AuditEvent
+  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, BridgeSessionAlias, CodexSession}
+  alias CodexPooler.Jobs.PoolDeletionWorker
   alias CodexPooler.Pools
-  alias CodexPooler.Pools.{Membership, OperatorPoolAssignment, RoutingSettings}
+  alias CodexPooler.Pools.{Membership, OperatorPoolAssignment, Pool, RoutingSettings}
   alias CodexPooler.Repo
+  alias CodexPooler.TestAppEnv
 
   import CodexPooler.AccountsFixtures
-  import CodexPooler.PoolerFixtures, only: [operator_pool_assignment_fixture: 3]
+
+  import CodexPooler.PoolerFixtures,
+    only: [
+      active_api_key_fixture: 1,
+      attempt_fixture: 2,
+      ledger_entry_fixture: 1,
+      operator_pool_assignment_fixture: 3,
+      pool_fixture: 0,
+      pool_fixture: 1,
+      request_fixture: 1,
+      upstream_assignment_fixture: 1
+    ]
 
   describe "pool lifecycle" do
     test "instance owners create normalized pools and list active pools" do
@@ -122,11 +136,11 @@ defmodule CodexPooler.PoolsTest do
       assert {:error, changeset} = Pools.create_pool(scope, %{slug: "SHARED", name: "Shared 2"})
       assert %{slug: ["has already been taken"]} = errors_on(changeset)
 
-      assert {:error, %{code: :pool_not_archived}} = Pools.delete_pool(scope, pool)
+      assert {:error, %{code: :pool_not_archived}} = Pools.delete_archived_pool(scope, pool, pool.slug)
       assert Pools.get_pool(pool.id)
 
       assert {:ok, archived_pool} = Pools.change_pool_status(scope, pool, "archived")
-      assert {:error, %{code: :confirmation_mismatch}} = Pools.delete_pool(scope, archived_pool)
+      assert {:error, %{code: :confirmation_mismatch}} = Pools.delete_archived_pool(scope, archived_pool, nil)
       assert Pools.get_pool(pool.id)
 
       assert {:ok, deleted_pool} =
@@ -161,7 +175,7 @@ defmodule CodexPooler.PoolsTest do
                sticky_http_sessions: false,
                prompt_cache_affinity_enabled: true,
                v1_compatibility_enabled: true,
-               request_compression_enabled: false
+               allow_image_generation: true
              } = Pools.routing_settings_with_defaults(pool)
 
       assert pool_id == pool.id
@@ -171,11 +185,17 @@ defmodule CodexPooler.PoolsTest do
                routing_strategy: "bridge_ring",
                prompt_cache_affinity_enabled: true,
                v1_compatibility_enabled: true,
-               request_compression_enabled: false
+               allow_image_generation: true
              } =
                Pools.ensure_routing_settings(pool)
 
       assert Pools.v1_compatibility_enabled?(pool)
+      assert Pools.allow_image_generation?(pool)
+      assert Pools.allow_image_generation?(Ecto.UUID.generate())
+      assert Pools.allow_image_generation?(nil)
+      assert Pools.allow_audio_transcription?(pool)
+      assert Pools.allow_audio_transcription?(Ecto.UUID.generate())
+      assert Pools.allow_audio_transcription?(nil)
 
       assert {:ok, routed_pool} =
                Pools.create_pool(scope, %{slug: "routing-custom", name: "Routing Custom"})
@@ -188,14 +208,17 @@ defmodule CodexPooler.PoolsTest do
                  "sticky_http_sessions" => true,
                  "prompt_cache_affinity_enabled" => false,
                  "v1_compatibility_enabled" => false,
-                 "request_compression_enabled" => "true"
+                 "request_compression_enabled" => "true",
+                 "allow_image_generation" => false
                })
 
       refute Pools.get_routing_settings(routed_pool).prompt_cache_affinity_enabled
-      assert Pools.get_routing_settings(routed_pool).request_compression_enabled
+      refute Map.has_key?(Pools.get_routing_settings(routed_pool), :request_compression_enabled)
+      refute Pools.get_routing_settings(routed_pool).allow_image_generation
+      refute Pools.allow_image_generation?(routed_pool)
       refute Pools.routing_settings_with_defaults(routed_pool).prompt_cache_affinity_enabled
 
-      assert Pools.routing_settings_with_defaults(routed_pool).request_compression_enabled
+      refute Map.has_key?(Pools.routing_settings_with_defaults(routed_pool), :request_compression_enabled)
       refute Pools.v1_compatibility_enabled?(routed_pool)
 
       assert {:ok, %RoutingSettings{} = reenabled_settings} =
@@ -207,7 +230,7 @@ defmodule CodexPooler.PoolsTest do
 
       assert reenabled_settings.prompt_cache_affinity_enabled
       assert reenabled_settings.v1_compatibility_enabled
-      refute reenabled_settings.request_compression_enabled
+      refute Map.has_key?(reenabled_settings, :request_compression_enabled)
       assert Pools.v1_compatibility_enabled?(routed_pool)
 
       assert {:ok, %RoutingSettings{} = string_disabled_settings} =
@@ -215,14 +238,14 @@ defmodule CodexPooler.PoolsTest do
                  "request_compression_enabled" => "false"
                })
 
-      refute string_disabled_settings.request_compression_enabled
+      refute Map.has_key?(string_disabled_settings, :request_compression_enabled)
 
       assert {:ok, %RoutingSettings{} = invalid_disabled_settings} =
                Pools.update_routing_settings(scope, routed_pool, %{
                  "request_compression_enabled" => "invalid"
                })
 
-      refute invalid_disabled_settings.request_compression_enabled
+      refute Map.has_key?(invalid_disabled_settings, :request_compression_enabled)
 
       audits =
         Repo.all(
@@ -247,15 +270,18 @@ defmodule CodexPooler.PoolsTest do
                true
              ]
 
-      assert Enum.map(audits, & &1.details["request_compression_enabled"]) == [
-               true,
+      assert Enum.all?(audits, &is_boolean(&1.details["prompt_cache_affinity_enabled"]))
+      refute Enum.any?(audits, &Map.has_key?(&1.details, "request_compression_enabled"))
+
+      assert Enum.map(audits, & &1.details["allow_image_generation"]) == [
+               false,
                false,
                false,
                false
              ]
 
-      assert Enum.all?(audits, &is_boolean(&1.details["prompt_cache_affinity_enabled"]))
-      assert Enum.all?(audits, &is_boolean(&1.details["request_compression_enabled"]))
+      assert Enum.all?(audits, &is_boolean(&1.details["allow_image_generation"]))
+      refute Enum.any?(audits, &Map.has_key?(&1.details, "upstream_websocket_bridge_enabled"))
 
       assert Enum.map(audits, & &1.pool_id) == [
                routed_pool.id,
@@ -276,41 +302,125 @@ defmodule CodexPooler.PoolsTest do
                  routing_strategy: "bridge_ring",
                  prompt_cache_affinity_enabled: true,
                  v1_compatibility_enabled: true,
-                 request_compression_enabled: false
+                 allow_image_generation: true
                },
                ^routed_pool_id => %RoutingSettings{
                  routing_strategy: "deterministic_rotation",
                  prompt_cache_affinity_enabled: true,
                  v1_compatibility_enabled: true,
-                 request_compression_enabled: false
+                 allow_image_generation: false
                },
                ^missing_pool_id => %RoutingSettings{
                  routing_strategy: "bridge_ring",
                  prompt_cache_affinity_enabled: true,
                  v1_compatibility_enabled: true,
-                 request_compression_enabled: false
+                 allow_image_generation: true
                }
              } = settings_by_pool_id
     end
 
-    test "routing settings persist boolean request compression enablement" do
-      %{user: owner} = bootstrap_owner_fixture(%{"email" => "compression-owner@example.com"})
+    test "routing settings persist false image generation permission and reject nil" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "image-permission-owner@example.com"})
       scope = Scope.for_user(owner, ["instance_owner"])
 
       assert {:ok, pool} =
                Pools.create_pool(scope, %{
-                 slug: "request-compression-boolean",
-                 name: "Request Compression Boolean"
+                 slug: "image-generation-permission",
+                 name: "Image Generation Permission"
                })
 
-      assert {:ok, %RoutingSettings{} = settings} =
+      assert {:ok, %RoutingSettings{allow_image_generation: false}} =
                Pools.update_routing_settings(scope, pool, %{
-                 "request_compression_enabled" => true
+                 "allow_image_generation" => false
                })
 
-      assert settings.request_compression_enabled == true
-      assert Repo.get!(RoutingSettings, pool.id).request_compression_enabled == true
-      assert Pools.get_routing_settings(pool).request_compression_enabled == true
+      assert Repo.get!(RoutingSettings, pool.id).allow_image_generation == false
+      refute Pools.allow_image_generation?(pool)
+
+      audit =
+        Repo.get_by!(AuditEvent,
+          action: "pool.routing_update",
+          target_id: pool.id
+        )
+
+      assert audit.details["allow_image_generation"] == false
+      refute Map.has_key?(audit.details, "upstream_websocket_bridge_enabled")
+
+      assert {:error, changeset} =
+               Pools.update_routing_settings(scope, pool, %{
+                 "allow_image_generation" => nil
+               })
+
+      assert %{allow_image_generation: ["can't be blank"]} = errors_on(changeset)
+      assert Repo.get!(RoutingSettings, pool.id).allow_image_generation == false
+
+      admin = user_fixture(%{"email" => "image-permission-admin@example.com"})
+
+      assert {:ok, _membership} =
+               Pools.create_membership(scope, %{user_id: admin.id, role: "instance_admin"})
+
+      admin_scope = Scope.for_user(admin)
+
+      assert {:error, %{code: :capability_denied}} =
+               Pools.update_routing_settings(admin_scope, pool, %{
+                 "allow_image_generation" => true
+               })
+
+      assert Repo.get!(RoutingSettings, pool.id).allow_image_generation == false
+    end
+
+    test "routing settings persist audio permission, audit changes and reject unauthorized or null updates" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      pool = pool_fixture(%{slug: "audio-permission", name: "Audio Permission"})
+
+      assert {:ok, %RoutingSettings{allow_audio_transcription: false}} =
+               Pools.update_routing_settings(scope, pool, %{"allow_audio_transcription" => "false"})
+
+      refute Pools.allow_audio_transcription?(pool)
+      assert Pools.allow_image_generation?(pool)
+      assert Pools.routing_settings_by_pool_ids([pool.id])[pool.id].allow_audio_transcription == false
+      assert Repo.get_by!(AuditEvent, action: "pool.routing_update", target_id: pool.id).details["allow_audio_transcription"] == false
+
+      assert {:error, changeset} = Pools.update_routing_settings(scope, pool, %{"allow_audio_transcription" => nil})
+      assert %{allow_audio_transcription: ["can't be blank"]} = errors_on(changeset)
+
+      admin = user_fixture(%{"email" => "admin@example.com"})
+      assert {:ok, _membership} = Pools.create_membership(scope, %{user_id: admin.id, role: "instance_admin"})
+      assert {:error, %{code: :capability_denied}} = Pools.update_routing_settings(Scope.for_user(admin), pool, %{"allow_audio_transcription" => true})
+      refute Pools.allow_audio_transcription?(pool)
+
+      assert {:ok, %RoutingSettings{allow_audio_transcription: true}} =
+               Pools.update_routing_settings(scope, pool, %{"allow_audio_transcription" => "true"})
+
+      assert Pools.allow_audio_transcription?(pool)
+    end
+
+    test "routing settings ignore retired attributes and preserve inert legacy values" do
+      %{user: owner} = bootstrap_owner_fixture()
+      scope = Scope.for_user(owner, ["instance_owner"])
+      refute :request_compression_enabled in RoutingSettings.__schema__(:fields)
+
+      for legacy_value <- [false, true] do
+        assert {:ok, pool} = Pools.create_pool(scope, %{slug: "legacy-routing-#{legacy_value}", name: "Legacy Routing #{legacy_value}"})
+        settings = Pools.ensure_routing_settings(pool)
+        refute Map.has_key?(settings, :request_compression_enabled)
+        assert [[false]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
+        Repo.query!("UPDATE pool_routing_settings SET request_compression_enabled = $1 WHERE pool_id = $2", [legacy_value, Ecto.UUID.dump!(pool.id)])
+
+        for forged <- [true, false, "true", "false", "invalid"] do
+          assert {:ok, updated} = Pools.update_routing_settings(scope, pool, %{"request_compression_enabled" => forged, "bridge_ring_size" => 5})
+          assert updated.bridge_ring_size == 5
+          refute Map.has_key?(updated, :request_compression_enabled)
+          refute Map.has_key?(Pools.get_routing_settings(pool), :request_compression_enabled)
+          refute Map.has_key?(Pools.routing_settings_with_defaults(pool), :request_compression_enabled)
+          assert [[^legacy_value]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
+        end
+
+        audits = Repo.all(from audit in AuditEvent, where: audit.action == "pool.routing_update" and audit.target_id == ^pool.id)
+        assert length(audits) == 5
+        refute Enum.any?(audits, &Map.has_key?(&1.details, "request_compression_enabled"))
+      end
     end
 
     test "pool workflow defaults prompt cache affinity on and persists explicit disables" do
@@ -584,32 +694,22 @@ defmodule CodexPooler.PoolsTest do
                [assigned_pool.id, disabled_pool.id] |> Enum.sort()
 
       assert {:ok, decision} =
-               Pools.require_capability(admin_scope, Pools.capability(:pool_api_key_manage),
-                 pool_id: assigned_pool.id
-               )
+               Pools.require_capability(admin_scope, Pools.capability(:pool_api_key_manage), pool_id: assigned_pool.id)
 
       assert decision.actor_role == "instance_admin"
       assert decision.pool_id == assigned_pool.id
 
       assert {:ok, _decision} =
-               Pools.require_capability(admin_scope, Pools.capability(:pool_operate),
-                 pool_id: assigned_pool.id
-               )
+               Pools.require_capability(admin_scope, Pools.capability(:pool_operate), pool_id: assigned_pool.id)
 
       assert {:error, %{code: :capability_denied}} =
-               Pools.require_capability(admin_scope, Pools.capability(:pool_operate),
-                 pool_id: unassigned_pool.id
-               )
+               Pools.require_capability(admin_scope, Pools.capability(:pool_operate), pool_id: unassigned_pool.id)
 
       assert {:error, %{code: :capability_denied}} =
-               Pools.require_capability(admin_scope, Pools.capability(:pool_api_key_manage),
-                 pool_id: revoked_pool.id
-               )
+               Pools.require_capability(admin_scope, Pools.capability(:pool_api_key_manage), pool_id: revoked_pool.id)
 
       assert {:error, %{code: :pool_not_found}} =
-               Pools.require_capability(admin_scope, Pools.capability(:pool_operate),
-                 pool_id: disabled_pool.id
-               )
+               Pools.require_capability(admin_scope, Pools.capability(:pool_operate), pool_id: disabled_pool.id)
 
       assert {:error, %{code: :capability_denied}} =
                Pools.require_capability(admin_scope, Pools.capability(:pool_operate))
@@ -682,6 +782,44 @@ defmodule CodexPooler.PoolsTest do
       assert Repo.get!(Pools.Pool, archived_pool.id).status == "archived"
     end
 
+    # The operators a Pool status change newly shows the Pool to are told so on
+    # their own notification topics (findings#206 row 206-308).
+    test "a Pool's operators are the active owners and its assigned active admins while it is active" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      owner_scope = Scope.for_user(owner, ["instance_owner"])
+      assert {:ok, pool} = Pools.create_pool(owner_scope, %{slug: "operators", name: "Operators"})
+      assert {:ok, other_pool} = Pools.create_pool(owner_scope, %{slug: "operators-other", name: "Operators Other"})
+
+      [assigned, unassigned, revoked] =
+        for label <- ["assigned", "unassigned", "revoked"] do
+          admin = user_fixture(%{"email" => "operators-#{label}@example.com"})
+          assert {:ok, _membership} = Pools.create_membership(owner_scope, %{user_id: admin.id, role: "instance_admin"})
+          admin
+        end
+
+      operator_pool_assignment_fixture(assigned, pool, created_by_user_id: owner.id)
+      operator_pool_assignment_fixture(unassigned, other_pool, created_by_user_id: owner.id)
+      operator_pool_assignment_fixture(revoked, pool, created_by_user_id: owner.id)
+      revoked_membership = Repo.get_by!(Membership, user_id: revoked.id)
+      revoked_membership |> Membership.changeset(%{status: "revoked", revoked_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)}) |> Repo.update!()
+
+      assert Enum.sort(Pools.list_pool_operator_ids(pool)) == Enum.sort([owner.id, assigned.id])
+      assert Enum.sort(Pools.list_pool_operator_ids(other_pool.id)) == Enum.sort([owner.id, unassigned.id])
+
+      assert {:ok, disabled} = Pools.change_pool_status(owner_scope, pool, "disabled")
+      assert Pools.list_pool_operator_ids(disabled) == []
+
+      assert {:ok, active} = Pools.change_pool_status(owner_scope, disabled, "active")
+      assert Enum.sort(Pools.list_pool_operator_ids(active)) == Enum.sort([owner.id, assigned.id])
+
+      # Archiving revokes the assignments and restoring does not bring them back.
+      assert {:ok, archived} = Pools.change_pool_status(owner_scope, active, "archived")
+      assert Pools.list_pool_operator_ids(archived) == []
+      assert {:ok, restored} = Pools.change_pool_status(owner_scope, archived, "active")
+      assert Pools.list_pool_operator_ids(restored) == [owner.id]
+      assert Pools.list_pool_operator_ids(Ecto.UUID.generate()) == []
+    end
+
     test "creates instance admin memberships through the pools boundary" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       owner_scope = Scope.for_user(owner, ["instance_owner"])
@@ -720,12 +858,227 @@ defmodule CodexPooler.PoolsTest do
       scope = Scope.for_user(user, [])
 
       assert {:error, %{code: :capability_denied, message: message}} =
-               Pools.require_capability(scope, Pools.capability(:pool_api_key_manage),
-                 pool_id: pool.id
-               )
+               Pools.require_capability(scope, Pools.capability(:pool_api_key_manage), pool_id: pool.id)
 
       assert message =~ "node admins"
     end
+  end
+
+  describe "archived Pool deletion" do
+    setup do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "deletion-owner@example.com"})
+      %{owner: owner, scope: Scope.for_user(owner, ["instance_owner"])}
+    end
+
+    test "a Pool with little history is deleted at once with its history and one audit event", %{owner: owner, scope: scope} do
+      pool = pool_fixture()
+      history = pool_history!(pool)
+      pool = archive!(pool)
+      other_pool = pool_fixture()
+      other_history = pool_history!(other_pool)
+
+      assert {:ok, %Pool{id: pool_id}} = Pools.delete_archived_pool(scope, pool, pool.slug)
+      assert pool_id == pool.id
+
+      refute Repo.get(Pool, pool.id)
+      assert history_counts(pool, history) == empty_history_counts()
+      assert history_counts(other_pool, other_history) == full_history_counts()
+
+      assert [%AuditEvent{actor_user_id: actor_id, pool_id: nil, target_id: target_id}] = pool_delete_audit_events(pool)
+      assert actor_id == owner.id
+      assert target_id == pool.id
+      refute_enqueued(worker: PoolDeletionWorker, args: %{"pool_id" => pool.id})
+    end
+
+    test "the immediate delete runs under its own statement timeout", %{scope: scope} do
+      Repo.query!("CREATE TEMPORARY TABLE pool_delete_statement_timeouts (setting text) ON COMMIT DROP")
+
+      Repo.query!("""
+      CREATE FUNCTION pg_temp.record_pool_delete_statement_timeout() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        INSERT INTO pool_delete_statement_timeouts VALUES (current_setting('statement_timeout'));
+        RETURN OLD;
+      END $$
+      """)
+
+      Repo.query!("CREATE TRIGGER record_pool_delete_statement_timeout BEFORE DELETE ON pools FOR EACH ROW EXECUTE FUNCTION pg_temp.record_pool_delete_statement_timeout()")
+
+      pool = pool_fixture(%{status: "archived"})
+
+      assert {:ok, _deleted} = Pools.delete_archived_pool(scope, pool, pool.slug)
+      assert Repo.query!("SELECT setting FROM pool_delete_statement_timeouts").rows == [["10s"]]
+    end
+
+    test "a cancelled delete writes no audit event and hands the Pool to the deletion job", %{scope: scope} do
+      Repo.query!("""
+      CREATE FUNCTION pg_temp.cancel_pool_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        RAISE EXCEPTION 'canceling statement due to user request' USING ERRCODE = 'query_canceled';
+      END $$
+      """)
+
+      Repo.query!("CREATE TRIGGER cancel_pool_delete BEFORE DELETE ON pools FOR EACH ROW EXECUTE FUNCTION pg_temp.cancel_pool_delete()")
+
+      pool = pool_fixture()
+      history = pool_history!(pool)
+      pool = archive!(pool)
+
+      assert {:deleting, %Pool{id: pool_id}} = Pools.delete_archived_pool(scope, pool, pool.slug)
+      assert pool_id == pool.id
+
+      assert Repo.get!(Pool, pool.id).status == "archived"
+      assert history_counts(pool, history) == full_history_counts()
+      assert pool_delete_audit_events(pool) == []
+      assert_enqueued(worker: PoolDeletionWorker, args: %{"pool_id" => pool.id})
+    end
+
+    test "a Pool with a large history is deleted by the job in batches, and only then audited", %{owner: owner, scope: scope} do
+      TestAppEnv.restore_on_exit(:pool_deletion_immediate_request_limit)
+      Application.put_env(:codex_pooler, :pool_deletion_immediate_request_limit, 2)
+
+      pool = pool_fixture()
+      history = pool_history!(pool)
+      pool = archive!(pool)
+      other_pool = pool_fixture()
+      other_history = pool_history!(other_pool)
+
+      assert {:deleting, %Pool{}} = Pools.delete_archived_pool(scope, pool, pool.slug)
+      assert Pools.pool_deletion_states([pool.id, other_pool.id]) == %{pool.id => :in_progress}
+      assert {:deleting, %Pool{}} = Pools.delete_archived_pool(scope, pool, pool.slug)
+      assert [%Oban.Job{args: args}] = all_enqueued(worker: PoolDeletionWorker, args: %{"pool_id" => pool.id})
+      assert args == %{"pool_id" => pool.id, "requested_by_user_id" => owner.id}
+
+      assert {:error, %{code: :pool_deletion_in_progress}} = Pools.change_pool_status(scope, pool, "active")
+      assert Repo.get!(Pool, pool.id).status == "archived"
+      assert pool_delete_audit_events(pool) == []
+
+      assert Pools.continue_pool_deletion(pool.id, owner.id, System.monotonic_time(:millisecond) - 1) == :more
+      assert history_counts(pool, history) == full_history_counts()
+
+      assert :ok = perform_job(PoolDeletionWorker, args)
+
+      refute Repo.get(Pool, pool.id)
+      assert history_counts(pool, history) == empty_history_counts()
+      assert history_counts(other_pool, other_history) == full_history_counts()
+      assert [%AuditEvent{actor_user_id: actor_id}] = pool_delete_audit_events(pool)
+      assert actor_id == owner.id
+
+      assert :ok = perform_job(PoolDeletionWorker, args)
+      assert length(pool_delete_audit_events(pool)) == 1
+    end
+
+    test "a deletion job leaves a Pool that is no longer archived alone and reports a failed job" do
+      pool = pool_fixture(%{status: "active"})
+      history = pool_history!(pool)
+
+      assert {:cancel, :pool_not_archived} = perform_job(PoolDeletionWorker, %{"pool_id" => pool.id})
+      assert history_counts(pool, history) == full_history_counts()
+
+      %{"pool_id" => pool.id}
+      |> PoolDeletionWorker.new()
+      |> Oban.insert!()
+      |> Ecto.Changeset.change(state: "discarded")
+      |> Repo.update!()
+
+      assert Pools.pool_deletion_states([pool.id]) == %{pool.id => :failed}
+    end
+  end
+
+  defp archive!(pool), do: pool |> Ecto.Changeset.change(status: "archived") |> Repo.update!()
+
+  defp pool_history!(pool) do
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request_ids =
+      for _index <- 1..3 do
+        request = request_fixture(%{pool: pool, api_key: api_key})
+        attempt_fixture(request, assignment)
+        ledger_entry_fixture(request)
+        request.id
+      end
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    session =
+      Repo.insert!(%CodexSession{
+        pool_id: pool.id,
+        api_key_id: api_key.id,
+        session_key: "deletion-session-#{System.unique_integer([:positive])}",
+        pool_upstream_assignment_id: assignment.id,
+        status: "active",
+        created_at: now,
+        updated_at: now
+      })
+
+    %BridgeSessionAlias{}
+    |> BridgeSessionAlias.changeset(%{
+      codex_session_id: session.id,
+      pool_id: pool.id,
+      api_key_id: api_key.id,
+      alias_kind: "turn_state",
+      alias_hash: :crypto.hash(:sha256, "deletion-alias-#{System.unique_integer([:positive])}"),
+      status: "active",
+      expires_at: DateTime.add(now, 3_600, :second),
+      metadata: %{},
+      created_at: now,
+      updated_at: now
+    })
+    |> Repo.insert!()
+
+    %BridgeOwnerLease{}
+    |> BridgeOwnerLease.changeset(%{
+      codex_session_id: session.id,
+      pool_id: pool.id,
+      api_key_id: api_key.id,
+      pool_upstream_assignment_id: assignment.id,
+      owner_instance_id: "node-a",
+      lease_token: Ecto.UUID.generate(),
+      status: "active",
+      acquired_at: now,
+      renewed_at: now,
+      expires_at: DateTime.add(now, 45, :second),
+      metadata: %{},
+      created_at: now,
+      updated_at: now
+    })
+    |> Repo.insert!()
+
+    %{api_key_id: api_key.id, assignment_id: assignment.id, request_ids: request_ids, session_id: session.id}
+  end
+
+  # Rows of the Pool's history, counted by the ids the fixture created and by the Pool id.
+  defp history_counts(pool, history) do
+    request_ids = Enum.map(history.request_ids, &Ecto.UUID.dump!/1)
+    pool_id = Ecto.UUID.dump!(pool.id)
+
+    [row] =
+      Repo.query!(
+        """
+        SELECT (SELECT count(*) FROM requests WHERE id = ANY($1)),
+               (SELECT count(*) FROM attempts WHERE request_id = ANY($1)),
+               (SELECT count(*) FROM ledger_entries WHERE request_id = ANY($1)),
+               (SELECT count(*) FROM codex_sessions WHERE pool_id = $2),
+               (SELECT count(*) FROM bridge_session_aliases WHERE pool_id = $2),
+               (SELECT count(*) FROM bridge_owner_leases WHERE pool_id = $2),
+               (SELECT count(*) FROM api_keys WHERE pool_id = $2),
+               (SELECT count(*) FROM pool_upstream_assignments WHERE pool_id = $2)
+        """,
+        [request_ids, pool_id]
+      ).rows
+
+    Enum.zip(~w(requests attempts ledger_entries codex_sessions bridge_session_aliases bridge_owner_leases api_keys pool_upstream_assignments)a, row)
+    |> Map.new()
+  end
+
+  defp full_history_counts do
+    %{requests: 3, attempts: 3, ledger_entries: 3, codex_sessions: 1, bridge_session_aliases: 1, bridge_owner_leases: 1, api_keys: 1, pool_upstream_assignments: 1}
+  end
+
+  defp empty_history_counts, do: Map.new(full_history_counts(), fn {table, _count} -> {table, 0} end)
+
+  defp pool_delete_audit_events(pool) do
+    Repo.all(from event in AuditEvent, where: event.action == "pool.delete" and event.target_id == ^pool.id)
   end
 
   defp user_fixture(attrs) do

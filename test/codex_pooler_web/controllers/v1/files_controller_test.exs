@@ -10,12 +10,25 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files
   alias CodexPooler.Files.FileRecord
+  alias CodexPooler.Files.UploadUrlPolicy
   alias CodexPooler.Gateway.Transports.FileBridge
   alias CodexPooler.Repo
 
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
   setup do
     old_files_config = Application.get_env(:codex_pooler, Files, [])
-    old_bridge_config = Application.get_env(:codex_pooler, FileBridge, [])
+    CodexPooler.TestAppEnv.restore_on_exit(FileBridge)
+    CodexPooler.TestAppEnv.restore_on_exit(UploadUrlPolicy)
+
+    Application.put_env(:codex_pooler, UploadUrlPolicy,
+      resolver: fn
+        _host, :inet -> {:ok, [{93, 184, 216, 34}]}
+        _host, :inet6 -> {:error, :nxdomain}
+      end
+    )
 
     Application.put_env(:codex_pooler, Files,
       max_file_size_bytes: 64,
@@ -24,13 +37,11 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
 
     Application.put_env(:codex_pooler, FileBridge,
       finalize_retry_timeout_ms: 1_000,
-      finalize_retry_interval_ms: 0
+      finalize_retry_interval_ms: 0,
+      upload_retry_interval_ms: 0
     )
 
-    on_exit(fn ->
-      Application.put_env(:codex_pooler, Files, old_files_config)
-      Application.put_env(:codex_pooler, FileBridge, old_bridge_config)
-    end)
+    on_exit(fn -> Application.put_env(:codex_pooler, Files, old_files_config) end)
 
     :ok
   end
@@ -100,8 +111,10 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
     assert %{"object" => "list", "data" => [listed]} = json_response(list_conn, 200)
     assert listed["id"] == file_id
 
+    before_content = Repo.aggregate(Request, :count)
     content_conn = build_conn() |> auth(setup) |> get("/v1/files/#{file_id}/content")
     assert json_response(content_conn, 404)["error"]["code"] == "unsupported_endpoint"
+    assert Repo.aggregate(Request, :count) == before_content + 1
 
     binary_content_conn =
       build_conn()
@@ -111,8 +124,10 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
 
     assert json_response(binary_content_conn, 404)["error"]["code"] == "unsupported_endpoint"
 
+    before_delete = Repo.aggregate(Request, :count)
     delete_conn = build_conn() |> auth(setup) |> delete("/v1/files/#{file_id}")
     assert json_response(delete_conn, 404)["error"]["code"] == "unsupported_endpoint"
+    assert Repo.aggregate(Request, :count) == before_delete + 1
 
     assert [create_request, finalize_request] = FakeUpstream.requests(upstream)
     assert create_request.path == "/backend-api/files"
@@ -138,6 +153,32 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
     refute inspect(requests) =~ file_contents
     refute inspect(requests) =~ setup.raw_key
     refute inspect(requests) =~ upload_url
+  end
+
+  test "transient upload recovery retains one file record and one create/finalize pair", %{conn: conn} do
+    setup = active_api_key_fixture()
+    file_id = "file_retry_#{System.unique_integer([:positive])}"
+    contents = "synthetic retry upload"
+    upload_url = stub_upload_put(file_id, statuses: [503, 201])
+    upstream = start_upstream(FakeUpstream.file_protocol_success(file_id: file_id, upload_url: upload_url))
+
+    active_upstream_assignment_fixture(setup.pool, %{
+      metadata: %{"base_url" => FakeUpstream.url(upstream)},
+      access_token: "synthetic-upload-token"
+    })
+
+    response = conn |> auth(setup) |> post("/v1/files", %{"purpose" => "user_data", "file" => upload_fixture("retry.txt", "text/plain", contents)})
+    assert %{"id" => ^file_id, "status" => "uploaded"} = json_response(response, 200)
+    assert [file] = Repo.all(from file in FileRecord, where: file.pool_id == ^setup.pool.id)
+    assert file.status == "uploaded"
+    assert file.finalize_status == "succeeded"
+    assert [create, finalize] = FakeUpstream.requests(upstream)
+    assert create.path == "/backend-api/files"
+    assert finalize.path == "/backend-api/files/#{file_id}/uploaded"
+    for _attempt <- 1..2, do: assert_upload_put(file_id, "/upload/#{file_id}", contents, "text/plain")
+    refute_received {:upload_put, ^file_id, _, _, _, _}
+    refute inspect(file) =~ upload_url
+    refute inspect(file) =~ contents
   end
 
   @tag :unauthorized_file
@@ -357,7 +398,7 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
     assert %{"id" => ^file_id, "status" => "uploaded"} = json_response(conn, 200)
 
     assert_receive {:upload_put, ^file_id, "PUT", ^upload_path, ^file_contents, headers},
-                   1_000
+                   @detection_timeout_ms
 
     assert_exact_safe_upload_headers(headers, "application/json")
 
@@ -370,6 +411,31 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
     assert [create_request, finalize_request] = FakeUpstream.requests(upstream)
     assert create_request.path == "/backend-api/files"
     assert finalize_request.path == "/backend-api/files/#{file_id}/uploaded"
+  end
+
+  @tag :upload_url_policy
+  test "private DNS answers fail before direct PUT or file row", %{conn: conn} do
+    Application.put_env(:codex_pooler, UploadUrlPolicy, resolver: fn _host, _family -> {:ok, [{127, 0, 0, 1}]} end)
+    setup = active_api_key_fixture()
+    file_id = "file_private_dns_#{System.unique_integer([:positive])}"
+    upload_url = stub_upload_put(file_id)
+    upstream = start_upstream(FakeUpstream.file_protocol_success(file_id: file_id, upload_url: upload_url))
+
+    active_upstream_assignment_fixture(setup.pool, %{
+      chatgpt_account_id: "acct_private_dns",
+      metadata: %{"base_url" => FakeUpstream.url(upstream)},
+      access_token: "synthetic-private-dns-token"
+    })
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/files", %{"purpose" => "user_data", "file" => upload_fixture("sample.txt", "text/plain", "synthetic bytes")})
+
+    assert_openai_error(response, 502, code: "upstream_file_bridge_invalid_response", message: "upstream file create returned an invalid upload_url")
+    refute Repo.get_by(FileRecord, file_id: file_id)
+    assert [%{path: "/backend-api/files"}] = FakeUpstream.requests(upstream)
+    refute_received {:upload_put, ^file_id, _method, _path, _body, _headers}
   end
 
   @tag :upload_url_policy
@@ -454,6 +520,7 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
     response_body = Keyword.get(opts, :response_body, "")
     stub_name = {__MODULE__, :upload_put, file_id}
     test_pid = self()
+    statuses = start_supervised!(Supervisor.child_spec({Agent, fn -> Keyword.get(opts, :statuses, [response_status]) end}, id: make_ref()))
 
     Req.Test.stub(stub_name, fn conn ->
       send(test_pid, {
@@ -465,8 +532,14 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
         conn.req_headers
       })
 
+      status =
+        Agent.get_and_update(statuses, fn
+          [status | rest] -> {status, rest}
+          [] -> {response_status, []}
+        end)
+
       conn
-      |> Plug.Conn.put_status(response_status)
+      |> Plug.Conn.put_status(status)
       |> Req.Test.text(response_body)
     end)
 
@@ -541,8 +614,9 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
   end
 
   defp assert_upload_put(file_id, path, body, content_type) do
-    assert_receive {:upload_put, ^file_id, "PUT", ^path, ^body, headers}, 1_000
+    assert_receive {:upload_put, ^file_id, "PUT", ^path, ^body, headers}, @detection_timeout_ms
     assert header!(headers, "content-type") == content_type
+    assert header!(headers, "content-length") == Integer.to_string(byte_size(body))
     assert header!(headers, "x-ms-blob-type") == "BlockBlob"
     refute Enum.any?(headers, fn {name, _value} -> name in ["authorization", "cookie"] end)
   end
@@ -586,14 +660,12 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
       message: "upstream file upload failed with status #{status}"
     )
 
-    assert_receive {:upload_redirect, ^file_id, "PUT", :https, "upload.example.invalid",
-                    ^upload_path, ^file_contents, headers},
-                   1_000
+    assert_receive {:upload_redirect, ^file_id, "PUT", :https, "upload.example.invalid", ^upload_path, ^file_contents, headers},
+                   @detection_timeout_ms
 
     assert_exact_safe_upload_headers(headers, "text/plain")
 
-    refute_received {:upload_private_target, ^file_id, _method, _scheme, _host, _path, _body,
-                     _headers}
+    refute_received {:upload_private_target, ^file_id, _method, _scheme, _host, _path, _body, _headers}
 
     assert [%{path: "/backend-api/files"}] = FakeUpstream.requests(upstream)
 
@@ -611,6 +683,7 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
 
   defp assert_exact_safe_upload_headers(headers, content_type) do
     assert headers |> Enum.map(&elem(&1, 0)) |> Enum.sort() == [
+             "content-length",
              "content-type",
              "x-ms-blob-type"
            ]
@@ -633,9 +706,17 @@ defmodule CodexPoolerWeb.V1.FilesControllerTest do
 
   defp assert_openai_error(conn, status, opts) do
     assert %{"error" => error} = json_response(conn, status)
-    assert error["type"] == "invalid_request_error"
+    assert error["type"] == Keyword.get(opts, :type, public_error_type(status))
     assert error["code"] == Keyword.fetch!(opts, :code)
     assert error["message"] == Keyword.fetch!(opts, :message)
     assert error["param"] == Keyword.get(opts, :param)
   end
+
+  # The public contract for errors the Pooler authors: a 5xx is never typed as a
+  # client error, and a 429 is a throttle (findings#191). This helper used to
+  # assert `invalid_request_error` for every status, which pinned the defect for
+  # the 502 upload failures rather than describing them.
+  defp public_error_type(status) when status >= 500, do: "server_error"
+  defp public_error_type(429), do: "rate_limit_error"
+  defp public_error_type(_status), do: "invalid_request_error"
 end

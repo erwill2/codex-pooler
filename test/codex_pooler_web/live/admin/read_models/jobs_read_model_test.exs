@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
   alias CodexPooler.Jobs.{
     AccountReconciliationWorker,
     RuntimeStateCleanupWorker,
+    SavedResetRedemptionWorker,
     TokenRefreshEnqueueWorker,
     TokenRefreshWorker
   }
@@ -65,7 +66,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
       JobsReadModel.load(owner_scope,
         params: %{
           "worker" => worker_name(TokenRefreshWorker),
-          "queue" => "jobs",
           "job_id" => Integer.to_string(selected_job.id)
         },
         now: now
@@ -86,7 +86,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert overview.total == 1
     assert explorer == %{items: [projection.selected_job], total: 1, limit: 20, offset: 0}
     assert filters.worker == worker_name(TokenRefreshWorker)
-    assert filters.queue == "jobs"
     assert filters.job_id == selected_job.id
     assert form_values["job_id"] == Integer.to_string(selected_job.id)
 
@@ -95,8 +94,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert worker_name(RuntimeStateCleanupWorker) in worker_option_values
     assert worker_name(TokenRefreshEnqueueWorker) in worker_option_values
     assert worker_name(TokenRefreshWorker) in worker_option_values
-
-    assert filter_options.queue |> Enum.map(& &1.value) == ["", "critical", "jobs"]
 
     failure_summary = %{title: "Attempt 1", message: "stacktrace-with-[redacted]"}
 
@@ -140,6 +137,151 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert projection.explorer.items == []
     assert projection.selected_job == nil
     assert projection.filters.job_id == hidden_completed_job.id
+  end
+
+  @tag :scheduled_expiry_enqueue
+  test "projects scheduled saved-reset jobs as identity targets with assignment context" do
+    pool = pool_fixture(%{name: "Scheduled Rescue Pool", slug: "scheduled-rescue-pool"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Scheduled rescue account",
+        assignment_label: "Scheduled rescue assignment"
+      })
+
+    job =
+      insert_job(1,
+        worker: SavedResetRedemptionWorker,
+        state: "available",
+        inserted_at: ~U[2026-06-02 10:00:00Z],
+        args: %{
+          "pool_upstream_assignment_id" => assignment.id,
+          "upstream_identity_id" => identity.id,
+          "target_kind" => "upstream_identity",
+          "trigger_kind" => "scheduled_expiry_rescue"
+        }
+      )
+
+    projection =
+      JobsReadModel.load(:system,
+        params: %{
+          "job_id" => Integer.to_string(job.id),
+          "target_kind" => "upstream_identity",
+          "target_id" => identity.id
+        },
+        now: ~U[2026-06-02 10:30:00Z]
+      )
+
+    assert %{
+             id: job_id,
+             trigger_kind: "scheduled_expiry_rescue",
+             target: %{
+               target_kind: "upstream_identity",
+               assignment_id: assignment_id,
+               assignment_label: "Scheduled rescue assignment",
+               assignment_identity_id: identity_id,
+               assignment_identity_label: "Scheduled rescue account",
+               upstream_identity_id: identity_id,
+               direct_identity_label: "Scheduled rescue account"
+             }
+           } = projection.selected_job
+
+    assert job_id == job.id
+    assert assignment_id == assignment.id
+    assert identity_id == identity.id
+    assert Enum.map(projection.explorer.items, & &1.id) == [job.id]
+  end
+
+  @tag :scheduled_expiry_worker
+  test "projects bounded cancelled scheduled evidence diagnostics" do
+    job =
+      insert_job(1,
+        worker: SavedResetRedemptionWorker,
+        state: "cancelled",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: ~U[2026-07-29 12:00:00Z],
+        cancelled_at: ~U[2026-07-29 12:00:01Z],
+        args: %{"trigger_kind" => "scheduled_expiry_rescue"},
+        errors: [
+          %{
+            "attempt" => 1,
+            "at" => "2026-07-29T12:00:01Z",
+            "error" => "CodexPooler.Jobs.SavedResetRedemptionWorker cancelled with :scheduled_expiry_decision_evidence_invalid"
+          }
+        ]
+      )
+
+    projection =
+      JobsReadModel.load(:system,
+        params: %{"job_id" => Integer.to_string(job.id)},
+        now: ~U[2026-07-29 12:30:00Z]
+      )
+
+    assert %{
+             id: job_id,
+             state: "cancelled",
+             trigger_kind: "scheduled_expiry_rescue",
+             failure_summary: %{
+               title: "Attempt 1",
+               message: diagnostic
+             }
+           } = projection.selected_job
+
+    assert job_id == job.id
+    assert diagnostic =~ "scheduled_expiry_decision_evidence_invalid"
+    refute Map.has_key?(projection.selected_job, :errors)
+  end
+
+  @tag :stale_consuming_recovery
+  test "projects stale-consuming recovery without attempt generation or raw arguments" do
+    pool = pool_fixture(%{name: "Recovery Pool", slug: "recovery-pool"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Recovery account",
+        assignment_label: "Recovery assignment"
+      })
+
+    attempt_id = Ecto.UUID.generate()
+
+    job =
+      insert_job(1,
+        worker: SavedResetRedemptionWorker,
+        state: "available",
+        inserted_at: ~U[2026-08-04 10:00:00Z],
+        args: %{
+          "pool_upstream_assignment_id" => assignment.id,
+          "upstream_identity_id" => identity.id,
+          "attempt_id" => attempt_id,
+          "generation" => 12,
+          "recovery_kind" => "stale_consuming"
+        }
+      )
+
+    projection =
+      JobsReadModel.load(:system,
+        params: %{"job_id" => Integer.to_string(job.id)},
+        now: ~U[2026-08-04 10:30:00Z]
+      )
+
+    assert %{
+             id: job_id,
+             target: %{
+               assignment_id: assignment_id,
+               upstream_identity_id: identity_id
+             }
+           } = projection.selected_job
+
+    assert job_id == job.id
+    assert assignment_id == assignment.id
+    assert identity_id == identity.id
+    refute Map.has_key?(projection.selected_job, :args)
+
+    serialized = inspect(projection)
+    refute serialized =~ attempt_id
+    refute serialized =~ "generation"
+    refute serialized =~ "stale_consuming"
   end
 
   test "default projection excludes discarded jobs resolved by a later target success" do
@@ -211,8 +353,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
         }
       ]
     )
@@ -232,8 +373,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
       errors: [
         %{
           "attempt" => 1,
-          "error" =>
-            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, %{code: :pool_account_not_reconcilable, message: \"active pool assignment was not found for reconciliation\"}}"
+          "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, %{code: :pool_account_not_reconcilable, message: \"active pool assignment was not found for reconciliation\"}}"
         }
       ]
     )
@@ -284,8 +424,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
         errors: [
           %{
             "attempt" => 1,
-            "error" =>
-              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: catalog_sync_failed\"}"
+            "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: catalog_sync_failed\"}"
           }
         ]
       )
@@ -346,8 +485,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
         errors: [
           %{
             "attempt" => 1,
-            "error" =>
-              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+            "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
           }
         ]
       )
@@ -369,8 +507,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
         errors: [
           %{
             "attempt" => 1,
-            "error" =>
-              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+            "error" => "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
           }
         ]
       )
@@ -418,8 +555,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
         errors: [
           %{
             "attempt" => 2,
-            "error" =>
-              "provider failed with safe recovery context. safe credential punctuation context: secret=secret-value-do-not-leak ; secret_token=secret-token-do-not-leak, client_secret=client-secret-do-not-leak. safe punctuation context: id_token=token-id-do-not-leak, session_token=token-session-do-not-leak; api-token=token-api-do-not-leak nested_token=token-nested-do-not-leak. provider_body={\"access_token\":\"token-access-do-not-leak\",\"nested\":{\"refresh_token\":\"token-refresh-do-not-leak\"}} body=first token-refresh-do-not-leak second auth_json={\"refresh_token\":\"token-auth-json-do-not-leak\"}. escaped string context: auth_json=\"{\\\"refresh_token\\\":\\\"escaped-refresh-do-not-leak\\\",\\\"access_token\\\":\\\"escaped-access-do-not-leak\\\"}\" provider_body=\"{\\\"refresh_token\\\":\\\"escaped-provider-refresh-do-not-leak\\\"}\". spaced alias context: client_secret=space-client-secret-do-not-leak first second; password=space-password-do-not-leak tail words"
+            "error" => "provider failed with safe recovery context. safe credential punctuation context: secret=secret-value-do-not-leak ; secret_token=secret-token-do-not-leak, client_secret=client-secret-do-not-leak. safe punctuation context: id_token=token-id-do-not-leak, session_token=token-session-do-not-leak; api-token=token-api-do-not-leak nested_token=token-nested-do-not-leak. provider_body={\"access_token\":\"token-access-do-not-leak\",\"nested\":{\"refresh_token\":\"token-refresh-do-not-leak\"}} body=first token-refresh-do-not-leak second auth_json={\"refresh_token\":\"token-auth-json-do-not-leak\"}. escaped string context: auth_json=\"{\\\"refresh_token\\\":\\\"escaped-refresh-do-not-leak\\\",\\\"access_token\\\":\\\"escaped-access-do-not-leak\\\"}\" provider_body=\"{\\\"refresh_token\\\":\\\"escaped-provider-refresh-do-not-leak\\\"}\". spaced alias context: client_secret=space-client-secret-do-not-leak first second; password=space-password-do-not-leak tail words"
           }
         ]
       )
@@ -707,9 +843,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert length(fast_projection.worker_jobs_by_group.account_reconciliation.unresolved_failures) ==
              3
 
-    assert length(
-             completed_projection.worker_jobs_by_group.account_reconciliation.unresolved_failures
-           ) == 3
+    assert length(completed_projection.worker_jobs_by_group.account_reconciliation.unresolved_failures) == 3
 
     assert full_projection.overview.total == 6
 
@@ -814,6 +948,9 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
   defp capture_repo_queries(fun) when is_function(fun, 0) do
     test_pid = self()
     handler_id = {__MODULE__, test_pid, System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(

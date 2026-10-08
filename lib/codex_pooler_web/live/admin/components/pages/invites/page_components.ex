@@ -6,9 +6,10 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.DateTimeDisplay
+  alias CodexPoolerWeb.RelativeTime
   alias Phoenix.LiveView.JS
 
-  @invite_docs_url "https://docs.codex-pooler.com/operators/invites/#active-invite-actions"
+  @invite_docs_url "https://www.codex-pooler.com/docs/operators/invites/#active-invite-actions"
 
   attr :id, :string, required: true
   attr :label, :string, required: true
@@ -42,7 +43,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
         <summary
           data-role={"#{@role}-trigger"}
           aria-label={@label}
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name={@selected.icon} class={["size-4 shrink-0", option_icon_class(@selected)]} />
           <span class="truncate">{@selected.label}</span>
@@ -79,8 +80,11 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
   attr :invites, :map, required: true
   attr :mailer_configured?, :boolean, required: true
   attr :datetime_preferences, :map, required: true
+  attr :now, :any, default: nil
 
   def invites_table(assigns) do
+    assigns = assign(assigns, :now, assigns.now || DateTime.utc_now())
+
     ~H"""
     <AdminComponents.empty_state
       :if={@invites.items == []}
@@ -172,7 +176,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
                 class="whitespace-nowrap text-center text-xs text-base-content/70"
                 title={datetime_label(invite.expires_at, @datetime_preferences)}
               >
-                {expiry_label(invite.expires_at)}
+                {expiry_label(invite.expires_at, @now)}
               </td>
               <td class="text-right">
                 <.invite_actions_menu
@@ -242,25 +246,22 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
     assigns = assign(assigns, :invite_docs_url, @invite_docs_url)
 
     ~H"""
-    <dialog :if={@invite} id="invite-revoke-dialog" class="modal" open>
-      <div class="modal-box max-w-xl rounded-box border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="grid gap-2 px-5 py-4">
-          <p class="text-xs font-semibold uppercase tracking-wide text-primary">Pool onboarding</p>
-          <h2 class="text-xl font-semibold text-base-content">Revoke Pool invite</h2>
-          <p class="text-sm text-base-content/70">
-            Revoke the active invite for <span class="font-semibold text-base-content">
-              {@invite.invited_email}
-            </span>.
+    <dialog
+      :if={@invite}
+      id="invite-revoke-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">Pool invite</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">
+            Revoke the invite for {@invite.invited_email}?
+          </h2>
+          <p class="mt-2 text-sm leading-6 text-base-content/70">
+            The invite URL stops working immediately. Upstream accounts already onboarded through it
+            keep working.
           </p>
-        </div>
-
-        <div class="border-t border-base-300 px-5 py-4">
-          <div class="alert border-error/20 bg-error/10 text-error">
-            <.icon name="hero-no-symbol" class="size-5" />
-            <span>
-              The existing invite URL will stop working immediately. Existing upstream accounts are not affected.
-            </span>
-          </div>
         </div>
 
         <AdminComponents.dialog_footer
@@ -268,24 +269,20 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
           docs_url={@invite_docs_url}
         >
           <:actions>
-            <button
+            <AdminComponents.action_button
               id="invite-revoke-cancel"
-              type="button"
-              class="btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"
+              label="Cancel"
+              variant={:ghost}
               phx-click="cancel_revoke_invite"
-            >
-              <span>Cancel</span>
-            </button>
-            <button
+            />
+            <AdminComponents.action_button
               id="invite-revoke-confirm"
-              type="button"
-              class="btn btn-error btn-sm gap-2"
+              icon="hero-no-symbol"
+              label="Revoke"
+              variant={:danger}
               phx-click="confirm_revoke_invite"
               phx-value-id={@invite.id}
-            >
-              <.icon name="hero-no-symbol" class="size-4" />
-              <span>Revoke invite</span>
-            </button>
+            />
           </:actions>
         </AdminComponents.dialog_footer>
       </div>
@@ -349,13 +346,13 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
     DateTimeDisplay.format_datetime(datetime, datetime_preferences)
   end
 
-  defp expiry_label(nil), do: "No expiry"
+  defp expiry_label(nil, _now), do: "No expiry"
 
-  defp expiry_label(%DateTime{} = datetime) do
-    diff_seconds = DateTime.diff(datetime, DateTime.utc_now(), :second)
+  defp expiry_label(%DateTime{} = datetime, %DateTime{} = now) do
+    diff_seconds = RelativeTime.seconds_until(datetime, now)
 
     cond do
-      diff_seconds <= 0 ->
+      DateTime.compare(datetime, now) != :gt ->
         "Expired"
 
       diff_seconds < 60 ->

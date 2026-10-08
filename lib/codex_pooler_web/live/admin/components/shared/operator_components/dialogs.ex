@@ -7,13 +7,14 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.OperatorComponents.Identity
   alias CodexPoolerWeb.Admin.OperatorForm
+  alias Phoenix.HTML.{Form, FormField}
 
-  @operator_docs_url "https://docs.codex-pooler.com/operators/operators/#create-operator"
-  @operator_actions_docs_url "https://docs.codex-pooler.com/operators/operators/#action-menu"
-  @operator_password_docs_url "https://docs.codex-pooler.com/operators/operators/#password-reset"
+  @operator_docs_url "https://www.codex-pooler.com/docs/operators/operators/#create-operator"
+  @operator_actions_docs_url "https://www.codex-pooler.com/docs/operators/operators/#action-menu"
+  @operator_password_docs_url "https://www.codex-pooler.com/docs/operators/operators/#password-reset"
 
   attr :creating_operator, :boolean, required: true
-  attr :create_form, Phoenix.HTML.Form, required: true
+  attr :create_form, Form, required: true
   attr :temporary_password_receipt, :map, default: nil
   attr :pool_options, :list, default: []
 
@@ -21,15 +22,22 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
     assigns = assign(assigns, :operator_docs_url, @operator_docs_url)
 
     ~H"""
-    <dialog :if={@creating_operator} id="operator-create-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+    <dialog
+      :if={@creating_operator}
+      id="operator-create-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
             Operator access
           </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Create operator</h2>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">
+            {create_dialog_title(@temporary_password_receipt)}
+          </h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Add a local admin account and decide how the first password is delivered.
+            {create_dialog_description(@temporary_password_receipt)}
           </p>
         </div>
 
@@ -41,7 +49,6 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           copy_button_id="operator-create-copy-temporary-password"
           close_button_id="operator-create-dialog-close"
           close_event="cancel_create_operator"
-          heading_text="Copy this temporary password now."
           email_error_copy="Operator email could not be sent. Copy the temporary password now."
         />
 
@@ -51,7 +58,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           for={@create_form}
           phx-submit="create_operator"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <div class="grid gap-4 md:grid-cols-2">
             <.operator_email_input
@@ -106,16 +113,21 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   end
 
   attr :editing_operator, :any, default: nil
-  attr :edit_form, Phoenix.HTML.Form, default: nil
+  attr :edit_form, Form, default: nil
   attr :pool_options, :list, default: []
 
   def operator_edit_dialog(assigns) do
     assigns = assign(assigns, :operator_actions_docs_url, @operator_actions_docs_url)
 
     ~H"""
-    <dialog :if={@editing_operator} id="operator-edit-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+    <dialog
+      :if={@editing_operator}
+      id="operator-edit-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
             Operator profile
           </p>
@@ -130,7 +142,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           for={@edit_form}
           phx-submit="save_operator"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@edit_form[:id]} type="hidden" />
           <div class="grid gap-4 md:grid-cols-2">
@@ -181,7 +193,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   attr :resetting_operator, :any, default: nil
   attr :password_dialog_receipt, :map, default: nil
   attr :reset_operation, :atom, default: nil
-  attr :reset_form, Phoenix.HTML.Form, required: true
+  attr :reset_form, Form, required: true
 
   def operator_password_dialog(assigns) do
     assigns = assign(assigns, :operator_password_docs_url, @operator_password_docs_url)
@@ -190,11 +202,11 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
     <dialog
       :if={@resetting_operator || @password_dialog_receipt}
       id="operator-password-dialog"
-      class="modal"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
       open
     >
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
             Operator credential
           </p>
@@ -220,7 +232,6 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           copy_button_id="operator-copy-temporary-password"
           close_button_id="operator-password-dialog-close"
           close_event="cancel_reset"
-          heading_text="Temporary password ready"
         />
 
         <.form
@@ -229,7 +240,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           for={@reset_form}
           phx-submit="save_temporary_password"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@reset_form[:id]} type="hidden" />
           <.input field={@reset_form[:operation]} type="hidden" />
@@ -268,12 +279,12 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
     """
   end
 
-  attr :field, Phoenix.HTML.FormField, required: true
+  attr :field, FormField, required: true
   attr :label, :string, default: "Email"
   attr :placeholder, :string, default: "operator@example.com"
   attr :required, :boolean, default: false
 
-  defp operator_email_input(%{field: %Phoenix.HTML.FormField{} = field} = assigns) do
+  defp operator_email_input(%{field: %FormField{} = field} = assigns) do
     errors = if Phoenix.Component.used_input?(field), do: field.errors, else: []
 
     assigns =
@@ -293,7 +304,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
             type="email"
             id={@id}
             name={@name}
-            value={Phoenix.HTML.Form.normalize_value("email", @value)}
+            value={Form.normalize_value("email", @value)}
             placeholder={@placeholder}
             autocomplete="email"
             required={@required}
@@ -309,57 +320,123 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
     """
   end
 
-  attr :form, Phoenix.HTML.Form, required: true
+  attr :form, Form, required: true
   attr :pool_options, :list, required: true
   attr :field_prefix, :string, required: true
 
   defp operator_role_fields(assigns) do
     assigns =
-      assign(
-        assigns,
-        :selected_pool_ids,
-        OperatorForm.selected_pool_ids(assigns.form)
-      )
+      assigns
+      |> assign(:selected_pool_ids, OperatorForm.selected_pool_ids(assigns.form))
+      |> assign(:selected_role, to_string(Form.input_value(assigns.form, :role)))
 
     ~H"""
-    <.input
-      field={@form[:role]}
-      type="select"
-      label="Operator role"
-      options={OperatorForm.role_options()}
-    />
-    <div class="fieldset mb-2 md:col-span-2">
-      <span class="label mb-1">Assigned Pools for instance admins</span>
-      <input type="hidden" name={@field_prefix <> "[pool_ids][]"} value="" />
-      <div
-        id={@field_prefix <> "_pool_ids_group"}
-        class="grid gap-2 rounded-box border border-base-300 bg-base-200/60 p-3"
-      >
-        <p :if={@pool_options == []} class="text-sm text-base-content/60">
-          No Pools are available yet. Owners can still create another owner.
-        </p>
-        <label
-          :for={pool <- @pool_options}
-          id={@field_prefix <> "_pool_id_" <> pool.id <> "_option"}
-          class="flex items-center gap-3 rounded-box bg-base-100 px-3 py-2 text-sm"
-        >
-          <input
-            id={@field_prefix <> "_pool_id_" <> pool.id}
-            type="checkbox"
-            name={@field_prefix <> "[pool_ids][]"}
-            value={pool.id}
-            checked={MapSet.member?(@selected_pool_ids, pool.id)}
-            class="checkbox checkbox-sm"
+    <div class="contents group/rolegate">
+      <fieldset id={@field_prefix <> "_role"} class="grid gap-2 md:col-span-2">
+        <legend class="mb-1 text-[0.6rem] font-bold uppercase tracking-wide text-base-content/50">
+          Operator role
+          <span class="ml-1 text-[11px] font-medium normal-case tracking-normal text-base-content/45">
+            Instance-wide owner or Pool-scoped admin
+          </span>
+        </legend>
+        <div class="grid gap-2 sm:grid-cols-2">
+          <.operator_role_card
+            id={@field_prefix <> "_role_instance_admin"}
+            field_prefix={@field_prefix}
+            value="instance_admin"
+            selected_role={@selected_role}
+            label="Instance admin"
+            description="Manages only the Pools assigned below."
           />
-          <span>{OperatorForm.pool_option_label(pool)}</span>
-        </label>
+          <.operator_role_card
+            id={@field_prefix <> "_role_instance_owner"}
+            field_prefix={@field_prefix}
+            value="instance_owner"
+            selected_role={@selected_role}
+            label="Instance owner"
+            description="Instance-wide access to every Pool and setting."
+          />
+        </div>
+      </fieldset>
+      <div class="fieldset mb-2 transition-opacity md:col-span-2 group-has-[.operator-role-owner:checked]/rolegate:opacity-45">
+        <p class="mb-1 text-[0.6rem] font-bold uppercase tracking-wide text-base-content/50">
+          Assigned Pools
+          <span class="ml-1 text-[11px] font-medium normal-case tracking-normal text-base-content/45">
+            Apply only while the role is instance admin; owners keep instance-wide access
+          </span>
+        </p>
+        <input type="hidden" name={@field_prefix <> "[pool_ids][]"} value="" />
+        <div id={@field_prefix <> "_pool_ids_group"} class="grid gap-2 sm:grid-cols-2">
+          <p :if={@pool_options == []} class="text-sm text-base-content/60 sm:col-span-2">
+            No Pools are available yet. Owners can still create another owner.
+          </p>
+          <label
+            :for={pool <- @pool_options}
+            id={@field_prefix <> "_pool_id_" <> pool.id <> "_option"}
+            class="flex min-h-10 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-1.5 transition-colors hover:border-primary/50 hover:bg-primary/5 has-[:checked]:border-primary/40 has-[:checked]:bg-primary/5"
+          >
+            <input
+              id={@field_prefix <> "_pool_id_" <> pool.id}
+              type="checkbox"
+              name={@field_prefix <> "[pool_ids][]"}
+              value={pool.id}
+              checked={MapSet.member?(@selected_pool_ids, pool.id)}
+              class="checkbox checkbox-primary checkbox-sm shrink-0"
+            />
+            <span class="truncate text-sm font-medium text-base-content">{pool.name}</span>
+          </label>
+        </div>
       </div>
-      <p class="mt-1 text-xs text-base-content/60">
-        Pool assignments apply only while the operator role is instance admin. Owners keep instance-wide access.
-      </p>
     </div>
     """
   end
+
+  attr :id, :string, required: true
+  attr :field_prefix, :string, required: true
+  attr :value, :string, required: true
+  attr :selected_role, :string, required: true
+  attr :label, :string, required: true
+  attr :description, :string, required: true
+
+  defp operator_role_card(assigns) do
+    ~H"""
+    <label class="group/rolecard relative flex min-w-0 cursor-pointer items-start gap-2.5 rounded-box border border-base-300 bg-base-100 p-2.5 transition-colors hover:border-primary/50 has-[.operator-role-radio:checked]:border-primary/60 has-[.operator-role-radio:checked]:bg-primary/5 has-[.operator-role-radio:focus-visible]:outline has-[.operator-role-radio:focus-visible]:outline-2 has-[.operator-role-radio:focus-visible]:outline-offset-2 has-[.operator-role-radio:focus-visible]:outline-primary">
+      <span class="pointer-events-none absolute right-2.5 top-3">
+        <.icon
+          name="hero-check"
+          class="hidden size-3 text-primary group-has-[.operator-role-radio:checked]/rolecard:inline-block"
+        />
+      </span>
+      <input
+        id={@id}
+        type="radio"
+        class={[
+          "operator-role-radio sr-only",
+          @value == "instance_owner" && "operator-role-owner"
+        ]}
+        name={@field_prefix <> "[role]"}
+        value={@value}
+        checked={@selected_role == @value}
+      />
+      <span class="grid min-w-0 gap-0.5">
+        <span class="text-[13px] font-semibold leading-tight text-base-content">{@label}</span>
+        <span class="text-[11px] leading-4 text-base-content/55">{@description}</span>
+      </span>
+    </label>
+    """
+  end
+
+  # The header follows the flow rather than freezing on the form's opening line:
+  # once the receipt exists the operator does too, and "add a local admin
+  # account" is describing a step already taken.
+  defp create_dialog_title(nil), do: "Create operator"
+  defp create_dialog_title(_receipt), do: "Copy this password before closing"
+
+  defp create_dialog_description(nil),
+    do: "Add a local admin account and decide how the first password is delivered."
+
+  defp create_dialog_description(_receipt),
+    do: "It is shown once, and cannot be recovered afterwards."
 
   attr :receipt, :map, required: true
   attr :wrapper_id, :string, required: true
@@ -367,61 +444,32 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   attr :copy_button_id, :string, required: true
   attr :close_button_id, :string, required: true
   attr :close_event, :string, required: true
-  attr :heading_text, :string, required: true
   attr :email_error_copy, :string, default: nil
 
   defp temporary_password_receipt_card(assigns) do
     assigns = assign(assigns, :operator_password_docs_url, @operator_password_docs_url)
 
     ~H"""
-    <div class="grid gap-5 p-6">
-      <div
-        id={@wrapper_id}
-        class={[
-          "alert items-start",
-          @receipt.email_error? && "alert-warning",
-          !@receipt.email_error? && "alert-success"
-        ]}
-      >
-        <.icon name="hero-key" class="size-5" />
+    <div id={@wrapper_id} class="grid gap-4 p-5 sm:p-6">
+      <div :if={@receipt.email_error?} class="alert alert-warning items-start">
+        <.icon name="hero-exclamation-triangle" class="size-5" />
         <div class="grid gap-1">
-          <p class="font-semibold">{@heading_text}</p>
-          <p :if={@receipt.email_error? && @email_error_copy} class="text-sm">
-            {@email_error_copy}
-          </p>
-          <p class="text-sm">
-            {@receipt.operator_email} must use this password on next sign in.
-          </p>
+          <p class="font-semibold">{@email_error_copy}</p>
+          <p class="text-sm">Hand it over yourself: they have no other way to receive it.</p>
         </div>
       </div>
 
-      <div class="grid gap-2 rounded-box border border-base-300 bg-base-200 p-4">
-        <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-          one-time password
-        </p>
-        <div class="join w-full">
-          <code
-            id={@code_id}
-            class="join-item min-h-10 flex-1 break-all border border-base-300 bg-base-100 px-3 py-2.5 font-mono text-sm text-base-content"
-          >
-            {@receipt.temporary_password}
-          </code>
-          <button
-            id={@copy_button_id}
-            type="button"
-            class="btn btn-neutral join-item min-h-10"
-            phx-hook="ClipboardCopy"
-            phx-update="ignore"
-            data-copy-text={@receipt.temporary_password}
-            data-copy-label="Copy"
-            data-copied-label="Copied"
-            aria-label="Copy one-time password"
-          >
-            <.icon name="hero-clipboard-document" class="copy-icon size-4" />
-            <span data-copy-label>Copy</span>
-          </button>
-        </div>
-      </div>
+      <p class="text-sm leading-6 text-base-content/70">
+        <span class="font-semibold text-base-content">{@receipt.operator_email}</span> must use it on next sign in.
+      </p>
+
+      <AdminComponents.one_time_secret
+        value={@receipt.temporary_password}
+        value_id={@code_id}
+        copy_id={@copy_button_id}
+        copy_label="Copy password"
+        copy_aria_label="Copy one-time password"
+      />
     </div>
 
     <AdminComponents.dialog_footer id={"#{@wrapper_id}-footer"} docs_url={@operator_password_docs_url}>
@@ -429,7 +477,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         <AdminComponents.action_button
           id={@close_button_id}
           icon="hero-check"
-          label="Close"
+          label="Done"
           phx-click={@close_event}
           variant={:primary}
         />
@@ -438,7 +486,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
     """
   end
 
-  attr :form, Phoenix.HTML.Form, required: true
+  attr :form, Form, required: true
 
   defp temporary_password_fields(assigns) do
     ~H"""

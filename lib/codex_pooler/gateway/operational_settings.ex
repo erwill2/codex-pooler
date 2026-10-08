@@ -3,7 +3,10 @@ defmodule CodexPooler.Gateway.OperationalSettings do
   Runtime-configurable gateway hardening and Codex settings.
   """
 
+  alias CodexPooler.Gateway.OperationalSettings.IPRules
+  alias CodexPooler.Gateway.OwnerRenewalSchedule
   alias CodexPooler.{InstanceSettings, RouteClass}
+  alias CodexPooler.Platform.OutboundHTTP
 
   @default_decompression_algorithms ["gzip", "deflate", "zstd"]
   @default_bulkheads RouteClass.default_bulkheads()
@@ -11,12 +14,69 @@ defmodule CodexPooler.Gateway.OperationalSettings do
   @websocket_owner_forwarding_allowed_values "true,false,1,0,yes,no,on,off"
   @websocket_owner_forwarding_truthy ~w(true 1 yes on)
   @websocket_owner_forwarding_falsey ~w(false 0 no off)
+  # `upstream_conn_max_idle_time_ms` is this snapshot's copy of the outbound
+  # connection idle bound. Its rationale, bounds, and clamping belong to
+  # `CodexPooler.Platform.OutboundHTTP`, which every non-gateway Req caller
+  # reads directly. The struct default seeds the Instance Setting default
+  # through `InstanceSettings.Defaults` and must equal
+  # `OutboundHTTP.default_conn_max_idle_time_ms/0`.
+  @upstream_conn_max_idle_time_default_ms 45_000
+  # `upstream_token_refresh_margin_seconds` is how close an active upstream
+  # identity's access token may come to its deadline before scheduled recovery
+  # refreshes it proactively, instead of waiting for traffic to mark it
+  # refresh_due. Its selection semantics belong to
+  # `CodexPooler.Jobs.TokenRefreshRecovery`, which reads this snapshot. Observed
+  # Codex access tokens carry a `jwt_exp` deadline roughly 6-10 days out, so the
+  # 48 h default refreshes an active identity about two days before it would
+  # expire: enough slack for several attempts at the recovery cooldown, while
+  # still leaving most of the token's life untouched. The struct default seeds
+  # the Instance Setting default through `InstanceSettings.Defaults`.
+  @upstream_token_refresh_margin_default_seconds 48 * 60 * 60
   @websocket_idle_timeout_default_ms 1_800_000
   @websocket_idle_timeout_min_ms 60_000
   @websocket_idle_timeout_max_ms 3_600_000
   @websocket_owner_idle_timeout_default_ms 1_800_000
   @websocket_owner_idle_timeout_min_ms 60_000
   @websocket_owner_idle_timeout_max_ms 3_600_000
+
+  @struct_fields [
+    source: :database,
+    db_available?: true,
+    secrets_available?: true,
+    file_max_size_bytes: 25 * 1024 * 1024,
+    upload_ttl_seconds: 24 * 60 * 60,
+    abandoned_upload_cleanup_interval_seconds: 15 * 60,
+    bridge_owner_lease_ttl_seconds: 45,
+    bridge_owner_lease_renewal_seconds: 15,
+    expired_alias_ttl_seconds: 24 * 60 * 60,
+    firewall_allowlist: [],
+    firewall_allowlist_compiled: {:ok, []},
+    trusted_proxies: [],
+    trusted_proxies_compiled: {:ok, []},
+    forwarded_client_ip_source: :x_forwarded_for,
+    forwarded_proxy_depth: 0,
+    decompression_algorithms: @default_decompression_algorithms,
+    zstd_supported?: true,
+    max_compressed_body_bytes: 128 * 1024 * 1024,
+    max_decompressed_body_bytes: 256 * 1024 * 1024,
+    max_decompression_ratio: 200,
+    decompression_timeout_ms: 10_000,
+    gateway_debug?: false,
+    sse_keepalive_interval_ms: 10_000,
+    bulkheads: @default_bulkheads,
+    circuit_failure_threshold: 3,
+    circuit_open_seconds: 60,
+    circuit_half_open_probe_limit: 1,
+    circuit_success_threshold: 1,
+    upstream_connect_timeout_ms: :timer.seconds(15),
+    upstream_pool_timeout_ms: :timer.seconds(15),
+    upstream_receive_timeout_ms: :timer.minutes(5),
+    upstream_conn_max_idle_time_ms: @upstream_conn_max_idle_time_default_ms,
+    upstream_token_refresh_margin_seconds: @upstream_token_refresh_margin_default_seconds,
+    websocket_idle_timeout_ms: @websocket_idle_timeout_default_ms,
+    websocket_owner_idle_timeout_ms: @websocket_owner_idle_timeout_default_ms,
+    model_context_window_overrides: %{}
+  ]
 
   @type bulkhead_settings :: %{
           max_concurrency: pos_integer(),
@@ -25,6 +85,9 @@ defmodule CodexPooler.Gateway.OperationalSettings do
         }
 
   @type t :: %__MODULE__{
+          source: :database | :fallback_defaults,
+          db_available?: boolean(),
+          secrets_available?: boolean(),
           file_max_size_bytes: pos_integer(),
           upload_ttl_seconds: pos_integer(),
           abandoned_upload_cleanup_interval_seconds: pos_integer(),
@@ -32,7 +95,11 @@ defmodule CodexPooler.Gateway.OperationalSettings do
           bridge_owner_lease_renewal_seconds: pos_integer(),
           expired_alias_ttl_seconds: pos_integer(),
           firewall_allowlist: [String.t()],
+          firewall_allowlist_compiled: IPRules.compiled(),
           trusted_proxies: [String.t()],
+          trusted_proxies_compiled: IPRules.compiled(),
+          forwarded_client_ip_source: :peer | :x_forwarded_for | :x_real_ip,
+          forwarded_proxy_depth: 0..16,
           decompression_algorithms: [String.t()],
           zstd_supported?: boolean(),
           max_compressed_body_bytes: pos_integer(),
@@ -49,59 +116,61 @@ defmodule CodexPooler.Gateway.OperationalSettings do
           upstream_connect_timeout_ms: pos_integer(),
           upstream_pool_timeout_ms: pos_integer(),
           upstream_receive_timeout_ms: pos_integer(),
+          upstream_conn_max_idle_time_ms: pos_integer(),
+          upstream_token_refresh_margin_seconds: pos_integer(),
           websocket_idle_timeout_ms: pos_integer(),
           websocket_owner_idle_timeout_ms: pos_integer(),
           model_context_window_overrides: %{String.t() => pos_integer()}
         }
 
-  defstruct file_max_size_bytes: 25 * 1024 * 1024,
-            upload_ttl_seconds: 24 * 60 * 60,
-            abandoned_upload_cleanup_interval_seconds: 15 * 60,
-            bridge_owner_lease_ttl_seconds: 45,
-            bridge_owner_lease_renewal_seconds: 15,
-            expired_alias_ttl_seconds: 24 * 60 * 60,
-            firewall_allowlist: [],
-            trusted_proxies: [],
-            decompression_algorithms: @default_decompression_algorithms,
-            zstd_supported?: true,
-            max_compressed_body_bytes: 32 * 1024 * 1024,
-            max_decompressed_body_bytes: 64 * 1024 * 1024,
-            max_decompression_ratio: 200,
-            decompression_timeout_ms: 10_000,
-            gateway_debug?: false,
-            sse_keepalive_interval_ms: 10_000,
-            bulkheads: @default_bulkheads,
-            circuit_failure_threshold: 3,
-            circuit_open_seconds: 60,
-            circuit_half_open_probe_limit: 1,
-            circuit_success_threshold: 1,
-            upstream_connect_timeout_ms: :timer.seconds(15),
-            upstream_pool_timeout_ms: :timer.seconds(15),
-            upstream_receive_timeout_ms: :timer.minutes(5),
-            websocket_idle_timeout_ms: @websocket_idle_timeout_default_ms,
-            websocket_owner_idle_timeout_ms: @websocket_owner_idle_timeout_default_ms,
-            model_context_window_overrides: %{}
+  defstruct @struct_fields
 
   @spec current() :: t()
-  def current do
-    case test_settings_override() do
-      %__MODULE__{} = settings -> settings
-      nil -> InstanceSettings.current() |> from_instance_settings()
+  if Mix.env() == :test do
+    def current do
+      case test_settings_override() do
+        %__MODULE__{} = settings -> normalize_ip_rules(settings)
+        nil -> InstanceSettings.current() |> from_instance_settings()
+      end
     end
+
+    defp test_settings_override do
+      config = Application.get_env(:codex_pooler, __MODULE__, [])
+
+      unless Keyword.get(config, :use_instance_settings?, false) do
+        Keyword.get(config, :settings, %__MODULE__{})
+      end
+    end
+
+    defp normalize_ip_rules(%__MODULE__{} = settings) do
+      %{
+        settings
+        | firewall_allowlist_compiled: IPRules.compile(settings.firewall_allowlist),
+          trusted_proxies_compiled: IPRules.compile(settings.trusted_proxies)
+      }
+    end
+  else
+    def current, do: InstanceSettings.current() |> from_instance_settings()
   end
 
   @spec from_instance_settings(InstanceSettings.Settings.t()) :: t()
   def from_instance_settings(%InstanceSettings.Settings{} = settings) do
     %__MODULE__{
+      source: settings.source,
+      db_available?: settings.db_available?,
+      secrets_available?: settings.secrets_available?,
       file_max_size_bytes: settings.files.max_size_bytes,
       upload_ttl_seconds: settings.files.upload_ttl_seconds,
-      abandoned_upload_cleanup_interval_seconds:
-        settings.files.abandoned_upload_cleanup_interval_seconds,
-      bridge_owner_lease_ttl_seconds: settings.gateway.bridge_owner_lease_ttl_seconds,
-      bridge_owner_lease_renewal_seconds: settings.gateway.bridge_owner_lease_renewal_seconds,
+      abandoned_upload_cleanup_interval_seconds: settings.files.abandoned_upload_cleanup_interval_seconds,
+      bridge_owner_lease_ttl_seconds: effective_owner_lease_ttl_seconds(settings.gateway),
+      bridge_owner_lease_renewal_seconds: effective_owner_lease_renewal_seconds(settings.gateway),
       expired_alias_ttl_seconds: settings.gateway.expired_alias_ttl_seconds,
       firewall_allowlist: settings.ingress.firewall_allowlist,
+      firewall_allowlist_compiled: IPRules.compile(settings.ingress.firewall_allowlist),
       trusted_proxies: settings.ingress.trusted_proxies,
+      trusted_proxies_compiled: IPRules.compile(settings.ingress.trusted_proxies),
+      forwarded_client_ip_source: settings.ingress.forwarded_client_ip_source,
+      forwarded_proxy_depth: settings.ingress.forwarded_proxy_depth,
       decompression_algorithms: settings.ingress.decompression_algorithms,
       zstd_supported?: true,
       max_compressed_body_bytes: settings.ingress.max_compressed_body_bytes,
@@ -118,23 +187,56 @@ defmodule CodexPooler.Gateway.OperationalSettings do
       upstream_connect_timeout_ms: settings.gateway.upstream_connect_timeout_ms,
       upstream_pool_timeout_ms: settings.gateway.upstream_pool_timeout_ms,
       upstream_receive_timeout_ms: settings.gateway.upstream_receive_timeout_ms,
-      websocket_idle_timeout_ms:
-        clamp_websocket_idle_timeout(settings.gateway.websocket_idle_timeout_ms),
-      websocket_owner_idle_timeout_ms:
-        clamp_websocket_owner_idle_timeout(settings.gateway.websocket_owner_idle_timeout_ms),
+      upstream_conn_max_idle_time_ms: OutboundHTTP.conn_max_idle_time_ms(settings),
+      upstream_token_refresh_margin_seconds: settings.gateway.upstream_token_refresh_margin_seconds,
+      websocket_idle_timeout_ms: clamp_websocket_idle_timeout(settings.gateway.websocket_idle_timeout_ms),
+      websocket_owner_idle_timeout_ms: clamp_websocket_owner_idle_timeout(settings.gateway.websocket_owner_idle_timeout_ms),
       model_context_window_overrides: settings.gateway.model_context_window_overrides
     }
   end
 
+  @doc """
+  Finch HTTP/1 pool options for gateway Req requests, built by
+  `OutboundHTTP.pool_options/1` from this snapshot's idle bound: dispatch
+  through `TransportEnvelope.req_timeout_options/1` and the file bridge upload
+  PUT. Callers outside the gateway use `OutboundHTTP.pool_options/0`, which
+  reads the same Instance Setting.
+  """
+  @spec upstream_http_pool_options() :: OutboundHTTP.pool_options()
+  def upstream_http_pool_options do
+    OutboundHTTP.pool_options(current().upstream_conn_max_idle_time_ms)
+  end
+
+  @spec upstream_http_pool_options(keyword()) :: OutboundHTTP.pool_options()
+  def upstream_http_pool_options(conn_opts) when is_list(conn_opts) do
+    OutboundHTTP.pool_options_with_conn_opts(
+      current().upstream_conn_max_idle_time_ms,
+      conn_opts
+    )
+  end
+
+  @spec upstream_http_pool_options(String.t(), keyword()) :: OutboundHTTP.pool_options()
+  def upstream_http_pool_options(url, conn_opts) when is_binary(url) and is_list(conn_opts) do
+    OutboundHTTP.pool_options_for_url(
+      url,
+      current().upstream_conn_max_idle_time_ms,
+      conn_opts
+    )
+  end
+
   @spec firewall_enabled?(t()) :: boolean()
   def firewall_enabled?(%__MODULE__{firewall_allowlist: allowlist}), do: allowlist != []
+
+  @spec settings_unavailable?(t()) :: boolean()
+  def settings_unavailable?(%__MODULE__{source: :fallback_defaults}), do: true
+  def settings_unavailable?(%__MODULE__{}), do: false
 
   @spec websocket_owner_forwarding_env_name() :: String.t()
   def websocket_owner_forwarding_env_name, do: @websocket_owner_forwarding_env
 
   @spec websocket_owner_forwarding_enabled?() :: boolean()
   def websocket_owner_forwarding_enabled? do
-    Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled, false)
+    Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled, false) == true
   end
 
   @spec parse_websocket_owner_forwarding_env!() :: boolean()
@@ -163,14 +265,26 @@ defmodule CodexPooler.Gateway.OperationalSettings do
     end
   end
 
-  defp test_settings_override do
-    if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
-      config = Application.get_env(:codex_pooler, __MODULE__, [])
+  @doc """
+  The owner lease ttl in effect for stored gateway settings: a stored value
+  below `OwnerRenewalSchedule.minimum_lease_ttl_seconds/0` is raised to it.
+  """
+  @spec effective_owner_lease_ttl_seconds(map()) :: pos_integer()
+  def effective_owner_lease_ttl_seconds(gateway) when is_map(gateway),
+    do: OwnerRenewalSchedule.effective_lease_ttl_seconds(Map.get(gateway, :bridge_owner_lease_ttl_seconds), @struct_fields[:bridge_owner_lease_ttl_seconds])
 
-      unless Keyword.get(config, :use_instance_settings?, false) do
-        Keyword.get(config, :settings, %__MODULE__{})
-      end
-    end
+  @doc """
+  The owner lease renewal interval in effect for stored gateway settings: a
+  stored value above a third of the effective ttl is lowered to it, so every
+  owner renews well before its lease expires (findings#206 row 206-499).
+  """
+  @spec effective_owner_lease_renewal_seconds(map()) :: pos_integer()
+  def effective_owner_lease_renewal_seconds(gateway) when is_map(gateway) do
+    OwnerRenewalSchedule.effective_renewal_seconds(
+      Map.get(gateway, :bridge_owner_lease_renewal_seconds),
+      effective_owner_lease_ttl_seconds(gateway),
+      @struct_fields[:bridge_owner_lease_renewal_seconds]
+    )
   end
 
   defp normalize_bulkheads(bulkheads) when is_map(bulkheads) do

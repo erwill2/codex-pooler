@@ -3,6 +3,11 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
 
   alias CodexPooler.Accounting
   alias CodexPooler.Alerts.Schemas.{AlertChannel, AlertDeliveryAttempt, AlertIncident}
+  alias CodexPooler.Alerts.StatusVocabulary.AssignmentState
+  alias CodexPooler.JSON.OrderedObject
+  alias CodexPooler.RouteClass
+
+  @circuit_blocked_reasons ~w(open_cooldown open_no_probe probe_saturated)
 
   # reset_expires_at / reset_first_seen_at are the evidence v1 names; the
   # current evaluator emits the *_reset_* v2 keys, but stored incidents can
@@ -10,21 +15,30 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
   @safe_summary_keys ~w(
     assignment_count
     available_count
+    circuit_blocked_assignment_count
+    circuit_blocked_lane_count
+    circuit_blocked_reasons
+    circuit_blocked_route_classes
+    circuit_recency_seconds
     earliest_reset_first_seen_at
     enabled_assignment_count
     impacted_pool_count
     latest_reset_expires_at
     latest_reset_first_seen_at
     model
+    model_membership_resolved
     new_reset_count
     next_reset_expires_at
+    non_serving_assignment_count
     path_style
     quota_state
     reason_code
     reset_expires_at
     reset_first_seen_at
+    route_class_scope
     routing_usable
     source
+    state_counts
     status
     target_state
     threshold_used_percent
@@ -95,7 +109,7 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
 
     %{
       event_id: Map.fetch!(payload, "event_id"),
-      body: payload |> canonical_json_value() |> Jason.encode!()
+      body: payload |> canonical_json_value() |> CodexPooler.JSON.encode!()
     }
   end
 
@@ -113,7 +127,7 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
     evidence
     |> safe_metadata()
     |> Map.take(@safe_summary_keys)
-    |> Map.new(fn {key, value} -> {key, safe_summary_value(value)} end)
+    |> Map.new(fn {key, value} -> {key, safe_summary_value(key, value, evidence)} end)
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
@@ -147,18 +161,48 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
   end
 
   defp reason_code(%{} = evidence) do
-    case safe_summary_value(Map.get(evidence, "reason_code") || Map.get(evidence, :reason_code)) do
+    case safe_summary_value(
+           "reason_code",
+           Map.get(evidence, "reason_code") || Map.get(evidence, :reason_code),
+           evidence
+         ) do
       value when is_binary(value) -> value
       _value -> nil
     end
   end
 
-  defp safe_summary_value(value) when is_integer(value) or is_float(value) or is_boolean(value),
-    do: value
+  defp safe_summary_value("circuit_blocked_route_classes", _value, evidence) do
+    bounded_safe_list(
+      evidence,
+      "circuit_blocked_route_classes",
+      :circuit_blocked_route_classes,
+      RouteClass.all()
+    )
+  end
 
-  defp safe_summary_value(%Decimal{} = value), do: Decimal.to_string(value, :normal)
+  # Per-assignment state counts from the evaluation, bounded to the alert
+  # state vocabulary, so an incident caused by, for example, an unserved model
+  # says so instead of only `model_membership_resolved=false`.
+  defp safe_summary_value("state_counts", _value, evidence),
+    do: AssignmentState.bounded_counts(Map.get(evidence, "state_counts") || Map.get(evidence, :state_counts))
 
-  defp safe_summary_value(value) when is_binary(value) do
+  defp safe_summary_value("circuit_blocked_reasons", _value, evidence) do
+    bounded_safe_list(
+      evidence,
+      "circuit_blocked_reasons",
+      :circuit_blocked_reasons,
+      @circuit_blocked_reasons
+    )
+  end
+
+  defp safe_summary_value(_key, value, _evidence)
+       when is_integer(value) or is_float(value) or is_boolean(value),
+       do: value
+
+  defp safe_summary_value(_key, %Decimal{} = value, _evidence),
+    do: Decimal.to_string(value, :normal)
+
+  defp safe_summary_value(_key, value, _evidence) when is_binary(value) do
     value = String.trim(value)
 
     cond do
@@ -169,13 +213,31 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
     end
   end
 
-  defp safe_summary_value(_value), do: nil
+  defp safe_summary_value(_key, _value, _evidence), do: nil
+
+  defp bounded_safe_list(evidence, string_key, atom_key, vocabulary) do
+    values = Map.get(evidence, string_key) || Map.get(evidence, atom_key)
+
+    values =
+      case values do
+        values when is_list(values) ->
+          values
+          |> Enum.filter(&(&1 in vocabulary))
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        _value ->
+          []
+      end
+
+    if values == [], do: nil, else: values
+  end
 
   defp canonical_json_value(%{} = value) do
     value
     |> Enum.map(fn {key, item} -> {to_string(key), canonical_json_value(item)} end)
     |> Enum.sort_by(fn {key, _value} -> key end)
-    |> Jason.OrderedObject.new()
+    |> OrderedObject.new()
   end
 
   defp canonical_json_value(values) when is_list(values),

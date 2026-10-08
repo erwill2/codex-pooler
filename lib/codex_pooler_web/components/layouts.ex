@@ -77,7 +77,7 @@ defmodule CodexPoolerWeb.Layouts do
     >
       <aside class="flex flex-col items-center gap-2 sm:flex-row sm:gap-3">
         <.link
-          href="https://docs.codex-pooler.com"
+          href="https://www.codex-pooler.com/"
           target="_blank"
           rel="noopener noreferrer"
           class="font-medium text-base-content/75 hover:text-base-content"
@@ -109,11 +109,13 @@ defmodule CodexPoolerWeb.Layouts do
 
   if @dev_features_build_enabled do
     defp impeccable_live_script(assigns) do
+      # The src carries the running helper's port and session token, so it is
+      # resolved per render rather than baked in; nil means "render nothing"
+      # (toggle off, no helper, or the injector already owns the document).
+      assigns = assign(assigns, :src, CodexPoolerWeb.DevFeatures.impeccable_live_script_src())
+
       ~H"""
-      <script
-        :if={CodexPoolerWeb.DevFeatures.impeccable_live_enabled?()}
-        src={CodexPoolerWeb.DevFeatures.impeccable_live_script_src()}
-      >
+      <script :if={@src} src={@src}>
       </script>
       """
     end
@@ -142,7 +144,8 @@ defmodule CodexPoolerWeb.Layouts do
 
   def flash_group(assigns) do
     ~H"""
-    <div id={@id} aria-live="polite" class="toast toast-top toast-end z-50">
+    <%!-- Below `sm` the stack sits at the bottom so it clears the top header and the page connection notices; a bottom-sheet dialog (z 999) would hide it there, so while one is open it goes back to the top. From `sm` it sits at the top as before. --%>
+    <div id={@id} aria-live="polite" class="toast toast-end z-50 sm:toast-top max-sm:[body:has(dialog[open])_&]:top-4 max-sm:[body:has(dialog[open])_&]:bottom-auto">
       <.flash kind={:info} flash={@flash} />
       <.flash kind={:error} flash={@flash} />
 
@@ -185,9 +188,7 @@ defmodule CodexPoolerWeb.Layouts do
   """
   attr :id, :string, default: nil
 
-  attr :class, :any,
-    default:
-      "card relative flex flex-row items-center border-2 border-base-300 bg-base-300 rounded-full"
+  attr :class, :any, default: "card relative flex flex-row items-center border-2 border-base-300 bg-base-300 rounded-full"
 
   def theme_toggle(assigns) do
     ~H"""
@@ -195,6 +196,9 @@ defmodule CodexPoolerWeb.Layouts do
       <div class="absolute w-1/3 h-full rounded-full border-1 border-base-200 bg-base-100 brightness-200 left-0 [[data-theme=light]_&]:left-1/3 [[data-theme=dark]_&]:left-2/3 transition-[left]" />
 
       <button
+        type="button"
+        aria-label={gettext("Match system theme")}
+        title={gettext("Match system theme")}
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="system"
@@ -203,6 +207,9 @@ defmodule CodexPoolerWeb.Layouts do
       </button>
 
       <button
+        type="button"
+        aria-label={gettext("Light theme")}
+        title={gettext("Light theme")}
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="light"
@@ -211,6 +218,9 @@ defmodule CodexPoolerWeb.Layouts do
       </button>
 
       <button
+        type="button"
+        aria-label={gettext("Dark theme")}
+        title={gettext("Dark theme")}
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="dark"

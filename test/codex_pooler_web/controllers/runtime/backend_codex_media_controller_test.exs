@@ -19,15 +19,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
 
   describe "Codex backend media endpoints" do
     setup do
-      previous = Application.get_env(:codex_pooler, InstanceSettings, [])
+      previous = CodexPooler.TestAppEnv.restore_on_exit(InstanceSettings)
       Application.put_env(:codex_pooler, InstanceSettings, Keyword.delete(previous, :repo))
       Repo.delete_all(Settings)
       InstanceSettings.reset_cache_for_test()
 
-      on_exit(fn ->
-        Application.put_env(:codex_pooler, InstanceSettings, previous)
-        InstanceSettings.reset_cache_for_test()
-      end)
+      on_exit(fn -> InstanceSettings.reset_cache_for_test() end)
 
       :ok
     end
@@ -86,6 +83,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
           "model" => requested_model,
           "file" => upload,
           "prompt" => prompt,
+          "keywords" => ["backend-keyword"],
+          "languages" => ["en"],
           "response_format" => "json"
         })
 
@@ -97,6 +96,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
       refute captured.body =~ Gateway.backend_transcription_model()
       refute captured.body =~ requested_model
       assert captured.body =~ prompt
+      refute captured.body =~ "backend-keyword"
+      refute captured.body =~ "keywords[]"
+      refute captured.body =~ "languages[]"
       refute captured.body =~ filename
       assert captured.body =~ ~s(filename="audio.wav")
       refute captured.body =~ "language"
@@ -113,6 +115,54 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
       refute inspect(request.request_metadata) =~ filename
       refute inspect(request.request_metadata) =~ prompt
       refute inspect(request.request_metadata) =~ transcript
+    end
+
+    for shape <- [:namespaced, :root, :no_constraint, :malformed, :invalid_field_value] do
+      @tag residency_shape: shape
+      test "POST /backend-api/transcribe derives residency from #{shape} selected credentials", %{conn: conn, residency_shape: shape} do
+        label = Atom.to_string(shape)
+
+        {token, expected_residency} = residency_credentials(shape)
+
+        upstream = start_upstream(FakeUpstream.json_response(%{"text" => "ok"}))
+
+        setup =
+          gateway_setup(upstream,
+            exposed_model_id: Gateway.backend_transcription_model(),
+            model_metadata: %{"input_modalities" => ["audio"], "modes" => ["transcription"]},
+            upstream_token: token
+          )
+
+        upload = upload_fixture("#{label}.wav", "audio/wav", "synthetic audio bytes")
+
+        response =
+          conn
+          |> recycle()
+          |> put_req_header(
+            "x-openai-internal-codex-residency",
+            "caller-controlled-residency"
+          )
+          |> auth(setup)
+          |> post("/backend-api/transcribe", %{"file" => upload})
+
+        assert %{"text" => "ok"} = json_response(response, 200)
+        assert [captured] = FakeUpstream.requests(upstream)
+
+        residency_headers = header_values(captured.headers, "x-openai-internal-codex-residency")
+
+        if expected_residency do
+          assert residency_headers == [expected_residency]
+        else
+          assert residency_headers == []
+        end
+
+        refute "caller-controlled-residency" in residency_headers
+
+        assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+        persisted = inspect(request.request_metadata)
+        refute persisted =~ token
+        refute persisted =~ (expected_residency || "caller-controlled-residency")
+      end
     end
 
     test "POST /backend-api/transcribe accepts omitted model by using fixed backend semantics", %{
@@ -222,7 +272,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
         setup.model
         |> Ecto.Changeset.change(%{
           source_assignment_count: 2,
-          metadata: %{"source_assignment_ids" => [setup.assignment.id, healthy.assignment.id]}
+          metadata:
+            setup.model.metadata
+            |> Map.put("source_assignment_ids", [setup.assignment.id, healthy.assignment.id])
+            |> put_in(
+              ["source_assignment_models", healthy.assignment.id],
+              setup.model.metadata["source_assignment_models"][setup.assignment.id]
+            )
         })
         |> Repo.update!()
 
@@ -281,7 +337,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
   defp gateway_setup(upstream, opts) do
     key = active_api_key_fixture()
     pool = key.pool
-    upstream_token = generated_secret("upstream")
+    upstream_token = Keyword.get(opts, :upstream_token, generated_secret("upstream"))
     upstream = gateway_upstream(pool, upstream, upstream_token)
     prime_routing_quota!(upstream.identity)
     model_metadata = Keyword.get(opts, :model_metadata, %{})
@@ -289,13 +345,23 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
     upstream_model_id = Keyword.get(opts, :upstream_model_id, "provider-gpt-media-model")
     supports_responses = Keyword.get(opts, :supports_responses, true)
 
+    source_metadata =
+      %{
+        "slug" => exposed_model_id,
+        "id" => upstream_model_id
+      }
+      |> Map.merge(Map.get(model_metadata, "upstream_model", %{}))
+      |> Map.merge(Map.drop(model_metadata, ["upstream_model"]))
+
     model =
       model_fixture(pool, %{
         exposed_model_id: exposed_model_id,
         upstream_model_id: upstream_model_id,
         pricing_ref: upstream_model_id,
         metadata:
-          Map.merge(%{"source_assignment_ids" => [upstream.assignment.id]}, model_metadata),
+          model_metadata
+          |> Map.put("source_assignment_ids", [upstream.assignment.id])
+          |> Map.put("source_assignment_models", %{upstream.assignment.id => source_metadata}),
         supports_responses: supports_responses,
         supports_streaming: false
       })
@@ -426,6 +492,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
     File.mkdir_p!(tmp_root)
 
     previous_upload_term = :persistent_term.get(Plug.Upload)
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs, and
+    # every later upload in the run would target the directory this test removes.
+    on_exit(fn ->
+      :persistent_term.put(Plug.Upload, previous_upload_term)
+      File.rm_rf!(tmp_root)
+    end)
+
     :persistent_term.put(Plug.Upload, {[tmp_root], "test-upload-suffix"})
     :ets.delete(Plug.Upload.Dir, self())
     :ets.delete(Plug.Upload.Path, self())
@@ -449,6 +523,28 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
 
   defp generated_secret(label),
     do: "fixture-secret-#{label}-#{System.unique_integer([:positive])}"
+
+  defp residency_credentials(:namespaced), do: {residency_token(:namespaced, "media-region-namespaced"), "media-region-namespaced"}
+  defp residency_credentials(:root), do: {residency_token(:root, "media-region-root"), "media-region-root"}
+  defp residency_credentials(:no_constraint), do: {residency_token(:root, "no_constraint"), nil}
+  defp residency_credentials(:malformed), do: {"malformed-selected-credential", nil}
+  defp residency_credentials(:invalid_field_value), do: {residency_token(:root, "invalid\r\nvalue"), nil}
+
+  defp residency_token(:namespaced, value) do
+    jwt(%{"https://api.openai.com/auth" => %{"chatgpt_compute_residency" => value}})
+  end
+
+  defp residency_token(:root, value), do: jwt(%{"chatgpt_compute_residency" => value})
+
+  defp jwt(claims) do
+    header = Base.url_encode64(CodexPooler.JSON.encode!(%{"alg" => "none"}), padding: false)
+    payload = Base.url_encode64(CodexPooler.JSON.encode!(claims), padding: false)
+    Enum.join([header, payload, "signature"], ".")
+  end
+
+  defp header_values(headers, expected_name) do
+    for {name, value} <- headers, String.downcase(name) == expected_name, do: value
+  end
 
   defp seed_preferring_assignment(assignment_ids, desired_assignment_id) do
     Enum.find(1..500, fn index ->

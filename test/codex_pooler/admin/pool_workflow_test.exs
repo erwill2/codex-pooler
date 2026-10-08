@@ -115,6 +115,69 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
     end
   end
 
+  describe "pool assignment audit" do
+    test "an edit audits each upstream account it assigns or unassigns, in the same transaction" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "assignment-audit-owner@example.com"})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      pool = pool_fixture(%{slug: "assignment-audit", name: "Assignment Audit"})
+
+      %{identity: kept_identity} = upstream_assignment_fixture(pool, %{chatgpt_account_id: "acct_audit_kept"})
+      %{identity: removed_identity, assignment: removed_assignment} = upstream_assignment_fixture(pool, %{chatgpt_account_id: "acct_audit_removed"})
+      added_identity = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_audit_added"})
+
+      assert {:ok, _pool} =
+               PoolWorkflow.update_pool_with_related_settings(scope, pool, %{
+                 "name" => "Assignment Audit",
+                 "status" => "active",
+                 "routing_strategy" => "bridge_ring",
+                 "upstream_identity_ids" => [kept_identity.id, added_identity.id],
+                 "api_key_ids" => []
+               })
+
+      assert Repo.get!(PoolUpstreamAssignment, removed_assignment.id).status == "deleted"
+
+      assert [removed] = assignment_audit_events(pool, "pool.assignment_remove")
+      assert removed.actor_user_id == owner.id
+      assert removed.target_type == "upstream_identity"
+      assert removed.target_id == removed_identity.id
+      assert removed.details["pool_upstream_assignment_id"] == removed_assignment.id
+
+      assert [added] = assignment_audit_events(pool, "pool.assignment_add")
+      assert added.target_id == added_identity.id
+
+      assert {:ok, _pool} =
+               PoolWorkflow.update_pool_with_related_settings(scope, pool, %{
+                 "name" => "Assignment Audit",
+                 "status" => "active",
+                 "routing_strategy" => "bridge_ring",
+                 "upstream_identity_ids" => [kept_identity.id, added_identity.id],
+                 "api_key_ids" => []
+               })
+
+      assert length(assignment_audit_events(pool, "pool.assignment_add")) == 1
+      assert length(assignment_audit_events(pool, "pool.assignment_remove")) == 1
+    end
+
+    test "a rolled back edit leaves no assignment audit event" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "assignment-audit-rollback@example.com"})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      pool = pool_fixture(%{slug: "assignment-audit-rollback", name: "Assignment Audit Rollback"})
+      %{assignment: assignment} = upstream_assignment_fixture(pool, %{chatgpt_account_id: "acct_audit_rollback"})
+
+      assert {:error, _reason} =
+               PoolWorkflow.update_pool_with_related_settings(scope, pool, %{
+                 "name" => "Assignment Audit Rollback",
+                 "status" => "active",
+                 "routing_strategy" => "bridge_ring",
+                 "upstream_identity_ids" => [],
+                 "api_key_ids" => [Ecto.UUID.generate()]
+               })
+
+      assert Repo.get!(PoolUpstreamAssignment, assignment.id).status != "deleted"
+      assert assignment_audit_events(pool, "pool.assignment_remove") == []
+    end
+  end
+
   describe "pool assignment catalog sync enqueue" do
     test "creation with upstream identity selection enqueues an immediate catalog sync" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "catalog-create-owner@example.com"})
@@ -270,48 +333,7 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
   end
 
   describe "pool routing settings workflow" do
-    test "creation persists per-pool upstream routing priorities" do
-      %{user: owner} = bootstrap_owner_fixture(%{"email" => "priority-owner@example.com"})
-      scope = Scope.for_user(owner, ["instance_owner"])
-
-      first = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_priority_first"})
-      second = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_priority_second"})
-
-      assert {:ok, pool} =
-               PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Priority Workflow",
-                 "routing_strategy" => "quota_first",
-                 "upstream_identity_ids" => [first.id, second.id],
-                 "upstream_priorities" => %{first.id => "1", second.id => "20"},
-                 "api_key_ids" => []
-               })
-
-      priorities =
-        pool
-        |> Upstreams.list_pool_assignments()
-        |> Map.new(&{&1.upstream_identity_id, &1.routing_priority})
-
-      assert priorities == %{first.id => 1, second.id => 20}
-    end
-
-    test "invalid upstream routing priority rolls back the coordinated workflow" do
-      %{user: owner} = bootstrap_owner_fixture(%{"email" => "priority-invalid@example.com"})
-      scope = Scope.for_user(owner, ["instance_owner"])
-      identity = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_priority_invalid"})
-
-      assert {:error, %Ecto.Changeset{} = changeset} =
-               PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Invalid Priority Workflow",
-                 "upstream_identity_ids" => [identity.id],
-                 "upstream_priorities" => %{identity.id => "0"},
-                 "api_key_ids" => []
-               })
-
-      assert "must be greater than or equal to 1" in errors_on(changeset).routing_priority
-      refute Repo.get_by(Pool, slug: "invalid-priority-workflow")
-    end
-
-    test "creation persists request compression routing setting when enabled" do
+    test "creation ignores retired routing attributes" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       scope = Scope.for_user(owner, ["instance_owner"])
 
@@ -324,12 +346,13 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
 
       settings = Pools.get_routing_settings(pool)
 
-      assert settings.request_compression_enabled == true
+      refute Map.has_key?(settings, :request_compression_enabled)
+      assert [[false]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
       assert settings.prompt_cache_affinity_enabled == true
       assert settings.v1_compatibility_enabled == true
     end
 
-    test "update persists request compression routing setting with compatibility toggles" do
+    test "update ignores retired routing attributes while persisting compatibility toggles" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       scope = Scope.for_user(owner, ["instance_owner"])
       pool = pool_fixture(%{slug: "compression-workflow-edit", name: "Compression Workflow Edit"})
@@ -338,6 +361,8 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
                Pools.update_routing_settings(scope, pool, %{
                  "request_compression_enabled" => true
                })
+
+      Repo.query!("UPDATE pool_routing_settings SET request_compression_enabled = true WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)])
 
       assert {:ok, updated_pool} =
                PoolWorkflow.update_pool_with_related_settings(scope, pool, %{
@@ -354,53 +379,58 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
       settings = Pools.get_routing_settings(updated_pool)
 
       assert updated_pool.id == pool.id
-      assert settings.request_compression_enabled == false
+      refute Map.has_key?(settings, :request_compression_enabled)
+      assert [[true]] = Repo.query!("SELECT request_compression_enabled FROM pool_routing_settings WHERE pool_id = $1", [Ecto.UUID.dump!(pool.id)]).rows
       assert settings.prompt_cache_affinity_enabled == false
       assert settings.v1_compatibility_enabled == false
     end
 
-    test "creation persists the upstream websocket bridge routing setting when enabled" do
+    test "creation defaults image generation permission on" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       scope = Scope.for_user(owner, ["instance_owner"])
 
       assert {:ok, pool} =
                PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Bridge Workflow Create",
-                 "routing_strategy" => "bridge_ring",
-                 "upstream_websocket_bridge_enabled" => "true"
+                 "name" => "Image Generation Workflow Create",
+                 "routing_strategy" => "bridge_ring"
                })
 
-      assert Pools.get_routing_settings(pool).upstream_websocket_bridge_enabled == true
+      assert Pools.get_routing_settings(pool).allow_image_generation == true
+      assert Pools.allow_image_generation?(pool)
+      assert Pools.get_routing_settings(pool).allow_audio_transcription == true
+      assert Pools.allow_audio_transcription?(pool)
     end
 
-    test "update toggles the upstream websocket bridge routing setting both ways" do
+    test "update toggles image generation permission both ways" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       scope = Scope.for_user(owner, ["instance_owner"])
-      pool = pool_fixture(%{slug: "bridge-workflow-edit", name: "Bridge Workflow Edit"})
-
-      assert {:ok, enabled_pool} =
-               PoolWorkflow.update_pool_with_related_settings(scope, pool, %{
-                 "name" => "Bridge Workflow Enabled",
-                 "status" => "active",
-                 "routing_strategy" => "bridge_ring",
-                 "upstream_websocket_bridge_enabled" => "true",
-                 "upstream_identity_ids" => [],
-                 "api_key_ids" => []
-               })
-
-      assert Pools.get_routing_settings(enabled_pool).upstream_websocket_bridge_enabled == true
+      pool = pool_fixture(%{slug: "image-workflow-edit", name: "Image Workflow Edit"})
 
       assert {:ok, disabled_pool} =
-               PoolWorkflow.update_pool_with_related_settings(scope, enabled_pool, %{
-                 "name" => "Bridge Workflow Disabled",
+               PoolWorkflow.update_pool_with_related_settings(scope, pool, %{
+                 "name" => "Image Workflow Disabled",
                  "status" => "active",
                  "routing_strategy" => "bridge_ring",
-                 "upstream_websocket_bridge_enabled" => "false",
+                 "allow_image_generation" => "false",
                  "upstream_identity_ids" => [],
                  "api_key_ids" => []
                })
 
-      assert Pools.get_routing_settings(disabled_pool).upstream_websocket_bridge_enabled == false
+      assert Pools.get_routing_settings(disabled_pool).allow_image_generation == false
+      refute Pools.allow_image_generation?(disabled_pool)
+
+      assert {:ok, enabled_pool} =
+               PoolWorkflow.update_pool_with_related_settings(scope, disabled_pool, %{
+                 "name" => "Image Workflow Enabled",
+                 "status" => "active",
+                 "routing_strategy" => "bridge_ring",
+                 "allow_image_generation" => "true",
+                 "upstream_identity_ids" => [],
+                 "api_key_ids" => []
+               })
+
+      assert Pools.get_routing_settings(enabled_pool).allow_image_generation == true
+      assert Pools.allow_image_generation?(enabled_pool)
     end
   end
 
@@ -414,5 +444,13 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
     {:ok, upstream} = FakeUpstream.start_link(mode)
     on_exit(fn -> FakeUpstream.stop(upstream) end)
     upstream
+  end
+
+  defp assignment_audit_events(pool, action) do
+    Repo.all(
+      from event in CodexPooler.Audit.AuditEvent,
+        where: event.pool_id == ^pool.id and event.action == ^action,
+        order_by: [asc: event.occurred_at]
+    )
   end
 end

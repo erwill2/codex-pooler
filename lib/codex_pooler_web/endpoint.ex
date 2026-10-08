@@ -2,7 +2,13 @@ defmodule CodexPoolerWeb.Endpoint do
   use Phoenix.Endpoint, otp_app: :codex_pooler
   use Plug.ErrorHandler
 
-  alias CodexPoolerWeb.Plugs.{RuntimeIngress, TrustedProxyRemoteIp}
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody
+
+  alias CodexPoolerWeb.Plugs.{
+    BackendFilesMultipartGuard,
+    RuntimeIngress,
+    TrustedProxyRemoteIp
+  }
 
   @multipart_parser_length 2_147_483_647
 
@@ -39,22 +45,20 @@ defmodule CodexPoolerWeb.Endpoint do
   end
 
   plug Plug.RequestId
-  plug TrustedProxyRemoteIp
+  plug :trusted_proxy_remote_ip
 
   plug Plug.Telemetry,
     event_prefix: [:phoenix, :endpoint],
     log: {__MODULE__, :request_log_level, []}
 
-  plug CodexPoolerWeb.Plugs.RuntimeIngress
-  plug CodexPoolerWeb.Plugs.BackendFilesMultipartGuard
+  plug :runtime_ingress
+  plug :backend_files_multipart_guard
 
   plug Plug.Parsers,
     parsers: [
       :urlencoded,
       {:multipart, length: @multipart_parser_length},
-      {CodexPoolerWeb.Plugs.RuntimeJsonParser,
-       body_reader:
-         {CodexPoolerWeb.Plugs.RuntimeIngress.CompressedBody, :read_plain_json_body, []}}
+      {CodexPoolerWeb.Plugs.RuntimeJsonParser, body_reader: {__MODULE__, :read_plain_json_body, []}}
     ],
     pass: ["*/*"],
     json_decoder: Phoenix.json_library()
@@ -62,9 +66,23 @@ defmodule CodexPoolerWeb.Endpoint do
   plug Plug.MethodOverride
   plug Plug.Head
   plug Plug.Session, @session_options
-  plug CodexPoolerWeb.Router
+  plug :dispatch_router
 
   def multipart_parser_length, do: @multipart_parser_length
+
+  @doc false
+  @spec read_plain_json_body(Plug.Conn.t(), keyword()) ::
+          CompressedBody.read_result()
+  def read_plain_json_body(conn, opts),
+    do: CompressedBody.read_plain_json_body(conn, opts)
+
+  defp trusted_proxy_remote_ip(conn, opts), do: TrustedProxyRemoteIp.call(conn, opts)
+  defp runtime_ingress(conn, opts), do: RuntimeIngress.call(conn, opts)
+
+  defp backend_files_multipart_guard(conn, opts),
+    do: BackendFilesMultipartGuard.call(conn, opts)
+
+  defp dispatch_router(conn, opts), do: CodexPoolerWeb.Router.call(conn, opts)
 
   def maybe_live_reloader(conn, opts) do
     if CodexPoolerWeb.BrowserSecurity.codex_desktop_browser?(conn) or

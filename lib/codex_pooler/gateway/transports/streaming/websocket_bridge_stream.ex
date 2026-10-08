@@ -14,14 +14,49 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   Before streaming, the relay emits exactly one out-of-band
   `{ref, {:preflight, decision}}` message so the dispatcher can commit to the
   websocket path or fall back to HTTP without consuming (and thereby
-  reordering) any real stream part. The dispatcher only ever commits on an
-  upstream event the public Responses normalization forwards downstream:
-  internal `codex.*` frames are buffered and flushed after the commit, and a
-  completion, failure event, owner error, or timeout before the first visible
-  event reports a fallback instead.
+  reordering) any real stream part. Commitment is keyed to client-rendered
+  content: lifecycle envelopes, item/part adds, and internal `codex.*`
+  markers stay buffered (bounded by count/bytes and by a pre-content
+  deadline that commits-and-flushes, since buffered frames prove the
+  upstream is alive); any content-bearing or unknown event, and every
+  structurally valid terminal, commits fail-closed. Before commitment a
+  fallback only when the owner supplies positive evidence that failure happened
+  before upstream submission. Ambiguous task exits, send failures, peer closes,
+  and local receive/pong timeouts commit a fatal stream error because the
+  provider may already be generating.
+
+  A provider refusal sent as the websocket transport's wrapped error frame
+  (`{"type": "error", "status": 4xx, "error": {...}}`, 429 excluded) before
+  any content is the websocket form of the HTTP 4xx the provider returns for
+  the same request, so the relay reports it as `{:rejected, status, body}`
+  with the provider's `{"error": ...}` body instead of committing a stream,
+  and the dispatcher finalizes it like that HTTP response (findings#225).
+
+  A provider usage limit sent before any output is the same kind of refusal,
+  but the upstream session consumes that frame as a retryable quota first
+  event and the owner completes the turn without delivering it. The submit
+  result carries the frame, so the relay reports it as
+  `{:rejected, 429, body, headers}` with the provider's `{"error": ...}` body
+  and the frame's sanitized headers, and the dispatcher reaches the HTTP
+  decision for the same `429`: another eligible candidate, or the terminal
+  usage-limit answer (findings#206 row 206-582). It used to commit a stream
+  error the client saw as an interrupted stream.
+
+  An owner error or completion frame that lands before commitment is terminal
+  for the turn, and the owner replies to the submit call before sending it, so
+  the relay yields on the submit task for one short hop
+  (`owner_terminal_settle_timeout_ms`) rather than the full settle window
+  before reporting. A submit still blocked after that hop cannot add
+  pre-submission proof; it keeps the remainder of the settle budget only for
+  attempt metadata, which the take collects after the client-visible report.
   """
 
+  alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponses
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
+  alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Gateway.Transports.Websocket.OwnerErrorVocabulary
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
 
@@ -40,16 +75,74 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
           correlation_id: String.t(),
           settle_timeout_ms: non_neg_integer()
         }
-  @type decision :: :stream | {:fallback, term()}
+  @type decision ::
+          :stream
+          | {:fallback, term()}
+          | {:policy_denied, CodexPooler.Gateway.Transports.ProviderCreditsAdmission.denial()}
+          | {:rejected, 400..499, binary()}
+          | {:rejected, 429, binary(), [{String.t(), String.t()}]}
   @type part :: {:data, binary()} | :done | {:bridge_error, term()}
+  @type attempt_metadata :: %{
+          optional(:model_usage) => map(),
+          optional(:response_usage) => map(),
+          optional(:tool_completion_failure) => StreamProtocol.terminal_failure(),
+          optional(:provider_credits_admission) => CodexPooler.Gateway.Transports.ProviderCreditsAdmission.Receipt.t() | nil,
+          upstream_websocket_connection: map() | nil,
+          transport_failure: map() | nil
+        }
 
   @default_settle_timeout_ms 5_000
+  # One scheduling hop: the owner replies to the submit call before it sends
+  # the terminal owner error/complete frame, so the task result is already
+  # queued or in flight when that frame is handled.
+  @default_owner_terminal_settle_timeout_ms 100
+  @default_preflight_timeout_ms 15_000
+  @max_precommit_frames 64
+  @max_precommit_bytes 1_048_576
+  # Must stay below the relay-owned preflight timeout so lifecycle frames from
+  # a healthy slow turn commit before total preflight silence fails closed.
+  @precontent_commit_deadline_ms 12_000
+  @buffered_event_types [
+    "response.created",
+    "response.in_progress",
+    "response.queued",
+    "codex.rate_limits",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.reasoning_summary_part.added"
+  ]
+  @fallback_structural_reason_codes ~w(
+    bridge_submit_crash
+    owner_call_timeout
+    owner_not_running
+    task_down
+    bridge_no_first_event
+    upstream_websocket_closed_before_terminal
+    upstream_websocket_error
+  )
+  @fallback_reason_codes MapSet.new(
+                           @fallback_structural_reason_codes ++
+                             OwnerErrorVocabulary.owner_error_codes()
+                         )
 
   @spec start(String.t(), keyword()) :: t()
   def start(correlation_id, opts \\ []) when is_binary(correlation_id) do
     parent = self()
     ref = make_ref()
     settle_timeout_ms = Keyword.get(opts, :settle_timeout_ms, @default_settle_timeout_ms)
+
+    owner_terminal_settle_timeout_ms =
+      Keyword.get(
+        opts,
+        :owner_terminal_settle_timeout_ms,
+        @default_owner_terminal_settle_timeout_ms
+      )
+
+    preflight_timeout_ms =
+      Keyword.get(opts, :preflight_timeout_ms, @default_preflight_timeout_ms)
+
+    precontent_deadline_ms =
+      Keyword.get(opts, :precontent_deadline_ms, @precontent_commit_deadline_ms)
 
     relay =
       spawn(fn ->
@@ -59,10 +152,25 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
           ref: ref,
           correlation_id: correlation_id,
           settle_timeout_ms: settle_timeout_ms,
+          owner_terminal_settle_timeout_ms: owner_terminal_settle_timeout_ms,
+          preflight_timeout_ms: preflight_timeout_ms,
+          precontent_deadline_ms: precontent_deadline_ms,
+          precontent_deadline_armed?: false,
           epoch: nil,
           task: nil,
+          task_settle_deadline_ms: nil,
           pending: [],
-          upstream_websocket_connection: nil
+          pending_count: 0,
+          pending_bytes: 0,
+          upstream_websocket_connection: nil,
+          model_usage: nil,
+          response_usage: nil,
+          tool_completion_failure: nil,
+          transport_failure: nil,
+          provider_credits_admission: nil,
+          policy_denial: nil,
+          quota_rejection: nil,
+          upstream_committed: false
         })
       end)
 
@@ -91,28 +199,28 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
     flush(ref)
   end
 
-  @doc "Returns and releases connection metadata retained by a committed bridge stream."
-  @spec take_upstream_websocket_connection(t()) :: map() | nil
-  def take_upstream_websocket_connection(%__MODULE__{
+  @doc "Atomically returns and clears safe metadata retained for one bridge attempt."
+  @spec take_upstream_websocket_attempt_metadata(t()) :: attempt_metadata()
+  def take_upstream_websocket_attempt_metadata(%__MODULE__{
         relay: relay,
         settle_timeout_ms: settle_timeout_ms
       }) do
     query_ref = make_ref()
     monitor_ref = Process.monitor(relay)
-    send(relay, {:take_upstream_websocket_connection, self(), query_ref})
+    send(relay, {:take_upstream_websocket_attempt_metadata, self(), query_ref})
 
     receive do
-      {^query_ref, connection} ->
+      {^query_ref, metadata} ->
         Process.demonitor(monitor_ref, [:flush])
-        connection
+        metadata
 
       {:DOWN, ^monitor_ref, :process, ^relay, _reason} ->
-        nil
+        empty_attempt_metadata()
     after
       settle_timeout_ms + 1_000 ->
         Process.demonitor(monitor_ref, [:flush])
         send(relay, :cancel)
-        nil
+        empty_attempt_metadata()
     end
   end
 
@@ -128,12 +236,26 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   @doc "Converts one canonical upstream JSON event into an SSE block."
   @spec sse_block(binary()) :: binary()
   def sse_block(text) when is_binary(text) do
-    case Jason.decode(text) do
-      {:ok, %{"type" => type}} when is_binary(type) and type != "" ->
-        "event: " <> type <> "\ndata: " <> text <> "\n\n"
+    text
+    |> frame_context()
+    |> sse_block_context()
+  end
+
+  # The HTTP SSE client and the relay after it parse this block as one SSE
+  # event, so a frame whose text spans several lines (a pretty-printed
+  # provider object) gets one `data:` line per text line, the rule the
+  # retained upstream body follows; before, every line after the first fell
+  # outside the event (findings#254 row 254-53). A single-line frame keeps its
+  # exact bytes.
+  defp sse_block_context(%{text: text, event_type: event_type}) do
+    data = IO.iodata_to_binary(SSEParser.data_lines(text))
+
+    case event_type do
+      type when is_binary(type) and type != "" ->
+        "event: " <> type <> "\n" <> data <> "\n\n"
 
       _other ->
-        "data: " <> text <> "\n\n"
+        data <> "\n\n"
     end
   end
 
@@ -153,6 +275,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
         task =
           Task.Supervisor.async_nolink(@submit_task_supervisor, fn -> run_submit(submit_fun) end)
 
+        Process.send_after(self(), :preflight_timeout, state.preflight_timeout_ms)
         preflight_loop(%{state | epoch: epoch, task: task})
 
       :cancel ->
@@ -188,12 +311,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   defp submit_exit_reason(_reason), do: :bridge_submit_crash
 
   # The preflight phase resolves the first upstream signal WITHOUT emitting any
-  # real stream part until it has told the dispatcher to commit. Only an event
-  # the public Responses normalization forwards downstream commits the stream;
-  # internal `codex.*` frames are buffered so their rate-limit snapshots still
-  # reach the relay pipeline after the commit. A completion, failure event,
-  # owner error, or task settlement before the first visible event reports a
-  # fallback instead.
+  # real stream part until it has told the dispatcher to commit. Lifecycle-only
+  # frames stay buffered; meaningful, unknown, malformed, and structural
+  # terminal frames commit conservatively.
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp preflight_loop(state) do
     %{
@@ -207,31 +327,57 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
 
     receive do
       {:websocket_owner_frame, ^correlation_id, ^epoch, {:data, text}} when is_binary(text) ->
-        case preflight_class(text) do
-          :visible -> commit_stream(state, text)
-          :internal -> preflight_loop(%{state | pending: [text | state.pending]})
-          :failure -> fall_back(state, :bridge_failed_before_visible)
+        frame = frame_context(text)
+
+        case preflight_class(frame) do
+          :commit -> commit_stream(state, frame)
+          :terminal -> commit_terminal(state, frame)
+          :buffer -> buffer_preflight(state, frame, &preflight_loop/1)
         end
 
       {:websocket_owner_frame, ^correlation_id, ^epoch, :complete} ->
-        fall_back(state, :bridge_no_first_event)
+        preflight_complete(state)
 
       {:websocket_owner_frame, ^correlation_id, ^epoch, {:error, error, _payload}} ->
-        fall_back(state, owner_error_reason(error))
+        preflight_owner_error(state, error)
 
       {:websocket_owner_frame, _correlation_id, _epoch, _payload} ->
         preflight_loop(state)
 
-      {^task_ref, {:error, reason}} ->
-        report_fallback(parent, ref, error_reason(reason))
+      {^task_ref, {:error, reason} = result} ->
+        state = put_submit_result_and_clear_task(state, result)
+
+        cond do
+          state.policy_denial ->
+            report_policy_denial(state)
+
+          quota_rejection?(state) ->
+            report_quota_rejection(state)
+
+          pre_submission_failure?(state.transport_failure) ->
+            report_fallback(parent, ref, error_reason(reason))
+
+          true ->
+            report_stream_error(parent, ref, error_reason(reason))
+            metadata_loop(state)
+        end
 
       {^task_ref, result} ->
         state
-        |> put_submit_result_connection(result)
+        |> put_submit_result_and_clear_task(result)
         |> preflight_after_result()
 
+      :precontent_commit_deadline ->
+        commit_pending_stream(state)
+
+      :preflight_timeout ->
+        Task.shutdown(task, :brutal_kill)
+        report_stream_error(parent, ref, :bridge_preflight_timeout)
+        metadata_loop(%{state | task: nil})
+
       {:DOWN, ^task_ref, :process, _pid, reason} ->
-        report_fallback(parent, ref, {:task_down, safe_reason(reason)})
+        report_stream_error(parent, ref, {:task_down, safe_reason(reason)})
+        metadata_loop(%{state | task: nil})
 
       {:DOWN, ^parent_monitor, :process, _pid, _reason} ->
         Task.shutdown(task, :brutal_kill)
@@ -242,8 +388,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   end
 
   # The submit task settled successfully before any frame arrived. Give the
-  # owner a brief window to deliver the first visible frame; otherwise fall
-  # back so the dispatcher can still retry over HTTP.
+  # owner a brief window to deliver the first visible frame; otherwise fail
+  # the committed websocket attempt without resubmitting over HTTP.
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp preflight_after_result(state) do
     %{
@@ -256,26 +402,38 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
 
     receive do
       {:websocket_owner_frame, ^correlation_id, ^epoch, {:data, text}} when is_binary(text) ->
-        case preflight_class(text) do
-          :visible ->
-            report_stream(parent, ref, state.pending, text)
-            relay_after_result(%{state | pending: []}, :ok)
+        frame = frame_context(text)
 
-          :internal ->
-            preflight_after_result(%{state | pending: [text | state.pending]})
+        case preflight_class(frame) do
+          :commit ->
+            report_stream(parent, ref, state.pending, frame)
+            relay_after_result(%{state | pending: [], upstream_committed: true}, :ok)
 
-          :failure ->
-            report_fallback(parent, ref, :bridge_failed_before_visible)
+          :terminal ->
+            report_terminal_or_rejection(parent, ref, state.pending, frame)
+            metadata_loop(%{state | pending: [], upstream_committed: true})
+
+          :buffer ->
+            buffer_preflight(state, frame, &preflight_after_result/1)
         end
 
       {:websocket_owner_frame, ^correlation_id, ^epoch, :complete} ->
-        report_fallback(parent, ref, :bridge_no_first_event)
+        report_stream_error(parent, ref, :upstream_websocket_error)
+        metadata_loop(state)
 
       {:websocket_owner_frame, ^correlation_id, ^epoch, {:error, error, _payload}} ->
-        report_fallback(parent, ref, owner_error_reason(error))
+        report_stream_error(parent, ref, owner_error_reason(error))
+        metadata_loop(state)
 
       {:websocket_owner_frame, _correlation_id, _epoch, _payload} ->
         preflight_after_result(state)
+
+      :precontent_commit_deadline ->
+        commit_pending_stream(state)
+
+      :preflight_timeout ->
+        report_stream_error(parent, ref, :bridge_preflight_timeout)
+        metadata_loop(state)
 
       {:DOWN, ^parent_monitor, :process, _pid, _reason} ->
         :ok
@@ -284,36 +442,191 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
         :ok
     after
       state.settle_timeout_ms ->
-        report_fallback(parent, ref, :bridge_no_first_event)
+        report_stream_error(parent, ref, :upstream_websocket_error)
+        metadata_loop(state)
     end
   end
 
-  defp commit_stream(state, text) do
-    report_stream(state.parent, state.ref, state.pending, text)
-    relay_loop(%{state | pending: []})
+  defp commit_stream(%{task: nil} = state, frame) do
+    report_stream(state.parent, state.ref, state.pending, frame)
+    relay_after_result(%{state | pending: [], upstream_committed: true}, :ok)
+  end
+
+  defp commit_stream(state, frame) do
+    report_stream(state.parent, state.ref, state.pending, frame)
+    relay_loop(%{state | pending: [], upstream_committed: true})
+  end
+
+  defp commit_terminal(state, frame) do
+    report_terminal_or_rejection(state.parent, state.ref, state.pending, frame)
+
+    state
+    |> Map.put(:pending, [])
+    |> Map.put(:upstream_committed, true)
+    |> settle_task()
+    |> metadata_loop()
+  end
+
+  defp buffer_preflight(state, %{text: text} = frame, continue) when is_function(continue, 1) do
+    pending_count = state.pending_count + 1
+    pending_bytes = state.pending_bytes + byte_size(text)
+
+    if pending_count > @max_precommit_frames or pending_bytes > @max_precommit_bytes do
+      :telemetry.execute(
+        [:codex_pooler, :gateway, :websocket_bridge, :precommit_overflow],
+        %{count: 1, frames: pending_count, bytes: pending_bytes},
+        %{max_frames: @max_precommit_frames, max_bytes: @max_precommit_bytes}
+      )
+
+      commit_stream(state, frame)
+    else
+      state = arm_precontent_deadline(state)
+
+      continue.(%{
+        state
+        | pending: [frame | state.pending],
+          pending_count: pending_count,
+          pending_bytes: pending_bytes
+      })
+    end
+  end
+
+  defp arm_precontent_deadline(%{precontent_deadline_armed?: true} = state), do: state
+
+  defp arm_precontent_deadline(state) do
+    Process.send_after(self(), :precontent_commit_deadline, state.precontent_deadline_ms)
+    %{state | precontent_deadline_armed?: true}
+  end
+
+  # Buffered frames prove the upstream turn is alive; when no content arrived
+  # by the deadline the relay commits and flushes before its total-silence
+  # deadline fails the websocket attempt.
+  defp commit_pending_stream(%{task: nil} = state) do
+    report_pending(state)
+    relay_after_result(%{state | pending: [], upstream_committed: true}, :ok)
+  end
+
+  defp commit_pending_stream(state) do
+    report_pending(state)
+    relay_loop(%{state | pending: [], upstream_committed: true})
+  end
+
+  defp report_pending(state) do
+    send(state.parent, {state.ref, {:preflight, :stream}})
+
+    state.pending
+    |> Enum.reverse()
+    |> Enum.each(fn earlier ->
+      send(state.parent, {state.ref, {:data, sse_block_context(earlier)}})
+    end)
   end
 
   # Committing flushes the buffered internal frames ahead of the visible one:
   # the public normalization drops them downstream, but the relay pipeline
   # still records their rate-limit snapshots, keeping parity with HTTP.
-  defp report_stream(parent, ref, pending, text) do
+  defp report_stream(parent, ref, pending, frame) do
     send(parent, {ref, {:preflight, :stream}})
 
     pending
     |> Enum.reverse()
-    |> Enum.each(fn earlier -> send(parent, {ref, {:data, sse_block(earlier)}}) end)
+    |> Enum.each(fn earlier -> send(parent, {ref, {:data, sse_block_context(earlier)}}) end)
 
-    send(parent, {ref, {:data, sse_block(text)}})
+    send(parent, {ref, {:data, sse_block_context(frame)}})
+  end
+
+  defp report_terminal_or_rejection(parent, ref, _pending, %{rejection: {status, body}}) do
+    send(parent, {ref, {:preflight, {:rejected, status, body}}})
+  end
+
+  defp report_terminal_or_rejection(parent, ref, pending, frame),
+    do: report_terminal(parent, ref, pending, frame)
+
+  defp report_terminal(parent, ref, pending, frame) do
+    report_stream(parent, ref, pending, frame)
+    send(parent, {ref, :done})
   end
 
   defp report_fallback(parent, ref, reason) do
+    :telemetry.execute(
+      [:codex_pooler, :gateway, :websocket_bridge, :fallback],
+      %{count: 1},
+      %{reason: fallback_reason_label(reason)}
+    )
+
     send(parent, {ref, {:preflight, {:fallback, reason}}})
   end
 
-  defp fall_back(state, reason) do
-    report_fallback(state.parent, state.ref, reason)
-    _state = settle_task(state)
-    :ok
+  defp fallback_reason_label(reason) when is_atom(reason) do
+    reason
+    |> Atom.to_string()
+    |> fallback_reason_code()
+  end
+
+  defp fallback_reason_label({label, _detail}) when is_atom(label),
+    do: fallback_reason_label(label)
+
+  defp fallback_reason_label(_reason), do: "unknown"
+
+  defp fallback_reason_code(reason) do
+    if MapSet.member?(@fallback_reason_codes, reason), do: reason, else: "unknown"
+  end
+
+  defp report_stream_error(parent, ref, reason) do
+    send(parent, {ref, {:preflight, :stream}})
+    send(parent, {ref, {:bridge_error, reason}})
+  end
+
+  defp pre_submission_failure?(%{"phase" => "connect", "upstream_committed" => false}),
+    do: true
+
+  defp pre_submission_failure?(_transport_failure), do: false
+
+  defp preflight_owner_error(state, error) do
+    state = settle_owner_terminal_task(state)
+    reason = owner_error_reason(error)
+
+    cond do
+      state.policy_denial ->
+        report_policy_denial(state)
+
+      quota_rejection?(state) ->
+        report_quota_rejection(state)
+
+      pre_submission_failure?(state.transport_failure) ->
+        report_fallback(state.parent, state.ref, reason)
+
+      true ->
+        report_stream_error(state.parent, state.ref, reason)
+        metadata_loop(state)
+    end
+  end
+
+  defp preflight_complete(state) do
+    state = settle_owner_terminal_task(state)
+
+    cond do
+      state.policy_denial -> report_policy_denial(state)
+      quota_rejection?(state) -> report_quota_rejection(state)
+      true -> preflight_complete_failure(state)
+    end
+  end
+
+  defp preflight_complete_failure(state) do
+    if pre_submission_failure?(state.transport_failure) do
+      report_fallback(
+        state.parent,
+        state.ref,
+        transport_failure_reason(state.transport_failure)
+      )
+    else
+      report_stream_error(
+        state.parent,
+        state.ref,
+        transport_failure_reason(state.transport_failure)
+      )
+
+      metadata_loop(state)
+    end
   end
 
   # Post-commit streaming still watches the submit task so its settlement is
@@ -331,8 +644,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
 
     receive do
       {:websocket_owner_frame, ^correlation_id, ^epoch, {:data, text}} when is_binary(text) ->
-        send(parent, {ref, {:data, sse_block(text)}})
-        relay_loop(state)
+        relay_committed_frame(state, frame_context(text), &relay_loop/1)
 
       {:websocket_owner_frame, ^correlation_id, ^epoch, :complete} ->
         send(parent, {ref, :done})
@@ -353,12 +665,12 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
 
       {^task_ref, {:error, reason} = result} ->
         state
-        |> put_submit_result_connection(result)
+        |> put_submit_result_and_clear_task(result)
         |> relay_after_result({:failed, error_reason(reason)})
 
       {^task_ref, result} ->
         state
-        |> put_submit_result_connection(result)
+        |> put_submit_result_and_clear_task(result)
         |> relay_after_result(:ok)
 
       {:DOWN, ^task_ref, :process, _pid, reason} ->
@@ -368,9 +680,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
         Task.shutdown(task, :brutal_kill)
 
       :cancel ->
-        state
-        |> settle_task()
-        |> metadata_loop()
+        Task.shutdown(task, :brutal_kill)
+        metadata_loop(%{state | task: nil})
     end
   end
 
@@ -389,8 +700,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
 
     receive do
       {:websocket_owner_frame, ^correlation_id, ^epoch, {:data, text}} when is_binary(text) ->
-        send(parent, {ref, {:data, sse_block(text)}})
-        relay_after_result(state, settle)
+        relay_committed_frame(state, frame_context(text), &relay_after_result(&1, settle))
 
       {:websocket_owner_frame, ^correlation_id, ^epoch, :complete} ->
         send(parent, {ref, :done})
@@ -436,11 +746,108 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
     %{state | task: nil}
   end
 
-  defp metadata_loop(state) do
+  defp settle_task(%{task: nil} = state), do: state
+
+  # Pre-content owner error/complete frames are terminal for the turn, and the
+  # owner has already replied to the submit call by the time it sends them, so
+  # the task result — the only carrier of the `transport_failure` the fallback
+  # decision reads — is settled, queued, or one scheduling hop away. Yield for
+  # that hop only. A task still blocked afterwards cannot add pre-submission
+  # proof, so the decision is reported at once and the task keeps the rest of
+  # the settle budget for attempt metadata (see `settle_task_before_take/1`).
+  defp settle_owner_terminal_task(%{task: %Task{} = task} = state) do
+    case Task.yield(task, state.owner_terminal_settle_timeout_ms) do
+      {:ok, result} ->
+        put_submit_result_connection(%{state | task: nil}, result)
+
+      {:exit, _reason} ->
+        %{state | task: nil}
+
+      nil ->
+        remaining_ms = max(state.settle_timeout_ms - state.owner_terminal_settle_timeout_ms, 0)
+
+        %{
+          state
+          | task_settle_deadline_ms: System.monotonic_time(:millisecond) + remaining_ms
+        }
+    end
+  end
+
+  # The take is the last consumer of attempt metadata, so a submit left pending
+  # by an owner-terminal report gets the remainder of its settle budget here,
+  # after the client-visible report, before it is discarded.
+  defp settle_task_before_take(%{task: %Task{} = task} = state) do
+    remaining_ms =
+      max((state.task_settle_deadline_ms || 0) - System.monotonic_time(:millisecond), 0)
+
+    state =
+      case Task.yield(task, remaining_ms) do
+        {:ok, result} ->
+          put_submit_result_connection(state, result)
+
+        {:exit, _reason} ->
+          state
+
+        nil ->
+          Task.shutdown(task, :brutal_kill)
+          state
+      end
+
+    %{state | task: nil}
+  end
+
+  defp relay_committed_frame(state, frame, continue) when is_function(continue, 1) do
+    send(state.parent, {state.ref, {:data, sse_block_context(frame)}})
+
+    case terminal_class(frame) do
+      :terminal ->
+        send(state.parent, {state.ref, :done})
+
+        state
+        |> settle_task()
+        |> metadata_loop()
+
+      _nonterminal ->
+        continue.(state)
+    end
+  end
+
+  # A submit left pending by an owner-terminal report is still watched here so
+  # its late settlement feeds the take; every exit reaps it.
+  defp metadata_loop(%{task: %Task{ref: task_ref} = task} = state) do
     receive do
-      {:take_upstream_websocket_connection, caller, query_ref}
+      {:take_upstream_websocket_attempt_metadata, caller, query_ref}
       when is_pid(caller) and is_reference(query_ref) ->
-        send(caller, {query_ref, state.upstream_websocket_connection})
+        state = settle_task_before_take(state)
+        send(caller, {query_ref, attempt_metadata(state)})
+
+      {^task_ref, result} ->
+        state
+        |> put_submit_result_and_clear_task(result)
+        |> metadata_loop()
+
+      {:DOWN, ^task_ref, :process, _pid, _reason} ->
+        metadata_loop(%{state | task: nil})
+
+      {:DOWN, parent_monitor, :process, _pid, _reason}
+      when parent_monitor == state.parent_monitor ->
+        Task.shutdown(task, :brutal_kill)
+
+      :cancel ->
+        Task.shutdown(task, :brutal_kill)
+        metadata_loop(%{state | task: nil})
+    after
+      state.settle_timeout_ms -> Task.shutdown(task, :brutal_kill)
+    end
+
+    :ok
+  end
+
+  defp metadata_loop(%{task: nil} = state) do
+    receive do
+      {:take_upstream_websocket_attempt_metadata, caller, query_ref}
+      when is_pid(caller) and is_reference(query_ref) ->
+        send(caller, {query_ref, attempt_metadata(state)})
 
       {:DOWN, parent_monitor, :process, _pid, _reason}
       when parent_monitor == state.parent_monitor ->
@@ -457,38 +864,164 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
 
   defp put_submit_result_connection(state, {status, result})
        when status in [:ok, :error] and is_map(result) do
-    case Map.get(result, :upstream_websocket_connection) do
-      connection when is_map(connection) ->
-        %{state | upstream_websocket_connection: connection}
+    connection = safe_connection(Map.get(result, :upstream_websocket_connection))
 
-      _connection ->
+    transport_failure =
+      result
+      |> Map.get(:transport_failure)
+      |> TransportFailureReason.sanitize_transport_failure_metadata()
+      |> committed_transport_failure(state.upstream_committed)
+
+    put_quota_rejection(
+      %{
         state
-    end
+        | upstream_websocket_connection: connection || state.upstream_websocket_connection,
+          model_usage: model_usage(result),
+          response_usage: Map.get(result, :response_usage),
+          tool_completion_failure: tool_completion_failure(result),
+          transport_failure: nonempty_map(transport_failure) || state.transport_failure,
+          provider_credits_admission: Map.get(result, :provider_credits_admission),
+          policy_denial: if(Map.get(result, :reason) == :provider_credits_policy_denied, do: result)
+      },
+      {status, result}
+    )
   end
 
   defp put_submit_result_connection(state, _result), do: state
 
-  # Mirrors PublicResponses.normalize_public_block/3: `codex.*` events and
-  # typeless payloads produce no downstream output, so they must not commit
-  # the bridge — a later failure would otherwise strand the turn past its
-  # pre-visible HTTP fallback. Upstream failure terminals fall back outright.
-  defp preflight_class(text) do
-    case Jason.decode(text) do
-      {:ok, %{"type" => type} = decoded} when is_binary(type) and type != "" ->
-        cond do
-          failed_terminal?(type, decoded) -> :failure
-          String.starts_with?(type, "codex.") -> :internal
-          true -> :visible
-        end
+  defp tool_completion_failure(%{public_tool_completion_reason: reason, upstream_error_code: "upstream_stream_error"})
+       when reason in [:incomplete_tool_item, :invalid_tool_correlation, :tool_tracking_overflow] do
+    %{code: "upstream_stream_error", upstream_code: nil, upstream_error_param: nil, event_type: "error", data_type: "error", tool_completion_reason: reason}
+  end
 
-      _other ->
-        :internal
+  defp tool_completion_failure(_result), do: nil
+
+  defp model_usage(%{response_usage: %{model_observation: %{"version" => 1}} = usage}), do: Map.take(usage, [:served_model, :model_observation])
+  defp model_usage(%{response_usage: %{} = usage}), do: Map.take(usage, [:served_model])
+
+  # Old owners retain mapped response bodies without collection provenance.
+  # Their public failure placeholder cannot identify a provider model.
+  defp model_usage(%{body: body}) when is_binary(body), do: ResponseUsage.legacy_websocket_model_usage(body)
+
+  defp model_usage(_result), do: nil
+
+  defp report_policy_denial(state) do
+    send(state.parent, {state.ref, {:preflight, {:policy_denied, state.policy_denial}}})
+    metadata_loop(state)
+  end
+
+  defp quota_rejection?(%{quota_rejection: {429, _body, _headers}, upstream_committed: false}), do: true
+  defp quota_rejection?(_state), do: false
+
+  defp report_quota_rejection(%{quota_rejection: {status, body, headers}} = state) do
+    send(state.parent, {state.ref, {:preflight, {:rejected, status, body, headers}}})
+    metadata_loop(state)
+  end
+
+  # The pre-output usage-limit refusal the upstream session consumed: its
+  # submit result keeps the provider's frame in the retained body and the
+  # frame's sanitized headers. Only the error object and those headers go on.
+  defp put_quota_rejection(state, {:error, %{reason: {:quota_exhausted_first_event, _failure}} = result}) do
+    case provider_error(Map.get(result, :body)) do
+      %{} = error ->
+        headers = result |> Map.get(:websocket_frame_headers) |> frame_headers()
+        %{state | quota_rejection: {429, CodexPooler.JSON.encode!(%{"error" => error}), headers}}
+
+      nil ->
+        state
     end
   end
 
-  defp failed_terminal?(type, decoded) do
-    match?({:ok, %{kind: :failed}}, StreamProtocol.terminal_outcome(type, decoded))
+  defp put_quota_rejection(state, _result), do: state
+
+  # The retained body frames each upstream text line as its own `data:` line
+  # and each frame as its own block (findings#254 row 254-60).
+  defp provider_error(body) when is_binary(body) do
+    body
+    |> String.split(["\n\n", "\r\n\r\n"], trim: true)
+    |> Enum.find_value(fn block ->
+      data =
+        block
+        |> String.split(["\r\n", "\n"])
+        |> Enum.flat_map(fn
+          "data:" <> value -> [String.trim_leading(value)]
+          _line -> []
+        end)
+        |> Enum.join("\n")
+
+      case CodexPooler.JSON.decode(data) do
+        {:ok, %{"response" => %{"error" => %{} = error}}} -> error
+        {:ok, %{"error" => %{} = error}} -> error
+        _other -> nil
+      end
+    end)
   end
+
+  defp provider_error(_body), do: nil
+
+  defp frame_headers(%{} = headers), do: Enum.flat_map(headers, fn {name, value} -> if is_binary(value), do: [{to_string(name), value}], else: [] end)
+  defp frame_headers(_headers), do: []
+
+  defp put_submit_result_and_clear_task(%{task: %Task{ref: task_ref}} = state, result) do
+    Process.demonitor(task_ref, [:flush])
+
+    state
+    |> put_submit_result_connection(result)
+    |> Map.put(:task, nil)
+  end
+
+  defp preflight_class(%{preflight_class: preflight_class}), do: preflight_class
+
+  defp nonterminal_preflight_class(%{"type" => type}) when type in @buffered_event_types,
+    do: :buffer
+
+  # Internal codex.* markers are never forwarded to public /v1 clients, so
+  # they must not commit the bridge; unknown types stay fail-closed commits.
+  defp nonterminal_preflight_class(%{"type" => "codex." <> _rest}), do: :buffer
+
+  defp nonterminal_preflight_class(_decoded), do: :commit
+
+  defp terminal_class(%{terminal?: true}), do: :terminal
+  defp terminal_class(%{terminal?: false}), do: :nonterminal
+
+  defp frame_context(text) do
+    case CodexPooler.JSON.decode(text) do
+      {:ok, %{} = decoded} ->
+        terminal_outcome = StreamProtocol.terminal_outcome(nil, decoded)
+        terminal? = terminal_outcome?(terminal_outcome)
+
+        %{
+          text: text,
+          event_type: event_type(decoded),
+          terminal?: terminal?,
+          preflight_class: if(terminal?, do: :terminal, else: nonterminal_preflight_class(decoded)),
+          rejection: if(terminal?, do: provider_rejection(decoded))
+        }
+
+      _other ->
+        %{text: text, event_type: nil, terminal?: false, preflight_class: :commit, rejection: nil}
+    end
+  end
+
+  # The owner's public mapper passes this frame through unmasked
+  # (`PublicResponses.normalize_owner_json_message/2`), so its status and the
+  # provider's error object are still intact here.
+  defp provider_rejection(%{"error" => error} = decoded) do
+    if PublicResponses.provider_rejection_frame?(decoded) do
+      {Map.get(decoded, "status", Map.get(decoded, "status_code")), CodexPooler.JSON.encode!(%{"error" => error})}
+    end
+  end
+
+  defp provider_rejection(_decoded), do: nil
+
+  defp terminal_outcome?({:ok, %{kind: kind}})
+       when kind in [:completed, :incomplete, :failed],
+       do: true
+
+  defp terminal_outcome?(_outcome), do: false
+
+  defp event_type(%{"type" => type}) when is_binary(type) and type != "", do: type
+  defp event_type(_decoded), do: nil
 
   defp owner_error_reason(error) when is_atom(error), do: error
 
@@ -499,6 +1032,75 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   defp error_reason(%{reason: reason}) when is_atom(reason), do: reason
   defp error_reason(reason) when is_atom(reason), do: reason
   defp error_reason(_reason), do: :upstream_websocket_error
+
+  defp transport_failure_reason(%{"reason" => "upstream_websocket_closed_before_terminal"}),
+    do: :upstream_websocket_closed_before_terminal
+
+  defp transport_failure_reason(%{"reason" => "upstream_websocket_receive_timeout"}),
+    do: :upstream_websocket_receive_timeout
+
+  defp transport_failure_reason(%{"reason" => "upstream_websocket_pong_deadline"}),
+    do: :upstream_websocket_pong_deadline
+
+  defp transport_failure_reason(_transport_failure), do: :upstream_websocket_error
+
+  defp attempt_metadata(state) do
+    %{
+      upstream_websocket_connection: state.upstream_websocket_connection,
+      transport_failure: state.transport_failure,
+      provider_credits_admission: state.provider_credits_admission
+    }
+    |> then(fn metadata -> if state.model_usage, do: Map.put(metadata, :model_usage, state.model_usage), else: metadata end)
+    |> then(fn metadata -> if state.response_usage, do: Map.put(metadata, :response_usage, state.response_usage), else: metadata end)
+    |> then(fn metadata -> if state.tool_completion_failure, do: Map.put(metadata, :tool_completion_failure, state.tool_completion_failure), else: metadata end)
+  end
+
+  defp empty_attempt_metadata do
+    %{upstream_websocket_connection: nil, transport_failure: nil}
+  end
+
+  defp safe_connection(connection) when is_map(connection) do
+    atom_keys = [:lifecycle_id, :generation, :reused, :reconnected]
+    string_keys = Enum.map(atom_keys, &Atom.to_string/1)
+    atom_fields = Map.take(connection, atom_keys)
+    string_fields = Map.take(connection, string_keys)
+
+    cond do
+      valid_connection?(atom_fields, atom_keys) and map_size(string_fields) == 0 ->
+        atom_fields
+
+      valid_connection?(string_fields, string_keys) and map_size(atom_fields) == 0 ->
+        string_fields
+
+      true ->
+        nil
+    end
+  end
+
+  defp safe_connection(_connection), do: nil
+
+  defp valid_connection?(connection, [lifecycle_key, generation_key, reused_key, reconnected_key]) do
+    map_size(connection) == 4 and
+      match?({:ok, _uuid}, Ecto.UUID.cast(Map.get(connection, lifecycle_key))) and
+      is_integer(Map.get(connection, generation_key)) and Map.get(connection, generation_key) > 0 and
+      is_boolean(Map.get(connection, reused_key)) and
+      is_boolean(Map.get(connection, reconnected_key))
+  end
+
+  # The connection-bound guard's metadata is its proof that nothing reached the
+  # provider (`upstream_committed=false`); the relay committing to the refusal
+  # it answered with does not change that, so the exact guard map, the only
+  # one sanitizing keeps with that `termination_source`, is kept as it is.
+  defp committed_transport_failure(%{"termination_source" => "continuation_generation_guard"} = metadata, _upstream_committed),
+    do: metadata
+
+  defp committed_transport_failure(metadata, true) when map_size(metadata) > 0,
+    do: Map.put(metadata, "upstream_committed", true)
+
+  defp committed_transport_failure(metadata, _upstream_committed), do: metadata
+
+  defp nonempty_map(metadata) when map_size(metadata) > 0, do: metadata
+  defp nonempty_map(_metadata), do: nil
 
   defp safe_reason(reason) when is_atom(reason), do: reason
   defp safe_reason(_reason), do: :relay_task_down

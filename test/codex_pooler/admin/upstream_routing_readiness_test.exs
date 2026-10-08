@@ -3,7 +3,13 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadinessTest do
 
   alias CodexPooler.Admin.UpstreamQuotaReadiness
   alias CodexPooler.Admin.UpstreamRoutingReadiness
-  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+
+  alias CodexPooler.Upstreams.Quota.{
+    AccountAvailabilityStore,
+    AccountQuotaWindow,
+    RoutingQuotaSnapshot
+  }
+
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @as_of ~U[2026-05-30 12:00:00Z]
@@ -137,6 +143,247 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadinessTest do
                  quota_readiness
                )
     end
+
+    for phase <- ["consuming", "consumed_pending_probe"] do
+      test "explains that a #{phase} banked reset waits for a request on included quota" do
+        # The window is still exhausted: the readiness that applies is the pending recovery, not the exhaustion.
+        exhausted = %{account_primary_window() | used_percent: Decimal.new("100")}
+
+        identity = %UpstreamIdentity{
+          status: "active",
+          metadata: %{"credential_epoch" => 1, "saved_reset_redemption" => %{"phase" => unquote(phase)}}
+        }
+
+        quota_readiness =
+          identity
+          |> RoutingQuotaSnapshot.from_identity([exhausted], @as_of)
+          |> UpstreamQuotaReadiness.from_snapshot()
+
+        assert quota_readiness.reason_codes == ["saved_reset_probe_pending"]
+
+        assert %{
+                 routing_ready_now?: false,
+                 state: "quota_blocked",
+                 label: "Banked-reset recovery pending",
+                 tone: :warning,
+                 reason_code: "saved_reset_probe_pending",
+                 reason: "Waiting for a request on included quota to confirm the reset. Requests paid with provider credits do not count."
+               } =
+                 UpstreamRoutingReadiness.from_inputs(identity, [healthy_assignment()], quota_readiness)
+      end
+    end
+  end
+
+  describe "assignment_routing_ready?/1" do
+    test "accepts active, healthy, eligible assignment structs and maps only" do
+      assert UpstreamRoutingReadiness.assignment_routing_ready?(healthy_assignment())
+
+      assert UpstreamRoutingReadiness.assignment_routing_ready?(%{
+               status: "active",
+               health_status: "active",
+               eligibility_status: "eligible"
+             })
+
+      assert UpstreamRoutingReadiness.assignment_routing_ready?(%{
+               "status" => "active",
+               "health_status" => "active",
+               "eligibility_status" => "eligible"
+             })
+
+      refute UpstreamRoutingReadiness.assignment_routing_ready?(%{
+               status: "disabled",
+               health_status: "active",
+               eligibility_status: "eligible"
+             })
+
+      refute UpstreamRoutingReadiness.assignment_routing_ready?(%{
+               status: "active",
+               health_status: "degraded",
+               eligibility_status: "eligible"
+             })
+
+      refute UpstreamRoutingReadiness.assignment_routing_ready?(%{
+               status: "active",
+               health_status: "active",
+               eligibility_status: "ineligible"
+             })
+
+      refute UpstreamRoutingReadiness.assignment_routing_ready?(%{status: "active"})
+      refute UpstreamRoutingReadiness.assignment_routing_ready?(nil)
+    end
+  end
+
+  describe "with_circuit_visibility/2" do
+    test "overlays blocked and recovering circuit evidence onto ready verdicts without changing base fields" do
+      quota_readiness = fresh_quota_readiness()
+
+      ready =
+        UpstreamRoutingReadiness.from_inputs(
+          identity("active"),
+          healthy_assignment(),
+          quota_readiness
+        )
+
+      ready_refreshing =
+        UpstreamRoutingReadiness.from_inputs(
+          identity("refreshing"),
+          healthy_assignment(),
+          quota_readiness
+        )
+
+      expected_by_circuit_state = %{
+        :blocked => %{
+          state: "circuit_protection_active",
+          label: "Circuit protection active",
+          tone: :error,
+          reason: "One or more model and route lanes are blocked; unaffected routes may remain available.",
+          reason_code: "circuit_routes_blocked",
+          recovery_action: "Wait for circuit protection to clear before relying on affected routes."
+        },
+        :recovering => %{
+          state: "circuit_recovering",
+          label: "Circuit recovery in progress",
+          tone: :warning,
+          reason: "One or more model and route lanes are recovering; unaffected routes may remain available.",
+          reason_code: "circuit_recovering",
+          recovery_action: "Wait for circuit recovery to complete before relying on affected routes."
+        }
+      }
+
+      for base_readiness <- [ready, ready_refreshing],
+          circuit_state <- [:blocked, :recovering] do
+        result =
+          UpstreamRoutingReadiness.with_circuit_visibility(
+            base_readiness,
+            circuit_summary(circuit_state)
+          )
+
+        assert Map.take(result, Map.keys(expected_by_circuit_state[circuit_state])) ==
+                 expected_by_circuit_state[circuit_state]
+
+        assert result.routing_ready_now?
+
+        assert Map.drop(result, Map.keys(expected_by_circuit_state[circuit_state])) ==
+                 Map.drop(base_readiness, Map.keys(expected_by_circuit_state[circuit_state]))
+      end
+    end
+
+    test "preserves false lifecycle, assignment, and quota verdicts despite circuit evidence" do
+      fresh_quota = fresh_quota_readiness()
+      blocked_quota = UpstreamQuotaReadiness.from_windows([], @as_of)
+
+      base_readinesses = [
+        UpstreamRoutingReadiness.from_inputs(
+          identity("disabled"),
+          healthy_assignment(),
+          fresh_quota
+        ),
+        UpstreamRoutingReadiness.from_inputs(identity("active"), nil, fresh_quota),
+        UpstreamRoutingReadiness.from_inputs(
+          identity("active"),
+          healthy_assignment(),
+          blocked_quota
+        )
+      ]
+
+      for base_readiness <- base_readinesses,
+          circuit_state <- [:blocked, :recovering] do
+        assert UpstreamRoutingReadiness.with_circuit_visibility(
+                 base_readiness,
+                 circuit_summary(circuit_state)
+               ) === base_readiness
+      end
+    end
+
+    test "returns the exact base verdict for clear circuit evidence" do
+      base_readiness =
+        UpstreamRoutingReadiness.from_inputs(
+          identity("active"),
+          [healthy_assignment()],
+          fresh_quota_readiness()
+        )
+
+      assert UpstreamRoutingReadiness.with_circuit_visibility(
+               base_readiness,
+               circuit_summary(:closed)
+             ) === base_readiness
+    end
+  end
+
+  describe "with_model_availability/3" do
+    test "exposes only limited readiness when advertised Spark has independent permission" do
+      {identity, snapshot, assignment} = spark_inputs()
+      quota = UpstreamQuotaReadiness.from_snapshot(snapshot)
+      refute quota.routing_ready_now?
+
+      readiness =
+        identity
+        |> UpstreamRoutingReadiness.from_inputs([assignment], quota)
+        |> UpstreamRoutingReadiness.with_model_availability(snapshot, [assignment])
+
+      assert readiness.state == "model_limited"
+      assert readiness.label == "Limited model availability"
+      assert readiness.reason_code == "spark_quota_available"
+      assert readiness.tone == :warning
+      assert readiness.routing_ready_now?
+      refute readiness.quota_readiness.routing_ready_now?
+    end
+
+    test "preserves lifecycle assignment catalog and permission blockers" do
+      {identity, snapshot, assignment} = spark_inputs()
+
+      for {identity, snapshot, assignment} <- [
+            {%{identity | status: "disabled"}, snapshot, assignment},
+            {identity, snapshot, %{assignment | health_status: "errored"}},
+            {identity, snapshot, %{assignment | models: []}},
+            {identity, %{snapshot | raw_windows: []}, assignment}
+          ] do
+        quota = UpstreamQuotaReadiness.from_snapshot(snapshot)
+
+        readiness =
+          identity
+          |> UpstreamRoutingReadiness.from_inputs([assignment], quota)
+          |> UpstreamRoutingReadiness.with_model_availability(snapshot, [assignment])
+
+        refute readiness.routing_ready_now?
+        refute readiness.state == "model_limited"
+      end
+    end
+  end
+
+  defp spark_inputs do
+    identity = %UpstreamIdentity{
+      id: Ecto.UUID.generate(),
+      status: "active",
+      metadata: %{
+        "credential_epoch" => 1,
+        AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:blocked, @as_of, 1)
+      }
+    }
+
+    spark = %{
+      account_primary_window()
+      | quota_key: "codex_bengalfox",
+        quota_scope: "model",
+        quota_family: "codex_model",
+        model: "gpt-5.3-codex-spark",
+        upstream_model: "gpt-5.3-codex-spark",
+        raw_metered_feature: "codex_bengalfox",
+        metadata: %{
+          "independent_spark_permission" => true,
+          "independent_spark_permission_observed_at" => DateTime.to_iso8601(@as_of),
+          "independent_spark_permission_reset_at" => DateTime.to_iso8601(@future_reset),
+          "rate_limit_allowed" => true,
+          "rate_limit_reached" => false
+        }
+    }
+
+    assignment =
+      healthy_assignment()
+      |> Map.from_struct()
+      |> Map.put(:models, [%{exposed_model_id: "gpt-5.3-codex-spark"}])
+
+    {identity, RoutingQuotaSnapshot.from_identity(identity, [spark], @as_of), assignment}
   end
 
   defp fresh_quota_readiness do
@@ -176,6 +423,21 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadinessTest do
       status: "active",
       health_status: "active",
       eligibility_status: "eligible"
+    }
+  end
+
+  defp circuit_summary(state) do
+    %{
+      state: state,
+      ready?: state != :blocked,
+      tone: if(state == :blocked, do: :error, else: :warning),
+      label: "Circuit fixture",
+      detail: "Circuit fixture detail",
+      blocked_lane_count: if(state == :blocked, do: 1, else: 0),
+      recovering_lane_count: if(state == :recovering, do: 1, else: 0),
+      affected_lane_count: if(state == :closed, do: 0, else: 1),
+      blocked_reasons: [],
+      representative: nil
     }
   end
 end

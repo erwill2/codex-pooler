@@ -1,12 +1,18 @@
 defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
   use ExUnit.Case, async: false
+  use CodexPooler.CommittedWriteGuard
 
   alias CodexPooler.MixTasks.TestDatabaseLock
   alias CodexPooler.Repo
 
   @lock_namespace "codex_pooler_test_runner"
   @lock_database "postgres"
-  @lock_wait_attempts 50
+  @detection_timeout_ms 15_000
+  # A lock holder waits for its release message, which the test sends only
+  # after up to two detection budgets of its own (the second caller's entry and
+  # its advisory-lock wait); the wait outlasts that chain so the late step, not
+  # the holder, reports the failure. A green run never spends it.
+  @handoff_timeout_ms 3 * @detection_timeout_ms
   @connection_keys [
     :after_connect,
     :connect_timeout,
@@ -39,12 +45,12 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
           receive do
             :release_first -> :first_released
           after
-            5_000 -> raise "timed out waiting to release first lock holder"
+            @handoff_timeout_ms -> raise "timed out waiting to release first lock holder"
           end
         end)
       end)
 
-    assert_receive :first_locked, 5_000
+    assert_receive :first_locked, @detection_timeout_ms
 
     second =
       Task.async(fn ->
@@ -56,33 +62,84 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
         end)
       end)
 
-    assert_receive :second_entering_lock, 5_000
+    assert_receive :second_entering_lock, @detection_timeout_ms
     assert_advisory_lock_waiter!(observer, repo_config)
 
     send(first.pid, :release_first)
 
-    assert Task.await(first) == :first_released
-    assert Task.await(second) == :second_released
-    assert_receive :second_locked
+    assert Task.await(first, @detection_timeout_ms) == :first_released
+    assert Task.await(second, @detection_timeout_ms) == :second_released
+    assert_receive :second_locked, @detection_timeout_ms
   end
 
-  defp assert_advisory_lock_waiter!(conn, repo_config, attempts \\ @lock_wait_attempts)
+  test "does not serialize callers for different invocation databases" do
+    parent = self()
 
-  defp assert_advisory_lock_waiter!(conn, repo_config, attempts) when attempts > 0 do
-    if advisory_lock_waiter?(conn, repo_config) do
-      :ok
-    else
-      receive do
-      after
-        20 -> assert_advisory_lock_waiter!(conn, repo_config, attempts - 1)
-      end
+    first_config =
+      Keyword.put(
+        Repo.config(),
+        :database,
+        configured_partition_database("0123456789abcdef", 1)
+      )
+
+    second_config =
+      Keyword.put(
+        Repo.config(),
+        :database,
+        configured_partition_database("fedcba9876543210", 1)
+      )
+
+    first =
+      Task.async(fn ->
+        TestDatabaseLock.with_lock!(first_config, fn ->
+          send(parent, :first_distinct_lock_acquired)
+
+          receive do
+            :release_first_distinct_lock -> :first_distinct_lock_released
+          after
+            @handoff_timeout_ms -> raise "timed out waiting to release first distinct lock"
+          end
+        end)
+      end)
+
+    assert_receive :first_distinct_lock_acquired, @detection_timeout_ms
+
+    second =
+      Task.async(fn ->
+        TestDatabaseLock.with_lock!(second_config, fn ->
+          send(parent, :second_distinct_lock_acquired)
+          :second_distinct_lock_released
+        end)
+      end)
+
+    assert_receive :second_distinct_lock_acquired, @detection_timeout_ms
+    send(first.pid, :release_first_distinct_lock)
+
+    assert Task.await(first, @detection_timeout_ms) == :first_distinct_lock_released
+    assert Task.await(second, @detection_timeout_ms) == :second_distinct_lock_released
+  end
+
+  # `pg_locks` has no completion signal for a backend joining the lock queue, so
+  # poll it against one monotonic detection deadline.
+  defp assert_advisory_lock_waiter!(conn, repo_config) do
+    deadline = System.monotonic_time(:millisecond) + @detection_timeout_ms
+    await_advisory_lock_waiter!(conn, repo_config, deadline)
+  end
+
+  defp await_advisory_lock_waiter!(conn, repo_config, deadline) do
+    cond do
+      advisory_lock_waiter?(conn, repo_config) ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected a PostgreSQL advisory lock waiter for #{Keyword.fetch!(repo_config, :database)}")
+
+      true ->
+        receive do
+        after
+          20 -> await_advisory_lock_waiter!(conn, repo_config, deadline)
+        end
     end
-  end
-
-  defp assert_advisory_lock_waiter!(_conn, repo_config, 0) do
-    flunk(
-      "expected a PostgreSQL advisory lock waiter for #{Keyword.fetch!(repo_config, :database)}"
-    )
   end
 
   defp advisory_lock_waiter?(conn, repo_config) do
@@ -131,4 +188,31 @@ defmodule CodexPooler.MixTasks.TestDatabaseLockTest do
   catch
     :exit, _reason -> :ok
   end
+
+  defp configured_partition_database(namespace, partition) do
+    previous_namespace = System.get_env("CODEX_POOLER_TEST_RUN_NAMESPACE")
+    previous_partition = System.get_env("MIX_TEST_PARTITION")
+
+    restore = fn ->
+      restore_env("CODEX_POOLER_TEST_RUN_NAMESPACE", previous_namespace)
+      restore_env("MIX_TEST_PARTITION", previous_partition)
+    end
+
+    # Also on_exit: the ExUnit timeout kills the test before `after` runs, and every later run
+    # of the config reader in this VM would resolve the namespaced database.
+    on_exit(restore)
+
+    System.put_env("CODEX_POOLER_TEST_RUN_NAMESPACE", namespace)
+    System.put_env("MIX_TEST_PARTITION", Integer.to_string(partition))
+
+    try do
+      config = Config.Reader.read!("config/test.exs", env: :test)
+      config[:codex_pooler][CodexPooler.Repo][:database]
+    after
+      restore.()
+    end
+  end
+
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
 end

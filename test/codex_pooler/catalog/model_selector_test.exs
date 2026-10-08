@@ -17,7 +17,16 @@ defmodule CodexPooler.Catalog.ModelSelectorTest do
         model_fixture(pool, %{
           exposed_model_id: "gpt-visible",
           display_name: "GPT Visible",
-          metadata: %{"source_assignment_ids" => [routed.assignment.id]}
+          metadata: %{
+            "source_assignment_ids" => [routed.assignment.id],
+            "source_assignment_models" => %{
+              routed.assignment.id => %{
+                "description" => "Synthetic visible model.",
+                "visibility" => "hide",
+                "supported_in_api" => false
+              }
+            }
+          }
         })
 
       model_fixture(pool, %{
@@ -35,6 +44,18 @@ defmodule CodexPooler.Catalog.ModelSelectorTest do
 
       assert state.catalog.status == :synced
       assert [%{identifier: "gpt-visible", display_name: "GPT Visible"}] = state.options
+
+      assert [
+               %{
+                 model_info: %{
+                   description: "Synthetic visible model.",
+                   description_state: :available,
+                   visibility: :hidden,
+                   api_support: :unsupported
+                 }
+               }
+             ] = state.options
+
       assert [%{identifier: "gpt-visible", selected?: true}] = state.selected_options
 
       assert Enum.map(state.selected_unavailable_chips, & &1.identifier) == [
@@ -202,7 +223,6 @@ defmodule CodexPooler.Catalog.ModelSelectorTest do
       discovered_model_count: Map.get(attrs, :discovered_model_count, 0),
       upserted_model_count: Map.get(attrs, :upserted_model_count, 0),
       stale_marked_count: Map.get(attrs, :stale_marked_count, 0),
-      retired_count: Map.get(attrs, :retired_count, 0),
       error_message: Map.get(attrs, :error_message),
       stats: Map.get(attrs, :stats, %{})
     })

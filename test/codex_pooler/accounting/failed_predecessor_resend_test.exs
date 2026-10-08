@@ -1,0 +1,713 @@
+defmodule CodexPooler.Accounting.FailedPredecessorResendTest do
+  use CodexPooler.DataCase, async: false
+
+  import CodexPooler.AccountingTestSupport
+  import CodexPooler.PoolerFixtures, only: [attempt_fixture: 3]
+
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.{ClientRetry, Request, RequestReplayEntitlement}
+  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Transports.TransportFailureReason
+  alias CodexPooler.Repo
+
+  @endpoint "/backend-api/codex/responses"
+  @retry_prefix "codex-request-retry:"
+
+  describe "deterministic failed-predecessor resend claim" do
+    test "derives one bounded claim per original claim and predecessor without embedding either" do
+      original = request_claim()
+      predecessor_id = Ecto.UUID.generate()
+
+      assert {:ok, claim} =
+               ClientRetry.deterministic_failed_predecessor_claim(original, predecessor_id)
+
+      assert {:ok, ^claim} =
+               ClientRetry.deterministic_failed_predecessor_claim(original, predecessor_id)
+
+      assert String.starts_with?(claim, @retry_prefix)
+      assert byte_size(claim) == byte_size(@retry_prefix) + 43
+      refute ClientRetry.reserved_successor_claim?(claim)
+      refute claim =~ String.slice(original, -24, 24)
+      refute claim =~ predecessor_id
+
+      assert {:ok, other_predecessor} =
+               ClientRetry.deterministic_failed_predecessor_claim(original, Ecto.UUID.generate())
+
+      assert {:ok, chained} =
+               ClientRetry.deterministic_failed_predecessor_claim(claim, predecessor_id)
+
+      assert length(Enum.uniq([claim, other_predecessor, chained])) == 3
+    end
+  end
+
+  describe "claim_websocket_turn after a terminally failed predecessor" do
+    setup do
+      setup = accounting_setup()
+      session = insert_session!(setup)
+      claim = request_claim()
+
+      opts = %{
+        endpoint: @endpoint,
+        correlation_id: claim,
+        codex_session: session,
+        request_metadata: %{"request_id" => "resend-#{System.unique_integer([:positive])}"}
+      }
+
+      %{setup: setup, session: session, claim: claim, opts: opts}
+    end
+
+    test "admits the byte-identical resend as a new request with the derived claim and chains",
+         %{setup: setup, session: session, claim: claim, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      fail_predecessor!(setup, session, predecessor, "server_error")
+
+      assert {:ok, %{request: resend, client_resend: %{predecessor_shape: :provider_terminal}}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      {:ok, expected_claim} =
+        ClientRetry.deterministic_failed_predecessor_claim(claim, predecessor.id)
+
+      assert resend.id != predecessor.id
+      assert resend.correlation_id == expected_claim
+      assert resend.status == "accepted"
+      assert resend.transport == "websocket"
+      assert resend.request_metadata["request_id"] == opts.request_metadata["request_id"]
+
+      assert resend.request_metadata["client_resend"] == %{
+               "predecessor_request_id" => predecessor.id,
+               "reason" => "failed_predecessor"
+             }
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 2
+
+      # A resend after the admitted retry also fails derives from the retry.
+      fail_predecessor!(setup, session, resend, "server_error")
+
+      assert {:ok, %{request: third}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      {:ok, expected_third} =
+        ClientRetry.deterministic_failed_predecessor_claim(expected_claim, resend.id)
+
+      assert third.correlation_id == expected_third
+      assert third.request_metadata["client_resend"]["predecessor_request_id"] == resend.id
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 3
+    end
+
+    for mutation <- [:none, :visible, :generation, :attempt, :source, :phase, :terminal, :candidate, :committed, :output, :expired, :active] do
+      test "previsible idle timeout #{mutation} preserves its exact admission boundary", %{setup: setup, session: session, opts: opts} do
+        {:ok, %{request: request}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+        failure = %{"phase" => "receive_timeout", "termination_source" => "pooler_receive_timeout", "pre_visible_output" => true, "upstream_committed" => true, "terminal_seen" => false, "terminal_candidate_seen" => false}
+        %{request: request, attempt: attempt, turn: turn} = fail_predecessor!(setup, session, request, "stream_idle_timeout", response_metadata: %{"transport_failure" => failure}, first_visible_output_at: nil)
+
+        case unquote(mutation) do
+          :none ->
+            :ok
+
+          :visible ->
+            Repo.update!(Ecto.Changeset.change(turn, first_visible_output_at: db_now()))
+
+          :generation ->
+            Repo.update!(Ecto.Changeset.change(attempt, replay_generation: 1))
+
+          :attempt ->
+            Repo.update!(Ecto.Changeset.change(turn, final_attempt_id: nil))
+
+          :expired ->
+            Repo.update!(Ecto.Changeset.change(request, completed_at: DateTime.add(db_now(), -31, :second)))
+
+          :active ->
+            Repo.update!(Ecto.Changeset.change(turn, status: "in_progress", completed_at: nil))
+
+          mutation ->
+            {key, value} = Map.fetch!(%{source: {"termination_source", "peer_close_frame"}, phase: {"phase", "receive"}, terminal: {"terminal_seen", true}, candidate: {"terminal_candidate_seen", true}, committed: {"upstream_committed", false}, output: {"pre_visible_output", false}}, mutation)
+            Repo.update!(Ecto.Changeset.change(attempt, response_metadata: %{"transport_failure" => Map.put(failure, key, value)}))
+        end
+
+        before = Repo.aggregate(Request, :count)
+
+        if unquote(mutation) == :none do
+          assert {:ok, %{request: successor, client_resend: %{predecessor_shape: :previsible_idle_timeout}}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+          assert successor.id != request.id
+          assert Repo.exists?(from(link in CodexPooler.Accounting.RequestClientRetryLink, where: link.predecessor_request_id == ^request.id and link.successor_request_id == ^successor.id))
+        else
+          assert {:error, %{code: :duplicate_request}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+          assert Repo.aggregate(Request, :count) == before
+        end
+      end
+    end
+
+    test "keeps the duplicate fence while the predecessor is accepted or in progress",
+         %{setup: setup, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      attempt_fixture(predecessor, setup.assignment, %{
+        status: "in_progress",
+        completed_at: nil,
+        transport: "websocket",
+        usage_status: "usage_pending"
+      })
+
+      Repo.update!(Ecto.Changeset.change(predecessor, status: "in_progress"))
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    end
+
+    test "keeps the duplicate fence for a succeeded predecessor", %{setup: setup, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      now = db_now()
+
+      attempt_fixture(predecessor, setup.assignment, %{
+        status: "succeeded",
+        completed_at: now,
+        transport: "websocket"
+      })
+
+      Repo.update!(
+        Ecto.Changeset.change(predecessor,
+          status: "succeeded",
+          usage_status: "usage_known",
+          completed_at: now
+        )
+      )
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    end
+
+    test "keeps the duplicate fence when a failed predecessor still has an in-progress turn",
+         %{setup: setup, session: session, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      fail_predecessor!(setup, session, predecessor, "server_error")
+
+      Repo.update_all(from(t in CodexTurn, where: t.request_id == ^predecessor.id),
+        set: [status: "in_progress", completed_at: nil]
+      )
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+    end
+
+    test "keeps the duplicate fence after the retry window",
+         %{setup: setup, session: session, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      fail_predecessor!(setup, session, predecessor, "server_error")
+
+      expired_at = DateTime.add(db_now(), -31, :second)
+
+      Repo.update_all(from(r in Request, where: r.id == ^predecessor.id),
+        set: [completed_at: expired_at]
+      )
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    end
+
+    test "keeps the duplicate fence for an owner drain or client disconnect and admits a task exception",
+         %{setup: setup, session: session, opts: opts} do
+      for code <- ["owner_drained", "client_disconnected", "invalid_request_error"] do
+        opts = %{opts | correlation_id: request_claim()}
+
+        {:ok, %{request: predecessor}} =
+          Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+        fail_predecessor!(setup, session, predecessor, code)
+
+        assert {:error, %{code: :duplicate_request, resend_disposition: :terminal_predecessor}} =
+                 Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+      end
+
+      opts = %{opts | correlation_id: request_claim()}
+
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      fail_predecessor!(setup, session, predecessor, "owner_task_exception")
+
+      assert {:ok,
+              %{
+                request: resend,
+                client_resend: %{
+                  predecessor_request_id: predecessor_id,
+                  predecessor_shape: :task_exception
+                }
+              }} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert predecessor_id == predecessor.id
+      assert String.starts_with?(resend.correlation_id, @retry_prefix)
+    end
+
+    test "admits a websocket predecessor interrupted before any visible output and keeps the fence once output was visible",
+         %{setup: setup, session: session, opts: opts} do
+      opts = %{opts | correlation_id: request_claim()}
+      {:ok, %{request: predecessor}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+      interrupt_predecessor!(setup, session, predecessor, first_visible_output_at: nil)
+
+      assert {:ok, %{request: resend, client_resend: %{predecessor_request_id: predecessor_id, predecessor_shape: :previsible_disconnect}}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert predecessor_id == predecessor.id
+      assert String.starts_with?(resend.correlation_id, @retry_prefix)
+
+      for overrides <- [[first_visible_output_at: db_now()], [replay_generation: 1], [turn_status: "failed"]] do
+        opts = %{opts | correlation_id: request_claim()}
+        {:ok, %{request: predecessor}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+        interrupt_predecessor!(setup, session, predecessor, Keyword.merge([first_visible_output_at: nil], overrides))
+
+        assert {:error, %{code: :duplicate_request, resend_disposition: :terminal_predecessor}} =
+                 Accounting.claim_websocket_turn(setup.auth, setup.model, opts),
+               "admitted a client-disconnected predecessor with #{inspect(overrides)}"
+      end
+    end
+
+    test "admits an upstream stream error predecessor with verified lifecycle-cut or partial-reasoning evidence",
+         %{setup: setup, session: session, opts: opts} do
+      for {shape, metadata} <- [
+            lifecycle_cut: lifecycle_cut_metadata(),
+            partial_reasoning_cut: partial_reasoning_cut_metadata()
+          ] do
+        opts = %{opts | correlation_id: request_claim()}
+
+        {:ok, %{request: predecessor}} =
+          Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+        fail_predecessor!(setup, session, predecessor, "upstream_stream_error", response_metadata: metadata)
+
+        assert {:ok,
+                %{
+                  request: resend,
+                  client_resend: %{
+                    predecessor_request_id: predecessor_id,
+                    predecessor_shape: ^shape
+                  }
+                }} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+        {:ok, expected_claim} =
+          ClientRetry.deterministic_failed_predecessor_claim(opts.correlation_id, predecessor.id)
+
+        assert predecessor_id == predecessor.id
+        assert resend.correlation_id == expected_claim
+
+        assert resend.request_metadata["client_resend"] == %{
+                 "predecessor_request_id" => predecessor.id,
+                 "reason" => "failed_predecessor"
+               }
+      end
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 4
+    end
+
+    test "keeps the duplicate fence for an upstream stream error without verified cut evidence",
+         %{setup: setup, session: session, opts: opts} do
+      non_closed_transport_failure = %{
+        "phase" => "receive",
+        "termination_source" => "mint_transport_error",
+        "exception" => "Mint.TransportError",
+        "reason" => "timeout",
+        "transport_signal" => "ssl_closed"
+      }
+
+      for {label, metadata} <- [
+            without_observation: Map.delete(lifecycle_cut_metadata(), "native_client_retry_observation"),
+            one_completed_output_item:
+              put_in(
+                lifecycle_cut_metadata(),
+                ["native_client_retry_observation", "output_item_done_count"],
+                1
+              ),
+            non_closed_transport_failure: Map.put(lifecycle_cut_metadata(), "transport_failure", non_closed_transport_failure),
+            visible_without_reasoning:
+              put_in(
+                partial_reasoning_cut_metadata(),
+                ["native_client_retry_observation", "partial_reasoning_seen"],
+                false
+              )
+          ] do
+        opts = %{opts | correlation_id: request_claim()}
+
+        {:ok, %{request: predecessor}} =
+          Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+        fail_predecessor!(setup, session, predecessor, "upstream_stream_error", response_metadata: metadata)
+
+        assert {:error, %{code: :duplicate_request, resend_disposition: :terminal_predecessor}} =
+                 Accounting.claim_websocket_turn(setup.auth, setup.model, opts),
+               "expected #{label} to keep the fence"
+      end
+
+      # A replayed attempt carrying lifecycle-cut evidence is not the
+      # generation-zero cut the resend repeats.
+      opts = %{opts | correlation_id: request_claim()}
+
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      %{attempt: attempt} =
+        fail_predecessor!(setup, session, predecessor, "upstream_stream_error", response_metadata: lifecycle_cut_metadata())
+
+      Repo.update!(Ecto.Changeset.change(attempt, replay_generation: 1))
+
+      assert {:error, %{code: :duplicate_request, resend_disposition: :terminal_predecessor}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 5
+    end
+
+    test "keeps the duplicate fence for an anchored resend of a provider failure",
+         %{setup: setup, session: session, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      fail_predecessor!(setup, session, predecessor, "server_error")
+
+      assert {:error, %{code: :duplicate_request, resend_disposition: :anchor_unavailable}} =
+               Accounting.claim_websocket_turn(
+                 setup.auth,
+                 setup.model,
+                 Map.put(opts, :anchor_present?, true)
+               )
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    end
+
+    test "keeps the duplicate fence when the predecessor holds a replay entitlement",
+         %{setup: setup, session: session, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      %{turn: turn, attempt: attempt} =
+        fail_predecessor!(setup, session, predecessor, "server_error")
+
+      now = db_now()
+
+      %RequestReplayEntitlement{}
+      |> RequestReplayEntitlement.changeset(%{
+        request_id: predecessor.id,
+        codex_turn_id: turn.id,
+        eligible_attempt_id: attempt.id,
+        api_key_id: setup.api_key.id,
+        api_key_runtime_epoch: setup.api_key.runtime_revocation_epoch,
+        pool_id: setup.pool.id,
+        model_id: setup.model.id,
+        model_identifier: setup.model.exposed_model_id,
+        semantic_turn_digest: turn.semantic_turn_digest,
+        replay_claim_digest: :crypto.strong_rand_bytes(32),
+        replay_generation: 1,
+        owner_lease_digest: <<1::256>>,
+        owner_lease_key_version: "test-v1",
+        predecessor_epoch: 1,
+        status: "armed",
+        armed_at: now,
+        expires_at: DateTime.add(now, 30, :second)
+      })
+      |> Repo.insert!()
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+    end
+
+    test "keeps the duplicate fence without a session lock context or for a turn claim",
+         %{setup: setup, session: session, opts: opts} do
+      {:ok, %{request: predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+      fail_predecessor!(setup, session, predecessor, "server_error")
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(
+                 setup.auth,
+                 setup.model,
+                 Map.delete(opts, :codex_session)
+               )
+
+      turn_claim =
+        "codex-turn:" <> Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+      turn_opts = %{opts | correlation_id: turn_claim}
+
+      {:ok, %{request: turn_predecessor}} =
+        Accounting.claim_websocket_turn(setup.auth, setup.model, turn_opts)
+
+      fail_predecessor!(setup, session, turn_predecessor, "server_error")
+
+      assert {:error, %{code: :duplicate_request}} =
+               Accounting.claim_websocket_turn(setup.auth, setup.model, turn_opts)
+
+      assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 2
+    end
+  end
+
+  # A native websocket compaction is judged by the rule the owner's compaction
+  # retry policy applies with forwarding on (`ClientRetry.compaction_resend_shape/3`),
+  # failing closed (findings#270 rows 270-237 and 270-238).
+  describe "claim_websocket_turn after a failed native websocket compaction" do
+    setup do
+      setup = accounting_setup()
+      session = insert_session!(setup)
+
+      opts = %{
+        endpoint: "/backend-api/codex/responses/compact",
+        correlation_id: request_claim(),
+        codex_session: session,
+        request_metadata: %{"request_id" => "compaction-resend-#{System.unique_integer([:positive])}"}
+      }
+
+      %{setup: setup, session: session, opts: opts}
+    end
+
+    test "admits a compaction whose anchor was refused before any execution, by the guard or by the provider",
+         %{setup: setup, session: session, opts: opts} do
+      for metadata <- [anchor_refusal_metadata(:guard), anchor_refusal_metadata(:provider)] do
+        opts = %{opts | correlation_id: request_claim()}
+        {:ok, %{request: predecessor}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+        fail_predecessor!(setup, session, predecessor, "stream_incomplete", response_metadata: metadata)
+
+        assert {:ok, %{request: resend, client_resend: %{predecessor_request_id: predecessor_id, predecessor_shape: :anchor_refusal}}} =
+                 Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+        assert predecessor_id == predecessor.id
+        assert String.starts_with?(resend.correlation_id, @retry_prefix)
+      end
+    end
+
+    # `stream_incomplete` is in the retryable first-event vocabulary, so every
+    # such compaction used to be admitted here as a provider terminal, whatever
+    # its shape: a provider 400 of another message class, the provider's
+    # anchor refusal without the receipt of its one pushed frame, one without
+    # any proof at all.
+    test "keeps the fence for a stream_incomplete compaction without a verified shape",
+         %{setup: setup, session: session, opts: opts} do
+      unproven = [
+        Map.delete(anchor_refusal_metadata(:provider), "rejection_message_class"),
+        Map.delete(anchor_refusal_metadata(:provider), "downstream_delivery"),
+        %{"stream_terminal_type" => "error", "error_kind" => "stream_incomplete"}
+      ]
+
+      for metadata <- unproven do
+        opts = %{opts | correlation_id: request_claim()}
+        {:ok, %{request: predecessor}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+        fail_predecessor!(setup, session, predecessor, "stream_incomplete", response_metadata: metadata)
+
+        assert {:error, %{code: :duplicate_request, resend_disposition: :terminal_predecessor}} =
+                 Accounting.claim_websocket_turn(setup.auth, setup.model, opts),
+               "admitted a compaction with #{inspect(metadata)}"
+      end
+    end
+
+    test "admits a compaction drained before any output and one the provider ended with a retryable terminal",
+         %{setup: setup, session: session, opts: opts} do
+      for {code, visible, metadata, shape} <- [
+            {"owner_drained", nil, %{"error_kind" => "owner_drained"}, :compaction_cut},
+            {"server_error", db_now(), %{"stream_terminal_type" => "response.failed", "error_kind" => "server_error"}, :provider_terminal}
+          ] do
+        opts = %{opts | correlation_id: request_claim()}
+        {:ok, %{request: predecessor}} = Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+        fail_predecessor!(setup, session, predecessor, code, response_metadata: metadata, first_visible_output_at: visible)
+
+        assert {:ok, %{client_resend: %{predecessor_request_id: predecessor_id, predecessor_shape: ^shape}}} =
+                 Accounting.claim_websocket_turn(setup.auth, setup.model, opts)
+
+        assert predecessor_id == predecessor.id
+      end
+    end
+  end
+
+  # One terminal error frame pushed and nothing before it, with the guard's
+  # metadata or the provider's refusal (findings#232 row 232-277).
+  defp anchor_refusal_metadata(refusal) do
+    base = %{
+      "stream_terminal_type" => "error",
+      "error_kind" => "stream_incomplete",
+      "upstream_error_code" => "previous_response_not_found",
+      "downstream_delivery" => %{"outcome" => "delivered", "terminal_class" => "error", "highest_frame_class" => "terminal", "frames_after_visible" => 1, "transport" => "websocket"}
+    }
+
+    case refusal do
+      :guard ->
+        Map.put(base, "transport_failure", TransportFailureReason.continuation_generation_guard_metadata(:fresh))
+
+      :provider ->
+        Map.merge(base, %{
+          "rejection_upstream_status" => 400,
+          "rejection_error_type" => "invalid_request_error",
+          "rejection_message_class" => "invalid_previous_response_id"
+        })
+    end
+  end
+
+  defp request_claim,
+    do: "codex-request:" <> Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+  defp insert_session!(setup) do
+    now = db_now()
+
+    Repo.insert!(%CodexSession{
+      pool_id: setup.pool.id,
+      api_key_id: setup.api_key.id,
+      session_key: "resend-#{System.unique_integer([:positive, :monotonic])}",
+      pool_upstream_assignment_id: setup.assignment.id,
+      status: "active",
+      created_at: now,
+      updated_at: now
+    })
+  end
+
+  defp fail_predecessor!(setup, session, request, code, opts \\ []) do
+    now = db_now()
+
+    response_metadata =
+      Keyword.get(opts, :response_metadata, %{
+        "stream_terminal_type" => "response.failed",
+        "error_kind" => code
+      })
+
+    attempt =
+      attempt_fixture(request, setup.assignment, %{
+        status: "failed",
+        completed_at: now,
+        network_error_code: code,
+        transport: "websocket",
+        usage_status: "usage_unknown",
+        response_metadata: response_metadata
+      })
+
+    sequence =
+      Repo.one(
+        from turn in CodexTurn,
+          where: turn.codex_session_id == ^session.id,
+          select: coalesce(max(turn.turn_sequence), 0)
+      ) + 1
+
+    turn =
+      Repo.insert!(%CodexTurn{
+        codex_session_id: session.id,
+        request_id: request.id,
+        turn_sequence: sequence,
+        transport_kind: "websocket",
+        semantic_turn_digest: :crypto.strong_rand_bytes(32),
+        status: "failed",
+        error_code: code,
+        final_attempt_id: attempt.id,
+        first_visible_output_at: Keyword.get(opts, :first_visible_output_at, now),
+        started_at: now,
+        completed_at: now,
+        created_at: now,
+        updated_at: now
+      })
+
+    request =
+      Repo.update!(
+        Ecto.Changeset.change(request,
+          status: "failed",
+          usage_status: "usage_unknown",
+          response_status_code: 200,
+          last_error_code: code,
+          completed_at: now
+        )
+      )
+
+    %{request: request, attempt: attempt, turn: turn}
+  end
+
+  # The rows a direct websocket socket leaves when its client closes during a
+  # turn: request and generation-zero attempt failed `client_disconnected`,
+  # turn interrupted, `first_visible_output_at` set only when output reached
+  # the client (findings#232 row 232-112).
+  defp interrupt_predecessor!(setup, session, request, opts) do
+    now = db_now()
+
+    attempt =
+      attempt_fixture(request, setup.assignment, %{
+        status: "failed",
+        completed_at: now,
+        network_error_code: "client_disconnected",
+        transport: "websocket",
+        usage_status: "usage_unknown",
+        response_metadata: %{"error_kind" => "client_disconnected"}
+      })
+      |> Ecto.Changeset.change(replay_generation: Keyword.get(opts, :replay_generation, 0))
+      |> Repo.update!()
+
+    sequence = Repo.one(from turn in CodexTurn, where: turn.codex_session_id == ^session.id, select: coalesce(max(turn.turn_sequence), 0)) + 1
+
+    Repo.insert!(%CodexTurn{
+      codex_session_id: session.id,
+      request_id: request.id,
+      turn_sequence: sequence,
+      transport_kind: "websocket",
+      semantic_turn_digest: :crypto.strong_rand_bytes(32),
+      status: Keyword.get(opts, :turn_status, "interrupted"),
+      error_code: "client_disconnected",
+      final_attempt_id: attempt.id,
+      first_visible_output_at: Keyword.fetch!(opts, :first_visible_output_at),
+      started_at: now,
+      completed_at: now,
+      created_at: now,
+      updated_at: now
+    })
+
+    Repo.update!(Ecto.Changeset.change(request, status: "failed", usage_status: "usage_unknown", response_status_code: 499, last_error_code: "client_disconnected", completed_at: now))
+  end
+
+  # The metadata a lifecycle-only cut persists (findings issue 124): only
+  # `response.created` and `response.in_progress` arrived before the TLS
+  # connection closed under the receive loop.
+  defp lifecycle_cut_metadata do
+    %{
+      "transport_failure" => %{
+        "phase" => "receive",
+        "termination_source" => "mint_transport_error",
+        "exception" => "Mint.TransportError",
+        "reason" => "closed",
+        "transport_signal" => "ssl_closed",
+        "terminal_seen" => false,
+        "terminal_candidate_seen" => false
+      },
+      "native_client_retry_observation" => %{
+        "version" => 1,
+        "authority_complete" => true,
+        "output_item_done_count" => 0,
+        "output_item_done_count_saturated" => false,
+        "partial_reasoning_seen" => false,
+        "first_visible_at" => nil,
+        "terminal_seen" => false,
+        "terminal_candidate_seen" => false
+      }
+    }
+  end
+
+  defp partial_reasoning_cut_metadata do
+    metadata = lifecycle_cut_metadata()
+
+    observation =
+      metadata["native_client_retry_observation"]
+      |> Map.put("partial_reasoning_seen", true)
+      |> Map.put("first_visible_at", "2026-09-11T09:00:00.123456Z")
+
+    Map.put(metadata, "native_client_retry_observation", observation)
+  end
+
+  defp db_now do
+    %{rows: [[now]]} = Repo.query!("SELECT clock_timestamp()", [])
+    now
+  end
+end

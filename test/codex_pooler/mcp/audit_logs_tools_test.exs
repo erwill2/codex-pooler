@@ -89,7 +89,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
 
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     structured = result["structuredContent"]
 
@@ -98,10 +98,11 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
              "limit",
              "nextOffset",
              "offset",
-             "total"
+             "total",
+             "totalExact"
            ]
 
-    assert %{"items" => [item], "total" => 1, "limit" => 10, "offset" => 0} = structured
+    assert %{"items" => [item], "total" => 1, "totalExact" => true, "limit" => 10, "offset" => 0} = structured
     assert structured["nextOffset"] == nil
 
     assert item["id"] == event.id
@@ -147,7 +148,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
   end
 
   test "audit-log list text handles empty results without echoing caller filters", %{auth: auth} do
-    sentinels = caller_filter_sentinels()
+    sentinels = Map.put(caller_filter_sentinels(), "outcome", "failure")
 
     assert {:ok, result} =
              ToolDispatch.call(
@@ -161,6 +162,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     assert result["structuredContent"] == %{
              "items" => [],
              "total" => 0,
+             "totalExact" => true,
              "limit" => 50,
              "offset" => 5,
              "nextOffset" => nil
@@ -280,7 +282,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
       |> Enum.count(&String.starts_with?(&1, "- occurred_at="))
 
     assert row_count == 10
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
   end
 
   test "audit-log tool rejects malformed semantic filters without echoing date sentinels", %{
@@ -341,7 +343,7 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     assert result["isError"] == false
     assert :ok = Redaction.assert_mcp_output_safe!(result)
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    refute text =~ Jason.encode!(result["structuredContent"])
+    refute text =~ CodexPooler.JSON.encode!(result["structuredContent"])
 
     assert %{"status" => "ok", "kind" => "audit_log", "item" => item} =
              result["structuredContent"]
@@ -383,6 +385,52 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
     refute text =~ long_detail
 
     assert_no_unsafe_audit_log_text(result)
+  end
+
+  test "audit-log MCP output hides IPv4 and IPv6 immediate peer provenance", %{
+    auth: auth,
+    user: user
+  } do
+    ipv4_peer = "192.0.2.91"
+    ipv6_peer = "2001:db8::91"
+
+    event =
+      %AuditEvent{
+        occurred_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+        actor_type: "user",
+        actor_user_id: user.id,
+        action: "auth.login",
+        target_type: "session",
+        target_id: Ecto.UUID.generate(),
+        outcome: "success",
+        details: %{
+          "ipv4_provenance" => %{
+            "immediate_peer_ip" => ipv4_peer,
+            "client_ip_source" => "x_forwarded_for",
+            "inspected_hops" => 2
+          },
+          "ipv6_provenance" => %{
+            "immediate_peer_ip" => ipv6_peer,
+            "client_ip_source" => "x_real_ip",
+            "inspected_hops" => 1
+          }
+        }
+      }
+      |> Repo.insert!()
+
+    assert {:ok, result} =
+             ToolDispatch.call("codex_pooler_get_audit_log", %{"id" => event.id}, %{auth: auth})
+
+    assert result["isError"] == false
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+
+    details = result["structuredContent"]["item"]["details"]
+    assert details["ipv4_provenance"]["immediate_peer_ip"] == "[REDACTED]"
+    assert details["ipv6_provenance"]["immediate_peer_ip"] == "[REDACTED]"
+    assert details["ipv4_provenance"]["client_ip_source"] == "x_forwarded_for"
+    assert details["ipv6_provenance"]["inspected_hops"] == 1
+    refute inspect(result) =~ ipv4_peer
+    refute inspect(result) =~ ipv6_peer
   end
 
   test "audit-log get text handles nil optional fields and missing selectors", %{auth: auth} do

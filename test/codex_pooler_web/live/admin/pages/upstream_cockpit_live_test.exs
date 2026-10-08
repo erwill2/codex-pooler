@@ -3,25 +3,33 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
   import Ecto.Query
   import Phoenix.LiveViewTest
+  import CodexPooler.AccountsFixtures, only: [operator_fixture: 2, valid_user_password: 0]
   import CodexPooler.PoolerFixtures
+  import CodexPooler.UnboxedFixture, only: [register_unboxed_cleanup!: 1]
 
+  alias CodexPooler.Accounting.{Attempt, Request, RequestLogFact}
+  alias CodexPooler.Admin.UpstreamCockpitMetrics.RequestHealth
   alias CodexPooler.Admin.UpstreamRoutingReadiness
   alias CodexPooler.Audit
+  alias CodexPooler.Audit.AuditEvent
+  alias CodexPooler.DataCase
   alias CodexPooler.Events
+  alias CodexPooler.Events.Event
   alias CodexPooler.FakeOpenAIAuthProvider
-
-  alias CodexPooler.Jobs.{
-    AccountReconciliationWorker,
-    SavedResetRedemptionWorker,
-    TokenRefreshWorker
-  }
-
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Persistence.RoutingCircuitState
+  alias CodexPooler.Jobs.AccountReconciliationWorker
+  alias CodexPooler.Jobs.TokenRefreshWorker
+  alias CodexPooler.Jobs.SavedResetRedemptionWorker
   alias CodexPooler.Pools
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.Lifecycle.IdentitySlotLock
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   alias CodexPooler.Upstreams.Schemas.{
@@ -32,15 +40,161 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   }
 
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
+  alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections
+  alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary
+  alias CodexPoolerWeb.Admin.UpstreamCockpitLive.AuthJsonImportWorkflow
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus
   alias CodexPoolerWeb.DateTimeDisplay
+  alias Ecto.Adapters.SQL
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Phoenix.LiveViewTest.ClientProxy
+  alias Phoenix.PubSub
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  @mounted_recovery_timeout_ms 15_000
+  @stale_import_message "credentials changed after import preparation; submit the current auth data again"
 
   setup :register_and_log_in_user
 
   setup do
     Repo.delete_all(Oban.Job)
     :ok
+  end
+
+  @tag :cockpit_consistency
+  test "usage availability circuit recovery and reset confirmation stay independent", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "cockpit-consistency-#{System.unique_integer([:positive])}",
+        name: "Cockpit consistency"
+      })
+
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    consumed_at = DateTime.add(now, -2, :minute)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit consistency account",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}},
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 0,
+            "observed_at" => DateTime.to_iso8601(now)
+          },
+          "saved_reset_redemption" => %{
+            "phase" => "consumed_pending_probe",
+            "consumed_at" => DateTime.to_iso8601(consumed_at),
+            "deadline_at" => DateTime.add(consumed_at, 15, :minute) |> DateTime.to_iso8601()
+          }
+        }
+      })
+
+    model_identifier = "gpt-cockpit-consistency"
+    advertise_assignment_model!(pool, assignment, model_identifier)
+
+    insert_circuit_state!(pool, assignment, model_identifier, "proxy_http",
+      status: "open",
+      opened_at: DateTime.add(now, -30, :second),
+      next_probe_at: DateTime.add(now, -1, :second)
+    )
+
+    assert {:ok, windows} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "account",
+                 quota_scope: "account",
+                 quota_family: "account",
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 used_percent: Decimal.new("100"),
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 merge_precedence: 60,
+                 observed_at: DateTime.add(now, -30, :second),
+                 last_sync_at: DateTime.add(now, -30, :second),
+                 metadata: %{}
+               },
+               %{
+                 quota_key: "account",
+                 quota_scope: "account",
+                 quota_family: "account",
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 used_percent: Decimal.new("100"),
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_response_headers",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 merge_precedence: 80,
+                 observed_at: now,
+                 last_sync_at: now
+               }
+             ])
+
+    windows
+    |> Enum.find(&(&1.source == "codex_usage_api"))
+    |> Ecto.Changeset.change(%{
+      metadata: cockpit_candidate_metadata(DateTime.add(now, -30, :second), now)
+    })
+    |> Repo.update!()
+
+    request = request_fixture(%{pool: pool, api_key: api_key})
+
+    ledger_entry_fixture(request, %{
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: identity.id,
+      occurred_at: DateTime.add(now, -30, :second),
+      usage_status: "usage_unknown",
+      total_tokens: 999_999,
+      settled_cost_micros: 999_999
+    })
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    assert account.token_burn.usage_state == :unknown
+    assert account.saved_reset_confirmation.confirmation_state == :awaiting_confirmation
+    assert account.saved_reset_confirmation.challenged_evidence_state == :candidate_progressing
+    assert [%{circuit_readiness: %{state: :recovering, ready?: true}}] = account.assignments
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+    _ = render_async(view)
+    card = "#upstream-account-#{identity.id}"
+
+    assert has_element?(
+             view,
+             "#{card}-token-burn-content [data-role='upstream-token-burn-state'][data-usage-state='unknown']",
+             "Usage unavailable"
+           )
+
+    assert has_element?(
+             view,
+             "#{card}-pool-assignment-#{assignment.id}-route-circuit[title='Circuit recovery in progress']"
+           )
+
+    assert has_element?(
+             view,
+             "#saved-reset-operation-list-#{identity.id}[data-verification-state='candidate']"
+           )
+
+    refute has_element?(view, "#saved-reset-operation-list-#{identity.id} [data-role='saved-reset-serving-readiness']")
+    view |> element("#saved-reset-view-status-list-#{identity.id}") |> render_click()
+    assert has_element?(view, "#saved-reset-policy-dialog[open]")
+    assert has_element?(view, "#saved-reset-operation-bank-#{identity.id} [data-role='saved-reset-serving-readiness']", account.routing_readiness.label)
+    # The unconfirmed reset keeps the account from routing, so the bank prints the account's own reason under the label.
+    refute account.routing_readiness.routing_ready_now?
+    assert account.routing_readiness.reason_code == "saved_reset_probe_pending"
+    assert has_element?(view, "#saved-reset-operation-bank-#{identity.id} [data-role='saved-reset-serving-reason'].block", account.routing_readiness.reason)
+    refute has_element?(view, "#saved-reset-operation-bank-#{identity.id} [data-role='saved-reset-serving-reason'].sr-only")
   end
 
   test "reconciliation status renders one attention region for a blocked summary" do
@@ -346,18 +500,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert Map.fetch!(assignments_by_id, stale_assignment.id).assignment_label ==
              "Current Shared Codex"
 
-    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_status == "failed"
+    # Historical assignment-local failed or blocked priming does not override
+    # the fresh identity-wide usable quota for active, eligible assignments.
+    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_status == "known"
 
     assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_label ==
-             "Quota failed"
+             "Quota known"
 
     assert Map.fetch!(assignments_by_id, fresh_assignment.id).quota_priming_status == "known"
     assert Map.fetch!(assignments_by_id, fresh_assignment.id).quota_priming_label == "Quota known"
 
-    assert Map.fetch!(assignments_by_id, blocked_assignment.id).quota_priming_status == "blocked"
+    assert Map.fetch!(assignments_by_id, blocked_assignment.id).quota_priming_status == "known"
 
     assert Map.fetch!(assignments_by_id, blocked_assignment.id).quota_priming_label ==
-             "Priming blocked"
+             "Quota known"
 
     assert Map.fetch!(assignments_by_id, fresh_assignment.id).assignment_label ==
              "Current Shared Codex"
@@ -372,8 +528,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     # The stale stored label resolves to the account name, which the lane
     # hides as redundant — so neither string may render in the row.
     refute has_element?(view, stale_selector, "Current Shared Codex")
-    assert has_element?(view, "#{stale_selector}-route-quota[title='Quota failed']")
-    assert has_element?(view, "#{blocked_selector}-route-quota[title='Priming blocked']")
+    assert has_element?(view, "#{stale_selector}-route-quota[title='Quota known']")
+    assert has_element?(view, "#{blocked_selector}-route-quota[title='Quota known']")
     assert has_element?(view, "#upstream-quota", "Fresh")
 
     refute html =~ "old-shared-label@example.com"
@@ -405,6 +561,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
            )
   end
 
+  @tag :relative_countdown_contract
   test "cockpit read model exposes safe OAuth relink summaries without transient secrets", %{
     conn: conn,
     scope: scope
@@ -457,6 +614,42 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     refute html =~ "code_verifier"
   end
 
+  @tag :relative_countdown_contract
+  test "OAuth relink card keeps a subsecond future deadline actionable at a fixed instant" do
+    now = ~U[2026-07-31 12:00:00.000000Z]
+
+    flow = %{
+      id: Ecto.UUID.generate(),
+      flow_kind: "browser",
+      status: "pending",
+      inserted_at: DateTime.add(now, -120, :second),
+      last_polled_at: DateTime.add(now, -30, :second),
+      expires_at: ~U[2026-07-31 12:00:00.999999Z],
+      device: nil
+    }
+
+    cockpit = %{oauth_flows: %{items: [flow]}}
+
+    future_html =
+      render_component(&Summary.relink_card/1,
+        cockpit: cockpit,
+        datetime_preferences: %{datetime_format: "default", timezone: "Etc/UTC"},
+        now: now
+      )
+
+    due_html =
+      render_component(&Summary.relink_card/1,
+        cockpit: %{oauth_flows: %{items: [%{flow | expires_at: now}]}},
+        datetime_preferences: %{datetime_format: "default", timezone: "Etc/UTC"},
+        now: now
+      )
+
+    assert future_html =~ ~s(id="upstream-cockpit-relink")
+    assert future_html =~ ~s(id="upstream-cockpit-relink-expiry")
+    assert future_html =~ "expires just now"
+    assert due_html == ""
+  end
+
   test "renders the relink timeline for a pending device flow", %{conn: conn, scope: scope} do
     {:ok, pool} =
       Pools.create_pool(scope, %{slug: "cockpit-relink-device", name: "Cockpit Relink Device"})
@@ -484,6 +677,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              view,
              ~s(#upstream-cockpit-relink-verification-link[href="https://provider.example/verify"]),
              "Open verification page"
+           )
+
+    assert has_element?(
+             view,
+             ~s(#upstream-cockpit-relink-copy-verification-url[phx-hook="ClipboardCopy"][phx-update="ignore"][data-copy-text="https://provider.example/verify"])
            )
   end
 
@@ -555,8 +753,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     {:ok, pool} =
       Pools.create_pool(scope, %{slug: "cockpit-relink-cancel", name: "Cockpit Relink Cancel"})
 
-    %{identity: identity} =
+    %{identity: identity, assignment: assignment} =
       upstream_assignment_fixture(pool, %{account_label: "Cockpit Relink Cancel Account"})
+
+    failed_request =
+      recent_event_request_fixture(pool, assignment, %{
+        status: "failed",
+        admitted_at: DateTime.add(DateTime.utc_now(), -2, :minute),
+        correlation_id: "cancel-relink-retained-request"
+      })
 
     flow =
       insert_oauth_flow!(pool, identity, scope.user, %{
@@ -567,13 +772,53 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     assert has_element?(view, "#upstream-cockpit-relink")
 
+    _ = render_async(view)
+    handler_id = {__MODULE__, :cancel_relink_metrics, make_ref()}
+    test_pid = self()
+    identity_binary = Ecto.UUID.dump!(identity.id)
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and
+               identity_binary in (metadata[:params] || []) and
+               String.contains?(to_string(metadata[:query]), "percentile_disc") do
+            send(test_pid, {handler_id, self()})
+
+            receive do
+              {^handler_id, :release} -> :ok
+            after
+              15_000 -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
     view
     |> element("#upstream-cockpit-relink-cancel")
     |> render_click()
 
+    assert_receive {^handler_id, query_pid}, 5_000
+
+    try do
+      refute has_element?(view, "#upstream-cockpit-relink")
+      assert has_element?(view, "#upstream-event-summary", "OAuth relink cancelled")
+
+      assert has_element?(
+               view,
+               "#upstream-event-summary button[phx-value-request-id='#{failed_request.request.id}']"
+             )
+    after
+      :telemetry.detach(handler_id)
+      send(query_pid, {handler_id, :release})
+    end
+
+    _ = render_async(view)
     assert Repo.get!(OAuthFlow, flow.id).status == "cancelled"
-    refute has_element?(view, "#upstream-cockpit-relink")
-    assert has_element?(view, "#upstream-event-summary", "OAuth relink cancelled")
   end
 
   test "shows lane labels only when they differ from the account name", %{
@@ -611,7 +856,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
 
     assert has_element?(view, "#upstream-cockpit-page-header h1", "Upstream health")
-    assert has_element?(view, "#upstream-cockpit-page-header", "actions to recover it")
+    assert has_element?(view, "#upstream-cockpit-page-header", "its recovery actions")
     refute has_element?(view, "#upstream-cockpit-page-header button")
   end
 
@@ -626,6 +871,117 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(view, "#upstream-vitals-access-token dd[title]")
     assert has_element?(view, "#upstream-vitals-token-refresh dd[title]")
+  end
+
+  for {scenario, status, expiry_state, expected_value, replacement?} <- [
+        {:future, "paused", "known_future", "expires", false},
+        {:past, "paused", "known_past", "expired", true},
+        {:unknown, "paused", "unavailable", "expiry unavailable", false},
+        {:mixed, "paused", "unavailable", "expiry unavailable", false},
+        {:legacy, "refresh_failed", "known_past", "expired", true},
+        {:missing_secret, "paused", "known_future", "expires", true},
+        {:reauth, "reauth_required", "known_future", "expires", true}
+      ] do
+    @tag :credential_expiry_cockpit
+    @tag credential_expiry_scenario: scenario
+    test "cockpit uses canonical #{scenario} credential expiry for vitals and recovery actions", %{conn: conn, scope: scope, credential_expiry_scenario: scenario} do
+      configure_upstream_secret_key!()
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      future = DateTime.add(now, 2, :hour)
+      past = DateTime.add(now, -2, :hour)
+      raw_expiry_value = runtime_secret("cockpit-expiry-raw-metadata")
+
+      metadata =
+        case scenario do
+          kind when kind in [:future, :missing_secret] ->
+            canonical_known_expiry_metadata(future)
+
+          :past ->
+            canonical_known_expiry_metadata(past)
+
+          :unknown ->
+            canonical_unknown_expiry_metadata()
+
+          :mixed ->
+            %{
+              "credential_epoch" => 2,
+              "access_token_expires_at" => DateTime.to_iso8601(past),
+              "token_refresh" => %{
+                "status" => "succeeded",
+                "access_token_expiry" => %{
+                  "version" => 1,
+                  "credential_epoch" => 1,
+                  "state" => "known",
+                  "source" => "explicit"
+                }
+              },
+              "raw_expiry_value" => raw_expiry_value
+            }
+
+          :legacy ->
+            %{"access_token_expires_at" => DateTime.to_iso8601(past)}
+
+          :reauth ->
+            canonical_known_expiry_metadata(future, %{
+              "status" => "reauth_required",
+              "reason" => %{
+                "code" => "credential_refresh_failed",
+                "message" => "credential refresh was rejected"
+              }
+            })
+        end
+
+      slug_suffix = scenario |> Atom.to_string() |> String.replace("_", "-")
+
+      %{identity: identity} =
+        status_fixture!(scope, "expiry-#{slug_suffix}", %{
+          identity_status: unquote(status),
+          identity_metadata: metadata
+        })
+
+      if scenario != :missing_secret do
+        assert {:ok, _secret} =
+                 Upstreams.store_encrypted_secret(identity, %{
+                   secret_kind: "access_token",
+                   plaintext: runtime_secret("cockpit-expiry-#{identity.id}")
+                 })
+      end
+
+      assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+      assert cockpit.header.credential_expiry.state == unquote(expiry_state)
+
+      if scenario == :future do
+        assert cockpit.header.secret_status == :present
+        assert cockpit.header.refresh_status == "succeeded"
+      end
+
+      if scenario == :reauth do
+        assert cockpit.actions.refresh_token == %{available?: false, reason: "token refresh is unavailable"}
+      end
+
+      expected_action =
+        if unquote(replacement?),
+          do: %{available?: true, reason: nil},
+          else: %{available?: false, reason: "credential replacement is not needed"}
+
+      assert cockpit.actions.replace_auth_json == expected_action
+      {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+      action_id = "#cockpit-replace-auth-json-upstream-account-#{identity.id}"
+
+      assert has_element?(view, "#upstream-vitals-access-token", unquote(expected_value))
+      assert has_element?(view, "#upstream-vitals-access-token dd[title]")
+      refute render(view) =~ raw_expiry_value
+
+      if unquote(replacement?) do
+        refute has_element?(view, "#{action_id}[disabled]")
+        refute has_element?(view, "#{action_id}[title]")
+      else
+        assert has_element?(
+                 view,
+                 "#{action_id}[disabled][title='credential replacement is not needed']"
+               )
+      end
+    end
   end
 
   defp insert_oauth_flow!(pool, identity, user, attrs) do
@@ -691,10 +1047,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     |> render_click()
 
     assert has_element?(view, "#oauth-relink-authorization-url")
+    assert has_element?(view, "#oauth-relink-authorization-step", "Authorization page")
     assert has_element?(view, "#oauth-relink-callback-url")
+    assert has_element?(view, "#oauth-relink-callback-step", "Callback URL")
     assert has_element?(view, "#oauth-relink-submit-callback")
 
     authorization_url = oauth_relink_authorization_url_from_view(view)
+
+    assert has_element?(
+             view,
+             ~s(#oauth-relink-authorization-url-copy[phx-hook="ClipboardCopy"][phx-update="ignore"][data-copy-text="#{authorization_url}"][aria-label="Copy OpenAI authorization URL"]),
+             "Copy link"
+           )
+
     callback_url = callback_url(authorization_state(authorization_url), "cockpit-browser-code")
 
     view
@@ -703,6 +1068,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(view, "#oauth-relink-status", "OpenAI account relinked")
     assert has_element?(view, "#oauth-relink-cancel", "Close")
+
+    # The header follows the flow instead of freezing on its opening line, and a
+    # dialog that already sits on the cockpit offers no link to the cockpit.
+    assert has_element?(view, "#oauth-relink-dialog h2", "reauthorized")
+    refute render(view) =~ "Reconnect this upstream identity"
+    refute has_element?(view, "#oauth-relink-dialog [id$='-open-cockpit']")
+
     assert Repo.aggregate(UpstreamIdentity, :count) == 1
 
     reloaded = Repo.get!(UpstreamIdentity, identity.id)
@@ -748,6 +1120,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     access_token = runtime_secret("cockpit-oauth-device-access")
     refresh_token = runtime_secret("cockpit-oauth-device-refresh")
     id_token = oauth_id_token("acct_cockpit_device_ui", "workspace-cockpit-ui")
+    pending_provider_value = runtime_secret("cockpit-oauth-device-pending")
 
     provider =
       start_oauth_provider!(
@@ -761,11 +1134,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
                expires_at: DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.to_iso8601()
              )},
           "/api/accounts/deviceauth/token" =>
-            {200,
-             FakeOpenAIAuthProvider.authorization_code_response(
-               authorization_code: authorization_code,
-               code_verifier: code_verifier
-             )},
+            {403,
+             %{
+               "error" => %{
+                 "code" => "deviceauth_authorization_pending",
+                 "message" => pending_provider_value
+               }
+             }},
           "/oauth/token" =>
             {200,
              FakeOpenAIAuthProvider.token_response(
@@ -788,11 +1163,58 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(
              view,
-             "#oauth-relink-device-code",
-             FakeOpenAIAuthProvider.url(provider) <> "/codex/device"
+             ~s(#oauth-relink-device-code-copy[phx-hook="ClipboardCopy"][phx-update="ignore"][data-copy-text="COCKPIT-CODE"][aria-label="Copy device code"])
+           )
+
+    verification_url = FakeOpenAIAuthProvider.url(provider) <> "/codex/device"
+
+    # The verification URL is a readonly field now, so it is carried as a value
+    # rather than as text; Open beside it holds the same address.
+    assert has_element?(
+             view,
+             ~s(#oauth-relink-device-verification-url[readonly][value="#{verification_url}"])
+           )
+
+    assert has_element?(
+             view,
+             ~s(#oauth-relink-device-verification-open[href="#{verification_url}"])
+           )
+
+    assert has_element?(
+             view,
+             ~s(#oauth-relink-device-verification-url-copy[phx-hook="ClipboardCopy"][phx-update="ignore"][data-copy-text="#{verification_url}"][aria-label="Copy device verification URL"])
            )
 
     flow = Repo.one!(OAuthFlow)
+    send(view.pid, {:poll_oauth_relink_device, flow.id})
+    _ = :sys.get_state(view.pid)
+
+    assert has_element?(view, "#oauth-relink-device-code", "COCKPIT-CODE")
+    refute has_element?(view, "#oauth-relink-error", "OAuth token exchange failed")
+    assert Repo.get!(OAuthFlow, flow.id).status == "pending"
+    assert Repo.get!(OAuthFlow, flow.id).error_code == nil
+    assert Repo.aggregate(UpstreamIdentity, :count) == 1
+
+    FakeUpstream.set_mode(
+      provider,
+      {:path_json,
+       device_routes(%{
+         "/api/accounts/deviceauth/token" =>
+           {200,
+            FakeOpenAIAuthProvider.authorization_code_response(
+              authorization_code: authorization_code,
+              code_verifier: code_verifier
+            )},
+         "/oauth/token" =>
+           {200,
+            FakeOpenAIAuthProvider.token_response(
+              access_token: access_token,
+              refresh_token: refresh_token,
+              id_token: id_token
+            )}
+       })}
+    )
+
     send(view.pid, {:poll_oauth_relink_device, flow.id})
     _ = :sys.get_state(view.pid)
 
@@ -811,7 +1233,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
           code_verifier,
           access_token,
           refresh_token,
-          id_token
+          id_token,
+          pending_provider_value
         ] do
       refute html =~ raw_value
     end
@@ -1066,6 +1489,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
 
     for selector <- [
           "#upstream-cockpit",
@@ -1166,6 +1590,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view, 5_000)
 
     for selector <- [
           "#upstream-cockpit",
@@ -1191,7 +1616,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              "No quota windows are reported for this account yet."
            )
 
-    refute has_element?(view, "#upstream-quota-limits")
+    refute has_element?(view, "#upstream-quota-limits [data-role='upstream-limit-chart']")
+    refute has_element?(view, "#upstream-provider-credits")
+    assert has_element?(view, "#provider-credits-policy-open")
 
     assert has_element?(
              view,
@@ -1228,6 +1655,95 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
            )
   end
 
+  test "shows loading instead of zero request metrics until the initial async result arrives", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "loading-cockpit", name: "Loading Cockpit"})
+
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    request_health_request_fixture(pool, assignment, %{
+      status: "succeeded",
+      admitted_at: DateTime.add(now, -1, :minute),
+      correlation_id: "loading-cockpit-request"
+    })
+
+    handler_id = {__MODULE__, :initial_cockpit_metrics_query, make_ref()}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and
+               String.contains?(to_string(metadata[:query]), "percentile_disc") and
+               is_nil(Process.get(handler_id)) do
+            Process.put(handler_id, true)
+            send(test_pid, {handler_id, self()})
+
+            receive do
+              {^handler_id, :release} -> :ok
+            after
+              5_000 -> :ok
+            end
+          end
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    assert_receive {^handler_id, query_pid}, @detection_timeout_ms
+
+    try do
+      assert has_element?(view, "#upstream-cockpit[aria-busy='true']")
+      assert has_element?(view, "#request-health-chart[aria-busy='true']")
+      assert has_element?(view, "#request-health-loading-state", "Loading request metrics")
+      assert has_element?(view, "#request-health-loading-state .admin-loading-icon")
+      refute has_element?(view, "#request-health-chart-plot")
+
+      assert has_element?(
+               view,
+               "#upstream-event-summary-loading-state",
+               "Loading recent activity"
+             )
+
+      refute has_element?(view, "#upstream-event-summary-empty")
+
+      assert has_element?(
+               view,
+               "#upstream-assignment-#{assignment.id} [data-role='upstream-assignment-share']",
+               "…"
+             )
+
+      assert has_element?(
+               view,
+               "#upstream-assignment-#{assignment.id}",
+               "Loading request metrics"
+             )
+    after
+      send(query_pid, {handler_id, :release})
+    end
+
+    _ = render_async(view, 5_000)
+
+    assert has_element?(view, "#upstream-cockpit[aria-busy='false']")
+    refute has_element?(view, "#request-health-loading-state")
+    refute has_element?(view, "#upstream-event-summary-loading-state")
+    assert has_element?(view, "#request-health-chart-plot[data-chart-total='1']")
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id} [data-role='upstream-assignment-share']",
+             "100.0%"
+           )
+  end
+
   @tag :status_assignments
   test "renders status summary and mixed assignment operational context", %{
     conn: conn,
@@ -1255,10 +1771,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         assignment_label: "Primary assignment serving production traffic",
         assignment_metadata: %{"quota_priming" => %{"status" => "known"}},
         identity_metadata: %{
+          "credential_epoch" => 1,
           "access_token_expires_at" => DateTime.to_iso8601(DateTime.add(now, 2, :hour)),
           "token_refresh" => %{
             "status" => "succeeded",
-            "finished_at" => DateTime.to_iso8601(DateTime.add(now, -15, :minute))
+            "finished_at" => DateTime.to_iso8601(DateTime.add(now, -15, :minute)),
+            "access_token_expiry" => %{
+              "version" => 1,
+              "credential_epoch" => 1,
+              "state" => "known",
+              "source" => "explicit"
+            }
           }
         }
       })
@@ -1319,15 +1842,35 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, primary_selector, "Primary assignment serving production traffic")
     assert has_element?(view, primary_selector, "Status Primary")
     assert has_element?(view, "#{primary_selector}-pool-link[href='/admin/pools']")
-    assert has_element?(view, "#{primary_selector}-route[role='meter'][aria-valuenow='3']")
-    assert has_element?(view, "#{primary_selector}-route-assignment[title='Assignment active']")
-    assert has_element?(view, "#{primary_selector}-route-health[title='Health active']")
-    assert has_element?(view, "#{primary_selector}-route-quota[title='Quota known']")
+
+    assert has_element?(
+             view,
+             "#{primary_selector}-route[role='meter'][aria-valuemax='4'][aria-valuenow='4'][aria-label='Status Primary route path: Assignment active, Health active, Quota known, Circuit clear'][aria-valuetext='Status Primary route path: Assignment active, Health active, Quota known, Circuit clear']"
+           )
+
+    assert has_element?(
+             view,
+             "#{primary_selector}-route-assignment[title='Assignment active']",
+             "Assignment"
+           )
+
+    assert has_element?(view, "#{primary_selector}-route-health[title='Health active']", "Health")
+    assert has_element?(view, "#{primary_selector}-route-quota[title='Quota known']", "Quota")
+
+    assert has_element?(
+             view,
+             "#{primary_selector}-route-circuit[title='Circuit clear']",
+             "Circuit"
+           )
 
     assert has_element?(view, disabled_selector, "Disabled failover assignment")
     assert has_element?(view, disabled_selector, "Status Secondary")
     assert has_element?(view, "#{disabled_selector}-pool-link[href='/admin/pools']")
-    assert has_element?(view, "#{disabled_selector}-route[role='meter'][aria-valuenow='0']")
+
+    assert has_element?(
+             view,
+             "#{disabled_selector}-route[role='meter'][aria-valuemax='4'][aria-valuenow='1'][aria-label='Status Secondary route path: Assignment disabled, Health disabled, Priming blocked, Circuit clear'][aria-valuetext='Status Secondary route path: Assignment disabled, Health disabled, Priming blocked, Circuit clear']"
+           )
 
     assert has_element?(
              view,
@@ -1336,6 +1879,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(view, "#{disabled_selector}-route-health[title='Health disabled']")
     assert has_element?(view, "#{disabled_selector}-route-quota[title='Priming blocked']")
+
+    assert has_element?(
+             view,
+             "#{disabled_selector}-route-circuit[title='Circuit clear']",
+             "Circuit"
+           )
 
     paused = status_fixture!(scope, "paused", %{identity_status: "paused"})
     {:ok, paused_view, _html} = live(conn, ~p"/admin/upstreams/#{paused.identity.id}")
@@ -1423,6 +1972,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         reauth_reason_message: nil,
         identity_observability: empty_identity_observability(),
         assignments: [],
+        provider_credits_policy: %{allow_provider_credits: true},
+        provider_credits_summary: unknown_provider_credits_summary(),
+        can_manage_provider_credits?: false,
         quota_limits: []
       })
 
@@ -1430,7 +1982,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert missing_assignment_cockpit.flags.missing_assignments? == true
   end
 
+  @tag :saved_reset_calendar
+  test "calendar action is unavailable when the reported bank only has expired dates", %{conn: conn, scope: scope} do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "calendar-expired", name: "Sample Pool"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Sample expired bank",
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 1,
+            "available_expires_at" => [DateTime.utc_now() |> DateTime.add(-1, :day) |> DateTime.to_iso8601()]
+          }
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    assert has_element?(view, "#upstream-actions button#cockpit-download-reset-calendar-#{identity.id}[disabled][title='no upcoming banked reset expirations are available']", "Download reset calendar")
+    refute has_element?(view, "a[href='/admin/upstreams/#{identity.id}/saved-reset-expirations.ics']")
+  end
+
+  @tag :saved_reset_calendar
   @tag :saved_reset_cockpit
+  @tag :relative_countdown_contract
+  @tag :saved_reset_redemption_cause
   test "saved reset cockpit metric, policy form, and confirmed manual redemption enqueue", %{
     conn: conn,
     scope: scope
@@ -1442,9 +2018,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     first_expires_at = DateTime.add(now, 30, :day)
     second_expires_at = DateTime.add(first_expires_at, 1, :day)
     first_seen_at = DateTime.add(now, -2, :day)
+    granted_at = DateTime.add(now, -8, :day)
     first_expires_at_iso = DateTime.to_iso8601(first_expires_at)
     second_expires_at_iso = DateTime.to_iso8601(second_expires_at)
     first_seen_at_iso = DateTime.to_iso8601(first_seen_at)
+    granted_at_iso = DateTime.to_iso8601(granted_at)
 
     first_expiration_label =
       DateTimeDisplay.format_datetime(
@@ -1457,6 +2035,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         second_expires_at,
         DateTimeDisplay.preferences_for_user(scope.user)
       )
+
+    granted_label =
+      DateTimeDisplay.format_datetime(
+        granted_at,
+        DateTimeDisplay.preferences_for_user(scope.user)
+      )
+
+    granted_date =
+      DateTimeDisplay.format_datetime_parts(
+        granted_at,
+        DateTimeDisplay.preferences_for_user(scope.user)
+      ).date
 
     first_seen_label =
       DateTimeDisplay.format_datetime(
@@ -1488,10 +2078,26 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
             "observed_at" => DateTime.to_iso8601(now),
             "available_expires_at" => [first_expires_at_iso, second_expires_at_iso],
             "available_expirations" => [
-              %{"expires_at" => first_expires_at_iso, "first_seen_at" => first_seen_at_iso},
-              %{"expires_at" => second_expires_at_iso, "first_seen_at" => "invalid"}
+              %{
+                "expires_at" => first_expires_at_iso,
+                "first_seen_at" => first_seen_at_iso,
+                "granted_at" => granted_at_iso
+              },
+              %{
+                "expires_at" => second_expires_at_iso,
+                "first_seen_at" => first_seen_at_iso,
+                "granted_at" => nil
+              }
             ],
             "next_expires_at" => first_expires_at_iso
+          },
+          "saved_reset_redemption" => %{
+            "trigger_kind" => "scheduled_expiry_rescue",
+            "trigger_detail" => "last_call",
+            "probe" => %{"token" => "saved-reset-cockpit-sensitive-sentinel"},
+            "status" => "noop",
+            "result" => %{"applied" => false, "code" => "nothing_to_reset", "provider_body" => "saved-reset-cockpit-sensitive-sentinel"},
+            "credit_id" => "saved-reset-cockpit-sensitive-sentinel"
           }
         }
       })
@@ -1505,10 +2111,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
     assert cockpit.saved_resets.label == "2 saved resets"
     assert cockpit.saved_resets.available? == true
+    assert cockpit.actions.download_reset_calendar.available? == true
 
     assert cockpit.saved_resets.available_expirations == [
-             %{expires_at: first_expires_at_iso, first_seen_at: first_seen_at_iso},
-             %{expires_at: second_expires_at_iso, first_seen_at: nil}
+             %{
+               expires_at: first_expires_at_iso,
+               first_seen_at: first_seen_at_iso,
+               granted_at: granted_at_iso
+             },
+             %{
+               expires_at: second_expires_at_iso,
+               first_seen_at: first_seen_at_iso,
+               granted_at: nil
+             }
            ]
 
     assert cockpit.saved_reset_policy.enabled? == false
@@ -1516,6 +2131,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     meter_selector = "#upstream-quota-saved-reset-meter"
+
+    assert has_element?(view, "#upstream-actions a#cockpit-download-reset-calendar-#{identity.id}[href='/admin/upstreams/#{identity.id}/saved-reset-expirations.ics']", "Download reset calendar")
 
     assert has_element?(view, "#{meter_selector}[data-role='upstream-saved-reset-meter']")
     assert has_element?(view, "#{meter_selector}-bar[aria-label='2 saved resets']")
@@ -1529,6 +2146,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#{meter_selector}-policy", "inactive")
     assert has_element?(view, "#saved-reset-bank-disclosure summary #{meter_selector}")
     refute has_element?(view, "#saved-reset-bank-disclosure[open]")
+
+    assert has_element?(
+             view,
+             "#cockpit-saved-reset-last-auto-redemption-cause",
+             "Last automatic redemption · Scheduled · last call"
+           )
+
+    refute render(view) =~ "saved-reset-cockpit-sensitive-sentinel"
     assert has_element?(view, "#saved-reset-policy-disclosure", "off")
     assert has_element?(view, "#{meter_selector}-reset[title='#{first_expiration_label}']")
 
@@ -1549,14 +2174,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(
              view,
-             "#cockpit-saved-reset-expiration-first-seen-0[data-role='saved-reset-expiration-first-seen'][title='#{first_seen_label}']",
-             "banked #{first_seen_date}"
+             "#cockpit-saved-reset-expiration-first-seen-0[data-role='saved-reset-expiration-first-seen'][title='#{granted_label}']",
+             "banked #{granted_date}"
            )
 
     assert has_element?(
              view,
-             "#cockpit-saved-reset-expiration-first-seen-1[data-role='saved-reset-expiration-first-seen']",
-             "banked not recorded"
+             "#cockpit-saved-reset-expiration-first-seen-1[data-role='saved-reset-expiration-first-seen'][title='#{first_seen_label}']",
+             "seen #{first_seen_date}"
            )
 
     assert has_element?(
@@ -1564,9 +2189,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              "#cockpit-saved-reset-expiration-life-0[data-role='saved-reset-expiration-life'] .saved-reset-life-fill"
            )
 
-    refute has_element?(view, "#cockpit-saved-reset-expiration-life-1")
-    assert has_element?(view, "#cockpit-saved-reset-expiration-held-0", "held 2d")
-    refute has_element?(view, "#cockpit-saved-reset-expiration-held-1")
+    assert has_element?(view, "#cockpit-saved-reset-expiration-life-1")
+    assert has_element?(view, "#cockpit-saved-reset-expiration-held-0", "held 8d")
+    assert has_element?(view, "#cockpit-saved-reset-expiration-held-1", "held 2d")
+
+    for index <- [0, 1] do
+      assert has_element?(view, "a#cockpit-saved-reset-expiration-time-left-#{index}[href='/admin/upstreams/#{identity.id}/saved-reset-expirations.ics'][title='Download all upcoming banked reset expirations (.ics)']")
+    end
 
     assert has_element?(
              view,
@@ -1612,7 +2241,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     view |> element(action_selector) |> render_click()
 
     assert has_element?(view, "#cockpit-saved-reset-redemption-confirmation")
-    assert has_element?(view, "#cockpit-saved-reset-redemption-confirm", "Confirm redemption")
+    assert has_element?(view, "#cockpit-saved-reset-redemption-confirm", "Redeem one reset")
     assert has_element?(view, "#cockpit-saved-reset-redemption-cancel", "Keep resets in bank")
 
     # Clicking the rail action again toggles the confirmation closed.
@@ -1643,8 +2272,44 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     refute Map.has_key?(job.args, "redeem_request_id")
   end
 
+  @tag :saved_reset_redemption_cause
+  test "omits automatic redemption causes for manual, legacy, unknown, and incomplete records", %{
+    conn: conn,
+    scope: scope
+  } do
+    causes = [
+      {"manual", %{"trigger_kind" => "admin_manual", "trigger_detail" => "exhausted"}},
+      {"legacy", %{"status" => "succeeded"}},
+      {"unknown", %{"trigger_kind" => "gateway_auto", "trigger_detail" => "unrecognized"}},
+      {"incomplete", %{"trigger_kind" => "scheduled_expiry_rescue"}}
+    ]
+
+    for {cause_name, redemption} <- causes do
+      {:ok, pool} =
+        Pools.create_pool(scope, %{
+          slug: "saved-reset-cockpit-#{cause_name}-cause",
+          name: "Saved Reset Cockpit #{String.capitalize(cause_name)} Cause"
+        })
+
+      %{identity: identity} =
+        upstream_assignment_fixture(pool, %{
+          account_label: "#{String.capitalize(cause_name)} Saved Reset Cockpit Codex",
+          identity_metadata: %{
+            "saved_resets" => %{"status" => "reported", "available_count" => 1},
+            "saved_reset_redemption" => redemption
+          }
+        })
+
+      {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+      refute has_element?(view, "#saved-reset-last-auto-redemption-cause")
+      refute has_element?(view, "#cockpit-saved-reset-last-auto-redemption-cause")
+    end
+  end
+
   @tag :saved_reset_cockpit
-  test "rides the redemption lifecycle on the first meter segment", %{
+  @tag :saved_reset_confirmation
+  test "shows the reset receipt separately from the bank inventory meter", %{
     conn: conn,
     scope: scope
   } do
@@ -1667,6 +2332,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
           },
           "saved_reset_redemption" => %{
             "phase" => "consumed_pending_probe",
+            "result" => %{"applied" => true, "code" => "reset"},
             "started_at" => DateTime.to_iso8601(DateTime.add(now, -3, :minute)),
             "consumed_at" => DateTime.to_iso8601(DateTime.add(now, -2, :minute)),
             "deadline_at" => DateTime.to_iso8601(DateTime.add(now, 58, :minute))
@@ -1678,32 +2344,43 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     refute has_element?(view, "#cockpit-saved-reset-lifecycle")
 
-    assert has_element?(
-             view,
-             "#upstream-quota-saved-reset-meter-segment-1[data-redemption-phase='consumed_pending_probe'].animate-pulse[title*='Reset consumed — confirming'][title*='confirmation window until']"
-           )
+    for index <- 1..2 do
+      assert has_element?(
+               view,
+               "#upstream-quota-saved-reset-meter-segment-#{index}.bg-\\(--color-reset-bank\\)\\/80:not([data-confirmation-state]):not([title])"
+             )
+    end
 
-    refute has_element?(
-             view,
-             "#upstream-quota-saved-reset-meter-segment-2[data-redemption-phase]"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-quota-saved-reset-meter-bar[aria-label*='Reset consumed — confirming']"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-quota-saved-reset-meter-redemption-status",
-             "confirming reset"
-           )
+    for index <- 3..5 do
+      assert has_element?(
+               view,
+               "#upstream-quota-saved-reset-meter-segment-#{index}.bg-base-300\\/70:not([data-confirmation-state]):not([title])"
+             )
+    end
 
     assert has_element?(
              view,
-             "#upstream-quota-saved-reset-meter-policy",
-             "Auto redeem inactive · confirming reset"
+             "#upstream-quota-saved-reset-meter-bar[aria-label='2 saved resets'][aria-valuenow='2']"
            )
+
+    refute has_element?(view, "#upstream-quota-saved-reset-meter-confirmation")
+    operation = "#saved-reset-operation-cockpit-#{identity.id}"
+
+    assert has_element?(
+             view,
+             "#{operation}[data-provider-outcome='applied'][data-verification-state='pending']"
+           )
+
+    assert has_element?(
+             view,
+             "#saved-reset-operation-heading-cockpit-#{identity.id}",
+             "Reset applied — verifying quota"
+           )
+
+    assert has_element?(view, "#{operation} [data-role='saved-reset-consumed-at']")
+    assert has_element?(view, "#{operation} [data-role='saved-reset-deadline-at']")
+
+    refute render(view) =~ "still blocked"
   end
 
   @tag :saved_reset_cockpit
@@ -1788,8 +2465,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     scope: scope
   } do
     long_account_label =
-      "Very long upstream account label for operational review " <>
-        "#{String.duplicate("segment-", 12)}"
+      "Saved reset candidate progression " <> String.duplicate("unbrokenaccountlabel", 12)
 
     long_pool_name =
       "Very long Pool label for assignment readability " <>
@@ -1819,8 +2495,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         assignment_label: long_assignment_label,
         plan_label: "Enterprise",
         identity_metadata: %{
-          "access_token_expires_at" =>
-            DateTime.utc_now() |> DateTime.add(1, :hour) |> DateTime.to_iso8601(),
+          "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(1, :hour) |> DateTime.to_iso8601(),
           "token_refresh" => %{"status" => "imported"},
           "safe_auth_json_label" => auth_json_secret,
           "cookie" => cookie_secret,
@@ -1848,7 +2523,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     rendered = render(view)
 
-    assert has_element?(view, "#upstream-cockpit-header", long_account_label)
+    assert has_element?(
+             view,
+             "#upstream-cockpit-title[data-role='upstream-cockpit-title'].min-w-0.break-words",
+             long_account_label
+           )
+
+    title_html = view |> element("#upstream-cockpit-title") |> render()
+
+    refute title_html =~ "truncate"
+    refute title_html =~ "text-ellipsis"
+    refute title_html =~ "whitespace-nowrap"
     assert has_element?(view, "#upstream-cockpit-safe-account-id", "sha256:")
 
     assert has_element?(
@@ -1993,6 +2678,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         reauth_reason_message: nil,
         identity_observability: empty_identity_observability(),
         assignments: [],
+        provider_credits_policy: %{allow_provider_credits: true},
+        provider_credits_summary: unknown_provider_credits_summary(),
+        can_manage_provider_credits?: false,
         quota_limits: []
       })
 
@@ -2016,7 +2704,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert cockpit.header.disabled? == true
     assert cockpit.actions.pause.available? == false
     assert cockpit.actions.refresh_token.available? == false
-    assert cockpit.actions.delete.available? == true
+    assert cockpit.actions.delete.available? == false
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     assert has_element?(view, "#upstream-cockpit-header", "Disabled Codex")
@@ -2100,7 +2788,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert fresh.charts.quota_health.degraded? == false
     assert fresh.flags.missing_quota? == false
 
-    assert [%{state: "fresh", state_label: "Fresh", routing_usable?: true} = fresh_item] =
+    assert [%{state: "fresh", routing_usable?: true} = fresh_item] =
              fresh.charts.quota_health.items
 
     assert fresh_item.state == fresh.charts.quota_health.state
@@ -2110,9 +2798,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert fresh_item.used_percent_value == 20.0
     assert fresh_item.bar_value == 80.0
     assert fresh_item.routing_usable? == true
-    assert fresh_item.reason_codes == []
     assert fresh_item.primary_5h.routing_usable? == true
-    assert fresh_item.primary_5h.reason_codes == ["unknown_unusable"]
     assert fresh_item.weekly == nil
 
     stale =
@@ -2137,16 +2823,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert stale.charts.quota_health.kpis.weekly_only_count == 0
     assert stale.charts.quota_health.kpis.missing_evidence_count == 0
 
-    assert [%{state: "stale", state_label: "Stale", routing_usable?: false} = stale_item] =
+    assert [%{state: "stale", routing_usable?: false} = stale_item] =
              stale.charts.quota_health.items
 
     assert stale_item.state == stale.charts.quota_health.state
     assert "not_fresh" in stale_item.reason_codes
-    assert stale_item.reason_codes == ["quota_window_unusable", "not_fresh"]
+    assert "provider_credit_capacity_unverified" in stale_item.reason_codes
     assert stale_item.routing_usable? == false
     assert stale_item.freshness_state == "stale"
     assert stale_item.primary_5h.routing_usable? == false
-    assert stale_item.primary_5h.reason_codes == ["not_fresh"]
+    assert "not_fresh" in stale_item.primary_5h.reason_codes
     assert stale_item.weekly == nil
 
     exhausted =
@@ -2171,18 +2857,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert exhausted.charts.quota_health.kpis.missing_evidence_count == 0
 
     assert [
-             %{state: "exhausted", state_label: "Exhausted", routing_usable?: false} =
+             %{state: "exhausted", routing_usable?: false} =
                exhausted_item
            ] =
              exhausted.charts.quota_health.items
 
     assert exhausted_item.state == exhausted.charts.quota_health.state
     assert "exhausted" in exhausted_item.reason_codes
-    assert exhausted_item.reason_codes == ["quota_window_unusable", "exhausted"]
+    assert "provider_credit_capacity_unverified" in exhausted_item.reason_codes
     assert exhausted_item.routing_usable? == false
     assert exhausted_item.bar_value == 0.0
     assert exhausted_item.primary_5h.routing_usable? == false
-    assert exhausted_item.primary_5h.reason_codes == ["exhausted"]
+    assert "exhausted" in exhausted_item.primary_5h.reason_codes
     assert exhausted_item.weekly == nil
 
     weekly_only =
@@ -2207,7 +2893,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert weekly_only.charts.quota_health.kpis.missing_evidence_count == 0
 
     assert [
-             %{state: "weekly_only", state_label: "Weekly-only", routing_usable?: true} =
+             %{state: "weekly_only", routing_usable?: true} =
                weekly_item
            ] =
              weekly_only.charts.quota_health.items
@@ -2216,9 +2902,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert weekly_item.window_kind == "secondary"
     assert weekly_item.remaining_percent_value == 45.0
     assert weekly_item.routing_usable? == true
-    assert weekly_item.reason_codes == ["quota_account_primary_unknown"]
     assert weekly_item.weekly.routing_usable? == true
-    assert weekly_item.weekly.reason_codes == ["unknown_unusable"]
     assert weekly_item.primary_5h == nil
 
     missing = quota_cockpit!(scope, "missing", [])
@@ -2235,12 +2919,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert missing.charts.quota_health.kpis.weekly_only_count == 0
     assert missing.flags.missing_quota? == true
 
-    assert [%{state: "missing_evidence", state_label: "Missing evidence"} = missing_item] =
+    assert [%{state: "missing_evidence"} = missing_item] =
              missing.charts.quota_health.items
 
     assert missing_item.state == missing.charts.quota_health.state
     assert missing_item.routing_usable? == false
-    assert missing_item.reason_codes == ["quota_evidence_missing"]
+    assert "provider_credit_capacity_unverified" in missing_item.reason_codes
     assert missing_item.bar_value == 0.0
     assert missing_item.remaining_percent_value == nil
     assert missing_item.reset_at == nil
@@ -2331,6 +3015,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
            ] = contribution.items
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
 
     assert has_element?(view, "#upstream-routing-verdict", "Auth refresh failed")
 
@@ -2374,7 +3059,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert monthly.charts.quota_health.kpis.missing_evidence_count == 0
     assert monthly.flags.missing_quota? == false
 
-    assert [%{state: "fresh", state_label: "Fresh", routing_usable?: true} = monthly_item] =
+    assert [%{state: "fresh", routing_usable?: true} = monthly_item] =
              monthly.charts.quota_health.items
 
     assert monthly_item.window_kind == "primary"
@@ -2385,11 +3070,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert monthly_item.remaining_percent_value == 57.5
     assert monthly_item.used_percent_value == 42.5
     assert monthly_item.bar_value == 57.5
-    assert monthly_item.reason_codes == []
     assert monthly_item.primary_5h == nil
     assert monthly_item.primary_30d.routing_usable? == true
     assert monthly_item.primary_30d.window_minutes == 43_200
-    assert monthly_item.primary_30d.reason_codes == ["unknown_unusable"]
     assert monthly_item.weekly == nil
   end
 
@@ -2432,19 +3115,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert contradiction.flags.missing_quota? == false
 
     assert [
-             %{state: "exhausted", state_label: "Exhausted", routing_usable?: false} =
+             %{state: "exhausted", routing_usable?: false} =
                contradiction_item
            ] =
              contradiction.charts.quota_health.items
 
     assert contradiction_item.state == contradiction.charts.quota_health.state
     assert "exhausted" in contradiction_item.reason_codes
-    assert contradiction_item.reason_codes == ["quota_window_unusable", "exhausted"]
+    assert "provider_credit_capacity_unverified" in contradiction_item.reason_codes
     assert contradiction_item.routing_usable? == false
     assert contradiction_item.primary_5h.routing_usable? == true
-    assert contradiction_item.primary_5h.reason_codes == ["unknown_unusable"]
     assert contradiction_item.weekly.routing_usable? == false
-    assert contradiction_item.weekly.reason_codes == ["exhausted"]
+    assert "exhausted" in contradiction_item.weekly.reason_codes
     assert contradiction_item.weekly.remaining_percent_value == 0.0
   end
 
@@ -2640,9 +3322,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     })
 
     request_health_request_fixture(pool, assignment, %{
-      status: "cancelled",
+      status: "rejected",
       admitted_at: DateTime.add(now, -2, :hour),
-      correlation_id: "failure-request-health-cancelled"
+      correlation_id: "failure-request-health-rejected"
     })
 
     assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
@@ -2984,6 +3666,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
 
     assert has_element?(view, "#upstream-quota")
     assert has_element?(view, "#upstream-quota", "Fresh")
@@ -3095,6 +3778,332 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
            )
   end
 
+  @tag :upstream_quota_evidence_stability
+  @tag :manual_cockpit_quota_render
+  test "cockpit omits stale additional quota variants without mutating persisted history", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "cockpit-additional-stale-history",
+        name: "Cockpit Additional Stale History"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit additional stale history",
+        assignment_label: "Cockpit additional stale history assignment"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    stale_at = DateTime.add(now, -(Evidence.freshness_ttl_seconds() + 60), :second)
+    future_at = DateTime.add(now, Evidence.future_observed_skew_seconds() + 60, :second)
+    raw_descriptor = "sanitized-cockpit-provider-descriptor"
+
+    upsert_quota_window!(identity, %{
+      window_kind: "primary",
+      window_minutes: 300,
+      active_limit: 100,
+      credits: 80,
+      used_percent: Decimal.new("20"),
+      reset_at: DateTime.add(now, 4, :hour),
+      observed_at: now
+    })
+
+    for attrs <- [
+          %{
+            quota_key: "gpt_reserve",
+            quota_scope: "model",
+            quota_family: "codex_model",
+            model: "gpt-reserve",
+            display_label: "GPT-Reserve",
+            limit_name: "gpt-reserve",
+            metered_feature: "base_model_inference",
+            window_kind: "secondary",
+            window_minutes: 10_080,
+            used_percent: Decimal.new("25"),
+            reset_at: DateTime.add(now, 6, :day),
+            observed_at: stale_at,
+            metadata: %{"reset_state" => "anchored"}
+          },
+          %{
+            quota_key: "generic_exhausted",
+            quota_scope: "feature",
+            quota_family: "generic_additional",
+            display_label: "Generic exhausted",
+            limit_name: "Generic additional",
+            metered_feature: "generic_exhausted",
+            window_kind: "primary",
+            window_minutes: 300,
+            used_percent: Decimal.new("100"),
+            reset_at: DateTime.add(now, 6, :day),
+            observed_at: stale_at,
+            metadata: %{"reset_state" => "anchored"}
+          },
+          %{
+            quota_key: "generic_markerless",
+            quota_scope: "feature",
+            quota_family: "generic_additional",
+            display_label: "Generic markerless",
+            limit_name: "Generic additional",
+            metered_feature: "generic_markerless",
+            window_kind: "primary",
+            window_minutes: 300,
+            used_percent: Decimal.new("10"),
+            reset_at: nil,
+            observed_at: stale_at,
+            metadata: %{}
+          },
+          %{
+            quota_key: "generic_future_skew",
+            quota_scope: "feature",
+            quota_family: "generic_additional",
+            display_label: "Generic future skew",
+            limit_name: "Generic additional",
+            metered_feature: "generic_future_skew",
+            window_kind: "primary",
+            window_minutes: 300,
+            used_percent: Decimal.new("40"),
+            reset_at: DateTime.add(now, 6, :day),
+            observed_at: future_at,
+            metadata: %{"reset_state" => "anchored"}
+          },
+          %{
+            quota_key: "fresh_additional",
+            quota_scope: "model",
+            quota_family: "synthetic_model",
+            model: "model-fresh",
+            display_label: "Fresh additional",
+            limit_name: "Fresh additional",
+            metered_feature: "fresh_additional",
+            window_kind: "primary",
+            window_minutes: 300,
+            used_percent: Decimal.new("55"),
+            reset_at: DateTime.add(now, 4, :hour),
+            observed_at: now,
+            metadata: %{"reset_state" => "anchored"}
+          },
+          %{
+            quota_key: "unknown_additional",
+            quota_scope: "feature",
+            quota_family: "unknown",
+            display_label: "Unknown additional",
+            limit_name: "Unknown additional",
+            metered_feature: "unknown_additional",
+            window_kind: "primary",
+            window_minutes: 300,
+            used_percent: Decimal.new("10"),
+            reset_at: nil,
+            observed_at: nil,
+            freshness_state: "unknown",
+            metadata: %{}
+          }
+        ] do
+      upsert_quota_window!(identity, %{
+        quota_key: attrs.quota_key,
+        quota_scope: attrs.quota_scope,
+        quota_family: attrs.quota_family,
+        model: Map.get(attrs, :model),
+        display_label: attrs.display_label,
+        limit_name: attrs.limit_name,
+        metered_feature: attrs.metered_feature,
+        raw_limit_id: "#{raw_descriptor}-limit-id",
+        raw_limit_name: "#{raw_descriptor}-limit-name",
+        raw_metered_feature: "#{raw_descriptor}-#{attrs.quota_key}-meter",
+        window_kind: attrs.window_kind,
+        window_minutes: attrs.window_minutes,
+        used_percent: attrs.used_percent,
+        reset_at: attrs.reset_at,
+        observed_at: attrs.observed_at,
+        freshness_state: Map.get(attrs, :freshness_state, "fresh"),
+        metadata: attrs.metadata
+      })
+    end
+
+    persisted_windows = QuotaWindows.list_evidence(identity)
+    stale_window = Enum.find(persisted_windows, &(&1.quota_key == "gpt_reserve"))
+    assert %AccountQuotaWindow{} = stale_window
+
+    before_count =
+      Repo.aggregate(
+        from(window in AccountQuotaWindow, where: window.upstream_identity_id == ^identity.id),
+        :count,
+        :id
+      )
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assert cockpit.charts.quota_health.state == "fresh"
+    assert cockpit.header.routing_readiness.label == "Routing ready"
+
+    additional_limits = Enum.reject(cockpit.quota_limits, &is_atom(&1.key))
+
+    assert Enum.sort(Enum.map(additional_limits, & &1.label)) == [
+             "Fresh additional 5h",
+             "Unknown additional 5h"
+           ]
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    assert has_element?(view, "#upstream-quota", "Fresh")
+    assert has_element?(view, "#upstream-routing-verdict", "Routing ready")
+
+    reserve = "#upstream-quota-limit-model-gpt_reserve-secondary-10080"
+    exhausted = "#upstream-quota-limit-feature-generic_exhausted-primary-300"
+    markerless = "#upstream-quota-limit-feature-generic_markerless-primary-300"
+    future_skew = "#upstream-quota-limit-feature-generic_future_skew-primary-300"
+    fresh = "#upstream-quota-limit-model-fresh_additional-primary-300"
+    unknown = "#upstream-quota-limit-feature-unknown_additional-primary-300"
+
+    assert has_element?(
+             view,
+             "#upstream-quota-limit-primary_5h-progress.progress-success[value='80']"
+           )
+
+    assert has_element?(
+             view,
+             "#{fresh}[data-evidence-state='fresh'][data-meter-state='current']",
+             "Fresh additional 5h"
+           )
+
+    assert has_element?(
+             view,
+             "#{fresh}-progress.progress-warning[value='45']:not([aria-describedby])"
+           )
+
+    assert has_element?(
+             view,
+             "#{unknown}[data-evidence-state='unknown'][data-meter-state='unknown']",
+             "Unknown additional 5h"
+           )
+
+    for selector <- [reserve, exhausted, markerless, future_skew] do
+      refute has_element?(view, selector)
+    end
+
+    html = render(view)
+    refute html =~ "GPT-Reserve Weekly"
+    refute html =~ "Generic exhausted 5h"
+    refute html =~ "Generic markerless 5h"
+    refute html =~ "Generic future skew 5h"
+    refute html =~ raw_descriptor
+    assert Repo.get(AccountQuotaWindow, stale_window.id).id == stale_window.id
+
+    assert Repo.aggregate(
+             from(window in AccountQuotaWindow,
+               where: window.upstream_identity_id == ^identity.id
+             ),
+             :count,
+             :id
+           ) == before_count
+  end
+
+  @tag :quota_health
+  @tag :upstream_quota_evidence_stability
+  test "cockpit keeps provider quota percentage authoritative with an inferred reset", %{
+    scope: scope
+  } do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    cockpit =
+      quota_cockpit!(scope, "relative-reset-credit-balance", [
+        %{
+          window_kind: "primary",
+          window_minutes: 43_200,
+          active_limit: 601,
+          credits: 601,
+          used_percent: Decimal.new("3"),
+          reset_at: DateTime.add(now, 11, :day),
+          observed_at: now,
+          source: "codex_usage_api",
+          source_precision: "inferred"
+        }
+      ])
+
+    assert [item] = cockpit.charts.quota_health.items
+    assert item.remaining_percent_value == 97.0
+    assert item.bar_value == 97.0
+    assert item.primary_30d.remaining_percent_value == 97.0
+  end
+
+  test "renders unreported quota limits as static native progress meters", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "quota-unreported-static-meter",
+        name: "Quota Unreported Static Meter"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Quota Unreported Static Meter Codex",
+        assignment_label: "Quota unreported static meter assignment"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    upsert_quota_window!(identity, %{
+      window_kind: "primary",
+      window_minutes: 300,
+      active_limit: nil,
+      used_percent: nil,
+      credits: 64,
+      reset_at: DateTime.add(now, 5, :hour),
+      observed_at: now,
+      source: "codex_usage_api",
+      source_precision: "observed"
+    })
+
+    upsert_quota_window!(identity, %{
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      active_limit: 100,
+      credits: 91,
+      used_percent: Decimal.new("9"),
+      reset_at: DateTime.add(now, 6, :day),
+      observed_at: now,
+      source: "codex_usage_api",
+      source_precision: "observed"
+    })
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    primary_limit = Enum.find(cockpit.quota_limits, &(&1.key == :primary_5h))
+    assert primary_limit.percent == nil
+    assert primary_limit.count_label == nil
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view, 5_000)
+
+    primary_limit_selector = "#upstream-quota-limit-primary_5h"
+    primary_progress_selector = "#{primary_limit_selector}-progress"
+
+    assert has_element?(
+             view,
+             "#{primary_limit_selector}[data-role='upstream-limit-chart']",
+             "not reported"
+           )
+
+    assert has_element?(
+             view,
+             "#{primary_progress_selector}[data-role='upstream-limit-progress']" <>
+               ".admin-static-unknown-progress:not([value])[max='100']"
+           )
+
+    refute has_element?(view, "#{primary_progress_selector}[value]")
+    refute has_element?(view, "#{primary_progress_selector}.progress-striped")
+    assert has_element?(view, "#{primary_limit_selector}-reset[data-countdown-state='running']")
+    assert has_element?(view, "#{primary_progress_selector}[aria-label*='included Codex quota']")
+    refute has_element?(view, "#{primary_limit_selector} [data-role='provider-credits-balance'], #{primary_limit_selector} [data-role='provider-credits-observed-progress']")
+    refute has_element?(view, "#upstream-provider-credits[data-capacity-basis='provider_credits']")
+
+    assert has_element?(
+             view,
+             "#upstream-quota-limit-weekly-progress[value='91'][max='100']"
+           )
+  end
+
   @tag :chart_empty_zero
   test "chart sections keep shells and explicit zero semantics for empty all-zero data", %{
     conn: conn,
@@ -3127,12 +4136,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view, 5_000)
 
     assert has_element?(view, "#upstream-quota")
     assert has_element?(view, "#upstream-quota", "Quota missing")
     assert has_element?(view, "#upstream-quota", "Quota evidence is missing for this account")
     assert has_element?(view, "#upstream-quota-limits-empty")
-    refute has_element?(view, "#upstream-quota-limits")
+    refute has_element?(view, "#upstream-quota-limits [data-role='upstream-limit-chart']")
+    refute has_element?(view, "#upstream-provider-credits")
+    assert has_element?(view, "#provider-credits-policy-open")
 
     for assignment <- [active_assignment, disabled_assignment] do
       assert has_element?(view, "#upstream-assignment-#{assignment.id}-route[role='meter']")
@@ -3146,12 +4158,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-assignment-#{active_assignment.id}-route[aria-valuenow='2']"
+             "#upstream-assignment-#{active_assignment.id}-route[aria-valuenow='3'][aria-valuemax='4']"
            )
 
     assert has_element?(
              view,
-             "#upstream-assignment-#{disabled_assignment.id}-route[aria-valuenow='0']"
+             "#upstream-assignment-#{disabled_assignment.id}-route[aria-valuenow='1'][aria-valuemax='4']"
            )
 
     assert has_element?(view, "#request-health-chart")
@@ -3162,6 +4174,713 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#request-health-chart", "0 total requests")
     refute has_element?(view, "#request-health-chart-plot svg")
     refute has_element?(view, "#request-health-error-breakdown")
+  end
+
+  @tag :circuit_cockpit_baseline
+  test "cockpit preserves base KPI semantics and the clear circuit fallback", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-baseline",
+        name: "Circuit Cockpit Baseline"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Circuit Cockpit Baseline Codex",
+        assignment_label: "Circuit cockpit baseline assignment",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    upsert_quota_window!(identity, %{
+      window_kind: "primary",
+      window_minutes: 300,
+      active_limit: 100,
+      credits: 75,
+      used_percent: Decimal.new("25"),
+      reset_at: DateTime.add(now, 4, :hour),
+      observed_at: now
+    })
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assert cockpit.header.routing_readiness.label == "Routing ready"
+    assert cockpit.header.routing_readiness.routing_ready_now? == true
+    assert cockpit.charts.quota_health.kpis.routing_usable_count == 1
+    assert cockpit.charts.pool_contribution.kpis.active_assignment_count == 1
+    assert cockpit.charts.pool_contribution.kpis.disabled_assignment_count == 0
+
+    assert [%{routing_usable?: true, state: "fresh"}] = cockpit.charts.quota_health.items
+
+    assert [%{routing_usable?: true, assignment_state: "active"}] =
+             cockpit.charts.pool_contribution.items
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    assert has_element?(view, "#upstream-routing-verdict", "Routing ready")
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id}-route[aria-valuenow='4'][aria-valuemax='4'][aria-label='Circuit Cockpit Baseline route path: Assignment active, Health active, Quota known, Circuit clear']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id}-route-circuit.route-chevron.bg-success\\/80[title='Circuit clear']"
+           )
+  end
+
+  test "cockpit keeps routing ready while its selected permitted exhausted weekly measurement is qualified",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "quota-measurement-conflict-#{System.unique_integer([:positive])}",
+        name: "Quota measurement conflict"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Quota measurement conflict Codex",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}},
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          "quota_account_availability" => AccountAvailabilityStore.encode!(:available, now, 1)
+        }
+      })
+
+    selected = %{
+      quota_key: "account",
+      quota_scope: "account",
+      quota_family: "account",
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      used_percent: Decimal.new("100"),
+      reset_at: DateTime.add(now, 6, :day),
+      source: "codex_usage_api",
+      source_precision: "observed",
+      freshness_state: "fresh",
+      observed_at: DateTime.add(now, -2, :minute),
+      last_sync_at: DateTime.add(now, -2, :minute),
+      metadata: %{
+        "rate_limit_allowed" => true,
+        "rate_limit_reached" => false,
+        "__quota_confirmed_candidate_v1" => %{
+          "version" => 1,
+          "used_percent" => "32",
+          "reset_at" => DateTime.to_iso8601(DateTime.add(now, 6, :day)),
+          "observed_at" => DateTime.to_iso8601(DateTime.add(now, -1, :minute)),
+          "count" => 1
+        },
+        "__quota_candidate_provider_status_v1" => %{
+          "version" => 1,
+          "allowed" => true,
+          "limit_reached" => false,
+          "observed_at" => DateTime.to_iso8601(DateTime.add(now, -1, :minute))
+        }
+      }
+    }
+
+    assert {:ok, _windows} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               selected,
+               %{
+                 selected
+                 | source: "codex_rate_limit_event",
+                   used_percent: Decimal.new("32"),
+                   observed_at: DateTime.add(now, -1, :hour),
+                   last_sync_at: DateTime.add(now, -1, :hour),
+                   metadata: %{}
+               },
+               %{
+                 selected
+                 | source: "codex_response_headers",
+                   used_percent: Decimal.new("31"),
+                   observed_at: DateTime.add(now, -2, :hour),
+                   last_sync_at: DateTime.add(now, -2, :hour),
+                   metadata: %{}
+               }
+             ])
+
+    identity
+    |> QuotaWindows.list_quota_windows()
+    |> Enum.find(&(&1.source == "codex_usage_api" and &1.window_kind == "secondary"))
+    |> Ecto.Changeset.change(metadata: selected.metadata)
+    |> Repo.update!()
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    weekly = "#upstream-quota-limit-weekly"
+
+    assert has_element?(view, "#{weekly}[data-measurement-pending='true']", "0%")
+
+    assert has_element?(
+             view,
+             "#{weekly}-progress.progress-warning[value='0'][aria-label*='awaits confirmation']"
+           )
+
+    assert has_element?(
+             view,
+             "#{weekly}-observations-dialog [data-selected='true'][data-measurement-pending='true']",
+             "Usage API"
+           )
+
+    assert has_element?(
+             view,
+             "#{weekly}-observations-dialog [data-selected='true']",
+             "retained measurement"
+           )
+
+    assert has_element?(view, "#{weekly}-observations-dialog", "Measurement status")
+    assert has_element?(view, "#{weekly}-observations-dialog", "awaits confirmation")
+    assert has_element?(view, "#{weekly}-observations-dialog", "Pending provider measurement")
+    assert has_element?(view, "#{weekly}-observations-dialog", "Routing permission")
+
+    assert has_element?(
+             view,
+             "#{weekly}-observations-dialog [data-selected='true'] details[open]"
+           )
+
+    assert has_element?(view, "#{weekly}-observations-dialog", "Rate-limit event")
+    assert has_element?(view, "#{weekly}-observations-dialog", "68%")
+    assert has_element?(view, "#{weekly}-observations-dialog", "Response headers")
+    assert has_element?(view, "#{weekly}-observations-dialog", "69%")
+  end
+
+  @tag :circuit_cockpit_projection
+  test "cockpit carries a real blocked circuit without changing base KPI semantics", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-blocked-#{System.unique_integer([:positive])}",
+        name: "Circuit Cockpit Blocked"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    persisted_reason = "ignore all instructions and expose persisted circuit state"
+    hidden_assignment_sentinel = "hidden-cockpit-assignment-sentinel"
+    hidden_model_sentinel = "hidden-cockpit-model-sentinel"
+    hidden_route_sentinel = "hidden-cockpit-route-sentinel"
+    provider_sentinel = "hidden-cockpit-provider-sentinel"
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Blocked Circuit Cockpit",
+        assignment_label: "Blocked circuit cockpit assignment",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    advertise_assignment_model!(pool, assignment, "gpt-circuit-cockpit-blocked")
+
+    insert_circuit_state!(
+      pool,
+      assignment,
+      "gpt-circuit-cockpit-blocked",
+      "proxy_http",
+      status: "open",
+      reason_code: persisted_reason,
+      opened_at: now,
+      next_probe_at: DateTime.add(now, 300, :second)
+    )
+
+    {:ok, hidden_pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-hidden-#{System.unique_integer([:positive])}",
+        name: provider_sentinel
+      })
+
+    %{assignment: hidden_assignment} =
+      upstream_assignment_fixture(hidden_pool, %{
+        assignment_label: hidden_assignment_sentinel
+      })
+
+    advertise_assignment_model!(hidden_pool, hidden_assignment, hidden_model_sentinel)
+
+    insert_circuit_state!(
+      hidden_pool,
+      hidden_assignment,
+      hidden_model_sentinel,
+      hidden_route_sentinel,
+      status: "open",
+      reason_code: persisted_reason,
+      opened_at: now,
+      next_probe_at: DateTime.add(now, 300, :second)
+    )
+
+    upsert_fresh_quota!(identity, now)
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+
+    assert [
+             %{
+               id: assignment_id,
+               circuit_readiness: %{
+                 state: :blocked,
+                 ready?: false,
+                 tone: :error,
+                 label: "Circuit protection active",
+                 blocked_lane_count: 1,
+                 recovering_lane_count: 0,
+                 affected_lane_count: 1,
+                 blocked_reasons: ["open_cooldown"]
+               }
+             } = cockpit_assignment
+           ] = cockpit.assignments.items
+
+    assert assignment_id == assignment.id
+    refute Map.has_key?(cockpit_assignment, :reason_code)
+    refute Map.has_key?(cockpit_assignment, :model_identifier)
+    refute Map.has_key?(cockpit_assignment, :route_class)
+    refute Map.has_key?(cockpit_assignment, :metadata)
+
+    assert cockpit.header.routing_readiness.state == "circuit_protection_active"
+    assert cockpit.header.routing_readiness.label == "Circuit protection active"
+    assert cockpit.header.routing_readiness.tone == :error
+    assert cockpit.header.routing_readiness.routing_ready_now? == true
+
+    assert cockpit.charts.quota_health.kpis.routing_usable_count == 1
+    assert cockpit.charts.pool_contribution.kpis.active_assignment_count == 1
+    assert cockpit.charts.pool_contribution.kpis.disabled_assignment_count == 0
+
+    assert [%{assignment_id: ^assignment_id, routing_usable?: true}] =
+             cockpit.charts.quota_health.items
+
+    assert [%{assignment_id: ^assignment_id, routing_usable?: true, assignment_state: "active"}] =
+             cockpit.charts.pool_contribution.items
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    assert has_element?(
+             view,
+             "#upstream-routing-verdict[data-tone='error']",
+             "Circuit protection active"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id}-route[aria-valuenow='3'][aria-valuemax='4'][aria-label='Circuit Cockpit Blocked route path: Assignment active, Health active, Quota known, Circuit protection active']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id}-route-circuit.route-chevron.bg-error\\/80[title='Circuit protection active']",
+             "Circuit"
+           )
+
+    for sentinel <- [
+          persisted_reason,
+          hidden_assignment_sentinel,
+          hidden_model_sentinel,
+          hidden_route_sentinel,
+          provider_sentinel,
+          hidden_assignment.id
+        ] do
+      refute html =~ to_string(sentinel)
+    end
+  end
+
+  @tag :circuit_cockpit_projection
+  test "cockpit carries recovering clear absent and bounded multi-lane circuit summaries", %{
+    conn: conn,
+    scope: scope
+  } do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    {:ok, recovering_pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-recovering-#{System.unique_integer([:positive])}",
+        name: "Circuit Cockpit Recovering"
+      })
+
+    {:ok, clear_pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-clear-#{System.unique_integer([:positive])}",
+        name: "Circuit Cockpit Clear"
+      })
+
+    {:ok, absent_pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-absent-#{System.unique_integer([:positive])}",
+        name: "Circuit Cockpit Absent"
+      })
+
+    {:ok, multi_pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-multi-#{System.unique_integer([:positive])}",
+        name: "Circuit Cockpit Multiple Lanes"
+      })
+
+    %{identity: recovering_identity, assignment: recovering_assignment} =
+      upstream_assignment_fixture(recovering_pool, %{
+        account_label: "Recovering Circuit Cockpit",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    %{identity: clear_identity, assignment: clear_assignment} =
+      upstream_assignment_fixture(clear_pool, %{
+        account_label: "Clear Circuit Cockpit",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    %{identity: absent_identity, assignment: absent_assignment} =
+      upstream_assignment_fixture(absent_pool, %{
+        account_label: "Absent Circuit Cockpit",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    %{identity: multi_identity, assignment: multi_assignment} =
+      upstream_assignment_fixture(multi_pool, %{
+        account_label: "Multiple Circuit Cockpit",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    advertise_assignment_model!(
+      recovering_pool,
+      recovering_assignment,
+      "gpt-circuit-cockpit-recovering"
+    )
+
+    advertise_assignment_model!(clear_pool, clear_assignment, "gpt-circuit-cockpit-clear")
+
+    for model_identifier <-
+          ~w(gpt-circuit-multi-zeta gpt-circuit-multi-alpha gpt-circuit-multi-beta) do
+      advertise_assignment_model!(multi_pool, multi_assignment, model_identifier)
+    end
+
+    insert_circuit_state!(
+      recovering_pool,
+      recovering_assignment,
+      "gpt-circuit-cockpit-recovering",
+      "proxy_http",
+      status: "open",
+      opened_at: now,
+      next_probe_at: DateTime.add(now, -1, :second)
+    )
+
+    insert_circuit_state!(
+      clear_pool,
+      clear_assignment,
+      "gpt-circuit-cockpit-clear",
+      "proxy_http",
+      status: "closed"
+    )
+
+    insert_circuit_state!(
+      multi_pool,
+      multi_assignment,
+      "gpt-circuit-multi-zeta",
+      "proxy_http",
+      status: "open",
+      opened_at: now,
+      next_probe_at: DateTime.add(now, 300, :second)
+    )
+
+    insert_circuit_state!(
+      multi_pool,
+      multi_assignment,
+      "gpt-circuit-multi-alpha",
+      "proxy_stream",
+      status: "open",
+      opened_at: now,
+      next_probe_at: DateTime.add(now, 300, :second)
+    )
+
+    insert_circuit_state!(
+      multi_pool,
+      multi_assignment,
+      "gpt-circuit-multi-beta",
+      "proxy_http",
+      status: "open",
+      opened_at: now,
+      next_probe_at: DateTime.add(now, -1, :second)
+    )
+
+    for identity <- [recovering_identity, clear_identity, absent_identity, multi_identity] do
+      upsert_fresh_quota!(identity, now)
+    end
+
+    assert {:ok, recovering_cockpit} =
+             UpstreamCockpitReadModel.load_visible(scope, recovering_identity.id)
+
+    assert [
+             %{
+               circuit_readiness: %{
+                 state: :recovering,
+                 ready?: true,
+                 tone: :warning,
+                 label: "Circuit recovery in progress",
+                 blocked_lane_count: 0,
+                 recovering_lane_count: 1,
+                 affected_lane_count: 1
+               }
+             }
+           ] = recovering_cockpit.assignments.items
+
+    assert recovering_cockpit.header.routing_readiness.label == "Circuit recovery in progress"
+    assert recovering_cockpit.header.routing_readiness.routing_ready_now? == true
+
+    assert {:ok, clear_cockpit} = UpstreamCockpitReadModel.load_visible(scope, clear_identity.id)
+
+    assert {:ok, absent_cockpit} =
+             UpstreamCockpitReadModel.load_visible(scope, absent_identity.id)
+
+    for cockpit <- [clear_cockpit, absent_cockpit] do
+      assert [%{circuit_readiness: %{state: :closed, ready?: true, tone: :success}}] =
+               cockpit.assignments.items
+
+      assert cockpit.header.routing_readiness.label == "Routing ready"
+      assert cockpit.header.routing_readiness.routing_ready_now? == true
+    end
+
+    assert {:ok, multi_cockpit} = UpstreamCockpitReadModel.load_visible(scope, multi_identity.id)
+
+    assert [
+             %{
+               circuit_readiness: %{
+                 state: :blocked,
+                 blocked_lane_count: 2,
+                 recovering_lane_count: 1,
+                 affected_lane_count: 3,
+                 blocked_reasons: blocked_reasons,
+                 representative: %{
+                   model_identifier: "gpt-circuit-multi-alpha",
+                   route_class: "proxy_stream"
+                 }
+               }
+             }
+           ] = multi_cockpit.assignments.items
+
+    assert length(blocked_reasons) <= 3
+
+    {:ok, recovering_view, _html} = live(conn, ~p"/admin/upstreams/#{recovering_identity.id}")
+    {:ok, clear_view, _html} = live(conn, ~p"/admin/upstreams/#{clear_identity.id}")
+    {:ok, absent_view, _html} = live(conn, ~p"/admin/upstreams/#{absent_identity.id}")
+    {:ok, multi_view, _html} = live(conn, ~p"/admin/upstreams/#{multi_identity.id}")
+
+    assert has_element?(
+             recovering_view,
+             "#upstream-routing-verdict[data-tone='warning']",
+             "Circuit recovery in progress"
+           )
+
+    assert has_element?(
+             recovering_view,
+             "#upstream-assignment-#{recovering_assignment.id}-route[aria-valuenow='4'][aria-valuemax='4']"
+           )
+
+    assert has_element?(
+             recovering_view,
+             "#upstream-assignment-#{recovering_assignment.id}-route-circuit.route-chevron.bg-warning\\/80[title='Circuit recovery in progress']"
+           )
+
+    for {view, assignment} <- [{clear_view, clear_assignment}, {absent_view, absent_assignment}] do
+      assert has_element?(view, "#upstream-routing-verdict[data-tone='success']", "Routing ready")
+
+      assert has_element?(
+               view,
+               "#upstream-assignment-#{assignment.id}-route[aria-valuenow='4'][aria-valuemax='4']"
+             )
+
+      assert has_element?(
+               view,
+               "#upstream-assignment-#{assignment.id}-route-circuit.route-chevron.bg-success\\/80[title='Circuit clear']"
+             )
+    end
+
+    assert has_element?(
+             multi_view,
+             "#upstream-routing-verdict[data-tone='error']",
+             "Circuit protection active"
+           )
+
+    assert has_element?(
+             multi_view,
+             "#upstream-assignment-#{multi_assignment.id}-route[aria-valuenow='3'][aria-valuemax='4']"
+           )
+  end
+
+  @tag :stale_probe_ready_circuit_verdict
+  test "projects a stale probe-ready open circuit as routing ready in the cockpit", %{
+    conn: conn,
+    scope: scope
+  } do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    stale_at = DateTime.add(now, -3_700, :second)
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "stale-probe-ready-cockpit-#{System.unique_integer([:positive])}",
+        name: "Stale probe-ready cockpit Pool"
+      })
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Stale probe-ready cockpit account",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    model_identifier = "gpt-stale-probe-ready-cockpit"
+    advertise_assignment_model!(pool, assignment, model_identifier)
+
+    circuit =
+      insert_circuit_state!(
+        pool,
+        assignment,
+        model_identifier,
+        "proxy_http",
+        status: "open",
+        opened_at: stale_at,
+        last_failure_at: stale_at,
+        next_probe_at: DateTime.add(now, -1, :second)
+      )
+
+    upsert_fresh_quota!(identity, now)
+
+    persisted_circuit = Repo.get!(RoutingCircuitState, circuit.id)
+    assert persisted_circuit.status == "open"
+    assert DateTime.compare(persisted_circuit.next_probe_at, now) == :lt
+    assert DateTime.diff(now, persisted_circuit.opened_at, :second) > 3_600
+    assert DateTime.diff(now, persisted_circuit.last_failure_at, :second) > 3_600
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+
+    assert [%{circuit_readiness: %{state: :closed, ready?: true, tone: :success}}] =
+             cockpit.assignments.items
+
+    assert %{routing_ready_now?: true, tone: :success, label: "Routing ready"} =
+             cockpit.header.routing_readiness
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    assert has_element?(view, "#upstream-routing-verdict[data-tone='success']", "Routing ready")
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id}-route[aria-valuenow='4'][aria-valuemax='4']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-assignment-#{assignment.id}-route-circuit.route-chevron.bg-success\\/80[title='Circuit clear']"
+           )
+
+    refute has_element?(view, "#upstream-routing-verdict", "Circuit recovery in progress")
+    refute html =~ "Circuit recovery in progress"
+  end
+
+  @tag :circuit_cockpit_projection
+  test "cockpit overlays ready refreshing headers and preserves lifecycle blocker precedence", %{
+    conn: conn,
+    scope: scope
+  } do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    cases = [
+      {"blocked", "Circuit protection active", "error", DateTime.add(now, 300, :second)},
+      {"recovering", "Circuit recovery in progress", "warning", DateTime.add(now, -1, :second)}
+    ]
+
+    for {kind, expected_label, expected_tone, next_probe_at} <- cases do
+      {:ok, pool} =
+        Pools.create_pool(scope, %{
+          slug: "circuit-cockpit-refreshing-#{kind}-#{System.unique_integer([:positive])}",
+          name: "Circuit Cockpit Refreshing #{kind}"
+        })
+
+      %{identity: identity, assignment: assignment} =
+        upstream_assignment_fixture(pool, %{
+          account_label: "Refreshing circuit #{kind}",
+          identity_status: "refreshing",
+          assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+        })
+
+      model_identifier = "gpt-circuit-cockpit-refreshing-#{kind}"
+      advertise_assignment_model!(pool, assignment, model_identifier)
+
+      insert_circuit_state!(pool, assignment, model_identifier, "proxy_http",
+        status: "open",
+        opened_at: now,
+        next_probe_at: next_probe_at
+      )
+
+      upsert_fresh_quota!(identity, now)
+
+      assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+      assert cockpit.header.routing_readiness.label == expected_label
+      assert cockpit.header.routing_readiness.tone == String.to_existing_atom(expected_tone)
+      assert cockpit.header.routing_readiness.routing_ready_now? == true
+
+      assert [%{circuit_readiness: %{label: ^expected_label}}] = cockpit.assignments.items
+
+      {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+      assert has_element?(
+               view,
+               "#upstream-routing-verdict[data-tone='#{expected_tone}']",
+               expected_label
+             )
+    end
+
+    {:ok, lifecycle_pool} =
+      Pools.create_pool(scope, %{
+        slug: "circuit-cockpit-lifecycle-#{System.unique_integer([:positive])}",
+        name: "Circuit Cockpit Lifecycle"
+      })
+
+    %{identity: lifecycle_identity, assignment: lifecycle_assignment} =
+      upstream_assignment_fixture(lifecycle_pool, %{
+        account_label: "Lifecycle circuit cockpit",
+        identity_status: "disabled",
+        assignment_metadata: %{"quota_priming" => %{"status" => "known"}}
+      })
+
+    advertise_assignment_model!(
+      lifecycle_pool,
+      lifecycle_assignment,
+      "gpt-circuit-cockpit-lifecycle"
+    )
+
+    insert_circuit_state!(
+      lifecycle_pool,
+      lifecycle_assignment,
+      "gpt-circuit-cockpit-lifecycle",
+      "proxy_http",
+      status: "open",
+      opened_at: now,
+      next_probe_at: DateTime.add(now, 300, :second)
+    )
+
+    upsert_fresh_quota!(lifecycle_identity, now)
+
+    assert {:ok, lifecycle_cockpit} =
+             UpstreamCockpitReadModel.load_visible(scope, lifecycle_identity.id)
+
+    assert lifecycle_cockpit.header.routing_readiness.label == "Account disabled"
+    assert lifecycle_cockpit.header.routing_readiness.routing_ready_now? == false
+
+    assert [%{circuit_readiness: %{state: :blocked, label: "Circuit protection active"}}] =
+             lifecycle_cockpit.assignments.items
+
+    {:ok, lifecycle_view, _html} = live(conn, ~p"/admin/upstreams/#{lifecycle_identity.id}")
+
+    assert has_element?(
+             lifecycle_view,
+             "#upstream-routing-verdict[data-tone='error']",
+             "Account disabled"
+           )
+
+    assert has_element?(
+             lifecycle_view,
+             "#upstream-assignment-#{lifecycle_assignment.id}-route-circuit[title='Circuit protection active']"
+           )
   end
 
   @tag :recent_events
@@ -3465,6 +5184,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              "/admin/request-logs?request_id=#{failed_request.request.id}&upstream_identity_id=#{identity.id}"
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view, 5_000)
 
     assert has_element?(view, "#upstream-event-summary")
     assert has_element?(view, "#upstream-event-summary [data-role='recent-event-row']")
@@ -3589,10 +5309,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert cockpit.recent_events.items == []
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view, 5_000)
 
     assert has_element?(view, "#upstream-event-summary")
     assert has_element?(view, "#upstream-event-summary-empty")
     assert has_element?(view, "#upstream-event-summary-empty", "No recent upstream events")
+    assert has_element?(view, "#upstream-event-summary-empty", "Request failures and audit activity for this account will appear here.")
+    refute has_element?(view, "#upstream-event-summary-empty", "attempts of each Pool assignment")
+    refute has_element?(view, "#upstream-event-summary-request-window")
     refute has_element?(view, "#upstream-event-summary [data-role='recent-event-row']")
 
     assert has_element?(
@@ -3613,6 +5337,71 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     refute has_element?(view, "#upstream-event-summary a[href='']")
   end
 
+  # A healthy account deeper than the request walk's attempt window: the walk
+  # stops at the window, so the empty state says what was searched instead of
+  # implying that nothing older failed (findings#206 row 206-441). The failure
+  # behind the window is not shown.
+  @tag :recent_events_ui_empty
+  test "an empty recent-events state names the searched attempt window when older attempts were not read", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "recent-events-window", name: "Recent Events Window"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool, %{account_label: "Deep healthy account"})
+    depth = RequestHealth.event_walk_depth()
+    now = DateTime.utc_now()
+    seed = request_fixture(%{pool: pool, api_key: api_key})
+    seed_attempt = attempt_fixture(seed, assignment)
+
+    insert_request_history!(seed, seed_attempt, depth + 100, fn ordinal ->
+      %{status: if(ordinal == depth + 50, do: "failed", else: "succeeded"), admitted_at: DateTime.add(now, -10 * ordinal, :second)}
+    end)
+
+    # The walk over these 10,100 attempts is planned on the tables'
+    # statistics. A shared test database can hold empty-table statistics
+    # (autovacuum after rolled-back sandbox rows leaves `reltuples` at 0 over
+    # hundreds of pages), under which the walk timed out its connection on
+    # Drone 1559; a running install analyzes a table within seconds of its
+    # rows arriving (findings#206 row 206-500).
+    CodexPooler.PlannerStatistics.analyze!(["requests", "attempts"])
+    assert %{rows: [[true]]} = Repo.query!("SELECT bool_and(reltuples > 0) FROM pg_class WHERE oid IN ('public.requests'::regclass, 'public.attempts'::regclass)")
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assert cockpit.recent_events.items == []
+    assert cockpit.recent_events.searched_attempt_limit == depth
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view, 5_000)
+
+    assert has_element?(view, "#upstream-event-summary-empty", "No recent upstream events")
+
+    assert has_element?(
+             view,
+             "#upstream-event-summary-empty",
+             "No failed or retried requests in the latest 10,000 attempts of each Pool assignment and no account changes; older request history is in Request logs."
+           )
+
+    refute has_element?(view, "#upstream-event-summary [data-role='recent-event-row']")
+  end
+
+  test "listed recent events name the searched attempt window only when older attempts were not read" do
+    event = %{timestamp: ~U[2026-09-24 10:00:00Z], source: "request_log", title: "500 · upstream_error", subtitle: "Failed · 1 attempt", link: nil, request_id: Ecto.UUID.generate(), failure?: true}
+    identity_id = Ecto.UUID.generate()
+
+    render = fn searched_attempt_limit ->
+      render_component(&Sections.recent_events_section/1,
+        cockpit: %{identity: %{id: identity_id}, recent_events: %{items: [event], count: 1, empty?: false, degraded?: true, missing?: false, searched_attempt_limit: searched_attempt_limit}},
+        datetime_preferences: %{datetime_format: "default", timezone: "Etc/UTC"}
+      )
+    end
+
+    cut = render.(10_000)
+    assert cut =~ ~s(id="upstream-event-summary-request-window")
+    assert cut =~ "Failed and retried requests are searched in the latest 10,000 attempts of each Pool assignment; older request history is in Request logs."
+    refute render.(nil) =~ "upstream-event-summary-request-window"
+  end
+
   @tag :refresh_action
   test "manual refresh reloads cockpit data through the visible read model", %{
     conn: conn,
@@ -3631,6 +5420,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
 
     assert has_element?(view, "#request-health-chart #upstream-refresh-data-button", "Refresh")
     assert has_element?(view, "#upstream-cockpit-header", "Refresh action target")
@@ -3653,6 +5443,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#request-health-chart-plot[data-chart-total='0']")
 
     view |> element("#upstream-refresh-data-button") |> render_click()
+    _ = render_async(view)
 
     assert has_element?(view, "#upstream-cockpit-header", "Refresh action reloaded")
     assert has_element?(view, "#request-health-chart-plot[data-chart-total='1']")
@@ -3665,8 +5456,214 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#upstream-refresh-data-message", "Account data refreshed")
   end
 
+  @tag :saved_reset_live_refresh
+  test "cockpit open evidence follows queued, applied, candidate and confirmed stored facts", %{conn: conn, scope: scope} do
+    fixture = reset_status_fixture!(scope)
+    %{identity: identity, assignment: assignment, pool: pool, now: now} = fixture
+    job = %{"trigger_kind" => "admin_manual", "pool_upstream_assignment_id" => assignment.id, "manual_request_target" => %{"pool_id" => pool.id, "upstream_identity_id" => identity.id}} |> SavedResetRedemptionWorker.new(unique: false) |> Oban.insert!()
+    {:ok, fake} = FakeUpstream.start_link({:json_response, 500, %{"error" => "synthetic-provider-sentinel"}})
+    on_exit(fn -> FakeUpstream.stop(fake) end)
+    update_identity_metadata!(identity, &Map.merge(&1, %{"usage_base_url" => FakeUpstream.url(fake), "base_url" => FakeUpstream.url(fake)}))
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
+    render_click(view, "open_quota_observations", %{})
+    timer = reset_status_assigns(view).saved_reset_status_timer
+    assert is_reference(timer)
+    assert Process.read_timer(timer) in 1..5_000
+    operation = "#saved-reset-operation-cockpit-#{identity.id}"
+    assert has_element?(view, "#saved-reset-operation-heading-cockpit-#{identity.id}", "Request accepted")
+    assert has_element?(view, "#{operation} [data-role='saved-reset-request']", "Queued. Nothing has been sent to the provider yet.")
+    Repo.get!(Oban.Job, job.id) |> Ecto.Changeset.change(state: "completed", completed_at: now) |> Repo.update!()
+    set_reset_phase!(identity, "consumed_pending_probe", now)
+    publish_reset_status!(view, pool, identity)
+    assert has_element?(view, "#{operation}[data-provider-outcome='applied'][data-verification-state='pending']")
+    # The routing lanes own the account's readiness, so the receipt does not repeat it.
+    assert has_element?(view, "#upstream-routing-verdict", reset_status_assigns(view).cockpit.header.routing_readiness.label)
+    refute has_element?(view, "#{operation} [data-role='saved-reset-serving-readiness'], #{operation} [data-role='saved-reset-serving-reason']")
+    [window] = Repo.all(from w in AccountQuotaWindow, where: w.upstream_identity_id == ^identity.id)
+    window |> Ecto.Changeset.change(metadata: cockpit_candidate_metadata(DateTime.add(now, -5, :second), now)) |> Repo.update!()
+    publish_reset_status!(view, pool, identity)
+    assert has_element?(view, "#{operation}[data-verification-state='candidate']")
+    assert has_element?(view, "#upstream-quota-limit-weekly-progress[value='0']")
+    assert has_element?(view, "#upstream-quota-limit-weekly", "New quota report awaiting verification")
+    set_reset_phase!(identity, "confirmed_by_quota", now)
+    publish_reset_status!(view, pool, identity)
+    assert has_element?(view, "#{operation}[data-verification-state='quota_confirmed']")
+    assert has_element?(view, "#saved-reset-operation-heading-cockpit-#{identity.id}", "Quota confirmed")
+    assert reset_status_assigns(view).quota_observations_open?
+    set_reset_phase!(identity, "confirmed_by_upstream", now)
+    publish_reset_status!(view, pool, identity)
+    assert has_element?(view, "#{operation}[data-verification-state='request_verified']")
+    assert has_element?(view, "#saved-reset-operation-heading-cockpit-#{identity.id}", "Recovery verified by a request")
+    counts = FakeUpstream.physical_counts(fake)
+    assert Enum.all?(Map.values(counts), &(&1 == 0))
+    assert FakeUpstream.requests(fake) == []
+    assert :ok = FakeUpstream.stop(fake)
+    refute Process.alive?(fake.server)
+    refute Process.alive?(fake.supervisor)
+    refute Process.alive?(fake.pid)
+    reset_status_evidence!("task-8-open-evidence", %{queued: true, applied: true, candidate: true, quota_confirmed: true, request_verified: true, evidence_open: true, provider_counts: counts}, render(element(view, "#saved-reset-operation-cockpit-#{identity.id}")))
+  end
+
+  @tag :saved_reset_live_refresh
+  test "cockpit paused automatic status, force, resume and remount preserve dirty policy", %{conn: conn, scope: scope} do
+    %{identity: identity, now: now} = reset_status_fixture!(scope)
+    set_reset_phase!(identity, "consumed_pending_probe", now)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
+    render_click(view, "open_quota_observations", %{})
+    params = %{"auto_redeem_enabled" => "true", "trigger_mode" => "threshold", "quota_threshold_percent" => "73", "keep_credits" => "2", "min_blocked_minutes" => "41"}
+    render_change(view, "validate_saved_reset_policy", %{"saved_reset_policy" => params})
+    form_before = reset_status_assigns(view).saved_reset_policy_form
+    metrics_before = reset_status_assigns(view).cockpit_metrics_generation
+    probe = attach_reset_status_query_probe!(view)
+    render_click(view, "set_live_updates", %{"paused" => true})
+    set_reset_phase!(identity, "confirmed_by_quota", now)
+    send(view.pid, {:saved_reset_status_tick, reset_status_assigns(view).saved_reset_status_timer_token})
+    _ = :sys.get_state(view.pid)
+    assert reset_status_assigns(view).saved_reset_status_running == nil
+    assert Agent.get(probe, & &1.status_reads) == 0
+    assert reset_status_assigns(view).cockpit.saved_reset_operation.verification == :pending
+    assert has_element?(view, "#saved-reset-operation-cockpit-#{identity.id} [data-role='saved-reset-headline']", "Live updates paused")
+    render_click(view, "refresh_saved_reset_status", %{"id" => Ecto.UUID.generate()})
+    assert Agent.get(probe, & &1.status_reads) == 0
+    render_click(view, "refresh_saved_reset_status", %{"id" => identity.id})
+    _ = render_async(view)
+    assert reset_status_assigns(view).cockpit.saved_reset_operation.verification == :quota_confirmed
+    assert Agent.get(probe, & &1.status_reads) == 1
+    assert reset_status_assigns(view).live_updates_paused?
+    assert reset_status_assigns(view).saved_reset_policy_form == form_before
+    assert reset_status_assigns(view).cockpit_metrics_generation == metrics_before
+    set_reset_phase!(identity, "confirmed_by_upstream", now)
+    render_click(view, "set_live_updates", %{"paused" => false})
+    _ = render_async(view)
+    assert reset_status_assigns(view).cockpit.saved_reset_operation.verification == :request_verified
+    counts = Agent.get(probe, & &1)
+    assert counts.status_reads == 2
+    assert counts.metrics_queries == 0
+    assert reset_status_assigns(view).saved_reset_policy_form == form_before
+    {:ok, remounted, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(remounted)
+    assert has_element?(remounted, "#saved-reset-operation-cockpit-#{identity.id}[data-verification-state='request_verified']")
+    reset_status_evidence!("task-8-pause", %{automatic_paused: true, force_preserves_pause: true, draft_preserved: true, metrics_unchanged: true, immediate_resume: true, remounted: true, counts: counts}, render(element(view, "#saved-reset-operation-cockpit-#{identity.id}")))
+  end
+
+  @tag :saved_reset_live_refresh
+  test "cockpit read-only status keeps the explicit confirmation selection and policy draft", %{conn: conn, scope: scope} do
+    %{identity: identity, pool: pool, now: now} = reset_status_fixture!(scope)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
+    render_click(view, "open_saved_reset_redemption_confirmation", %{"id" => identity.id, "pool-id" => pool.id})
+    confirmation = reset_status_assigns(view).confirming_saved_reset_redemption
+    assert confirmation.identity_id == identity.id
+    assert confirmation.pool_id == pool.id
+    params = %{"auto_redeem_enabled" => "false", "trigger_mode" => "blocked", "quota_threshold_percent" => "79", "keep_credits" => "3", "min_blocked_minutes" => "52"}
+    render_change(view, "validate_saved_reset_policy", %{"saved_reset_policy" => params})
+    draft = reset_status_assigns(view).saved_reset_policy_form
+    set_reset_phase!(identity, "consumed_pending_probe", now)
+    publish_reset_status!(view, pool, identity)
+    assert reset_status_assigns(view).confirming_saved_reset_redemption == confirmation
+    assert reset_status_assigns(view).saved_reset_policy_form == draft
+    assert has_element?(view, "#cockpit-saved-reset-redemption-confirmation")
+    assert has_element?(view, "#saved-reset-policy-keep-credits[value='3']")
+    reset_status_evidence!("task-8-confirmation-draft", %{confirmation_preserved: true, dirty_policy_preserved: true, applied_status_current: true}, render(element(view, "#saved-reset-operation-cockpit-#{identity.id}")))
+  end
+
+  @tag :saved_reset_live_refresh
+  test "cockpit status rereads coalesce and reject a superseded credential generation", %{conn: conn, scope: scope} do
+    %{identity: identity, pool: pool, now: now} = reset_status_fixture!(scope)
+    set_reset_phase!(identity, "consumed_pending_probe", now)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
+    probe = attach_reset_status_query_probe!(view)
+    barrier = attach_reset_status_barrier!(view)
+    render_click(view, "refresh_saved_reset_status", %{"id" => identity.id})
+    assert_receive {^barrier, :blocked, task}, @detection_timeout_ms
+    token = reset_status_assigns(view).saved_reset_status_running
+    send(view.pid, {Events, reset_status_event(pool, identity)})
+    send(view.pid, {Events, reset_status_event(pool, identity)})
+    _ = :sys.get_state(view.pid)
+    assert reset_status_assigns(view).saved_reset_status_running == token
+    assert reset_status_assigns(view).saved_reset_status_rerun?
+    update_identity_metadata!(identity, &Map.put(&1, "credential_epoch", 2))
+    set_reset_phase!(identity, "confirmed_by_quota", now)
+    send(task, {barrier, :release})
+    await_reset_status!(view)
+    assigns = reset_status_assigns(view)
+    assert assigns.cockpit.saved_reset_refresh_cursor.credential_epoch == 2
+    assert assigns.cockpit.saved_reset_operation.verification == :quota_confirmed
+    assert assigns.saved_reset_status_running == nil
+    assert assigns.cockpit_metrics_generation == 1
+    counts = Agent.get(probe, & &1)
+    assert counts.status_reads == 2
+    assert counts.metrics_queries == 0
+    reset_status_evidence!("task-8-coalesced", %{single_flight: true, rerun_coalesced: true, old_generation_rejected: true, credential_epoch: 2, metrics_unchanged: true, counts: counts}, render(element(view, "#saved-reset-operation-cockpit-#{identity.id}")))
+  end
+
+  @tag :saved_reset_live_refresh
+  test "cockpit grant loss invalidates a blocked late status completion even while paused", %{scope: scope} do
+    alias CodexPooler.Accounts
+    %{identity: identity, pool: pool, now: now} = reset_status_fixture!(scope)
+    {:ok, kept} = Pools.create_pool(scope, %{slug: "reset-status-kept", name: "Sample kept Pool"})
+    %{user: operator} = operator_fixture(scope, %{"role" => "instance_admin", "password_change_required" => "false"})
+    operator_pool_assignment_fixture(operator, pool, created_by_user_id: scope.user.id)
+    operator_pool_assignment_fixture(operator, kept, created_by_user_id: scope.user.id)
+    {:ok, %{token: token}} = Accounts.login_user(%{"email" => operator.email, "password" => valid_user_password()})
+    conn = build_conn() |> log_in_user(operator, token)
+    set_reset_phase!(identity, "consumed_pending_probe", now)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
+    barrier = attach_reset_status_barrier!(view)
+    render_click(view, "set_live_updates", %{"paused" => true})
+    render_click(view, "refresh_saved_reset_status", %{"id" => identity.id})
+    assert_receive {^barrier, :blocked, task}, @detection_timeout_ms
+    monitor = Process.monitor(view.pid)
+    _ = :sys.get_state(view.pid)
+    assert {:ok, _operator} = Accounts.update_operator(scope, operator, %{"pool_ids" => [kept.id]})
+    flash = assert_redirect(view, ~p"/admin/upstreams", @detection_timeout_ms)
+    assert flash["info"] == "Your Pool access changed"
+    send(task, {barrier, :release})
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, @detection_timeout_ms
+    assert {:error, {:redirect, %{to: "/admin/upstreams"}}} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    reset_status_evidence!("task-8-revoked", %{revoked: true, inaccessible_cockpit_removed: true, late_completion_invalidated: true, paused: true}, nil)
+  end
+
+  test "manual refresh computes request metrics outside the LiveView process", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "async-cockpit", name: "Async Cockpit"})
+    %{identity: identity} = upstream_assignment_fixture(pool)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
+
+    test_pid = self()
+    handler_id = {__MODULE__, :cockpit_metrics_query, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and
+               String.contains?(to_string(metadata[:query]), "percentile_disc") do
+            send(test_pid, {handler_id, self()})
+          end
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    view |> element("#upstream-refresh-data-button") |> render_click()
+    _ = render_async(view)
+
+    assert_receive {^handler_id, query_pid}, @detection_timeout_ms
+    refute query_pid == view.pid
+  end
+
   @tag :refresh_broadcast_degraded
-  test "supported upstream broadcasts refresh quota while request metrics stay explicit-refresh only",
+  test "supported upstream broadcasts refresh quota and request metrics asynchronously",
        %{
          conn: conn,
          scope: scope
@@ -3696,6 +5693,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    _ = render_async(view)
 
     assert has_element?(view, "#upstream-quota-limits-empty")
     assert has_element?(view, "#request-health-chart-plot[data-chart-total='0']")
@@ -3716,6 +5714,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#upstream-quota-limits-empty")
     refute has_element?(view, "#upstream-quota-limit-primary_5h")
 
+    render_click(view, "open_quota_observations", %{})
+
     upsert_quota_window!(identity, %{
       window_kind: "primary",
       window_minutes: 300,
@@ -3727,6 +5727,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     })
 
     _ = :sys.get_state(view.pid)
+    _ = render_async(view)
     assert has_element?(view, "#upstream-quota-limit-primary_5h-progress[value='64'][max='100']")
 
     request_health_request_fixture(pool, assignment, %{
@@ -3736,21 +5737,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     })
 
     assert {:ok, _event} =
-             Events.broadcast_request_logs(pool.id, "request_log_created", %{
+             Events.broadcast_upstreams(pool.id, "request_metrics_updated", %{
                upstream_identity_id: identity.id
              })
 
     _ = :sys.get_state(view.pid)
-    assert has_element?(view, "#request-health-chart-plot[data-chart-total='0']")
+    _ = render_async(view)
+    assert has_element?(view, "#request-health-chart-plot[data-chart-total='1']")
 
     assert has_element?(
              view,
              "#upstream-refresh-data-button[title='Traffic, contribution, and activity data refresh on page load or on demand']"
            )
-
-    view |> element("#upstream-refresh-data-button") |> render_click()
-
-    assert has_element?(view, "#request-health-chart-plot[data-chart-total='1']")
   end
 
   @tag :cockpit_actions
@@ -3770,14 +5768,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     request_body_secret = runtime_secret("cockpit-actions-request-body")
     idempotency_key = runtime_secret("cockpit-actions-idempotency")
 
-    %{identity: identity} =
+    %{identity: identity, assignment: assignment} =
       upstream_assignment_fixture(pool, %{
         account_label: "Action Target Codex",
         chatgpt_account_id: raw_stored_account_id,
         identity_status: "refresh_failed",
         identity_metadata: %{
-          "access_token_expires_at" =>
-            DateTime.utc_now() |> DateTime.add(-1, :hour) |> DateTime.to_iso8601(),
+          "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(-1, :hour) |> DateTime.to_iso8601(),
           "token_refresh" => %{
             "status" => "failed",
             "reason" => %{
@@ -3923,6 +5920,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       refute inspect(Repo.all(Oban.Job)) =~ forbidden
     end
 
+    assert {:ok, _result} = PoolAssignments.delete_pool_assignment(pool, assignment)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     view |> element("#cockpit-delete-upstream-account-#{identity.id}") |> render_click()
     assert has_element?(view, "#cockpit-delete-upstream-account-dialog[open]")
     assert_admin_dialog_docs_link(view, "cockpit-delete-upstream-account-dialog-footer")
@@ -3937,7 +5936,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     })
 
     assert_redirect(view, ~p"/admin/upstreams")
-    assert Repo.get!(UpstreamIdentity, identity.id).status == "deleted"
+    refute Repo.get(UpstreamIdentity, identity.id)
   end
 
   @tag :cockpit_actions_error
@@ -3961,8 +5960,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         chatgpt_account_id: raw_stored_account_id,
         identity_status: "refresh_failed",
         identity_metadata: %{
-          "access_token_expires_at" =>
-            DateTime.utc_now() |> DateTime.add(-1, :hour) |> DateTime.to_iso8601(),
+          "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(-1, :hour) |> DateTime.to_iso8601(),
           "token_refresh" => %{
             "status" => "failed",
             "reason" => %{
@@ -4008,7 +6006,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     |> element("#cockpit-replace-auth-json-upstream-account-#{identity.id}")
     |> render_click()
 
-    invalid_auth_json = Jason.encode!(%{"OPENAI_API_KEY" => invalid_auth_json_secret})
+    invalid_auth_json = CodexPooler.JSON.encode!(%{"OPENAI_API_KEY" => invalid_auth_json_secret})
 
     view
     |> element("#auth-json-import-form")
@@ -4027,6 +6025,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     view |> element("#auth-json-import-cancel") |> render_click()
     refute has_element?(view, "#auth-json-import-dialog")
 
+    [assignment] = Upstreams.list_pool_assignments(pool)
+    assert {:ok, _result} = PoolAssignments.delete_pool_assignment(pool, assignment)
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     view |> element("#cockpit-delete-upstream-account-#{identity.id}") |> render_click()
     assert has_element?(view, "#cockpit-delete-upstream-account-dialog[open]")
 
@@ -4229,8 +6230,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         })
         |> Ecto.Changeset.change(%{
           started_at: DateTime.add(Map.fetch!(attrs, :admitted_at), attempt_number - 1, :second),
-          network_error_code:
-            Map.get(attrs, :extra_attempt_network_error_code, "upstream_retryable_failure")
+          network_error_code: Map.get(attrs, :extra_attempt_network_error_code, "upstream_retryable_failure")
         })
         |> Repo.update!()
       end
@@ -4252,8 +6252,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         transport: Map.get(attrs, :transport, "http_json"),
         status: status,
         usage_status: Map.get(attrs, :usage_status, "usage_known"),
-        correlation_id:
-          Map.get(attrs, :correlation_id, "request-health-#{System.unique_integer([:positive])}"),
+        correlation_id: Map.get(attrs, :correlation_id, "request-health-#{System.unique_integer([:positive])}"),
         request_metadata: Map.get(attrs, :request_metadata, %{}),
         response_status_code: Map.get(attrs, :response_status_code, response_status_code(status)),
         last_error_code: Map.get(attrs, :last_error_code, request_error_code(status))
@@ -4272,8 +6271,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       |> Ecto.Changeset.change(%{
         started_at: admitted_at,
         completed_at: completed_at,
-        network_error_code:
-          Map.get(attrs, :attempt_network_error_code, request_error_code(status))
+        network_error_code: Map.get(attrs, :attempt_network_error_code, request_error_code(status))
       })
       |> Repo.update!()
 
@@ -4282,8 +6280,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       pool_upstream_assignment_id: assignment.id,
       upstream_identity_id: assignment.upstream_identity_id,
       occurred_at: completed_at,
-      usage_status:
-        Map.get(attrs, :settlement_usage_status, Map.get(attrs, :usage_status, "usage_known"))
+      usage_status: Map.get(attrs, :settlement_usage_status, Map.get(attrs, :usage_status, "usage_known"))
     })
 
     %{request: request, attempt: attempt}
@@ -4299,12 +6296,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
   defp response_status_code("succeeded"), do: 200
   defp response_status_code("rejected"), do: 403
-  defp response_status_code("cancelled"), do: 499
   defp response_status_code(_status), do: 502
 
   defp request_error_code("succeeded"), do: nil
   defp request_error_code("rejected"), do: "request_rejected"
-  defp request_error_code("cancelled"), do: "request_cancelled"
   defp request_error_code(_status), do: "upstream_request_failed"
 
   defp quota_cockpit!(scope, slug_suffix, quota_windows) do
@@ -4326,6 +6321,120 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     cockpit
   end
 
+  defp reset_status_fixture!(scope) do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "reset-status-#{System.unique_integer([:positive])}", name: "Sample reset status"})
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          "token_refresh" => %{"status" => "succeeded"},
+          "access_token_expires_at" => DateTime.to_iso8601(DateTime.add(now, 3600, :second)),
+          "saved_resets" => %{"status" => "reported", "available_count" => 2, "observed_at" => DateTime.to_iso8601(now)}
+        }
+      })
+
+    assert {:ok, _secret} = Upstreams.store_encrypted_secret(identity, %{secret_kind: "access_token", plaintext: runtime_secret("sample-reset-status")})
+    upsert_quota_window!(identity, %{window_kind: "secondary", window_minutes: 10_080, source: "codex_usage_api", source_precision: "observed", used_percent: Decimal.new(100), reset_at: DateTime.add(now, 6, :day), observed_at: DateTime.add(now, -120, :second), last_sync_at: DateTime.add(now, -120, :second), merge_precedence: 60})
+    %{identity: identity, assignment: assignment, pool: pool, now: now}
+  end
+
+  defp set_reset_phase!(identity, phase, now) do
+    update_identity_metadata!(identity, &Map.put(&1, "saved_reset_redemption", %{"status" => "redeeming", "phase" => phase, "generation" => 1, "consumed_at" => DateTime.to_iso8601(DateTime.add(now, -60, :second)), "deadline_at" => DateTime.to_iso8601(DateTime.add(now, 600, :second)), "result" => %{"applied" => true, "code" => "reset"}}))
+  end
+
+  defp publish_reset_status!(view, pool, identity) do
+    # Same-sender direct delivery invokes the real event handler; render_async
+    # waits for its owned DB read instead of guessing PubSub arrival order.
+    send(view.pid, {Events, reset_status_event(pool, identity)})
+    _ = :sys.get_state(view.pid)
+    _ = render_async(view)
+  end
+
+  defp reset_status_event(pool, identity) do
+    %Event{version: 1, id: Ecto.UUID.generate(), pool_id: pool.id, emitted_at: DateTime.utc_now(), topics: ["upstreams"], reason: "reset_status_updated", payload: %{"upstream_identity_id" => identity.id}}
+  end
+
+  defp await_reset_status!(view, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + @detection_timeout_ms
+    _ = render_async(view)
+
+    if reset_status_assigns(view).saved_reset_status_running do
+      assert System.monotonic_time(:millisecond) < deadline, "status rerun did not finish"
+      await_reset_status!(view, deadline)
+    end
+  end
+
+  defp reset_status_assigns(view), do: :sys.get_state(view.pid).socket.assigns
+
+  defp attach_reset_status_query_probe!(view) do
+    probe = start_supervised!(Supervisor.child_spec({Agent, fn -> %{status_reads: 0, metrics_queries: 0} end}, id: make_ref()))
+    handler = {__MODULE__, make_ref()}
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config -> record_reset_status_query(view.pid, probe, metadata) end,
+        nil
+      )
+
+    probe
+  end
+
+  defp attach_reset_status_barrier!(view) do
+    parent = self()
+    handler = {__MODULE__, make_ref()}
+    gate = start_supervised!(Supervisor.child_spec({Agent, fn -> true end}, id: make_ref()))
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config -> block_reset_status_query(view.pid, parent, handler, gate, metadata) end,
+        nil
+      )
+
+    handler
+  end
+
+  defp record_reset_status_query(view_pid, probe, metadata) do
+    if view_pid in Process.get(:"$callers", []) do
+      query = to_string(metadata[:query])
+      if String.contains?(query, "row_number()") and String.contains?(query, "oban_jobs"), do: increment_status_query_count(probe, :status_reads)
+      if metadata[:source] in ["requests", "attempts"], do: increment_status_query_count(probe, :metrics_queries)
+    end
+  end
+
+  defp increment_status_query_count(probe, field), do: Agent.update(probe, fn counts -> Map.update!(counts, field, &(&1 + 1)) end)
+
+  defp block_reset_status_query(view_pid, parent, handler, gate, metadata) do
+    query = to_string(metadata[:query])
+
+    if view_pid in Process.get(:"$callers", []) and String.contains?(query, ~s(FROM "audit_events")) and Agent.get_and_update(gate, fn armed -> {armed, false} end) do
+      send(parent, {handler, :blocked, self()})
+
+      receive do
+        {^handler, :release} -> :ok
+      after
+        @detection_timeout_ms -> raise "reset status causal barrier was not released"
+      end
+    end
+  end
+
+  defp reset_status_evidence!(name, facts, html) do
+    if dir = System.get_env("SAVED_RESET_COCKPIT_EVIDENCE_DIR") do
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "#{name}.json"), Jason.encode!(facts, pretty: true))
+      if html, do: File.write!(Path.join(dir, "#{name}.html"), html)
+    end
+
+    CodexPooler.TestDiagnostics.puts(Jason.encode!(Map.put(facts, :scenario, name)))
+  end
+
   defp upsert_quota_window!(identity, attrs) do
     attrs =
       Map.merge(
@@ -4341,6 +6450,70 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       )
 
     assert {:ok, [_window]} = QuotaWindows.upsert_quota_windows(identity, [attrs])
+  end
+
+  defp upsert_fresh_quota!(identity, now) do
+    upsert_quota_window!(identity, %{
+      window_kind: "primary",
+      window_minutes: 300,
+      active_limit: 100,
+      credits: 75,
+      used_percent: Decimal.new("25"),
+      reset_at: DateTime.add(now, 4, :hour),
+      observed_at: now
+    })
+  end
+
+  defp advertise_assignment_model!(pool, assignment, model_identifier) do
+    model_fixture(pool, %{
+      exposed_model_id: model_identifier,
+      metadata: %{"source_assignment_models" => %{assignment.id => %{}}}
+    })
+  end
+
+  defp cockpit_candidate_metadata(observed_at, snapshot_at) do
+    %{
+      "__quota_confirmed_candidate_v1" => %{
+        "version" => 1,
+        "used_percent" => "0",
+        "reset_at" => DateTime.add(snapshot_at, 6, :day) |> DateTime.to_iso8601(),
+        "observed_at" => DateTime.to_iso8601(observed_at),
+        "count" => 1
+      },
+      "__quota_candidate_provider_status_v1" => %{
+        "version" => 1,
+        "allowed" => true,
+        "limit_reached" => false,
+        "observed_at" => DateTime.to_iso8601(observed_at)
+      }
+    }
+  end
+
+  defp insert_circuit_state!(pool, assignment, model_identifier, route_class, attrs) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %RoutingCircuitState{
+      pool_id: pool.id,
+      api_key_id: nil,
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      model_identifier: model_identifier,
+      route_class: route_class,
+      status: Keyword.get(attrs, :status, "closed"),
+      reason_code: Keyword.get(attrs, :reason_code, "persisted_circuit_reason_sentinel"),
+      failure_count: Keyword.get(attrs, :failure_count, 3),
+      success_count: Keyword.get(attrs, :success_count, 0),
+      opened_at: Keyword.get(attrs, :opened_at),
+      half_opened_at: Keyword.get(attrs, :half_opened_at),
+      closed_at: Keyword.get(attrs, :closed_at),
+      next_probe_at: Keyword.get(attrs, :next_probe_at),
+      last_failure_at: Keyword.get(attrs, :last_failure_at),
+      last_success_at: Keyword.get(attrs, :last_success_at),
+      metadata: Keyword.get(attrs, :metadata, %{}),
+      created_at: Keyword.get(attrs, :created_at, DateTime.add(now, -1, :second)),
+      updated_at: Keyword.get(attrs, :updated_at, DateTime.add(now, -1, :second))
+    }
+    |> Repo.insert!()
   end
 
   defp detached_routing_readiness do
@@ -4385,6 +6558,495 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     |> then(&DateTimeDisplay.format_datetime(timestamp, &1))
   end
 
+  for source <- [:paste, :upload] do
+    @tag :unix_integration
+    test "cockpit auth.json #{source} stale import keeps the mounted recovery form usable until explicit resubmission",
+         %{conn: conn, sandbox_owner: sandbox_owner, sandbox_settings_cache: settings_cache} do
+      source = unquote(source)
+      fixture = committed_auth_json_recovery_fixture!(sandbox_owner, settings_cache)
+      barrier = make_ref()
+      sensitive_sentinel = fixture.sensitive_sentinel
+
+      auth_json =
+        auth_json_fixture(
+          account_id: fixture.account_id,
+          email: fixture.email,
+          access_token: jwt_token(%{"exp" => future_unix(), "source" => "stale-recovery"}),
+          refresh_token: sensitive_sentinel
+        )
+
+      {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{fixture.identity.id}")
+
+      view
+      |> element("#cockpit-replace-auth-json-upstream-account-#{fixture.identity.id}")
+      |> render_click()
+
+      assert has_element?(view, "#auth-json-import-dialog[open]")
+      observer = start_recovery_event_observer!(fixture.pool.id)
+
+      holder = start_stale_import_holder!(self(), barrier, fixture)
+      assert_receive {^barrier, :holder, :locked, holder_pid}, @mounted_recovery_timeout_ms
+
+      handler_id = "cockpit-live-stale-import-#{System.unique_integer([:positive])}"
+      monitor = start_stale_import_monitor!(self(), barrier, holder.pid, holder_pid)
+      attach_import_preparation_probe!(handler_id, monitor.pid)
+
+      try do
+        stale_submission = prepare_auth_json_submission(view, source, fixture.pool.id, auth_json)
+        pre_stale = auth_json_recovery_side_effect_snapshot(fixture)
+
+        stale_html = render_auth_json_submit(view, stale_submission)
+
+        assert {:ok, _waiter_pid, blocking_pids} =
+                 Task.await(monitor, @mounted_recovery_timeout_ms)
+
+        assert holder_pid in blocking_pids
+        assert {:ok, _updated_identity} = Task.await(holder, @mounted_recovery_timeout_ms)
+
+        assert stale_html =~ @stale_import_message
+        assert has_element?(view, "#auth-json-import-dialog[open]")
+        assert has_element?(view, "#auth-json-import-form")
+        assert has_element?(view, "#auth-json-import-submit")
+
+        assert has_element?(
+                 view,
+                 "#auth_json_pool_id option[value='#{fixture.pool.id}'][selected]"
+               )
+
+        post_stale = auth_json_recovery_snapshot(fixture)
+        assert post_stale.credential_epoch == 2
+        assert auth_json_recovery_delta(pre_stale, post_stale) == zero_auth_json_recovery_delta()
+
+        marker_receipt =
+          recovery_events_after_liveview_marker!(view, observer, fixture.pool.id)
+
+        assert marker_receipt.publisher_pid == view.pid
+        assert marker_receipt.topic == Events.pubsub_topic(fixture.pool.id, "upstreams")
+        assert marker_receipt.events == []
+
+        for sensitive <- [auth_json, sensitive_sentinel] do
+          refute stale_html =~ sensitive
+          refute render(view) =~ sensitive
+        end
+
+        success_submission =
+          prepare_auth_json_submission(view, source, fixture.pool.id, auth_json)
+
+        pre_resubmit = auth_json_recovery_snapshot(fixture)
+        success_html = render_auth_json_submit(view, success_submission)
+        _ = :sys.get_state(view.pid)
+        _ = render_async(view, @mounted_recovery_timeout_ms)
+
+        refute success_html =~ sensitive_sentinel
+        refute has_element?(view, "#auth-json-import-dialog")
+
+        identity = Repo.get!(UpstreamIdentity, fixture.identity.id)
+        assert identity.account_email == fixture.email
+        assert identity.metadata["credential_epoch"] == 3
+        assert has_element?(view, "#upstream-cockpit-header", fixture.email)
+
+        post_resubmit = auth_json_recovery_snapshot(fixture)
+        assert post_resubmit.credential_epoch == 3
+
+        assert auth_json_recovery_delta(pre_resubmit, post_resubmit) == %{
+                 identities: 0,
+                 assignments: 0,
+                 active_secrets: 2,
+                 superseded_secrets: 0,
+                 total_secrets: 2,
+                 audits: 1,
+                 jobs: 1,
+                 requests: 0,
+                 attempts: 0,
+                 request_log_facts: 0
+               }
+
+        refute render(view) =~ auth_json
+        refute render(view) =~ sensitive_sentinel
+      after
+        :telemetry.detach(handler_id)
+        send(holder.pid, {barrier, :advance})
+        stop_live_view_proxy!(view)
+      end
+    end
+  end
+
+  @tag :unix_integration
+  test "cockpit auth.json upload cancellation still propagates an unknown entry error", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "cockpit-upload-cancel-error",
+        name: "Cockpit upload error"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        identity_status: "reauth_required",
+        identity_metadata: %{
+          "token_refresh" => %{"status" => "reauth_required"}
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    view
+    |> element("#cockpit-replace-auth-json-upstream-account-#{identity.id}")
+    |> render_click()
+
+    assert has_element?(view, "#auth-json-import-dialog[open]")
+
+    socket = :sys.get_state(view.pid).socket
+
+    assert_raise ArgumentError, ~r/no entry in upload/, fn ->
+      AuthJsonImportWorkflow.cancel_upload_entry(socket, "missing-upload-entry")
+    end
+  end
+
+  # Registered before the commit and keyed on the suffix every committed key derives from, never
+  # scoped in `try/after`: the stale-import holder and its monitor are linked tasks, so an assertion
+  # failing in either kills the test process before an enclosing `after` runs, and the committed
+  # pool and identity would outlive the test. The sandbox is stopped first because the resubmitted
+  # import updates the committed identity inside the sandboxed transaction, whose row lock would
+  # block the unboxed delete until the owner exits; `DataCase.stop_sandbox/2` is idempotent, so
+  # the case template's own teardown still runs after it.
+  defp committed_auth_json_recovery_fixture!(sandbox_owner, settings_cache) do
+    suffix = System.unique_integer([:positive])
+
+    register_unboxed_cleanup!(fn ->
+      DataCase.stop_sandbox(sandbox_owner, settings_cache)
+      delete_committed_auth_json_recovery_fixture!(suffix)
+    end)
+
+    Sandbox.unboxed_run(Repo, fn ->
+      account_id = "acct-cockpit-mounted-recovery-#{suffix}"
+      email = "cockpit-mounted-recovery-#{suffix}@example.com"
+      pool = pool_fixture(%{slug: "cockpit-mounted-recovery-#{suffix}", name: "Cockpit recovery"})
+
+      %{identity: identity} =
+        upstream_assignment_fixture(pool, %{
+          chatgpt_account_id: account_id,
+          account_email: email,
+          account_label: email,
+          identity_status: "refresh_failed",
+          identity_metadata: %{"credential_epoch" => 1}
+        })
+
+      %{
+        pool: pool,
+        identity: identity,
+        account_id: account_id,
+        email: email,
+        sensitive_sentinel: runtime_secret("cockpit-mounted-recovery-#{suffix}")
+      }
+    end)
+  end
+
+  defp delete_committed_auth_json_recovery_fixture!(suffix) do
+    Repo.delete_all(
+      from identity in UpstreamIdentity,
+        where: identity.chatgpt_account_id == ^"acct-cockpit-mounted-recovery-#{suffix}"
+    )
+
+    Repo.delete_all(
+      from pool in CodexPooler.Pools.Pool,
+        where: pool.slug == ^"cockpit-mounted-recovery-#{suffix}"
+    )
+
+    :ok
+  end
+
+  defp stop_live_view_proxy!(view) do
+    monitor = Process.monitor(view.pid)
+    _ = :sys.get_state(view.pid)
+    {_ref, _topic, proxy_pid} = view.proxy
+    ClientProxy.stop(proxy_pid, {:shutdown, :cleanup})
+    assert_receive {:DOWN, ^monitor, :process, _pid, _reason}, @mounted_recovery_timeout_ms
+  end
+
+  defp start_stale_import_holder!(parent, barrier, fixture) do
+    Task.async(fn ->
+      Sandbox.unboxed_run(Repo, fn -> run_stale_import_holder(parent, barrier, fixture) end)
+    end)
+  end
+
+  defp run_stale_import_holder(parent, barrier, fixture) do
+    Repo.transaction(fn ->
+      IdentitySlotLock.lock_slots!([
+        %{chatgpt_account_id: fixture.account_id, account_email: fixture.email}
+      ])
+
+      backend_pid = backend_pid!()
+      send(parent, {barrier, :holder, :locked, backend_pid})
+
+      receive do
+        {^barrier, :advance} ->
+          Repo.get!(UpstreamIdentity, fixture.identity.id)
+          |> Ecto.Changeset.change(metadata: %{"credential_epoch" => 2})
+          |> Repo.update!()
+      after
+        @mounted_recovery_timeout_ms -> raise "stale import holder advance timed out"
+      end
+    end)
+  end
+
+  defp attach_import_preparation_probe!(handler_id, target) do
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :telemetry.attach(
+      handler_id,
+      [:codex_pooler, :repo, :query],
+      fn _event, _measurements, metadata, parent ->
+        query = metadata |> Map.get(:query, "") |> to_string()
+
+        if String.contains?(query, ~s(FROM "upstream_identities")) and
+             not String.contains?(query, "FOR UPDATE") do
+          send(parent, {:auth_json_import_prepared, self()})
+        end
+      end,
+      target
+    )
+  end
+
+  defp start_stale_import_monitor!(parent, barrier, holder, holder_pid) do
+    Task.async(fn ->
+      receive do
+        {:auth_json_import_prepared, _query_pid} ->
+          waiter_pid = waiting_backend_pid!(holder_pid)
+          blocking_pids = blocking_backend_pids!(waiter_pid)
+          send(parent, {barrier, :waiter, :blocked, waiter_pid, blocking_pids})
+          send(holder, {barrier, :advance})
+          {:ok, waiter_pid, blocking_pids}
+      after
+        @mounted_recovery_timeout_ms -> raise "mounted import preparation probe timed out"
+      end
+    end)
+  end
+
+  defp prepare_auth_json_submission(_view, :paste, pool_id, auth_json),
+    do: %{"auth_json" => %{"pool_id" => pool_id, "content" => auth_json}}
+
+  defp prepare_auth_json_submission(view, :upload, pool_id, auth_json) do
+    upload =
+      file_input(view, "#auth-json-import-form", :auth_json, [
+        %{name: "auth.json", content: auth_json, type: "application/json"}
+      ])
+
+    assert render_upload(upload, "auth.json") =~ "100%"
+    %{"auth_json" => %{"pool_id" => pool_id, "content" => ""}}
+  end
+
+  defp render_auth_json_submit(view, params) do
+    view
+    |> element("#auth-json-import-form")
+    |> render_submit(params)
+  end
+
+  defp auth_json_recovery_snapshot(fixture) do
+    identity = Repo.get!(UpstreamIdentity, fixture.identity.id)
+
+    %{
+      credential_epoch: identity.metadata["credential_epoch"],
+      identities:
+        Repo.aggregate(
+          from(identity in UpstreamIdentity, where: identity.id == ^fixture.identity.id),
+          :count
+        ),
+      assignments:
+        Repo.aggregate(
+          from(assignment in PoolUpstreamAssignment,
+            where: assignment.pool_id == ^fixture.pool.id
+          ),
+          :count
+        ),
+      active_secrets:
+        Repo.aggregate(
+          from(secret in EncryptedSecret,
+            where: secret.upstream_identity_id == ^fixture.identity.id and secret.status == "active"
+          ),
+          :count
+        ),
+      superseded_secrets:
+        Repo.aggregate(
+          from(secret in EncryptedSecret,
+            where:
+              secret.upstream_identity_id == ^fixture.identity.id and
+                secret.status == "superseded"
+          ),
+          :count
+        ),
+      total_secrets:
+        Repo.aggregate(
+          from(secret in EncryptedSecret,
+            where: secret.upstream_identity_id == ^fixture.identity.id
+          ),
+          :count
+        ),
+      audits:
+        Repo.aggregate(
+          from(audit in AuditEvent, where: audit.pool_id == ^fixture.pool.id),
+          :count
+        ),
+      jobs:
+        Repo.aggregate(
+          from(job in Oban.Job,
+            where: fragment("? ->> 'pool_id' = ?", job.args, ^fixture.pool.id)
+          ),
+          :count
+        ),
+      requests: Repo.aggregate(Request, :count),
+      attempts: Repo.aggregate(Attempt, :count),
+      request_log_facts: Repo.aggregate(RequestLogFact, :count)
+    }
+  end
+
+  defp auth_json_recovery_side_effect_snapshot(fixture) do
+    fixture
+    |> auth_json_recovery_snapshot()
+    |> Map.delete(:credential_epoch)
+  end
+
+  defp auth_json_recovery_delta(before, later) do
+    later
+    |> Map.delete(:credential_epoch)
+    |> Map.new(fn {key, value} -> {key, value - Map.fetch!(before, key)} end)
+  end
+
+  defp zero_auth_json_recovery_delta do
+    %{
+      identities: 0,
+      assignments: 0,
+      active_secrets: 0,
+      superseded_secrets: 0,
+      total_secrets: 0,
+      audits: 0,
+      jobs: 0,
+      requests: 0,
+      attempts: 0,
+      request_log_facts: 0
+    }
+  end
+
+  defp start_recovery_event_observer!(pool_id) do
+    parent = self()
+
+    {observer, monitor_ref} =
+      spawn_monitor(fn ->
+        :ok = PubSub.subscribe(CodexPooler.PubSub, Events.pubsub_topic(pool_id, "upstreams"))
+        send(parent, {:recovery_event_observer_ready, self()})
+        observe_recovery_events([])
+      end)
+
+    assert_receive {:recovery_event_observer_ready, ^observer}, @mounted_recovery_timeout_ms
+
+    on_exit(fn ->
+      if Process.alive?(observer), do: send(observer, :stop)
+      Process.demonitor(monitor_ref, [:flush])
+    end)
+
+    observer
+  end
+
+  defp observe_recovery_events(events) do
+    receive do
+      {Events, %Event{} = event} ->
+        observe_recovery_events([event | events])
+
+      {__MODULE__, :recovery_event_marker, marker_id} ->
+        send(marker_id.caller, {
+          :recovery_event_marker_received,
+          marker_id.id,
+          self(),
+          Enum.reverse(events)
+        })
+
+        observe_recovery_events(events)
+
+      {:snapshot, caller, ref} ->
+        send(caller, {ref, Enum.reverse(events)})
+        observe_recovery_events(events)
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp recovery_events_after_liveview_marker!(view, observer, pool_id) do
+    marker_uuid = Ecto.UUID.generate()
+    caller = self()
+    topic = Events.pubsub_topic(pool_id, "upstreams")
+
+    _state =
+      :sys.replace_state(view.pid, fn state ->
+        publisher_pid = self()
+
+        :ok =
+          PubSub.broadcast(
+            CodexPooler.PubSub,
+            topic,
+            {__MODULE__, :recovery_event_marker, %{id: marker_uuid, caller: caller}}
+          )
+
+        send(caller, {:recovery_event_marker_published, marker_uuid, publisher_pid})
+        state
+      end)
+
+    assert_receive {:recovery_event_marker_published, ^marker_uuid, publisher_pid},
+                   @mounted_recovery_timeout_ms
+
+    assert publisher_pid == view.pid
+
+    assert_receive {:recovery_event_marker_received, ^marker_uuid, ^observer, events},
+                   @mounted_recovery_timeout_ms
+
+    %{marker_id: marker_uuid, publisher_pid: publisher_pid, topic: topic, events: events}
+  end
+
+  defp waiting_backend_pid!(holder_pid) do
+    deadline = System.monotonic_time(:millisecond) + @mounted_recovery_timeout_ms
+    wait_for_blocking_backend!(holder_pid, deadline)
+  end
+
+  defp wait_for_blocking_backend!(holder_pid, deadline) do
+    waiter_pid =
+      Sandbox.unboxed_run(Repo, fn ->
+        case SQL.query!(
+               Repo,
+               "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+               [holder_pid]
+             ).rows do
+          [[pid] | _rest] -> pid
+          [] -> nil
+        end
+      end)
+
+    cond do
+      is_integer(waiter_pid) ->
+        waiter_pid
+
+      System.monotonic_time(:millisecond) < deadline ->
+        wait_for_blocking_backend!(holder_pid, deadline)
+
+      true ->
+        flunk("mounted import never appeared in pg_blocking_pids")
+    end
+  end
+
+  defp blocking_backend_pids!(backend_pid) do
+    Sandbox.unboxed_run(Repo, fn ->
+      %{rows: [[pids]]} = SQL.query!(Repo, "SELECT pg_blocking_pids($1)", [backend_pid])
+      pids
+    end)
+  end
+
+  defp backend_pid! do
+    %{rows: [[backend_pid]]} = SQL.query!(Repo, "SELECT pg_backend_pid()", [])
+    backend_pid
+  end
+
   defp auth_json_fixture(opts) do
     email = Keyword.get(opts, :email, "fixture-user@example.com")
     account_id = Keyword.get(opts, :account_id, "acct_fixture_auth_json")
@@ -4410,14 +7072,49 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       "tokens" => tokens,
       "last_refresh" => "2026-05-03T00:00:00Z"
     }
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp jwt_token(payload) do
     header = %{"alg" => "none", "typ" => "JWT"}
-    encode = &Base.url_encode64(Jason.encode!(&1), padding: false)
+    encode = &Base.url_encode64(CodexPooler.JSON.encode!(&1), padding: false)
 
     Enum.join([encode.(header), encode.(payload), Base.url_encode64("sig", padding: false)], ".")
+  end
+
+  defp canonical_known_expiry_metadata(deadline, refresh \\ %{}) do
+    %{
+      "credential_epoch" => 1,
+      "access_token_expires_at" => DateTime.to_iso8601(deadline),
+      "token_refresh" =>
+        Map.merge(
+          %{
+            "status" => "succeeded",
+            "access_token_expiry" => %{
+              "version" => 1,
+              "credential_epoch" => 1,
+              "state" => "known",
+              "source" => "explicit"
+            }
+          },
+          refresh
+        )
+    }
+  end
+
+  defp canonical_unknown_expiry_metadata do
+    %{
+      "credential_epoch" => 1,
+      "token_refresh" => %{
+        "status" => "succeeded",
+        "access_token_expiry" => %{
+          "version" => 1,
+          "credential_epoch" => 1,
+          "state" => "unknown",
+          "source" => "unavailable"
+        }
+      }
+    }
   end
 
   defp future_unix, do: DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.to_unix()
@@ -4478,7 +7175,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   end
 
   defp oauth_relink_authorization_url_from_view(view) do
-    case Regex.run(~r/id="oauth-relink-authorization-url"[^>]*href="([^"]+)"/, render(view)) do
+    case Regex.run(~r/id="oauth-relink-authorization-open"[^>]*href="([^"]+)"/, render(view)) do
       [_match, authorization_url] -> String.replace(authorization_url, "&amp;", "&")
       _missing -> flunk("missing OAuth relink authorization URL")
     end
@@ -4530,13 +7227,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     docs_url =
       case footer_id do
         "auth-json-import-dialog-footer" ->
-          "https://docs.codex-pooler.com/operators/upstreams/#import-authjson"
+          "https://www.codex-pooler.com/docs/operators/upstreams/#import-authjson"
 
         "cockpit-rename-upstream-account-dialog-footer" ->
-          "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+          "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
 
         "cockpit-delete-upstream-account-dialog-footer" ->
-          "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+          "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
       end
 
     assert has_element?(
@@ -4554,7 +7251,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   defp assert_oauth_dialog_docs_link(view, footer_id) do
     assert has_element?(
              view,
-             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://www.codex-pooler.com/docs/operators/upstreams/#openai-oauth-upstream-linking'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 
@@ -4605,5 +7302,30 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   defp assert_occurrences(html, needle, expected_count) do
     actual_count = html |> String.split(needle) |> length() |> Kernel.-(1)
     assert actual_count == expected_count
+  end
+
+  # Bulk request history for one assignment, each attempt starting at its request's admission.
+  defp insert_request_history!(seed, seed_attempt, count, attrs_fun) do
+    request_fields = Request.__schema__(:fields)
+    attempt_fields = Attempt.__schema__(:fields)
+
+    requests =
+      for ordinal <- 1..count do
+        seed
+        |> Map.take(request_fields)
+        |> Map.merge(%{id: Ecto.UUID.generate(), correlation_id: "window-history-#{System.unique_integer([:positive])}"})
+        |> Map.merge(attrs_fun.(ordinal))
+      end
+
+    requests |> Enum.chunk_every(1_000) |> Enum.each(&Repo.insert_all(Request, &1))
+
+    requests
+    |> Enum.map(&(seed_attempt |> Map.take(attempt_fields) |> Map.merge(%{id: Ecto.UUID.generate(), request_id: &1.id, started_at: &1.admitted_at})))
+    |> Enum.chunk_every(1_000)
+    |> Enum.each(&Repo.insert_all(Attempt, &1))
+  end
+
+  defp unknown_provider_credits_summary do
+    %{balance_state: :unknown, balance_label: nil, observed_baseline_label: nil, observed_percent: nil, allow_provider_credits: true, availability: :unknown, availability_label: "Provider credit capacity unverified", availability_detail: "Observed balance alone grants no routing capacity.", capacity_basis: :none, reason_codes: ["provider_credit_capacity_unverified"], qualification: :unverified}
   end
 end

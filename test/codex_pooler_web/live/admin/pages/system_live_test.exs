@@ -6,17 +6,23 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
   import Ecto.Query
   import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures, only: [active_api_key_fixture: 0]
 
   alias CodexPooler.Accounts
+  alias CodexPooler.Accounts.{Authentication, Session}
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.MCP
   alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings}
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
+  alias CodexPooler.RouteClass
+  alias CodexPoolerWeb.Admin.SystemPageComponents.Metrics, as: MetricsComponent
+  alias CodexPoolerWeb.Admin.SystemSettingsForm
 
   setup :register_and_log_in_user
 
@@ -63,12 +69,13 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
            )
 
     refute has_element?(view, "#system-workspace")
+    refute has_element?(view, "#system-runtime-firewall-card")
     refute has_element?(view, "#system-settings-panel")
     refute has_element?(view, "#instance-settings-gateway-form")
     refute has_element?(view, "#admin-nav-system")
     refute has_element?(view, "#admin-nav-jobs")
     refute has_element?(view, "#admin-nav-operators")
-    refute html =~ "777"
+    refute has_element?(view, "#instance-settings-upload-ttl-seconds[value='777']")
     refute html =~ "MCP keys exist in this system"
 
     state = :sys.get_state(view.pid)
@@ -107,12 +114,9 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
       Repo.aggregate(from(event in AuditEvent, where: event.actor_user_id == ^admin.id), :count)
 
     for {event, params} <- [
-          {"validate_instance_settings",
-           %{"instance_settings" => %{"files" => %{"upload_ttl_seconds" => "999"}}}},
-          {"save_instance_settings",
-           %{"instance_settings" => %{"files" => %{"upload_ttl_seconds" => "999"}}}},
-          {"autosave_instance_settings",
-           %{"instance_settings" => %{"mcp" => %{"enabled" => "true"}}}},
+          {"validate_instance_settings", %{"instance_settings" => %{"files" => %{"upload_ttl_seconds" => "999"}}}},
+          {"save_instance_settings", %{"instance_settings" => %{"files" => %{"upload_ttl_seconds" => "999"}}}},
+          {"autosave_instance_settings", %{"instance_settings" => %{"mcp" => %{"enabled" => "true"}}}},
           {"test_smtp", %{}},
           {"import_sample_data", %{}},
           {"import_pricing_catalog", %{}}
@@ -147,6 +151,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     assert has_element?(view, "#system-tab-mcp", "MCP")
     assert has_element?(view, "#system-tab-metrics", "Metrics")
     assert has_element?(view, "#system-tab-gateway", "Gateway")
+    assert has_element?(view, "#system-tab-firewall", "Firewall")
     refute has_element?(view, "#system-tab-development")
     assert has_element?(view, "#system-settings-panel")
     assert has_element?(view, "#system-settings-panel[data-selected-tab='smtp']")
@@ -174,16 +179,31 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     assert has_element?(gateway_view, "#system-tab-gateway[aria-selected='true']", "Gateway")
     assert has_element?(gateway_view, "#system-settings-panel[data-selected-tab='gateway']")
 
-    for group <- ~w(gateway ingress files transcription operator catalog) do
+    for group <- ~w(gateway operator catalog) do
       assert has_element?(gateway_view, "#instance-settings-#{group}-form")
       assert has_element?(gateway_view, "#instance-settings-#{group}-submit")
       assert has_element?(gateway_view, "#instance-settings-#{group}-errors")
       assert has_element?(gateway_view, "#instance-settings-#{group}-status")
     end
 
+    refute has_element?(gateway_view, "#instance-settings-files-form")
+    refute has_element?(gateway_view, "#instance-settings-transcription-form")
+
     refute has_element?(gateway_view, "#instance-settings-smtp-form")
     refute has_element?(gateway_view, "#instance-settings-mcp-form")
     refute has_element?(gateway_view, "#instance-settings-metrics-form")
+    refute has_element?(gateway_view, "#instance-settings-ingress-form")
+    refute has_element?(gateway_view, "#system-runtime-firewall-card")
+
+    {:ok, firewall_view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+    assert has_element?(firewall_view, "#system-tab-firewall[aria-selected='true']", "Firewall")
+    assert has_element?(firewall_view, "#system-settings-panel[data-selected-tab='firewall']")
+    assert has_element?(firewall_view, "#system-runtime-firewall-card")
+    assert has_element?(firewall_view, "#instance-settings-ingress-form")
+    assert has_element?(firewall_view, "#instance-settings-ingress-submit")
+    assert has_element?(firewall_view, "#instance-settings-ingress-errors")
+    assert has_element?(firewall_view, "#instance-settings-ingress-status")
+    refute has_element?(firewall_view, "#instance-settings-gateway-form")
 
     {:ok, mcp_view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "mcp"}}")
     assert has_element?(mcp_view, "#system-tab-mcp[aria-selected='true']", "MCP")
@@ -203,6 +223,788 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
     assert has_element?(metrics_view, "#instance-settings-metrics-token-clear[type='checkbox']")
     refute has_element?(metrics_view, "#instance-settings-gateway-form")
+  end
+
+  test "renders a structured validated bulkhead editor with every route class", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkheads[data-active-preset='default']"
+           )
+
+    refute has_element?(view, "textarea#instance-settings-bulkheads")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-preset-default[aria-pressed='true']",
+             "Solo / Small"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-presets.max-w-2xl.sm\\:grid-cols-3"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-preset-default.border-primary\\/60.bg-primary\\/5"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-preset-medium.border-base-300.bg-base-100"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-preset-default-indicator",
+             "Default"
+           )
+
+    assert has_element?(view, "#instance-settings-bulkhead-preset-default", "1-4 active users")
+    assert has_element?(view, "#instance-settings-bulkhead-preset-medium", "5-49 active users")
+    assert has_element?(view, "#instance-settings-bulkhead-preset-large", "50+ active users")
+    refute has_element?(view, "#instance-settings-bulkhead-custom")
+
+    for route_class <- RouteClass.all() do
+      assert has_element?(
+               view,
+               "#instance-settings-bulkhead-row-#{String.replace(route_class, "_", "-")}[data-route-class='#{route_class}']"
+             )
+    end
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-max-concurrency[name='instance_settings[gateway][bulkheads][proxy_http][max_concurrency]'][value='32']"
+           )
+
+    assert has_element?(view, "#instance-settings-bulkheads", "Does not share streaming")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkheads",
+             "No current route selects this class"
+           )
+
+    assert has_element?(view, "#instance-settings-bulkhead-mobile-cue", "Swipe table for limits")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-preset-region + #instance-settings-bulkhead-mobile-cue + #instance-settings-bulkhead-scroll-region"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-notes",
+             "Route classes stay fixed"
+           )
+
+    refute has_element?(
+             view,
+             "#instance-settings-bulkhead-notes",
+             "Per-node starting points"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-group-supporting > th.border-t.border-t-base-300",
+             "Supporting lanes"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-scroll-region thead th.border-b-0"
+           )
+  end
+
+  test "renders gateway limits with units and grouped default actions", %{conn: conn} do
+    assert {:ok, _settings} =
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+               "gateway" => %{"upstream_connect_timeout_ms" => 12_345}
+             })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(view, "#instance-settings-gateway-debug-region")
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-debug-region #instance-settings-gateway-debug"
+           )
+
+    refute has_element?(
+             view,
+             "#instance-settings-gateway-scalar-matrix #instance-settings-gateway-debug"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-scalar-matrix")
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-hint-websocket-owner-idle-timeout-ms.w-full.max-w-none",
+             "Post-detach retention for websocket owners"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-scalar-group-streaming", "Streaming")
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-streaming > th.border-t.border-t-base-300"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-scroll-region thead th.border-b-0"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-upstream",
+             "Upstream timing"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-scalar-group-continuity", "Continuity")
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-circuit",
+             "Circuit recovery"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-files",
+             "File bridge"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-transcription",
+             "Audio transcription"
+           )
+
+    assert has_element?(
+             view,
+             "tbody[data-runtime-limit-group='circuit'] + tbody[data-runtime-limit-group='files'] + tbody[data-runtime-limit-group='transcription']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-upstream-connect-timeout-ms[value='12345']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-reset-upstream.btn-square[aria-label='Reset Upstream timing settings to their defaults'][title='Reset Upstream timing settings to their defaults']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-continuity > th.border-t.border-t-base-300"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-group-circuit > th.border-t.border-t-base-300"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-unit-upstream-connect-timeout-ms",
+             "ms"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-file-max-size-bytes[name='instance_settings[files][max_size_bytes]']"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-unit-file-max-size-bytes", "bytes")
+
+    assert has_element?(
+             view,
+             "#instance-settings-transcription-max-upload-bytes[name='instance_settings[transcription][max_upload_bytes]']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-unit-transcription-max-upload-bytes",
+             "bytes"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-scalar-mobile-cue",
+             "Swipe table for values"
+           )
+  end
+
+  test "validates a gateway scalar without treating LiveView bulkhead metadata as fields", %{
+    conn: conn
+  } do
+    settings = InstanceSettings.ensure_singleton!()
+    params = SystemSettingsForm.params_from_settings(settings)
+
+    gateway_params =
+      params["gateway"]
+      |> Map.put("sse_keepalive_interval_ms", "10001")
+      |> Map.update!("bulkheads", fn bulkheads ->
+        Map.new(bulkheads, fn {route_class, config} ->
+          live_view_config =
+            config
+            |> Map.new(fn {field, value} -> {field, to_string(value)} end)
+            |> Map.merge(%{
+              "_unused_max_concurrency" => "",
+              "_unused_queue_limit" => "",
+              "_unused_queue_timeout_ms" => ""
+            })
+
+          {route_class, live_view_config}
+        end)
+      end)
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    view
+    |> element("#instance-settings-gateway-form")
+    |> render_change(%{
+      "_target" => ["instance_settings", "gateway", "sse_keepalive_interval_ms"],
+      "instance_settings" => %{
+        "_group" => "gateway",
+        "lock_version" => Integer.to_string(settings.lock_version),
+        "gateway" => gateway_params
+      }
+    })
+
+    assert has_element?(view, "#instance-settings-sse-keepalive-interval-ms[value='10001']")
+    refute has_element?(view, "#instance-settings-gateway-errors li")
+  end
+
+  test "restores one gateway group without persisting until the card is saved", %{conn: conn} do
+    assert {:ok, _settings} =
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+               "gateway" => %{
+                 "upstream_connect_timeout_ms" => 88_888,
+                 "upstream_pool_timeout_ms" => 99_999
+               }
+             })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    render_click(element(view, "#instance-settings-gateway-reset-upstream"))
+
+    assert has_element?(view, "#instance-settings-upstream-connect-timeout-ms[value='15000']")
+    assert has_element?(view, "#instance-settings-upstream-pool-timeout-ms[value='15000']")
+    assert has_element?(view, "#instance-settings-upstream-receive-timeout-ms[value='300000']")
+    assert has_element?(view, "#instance-settings-upstream-conn-max-idle-time-ms[value='45000']")
+    assert has_element?(view, "#instance-settings-gateway-status", "Unsaved changes")
+    assert InstanceSettings.get!().gateway.upstream_pool_timeout_ms == 99_999
+    assert InstanceSettings.get!().gateway.upstream_connect_timeout_ms == 88_888
+
+    view |> form("#instance-settings-gateway-form") |> render_submit()
+
+    assert InstanceSettings.get!().gateway.upstream_pool_timeout_ms == 15_000
+    assert InstanceSettings.get!().gateway.upstream_connect_timeout_ms == 15_000
+
+    {:ok, reloaded_view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             reloaded_view,
+             "#instance-settings-upstream-pool-timeout-ms[value='15000']"
+           )
+  end
+
+  test "applies a bulkhead preset, saves it, and reloads the persisted values", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    render_click(element(view, "#instance-settings-bulkhead-preset-medium"))
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkheads[data-active-preset='medium']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-max-concurrency[value='64']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-queue-limit[value='256']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-queue-timeout-ms[value='10000']"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-status", "Unsaved changes")
+
+    saved_html = view |> form("#instance-settings-gateway-form") |> render_submit()
+
+    assert saved_html =~ "Gateway controls saved"
+
+    saved = InstanceSettings.get!()
+    assert saved.gateway.bulkheads[RouteClass.proxy_http()]["max_concurrency"] == 64
+    assert saved.gateway.bulkheads[RouteClass.proxy_http()]["queue_limit"] == 256
+    assert saved.gateway.bulkheads[RouteClass.proxy_http()]["queue_timeout_ms"] == 10_000
+
+    {:ok, reloaded_view, _html} =
+      live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             reloaded_view,
+             "#instance-settings-bulkheads[data-active-preset='medium']"
+           )
+
+    assert has_element?(
+             reloaded_view,
+             "#instance-settings-bulkhead-proxy-http-max-concurrency[value='64']"
+           )
+  end
+
+  test "marks manually edited bulkhead values as custom without saving them", %{conn: conn} do
+    settings = InstanceSettings.ensure_singleton!()
+    params = SystemSettingsForm.params_from_settings(settings)
+
+    changed_gateway =
+      put_in(
+        params["gateway"],
+        ["bulkheads", RouteClass.proxy_http(), "queue_limit"],
+        "129"
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    view
+    |> element("#instance-settings-gateway-form")
+    |> render_change(%{
+      "instance_settings" => %{
+        "_group" => "gateway",
+        "lock_version" => Integer.to_string(settings.lock_version),
+        "gateway" => changed_gateway
+      }
+    })
+
+    assert has_element?(view, "#instance-settings-bulkheads[data-active-preset='custom']")
+    assert has_element?(view, "#instance-settings-bulkhead-custom", "Custom values")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-queue-limit[value='129']"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-status", "Unsaved changes")
+
+    assert InstanceSettings.get!().gateway.bulkheads[RouteClass.proxy_http()]["queue_limit"] ==
+             128
+  end
+
+  test "shows the invalid bulkhead field and does not persist it", %{conn: conn} do
+    settings = InstanceSettings.ensure_singleton!()
+    params = SystemSettingsForm.params_from_settings(settings)
+
+    invalid_gateway =
+      put_in(
+        params["gateway"],
+        ["bulkheads", RouteClass.proxy_http(), "max_concurrency"],
+        "0"
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    html =
+      view
+      |> element("#instance-settings-gateway-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "lock_version" => Integer.to_string(settings.lock_version),
+          "gateway" => invalid_gateway
+        }
+      })
+
+    assert html =~ "Gateway controls could not be saved"
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-max-concurrency[aria-invalid='true'][value='0']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-bulkhead-proxy-http-max-concurrency-error",
+             "Must be 1 or more"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-errors",
+             "positive max_concurrency"
+           )
+
+    persisted = InstanceSettings.get!()
+    assert persisted.lock_version == settings.lock_version
+    assert persisted.gateway.bulkheads[RouteClass.proxy_http()]["max_concurrency"] == 32
+  end
+
+  test "metrics card exposes open and protected endpoint states and warns before clear reopens it",
+       %{
+         conn: conn
+       } do
+    metrics_token = "metrics-exposure-state-#{System.unique_integer([:positive])}"
+    {:ok, view, html} = live(conn, ~p"/admin/system?#{%{"tab" => "metrics"}}")
+
+    assert has_element?(
+             view,
+             "#instance-settings-metrics-exposure-status[data-state='open']",
+             "Open"
+           )
+
+    assert html =~
+             "No metrics bearer token is stored, so /metrics returns 200 without Authorization."
+
+    assert html =~ "The runtime firewall does not apply to /metrics."
+
+    configured_html =
+      view
+      |> element("#instance-settings-metrics-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "metrics" => %{"bearer_token" => metrics_token}
+        }
+      })
+
+    assert has_element?(
+             view,
+             "#instance-settings-metrics-exposure-status[data-state='protected']",
+             "Protected"
+           )
+
+    assert configured_html =~
+             "A metrics bearer token is stored, so /metrics requires the exact Bearer token."
+
+    assert has_element?(view, "#instance-settings-metrics-token-clear[type='checkbox']")
+    assert configured_html =~ "Clear stored token — reopens /metrics"
+
+    clear_html =
+      view
+      |> element("#instance-settings-metrics-form")
+      |> render_change(%{
+        "instance_settings" => %{
+          "metrics" => %{"bearer_token_action" => "clear"}
+        }
+      })
+
+    assert clear_html =~ "Clearing the stored token reopens /metrics without authentication."
+    refute clear_html =~ metrics_token
+
+    reopened_html =
+      view
+      |> element("#instance-settings-metrics-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "metrics" => %{"bearer_token_action" => "clear"}
+        }
+      })
+
+    assert has_element?(
+             view,
+             "#instance-settings-metrics-exposure-status[data-state='open']",
+             "Open"
+           )
+
+    assert reopened_html =~ "Metrics bearer token cleared"
+    assert has_element?(view, "#instance-settings-metrics-status", "Cleared")
+  end
+
+  test "metrics card presents the fail-closed unavailable state", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "metrics"}}")
+    state = :sys.get_state(view.pid)
+    assigns = state.socket.assigns
+
+    unavailable_settings = %{
+      assigns.settings
+      | metrics: %{assigns.settings.metrics | bearer_token_status: :unavailable}
+    }
+
+    html =
+      render_component(&MetricsComponent.card/1, %{
+        selected_tab: "metrics",
+        forms: assigns.forms,
+        form_params: assigns.form_params,
+        settings: unavailable_settings,
+        card_statuses: assigns.card_statuses
+      })
+
+    assert html =~ ~s(id="instance-settings-metrics-exposure-status")
+    assert html =~ ~s(data-state="unavailable")
+    assert html =~ "Unavailable"
+    assert html =~ "Metrics settings are unavailable, so /metrics fails closed with 401."
+    assert html =~ "The runtime firewall does not apply to /metrics."
+  end
+
+  test "shows runtime firewall state and only the current active session IP", %{
+    conn: conn,
+    user: user
+  } do
+    now = DateTime.utc_now()
+    current_session = current_session_from_conn!(conn)
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [ip_address: "198.51.100.23"]
+    )
+
+    Repo.insert!(%Session{
+      user_id: user.id,
+      session_token_hash: :crypto.hash(:sha256, "other-system-session"),
+      status: "active",
+      expires_at: DateTime.add(now, 1, :hour),
+      ip_address: "203.0.113.91",
+      created_at: now
+    })
+
+    assert {:ok, _settings} =
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+               "ingress" => %{"firewall_allowlist" => ["198.51.100.0/24"]}
+             })
+
+    {:ok, view, html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(view, "#system-runtime-firewall-card")
+
+    assert has_element?(
+             view,
+             "#system-runtime-firewall-status[data-state='enabled']",
+             "Enabled"
+           )
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip.text-xs[data-state='available']",
+             "198.51.100.23"
+           )
+
+    refute html =~ "203.0.113.91"
+  end
+
+  test "shows disabled firewall and a safe fallback without a recorded session IP", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(
+             view,
+             "#system-runtime-firewall-scope",
+             "Covers compatibility routes and /mcp. /metrics uses its separate bearer boundary."
+           )
+
+    assert has_element?(
+             view,
+             "#system-runtime-firewall-status[data-state='disabled']",
+             "Disabled"
+           )
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip[data-state='unavailable']",
+             "not recorded"
+           )
+  end
+
+  test "looks up only the current user's active unexpired session IP", %{
+    conn: conn,
+    scope: scope,
+    user: user
+  } do
+    now = DateTime.utc_now()
+    current_session = current_session_from_conn!(conn)
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [ip_address: "2001:db8::7"]
+    )
+
+    assert Accounts.current_user_session_ip(user, current_session.id) == "2001:db8::7"
+    assert Accounts.current_user_session_ip(user, nil) == nil
+
+    %{user: other_user} =
+      operator_fixture(scope, %{
+        "email" => "system-session-owner-check@example.com",
+        "password_change_required" => "false"
+      })
+
+    assert Accounts.current_user_session_ip(other_user, current_session.id) == nil
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [status: "revoked"]
+    )
+
+    assert Accounts.current_user_session_ip(user, current_session.id) == nil
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [status: "active", expires_at: DateTime.add(now, -1, :second)]
+    )
+
+    assert Accounts.current_user_session_ip(user, current_session.id) == nil
+  end
+
+  test "renders a normalized IPv6 address for the current session", %{conn: conn} do
+    current_session = current_session_from_conn!(conn)
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [ip_address: "2001:db8::7"]
+    )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip[data-state='available']",
+             "2001:db8::7"
+           )
+  end
+
+  test "updates the rendered firewall state after saving ingress settings", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(view, "#system-runtime-firewall-status[data-state='disabled']")
+
+    view
+    |> element("#instance-settings-ingress-form")
+    |> render_submit(%{
+      "instance_settings" => %{
+        "ingress" => %{"firewall_allowlist" => "198.51.100.0/24"}
+      }
+    })
+
+    assert has_element?(view, "#system-runtime-firewall-status[data-state='enabled']")
+
+    view
+    |> element("#instance-settings-ingress-form")
+    |> render_submit(%{"instance_settings" => %{"ingress" => %{"firewall_allowlist" => ""}}})
+
+    assert has_element?(view, "#system-runtime-firewall-status[data-state='disabled']")
+  end
+
+  test "drops an expired current-session IP on repeated LiveView refresh", %{
+    conn: conn
+  } do
+    now = DateTime.utc_now()
+    current_session = current_session_from_conn!(conn)
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [ip_address: "198.51.100.44"]
+    )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(view, "#system-current-session-ip", "198.51.100.44")
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [expires_at: DateTime.add(now, -1, :second)]
+    )
+
+    render_patch(view, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    refute has_element?(view, "#system-runtime-firewall-card")
+
+    render_patch(view, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip[data-state='unavailable']",
+             "not recorded"
+           )
+
+    refute render(view) =~ "198.51.100.44"
+
+    render_patch(view, ~p"/admin/system?#{%{"tab" => "smtp"}}")
+
+    refute has_element?(view, "#system-runtime-firewall-card")
+
+    render_patch(view, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip[data-state='unavailable']",
+             "not recorded"
+           )
+  end
+
+  test "renders only the authenticated current session across multiple active sessions and refreshes",
+       %{
+         conn: conn,
+         user: user
+       } do
+    now = DateTime.utc_now()
+    current_ip = "198.51.100.61"
+    other_ip = "203.0.113.161"
+    current_session = current_session_from_conn!(conn)
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [ip_address: current_ip]
+    )
+
+    assert {:ok, %{token: other_token}} =
+             Accounts.login_user(
+               %{"email" => user.email, "password" => valid_user_password()},
+               %{ip_address: other_ip, user_agent: "other-system-session"}
+             )
+
+    assert other_session_id = Accounts.session_id_for_token(other_token)
+    other_session = Repo.get!(Session, other_session_id)
+    assert other_session.user_id == user.id
+    assert other_session.status == "active"
+    assert DateTime.after?(other_session.expires_at, now)
+    assert other_session.ip_address == other_ip
+
+    {:ok, view, html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip[data-state='available']",
+             current_ip
+           )
+
+    refute html =~ other_ip
+
+    Repo.update_all(
+      from(session in Session, where: session.id == ^current_session.id),
+      set: [status: "revoked", revoked_at: now]
+    )
+
+    render_patch(view, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    render_patch(view, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    assert has_element?(
+             view,
+             "#system-current-session-ip[data-state='unavailable']",
+             "not recorded"
+           )
+
+    refreshed_html = render(view)
+    refute refreshed_html =~ current_ip
+    refute refreshed_html =~ other_ip
+
+    reloaded_other_session = Repo.get!(Session, other_session_id)
+    assert reloaded_other_session.status == "active"
+    assert DateTime.after?(reloaded_other_session.expires_at, now)
+    assert reloaded_other_session.ip_address == other_ip
+  end
+
+  test "normalizes stored session IPs and rejects malformed values" do
+    assert Authentication.safe_session_ip("2001:db8::7") == "2001:db8::7"
+    assert Authentication.safe_session_ip("not-an-ip") == nil
+    assert Authentication.safe_session_ip(nil) == nil
   end
 
   test "hides development helpers when dev features are disabled even if the setting is true", %{
@@ -227,7 +1029,8 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     refute has_element?(view, "#instance-settings-account-reconciliation-paused")
     refute has_element?(view, "#instance-settings-import-sample-data")
     refute has_element?(view, "#instance-settings-import-pricing-catalog")
-    refute html =~ "http://localhost:8400/live.js"
+    refute has_element?(view, "#instance-settings-impeccable-live")
+    refute html =~ "/live.js"
   end
 
   test "renders and saves the development helper toggle only behind the dev feature gate", %{
@@ -277,7 +1080,16 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     assert has_element?(
              view,
              "#instance-settings-development",
-             "Requires a local Impeccable server at http://localhost:8400."
+             "Loads the live client from the running local Impeccable helper on the next full page load."
+           )
+
+    assert has_element?(view, "#instance-settings-impeccable-live", "Impeccable live helper")
+    assert has_element?(view, "#instance-settings-impeccable-live-recheck", "Recheck Helper")
+
+    assert has_element?(
+             view,
+             "#instance-settings-impeccable-live-status",
+             "Live client off"
            )
 
     assert has_element?(
@@ -324,7 +1136,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
     refute has_element?(view, "#instance-settings-impeccable-live-enabled[checked]")
     refute has_element?(view, "#instance-settings-account-reconciliation-paused[checked]")
-    refute html =~ "http://localhost:8400/live.js"
+    refute html =~ "/live.js"
 
     html =
       view
@@ -344,6 +1156,16 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     assert has_element?(view, "#instance-settings-development-status", "Saved")
     assert has_element?(view, "#instance-settings-impeccable-live-enabled[checked]")
     assert has_element?(view, "#instance-settings-account-reconciliation-paused[checked]")
+
+    # Enabling the toggle re-resolves the helper: with no handshake file the
+    # surface says so instead of implying a live client is attached.
+    assert has_element?(
+             view,
+             "#instance-settings-impeccable-live-status",
+             "No helper detected"
+           )
+
+    assert render_click(view, "recheck_impeccable_live") =~ "No helper detected"
 
     event = Repo.get_by!(AuditEvent, action: "instance_settings.update", actor_user_id: user.id)
 
@@ -381,15 +1203,31 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
       "generated_at" => "2026-05-23T12:00:00Z",
       "models" => %{
         "gpt-system-live-pricing" => %{
+          "categories" => ["language_model"],
+          "category" => "language_model",
           "model" => "gpt-system-live-pricing",
           "pricing_type" => "per_1m_tokens",
+          "pricing_types" => ["per_1m_tokens"],
           "prices" => %{
             "standard" => %{
               "default" => %{"input" => 1.25, "output" => 10.0}
             }
-          }
+          },
+          "timestamp" => "2026-05-23T12:00:00Z"
         }
-      }
+      },
+      "models_count" => 1,
+      "source" => "synthetic",
+      "source_url" => "https://example.com/pricing.json",
+      "tools" => %{
+        "sample-tool" => %{
+          "details" => "Synthetic tool",
+          "price" => 0,
+          "pricing" => "$0",
+          "tool" => "Sample Tool"
+        }
+      },
+      "tools_count" => 1
     }
 
     upstream = start_upstream(FakeUpstream.json_response(pricing_payload))
@@ -416,7 +1254,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
              from snapshot in PricingSnapshot,
                where:
                  snapshot.model_identifier == "gpt-system-live-pricing" and
-                   snapshot.price_version == "2026-05-23T12:00:00Z:importer-format-1" and
+                   snapshot.price_version == "2026-05-23T12:00:00Z:importer-format-2" and
                    snapshot.source_url == ^source_url
            )
 
@@ -693,16 +1531,25 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
   end
 
   test "renders operational hints and realistic IP placeholders", %{conn: conn} do
-    {:ok, view, html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    {:ok, gateway_view, gateway_html} =
+      live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    {:ok, firewall_view, firewall_html} =
+      live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
 
     for selector <- [
           "#admin-system-live",
           "#system-tabs",
-          "#system-settings-panel",
+          "#system-settings-panel"
+        ] do
+      assert has_element?(gateway_view, selector)
+    end
+
+    for selector <- [
           "#instance-settings-ingress-form",
           "#instance-settings-ingress-submit"
         ] do
-      assert has_element?(view, selector)
+      assert has_element?(firewall_view, selector)
     end
 
     {:ok, smtp_view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "smtp"}}")
@@ -717,16 +1564,21 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
           "172.16.0.0/12",
           "2001:db8:10::/48"
         ] do
-      assert html =~ placeholder
+      assert firewall_html =~ placeholder
     end
 
-    refute html =~ "198.51.100.10/32\\n203.0.113.0/24"
-    refute html =~ "Operator login URL"
-    assert html =~ "Public operator app URL"
-    assert html =~ "Operator emails append /login to this value."
+    refute firewall_html =~ "198.51.100.10/32\\n203.0.113.0/24"
+    refute gateway_html =~ "Operator login URL"
+    assert gateway_html =~ "Public operator app URL"
+    assert gateway_html =~ "Operator emails append /login to this value."
+    assert has_element?(firewall_view, "#instance-settings-forwarded-client-ip-source")
+    assert has_element?(firewall_view, "#instance-settings-forwarded-proxy-depth")
+
+    assert firewall_html =~
+             "number of proxies between the internet and the pooler, including the one connected directly; 0 uses trusted-CIDR walking."
 
     for hint <- [
-          "Records sanitized request/attempt routing metadata for new gateway requests.",
+          "Adds sanitized request and routing details to gateway logs and attempt metadata for temporary troubleshooting. It increases log and stored-data volume; keep it disabled during normal production operation to minimize overhead.",
           "Interval for downstream SSE heartbeat events; 0 disables heartbeats.",
           "Maximum time allowed to establish a connection to an upstream account.",
           "Maximum time a gateway request may wait for an available pooled connection.",
@@ -738,10 +1590,148 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
           "How long an opened circuit stays closed to normal traffic before probing.",
           "Concurrent probe attempts allowed while testing a half-open circuit.",
           "Successful probes required before closing a previously opened circuit.",
-          "Per route-class concurrency, queue length, and queue timeout policy as JSON.",
-          "Model-specific context window sizes used when upstream metadata is missing or needs correction."
+          "Each class has a separate per-node concurrency and queue budget.",
+          "Model-specific raw native context windows used when upstream metadata is missing or needs correction. Codex applies the advertised effective percentage once; /v1/models publishes the flattened value."
         ] do
-      assert html =~ hint
+      assert gateway_html =~ hint
+    end
+  end
+
+  test "saves and reloads every valid forwarded client policy", %{conn: conn} do
+    for {source, depth} <- [
+          {"peer", 0},
+          {"x_real_ip", 0},
+          {"x_forwarded_for", 2}
+        ] do
+      {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+      saved_html =
+        view
+        |> element("#instance-settings-ingress-form")
+        |> render_submit(%{
+          "instance_settings" => %{
+            "ingress" => %{
+              "forwarded_client_ip_source" => source,
+              "forwarded_proxy_depth" => Integer.to_string(depth)
+            }
+          }
+        })
+
+      assert saved_html =~ "Runtime ingress saved"
+
+      saved = InstanceSettings.get!()
+      assert saved.ingress.forwarded_client_ip_source == String.to_existing_atom(source)
+      assert saved.ingress.forwarded_proxy_depth == depth
+
+      {:ok, reloaded_view, _html} =
+        live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+      assert has_element?(
+               reloaded_view,
+               "#instance-settings-forwarded-client-ip-source option[value='#{source}'][selected]"
+             )
+
+      assert has_element?(
+               reloaded_view,
+               "#instance-settings-forwarded-proxy-depth[value='#{depth}']"
+             )
+    end
+  end
+
+  @tag :capture_log
+  test "saving X-Forwarded-For depth changes the next runtime request without restart", %{
+    conn: conn
+  } do
+    previous_operational_settings = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
+
+    Application.put_env(
+      :codex_pooler,
+      OperationalSettings,
+      previous_operational_settings
+      |> Keyword.delete(:settings)
+      |> Keyword.put(:use_instance_settings?, true)
+    )
+
+    assert {:ok, _settings} =
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+               "ingress" => %{
+                 "firewall_allowlist" => ["198.51.100.77"],
+                 "trusted_proxies" => ["10.0.0.1"],
+                 "forwarded_client_ip_source" => "x_forwarded_for",
+                 "forwarded_proxy_depth" => 1
+               }
+             })
+
+    setup = active_api_key_fixture()
+
+    denied =
+      build_conn()
+      |> remote_ip({10, 0, 0, 1})
+      |> put_req_header("x-forwarded-for", "198.51.100.77, 203.0.113.10")
+      |> put_req_header("authorization", setup.authorization)
+      |> get("/api/codex/usage")
+
+    assert json_response(denied, 403)["error"]["code"] == "access_denied"
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+    saved_html =
+      view
+      |> element("#instance-settings-ingress-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "ingress" => %{
+            "forwarded_client_ip_source" => "x_forwarded_for",
+            "forwarded_proxy_depth" => "2"
+          }
+        }
+      })
+
+    assert saved_html =~ "Runtime ingress saved"
+
+    allowed =
+      build_conn()
+      |> remote_ip({10, 0, 0, 1})
+      |> put_req_header("x-forwarded-for", "198.51.100.77, 203.0.113.10")
+      |> put_req_header("x-real-ip", <<255>>)
+      |> put_req_header("authorization", setup.authorization)
+      |> get("/api/codex/usage")
+
+    assert %{"plan_type" => "api_key"} = json_response(allowed, 200)
+    assert InstanceSettings.current().ingress.forwarded_proxy_depth == 2
+  end
+
+  test "rejects invalid forwarded client policy inline without mutating persisted settings", %{
+    conn: conn
+  } do
+    original = InstanceSettings.ensure_singleton!()
+
+    for {source, depth, expected_error} <- [
+          {"peer", "1", "must be 0 unless forwarded client IP source is X-Forwarded-For"},
+          {"x_real_ip", "1", "must be 0 unless forwarded client IP source is X-Forwarded-For"},
+          {"x_forwarded_for", "17", "must be less than or equal to 16"}
+        ] do
+      {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
+
+      rejected_html =
+        view
+        |> element("#instance-settings-ingress-form")
+        |> render_submit(%{
+          "instance_settings" => %{
+            "ingress" => %{
+              "forwarded_client_ip_source" => source,
+              "forwarded_proxy_depth" => depth
+            }
+          }
+        })
+
+      assert rejected_html =~ "Runtime ingress could not be saved"
+      assert has_element?(view, "#instance-settings-ingress-errors", expected_error)
+
+      persisted = InstanceSettings.get!()
+      assert persisted.lock_version == original.lock_version
+      assert persisted.ingress.forwarded_client_ip_source == :x_forwarded_for
+      assert persisted.ingress.forwarded_proxy_depth == 0
     end
   end
 
@@ -824,13 +1814,215 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
              "must be greater than or equal to 60000"
            )
 
+    assert has_element?(
+             view,
+             "#instance-settings-websocket-owner-idle-timeout-ms[aria-invalid='true']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-label-line-websocket-owner-idle-timeout-ms #instance-settings-websocket-owner-idle-timeout-ms-error",
+             "must be greater than or equal to 60000"
+           )
+
     persisted = InstanceSettings.get!()
     assert persisted.gateway.websocket_owner_idle_timeout_ms == 900_000
     assert persisted.gateway.websocket_idle_timeout_ms == 444_000
   end
 
+  test "renders and enforces the owner lease ttl minimum on the gateway card", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bridge-owner-lease-ttl-seconds[name='instance_settings[gateway][bridge_owner_lease_ttl_seconds]'][value='45'][min='24']"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-hint-bridge-owner-lease-ttl-seconds", "At least 24 s")
+
+    html =
+      view
+      |> element("#instance-settings-gateway-form")
+      |> render_submit(%{"instance_settings" => %{"gateway" => %{"bridge_owner_lease_ttl_seconds" => "23"}}})
+
+    assert html =~ "Gateway controls could not be saved"
+    assert has_element?(view, "#instance-settings-bridge-owner-lease-ttl-seconds-error", "must be greater than or equal to 24")
+    assert InstanceSettings.get!().gateway.bridge_owner_lease_ttl_seconds == 45
+  end
+
+  test "renders and enforces the owner lease renewal bound on the gateway card", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             view,
+             "#instance-settings-bridge-owner-lease-renewal-seconds[name='instance_settings[gateway][bridge_owner_lease_renewal_seconds]'][value='15']"
+           )
+
+    assert has_element?(view, "#instance-settings-gateway-hint-bridge-owner-lease-renewal-seconds", "At most a third of the owner lease TTL")
+
+    html =
+      view
+      |> element("#instance-settings-gateway-form")
+      |> render_submit(%{"instance_settings" => %{"gateway" => %{"bridge_owner_lease_renewal_seconds" => "45"}}})
+
+    assert html =~ "Gateway controls could not be saved"
+    assert has_element?(view, "#instance-settings-bridge-owner-lease-renewal-seconds-error", "must be less than or equal to 15, a third of the owner lease TTL")
+    assert InstanceSettings.get!().gateway.bridge_owner_lease_renewal_seconds == 15
+  end
+
+  test "renders the upstream connection idle bound in the upstream timing group", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             view,
+             "tbody[data-runtime-limit-group='upstream'] #instance-settings-upstream-conn-max-idle-time-ms[name='instance_settings[gateway][upstream_conn_max_idle_time_ms]'][value='45000'][min='1000'][max='3600000']"
+           )
+
+    assert has_element?(
+             view,
+             "label[for='instance-settings-upstream-conn-max-idle-time-ms']",
+             "Connection idle bound (ms)"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-hint-upstream-conn-max-idle-time-ms",
+             "never interrupts an in-flight or streaming request"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-unit-upstream-conn-max-idle-time-ms",
+             "ms"
+           )
+  end
+
+  test "renders the proactive token refresh margin in the credential refresh group", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             view,
+             "tbody[data-runtime-limit-group='token_refresh'] #instance-settings-upstream-token-refresh-margin-seconds[name='instance_settings[gateway][upstream_token_refresh_margin_seconds]'][value='172800'][min='3600'][max='1209600']"
+           )
+
+    assert has_element?(
+             view,
+             "label[for='instance-settings-upstream-token-refresh-margin-seconds']",
+             "Proactive refresh margin (s)"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-hint-upstream-token-refresh-margin-seconds",
+             "cannot age into required re-authentication"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-unit-upstream-token-refresh-margin-seconds",
+             "s"
+           )
+  end
+
+  test "saves and resets proactive credential refresh through the gateway card", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    selector = "#instance-settings-upstream-token-refresh-proactive-enabled"
+    assert has_element?(view, selector <> "[checked]")
+
+    view
+    |> element("#instance-settings-gateway-form")
+    |> render_submit(%{
+      "instance_settings" => %{
+        "gateway" => %{"upstream_token_refresh_proactive_enabled" => "false"}
+      }
+    })
+
+    assert InstanceSettings.get!().gateway.upstream_token_refresh_proactive_enabled == false
+    refute has_element?(view, selector <> "[checked]")
+    render_click(element(view, "#instance-settings-gateway-reset-token_refresh"))
+    assert has_element?(view, selector <> "[checked]")
+    assert InstanceSettings.get!().gateway.upstream_token_refresh_proactive_enabled == false
+  end
+
+  test "validates, saves, audits, and reloads the upstream connection idle bound", %{
+    conn: conn,
+    user: user
+  } do
+    settings = InstanceSettings.ensure_singleton!()
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    view
+    |> element("#instance-settings-gateway-form")
+    |> render_change(%{
+      "_target" => ["instance_settings", "gateway", "upstream_conn_max_idle_time_ms"],
+      "instance_settings" => %{
+        "_group" => "gateway",
+        "lock_version" => Integer.to_string(settings.lock_version),
+        "gateway" => %{"upstream_conn_max_idle_time_ms" => "30000"}
+      }
+    })
+
+    assert has_element?(view, "#instance-settings-upstream-conn-max-idle-time-ms[value='30000']")
+    assert has_element?(view, "#instance-settings-gateway-status", "Unsaved changes")
+    assert InstanceSettings.get!().gateway.upstream_conn_max_idle_time_ms == 45_000
+
+    saved_html =
+      view
+      |> element("#instance-settings-gateway-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "gateway" => %{"upstream_conn_max_idle_time_ms" => "30000"}
+        }
+      })
+
+    assert saved_html =~ "Gateway controls saved"
+    assert InstanceSettings.get!().gateway.upstream_conn_max_idle_time_ms == 30_000
+
+    event = Repo.get_by!(AuditEvent, action: "instance_settings.update", actor_user_id: user.id)
+    assert get_in(event.details, ["changed_keys"]) == ["gateway.upstream_conn_max_idle_time_ms"]
+
+    {:ok, reloaded_view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    assert has_element?(
+             reloaded_view,
+             "#instance-settings-upstream-conn-max-idle-time-ms[value='30000']"
+           )
+  end
+
+  test "renders an inline upstream connection idle bound error without persisting it", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    html =
+      view
+      |> element("#instance-settings-gateway-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "gateway" => %{"upstream_conn_max_idle_time_ms" => "999"}
+        }
+      })
+
+    assert html =~ "Gateway controls could not be saved"
+
+    assert has_element?(
+             view,
+             "#instance-settings-upstream-conn-max-idle-time-ms[aria-invalid='true']"
+           )
+
+    assert has_element?(
+             view,
+             "#instance-settings-gateway-label-line-upstream-conn-max-idle-time-ms #instance-settings-upstream-conn-max-idle-time-ms-error",
+             "must be greater than or equal to 1000"
+           )
+
+    assert InstanceSettings.get!().gateway.upstream_conn_max_idle_time_ms == 45_000
+  end
+
   test "renders constrained compressed JSON encoding controls and help copy", %{conn: conn} do
-    {:ok, view, html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    {:ok, view, html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
 
     assert has_element?(view, "#instance-settings-decompression-algorithms")
 
@@ -876,7 +2068,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
   end
 
   test "saves empty compressed JSON encoding selection through the ingress card", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
 
     html =
       view
@@ -895,7 +2087,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
   end
 
   test "rejects unknown compressed JSON encodings even when posted outside the UI", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "firewall"}}")
 
     html =
       view
@@ -944,45 +2136,69 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
            )
   end
 
-  test "saves one settings card with current scope attribution", %{conn: conn, user: user} do
+  test "saves the status polling toggle through the operator settings form", %{conn: conn} do
+    {:ok, view, _} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+    assert has_element?(view, "#instance-settings-openai-status-polling-enabled[checked]")
+
+    view
+    |> element("#instance-settings-operator-form")
+    |> render_submit(%{
+      "instance_settings" => %{"operator" => %{"openai_status_polling_enabled" => "false"}}
+    })
+
+    refute InstanceSettings.get!().operator.openai_status_polling_enabled
+    refute has_element?(view, "#instance-settings-openai-status-polling-enabled[checked]")
+  end
+
+  test "saves gateway, file, and transcription limits as one card", %{conn: conn, user: user} do
     {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
 
     html =
       view
-      |> element("#instance-settings-files-form")
+      |> element("#instance-settings-gateway-form")
       |> render_submit(%{
         "instance_settings" => %{
-          "files" => %{"upload_ttl_seconds" => "321"}
+          "gateway" => %{"upstream_pool_timeout_ms" => "16000"},
+          "files" => %{"upload_ttl_seconds" => "321"},
+          "transcription" => %{"max_upload_bytes" => "30000000"}
         }
       })
 
-    assert html =~ "File bridge limits saved"
+    assert html =~ "Gateway controls saved"
     updated = InstanceSettings.get!()
+    assert updated.gateway.upstream_pool_timeout_ms == 16_000
     assert updated.files.upload_ttl_seconds == 321
+    assert updated.transcription.max_upload_bytes == 30_000_000
     assert updated.operator.login_base_url == "http://localhost"
     assert updated.updated_by_user_id == user.id
     assert has_element?(view, "#instance-settings-upload-ttl-seconds[value='321']")
-    assert has_element?(view, "#instance-settings-files-status", "Saved")
+    assert has_element?(view, "#instance-settings-gateway-status", "Saved")
 
     event = Repo.get_by!(AuditEvent, action: "instance_settings.update", actor_user_id: user.id)
-    assert get_in(event.details, ["changed_keys"]) == ["files.upload_ttl_seconds"]
+
+    assert get_in(event.details, ["changed_keys"]) == [
+             "files.upload_ttl_seconds",
+             "gateway.upstream_pool_timeout_ms",
+             "transcription.max_upload_bytes"
+           ]
   end
 
-  test "invalid card submit renders only that card changeset errors", %{conn: conn} do
+  test "invalid file limit renders in the composite gateway card", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
 
     html =
       view
-      |> element("#instance-settings-files-form")
+      |> element("#instance-settings-gateway-form")
       |> render_submit(%{
         "instance_settings" => %{
           "files" => %{"upload_ttl_seconds" => "-1"}
         }
       })
 
-    assert html =~ "File bridge limits could not be saved"
-    assert has_element?(view, "#instance-settings-files-errors")
-    assert has_element?(view, "#instance-settings-files-errors", "must be greater than 0")
+    assert html =~ "Gateway controls could not be saved"
+    assert has_element?(view, "#instance-settings-gateway-errors")
+    assert has_element?(view, "#instance-settings-gateway-errors", "must be greater than 0")
+    assert has_element?(view, "#instance-settings-upload-ttl-seconds[aria-invalid='true']")
     refute has_element?(view, "#instance-settings-operator-errors", "has invalid format")
 
     refute has_element?(
@@ -1056,6 +2272,8 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
       }
     })
 
+    select_system_tab(view, "firewall")
+
     html =
       view
       |> element("#instance-settings-ingress-form")
@@ -1119,7 +2337,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
     html =
       view
-      |> element("#instance-settings-files-form")
+      |> element("#instance-settings-gateway-form")
       |> render_submit(%{
         "instance_settings" => %{
           "lock_version" => stale.lock_version,
@@ -1131,7 +2349,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
     assert has_element?(
              view,
-             "#instance-settings-files-errors",
+             "#instance-settings-gateway-errors",
              "was updated by another operator"
            )
 
@@ -1196,7 +2414,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     select_system_tab(remounted_view, "gateway")
 
     remounted_view
-    |> element("#instance-settings-files-form")
+    |> element("#instance-settings-gateway-form")
     |> render_submit(%{
       "instance_settings" => %{
         "files" => %{"upload_ttl_seconds" => "654"}
@@ -1349,7 +2567,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
   test "smtp test button renders sanitized failure status without leaking secrets", %{
     conn: conn
   } do
-    port = free_port()
+    port = start_closing_tcp_server!()
 
     {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "metrics"}}")
 
@@ -1369,13 +2587,13 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
       "instance_settings" => %{
         "smtp" => %{
           "enabled" => "true",
-          "host" => "localhost",
+          "host" => "127.0.0.1",
           "port" => Integer.to_string(port),
           "username" => "username",
           "from" => "probe@example.com",
           "ssl" => "false",
           "tls" => "never",
-          "retries" => "2",
+          "retries" => "1",
           "password" => "super-secret-smtp-password"
         }
       }
@@ -1437,6 +2655,15 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     |> render_click()
   end
 
+  defp current_session_from_conn!(conn) do
+    with token when is_binary(token) <- get_session(conn, :user_token),
+         session_id when is_binary(session_id) <- Accounts.session_id_for_token(token) do
+      Repo.get!(Session, session_id)
+    else
+      _ -> flunk("expected authenticated test connection to resolve one active session")
+    end
+  end
+
   defp assert_mcp_initialize(conn, raw_token, expected_status, expected_value) do
     response =
       conn
@@ -1445,7 +2672,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
       |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("mcp-protocol-version", @mcp_version)
       |> put_req_header("authorization", "Bearer #{raw_token}")
-      |> post("/mcp", Jason.encode!(initialize_request()))
+      |> post("/mcp", CodexPooler.JSON.encode!(initialize_request()))
       |> json_response(expected_status)
 
     if expected_status == 200 do
@@ -1482,10 +2709,38 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     upstream
   end
 
+  defp start_closing_tcp_server! do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+    {:ok, port} = :inet.port(listener)
+    test_pid = self()
+
+    pid =
+      spawn_link(fn ->
+        send(test_pid, {:closing_tcp_server_ready, self()})
+
+        with {:ok, socket} <- :gen_tcp.accept(listener) do
+          :gen_tcp.close(socket)
+        end
+
+        :gen_tcp.close(listener)
+      end)
+
+    assert_receive {:closing_tcp_server_ready, ^pid}
+
+    on_exit(fn ->
+      Process.exit(pid, :shutdown)
+      :gen_tcp.close(listener)
+    end)
+
+    port
+  end
+
   defp free_port do
     {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
     {:ok, port} = :inet.port(socket)
     :ok = :gen_tcp.close(socket)
     port
   end
+
+  defp remote_ip(conn, ip), do: %{conn | remote_ip: ip}
 end

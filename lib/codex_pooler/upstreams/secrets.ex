@@ -6,14 +6,16 @@ defmodule CodexPooler.Upstreams.Secrets do
   import Ecto.Query
 
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Auth.{AccessTokenExpiry, TokenRefreshMetadata}
   alias CodexPooler.Upstreams.Schemas.EncryptedSecret
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPooler.Upstreams.SecretBox
+  alias CodexPooler.Upstreams.StatusVocabulary.Identity, as: IdentityStatus
 
   @active "active"
-  @deleted UpstreamIdentity.deleted_status()
-  @refresh_due UpstreamIdentity.refresh_due_status()
-  @reauth_required UpstreamIdentity.reauth_required_status()
+  @deleted IdentityStatus.deleted_status()
+  @refresh_due IdentityStatus.refresh_due_status()
+  @reauth_required IdentityStatus.reauth_required_status()
   @superseded "superseded"
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
@@ -35,7 +37,7 @@ defmodule CodexPooler.Upstreams.Secrets do
 
       %UpstreamIdentity{} = identity ->
         cond do
-          secret_expired?(identity.metadata) -> :expired
+          credential_expired?(identity.metadata, now()) -> :expired
           active_secret?(identity.id, "access_token") -> :present
           true -> :missing
         end
@@ -127,8 +129,7 @@ defmodule CodexPooler.Upstreams.Secrets do
         decrypt_upstream_secret(secret)
 
       nil ->
-        {:error,
-         lifecycle_error(:upstream_secret_not_found, "active upstream secret was not found")}
+        {:error, lifecycle_error(:upstream_secret_not_found, "active upstream secret was not found")}
     end
   end
 
@@ -184,17 +185,13 @@ defmodule CodexPooler.Upstreams.Secrets do
     )
   end
 
-  defp secret_expired?(metadata) when is_map(metadata) do
+  defp credential_expired?(metadata, %DateTime{} = evaluated_at) do
     metadata
-    |> Map.get("access_token_expires_at", Map.get(metadata, "secret_expires_at"))
-    |> parse_optional_datetime()
-    |> case do
-      %DateTime{} = expires_at -> DateTime.compare(expires_at, now()) != :gt
-      nil -> false
-    end
+    |> TokenRefreshMetadata.project_access_token_expiry()
+    |> AccessTokenExpiry.evaluate(evaluated_at)
+    |> Map.fetch!(:state)
+    |> Kernel.==(:expired)
   end
-
-  defp secret_expired?(_metadata), do: false
 
   defp encrypt_upstream_secret(%UpstreamIdentity{} = identity, attrs, plaintext) do
     attrs = atomize_attrs(attrs)
@@ -266,17 +263,6 @@ defmodule CodexPooler.Upstreams.Secrets do
          )}
     end
   end
-
-  defp parse_optional_datetime(%DateTime{} = datetime), do: datetime
-
-  defp parse_optional_datetime(value) when is_binary(value) do
-    case DateTime.from_iso8601(value) do
-      {:ok, datetime, _offset} -> datetime
-      _invalid -> nil
-    end
-  end
-
-  defp parse_optional_datetime(_value), do: nil
 
   defp normalize_identity(%UpstreamIdentity{id: id}), do: Repo.get(UpstreamIdentity, id)
   defp normalize_identity(id) when is_binary(id), do: Repo.get(UpstreamIdentity, id)

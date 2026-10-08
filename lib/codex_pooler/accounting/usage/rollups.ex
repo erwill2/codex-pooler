@@ -5,7 +5,14 @@ defmodule CodexPooler.Accounting.Rollups do
 
   import Ecto.Query
 
-  alias CodexPooler.Accounting.{DailyRollup, HourlyModelUsageRollup, LedgerEntry, Request}
+  alias CodexPooler.Accounting.{
+    DailyRollup,
+    DailyRollupCoverage,
+    HourlyModelUsageRollup,
+    LedgerEntry,
+    Request
+  }
+
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Repo
 
@@ -13,16 +20,16 @@ defmodule CodexPooler.Accounting.Rollups do
   @amount_recorded "recorded"
   @usage_known "usage_known"
   @unknown_model_code "Unknown model"
+  # The widest daily-rollup reader is the 28-day API key usage summary. One repair pass enqueues
+  # at most half of the jobs queue's default concurrency of eight, so rebuilds never crowd out the
+  # other scheduled work; the newest days go first because they are the ones readers use.
+  @coverage_repair_lookback_days 28
+  @coverage_repair_batch_limit 4
   @daily_rollup_conflict_targets %{
     "pool" => {:unsafe_fragment, "(rollup_date, pool_id) WHERE dimension_kind = 'pool'"},
-    "api_key" =>
-      {:unsafe_fragment, "(rollup_date, pool_id, api_key_id) WHERE dimension_kind = 'api_key'"},
-    "pool_upstream_assignment" =>
-      {:unsafe_fragment,
-       "(rollup_date, pool_upstream_assignment_id) WHERE dimension_kind = 'pool_upstream_assignment'"},
-    "upstream_identity" =>
-      {:unsafe_fragment,
-       "(rollup_date, upstream_identity_id) WHERE dimension_kind = 'upstream_identity'"},
+    "api_key" => {:unsafe_fragment, "(rollup_date, pool_id, api_key_id) WHERE dimension_kind = 'api_key'"},
+    "pool_upstream_assignment" => {:unsafe_fragment, "(rollup_date, pool_upstream_assignment_id) WHERE dimension_kind = 'pool_upstream_assignment'"},
+    "upstream_identity" => {:unsafe_fragment, "(rollup_date, upstream_identity_id) WHERE dimension_kind = 'upstream_identity'"},
     "model" => {:unsafe_fragment, "(rollup_date, model_id) WHERE dimension_kind = 'model'"}
   }
 
@@ -66,7 +73,11 @@ defmodule CodexPooler.Accounting.Rollups do
       CASE
         WHEN entry.usage_status = 'usage_known' THEN COALESCE(entry.settled_cost_micros, 0::numeric)
         ELSE 0::numeric
-      END AS settled_cost_micros
+      END AS settled_cost_micros,
+      CASE
+        WHEN entry.usage_status = 'usage_known' THEN ROUND(COALESCE(entry.settled_cost_micros, 0::numeric), 0)
+        ELSE 0::numeric
+      END AS rounded_settled_cost_micros
     FROM public.ledger_entries AS entry
     INNER JOIN public.requests AS request ON request.id = entry.request_id
     WHERE entry.entry_kind = 'settlement'
@@ -94,7 +105,8 @@ defmodule CodexPooler.Accounting.Rollups do
       reasoning_tokens,
       total_tokens,
       estimated_cost_micros,
-      settled_cost_micros
+      settled_cost_micros,
+      rounded_settled_cost_micros
     FROM source
 
     UNION ALL
@@ -118,8 +130,10 @@ defmodule CodexPooler.Accounting.Rollups do
       reasoning_tokens,
       total_tokens,
       estimated_cost_micros,
-      settled_cost_micros
+      settled_cost_micros,
+      rounded_settled_cost_micros
     FROM source
+    WHERE api_key_id IS NOT NULL
 
     UNION ALL
 
@@ -142,7 +156,8 @@ defmodule CodexPooler.Accounting.Rollups do
       reasoning_tokens,
       total_tokens,
       estimated_cost_micros,
-      settled_cost_micros
+      settled_cost_micros,
+      rounded_settled_cost_micros
     FROM source
     WHERE pool_upstream_assignment_id IS NOT NULL
 
@@ -167,7 +182,8 @@ defmodule CodexPooler.Accounting.Rollups do
       reasoning_tokens,
       total_tokens,
       estimated_cost_micros,
-      settled_cost_micros
+      settled_cost_micros,
+      rounded_settled_cost_micros
     FROM source
     WHERE upstream_identity_id IS NOT NULL
 
@@ -192,7 +208,8 @@ defmodule CodexPooler.Accounting.Rollups do
       reasoning_tokens,
       total_tokens,
       estimated_cost_micros,
-      settled_cost_micros
+      settled_cost_micros,
+      rounded_settled_cost_micros
     FROM source
     WHERE model_id IS NOT NULL
   ),
@@ -216,6 +233,7 @@ defmodule CodexPooler.Accounting.Rollups do
       total_tokens,
       estimated_cost_micros,
       settled_cost_micros,
+      rounded_settled_cost_micros,
       created_at,
       updated_at
     )
@@ -242,6 +260,12 @@ defmodule CodexPooler.Accounting.Rollups do
       sum(total_tokens)::bigint AS total_tokens,
       sum(estimated_cost_micros) AS estimated_cost_micros,
       sum(settled_cost_micros) AS settled_cost_micros,
+      sum(
+        CASE
+          WHEN dimension_kind = 'pool' THEN rounded_settled_cost_micros
+          ELSE 0::numeric
+        END
+      ) AS rounded_settled_cost_micros,
       $4,
       $4
     FROM dims
@@ -257,6 +281,43 @@ defmodule CodexPooler.Accounting.Rollups do
   SELECT
     (SELECT count(*) FROM source)::bigint AS settlement_count,
     (SELECT count(*) FROM inserted)::bigint AS rollup_count
+  """
+
+  @daily_pool_admission_rebuild_sql """
+  WITH source AS MATERIALIZED (
+    SELECT
+      request.pool_id,
+      count(*)::bigint AS admitted_request_count
+    FROM public.requests AS request
+    WHERE request.admitted_at >= $2
+      AND request.admitted_at < $3
+    GROUP BY request.pool_id
+  ),
+  upserted AS (
+    INSERT INTO public.daily_rollups (
+      rollup_date,
+      dimension_kind,
+      pool_id,
+      admitted_request_count,
+      created_at,
+      updated_at
+    )
+    SELECT
+      $1,
+      'pool',
+      pool_id,
+      admitted_request_count,
+      $4,
+      $4
+    FROM source
+    ON CONFLICT (rollup_date, pool_id) WHERE dimension_kind = 'pool' DO UPDATE SET
+      admitted_request_count = EXCLUDED.admitted_request_count,
+      updated_at = EXCLUDED.updated_at
+    RETURNING 1
+  )
+  SELECT
+    COALESCE((SELECT sum(admitted_request_count) FROM source), 0)::bigint AS admission_count,
+    (SELECT count(*) FROM upserted)::bigint AS rollup_count
   """
 
   @hourly_model_usage_rebuild_sql """
@@ -426,7 +487,9 @@ defmodule CodexPooler.Accounting.Rollups do
 
     request
     |> daily_rollup_identities(settlement)
-    |> Enum.each(&upsert_rollup!(&1, date, delta))
+    |> Enum.each(fn identity ->
+      upsert_rollup!(identity, date, daily_rollup_delta(identity, settlement, delta))
+    end)
 
     upsert_hourly_model_usage_rollup!(request, settlement, delta)
 
@@ -452,7 +515,9 @@ defmodule CodexPooler.Accounting.Rollups do
 
     request
     |> daily_rollup_identities(settlement)
-    |> Enum.each(&subtract_rollup!(&1, date, delta))
+    |> Enum.each(fn identity ->
+      subtract_rollup!(identity, date, daily_rollup_delta(identity, settlement, delta))
+    end)
 
     subtract_hourly_model_usage_rollup!(request, settlement, delta)
   end
@@ -460,13 +525,18 @@ defmodule CodexPooler.Accounting.Rollups do
   defp daily_rollup_identities(%Request{} = request, %LedgerEntry{} = settlement) do
     [
       %{dimension_kind: "pool", pool_id: request.pool_id},
-      %{dimension_kind: "api_key", pool_id: request.pool_id, api_key_id: request.api_key_id},
+      api_key_identity(request),
       pool_upstream_assignment_identity(request, settlement),
       upstream_identity_identity(request, settlement),
       model_identity(request)
     ]
     |> Enum.reject(&is_nil/1)
   end
+
+  defp api_key_identity(%Request{api_key_id: nil}), do: nil
+
+  defp api_key_identity(%Request{} = request),
+    do: %{dimension_kind: "api_key", pool_id: request.pool_id, api_key_id: request.api_key_id}
 
   defp pool_upstream_assignment_identity(%Request{} = request, %LedgerEntry{} = settlement) do
     if settlement.pool_upstream_assignment_id do
@@ -513,24 +583,88 @@ defmodule CodexPooler.Accounting.Rollups do
     |> Repo.all()
   end
 
-  @spec rebuild_for_date(Date.t()) :: {:ok, non_neg_integer()} | {:error, term()}
-  def rebuild_for_date(%Date{} = date) do
+  @spec rebuild_for_date(Date.t(), keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def rebuild_for_date(date, opts \\ [])
+
+  def rebuild_for_date(%Date{} = date, opts) when is_list(opts) do
     start_at = DateTime.new!(date, ~T[00:00:00], "Etc/UTC")
     end_at = DateTime.add(start_at, 1, :day)
     now = now()
+    before_coverage = Keyword.get(opts, :before_coverage, fn -> :ok end)
 
     Repo.transaction(fn ->
+      flush_pending_rollup_mutations!()
+      captured_version = coverage_version(date)
+      set_rebuild_suppression!(true)
+
       Repo.delete_all(from r in DailyRollup, where: r.rollup_date == ^date)
 
       %{rows: [[settlement_count, _rollup_count]]} =
         Repo.query!(@daily_rollup_rebuild_sql, [date, start_at, end_at, now])
+
+      %{rows: [[_admission_count, _admission_rollup_count]]} =
+        Repo.query!(@daily_pool_admission_rebuild_sql, [date, start_at, end_at, now])
+
+      flush_rebuild_projection_mutations!()
+      set_rebuild_suppression!(false)
+      before_coverage.()
+      publish_coverage!(date, captured_version)
 
       settlement_count
     end)
     |> unwrap_transaction()
   end
 
-  def rebuild_for_date(_date), do: {:error, :invalid_rollup_date}
+  def rebuild_for_date(_date, _opts), do: {:error, :invalid_rollup_date}
+
+  @doc """
+  Returns the completed UTC days whose daily rollups need a rebuild, newest first.
+
+  A day qualifies when it has no coverage row (its rebuild never ran or never committed), when
+  its coverage is incomplete (a request, recorded settlement or Pool rollup dated on it changed
+  after its rebuild), when its coverage has another contract version, or when its coverage was
+  published before the day ended (a rebuild that ran while the day was still current cannot
+  include what followed, and later writes to a current day do not mark it).
+
+  The candidates are the `:lookback_days` days before the database's current UTC day, the same
+  clock the coverage triggers use. The default reaches back over the widest reader of daily
+  rollups, the 28-day API key usage summary, so no reader keeps a day that is never rebuilt;
+  older days are read by nothing and are left as they are. `:limit` bounds how many days one
+  pass returns, so a mutation that marks many days (such as a Pool deletion) is repaired over
+  several passes instead of occupying the jobs queue at once.
+  """
+  @spec dates_needing_rebuild(keyword()) :: [Date.t()]
+  def dates_needing_rebuild(opts \\ []) do
+    lookback_days = Keyword.get(opts, :lookback_days, @coverage_repair_lookback_days)
+    limit = Keyword.get(opts, :limit, @coverage_repair_batch_limit)
+
+    %{rows: rows} =
+      Repo.query!(
+        """
+        WITH today AS (
+          SELECT (clock_timestamp() AT TIME ZONE 'UTC')::date AS utc_date
+        ),
+        candidates AS (
+          SELECT (today.utc_date - offset_days) AS rollup_date
+          FROM today
+          CROSS JOIN generate_series(1, $1::integer) AS offset_days
+        )
+        SELECT candidates.rollup_date
+        FROM candidates
+        LEFT JOIN public.daily_rollup_coverages AS coverage
+          ON coverage.rollup_date = candidates.rollup_date
+        WHERE coverage.rollup_date IS NULL
+           OR coverage.completed_at IS NULL
+           OR coverage.contract_version <> $2
+           OR coverage.completed_at < (candidates.rollup_date + 1)::timestamp
+        ORDER BY candidates.rollup_date DESC
+        LIMIT $3
+        """,
+        [lookback_days, DailyRollupCoverage.contract_version(), limit]
+      )
+
+    Enum.map(rows, fn [date] -> date end)
+  end
 
   @spec rebuild_hourly_model_usage_rollups_for_hour(DateTime.t()) ::
           {:ok, non_neg_integer()} | {:error, term()}
@@ -626,10 +760,8 @@ defmodule CodexPooler.Accounting.Rollups do
       update: [
         set: [
           model_id: ^model_id,
-          estimated_cost_micros:
-            fragment("? + EXCLUDED.estimated_cost_micros", rollup.estimated_cost_micros),
-          settled_cost_micros:
-            fragment("? + EXCLUDED.settled_cost_micros", rollup.settled_cost_micros),
+          estimated_cost_micros: fragment("? + EXCLUDED.estimated_cost_micros", rollup.estimated_cost_micros),
+          settled_cost_micros: fragment("? + EXCLUDED.settled_cost_micros", rollup.settled_cost_micros),
           updated_at: ^now
         ],
         inc: [
@@ -685,10 +817,8 @@ defmodule CodexPooler.Accounting.Rollups do
     from rollup in DailyRollup,
       update: [
         set: [
-          estimated_cost_micros:
-            fragment("? + EXCLUDED.estimated_cost_micros", rollup.estimated_cost_micros),
-          settled_cost_micros:
-            fragment("? + EXCLUDED.settled_cost_micros", rollup.settled_cost_micros),
+          estimated_cost_micros: fragment("? + EXCLUDED.estimated_cost_micros", rollup.estimated_cost_micros),
+          settled_cost_micros: fragment("? + EXCLUDED.settled_cost_micros", rollup.settled_cost_micros),
           updated_at: ^now
         ],
         inc: [
@@ -722,9 +852,42 @@ defmodule CodexPooler.Accounting.Rollups do
       raise Ecto.NoResultsError, queryable: schema
     end
 
-    Repo.delete_all(from(rollup in schema, where: ^filters, where: rollup.request_count == 0))
+    delete_drained_rollup(schema, filters)
 
     :ok
+  end
+
+  defp subtract_query(DailyRollup, filters, delta, now) do
+    from rollup in DailyRollup,
+      where: ^filters,
+      update: [
+        set: [
+          estimated_cost_micros:
+            fragment(
+              "? - ?",
+              rollup.estimated_cost_micros,
+              type(^delta.estimated_cost_micros, :decimal)
+            ),
+          settled_cost_micros:
+            fragment(
+              "? - ?",
+              rollup.settled_cost_micros,
+              type(^delta.settled_cost_micros, :decimal)
+            ),
+          updated_at: ^now
+        ],
+        inc: [
+          request_count: ^(-delta.request_count),
+          success_count: ^(-delta.success_count),
+          failure_count: ^(-delta.failure_count),
+          retry_count: ^(-delta.retry_count),
+          input_tokens: ^(-delta.input_tokens),
+          cached_input_tokens: ^(-delta.cached_input_tokens),
+          output_tokens: ^(-delta.output_tokens),
+          reasoning_tokens: ^(-delta.reasoning_tokens),
+          total_tokens: ^(-delta.total_tokens)
+        ]
+      ]
   end
 
   defp subtract_query(schema, filters, delta, now) do
@@ -773,6 +936,8 @@ defmodule CodexPooler.Accounting.Rollups do
 
   defp rollup_lookup(identity, date), do: Map.merge(identity, %{rollup_date: date})
 
+  defp daily_rollup_delta(_identity, _settlement, delta), do: delta
+
   defp rollup_delta(request, settlement) do
     %{
       request_count: 1,
@@ -809,6 +974,79 @@ defmodule CodexPooler.Accounting.Rollups do
     do: Map.fetch!(settlement, field) || Decimal.new(0)
 
   defp known_usage_decimal(%LedgerEntry{}, _field), do: Decimal.new(0)
+
+  defp delete_drained_rollup(DailyRollup, filters) do
+    Repo.delete_all(
+      from rollup in DailyRollup,
+        where: ^filters,
+        where: rollup.request_count == 0 and rollup.admitted_request_count == 0
+    )
+  end
+
+  defp delete_drained_rollup(schema, filters) do
+    Repo.delete_all(from rollup in schema, where: ^filters, where: rollup.request_count == 0)
+  end
+
+  defp flush_pending_rollup_mutations! do
+    Repo.query!("""
+    SET CONSTRAINTS
+      requests_track_pool_daily_rollup_mutation,
+      ledger_entries_track_pool_daily_rollup_mutation,
+      daily_rollups_track_pool_daily_rollup_mutation
+    IMMEDIATE
+    """)
+
+    Repo.query!("""
+    SET CONSTRAINTS
+      requests_track_pool_daily_rollup_mutation,
+      ledger_entries_track_pool_daily_rollup_mutation,
+      daily_rollups_track_pool_daily_rollup_mutation
+    DEFERRED
+    """)
+  end
+
+  defp coverage_version(date) do
+    DailyRollupCoverage
+    |> where([coverage], coverage.rollup_date == ^date)
+    |> select([coverage], coverage.mutation_version)
+    |> Repo.one()
+    |> then(&(&1 || 0))
+  end
+
+  defp set_rebuild_suppression!(enabled) do
+    value = if enabled, do: "on", else: "off"
+    Repo.query!("SELECT set_config('codex_pooler.pool_daily_rollup_rebuild', $1, true)", [value])
+  end
+
+  defp flush_rebuild_projection_mutations! do
+    Repo.query!("SET CONSTRAINTS daily_rollups_track_pool_daily_rollup_mutation IMMEDIATE")
+    Repo.query!("SET CONSTRAINTS daily_rollups_track_pool_daily_rollup_mutation DEFERRED")
+  end
+
+  defp publish_coverage!(date, captured_version) do
+    Repo.query!(
+      """
+      INSERT INTO public.daily_rollup_coverages (
+        rollup_date,
+        contract_version,
+        completed_at,
+        mutation_version,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, clock_timestamp() AT TIME ZONE 'UTC', $3, clock_timestamp() AT TIME ZONE 'UTC', clock_timestamp() AT TIME ZONE 'UTC')
+      ON CONFLICT (rollup_date) DO UPDATE SET
+        contract_version = EXCLUDED.contract_version,
+        completed_at = EXCLUDED.completed_at,
+        updated_at = EXCLUDED.updated_at
+      WHERE public.daily_rollup_coverages.mutation_version = $3
+      RETURNING mutation_version
+      """,
+      [date, DailyRollupCoverage.contract_version(), captured_version]
+    )
+
+    :ok
+  end
 
   defp maybe_where_dimension(query, nil), do: query
 

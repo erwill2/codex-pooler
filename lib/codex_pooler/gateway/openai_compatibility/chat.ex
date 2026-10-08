@@ -1,10 +1,14 @@
 defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   @moduledoc false
 
+  alias CodexPooler.Gateway.OpenAICompatibility.Chat.{CallIds, TextParts}
   alias CodexPooler.Gateway.OpenAICompatibility.{Error, Matrix, Responses, Validation}
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.ServiceTier
 
-  @locally_unsupported_fields ~w(audio frequency_penalty logit_bias logprobs modalities n prediction presence_penalty seed stop top_logprobs user web_search_options)
+  @locally_unsupported_fields ~w(audio frequency_penalty logit_bias logprobs modalities n prediction presence_penalty seed stop top_logprobs web_search_options)
+  @responses_fallback_fields ~w(input include reasoning text)
   @service_tiers ~w(auto default flex priority scale)
   @verbosity_values ~w(low medium high)
 
@@ -12,7 +16,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   def validate(payload) do
     with {:ok, %{chat_payload: chat_payload, response_payload: response_payload}} <-
            prepare_response_payload(payload),
-         {:ok, _response_payload} <- Responses.validate(response_payload) do
+         {:ok, _response_payload} <- Responses.validate(response_payload, surface: :chat) do
       {:ok, chat_payload}
     end
   end
@@ -29,10 +33,108 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   def coerce(payload, opts \\ %{}) do
     with {:ok, %{chat_payload: chat_payload, response_payload: response_payload}} <-
            prepare_response_payload(payload),
-         {:ok, response} <- Responses.coerce(response_payload, opts) do
-      {:ok, Map.put(response, :chat_payload, chat_payload)}
+         {:ok, response} <- Responses.coerce(response_payload, put_surface(opts, :chat)),
+         {:ok, normalized_payload} <- TextParts.normalize(response.payload, chat_payload),
+         {:ok, normalized_payload} <- CallIds.normalize(normalized_payload, chat_payload) do
+      options =
+        if normalized_payload == response.payload,
+          do: response.request_options,
+          else: RequestOptions.for_payload(response.request_options, response.endpoint, normalized_payload)
+
+      response =
+        response
+        |> Map.put(:payload, normalized_payload)
+        |> Map.put(:chat_payload, chat_payload)
+        |> Map.put(:request_options, RequestOptions.put_openai_compatibility(options, openai_chat_payload: chat_payload))
+
+      {:ok, response}
     end
   end
+
+  @doc """
+  Maps an upstream Responses parameter path from a relayed validation
+  rejection back to the Chat Completions field the client sent. Only the
+  renames this adapter performs on the messages path are reversed, and only
+  when the client actually sent the source field; every other path, and every
+  fallback-input request, is returned unchanged.
+  """
+  @spec public_validation_param(String.t(), map()) :: String.t()
+  def public_validation_param(param, %{"messages" => [_message | _rest]} = chat_payload)
+      when is_binary(param),
+      do: chat_validation_param(param, chat_payload)
+
+  def public_validation_param(param, _chat_payload), do: param
+
+  defp chat_validation_param("reasoning.effort", %{"reasoning" => effort}) when is_binary(effort),
+    do: "reasoning"
+
+  defp chat_validation_param("reasoning.effort", %{"reasoning_effort" => _effort}),
+    do: "reasoning_effort"
+
+  defp chat_validation_param("max_output_tokens", %{"max_completion_tokens" => _value}),
+    do: "max_completion_tokens"
+
+  defp chat_validation_param("max_output_tokens", %{"max_tokens" => _value}),
+    do: "max_tokens"
+
+  defp chat_validation_param("text.verbosity", %{"verbosity" => _verbosity}), do: "verbosity"
+
+  defp chat_validation_param("text.format" <> rest, %{"response_format" => %{} = format}),
+    do: response_format_validation_param(rest, format) || "text.format" <> rest
+
+  defp chat_validation_param("tool_choice.name", %{"tool_choice" => %{"type" => type} = choice})
+       when type in ["function", "custom"] and is_map_key(choice, type),
+       do: "tool_choice." <> type <> ".name"
+
+  defp chat_validation_param("tools[" <> _rest = param, %{"tools" => tools})
+       when is_list(tools),
+       do: tool_validation_param(param, tools)
+
+  # The adapter rebuilds `messages` into Responses input items, not one item
+  # per message (every tool call and some content parts become items of their
+  # own, an assistant message with empty content and tool calls leaves none,
+  # Lite prepends Pooler items), so no `input` path, index or item field names
+  # anything this client sent. The relay names the field that carried the
+  # refused item instead of a Responses path (findings#254 row 254-54).
+  defp chat_validation_param("input", _chat_payload), do: "messages"
+  defp chat_validation_param("input[" <> _rest, _chat_payload), do: "messages"
+  defp chat_validation_param("input." <> _rest, _chat_payload), do: "messages"
+
+  defp chat_validation_param(param, _chat_payload), do: param
+
+  defp response_format_validation_param("", %{"type" => type})
+       when type in ["json_object", "json_schema", "text"],
+       do: "response_format"
+
+  defp response_format_validation_param(".type", %{"type" => type})
+       when type in ["json_object", "json_schema", "text"],
+       do: "response_format.type"
+
+  defp response_format_validation_param("." <> _field = rest, %{
+         "type" => "json_schema",
+         "json_schema" => %{}
+       }),
+       do: "response_format.json_schema" <> rest
+
+  defp response_format_validation_param(_rest, _format), do: nil
+
+  defp tool_validation_param(param, tools) do
+    with [_match, index, field, rest] <-
+           Regex.run(~r/\Atools\[(0|[1-9][0-9]{0,3})\]\.([A-Za-z_]+)(.*)\z/, param),
+         %{"type" => type} = tool when type in ["function", "custom"] <-
+           Enum.at(tools, String.to_integer(index)),
+         true <- is_map(Map.get(tool, type)) and field in nested_tool_fields(type) do
+      "tools[" <> index <> "]." <> type <> "." <> field <> rest
+    else
+      _other -> param
+    end
+  end
+
+  defp nested_tool_fields("function"), do: ["name", "description", "parameters", "strict"]
+  defp nested_tool_fields("custom"), do: ["name", "description", "format"]
+
+  defp put_surface(opts, surface) when is_list(opts), do: Keyword.put(opts, :surface, surface)
+  defp put_surface(opts, surface) when is_map(opts), do: Map.put(opts, :surface, surface)
 
   defp prepare_response_payload(payload) do
     with {:ok, payload} <- Validation.normalize_payload(payload),
@@ -40,6 +142,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
          :ok <- Validation.reject_high_impact_fields(payload),
          :ok <- Validation.reject_unsupported_fields(payload, :chat),
          :ok <- Validation.require_model(payload),
+         {:ok, payload} <- discard_user_identifier(payload),
+         {:ok, payload} <- normalize_reasoning_alias(payload),
+         :ok <- reject_responses_fallback_fields_with_messages(payload),
          :ok <- reject_locally_unsupported_fields(payload),
          :ok <- validate_reasoning_effort(payload),
          :ok <- validate_service_tier(payload),
@@ -47,10 +152,40 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
          :ok <- validate_token_limits(payload),
          :ok <- validate_verbosity(payload),
          :ok <- validate_translatable_prompt_cache_breakpoints(payload),
+         :ok <- validate_image_details(payload),
+         :ok <- reject_namespaced_custom_tool_definitions(payload),
+         :ok <- validate_custom_tool_choice_shape(payload),
          {:ok, response_payload} <- response_payload(payload) do
       {:ok, %{chat_payload: payload, response_payload: response_payload}}
     end
   end
+
+  defp discard_user_identifier(%{"user" => user} = payload)
+       when is_binary(user) or is_nil(user),
+       do: {:ok, Map.delete(payload, "user")}
+
+  defp discard_user_identifier(%{"user" => _user}),
+    do: {:error, Error.invalid_request("user must be a string or null", "user")}
+
+  defp discard_user_identifier(payload), do: {:ok, payload}
+
+  defp normalize_reasoning_alias(%{"messages" => [_message | _rest], "reasoning" => effort} = payload)
+       when is_binary(effort) do
+    with :ok <- Validation.validate_reasoning_effort_token(effort, "reasoning"),
+         normalized = normalize_enum(effort),
+         canonical = Map.get(payload, "reasoning_effort", normalized),
+         true <- is_binary(canonical) and normalize_enum(canonical) == normalized do
+      {:ok, Map.put(payload, "reasoning_effort", normalized)}
+    else
+      false -> conflicting_reasoning_alias()
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp normalize_reasoning_alias(payload), do: {:ok, payload}
+
+  defp conflicting_reasoning_alias,
+    do: {:error, Error.invalid_request("reasoning and reasoning_effort must match", "reasoning")}
 
   defp reject_legacy_functions(payload) do
     cond do
@@ -58,13 +193,33 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
         {:error, Error.invalid_request("legacy functions are not translatable", "functions")}
 
       Map.has_key?(payload, "function_call") ->
-        {:error,
-         Error.invalid_request("legacy function_call is not translatable", "function_call")}
+        {:error, Error.invalid_request("legacy function_call is not translatable", "function_call")}
 
       true ->
         :ok
     end
   end
+
+  defp reject_namespaced_custom_tool_definitions(%{"tools" => tools}) when is_list(tools) do
+    if Enum.any?(tools, &namespaced_custom_tool_definition?/1),
+      do: {:error, Error.invalid_request("tool shape is not translatable", "tools")},
+      else: :ok
+  end
+
+  defp reject_namespaced_custom_tool_definitions(_payload), do: :ok
+
+  defp namespaced_custom_tool_definition?(%{"type" => "namespace", "tools" => tools})
+       when is_list(tools),
+       do: Enum.any?(tools, &custom_tool_definition?/1)
+
+  defp namespaced_custom_tool_definition?(_tool), do: false
+
+  defp custom_tool_definition?(%{"type" => "custom"}), do: true
+
+  defp custom_tool_definition?(%{"tools" => tools}) when is_list(tools),
+    do: Enum.any?(tools, &custom_tool_definition?/1)
+
+  defp custom_tool_definition?(_tool), do: false
 
   defp messages(%{"messages" => messages}) when is_list(messages) and messages != [] do
     if Enum.all?(messages, &valid_message?/1) do
@@ -89,13 +244,33 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
     end
   end
 
+  defp reject_responses_fallback_fields_with_messages(%{"messages" => messages} = payload)
+       when is_list(messages) and messages != [] do
+    case Enum.find(@responses_fallback_fields, &responses_fallback_field?(payload, &1)) do
+      nil ->
+        :ok
+
+      field ->
+        {:error,
+         Error.invalid_request(
+           "Responses fields cannot be combined with non-empty messages",
+           field
+         )}
+    end
+  end
+
+  defp reject_responses_fallback_fields_with_messages(_payload), do: :ok
+
+  defp responses_fallback_field?(%{"reasoning" => effort}, "reasoning") when is_binary(effort), do: false
+  defp responses_fallback_field?(payload, field), do: Map.has_key?(payload, field)
+
   defp validate_reasoning_effort(%{"reasoning_effort" => effort}),
     do: Validation.validate_reasoning_effort_token(effort, "reasoning_effort")
 
   defp validate_reasoning_effort(_payload), do: :ok
 
   defp validate_service_tier(%{"service_tier" => tier}) when is_binary(tier) do
-    tier = normalize_enum(tier)
+    tier = ServiceTier.canonicalize(tier)
 
     if tier in @service_tiers,
       do: :ok,
@@ -137,8 +312,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
         :ok
 
       [key | _rest] ->
-        {:error,
-         Error.invalid_request("stream_options field is not supported", "stream_options." <> key)}
+        {:error, Error.invalid_request("stream_options field is not supported", "stream_options." <> key)}
     end
   end
 
@@ -173,7 +347,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp valid_message?(%{"role" => "assistant", "tool_calls" => tool_calls} = message)
        when is_list(tool_calls) do
-    valid_assistant_tool_message_content?(Map.get(message, "content")) and
+    (valid_assistant_tool_message_content?(Map.get(message, "content")) or
+       (message["content"] == [] and tool_calls != [])) and
       valid_assistant_tool_calls?(tool_calls)
   end
 
@@ -217,6 +392,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   defp fallback_response_payload(%{"input" => _input} = payload, _messages_error) do
     payload
     |> Map.take(Matrix.forwarded_fields(:responses))
+    |> Map.delete("stream_options")
     |> Map.put_new("instructions", "")
     |> then(&{:ok, &1})
   end
@@ -280,15 +456,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
     |> Enum.reduce({[], []}, fn part, {items, pending_parts} ->
       case special_content_item(part) do
         nil ->
-          {items, pending_parts ++ [normalize_content_part(part, role)]}
+          {items, [normalize_content_part(part, role) | pending_parts]}
 
         item ->
           items = flush_message_item(items, pending_parts, role, message)
-          {items ++ [item], []}
+          {[item | items], []}
       end
     end)
     |> then(fn {items, pending_parts} ->
-      flush_message_item(items, pending_parts, role, message)
+      items |> flush_message_item(pending_parts, role, message) |> Enum.reverse()
     end)
   end
 
@@ -296,11 +472,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp flush_message_item(items, pending_parts, role, message) do
     item =
-      %{"type" => "message", "role" => role, "content" => pending_parts}
+      %{"type" => "message", "role" => role, "content" => Enum.reverse(pending_parts)}
       |> maybe_put(message, "name")
       |> maybe_put(message, "tool_call_id")
 
-    items ++ [item]
+    [item | items]
   end
 
   defp normalize_content_part(text, "assistant") when is_binary(text),
@@ -331,12 +507,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
          |> maybe_put_prompt_cache_breakpoint(part)
 
   defp normalize_content_part(
-         %{"type" => "image_url", "image_url" => %{"url" => image_url}} = part,
+         %{"type" => "image_url", "image_url" => %{"url" => image_url} = image} = part,
          _role
        )
        when is_binary(image_url),
        do:
          %{"type" => "input_image", "image_url" => image_url}
+         |> maybe_put_image_detail(image)
          |> maybe_put_prompt_cache_breakpoint(part)
 
   defp normalize_content_part(
@@ -371,7 +548,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
       "type" => "function_call",
       "call_id" => call_id,
       "name" => name,
-      "arguments" => Jason.encode!(input)
+      "arguments" => CodexPooler.JSON.encode!(input)
     }
   end
 
@@ -391,9 +568,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   defp assistant_tool_call_items(tool_calls),
     do: Enum.map(tool_calls, &assistant_tool_call_item/1)
 
-  defp assistant_tool_call_item(
-         %{"function" => %{"name" => name, "arguments" => arguments}} = item
-       ) do
+  defp assistant_tool_call_item(%{"function" => %{"name" => name, "arguments" => arguments}} = item) do
     %{
       "type" => "function_call",
       "call_id" => assistant_tool_call_id(item),
@@ -431,19 +606,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
        when is_binary(image_url),
        do: %{"type" => "input_image", "image_url" => image_url}
 
+  # A tool-result image keeps its detail like a message image (findings#206
+  # row 206-494); `validate_image_details/1` admits only an enum value.
   defp normalize_cline_tool_result_output_part(%{
          "type" => "image_url",
-         "image_url" => %{"url" => image_url}
+         "image_url" => %{"url" => image_url} = image
        })
        when is_binary(image_url),
-       do: %{"type" => "input_image", "image_url" => image_url}
+       do: %{"type" => "input_image", "image_url" => image_url} |> maybe_put_image_detail(image)
 
-  defp normalize_cline_tool_result_output_part(%{
-         "type" => "input_image",
-         "image_url" => image_url
-       })
+  defp normalize_cline_tool_result_output_part(%{"type" => "input_image", "image_url" => image_url} = part)
        when is_binary(image_url),
-       do: %{"type" => "input_image", "image_url" => image_url}
+       do: %{"type" => "input_image", "image_url" => image_url} |> maybe_put_image_detail(part)
 
   defp normalize_cline_tool_result_output_part(%{
          "type" => "image",
@@ -454,7 +628,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
        do: %{"type" => "input_image", "image_url" => "data:#{media_type};base64,#{data}"}
 
   defp normalize_cline_tool_result_output_part(%{"type" => "json", "value" => value}),
-    do: %{"type" => "input_text", "text" => Jason.encode!(value)}
+    do: %{"type" => "input_text", "text" => CodexPooler.JSON.encode!(value)}
 
   defp normalize_cline_tool_result_output_part(part), do: part
 
@@ -468,6 +642,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp valid_tool_content_part?(%{"type" => type, "text" => text})
        when type in ["text", "input_text"] and is_binary(text),
+       do: true
+
+  # Hermes in its default `chat_completions` mode sends a screenshot tool
+  # result as `image_url` parts of the tool message. The rebuild carries them
+  # into the `function_call_output`, where the Codex backend accepts an image
+  # (findings#206 row 206-476, probed on `gpt-6-luna`); a file part has no
+  # tool-output form there and stays refused.
+  defp valid_tool_content_part?(%{"type" => "image_url", "image_url" => image_url})
+       when is_binary(image_url),
+       do: true
+
+  defp valid_tool_content_part?(%{"type" => "image_url", "image_url" => %{"url" => image_url}})
+       when is_binary(image_url),
        do: true
 
   defp valid_tool_content_part?(_part), do: false
@@ -484,8 +671,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
     if content
        |> content_parts()
        |> Enum.any?(&marked_text_content_part?/1) do
-      {:error,
-       Error.invalid_request("assistant prompt_cache_breakpoint is not translatable", "input")}
+      {:error, Error.invalid_request("assistant prompt_cache_breakpoint is not translatable", "input")}
     end
   end
 
@@ -493,8 +679,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
     if content
        |> content_parts()
        |> Enum.any?(&marked_input_audio_content_part?/1) do
-      {:error,
-       Error.invalid_request("input_audio prompt_cache_breakpoint is not translatable", "input")}
+      {:error, Error.invalid_request("input_audio prompt_cache_breakpoint is not translatable", "input")}
     end
   end
 
@@ -523,6 +708,57 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp maybe_put_prompt_cache_breakpoint(acc, _part), do: acc
 
+  # `image_url.detail` becomes the `input_image` detail, as the Responses
+  # adapter forwards it; a null detail stays absent and Lite strips the rest
+  # in the payload normalizer. Only an enum value reaches here
+  # (`validate_image_details/1`).
+  defp maybe_put_image_detail(acc, %{"detail" => detail}) when is_binary(detail),
+    do: Map.put(acc, "detail", detail)
+
+  defp maybe_put_image_detail(acc, _image), do: acc
+
+  # The public Chat Completions API accepts `image_url.detail` (gpt-6-luna,
+  # probed 2026-09-24), and the Codex backend refuses a value outside low,
+  # high, auto and original on the `input_image` the rebuild produces
+  # (findings#206 row 206-476). Such a value is refused here, before
+  # reservation or dispatch and on every serving mode, under the Chat field
+  # the client sent rather than a rebuilt `input` path. A Responses-shaped
+  # `input_image` part in a Chat message is checked under its own `detail`.
+  defp validate_image_details(%{"messages" => messages}) when is_list(messages) do
+    messages
+    |> Enum.with_index()
+    |> Enum.find_value(:ok, fn
+      {%{"content" => content}, index} when is_list(content) ->
+        content
+        |> Enum.with_index()
+        |> Enum.find_value(fn {part, part_index} -> invalid_image_detail(part, "messages[#{index}].content[#{part_index}]") end)
+
+      {%{"content" => %{} = part}, index} ->
+        invalid_image_detail(part, "messages[#{index}].content")
+
+      _message ->
+        nil
+    end)
+  end
+
+  defp validate_image_details(_payload), do: :ok
+
+  defp invalid_image_detail(%{"type" => "image_url", "image_url" => %{"detail" => detail}}, path),
+    do: unless(Normalization.valid_image_detail?(detail), do: {:error, Normalization.invalid_image_detail(path <> ".image_url.detail")})
+
+  defp invalid_image_detail(%{"type" => "input_image", "detail" => detail}, path),
+    do: unless(Normalization.valid_image_detail?(detail), do: {:error, Normalization.invalid_image_detail(path <> ".detail")})
+
+  # A Cline `tool-result` carries its images in `output`; their detail is
+  # checked under `.output[k]` of the Chat field (findings#206 row 206-494).
+  defp invalid_image_detail(%{"type" => "tool-result", "output" => output}, path) when is_list(output) do
+    output
+    |> Enum.with_index()
+    |> Enum.find_value(fn {part, output_index} -> invalid_image_detail(part, "#{path}.output[#{output_index}]") end)
+  end
+
+  defp invalid_image_detail(_part, _path), do: nil
+
   defp valid_content?(content) when is_binary(content), do: true
 
   defp valid_content?(content) when is_list(content),
@@ -537,9 +773,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   defp valid_assistant_tool_calls?(tool_calls),
     do: Enum.all?(tool_calls, &valid_assistant_tool_call?/1)
 
-  defp valid_assistant_tool_call?(
-         %{"function" => %{"name" => name, "arguments" => arguments}} = item
-       )
+  defp valid_assistant_tool_call?(%{"function" => %{"name" => name, "arguments" => arguments}} = item)
        when is_binary(name) and name != "" and is_binary(arguments) do
     assistant_tool_call_id(item) != nil
   end
@@ -678,6 +912,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
       tool =
         function
         |> Map.take(["name", "description", "parameters", "strict"])
+        # Responses may make an omitted strict flag strict; Chat defaults to non-strict.
+        |> Map.put("strict", Map.get(function, "strict") || false)
         |> Map.put("type", "function")
 
       {:ok, tool}
@@ -692,18 +928,70 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
          "tools"
        )}
 
-  defp translate_tool(%{"type" => type} = tool)
-       when type in ["web_search_preview", "image_generation"],
-       do: {:ok, tool}
+  defp translate_tool(%{"type" => "custom", "custom" => %{} = custom} = tool) do
+    with :ok <- validate_exact_custom_keys(tool, ["type", "custom"]),
+         :ok <- validate_exact_custom_keys(custom, ["name", "description", "format"]) do
+      {:ok, Map.put(custom, "type", "custom")}
+    end
+  end
+
+  defp translate_tool(%{"type" => "custom", "name" => name} = tool)
+       when is_binary(name) and not is_map_key(tool, "custom") do
+    with :ok <- validate_exact_custom_keys(tool, ["type", "name", "description", "format"]) do
+      {:ok, tool}
+    end
+  end
+
+  defp translate_tool(%{"type" => "custom"}),
+    do: {:error, Error.invalid_request("custom tool requires nested custom properties", "tools")}
+
+  # `web_search_preview` is refused like on `/v1/responses`: the Codex backend refuses the tool type (findings#333).
+  defp translate_tool(%{"type" => "image_generation"} = tool), do: {:ok, tool}
 
   defp translate_tool(_tool),
     do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_custom_tool_choice_shape(%{
+         "tool_choice" => %{"type" => "custom", "custom" => %{} = custom} = choice
+       }) do
+    with :ok <- validate_exact_custom_choice_keys(choice, ["type", "custom"]) do
+      validate_exact_custom_choice_keys(custom, ["name"])
+    end
+  end
+
+  defp validate_custom_tool_choice_shape(%{"tool_choice" => %{"type" => "custom"}}),
+    do: {:error, Error.invalid_request("tool_choice shape is not translatable", "tool_choice")}
+
+  defp validate_custom_tool_choice_shape(_payload), do: :ok
+
+  defp validate_exact_custom_keys(value, allowed_keys) do
+    case value |> Map.keys() |> Enum.reject(&(&1 in allowed_keys)) do
+      [] -> :ok
+      [_key | _rest] -> {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+    end
+  end
+
+  defp validate_exact_custom_choice_keys(value, allowed_keys) do
+    case value |> Map.keys() |> Enum.reject(&(&1 in allowed_keys)) do
+      [] ->
+        :ok
+
+      [_key | _rest] ->
+        {:error, Error.invalid_request("tool_choice shape is not translatable", "tool_choice")}
+    end
+  end
 
   defp maybe_put_tool_choice(acc, %{
          "tool_choice" => %{"type" => "function", "function" => %{"name" => name}}
        })
        when is_binary(name),
        do: Map.put(acc, "tool_choice", %{"type" => "function", "name" => name})
+
+  defp maybe_put_tool_choice(acc, %{
+         "tool_choice" => %{"type" => "custom", "custom" => %{"name" => name}}
+       })
+       when is_binary(name),
+       do: Map.put(acc, "tool_choice", %{"type" => "custom", "name" => name})
 
   defp maybe_put_tool_choice(acc, %{"tool_choice" => tool_choice}),
     do: Map.put(acc, "tool_choice", tool_choice)
@@ -725,8 +1013,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
         {:ok, Map.put(acc, "text", %{"format" => Map.put(schema, "type", "json_schema")})}
 
       %{"type" => "json_schema"} ->
-        {:error,
-         Error.invalid_request("response_format json_schema must be an object", "response_format")}
+        {:error, Error.invalid_request("response_format json_schema must be an object", "response_format")}
 
       %{"type" => "text"} ->
         {:ok, Map.put(acc, "text", %{"format" => %{"type" => "text"}})}
@@ -760,7 +1047,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp maybe_put(acc, source, "service_tier" = key) do
     case Map.fetch(source, key) do
-      {:ok, value} when is_binary(value) -> Map.put(acc, key, normalize_enum(value))
+      {:ok, value} when is_binary(value) -> Map.put(acc, key, value)
       {:ok, value} -> Map.put(acc, key, value)
       :error -> acc
     end

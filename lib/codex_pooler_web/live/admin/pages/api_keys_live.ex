@@ -12,6 +12,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   alias CodexPoolerWeb.Admin.ApiKeyWizardComponents
   alias CodexPoolerWeb.Admin.ApiKeyWizardComponents.{Limits, Review}
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -34,6 +35,9 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
        api_key_wizard_step: "basics",
        api_key_model_selector_state: ApiKeysReadModel.empty_model_selector_state(),
        api_key_review_errors: [],
+       api_key_budget_usage: nil,
+       api_key_budget_usage_loading?: false,
+       api_key_budget_usage_async_key: nil,
        creating_api_key: false,
        editing_api_key: nil,
        deleting_api_key: nil,
@@ -42,7 +46,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
        created_secret: nil,
        pool_options: [],
        data_load_warnings: []
-     )}
+     )
+     |> NotificationCenterHooks.follow_viewer_visibility()}
   end
 
   @impl true
@@ -96,14 +101,16 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   end
 
   def handle_event("open_create_api_key", _params, socket) do
-    params = ApiKeyPolicyForm.empty_params(socket.assigns.pools)
+    params = ApiKeyPolicyForm.empty_params(socket.assigns.pools, operator_timezone(socket))
 
     {:noreply,
      socket
+     |> cancel_api_key_budget_usage()
      |> assign(
        creating_api_key: true,
        editing_api_key: nil,
        created_secret: nil,
+       api_key_budget_usage: nil,
        api_key_wizard_step: "basics"
      )
      |> assign_api_key_wizard_state(params)}
@@ -116,17 +123,19 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   def handle_event("edit_api_key", %{"id" => api_key_id}, socket) do
     case Access.get_api_key_with_policy(socket.assigns.current_scope, api_key_id) do
       {:ok, %{api_key: %APIKey{} = api_key, policy_bindings: policy_bindings}} ->
-        params = ApiKeyPolicyForm.params_for(api_key, policy_bindings)
+        params = ApiKeyPolicyForm.params_for(api_key, policy_bindings, operator_timezone(socket))
 
         {:noreply,
          socket
+         |> cancel_api_key_budget_usage()
          |> assign(
            creating_api_key: false,
            editing_api_key: api_key,
            created_secret: nil,
            api_key_wizard_step: "basics"
          )
-         |> assign_api_key_wizard_state(params)}
+         |> assign_api_key_wizard_state(params)
+         |> start_api_key_budget_usage(api_key)}
 
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, error_message(reason))}
@@ -134,17 +143,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   end
 
   def handle_event("cancel_edit", _params, socket) do
-    params = ApiKeyPolicyForm.empty_params(socket.assigns.pools)
-
-    {:noreply,
-     socket
-     |> assign(
-       creating_api_key: false,
-       editing_api_key: nil,
-       created_secret: nil,
-       api_key_wizard_step: "basics"
-     )
-     |> assign_api_key_wizard_state(params)}
+    {:noreply, close_edit_dialog(socket)}
   end
 
   def handle_event("close_secret", _params, socket) do
@@ -171,6 +170,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       %{id: _id} = api_key ->
         {:noreply,
          socket
+         |> cancel_api_key_budget_usage()
          |> assign(
            creating_api_key: false,
            editing_api_key: nil,
@@ -178,7 +178,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
            created_secret: nil,
            api_key_wizard_step: "basics"
          )
-         |> assign_api_key_wizard_state(ApiKeyPolicyForm.empty_params(socket.assigns.pools))
+         |> assign_api_key_wizard_state(ApiKeyPolicyForm.empty_params(socket.assigns.pools, operator_timezone(socket)))
          |> assign(:delete_form, Support.api_key_delete_form(api_key))
          |> update(:delete_form_version, &(&1 + 1))}
     end
@@ -196,10 +196,17 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
            socket.assigns.deleting_api_key,
          true <- deleting_api_key_id == api_key_id,
          true <- deleting_api_key_prefix == confirmation_prefix,
-         {:ok, _api_key} <- Access.delete_api_key(socket.assigns.current_scope, api_key_id) do
+         {status, _api_key} when status in [:ok, :deleting] <- Access.delete_api_key(socket.assigns.current_scope, api_key_id) do
+      # A key with a large history is revoked at once and deleted by a background job; its row
+      # shows it as deleting until the job removes it (findings#206 row 206-561).
+      message =
+        if status == :ok,
+          do: "API key deleted",
+          else: "API key revoked. Its deletion started; the key disappears once its request history has been detached."
+
       {:noreply,
        socket
-       |> put_flash(:info, "API key deleted")
+       |> put_flash(:info, message)
        |> clear_deleting_api_key()
        |> load_api_keys(reset_form: true)}
     else
@@ -225,6 +232,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       {:ok, %{api_key: api_key, raw_key: raw_key}} ->
         {:noreply,
          socket
+         |> cancel_api_key_budget_usage()
          |> put_flash(:info, "API key rotated")
          |> assign(:created_secret, Support.created_secret(api_key, raw_key))
          |> assign(:creating_api_key, false)
@@ -248,6 +256,70 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
 
   def handle_info({Events, _event}, socket), do: {:noreply, socket}
 
+  # Sent when the pause gate had to collapse two held events into one, so an
+  # arrival this page would have acted on may not be among what it replays.
+  def handle_info(:live_updates_resumed, socket) do
+    {:noreply, load_api_keys(socket, reset_form: false, clear_secret: false)}
+  end
+
+  # A role change or a Pool granted or revoked changes which Pools and keys this
+  # page may show. It re-reads them at once, and closes an open dialog on a key
+  # or a Pool the viewer can no longer see; a secret already shown stays
+  # (findings#206 row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    socket = load_api_keys(socket, reset_form: false, clear_secret: false)
+    visible? = &Map.has_key?(socket.assigns.pool_lookup, &1)
+
+    {socket, closed?} =
+      {socket, false}
+      |> close_if(match?(%APIKey{}, socket.assigns.editing_api_key) and not visible?.(socket.assigns.editing_api_key.pool_id), &close_edit_dialog/1)
+      |> close_if(match?(%{pool_id: _}, socket.assigns.deleting_api_key) and not visible?.(socket.assigns.deleting_api_key.pool_id), &clear_deleting_api_key/1)
+      |> close_if(
+        socket.assigns.creating_api_key and is_nil(socket.assigns.created_secret) and not visible?.(socket.assigns.api_key_params["pool_id"]),
+        &close_create_dialog/1
+      )
+
+    {:noreply, if(closed?, do: put_flash(socket, :info, "Your Pool access changed"), else: socket)}
+  end
+
+  defp close_if({socket, _closed?}, true, close), do: {close.(socket), true}
+  defp close_if({socket, closed?}, false, _close), do: {socket, closed?}
+
+  @impl true
+  def handle_async(
+        {:api_key_budget_usage, api_key_id, _load_token} = async_key,
+        {:ok, budget_usage},
+        socket
+      ) do
+    if current_api_key_budget_load?(socket, async_key, api_key_id) do
+      {:noreply,
+       assign(socket,
+         api_key_budget_usage: budget_usage,
+         api_key_budget_usage_loading?: false,
+         api_key_budget_usage_async_key: nil
+       )}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_async(
+        {:api_key_budget_usage, api_key_id, _load_token} = async_key,
+        {:exit, _reason},
+        socket
+      ) do
+    if current_api_key_budget_load?(socket, async_key, api_key_id) do
+      {:noreply,
+       assign(socket,
+         api_key_budget_usage: nil,
+         api_key_budget_usage_loading?: false,
+         api_key_budget_usage_async_key: nil
+       )}
+    else
+      {:noreply, socket}
+    end
+  end
+
   @impl true
   def render(assigns) do
     assigns =
@@ -264,12 +336,13 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       current_scope={@current_scope}
       active_nav={:api_keys}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-api-keys-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="api-key-page-header"
           title="API keys"
-          description="Create and manage API keys for each Pool, including model access, usage limits, rotation, and status."
+          description="The keys clients use to reach a Pool, each with its own model access and policies."
         >
           <:actions>
             <AdminComponents.action_button
@@ -349,6 +422,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
             <Limits.api_key_limits_step
               form={@api_key_form}
               limit_fields={@policy_limit_fields}
+              budget_usage={@api_key_budget_usage}
+              budget_usage_loading?={@api_key_budget_usage_loading?}
             />
           </:limits>
           <:review>
@@ -399,6 +474,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       {:ok, %{api_key: api_key, raw_key: raw_key}} ->
         {:noreply,
          socket
+         |> cancel_api_key_budget_usage()
          |> put_flash(:info, "API key created")
          |> assign(:created_secret, Support.created_secret(api_key, raw_key))
          |> assign(:creating_api_key, false)
@@ -423,6 +499,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       {:ok, _api_key} ->
         {:noreply,
          socket
+         |> cancel_api_key_budget_usage()
          |> put_flash(:info, "API key updated")
          |> assign(:created_secret, nil)
          |> assign(:creating_api_key, false)
@@ -443,6 +520,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       {:ok, _api_key} ->
         {:noreply,
          socket
+         |> cancel_api_key_budget_usage()
          |> put_flash(:info, success_message)
          |> assign(:created_secret, nil)
          |> assign(:creating_api_key, false)
@@ -458,8 +536,22 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
     Enum.find(socket.assigns.api_keys, &(&1.id == api_key_id))
   end
 
+  defp close_edit_dialog(socket) do
+    params = ApiKeyPolicyForm.empty_params(socket.assigns.pools, operator_timezone(socket))
+
+    socket
+    |> cancel_api_key_budget_usage()
+    |> assign(
+      creating_api_key: false,
+      editing_api_key: nil,
+      created_secret: nil,
+      api_key_wizard_step: "basics"
+    )
+    |> assign_api_key_wizard_state(params)
+  end
+
   defp close_create_dialog(socket) do
-    params = ApiKeyPolicyForm.empty_params(socket.assigns.pools)
+    params = ApiKeyPolicyForm.empty_params(socket.assigns.pools, operator_timezone(socket))
 
     assign(socket,
       creating_api_key: false,
@@ -467,6 +559,37 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
       api_key_wizard_step: "basics"
     )
     |> assign_api_key_wizard_state(params)
+  end
+
+  defp start_api_key_budget_usage(socket, %APIKey{id: api_key_id, pool_id: pool_id}) do
+    async_key = {:api_key_budget_usage, api_key_id, make_ref()}
+
+    socket
+    |> assign(
+      api_key_budget_usage: nil,
+      api_key_budget_usage_loading?: true,
+      api_key_budget_usage_async_key: async_key
+    )
+    |> start_async(async_key, fn -> ApiKeysReadModel.budget_usage(pool_id, api_key_id) end)
+  end
+
+  defp cancel_api_key_budget_usage(socket) do
+    socket =
+      case socket.assigns.api_key_budget_usage_async_key do
+        nil -> socket
+        async_key -> cancel_async(socket, async_key, {:shutdown, :cancel})
+      end
+
+    assign(socket,
+      api_key_budget_usage: nil,
+      api_key_budget_usage_loading?: false,
+      api_key_budget_usage_async_key: nil
+    )
+  end
+
+  defp current_api_key_budget_load?(socket, async_key, api_key_id) do
+    socket.assigns.api_key_budget_usage_async_key == async_key and
+      match?(%APIKey{id: ^api_key_id}, socket.assigns.editing_api_key)
   end
 
   defp clear_deleting_api_key(socket) do
@@ -519,7 +642,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
 
   defp maybe_reset_form(socket, opts, pools) do
     if Keyword.get(opts, :reset_form, false) or is_nil(socket.assigns.api_key_form) do
-      params = ApiKeyPolicyForm.empty_params(pools)
+      params = ApiKeyPolicyForm.empty_params(pools, operator_timezone(socket))
 
       assign(socket,
         api_key_params: params,
@@ -534,7 +657,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   defp assign_api_key_wizard_state(socket) do
     assign_api_key_wizard_state(
       socket,
-      socket.assigns.api_key_params || ApiKeyPolicyForm.empty_params(socket.assigns.pools)
+      socket.assigns.api_key_params || ApiKeyPolicyForm.empty_params(socket.assigns.pools, operator_timezone(socket))
     )
   end
 
@@ -554,6 +677,9 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   end
 
   defp error_message(reason), do: Support.error_message(reason)
+
+  defp operator_timezone(socket),
+    do: DateTimeDisplay.preferences_for_user(socket.assigns.current_scope.user).timezone
 
   defp assign_api_key_wizard_step(socket, "review") do
     if ApiKeyPolicyForm.expiry_errors(socket.assigns.api_key_params) == [] do

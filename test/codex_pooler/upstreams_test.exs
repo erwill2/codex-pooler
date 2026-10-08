@@ -7,7 +7,7 @@ defmodule CodexPooler.UpstreamsTest do
   alias CodexPooler.Accounts.{Scope, User}
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.FakeUpstream
-  alias CodexPooler.Jobs.AccountReconciliationWorker
+  alias CodexPooler.Jobs.{AccountReconciliationWorker, CatalogSyncWorker}
   alias CodexPooler.MCP.Tools.QuotaMetadata
   alias CodexPooler.Pools
   alias CodexPooler.Quotas
@@ -16,7 +16,7 @@ defmodule CodexPooler.UpstreamsTest do
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.{CodexAuth, CodexAuthJson, TokenRefresh}
   alias CodexPooler.Upstreams.CloudflareCookies
-  alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
+  alias CodexPooler.Upstreams.Lifecycle.{AccountAudit, IdentityLifecycle}
   alias CodexPooler.Upstreams.TokenLinking
 
   alias CodexPooler.Upstreams.Quota
@@ -36,12 +36,15 @@ defmodule CodexPooler.UpstreamsTest do
 
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
+  import ExUnit.CaptureLog, only: [capture_log: 1]
 
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport,
     only: [
       monthly_only_account_primary_quota_payload: 1,
       monthly_only_account_primary_quota_window_attrs: 1
     ]
+
+  @detection_timeout_ms 15_000
 
   describe "upstream identity lifecycle" do
     test "creates, activates, updates, and reuses upstream account identities" do
@@ -159,9 +162,7 @@ defmodule CodexPooler.UpstreamsTest do
       account_id = "acct_blank_subject_#{System.unique_integer([:positive])}"
 
       assert {:ok, identity} =
-               IdentityLifecycle.create_upstream_identity(
-                 subject_identity_attrs(account_id, %{chatgpt_user_id: "   "})
-               )
+               IdentityLifecycle.create_upstream_identity(subject_identity_attrs(account_id, %{chatgpt_user_id: "   "}))
 
       assert identity.chatgpt_user_id == nil
       assert Repo.get!(UpstreamIdentity, identity.id).chatgpt_user_id == nil
@@ -189,9 +190,7 @@ defmodule CodexPooler.UpstreamsTest do
       account_id = "acct_duplicate_user_legacy_#{System.unique_integer([:positive])}"
 
       assert {:ok, _identity} =
-               IdentityLifecycle.create_upstream_identity(
-                 subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"})
-               )
+               IdentityLifecycle.create_upstream_identity(subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"}))
 
       assert {:error, changeset} =
                IdentityLifecycle.create_upstream_identity(
@@ -233,9 +232,7 @@ defmodule CodexPooler.UpstreamsTest do
       account_id = "acct_distinct_user_legacy_#{System.unique_integer([:positive])}"
 
       assert {:ok, first_identity} =
-               IdentityLifecycle.create_upstream_identity(
-                 subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"})
-               )
+               IdentityLifecycle.create_upstream_identity(subject_identity_attrs(account_id, %{chatgpt_user_id: "user_123"}))
 
       assert {:ok, second_identity} =
                IdentityLifecycle.create_upstream_identity(
@@ -295,6 +292,38 @@ defmodule CodexPooler.UpstreamsTest do
     end
   end
 
+  describe "provider-routable account scope" do
+    test "returns the trimmed account id when the provider can route on it" do
+      assert UpstreamIdentity.account_scope("2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40") ==
+               "2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40"
+
+      assert UpstreamIdentity.account_scope("  2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40\t\n") ==
+               "2f1c6b1e-7a5d-4c93-9f2b-8d5a1c3e7b40"
+    end
+
+    test "has no scope for blank, missing, or non-binary account ids" do
+      assert UpstreamIdentity.account_scope("") == nil
+      assert UpstreamIdentity.account_scope("   \t\n ") == nil
+      assert UpstreamIdentity.account_scope(nil) == nil
+      assert UpstreamIdentity.account_scope(:acct_atom) == nil
+      assert UpstreamIdentity.account_scope(42) == nil
+      assert UpstreamIdentity.account_scope(%{"chatgpt_account_id" => "acct_map"}) == nil
+    end
+
+    test "has no scope for synthetic email_ and local_ placeholder account ids" do
+      assert UpstreamIdentity.account_scope("email_sentinel@example.com") == nil
+      assert UpstreamIdentity.account_scope("local_provider_identity") == nil
+      assert UpstreamIdentity.account_scope("  email_sentinel@example.com  ") == nil
+      assert UpstreamIdentity.account_scope("  local_provider_identity  ") == nil
+    end
+
+    test "matches the synthetic prefixes case-sensitively" do
+      assert UpstreamIdentity.account_scope("Email_x@example.com") == "Email_x@example.com"
+      assert UpstreamIdentity.account_scope("Local_provider_identity") == "Local_provider_identity"
+      assert UpstreamIdentity.account_scope("EMAIL_x@example.com") == "EMAIL_x@example.com"
+    end
+  end
+
   describe "pool assignment lifecycle" do
     test "counts visible pool assignments by pool id and excludes deleted rows" do
       pool = pool_fixture()
@@ -322,7 +351,7 @@ defmodule CodexPooler.UpstreamsTest do
                ])
     end
 
-    test "lists only upstream identities assigned through visible active pools" do
+    test "owners list identities in visible active pools plus globally unassigned identities" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
       scope = Scope.for_user(owner, ["instance_owner"])
       visible_pool = pool_fixture(%{status: "active"})
@@ -354,7 +383,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert visible_identity.id in visible_identity_ids
       refute disabled_pool_identity.id in visible_identity_ids
       refute deleted_identity.id in visible_identity_ids
-      refute deleted_assignment_identity.id in visible_identity_ids
+      assert deleted_assignment_identity.id in visible_identity_ids
     end
 
     test "enforces one assignment per pool identity and returns active eligible routing data" do
@@ -861,6 +890,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert identity.account_label == "fixture-user@example.com"
       assert identity.onboarding_method == "import"
       assert identity.plan_label == "pro"
+      assert identity.credential_provenance == "codex_chatgpt_oauth"
       assert identity.auth_verified_at
       assert identity.auth_fresh_at
       assert identity.metadata["account_email"] == "fixture-user@example.com"
@@ -1259,8 +1289,7 @@ defmodule CodexPooler.UpstreamsTest do
         plan_label: "team",
         token: access_token,
         refresh_token: refresh_token,
-        access_token_expires_at:
-          DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:microsecond),
+        access_token_expires_at: DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:microsecond),
         import_metadata: %{
           "account_email" => "token-linking@example.com",
           "auth_json_imported" => true
@@ -1289,6 +1318,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert identity.seat_type == "team-seat"
       assert identity.onboarding_method == "import"
       assert identity.plan_label == "team"
+      assert identity.credential_provenance == nil
       assert identity.metadata["auth_json_imported"] == true
       assert identity.metadata["credential_epoch"] == 1
       assert identity.metadata["usage_probe_sequence"] == 0
@@ -1355,9 +1385,9 @@ defmodule CodexPooler.UpstreamsTest do
       initial_epoch = identity.metadata["credential_epoch"]
 
       assert {:ok, renamed_identity} =
-               IdentityLifecycle.update_upstream_identity(identity, %{account_label: "codex01"})
+               IdentityLifecycle.update_upstream_identity(identity, %{account_label: "account-a"})
 
-      assert renamed_identity.account_label == "codex01"
+      assert renamed_identity.account_label == "account-a"
 
       assert {:ok,
               %{
@@ -1369,13 +1399,13 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert reimported_identity.id == identity.id
       assert reimported_identity.metadata["credential_epoch"] == initial_epoch + 1
-      assert reimported_identity.account_label == "codex01"
+      assert reimported_identity.account_label == "account-a"
       assert reimported_identity.account_email == account_email
       assert reimported_identity.metadata["account_email"] == account_email
       assert reimported_assignment.id == assignment.id
-      assert reimported_assignment.assignment_label == "codex01"
+      assert reimported_assignment.assignment_label == "account-a"
 
-      assert Repo.get!(UpstreamIdentity, identity.id).account_label == "codex01"
+      assert Repo.get!(UpstreamIdentity, identity.id).account_label == "account-a"
     end
 
     test "auth parsers prefer nested workspace claims over conflicting top-level claims" do
@@ -1401,9 +1431,7 @@ defmodule CodexPooler.UpstreamsTest do
               }} = CodexAuth.token_info(id_token)
 
       assert {:ok, attrs} =
-               CodexAuthJson.parse(
-                 auth_json_fixture(account_id: "acct_workspace_nested", id_token: id_token)
-               )
+               CodexAuthJson.parse(auth_json_fixture(account_id: "acct_workspace_nested", id_token: id_token))
 
       assert attrs.workspace_id == "ws_nested"
       assert attrs.workspace_label == "Nested Workspace"
@@ -1498,13 +1526,13 @@ defmodule CodexPooler.UpstreamsTest do
 
       auth_json =
         auth_json_fixture(account_id: "acct_workspace_label_only", id_token: id_token)
-        |> Jason.decode!()
+        |> CodexPooler.JSON.decode!()
         |> Map.merge(%{
           "workspace_id" => "untrusted_payload_workspace",
           "workspace_label" => "Untrusted Payload Workspace",
           "seat_type" => "untrusted-seat"
         })
-        |> Jason.encode!()
+        |> CodexPooler.JSON.encode!()
 
       assert {:ok, %{identity: identity}} =
                Upstreams.import_codex_auth_json(scope, pool, auth_json)
@@ -2018,8 +2046,7 @@ defmodule CodexPooler.UpstreamsTest do
           refresh_token: second_refresh
         )
 
-      assert {:ok,
-              %{status: :existing, identity: imported, assignment: imported_assignment} = result} =
+      assert {:ok, %{status: :existing, identity: imported, assignment: imported_assignment} = result} =
                Upstreams.import_codex_auth_json(scope, pool, second_auth_json)
 
       assert imported.id == identity.id
@@ -2110,9 +2137,8 @@ defmodule CodexPooler.UpstreamsTest do
           TokenRefresh.refresh_access_token(identity, trigger_kind: "stale_import_race")
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid,
-                      ^release_ref},
-                     1_000
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                     @detection_timeout_ms
 
       refreshing = Repo.get!(UpstreamIdentity, identity.id)
       claimed_generation = refreshing.metadata["token_refresh"]["generation"]
@@ -2134,7 +2160,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
 
-      assert {:ok, %{status: :noop, retryable?: false}} = Task.await(refresh_task, 1_000)
+      assert {:ok, %{status: :noop, retryable?: false}} = Task.await(refresh_task, @detection_timeout_ms)
 
       persisted = Repo.get!(UpstreamIdentity, identity.id)
       assert persisted.status == "active"
@@ -2221,14 +2247,10 @@ defmodule CodexPooler.UpstreamsTest do
 
       invalid_cases = [
         {"not-json", "Codex auth.json is malformed"},
-        {Jason.encode!(%{"OPENAI_API_KEY" => sensitive_token}),
-         "Codex API-key auth.json is not supported"},
-        {auth_json_fixture(access_token: jwt_token(%{"exp" => past_unix()})),
-         "Codex auth.json access token is expired"},
-        {auth_json_fixture(tokens: %{"id_token" => id_token_fixture()}),
-         "Codex auth.json is missing access_token"},
-        {auth_json_fixture(tokens: %{"access_token" => jwt_token(%{"exp" => future_unix()})}),
-         "Codex auth.json is missing id_token"},
+        {CodexPooler.JSON.encode!(%{"OPENAI_API_KEY" => sensitive_token}), "Codex API-key auth.json is not supported"},
+        {auth_json_fixture(access_token: jwt_token(%{"exp" => past_unix()})), "Codex auth.json access token is expired"},
+        {auth_json_fixture(tokens: %{"id_token" => id_token_fixture()}), "Codex auth.json is missing access_token"},
+        {auth_json_fixture(tokens: %{"access_token" => jwt_token(%{"exp" => future_unix()})}), "Codex auth.json is missing id_token"},
         {auth_json_fixture(
            tokens: %{
              "id_token" => id_token_fixture(),
@@ -2256,12 +2278,12 @@ defmodule CodexPooler.UpstreamsTest do
       unsupported_message = "Codex personal access token auth.json is not supported in this cycle"
 
       payloads = [
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "auth_mode" => "personalAccessToken",
           "personalAccessToken" => personal_access_token
         }),
-        Jason.encode!(%{"personalAccessToken" => personal_access_token}),
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{"personalAccessToken" => personal_access_token}),
+        CodexPooler.JSON.encode!(%{
           "tokens" => %{
             "access_token" => personal_access_token,
             "id_token" => id_token_fixture(),
@@ -2310,8 +2332,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert {:error,
               %{
                 code: :upstream_secret_key_invalid,
-                message:
-                  "CODEX_POOLER_UPSTREAM_SECRET_KEY must be 32 raw bytes or base64-encoded 32 bytes"
+                message: "CODEX_POOLER_UPSTREAM_SECRET_KEY must be 32 raw bytes or base64-encoded 32 bytes"
               } = error} =
                Upstreams.import_codex_auth_json(
                  scope,
@@ -2538,6 +2559,9 @@ defmodule CodexPooler.UpstreamsTest do
       assert {:ok, result} =
                Upstreams.pause_account_for_scope(scope, identity, %{reason: "operator_pause"})
 
+      assert result |> Map.keys() |> Enum.sort() ==
+               [:assignments, :identity, :secret_status, :status]
+
       assert result.status == :paused
       assert result.identity.status == "paused"
       assert result.secret_status == :present
@@ -2551,6 +2575,10 @@ defmodule CodexPooler.UpstreamsTest do
       assert Upstreams.list_eligible_pool_assignments(pool) == []
 
       assert {:ok, result} = Upstreams.reactivate_account_for_scope(scope, identity, %{})
+
+      assert result |> Map.keys() |> Enum.sort() ==
+               [:assignments, :identity, :secret_status, :status]
+
       assert result.status == :active
       assert result.identity.status == "active"
       assert result.secret_status == :present
@@ -2626,6 +2654,298 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert message == "upstream access token is missing"
       assert Upstreams.list_eligible_pool_assignments(pool) == []
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_229
+    test "pause and reactivation persist one manual catalog sync without changing results" do
+      Repo.delete_all(Oban.Job)
+      scope = fixture_owner_scope()
+      pool = pool_fixture()
+
+      identity =
+        active_identity_fixture(%{
+          chatgpt_account_id: "acct_issue_229_lifecycle",
+          account_label: "Issue 229 lifecycle"
+        })
+
+      configure_upstream_secret_key!()
+      token = generated_secret("issue-229-lifecycle")
+
+      assert {:ok, assignment} = PoolAssignments.create_pool_assignment(pool, identity, %{})
+      assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+      assert {:ok, _secret} =
+               Upstreams.store_encrypted_secret(identity, %{
+                 secret_kind: "access_token",
+                 plaintext: token
+               })
+
+      {pause_result, pause_queries} =
+        capture_repo_queries(fn ->
+          Upstreams.pause_account_for_scope(scope, identity, %{reason: "issue_229_pause"})
+        end)
+
+      assert {:ok,
+              %{
+                status: :paused,
+                identity: %UpstreamIdentity{status: "paused"},
+                assignments: [%PoolUpstreamAssignment{id: assignment_id, status: "paused"}],
+                secret_status: :present
+              } = paused_result} = pause_result
+
+      assert assignment_id == assignment.id
+
+      assert Map.keys(paused_result) |> Enum.sort() ==
+               [:assignments, :identity, :secret_status, :status]
+
+      assert [pause_job] = all_enqueued(worker: CatalogSyncWorker)
+      assert pause_job.args == %{"pool_id" => pool.id, "trigger_kind" => "manual"}
+      refute inspect(pause_job.args) =~ token
+      refute inspect(pause_job.args) =~ identity.chatgpt_account_id
+
+      audit_insert_index =
+        Enum.find_index(pause_queries, &insert_query_for?(&1, "audit_events"))
+
+      job_insert_index =
+        Enum.find_index(pause_queries, &insert_query_for?(&1, "oban_jobs"))
+
+      assert is_integer(audit_insert_index)
+      assert is_integer(job_insert_index)
+      assert audit_insert_index < job_insert_index
+      assert Enum.count(pause_queries, &active_pools_query?/1) == 1
+
+      Repo.delete_all(from job in Oban.Job, where: job.id == ^pause_job.id)
+      assert [] = all_enqueued(worker: CatalogSyncWorker)
+
+      assert {:ok,
+              %{
+                status: :active,
+                identity: %UpstreamIdentity{status: "active"},
+                assignments: [%PoolUpstreamAssignment{id: ^assignment_id, status: "active"}],
+                secret_status: :present
+              } = active_result} =
+               Upstreams.reactivate_account_for_scope(scope, identity, %{})
+
+      assert Map.keys(active_result) |> Enum.sort() ==
+               [:assignments, :identity, :secret_status, :status]
+
+      assert [reactivate_job] = all_enqueued(worker: CatalogSyncWorker)
+      assert reactivate_job.args == %{"pool_id" => pool.id, "trigger_kind" => "manual"}
+      refute inspect(reactivate_job.args) =~ token
+      refute inspect(reactivate_job.args) =~ identity.chatgpt_account_id
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_229
+    test "best-effort audit preserves its result while strict audit rejection propagates" do
+      Repo.delete_all(Oban.Job)
+      scope = fixture_owner_scope()
+      pool = pool_fixture()
+
+      identity =
+        active_identity_fixture(%{
+          chatgpt_account_id: "acct_issue_229_audit_rejection",
+          account_label: "Issue 229 audit rejection"
+        })
+
+      assert {:ok, assignment} = PoolAssignments.create_pool_assignment(pool, identity, %{})
+      assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+      result = %{
+        status: :paused,
+        identity: identity,
+        assignments: [assignment],
+        secret_status: :missing
+      }
+
+      {best_effort_result, best_effort_queries} =
+        capture_repo_queries(fn ->
+          {:ok, result}
+          |> AccountAudit.record_change(scope, "request.issue_229_rejected")
+        end)
+
+      assert best_effort_result == {:ok, result}
+      refute Enum.any?(best_effort_queries, &active_pools_query?/1)
+
+      {strict_result, strict_queries} =
+        capture_repo_queries(fn ->
+          {:ok, result}
+          |> AccountAudit.record_change_strict(scope, "request.issue_229_rejected")
+        end)
+
+      assert strict_result == {:error, :runtime_events_not_recorded}
+      refute Enum.any?(strict_queries, &active_pools_query?/1)
+      assert [] = all_enqueued(worker: CatalogSyncWorker)
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_229
+    test "strict lifecycle audit persistence failure performs no active pool read or catalog enqueue" do
+      Repo.delete_all(Oban.Job)
+      scope = fixture_owner_scope()
+      pool = pool_fixture()
+
+      identity =
+        active_identity_fixture(%{
+          chatgpt_account_id: "acct_issue_229_audit_persistence_failure",
+          account_label: "Issue 229 audit persistence failure"
+        })
+
+      assert {:ok, assignment} = PoolAssignments.create_pool_assignment(pool, identity, %{})
+      assert {:ok, _assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+      install_upstream_lifecycle_audit_failure_trigger!()
+
+      {_raised, queries} =
+        capture_repo_queries(fn ->
+          assert_raise Postgrex.Error, fn ->
+            Repo.transaction(fn ->
+              Upstreams.pause_account_for_scope(scope, identity, %{})
+            end)
+          end
+        end)
+
+      refute Enum.any?(queries, &active_pools_query?/1)
+      assert [] = all_enqueued(worker: CatalogSyncWorker)
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_229
+    test "pause enqueues distinct active pools and ignores duplicate, disabled, and unrelated assignments" do
+      Repo.delete_all(Oban.Job)
+      scope = fixture_owner_scope()
+      first_pool = pool_fixture(%{name: "Issue 229 first active"})
+      second_pool = pool_fixture(%{name: "Issue 229 second active"})
+      disabled_pool = pool_fixture(%{name: "Issue 229 disabled", status: "disabled"})
+      unrelated_pool = pool_fixture(%{name: "Issue 229 unrelated"})
+
+      identity =
+        active_identity_fixture(%{
+          chatgpt_account_id: "acct_issue_229_pool_filter",
+          account_label: "Issue 229 pool filter"
+        })
+
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      first_assignment =
+        insert_lifecycle_assignment!(first_pool, identity, "active", now)
+
+      Repo.query!("DROP INDEX pool_upstream_assignments_identity_uq")
+      _duplicate_assignment = insert_lifecycle_assignment!(first_pool, identity, "active", now)
+      _second_assignment = insert_lifecycle_assignment!(second_pool, identity, "active", now)
+
+      _disabled_assignment =
+        insert_lifecycle_assignment!(disabled_pool, identity, "active", now)
+
+      _unrelated_assignment =
+        insert_lifecycle_assignment!(unrelated_pool, identity, "deleted", now)
+
+      assert {:ok, %{status: :paused, assignments: assignments}} =
+               Upstreams.pause_account_for_scope(scope, identity, %{})
+
+      assert Enum.count(assignments, &(&1.pool_id == first_pool.id and &1.status == "paused")) ==
+               2
+
+      assert Repo.get!(PoolUpstreamAssignment, first_assignment.id).status == "paused"
+
+      assert Enum.any?(assignments, fn assignment ->
+               assignment.pool_id == unrelated_pool.id and assignment.status == "deleted"
+             end)
+
+      jobs = all_enqueued(worker: CatalogSyncWorker)
+
+      assert MapSet.new(Enum.map(jobs, & &1.args)) ==
+               MapSet.new([
+                 %{"pool_id" => first_pool.id, "trigger_kind" => "manual"},
+                 %{"pool_id" => second_pool.id, "trigger_kind" => "manual"}
+               ])
+
+      assert length(jobs) == 2
+
+      expected_pool_ids =
+        Pools.list_active_pools()
+        |> Enum.filter(&(&1.id in [first_pool.id, second_pool.id]))
+        |> Enum.map(& &1.id)
+
+      assert Enum.map(jobs, & &1.args["pool_id"]) == Enum.reverse(expected_pool_ids)
+      refute Enum.any?(jobs, &(&1.args["pool_id"] == disabled_pool.id))
+      refute Enum.any?(jobs, &(&1.args["pool_id"] == unrelated_pool.id))
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_229
+    test "failed reactivation preserves its error and enqueues no catalog sync" do
+      Repo.delete_all(Oban.Job)
+      scope = fixture_owner_scope()
+      pool = pool_fixture()
+
+      identity =
+        active_identity_fixture(%{
+          chatgpt_account_id: "acct_issue_229_missing_secret",
+          account_label: "Issue 229 missing secret"
+        })
+
+      assert {:ok, assignment} = PoolAssignments.create_pool_assignment(pool, identity, %{})
+      assert {:ok, _assignment} = PoolAssignments.activate_pool_assignment(assignment)
+      assert {:ok, %{status: :paused}} = Upstreams.pause_account_for_scope(scope, identity, %{})
+
+      Repo.delete_all(Oban.Job)
+
+      {{result, queries}, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          capture_repo_queries(fn ->
+            Upstreams.reactivate_account_for_scope(scope, identity, %{})
+          end)
+        end)
+
+      assert {:error,
+              %{
+                code: :upstream_secret_not_routable,
+                message: "upstream access token is missing"
+              }} = result
+
+      refute Enum.any?(queries, &active_pools_query?/1)
+      assert [] = all_enqueued(worker: CatalogSyncWorker)
+      refute log =~ identity.chatgpt_account_id
+      refute log =~ identity.account_label
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_229
+    test "catalog storage failure is nonfatal and logs only bounded metadata" do
+      Repo.delete_all(Oban.Job)
+      scope = fixture_owner_scope()
+      pool = pool_fixture()
+
+      identity =
+        active_identity_fixture(%{
+          chatgpt_account_id: "acct_issue_229_enqueue_failure",
+          account_label: "Issue 229 enqueue failure"
+        })
+
+      assert {:ok, assignment} = PoolAssignments.create_pool_assignment(pool, identity, %{})
+      assert {:ok, _assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+      Repo.query!("ALTER TABLE oban_jobs DROP CONSTRAINT positive_max_attempts")
+
+      Repo.query!("ALTER TABLE oban_jobs ADD CONSTRAINT positive_max_attempts CHECK (max_attempts > 3)")
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{status: :paused, identity: paused_identity}} =
+                   Upstreams.pause_account_for_scope(scope, identity, %{})
+
+          assert paused_identity.status == "paused"
+        end)
+
+      assert [] = all_enqueued(worker: CatalogSyncWorker)
+      assert [_event] = audit_events("upstream_account.pause", identity.id)
+      assert log =~ "pool_id=#{pool.id}"
+      assert log =~ "trigger_kind=manual"
+      assert log =~ "reason=rollback"
+      refute log =~ identity.chatgpt_account_id
+      refute log =~ identity.account_label
     end
 
     @tag :lifecycle_soft_delete
@@ -2863,428 +3183,6 @@ defmodule CodexPooler.UpstreamsTest do
       assert QuotaWindows.list_evidence(%{}) == []
     end
 
-    test "builds deterministic pool quota remaining charts from account evidence" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      weekly_reset_at = DateTime.add(now, 604_800, :second)
-      pool = pool_fixture(%{name: "Example Pool"})
-      empty_pool = pool_fixture(%{name: "Example Empty Pool"})
-
-      %{identity: team_identity, assignment: team_assignment} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-1",
-          account_label: "Example Team Account",
-          assignment_label: "Example Team Account"
-        })
-
-      %{identity: pro_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-2",
-          account_label: "Example Pro Account",
-          assignment_label: "Example Pro Account"
-        })
-
-      %{identity: weekly_only_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-weekly-only",
-          account_label: "Example Weekly Account",
-          assignment_label: "Example Weekly Account"
-        })
-
-      assert {:ok, _windows} =
-               QuotaWindows.upsert_quota_windows(team_identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 500,
-                   credits: 200,
-                   used_percent: Decimal.new("95"),
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now,
-                   metadata: %{"assignment_id" => team_assignment.id}
-                 },
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   credits: 75,
-                   reset_at: weekly_reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now,
-                   metadata: %{"assignment_id" => team_assignment.id}
-                 }
-               ])
-
-      assert {:ok, _model_window} =
-               QuotaWindows.upsert_quota_windows(team_identity, [
-                 %{
-                   quota_key: "gpt_5_3_codex_spark",
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 100,
-                   credits: 90,
-                   reset_at: reset_at,
-                   source: "codex_usage_api",
-                   source_precision: "observed",
-                   quota_scope: "model",
-                   quota_family: "codex_model",
-                   model: "gpt-5.3-codex-spark",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      assert {:ok, _feature_window} =
-               QuotaWindows.upsert_quota_windows(team_identity, [
-                 %{
-                   quota_key: "feature_limit",
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   credits: 90,
-                   reset_at: reset_at,
-                   source: "codex_usage_api",
-                   source_precision: "observed",
-                   quota_scope: "feature",
-                   quota_family: "feature_limit",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      assert {:ok, _upstream_model_window} =
-               QuotaWindows.upsert_quota_windows(team_identity, [
-                 %{
-                   quota_key: "upstream_model_limit",
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   credits: 90,
-                   reset_at: reset_at,
-                   source: "codex_usage_api",
-                   source_precision: "observed",
-                   quota_scope: "upstream_model",
-                   quota_family: "codex_model",
-                   upstream_model: "provider-gpt-5.3-codex-spark",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      assert {:ok, _windows} =
-               QuotaWindows.upsert_quota_windows(pro_identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 100,
-                   used_percent: Decimal.new("25"),
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 },
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   active_limit: 1000,
-                   credits: 900,
-                   reset_at: weekly_reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      assert {:ok, _weekly_only} =
-               QuotaWindows.upsert_quota_windows(weekly_only_identity, [
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   credits: 40,
-                   used_percent: Decimal.new("20"),
-                   reset_at: weekly_reset_at,
-                   source: "codex_usage_api",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      missing_pool_id = Ecto.UUID.generate()
-
-      result =
-        Quota.Charts.quota_remaining_charts_by_pool_ids(
-          [pool.id, empty_pool.id, missing_pool_id, nil, pool.id],
-          at: now
-        )
-
-      assert Map.keys(result) |> Enum.sort() ==
-               [empty_pool.id, missing_pool_id, pool.id] |> Enum.sort()
-
-      assert result[empty_pool.id].primary_5h.state == "empty"
-      assert result[missing_pool_id].weekly.state == "empty"
-
-      primary = result[pool.id].primary_5h
-      weekly = result[pool.id].weekly
-
-      assert primary.key == :primary_5h
-      assert weekly.key == :weekly
-      assert primary.title == "5h quota"
-      assert weekly.title == "Weekly quota"
-
-      assert Enum.map(primary.items, & &1.label) == [
-               "Example Pro Account",
-               "Example Team Account"
-             ]
-
-      refute Enum.any?(primary.items, &(&1.label == "Example Weekly Account"))
-
-      team_primary = Enum.find(primary.items, &(&1.label == "Example Team Account"))
-      assert_decimal_equal(team_primary.remaining, "75")
-      assert_decimal_equal(team_primary.capacity, "500")
-      assert_decimal_equal(team_primary.used, "425")
-      assert_decimal_equal(team_primary.remaining_percent, "15")
-
-      pro_primary = Enum.find(primary.items, &(&1.label == "Example Pro Account"))
-      assert_decimal_equal(pro_primary.remaining, "75")
-      assert_decimal_equal(pro_primary.capacity, "100")
-      assert_decimal_equal(pro_primary.used, "25")
-      assert_decimal_equal(pro_primary.remaining_percent, "75")
-
-      assert_decimal_equal(primary.remaining_total, "150")
-      assert_decimal_equal(primary.capacity_total, "600")
-      assert_decimal_equal(primary.used_total, "450")
-      assert_decimal_equal(primary.used_percent, "75")
-
-      assert Enum.map(weekly.items, & &1.label) == [
-               "Example Pro Account",
-               "Example Team Account",
-               "Example Weekly Account"
-             ]
-
-      weekly_only = Enum.find(weekly.items, &(&1.label == "Example Weekly Account"))
-      assert_decimal_equal(weekly_only.remaining, "40")
-      assert_decimal_equal(weekly_only.capacity, "50")
-      assert_decimal_equal(weekly_only.remaining_percent, "80")
-    end
-
-    test "quota remaining chart items sort by remaining descending before label" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      pool = pool_fixture(%{name: "Example Pool"})
-
-      %{identity: alpha_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-alpha-sort",
-          account_label: "Example Alpha Account",
-          assignment_label: "Example Alpha Account"
-        })
-
-      %{identity: zulu_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-zulu-sort",
-          account_label: "Example Zulu Account",
-          assignment_label: "Example Zulu Account"
-        })
-
-      assert {:ok, [_window]} =
-               QuotaWindows.upsert_quota_windows(alpha_identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   credits: 10,
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      assert {:ok, [_window]} =
-               QuotaWindows.upsert_quota_windows(zulu_identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   credits: 90,
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      chart =
-        Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].primary_5h
-
-      assert Enum.map(chart.items, & &1.label) == [
-               "Example Zulu Account",
-               "Example Alpha Account"
-             ]
-    end
-
-    test "quota remaining charts report excluded evidence and unknown capacity safely" do
-      now = ~U[2026-05-06 12:00:00Z]
-      future_reset = DateTime.add(now, 900, :second)
-      stale_observed_at = DateTime.add(now, -Quotas.Evidence.freshness_ttl_seconds() - 1, :second)
-      pool = pool_fixture(%{name: "Example Pool"})
-
-      excluded_cases = [
-        {"Example Resetless Account", %{observed_at: now}},
-        {"Example Stale Account", %{reset_at: future_reset, observed_at: stale_observed_at}},
-        {"Example Expired Account",
-         %{reset_at: DateTime.add(now, -60, :second), observed_at: now}},
-        {"Example Exhausted Account",
-         %{reset_at: future_reset, used_percent: Decimal.new("100"), observed_at: now}}
-      ]
-
-      for {label, attrs} <- excluded_cases do
-        %{identity: identity} =
-          upstream_assignment_fixture(pool, %{
-            chatgpt_account_id: "acct-#{System.unique_integer([:positive])}",
-            account_label: label,
-            assignment_label: label
-          })
-
-        window =
-          Map.merge(
-            %{
-              window_kind: "primary",
-              window_minutes: 300,
-              active_limit: 100,
-              used_percent: Decimal.new("20"),
-              source: "codex_response_headers",
-              source_precision: "observed",
-              freshness_state: "fresh"
-            },
-            attrs
-          )
-
-        assert {:ok, [_window]} =
-                 QuotaWindows.upsert_quota_windows(identity, [window])
-      end
-
-      %{identity: unknown_capacity_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-unknown-capacity",
-          account_label: "Example Unknown Capacity Account",
-          assignment_label: "Example Unknown Capacity Account"
-        })
-
-      %{identity: known_capacity_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-known-capacity",
-          account_label: "Example Known Capacity Account",
-          assignment_label: "Example Known Capacity Account"
-        })
-
-      assert {:ok, [_window]} =
-               QuotaWindows.upsert_quota_windows(
-                 unknown_capacity_identity,
-                 [
-                   %{
-                     window_kind: "secondary",
-                     window_minutes: 10_080,
-                     credits: 13,
-                     reset_at: DateTime.add(now, 604_800, :second),
-                     source: "codex_response_headers",
-                     source_precision: "observed",
-                     freshness_state: "fresh",
-                     observed_at: now
-                   }
-                 ]
-               )
-
-      assert {:ok, [_window]} =
-               QuotaWindows.upsert_quota_windows(known_capacity_identity, [
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   active_limit: 100,
-                   credits: 90,
-                   reset_at: DateTime.add(now, 604_800, :second),
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      charts = Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id]
-
-      assert charts.primary_5h.items == []
-      assert charts.primary_5h.excluded_count == 4
-      assert charts.primary_5h.state == "blocked"
-      assert charts.primary_5h.excluded_reasons["reset_missing"] == 1
-      assert charts.primary_5h.excluded_reasons["not_fresh"] >= 1
-      assert charts.primary_5h.excluded_reasons["expired"] == 1
-      assert charts.primary_5h.excluded_reasons["exhausted"] == 1
-
-      assert Enum.map(charts.weekly.items, & &1.label) == [
-               "Example Known Capacity Account",
-               "Example Unknown Capacity Account"
-             ]
-
-      unknown_capacity =
-        Enum.find(charts.weekly.items, &(&1.label == "Example Unknown Capacity Account"))
-
-      assert unknown_capacity.label == "Example Unknown Capacity Account"
-      assert_decimal_equal(unknown_capacity.remaining, "13")
-      assert unknown_capacity.capacity == nil
-      assert unknown_capacity.remaining_percent == nil
-      assert_decimal_equal(charts.weekly.remaining_total, "103")
-      assert charts.weekly.capacity_total == nil
-      assert charts.weekly.used_total == nil
-      assert charts.weekly.used_percent == nil
-    end
-
-    test "quota remaining charts keep active-limit-only usage unknown" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      pool = pool_fixture(%{name: "Example Active Limit Only Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-active-limit-only",
-          account_label: "Example Active Limit Only Account",
-          assignment_label: "Example Active Limit Only Account"
-        })
-
-      assert {:ok, [_window]} =
-               QuotaWindows.upsert_quota_windows(identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 100,
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      chart =
-        Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].primary_5h
-
-      assert chart.state == "usable"
-      assert [item] = chart.items
-      assert item.label == "Example Active Limit Only Account"
-      assert item.remaining == nil
-      assert_decimal_equal(item.capacity, "100")
-      assert item.used == nil
-      assert item.remaining_percent == nil
-      assert chart.remaining_total == nil
-      assert_decimal_equal(chart.capacity_total, "100")
-      assert chart.used_total == nil
-      assert chart.used_percent == nil
-    end
-
     test "bulk account summaries evaluate the effective windows at the caller's as_of" do
       as_of = DateTime.utc_now() |> DateTime.add(-2 * 3600, :second) |> DateTime.truncate(:second)
       pool = pool_fixture(%{name: "Example As Of Pool"})
@@ -3332,363 +3230,82 @@ defmodule CodexPooler.UpstreamsTest do
       assert summary.primary_5h.window_minutes == 300
     end
 
-    test "frozen 5h evidence superseded by fresh weekly stays out of charts and capacity summaries" do
-      now = DateTime.utc_now() |> DateTime.truncate(:second)
-      frozen_observed_at = DateTime.add(now, -2 * 3600, :second)
-      pool = pool_fixture(%{name: "Example Superseded Chart Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-superseded-chart",
-          account_label: "Example Superseded Chart Account",
-          assignment_label: "Example Superseded Chart Account"
-        })
-
-      assert {:ok, _frozen} =
-               QuotaWindows.upsert_quota_windows(identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   used_percent: Decimal.new("58"),
-                   reset_at: DateTime.add(frozen_observed_at, 10_800, :second),
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   last_sync_at: frozen_observed_at,
-                   observed_at: frozen_observed_at
-                 }
-               ])
-
-      assert {:ok, _weekly} =
-               QuotaWindows.upsert_quota_windows(identity, [
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   used_percent: Decimal.new("1"),
-                   reset_at: DateTime.add(now, 6, :day),
-                   source: "codex_usage_api",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      charts = Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id]
-
-      assert charts.primary_5h.evidence_count == 0
-      assert charts.primary_5h.excluded_count == 0
-      assert charts.primary_5h.items == []
-      refute charts.primary_5h.state == "blocked"
-
-      assert charts.weekly.usable_count == 1
-      assert charts.weekly.excluded_count == 0
-
-      capacity = Quota.Charts.quota_capacity_summary_by_pool_ids([pool.id])[pool.id]
-      assert capacity.window_count == 1
-      assert capacity.fresh_window_count == 1
-    end
-
-    test "quota remaining charts expose token-backed remaining and preserve exhausted zero" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      pool = pool_fixture(%{name: "Example Token Backed Pool"})
-
-      %{identity: known_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-token-known",
-          account_label: "Example Token Known Account",
-          assignment_label: "Example Token Known Account"
-        })
-
-      %{identity: exhausted_identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-token-exhausted",
-          account_label: "Example Token Exhausted Account",
-          assignment_label: "Example Token Exhausted Account"
-        })
-
-      assert {:ok, _windows} =
-               QuotaWindows.upsert_quota_windows(known_identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 1000,
-                   credits: 250,
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      assert {:ok, _windows} =
-               QuotaWindows.upsert_quota_windows(exhausted_identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 1000,
-                   credits: 0,
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      chart =
-        Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].primary_5h
-
-      known_item = Enum.find(chart.items, &(&1.label == "Example Token Known Account"))
-      [exhausted_window] = QuotaWindows.list_quota_windows(exhausted_identity)
-      exhausted_measurements = Measurements.for_window(exhausted_window)
-
-      assert_decimal_equal(known_item.remaining, "250")
-      assert_decimal_equal(known_item.capacity, "1000")
-      assert_decimal_equal(exhausted_measurements.remaining, "0")
-      assert_decimal_equal(exhausted_measurements.capacity, "1000")
-      assert_decimal_equal(chart.remaining_total, "250")
-      assert_decimal_equal(chart.capacity_total, "1000")
-      assert chart.excluded_count == 1
-    end
-
-    test "quota remaining charts keep percent-only partial evidence out of absolute totals" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      pool = pool_fixture(%{name: "Example Percent Only Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-percent-only",
-          account_label: "Example Percent Only Account",
-          assignment_label: "Example Percent Only Account"
-        })
+    test "bulk account summaries derive stale freshness at the supplied as_of" do
+      as_of = ~U[2026-08-08 12:00:00Z]
+      observed_at = DateTime.add(as_of, -Quotas.Evidence.freshness_ttl_seconds() - 1, :second)
+      pool = pool_fixture(%{name: "Stale read-time quota pool"})
+      %{identity: identity} = upstream_assignment_fixture(pool)
 
       assert {:ok, [_window]} =
                QuotaWindows.upsert_quota_windows(identity, [
                  %{
                    window_kind: "primary",
                    window_minutes: 300,
-                   used_percent: Decimal.new("42"),
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
+                   used_percent: Decimal.new("20"),
+                   reset_at: DateTime.add(as_of, 4, :hour),
+                   source: "codex_usage_api",
                    source_precision: "observed",
                    freshness_state: "fresh",
-                   observed_at: now
+                   observed_at: observed_at
                  }
                ])
 
-      chart =
-        Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].primary_5h
-
-      assert chart.state == "usable"
-      assert [item] = chart.items
-      assert item.label == "Example Percent Only Account"
-      assert item.remaining == nil
-      assert item.capacity == nil
-      assert item.used == nil
-      assert_decimal_equal(item.used_percent, "42")
-      assert_decimal_equal(item.remaining_percent, "58")
-      assert chart.remaining_total == nil
-      assert chart.capacity_total == nil
-      assert chart.used_total == nil
-      assert chart.used_percent == nil
+      assert [summary] = Quota.ReadModel.account_summaries_for_pool_ids([pool.id], as_of)
+      assert summary.state == :missing_evidence
+      assert summary.primary_5h.freshness_state == "stale"
+      refute summary.primary_5h.routing_usable?
     end
 
-    test "quota remaining charts treat zero absolute capacity with partial usage as percent-only evidence" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      pool = pool_fixture(%{name: "Example Zero Capacity Percent Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-zero-capacity-percent",
-          account_label: "Example Zero Capacity Percent Account",
-          assignment_label: "Example Zero Capacity Percent Account"
-        })
+    test "bulk account summaries preserve fresh freshness within the supplied ttl" do
+      as_of = ~U[2026-08-08 12:00:00Z]
+      observed_at = DateTime.add(as_of, -Quotas.Evidence.freshness_ttl_seconds(), :second)
+      pool = pool_fixture(%{name: "Fresh read-time quota pool"})
+      %{identity: identity} = upstream_assignment_fixture(pool)
 
       assert {:ok, [_window]} =
                QuotaWindows.upsert_quota_windows(identity, [
                  %{
                    window_kind: "primary",
                    window_minutes: 300,
-                   active_limit: 0,
-                   credits: 0,
-                   used_percent: Decimal.new("9"),
-                   reset_at: reset_at,
-                   source: "codex_usage",
+                   used_percent: Decimal.new("20"),
+                   reset_at: DateTime.add(as_of, 4, :hour),
+                   source: "codex_usage_api",
                    source_precision: "observed",
                    freshness_state: "fresh",
-                   observed_at: now
+                   observed_at: observed_at
                  }
                ])
 
-      chart =
-        Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].primary_5h
-
-      assert chart.state == "usable"
-      assert [item] = chart.items
-      assert item.label == "Example Zero Capacity Percent Account"
-      assert item.remaining == nil
-      assert item.capacity == nil
-      assert item.used == nil
-      assert_decimal_equal(item.used_percent, "9")
-      assert_decimal_equal(item.remaining_percent, "91")
-      assert chart.remaining_total == nil
-      assert chart.capacity_total == nil
-      assert chart.used_total == nil
-      assert chart.used_percent == nil
+      assert [summary] = Quota.ReadModel.account_summaries_for_pool_ids([pool.id], as_of)
+      assert summary.state == :available
+      assert summary.primary_5h.freshness_state == "fresh"
+      assert summary.primary_5h.routing_usable?
     end
 
-    test "quota remaining charts keep zero percent-only evidence from looking fully available" do
-      now = ~U[2026-05-06 12:00:00Z]
-      weekly_reset_at = DateTime.add(now, 604_800, :second)
-      pool = pool_fixture(%{name: "Example Zero Percent Only Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-zero-percent-only",
-          account_label: "Example Zero Percent Only Account",
-          assignment_label: "Example Zero Percent Only Account"
-        })
+    test "bulk account summaries keep current exhausted evidence fresh" do
+      as_of = ~U[2026-08-08 12:00:00Z]
+      observed_at = DateTime.add(as_of, -Quotas.Evidence.freshness_ttl_seconds(), :second)
+      pool = pool_fixture(%{name: "Exhausted read-time quota pool"})
+      %{identity: identity} = upstream_assignment_fixture(pool)
 
       assert {:ok, [_window]} =
                QuotaWindows.upsert_quota_windows(identity, [
                  %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   used_percent: Decimal.new("0"),
-                   reset_at: weekly_reset_at,
-                   source: "codex_rate_limit_event",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 }
-               ])
-
-      chart = Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].weekly
-
-      assert chart.state == "usable"
-      assert [item] = chart.items
-      assert item.label == "Example Zero Percent Only Account"
-      assert item.remaining == nil
-      assert item.capacity == nil
-      assert item.used == nil
-      assert_decimal_equal(item.used_percent, "0")
-      assert item.remaining_percent == nil
-      assert chart.lowest_remaining_percent == nil
-      assert chart.remaining_total == nil
-      assert chart.capacity_total == nil
-      assert chart.used_total == nil
-      assert chart.used_percent == nil
-    end
-
-    test "quota remaining charts do not infer capacity from known plan for percent-only evidence" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      weekly_reset_at = DateTime.add(now, 604_800, :second)
-      pool = pool_fixture(%{name: "Example Plan Capacity Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          plan_family: "pro",
-          account_label: "Example Pro Percent Account",
-          assignment_label: "Example Pro Percent Account"
-        })
-
-      assert {:ok, _windows} =
-               QuotaWindows.upsert_quota_windows(identity, [
-                 %{
                    window_kind: "primary",
                    window_minutes: 300,
-                   used_percent: Decimal.new("16"),
-                   reset_at: reset_at,
+                   used_percent: Decimal.new("100"),
+                   reset_at: DateTime.add(as_of, 4, :hour),
                    source: "codex_usage_api",
                    source_precision: "observed",
                    freshness_state: "fresh",
-                   observed_at: now
-                 },
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   used_percent: Decimal.new("61"),
-                   reset_at: weekly_reset_at,
-                   source: "codex_usage_api",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
+                   observed_at: observed_at
                  }
                ])
 
-      charts = Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id]
-
-      assert [primary_item] = charts.primary_5h.items
-      assert primary_item.remaining == nil
-      assert primary_item.capacity == nil
-      assert primary_item.used == nil
-      assert_decimal_equal(primary_item.remaining_percent, "84")
-      assert_decimal_equal(charts.primary_5h.lowest_remaining_percent, "84")
-      assert charts.primary_5h.remaining_total == nil
-      assert charts.primary_5h.capacity_total == nil
-
-      assert [weekly_item] = charts.weekly.items
-      assert weekly_item.remaining == nil
-      assert weekly_item.capacity == nil
-      assert weekly_item.used == nil
-      assert_decimal_equal(weekly_item.remaining_percent, "39")
-      assert_decimal_equal(charts.weekly.lowest_remaining_percent, "39")
-      assert charts.weekly.remaining_total == nil
-      assert charts.weekly.capacity_total == nil
-    end
-
-    test "quota remaining primary chart ignores unusable weekly caps" do
-      now = ~U[2026-05-06 12:00:00Z]
-      reset_at = DateTime.add(now, 900, :second)
-      weekly_reset_at = DateTime.add(now, 604_800, :second)
-      stale_observed_at = DateTime.add(now, -Quotas.Evidence.freshness_ttl_seconds() - 1, :second)
-      pool = pool_fixture(%{name: "Example Pool"})
-
-      %{identity: identity} =
-        upstream_assignment_fixture(pool, %{
-          chatgpt_account_id: "acct-example-stale-weekly-cap",
-          account_label: "Example Stale Weekly Account",
-          assignment_label: "Example Stale Weekly Account"
-        })
-
-      assert {:ok, _windows} =
-               QuotaWindows.upsert_quota_windows(identity, [
-                 %{
-                   window_kind: "primary",
-                   window_minutes: 300,
-                   active_limit: 100,
-                   credits: 80,
-                   reset_at: reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: now
-                 },
-                 %{
-                   window_kind: "secondary",
-                   window_minutes: 10_080,
-                   active_limit: 100,
-                   credits: 20,
-                   reset_at: weekly_reset_at,
-                   source: "codex_response_headers",
-                   source_precision: "observed",
-                   freshness_state: "fresh",
-                   observed_at: stale_observed_at
-                 }
-               ])
-
-      charts = Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id]
-
-      assert [primary_item] = charts.primary_5h.items
-      assert_decimal_equal(primary_item.remaining, "80")
-      assert charts.weekly.items == []
-      assert charts.weekly.excluded_count == 1
-      assert charts.weekly.excluded_reasons["not_fresh"] == 1
+      assert [summary] = Quota.ReadModel.account_summaries_for_pool_ids([pool.id], as_of)
+      assert summary.state == :exhausted
+      assert summary.primary_5h.freshness_state == "fresh"
+      refute summary.primary_5h.routing_usable?
     end
 
     test "replaces authoritative windows and derives usable selection data" do
@@ -3755,7 +3372,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "stores monthly-only account primary quota without synthetic secondary window" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 13:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       reset_at = DateTime.add(observed_at, 30, :day)
 
       assert {:ok, [window]} =
@@ -3785,7 +3402,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "persists monthly-only usage payload as raw account primary evidence" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 13:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       reset_at = DateTime.add(observed_at, 30, :day)
 
       payload =
@@ -3821,9 +3438,184 @@ defmodule CodexPooler.UpstreamsTest do
              ) == [{"account", "primary", 43_200}]
     end
 
-    test "preserves unknown long primary usage windows without remapping them" do
+    test "keeps usage window metadata bounded to timing fields without provider status" do
+      synced_at = ~U[2026-04-27 10:00:00Z]
+
+      assert {:ok, [account_primary]} =
+               QuotaWindows.codex_usage_quota_windows_from_payload(
+                 reset_bearing_account_primary_payload(),
+                 synced_at
+               )
+
+      assert account_primary.metadata == %{
+               "limit_window_seconds" => 18_000,
+               "reset_after_seconds" => 900
+             }
+    end
+
+    test "marks explicit usage resets even when the provider also sends a countdown" do
+      synced_at = ~U[2026-08-08 16:58:06Z]
+      reset_at = ~U[2026-09-06 10:06:17Z]
+
+      assert {:ok, [account_primary]} =
+               QuotaWindows.codex_usage_quota_windows_from_payload(
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_at" => DateTime.to_unix(reset_at),
+                       "reset_after_seconds" => DateTime.diff(reset_at, synced_at, :second)
+                     }
+                   }
+                 },
+                 synced_at
+               )
+
+      assert account_primary.source_precision == "observed"
+      assert account_primary.metadata["reset_at_source"] == "explicit"
+      assert DateTime.compare(account_primary.reset_at, reset_at) == :eq
+    end
+
+    test "keeps model weekly reset provenance relative when both reset fields are present" do
+      synced_at = ~U[2026-08-08 16:58:06Z]
+      reset_at = ~U[2026-08-15 10:06:17Z]
+
+      assert {:ok, [model_weekly]} =
+               QuotaWindows.codex_usage_quota_windows_from_payload(
+                 %{
+                   "additional_rate_limits" => [
+                     %{
+                       "limit_name" => "Example model weekly",
+                       "metered_feature" => "example_model_weekly",
+                       "rate_limit" => %{
+                         "primary_window" => %{
+                           "used_percent" => 21,
+                           "limit_window_seconds" => 604_800,
+                           "reset_at" => DateTime.to_unix(reset_at),
+                           "reset_after_seconds" => DateTime.diff(reset_at, synced_at, :second)
+                         }
+                       }
+                     }
+                   ]
+                 },
+                 synced_at
+               )
+
+      assert model_weekly.quota_scope == "model"
+      assert model_weekly.window_kind == "secondary"
+      assert model_weekly.metadata["reset_at_source"] == nil
+
+      assert model_weekly.metadata["reset_after_seconds"] ==
+               DateTime.diff(reset_at, synced_at, :second)
+    end
+
+    test "preserves distinct provider allow status on account and model windows" do
+      synced_at = ~U[2026-04-27 10:00:00Z]
+
+      assert {:ok, windows} =
+               QuotaWindows.codex_usage_quota_windows_from_payload(
+                 %{
+                   "rate_limit" => %{
+                     "allowed" => true,
+                     "limit_reached" => false,
+                     "primary_window" => %{
+                       "used_percent" => 12,
+                       "limit_window_seconds" => 18_000,
+                       "reset_after_seconds" => 900
+                     },
+                     "secondary_window" => %{
+                       "used_percent" => 21,
+                       "limit_window_seconds" => 604_800,
+                       "reset_at" => "2026-05-04T10:00:00Z"
+                     }
+                   },
+                   "additional_rate_limits" => [
+                     %{
+                       "limit_name" => "Provider model quota",
+                       "rate_limit" => %{
+                         "allowed" => false,
+                         "limit_reached" => true,
+                         "primary_window" => %{
+                           "used_percent" => 44,
+                           "limit_window_seconds" => 18_000
+                         }
+                       }
+                     }
+                   ]
+                 },
+                 synced_at
+               )
+
+      account_windows = Enum.filter(windows, &(&1.quota_scope == "account"))
+      assert Enum.map(account_windows, & &1.window_kind) == ["primary", "secondary"]
+
+      assert Enum.all?(account_windows, fn window ->
+               window.metadata["rate_limit_allowed"] == true and
+                 window.metadata["rate_limit_reached"] == false
+             end)
+
+      assert [model_window] = Enum.filter(windows, &(&1.quota_scope == "model"))
+
+      assert model_window.metadata["rate_limit_allowed"] == false
+      assert model_window.metadata["rate_limit_reached"] == true
+    end
+
+    test "preserves rejected provider status on weekly primary normalized as account secondary" do
       identity = active_identity_fixture()
       observed_at = ~U[2026-04-27 13:00:00Z]
+
+      assert {:ok, [weekly]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 weekly_only_payload(%{
+                   "rate_limit" => %{
+                     "allowed" => false,
+                     "limit_reached" => true,
+                     "primary_window" => %{
+                       "used_percent" => 100,
+                       "limit_window_seconds" => 604_800,
+                       "reset_at" => "2026-05-04T13:00:00Z"
+                     }
+                   }
+                 }),
+                 observed_at
+               )
+
+      assert weekly.quota_scope == "account"
+      assert weekly.window_kind == "secondary"
+      assert weekly.metadata["rate_limit_allowed"] == false
+      assert weekly.metadata["rate_limit_reached"] == true
+    end
+
+    test "omits unusable provider allow status from account usage evidence" do
+      synced_at = ~U[2026-04-27 10:00:00Z]
+
+      for rate_limit_status <- [
+            %{},
+            %{"allowed" => nil, "limit_reached" => nil},
+            %{"allowed" => "true", "limit_reached" => "false"},
+            %{"allowed" => 1, "limit_reached" => 0},
+            %{"allowed" => true, "limit_reached" => true},
+            %{"allowed" => false, "limit_reached" => false},
+            %{"allowed" => true},
+            %{"limit_reached" => false}
+          ] do
+        payload =
+          reset_bearing_account_primary_payload()
+          |> update_in(["rate_limit"], &Map.merge(&1, rate_limit_status))
+
+        assert {:ok, [account_primary]} =
+                 QuotaWindows.codex_usage_quota_windows_from_payload(payload, synced_at)
+
+        refute Map.has_key?(account_primary.metadata, "rate_limit_allowed")
+        refute Map.has_key?(account_primary.metadata, "rate_limit_reached")
+      end
+    end
+
+    test "preserves unknown long primary usage windows without remapping them" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       unknown_window_seconds = 1_209_600
       unknown_window_minutes = 20_160
       reset_after_seconds = 1_800
@@ -4070,6 +3862,29 @@ defmodule CodexPooler.UpstreamsTest do
         assert account_primary.active_limit == 0
         assert account_primary.credits == 0
       end
+    end
+
+    test "uses the reported credit balance as a baseline without rewriting provider usage" do
+      synced_at = ~U[2026-08-08 16:58:06Z]
+
+      assert {:ok, [account_primary]} =
+               QuotaWindows.codex_usage_quota_windows_from_payload(
+                 %{
+                   "credits" => %{"balance" => 601},
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_after_seconds" => 2_480_891
+                     }
+                   }
+                 },
+                 synced_at
+               )
+
+      assert account_primary.active_limit == 601
+      assert account_primary.credits == 601
+      assert Decimal.equal?(account_primary.used_percent, Decimal.new(3))
     end
 
     test "leaves missing and malformed credit balances unknown" do
@@ -4656,7 +4471,7 @@ defmodule CodexPooler.UpstreamsTest do
       refute Map.has_key?(stored.metadata, "reset_after_seconds")
     end
 
-    test "explicit usage reset corrects capacity-bearing rows derived from relative countdowns" do
+    test "explicit usage reset preserves provider exhaustion on capacity-bearing rows" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       bad_relative_reset_at = DateTime.add(observed_at, 28, :day)
@@ -4708,7 +4523,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert corrected.active_limit == 4_192
       assert corrected.credits == 3_521
       assert corrected.source_precision == "observed"
-      assert_in_delta Decimal.to_float(corrected.used_percent), 16.006_679, 0.000_001
+      assert Decimal.equal?(corrected.used_percent, Decimal.new(100))
       assert DateTime.compare(corrected.reset_at, explicit_reset_at) == :eq
       refute Map.has_key?(corrected.metadata, "reset_after_seconds")
     end
@@ -4801,7 +4616,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "persists reset-bearing usage windows with precise evidence dimensions" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 14:00:00Z]
+      observed_at = DateTime.utc_now()
       reset_at = DateTime.add(observed_at, 900, :second)
 
       assert {:ok, windows} =
@@ -5402,8 +5217,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       upstream =
         start_path_upstream(%{
-          "/backend-api/wham/usage" =>
-            {200, weekly_only_payload(%{"additional_rate_limits" => [descriptor]})}
+          "/backend-api/wham/usage" => {200, weekly_only_payload(%{"additional_rate_limits" => [descriptor]})}
         })
 
       %{identity: identity, pool: pool, assignment: assignment} =
@@ -5443,9 +5257,7 @@ defmodule CodexPooler.UpstreamsTest do
           configure_descriptor_zero_coverage_mode(mode, identity, assignment, existing)
 
         if mode == :auth do
-          Repo.delete_all(
-            from(secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity.id)
-          )
+          Repo.delete_all(from(secret in EncryptedSecret, where: secret.upstream_identity_id == ^identity.id))
         end
 
         assert {:ok, _result} = Upstreams.reconcile_pool_account(pool, assignment, opts)
@@ -5459,11 +5271,14 @@ defmodule CodexPooler.UpstreamsTest do
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             {:timeout_before_headers, self(), release_ref},
-             FakeUpstream.json_response(%{"error" => "unavailable"}, 503)
-           ]}
+          # provenance: synthetic_adversarial
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond: {:timeout_before_headers, self(), release_ref}
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -5477,19 +5292,33 @@ defmodule CodexPooler.UpstreamsTest do
           DateTime.utc_now() |> DateTime.truncate(:second),
           "Provider limit alpha"
         )
+        |> Repo.reload!()
 
       parent = self()
 
       task =
         Task.async(fn ->
           Sandbox.allow(Repo, parent, self())
-          Upstreams.reconcile_pool_account(pool, assignment, receive_timeout: 1)
+          Upstreams.reconcile_pool_account(pool, assignment, receive_timeout: 100)
         end)
 
-      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref}
-      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
-      assert {:ok, _result} = Task.await(task)
-      assert Enum.any?(QuotaWindows.list_evidence(identity), &(&1.id == existing.id))
+      assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                     15_000
+
+      try do
+        # Keep the response blocked until the real HTTP timeout has completed.
+        # Releasing first races a 200 unusable payload (which permits fallback)
+        # against a transport timeout (which stops probing).
+        assert {:ok, result} = Task.await(task, 15_000)
+        assert result.quota.status == :failed
+        assert result.quota.code == "quota_refresh_unavailable"
+        assert result.quota.message == "quota windows were not available (timeout)"
+        assert Repo.reload!(existing) == existing
+        assert FakeUpstream.count(upstream) == 1
+        assert :ok = FakeUpstream.verify!(upstream)
+      after
+        send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+      end
     end
 
     @tag :quota_descriptor_coverage
@@ -5652,13 +5481,16 @@ defmodule CodexPooler.UpstreamsTest do
 
     @tag :quota_probe_envelope
     test "duplicate rich identities keep preferred endpoint payload path and window coherent" do
+      now = System.system_time(:second)
+
       previous_payload =
         weekly_only_payload(%{
           "rate_limit" => %{
             "secondary_window" => %{
               "used_percent" => 31,
               "limit_window_seconds" => 604_800,
-              "reset_after_seconds" => 3_600
+              "reset_after_seconds" => 3_600,
+              "reset_at" => now + 3_600
             }
           }
         })
@@ -5669,12 +5501,14 @@ defmodule CodexPooler.UpstreamsTest do
           "primary_window" => %{
             "used_percent" => 12,
             "limit_window_seconds" => 18_000,
-            "reset_after_seconds" => 900
+            "reset_after_seconds" => 900,
+            "reset_at" => now + 900
           },
           "secondary_window" => %{
             "used_percent" => 47,
             "limit_window_seconds" => 604_800,
-            "reset_after_seconds" => 3_600
+            "reset_after_seconds" => 3_600,
+            "reset_at" => now + 3_600
           }
         }
       }
@@ -5988,7 +5822,18 @@ defmodule CodexPooler.UpstreamsTest do
 
       observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       covered = persist_descriptor_primary!(identity, observed_at, "Provider limit alpha")
-      failed_path = persist_descriptor_primary!(identity, observed_at, "Provider limit beta")
+
+      failed_path =
+        persist_descriptor_primary!(
+          identity,
+          observed_at,
+          "Provider limit beta",
+          "codex_usage_api",
+          "beta_meter",
+          []
+        )
+
+      assert covered.id != failed_path.id
 
       assert {:ok, %{status: :succeeded}} = Upstreams.reconcile_pool_account(pool, assignment)
 
@@ -6136,30 +5981,39 @@ defmodule CodexPooler.UpstreamsTest do
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             FakeUpstream.raw_response(html_403,
-               status: 403,
-               headers: [{"content-type", "text/html; charset=utf-8"}]
-             ),
-             FakeUpstream.json_response(
-               weekly_only_payload(%{
-                 "additional_rate_limits" => [
-                   %{
-                     "limit_name" => "GPT-5.3-Codex-Spark",
-                     "metered_feature" => "codex_bengalfox",
-                     "rate_limit" => %{
-                       "primary_window" => %{
-                         "used_percent" => 45,
-                         "limit_window_seconds" => 604_800,
-                         "reset_after_seconds" => 1_200
-                       }
-                     }
-                   }
-                 ]
-               })
-             )
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond:
+                FakeUpstream.raw_response(html_403,
+                  status: 403,
+                  headers: [{"content-type", "text/html; charset=utf-8"}]
+                )
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/usage",
+              respond:
+                FakeUpstream.json_response(
+                  weekly_only_payload(%{
+                    "additional_rate_limits" => [
+                      %{
+                        "limit_name" => "GPT-5.3-Codex-Spark",
+                        "metered_feature" => "codex_bengalfox",
+                        "rate_limit" => %{
+                          "primary_window" => %{
+                            "used_percent" => 45,
+                            "limit_window_seconds" => 604_800,
+                            "reset_after_seconds" => 1_200
+                          }
+                        }
+                      }
+                    ]
+                  })
+                )
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -6178,6 +6032,8 @@ defmodule CodexPooler.UpstreamsTest do
                "/backend-api/wham/usage",
                "/backend-api/codex/usage"
              ]
+
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "does not reuse Cloudflare cookies from non-ChatGPT usage probe origins" do
@@ -6185,30 +6041,40 @@ defmodule CodexPooler.UpstreamsTest do
 
       {:ok, upstream} =
         FakeUpstream.start_link(
-          {:sequence,
-           [
-             FakeUpstream.raw_response(html_403,
-               status: 403,
-               headers: [
-                 {"content-type", "text/html; charset=utf-8"},
-                 {"set-cookie", "__cf_bm=cf-token; Path=/; HttpOnly; Secure"}
-               ]
-             ),
-             FakeUpstream.json_response(%{
-               "rate_limit" => %{
-                 "primary_window" => %{
-                   "used_percent" => 42,
-                   "limit_window_seconds" => 18_000,
-                   "reset_after_seconds" => 300
-                 },
-                 "secondary_window" => %{
-                   "used_percent" => 51,
-                   "limit_window_seconds" => 604_800,
-                   "reset_after_seconds" => 3_600
-                 }
-               }
-             })
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond:
+                FakeUpstream.raw_response(html_403,
+                  status: 403,
+                  headers: [
+                    {"content-type", "text/html; charset=utf-8"},
+                    {"set-cookie", "__cf_bm=cf-token; Path=/; HttpOnly; Secure"}
+                  ]
+                )
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/usage",
+              headers: [forbidden: ["cookie"]],
+              respond:
+                FakeUpstream.json_response(%{
+                  "rate_limit" => %{
+                    "primary_window" => %{
+                      "used_percent" => 42,
+                      "limit_window_seconds" => 18_000,
+                      "reset_after_seconds" => 300
+                    },
+                    "secondary_window" => %{
+                      "used_percent" => 51,
+                      "limit_window_seconds" => 604_800,
+                      "reset_after_seconds" => 3_600
+                    }
+                  }
+                })
+            )
+          ])
         )
 
       on_exit(fn -> FakeUpstream.stop(upstream) end)
@@ -6232,6 +6098,7 @@ defmodule CodexPooler.UpstreamsTest do
       [_first_request, second_request | _rest] = FakeUpstream.requests(upstream)
       second_headers = Map.new(second_request.headers)
       refute Map.has_key?(second_headers, "cookie")
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "stores 5h and weekly quota windows from Codex response headers" do
@@ -6258,8 +6125,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert Enum.map(
                windows,
-               &{&1.quota_key, &1.window_kind, Decimal.to_integer(&1.used_percent),
-                &1.display_label, &1.source}
+               &{&1.quota_key, &1.window_kind, Decimal.to_integer(&1.used_percent), &1.display_label, &1.source}
              ) == [
                {"account", "primary", 12, "Account", "codex_response_headers"},
                {"account", "secondary", 67, "Account", "codex_response_headers"},
@@ -6370,13 +6236,45 @@ defmodule CodexPooler.UpstreamsTest do
              |> Map.has_key?("cookie")
 
       refute CloudflareCookies.store_from_headers(url, [
-               {"set-cookie",
-                "__cf_bm=expired; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
+               {"set-cookie", "__cf_bm=expired; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
              ])
 
       refute CloudflareCookies.request_headers(url, [])
              |> Map.new()
              |> Map.has_key?("cookie")
+    end
+
+    test "Cloudflare cookie jar accepts RFC 2616 Expires date formats" do
+      url =
+        "https://cookie-expiry-formats-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
+
+      for {name, expires} <- [
+            {"cf_chl_rfc1123", "Wed, 21 Oct 2099 07:28:00 GMT"},
+            {"cf_chl_rfc850", "Wednesday, 21-Oct-99 07:28:00 GMT"},
+            {"cf_chl_asctime", "Wed Oct 21 07:28:00 2099"}
+          ] do
+        assert CloudflareCookies.store_from_headers(url, [
+                 {"set-cookie", "#{name}=live; Expires=#{expires}; Path=/; HttpOnly; Secure"}
+               ])
+      end
+
+      cookie = CloudflareCookies.request_headers(url, []) |> Map.new() |> Map.fetch!("cookie")
+
+      assert cookie =~ "cf_chl_rfc1123=live"
+      assert cookie =~ "cf_chl_rfc850=live"
+      assert cookie =~ "cf_chl_asctime=live"
+    end
+
+    test "Cloudflare cookie jar treats invalid Expires dates as session cookies" do
+      url =
+        "https://cookie-invalid-expiry-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
+
+      assert CloudflareCookies.store_from_headers(url, [
+               {"set-cookie", "cf_chl_invalid=live; Expires=Wed, 32 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
+             ])
+
+      assert CloudflareCookies.request_headers(url, []) |> Map.new() |> Map.fetch!("cookie") =~
+               "cf_chl_invalid=live"
     end
 
     test "Cloudflare cookie jar is owned by the supervised process" do
@@ -7715,12 +7613,11 @@ defmodule CodexPooler.UpstreamsTest do
     end
 
     @tag :quota_confirmed_convergence
-    test "credit-only backward re-anchor adopts the reset while keeping credit-derived percent" do
-      # the free-plan shape observed live: canonical capacity-bearing monthly
-      # (18.5% = credits/capacity, reset in 27d) while the provider reports
-      # 100% used with the reset re-anchored 16 days earlier and only a credit
-      # balance. values must stay credit-derived on every observation; the
-      # earlier reset is adopted only after two matching observations
+    test "credit-only backward re-anchor adopts the reset while keeping provider exhaustion" do
+      # The provider reports 100% included-quota usage with the reset
+      # re-anchored 16 days earlier and only a current credit balance. The
+      # provider percent stays authoritative on every observation; the earlier
+      # reset is adopted only after two matching observations.
       identity = active_identity_fixture()
 
       canonical_at =
@@ -7759,12 +7656,6 @@ defmodule CodexPooler.UpstreamsTest do
                  canonical_at
                )
 
-      expected_percent =
-        Decimal.new(4_192)
-        |> Decimal.sub(Decimal.new(3_416))
-        |> Decimal.mult(Decimal.new(100))
-        |> Decimal.div(Decimal.new(4_192))
-
       first_at = DateTime.add(canonical_at, 60, :second)
 
       assert {:ok, first} =
@@ -7779,10 +7670,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert first.credits == 3_416
       assert DateTime.compare(first.reset_at, canonical_reset) == :eq
 
-      assert Decimal.equal?(
-               Decimal.round(first.used_percent, 6),
-               Decimal.round(expected_percent, 6)
-             )
+      assert Decimal.equal?(first.used_percent, Decimal.new(100))
 
       confirm_at = DateTime.add(canonical_at, 120, :second)
 
@@ -7798,10 +7686,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert confirmed.credits == 3_416
       assert DateTime.compare(confirmed.reset_at, reanchored_reset) == :eq
 
-      assert Decimal.equal?(
-               Decimal.round(confirmed.used_percent, 6),
-               Decimal.round(expected_percent, 6)
-             )
+      assert Decimal.equal?(confirmed.used_percent, Decimal.new(100))
     end
 
     @tag :quota_confirmed_convergence
@@ -8902,16 +8787,13 @@ defmodule CodexPooler.UpstreamsTest do
         |> Quotas.Evidence.new!(observed_at)
 
       assert Quotas.Evidence.identity_key(evidence) ==
-               {"model", "codex_model", "example-model", "upstream-model", "model_quota",
-                "primary", 300, "codex_usage_api", "limit-id", "Limit name", "meter"}
+               {"model", "codex_model", "example-model", "upstream-model", "model_quota", "primary", 300, "codex_usage_api", "limit-id", "Limit name", "meter"}
 
       assert Quotas.Evidence.descriptor_key(evidence) ==
-               {"model", "codex_model", "example-model", "upstream-model", "model_quota",
-                "codex_usage_api", "limit-id", "Limit name", "meter"}
+               {"model", "codex_model", "example-model", "upstream-model", "model_quota", "codex_usage_api", "limit-id", "Limit name", "meter"}
 
       assert Quotas.Evidence.logical_window_key(evidence) ==
-               {"model", "codex_model", "example-model", "upstream-model", "model_quota",
-                "primary", 300}
+               {"model", "codex_model", "example-model", "upstream-model", "model_quota", "primary", 300}
     end
 
     @tag :quota_candidate_contract
@@ -9047,19 +8929,12 @@ defmodule CodexPooler.UpstreamsTest do
       cutoff_margin = 60
 
       for {label, candidate_at, reset_at, confirmation_at, expected_result} <- [
-            {:ttl_in_budget, DateTime.add(now, -ttl + cutoff_margin, :second),
-             DateTime.add(now, cutoff_margin, :second), now, :confirmed},
-            {:ttl_past, DateTime.add(now, -ttl - cutoff_margin, :second),
-             DateTime.add(now, cutoff_margin, :second), now, :candidate_restarted},
+            {:ttl_in_budget, DateTime.add(now, -ttl + cutoff_margin, :second), DateTime.add(now, cutoff_margin, :second), now, :confirmed},
+            {:ttl_past, DateTime.add(now, -ttl - cutoff_margin, :second), DateTime.add(now, cutoff_margin, :second), now, :candidate_restarted},
             {:reset_exact, DateTime.add(now, -2, :second), now, now, :rejected},
-            {:reset_future, DateTime.add(now, -2, :second),
-             DateTime.add(now, cutoff_margin, :second), now, :confirmed},
-            {:future_skew_in_budget, DateTime.add(now, future_skew - cutoff_margin, :second),
-             DateTime.add(now, future_skew + 60, :second),
-             DateTime.add(now, future_skew + 1, :second), :confirmed},
-            {:future_skew_past, DateTime.add(now, future_skew + cutoff_margin, :second),
-             DateTime.add(now, future_skew + cutoff_margin + 60, :second),
-             DateTime.add(now, future_skew + cutoff_margin + 1, :second), :rejected}
+            {:reset_future, DateTime.add(now, -2, :second), DateTime.add(now, cutoff_margin, :second), now, :confirmed},
+            {:future_skew_in_budget, DateTime.add(now, future_skew - cutoff_margin, :second), DateTime.add(now, future_skew + 60, :second), DateTime.add(now, future_skew + 1, :second), :confirmed},
+            {:future_skew_past, DateTime.add(now, future_skew + cutoff_margin, :second), DateTime.add(now, future_skew + cutoff_margin + 60, :second), DateTime.add(now, future_skew + cutoff_margin + 1, :second), :rejected}
           ] do
         identity = active_identity_fixture(%{account_label: "Candidate cutoff #{label}"})
         canonical_at = DateTime.add(candidate_at, -1, :second)
@@ -9540,9 +9415,7 @@ defmodule CodexPooler.UpstreamsTest do
       existing_attrs = rich_identity_attrs(observed_at, %{raw_limit_id: "existing-limit"})
 
       assert {:ok, [existing]} =
-               QuotaWindows.upsert_quota_windows(identity, [existing_attrs],
-                 delete_missing?: false
-               )
+               QuotaWindows.upsert_quota_windows(identity, [existing_attrs], delete_missing?: false)
 
       valid_sibling =
         rich_identity_attrs(observed_at, %{
@@ -9878,7 +9751,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "stores Spark rate-limit events without deriving rolling weekly resets" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 12:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.add(-10, :day) |> DateTime.truncate(:second)
       primary_reset_at = DateTime.add(observed_at, 900, :second)
 
       assert {:ok, [primary, secondary]} =
@@ -10226,9 +10099,9 @@ defmodule CodexPooler.UpstreamsTest do
       assert evidence.quota_family == "codex_future_family"
       assert evidence.raw_limit_id == "codex_future_family"
       assert evidence.window_kind == "secondary"
+      assert Decimal.equal?(evidence.used_percent, Decimal.new("100"))
       assert evidence.observed_at == observed_at
       assert DateTime.compare(evidence.reset_at, DateTime.add(observed_at, 120, :second)) == :eq
-      refute Quotas.Evidence.routing_usable?(evidence, observed_at)
     end
 
     test "remaps weekly-duration primary header slot to the weekly secondary window" do
@@ -10428,9 +10301,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert QuotaWindows.usable_window?(window, observed_at, model: "gpt-5.3-codex-spark")
 
-      assert QuotaWindows.usable_window?(window, observed_at,
-               upstream_model: "upstream-gpt-5.3-codex-spark"
-             )
+      assert QuotaWindows.usable_window?(window, observed_at, upstream_model: "upstream-gpt-5.3-codex-spark")
 
       refute QuotaWindows.usable_window?(window, observed_at, model: "gpt-6-codex-other")
 
@@ -10781,7 +10652,54 @@ defmodule CodexPooler.UpstreamsTest do
     end
 
     @tag :upstream_quota_evidence_stability
-    test "incomplete free-plan usage cannot split percent from preserved credit capacity" do
+    test "a fresh usage snapshot repairs a legacy inferred denominator" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:second)
+      incoming_at = DateTime.add(observed_at, 60, :second)
+      reset_at = DateTime.add(observed_at, 29, :day)
+
+      assert {:ok, [_legacy_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 43_200,
+                   active_limit: 607,
+                   credits: 601,
+                   used_percent: Decimal.new("0.988"),
+                   reset_at: reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, [repaired_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "credits" => %{"balance" => 601},
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_at" => DateTime.to_unix(reset_at)
+                     }
+                   }
+                 },
+                 incoming_at
+               )
+
+      assert repaired_window.active_limit == 601
+      assert repaired_window.credits == 601
+      assert Decimal.equal?(repaired_window.used_percent, Decimal.new(3))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "an unconfirmed backward reset keeps the prior provider snapshot intact" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       reset_at = DateTime.add(observed_at, 28, :day)
@@ -10809,7 +10727,7 @@ defmodule CodexPooler.UpstreamsTest do
                  observed_at
                )
 
-      assert complete_window.active_limit == 4_192
+      assert complete_window.active_limit == 3_521
       assert complete_window.credits == 3_521
       assert Decimal.equal?(complete_window.used_percent, Decimal.new("16.007"))
 
@@ -10821,9 +10739,9 @@ defmodule CodexPooler.UpstreamsTest do
                )
 
       assert after_incomplete.id == complete_window.id
-      assert after_incomplete.active_limit == 4_192
+      assert after_incomplete.active_limit == 3_521
       assert after_incomplete.credits == 3_521
-      assert_in_delta Decimal.to_float(after_incomplete.used_percent), 16.006_679, 0.000_001
+      assert Decimal.equal?(after_incomplete.used_percent, Decimal.new("16.007"))
 
       assert DateTime.compare(after_incomplete.reset_at, reset_at) == :eq
     end
@@ -10875,9 +10793,9 @@ defmodule CodexPooler.UpstreamsTest do
       assert merged_window.metadata["reset_after_seconds"] ==
                complete_window.metadata["reset_after_seconds"]
 
-      assert merged_window.active_limit == 4_192
+      assert merged_window.active_limit == 3_521
       assert merged_window.credits == 3_521
-      assert_in_delta Decimal.to_float(merged_window.used_percent), 16.006_679, 0.000_001
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new(100))
     end
 
     for incoming_percent <- [16.007, 8] do
@@ -10928,10 +10846,117 @@ defmodule CodexPooler.UpstreamsTest do
         assert merged_window.metadata["reset_after_seconds"] ==
                  complete_window.metadata["reset_after_seconds"]
 
-        assert merged_window.active_limit == 4_192
+        assert merged_window.active_limit == 3_521
         assert merged_window.credits == 3_521
-        assert_in_delta Decimal.to_float(merged_window.used_percent), 16.006_679, 0.000_001
+        assert Decimal.equal?(merged_window.used_percent, Decimal.new("16.007"))
       end
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "explicit monthly usage repairs a row frozen to an older relative reset" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      stale_reset_at = DateTime.add(observed_at, 25, :day)
+      provider_reset_at = DateTime.add(observed_at, 28, :day)
+      incoming_at = DateTime.add(observed_at, 60, :second)
+
+      assert {:ok, [_stale_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 43_200,
+                   active_limit: 601,
+                   credits: 601,
+                   used_percent: Decimal.new(3),
+                   reset_at: stale_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at,
+                   metadata: %{
+                     "limit_window_seconds" => 2_592_000,
+                     "reset_after_seconds" => 2_592_000
+                   }
+                 }
+               ])
+
+      assert {:ok, [repaired_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "credits" => nil,
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_at" => DateTime.to_unix(provider_reset_at),
+                       "reset_after_seconds" => DateTime.diff(provider_reset_at, incoming_at, :second)
+                     }
+                   }
+                 },
+                 incoming_at
+               )
+
+      assert repaired_window.active_limit == 601
+      assert repaired_window.credits == 601
+      assert Decimal.equal?(repaired_window.used_percent, Decimal.new(3))
+      assert DateTime.compare(repaired_window.reset_at, provider_reset_at) == :eq
+      assert repaired_window.metadata["reset_at_source"] == "explicit"
+
+      assert repaired_window.metadata["reset_after_seconds"] ==
+               DateTime.diff(provider_reset_at, incoming_at, :second)
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "relative monthly usage cannot erase explicit reset provenance" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      explicit_reset_at = DateTime.add(observed_at, 28, :day)
+      relative_at = DateTime.add(observed_at, 120, :second)
+
+      assert {:ok, [explicit_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_at" => DateTime.to_unix(explicit_reset_at),
+                       "reset_after_seconds" => DateTime.diff(explicit_reset_at, observed_at, :second)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert explicit_window.metadata["reset_at_source"] == "explicit"
+
+      assert {:ok, [relative_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_after_seconds" => 2_592_000
+                     }
+                   }
+                 },
+                 relative_at
+               )
+
+      assert relative_window.id == explicit_window.id
+      assert Decimal.equal?(relative_window.used_percent, Decimal.new(3))
+      assert DateTime.compare(relative_window.reset_at, explicit_reset_at) == :eq
+      assert relative_window.metadata["reset_at_source"] == "explicit"
+
+      assert relative_window.metadata["reset_after_seconds"] ==
+               explicit_window.metadata["reset_after_seconds"]
     end
 
     @tag :upstream_quota_evidence_stability
@@ -10970,10 +10995,82 @@ defmodule CodexPooler.UpstreamsTest do
                  incoming_at
                )
 
-      assert exhausted_window.active_limit == 4_192
+      assert exhausted_window.active_limit == 3_521
       assert exhausted_window.credits == 0
       assert Decimal.equal?(exhausted_window.used_percent, Decimal.new(100))
       assert DateTime.compare(exhausted_window.reset_at, reset_at) == :eq
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "explicit zero credits upgrade a same-cycle weekly snapshot that omitted the balance" do
+      identity = active_identity_fixture()
+
+      observed_at =
+        DateTime.utc_now() |> DateTime.add(-300, :second) |> DateTime.truncate(:microsecond)
+
+      rejected_at = DateTime.add(observed_at, 60, :second)
+      incoming_at = DateTime.add(rejected_at, 60, :second)
+      reset_at = observed_at |> DateTime.add(7, :day) |> DateTime.truncate(:second)
+
+      quota_payload = %{
+        "rate_limit" => %{
+          "primary_window" => %{
+            "used_percent" => 0,
+            "limit_window_seconds" => 604_800,
+            "reset_after_seconds" => 604_800,
+            "reset_at" => DateTime.to_unix(reset_at)
+          }
+        }
+      }
+
+      assert {:ok, [missing_balance_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 quota_payload,
+                 observed_at
+               )
+
+      assert missing_balance_window.window_kind == "secondary"
+      assert missing_balance_window.active_limit == nil
+      assert missing_balance_window.credits == nil
+
+      assert {:ok, [rejected_resetless_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "credits" => %{"balance" => 0},
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 0,
+                       "limit_window_seconds" => 604_800,
+                       "reset_after_seconds" => 604_800
+                     }
+                   }
+                 },
+                 rejected_at
+               )
+
+      assert rejected_resetless_window.active_limit == nil
+      assert rejected_resetless_window.credits == nil
+
+      assert {:ok, [zero_balance_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 quota_payload
+                 |> Map.put("credits", %{"balance" => 0})
+                 |> put_in(
+                   ["rate_limit", "primary_window", "reset_after_seconds"],
+                   604_680
+                 ),
+                 incoming_at
+               )
+
+      assert zero_balance_window.id == missing_balance_window.id
+      assert zero_balance_window.active_limit == 0
+      assert zero_balance_window.credits == 0
+      assert Decimal.equal?(zero_balance_window.used_percent, Decimal.new(0))
+      assert DateTime.compare(zero_balance_window.reset_at, reset_at) == :eq
+      assert DateTime.compare(zero_balance_window.observed_at, incoming_at) == :eq
     end
 
     @tag :upstream_quota_evidence_stability
@@ -11014,14 +11111,14 @@ defmodule CodexPooler.UpstreamsTest do
                  incoming_at
                )
 
-      assert merged_window.active_limit == 4_192
+      assert merged_window.active_limit == 3_521
       assert merged_window.credits == 3_521
-      assert_in_delta Decimal.to_float(merged_window.used_percent), 16.006_679, 0.000_001
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new(100))
       assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
     end
 
     @tag :upstream_quota_evidence_stability
-    test "free-plan credit balance above known capacity preserves the last known balance" do
+    test "a larger observed credit balance expands the burn baseline" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
       reset_at = DateTime.add(observed_at, 28, :day)
@@ -11054,9 +11151,9 @@ defmodule CodexPooler.UpstreamsTest do
                  incoming_at
                )
 
-      assert merged_window.active_limit == 4_192
-      assert merged_window.credits == 3_521
-      assert_in_delta Decimal.to_float(merged_window.used_percent), 16.006_679, 0.000_001
+      assert merged_window.active_limit == 5_000
+      assert merged_window.credits == 5_000
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new(100))
       assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
     end
 
@@ -11184,8 +11281,11 @@ defmodule CodexPooler.UpstreamsTest do
 
       # Values always converge on the long-reset snapshot, while observation
       # liveness follows the latest fresh same-cycle provider confirmation even
-      # when that confirmation's values were rejected. Metadata keeps the value
-      # provenance of the accepted long-reset sample.
+      # when that confirmation's values were rejected. The stored countdown is
+      # measured against the kept long reset from that latest confirmation, so
+      # it agrees with `observed_at`; it kept the countdown of the accepted
+      # sample, which froze a cycle's first countdown for the whole window
+      # (findings#206 row 206-555).
       sequences = [
         {[
            snapshot.(1, short_reset_at, observed_at),
@@ -11205,7 +11305,7 @@ defmodule CodexPooler.UpstreamsTest do
          ], one_second_later, observed_at}
       ]
 
-      for {samples, expected_observed_at, expected_value_anchor_at} <- sequences do
+      for {samples, expected_observed_at, _value_anchor_at} <- sequences do
         identity = active_identity_fixture()
 
         merged_window =
@@ -11225,7 +11325,7 @@ defmodule CodexPooler.UpstreamsTest do
         assert Decimal.equal?(merged_window.used_percent, Decimal.new("2.000"))
 
         assert merged_window.metadata["reset_after_seconds"] ==
-                 DateTime.diff(long_reset_at, expected_value_anchor_at, :second)
+                 DateTime.diff(long_reset_at, expected_observed_at, :second)
       end
     end
 
@@ -11492,6 +11592,79 @@ defmodule CodexPooler.UpstreamsTest do
     end
 
     @tag :upstream_quota_evidence_stability
+    test "quota meter percentage preserves account credit boundary semantics" do
+      reset_at = ~U[2026-09-06 10:06:18Z]
+
+      included_quota = %Quota.AccountQuotaWindow{
+        quota_key: "account",
+        quota_scope: "account",
+        source: "codex_usage_api",
+        reset_at: reset_at,
+        active_limit: 601,
+        credits: 601,
+        used_percent: Decimal.new("3")
+      }
+
+      assert Decimal.equal?(
+               Measurements.meter_remaining_percent(included_quota),
+               Decimal.new("97")
+             )
+
+      assert Decimal.equal?(
+               Measurements.meter_remaining_percent(%{included_quota | reset_at: nil}),
+               Decimal.new("97")
+             )
+
+      resetless_zero = %Quota.AccountQuotaWindow{
+        included_quota
+        | reset_at: nil,
+          active_limit: 0,
+          credits: 0,
+          used_percent: Decimal.new("0")
+      }
+
+      assert Measurements.meter_remaining_percent(resetless_zero) == nil
+
+      assert Measurements.meter_remaining_percent(%{
+               resetless_zero
+               | active_limit: 601,
+                 credits: 601
+             }) == nil
+
+      exhausted = %Quota.AccountQuotaWindow{
+        included_quota
+        | active_limit: 601,
+          credits: 500,
+          used_percent: Decimal.new("100")
+      }
+
+      assert Decimal.equal?(
+               Decimal.round(Measurements.meter_remaining_percent(exhausted), 0),
+               Decimal.new("83")
+             )
+
+      credit_only = %Quota.AccountQuotaWindow{
+        included_quota
+        | active_limit: nil,
+          credits: 3_817,
+          used_percent: Decimal.new("100")
+      }
+
+      assert Measurements.meter_remaining_percent(credit_only) == nil
+
+      model_window = %Quota.AccountQuotaWindow{
+        included_quota
+        | quota_key: "codex_spark",
+          quota_scope: "model"
+      }
+
+      assert Decimal.equal?(
+               Measurements.meter_remaining_percent(model_window),
+               Decimal.new("100")
+             )
+    end
+
+    @tag :upstream_quota_evidence_stability
     test "credit-only monthly usage remains usable without fabricating percent capacity" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
@@ -11528,7 +11701,7 @@ defmodule CodexPooler.UpstreamsTest do
     end
 
     @tag :upstream_quota_evidence_stability
-    test "credit-only monthly usage refresh keeps existing capacity and recalculates used percent" do
+    test "credit-burning monthly usage keeps its balance baseline and provider percent" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       reset_at = DateTime.add(observed_at, 30, :day)
@@ -11572,12 +11745,6 @@ defmodule CodexPooler.UpstreamsTest do
                  }
                ])
 
-      expected_used_percent =
-        Decimal.new(4018)
-        |> Decimal.sub(Decimal.new(3817))
-        |> Decimal.mult(Decimal.new(100))
-        |> Decimal.div(Decimal.new(4018))
-
       measurements = Measurements.for_window(merged_window)
 
       assert merged_window.id == known_window.id
@@ -11585,16 +11752,96 @@ defmodule CodexPooler.UpstreamsTest do
       assert merged_window.credits == 3817
       assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
 
-      assert Decimal.equal?(
-               Decimal.round(merged_window.used_percent, 6),
-               Decimal.round(expected_used_percent, 6)
-             )
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new(100))
 
       assert Decimal.equal?(Decimal.round(measurements.remaining_percent, 0), Decimal.new("95"))
       assert QuotaWindows.usable_window?(merged_window, weak_observed_at)
 
       assert %{eligible?: true, routing_state: :precise, exclusions: []} =
                QuotaWindows.routing_quota_eligibility(identity, at: weak_observed_at)
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "parser-shaped credit burn preserves the last pre-burn balance as its baseline" do
+      identity = active_identity_fixture()
+
+      observed_at =
+        DateTime.utc_now() |> DateTime.add(-300, :second) |> DateTime.truncate(:microsecond)
+
+      burn_observed_at = DateTime.add(observed_at, 60, :second)
+      reset_at = DateTime.add(observed_at, 30, :day)
+
+      assert {:ok, [included_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "credits" => %{"balance" => 601},
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 3,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_at" => DateTime.to_unix(reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert included_window.active_limit == 601
+      assert included_window.credits == 601
+
+      assert {:ok, [burning_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "credits" => %{"balance" => 500},
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 100,
+                       "limit_window_seconds" => 2_592_000,
+                       "reset_at" => DateTime.to_unix(reset_at)
+                     }
+                   }
+                 },
+                 burn_observed_at
+               )
+
+      assert burning_window.id == included_window.id
+      assert burning_window.active_limit == 601
+      assert burning_window.credits == 500
+      assert Decimal.equal?(burning_window.used_percent, Decimal.new("100"))
+
+      assert Decimal.equal?(
+               Decimal.round(Measurements.meter_remaining_percent(burning_window), 0),
+               Decimal.new("83")
+             )
+
+      for {balance, seconds_after, expected_percent} <- [{300, 120, "50"}, {0, 180, "0"}] do
+        assert {:ok, [later_window]} =
+                 QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                   identity,
+                   %{
+                     "credits" => %{"balance" => balance},
+                     "rate_limit" => %{
+                       "primary_window" => %{
+                         "used_percent" => 100,
+                         "limit_window_seconds" => 2_592_000,
+                         "reset_at" => DateTime.to_unix(reset_at)
+                       }
+                     }
+                   },
+                   DateTime.add(observed_at, seconds_after, :second)
+                 )
+
+        assert later_window.id == included_window.id
+        assert later_window.active_limit == 601
+        assert later_window.credits == balance
+
+        assert Decimal.equal?(
+                 Decimal.round(Measurements.meter_remaining_percent(later_window), 0),
+                 Decimal.new(expected_percent)
+               )
+      end
     end
 
     test "headers cannot roll back a reset advanced by usage evidence" do
@@ -11789,8 +12036,7 @@ defmodule CodexPooler.UpstreamsTest do
                  [
                    {"x-codex-bengalfox-primary-used-percent", ["44"]},
                    {"x-codex-bengalfox-primary-window-minutes", ["300"]},
-                   {"x-codex-bengalfox-primary-reset-at",
-                    [DateTime.to_iso8601(expired_reset_at)]},
+                   {"x-codex-bengalfox-primary-reset-at", [DateTime.to_iso8601(expired_reset_at)]},
                    {"x-codex-bengalfox-limit-name", ["gpt-5.3-codex-spark"]}
                  ],
                  DateTime.add(now, -30, :second)
@@ -11832,7 +12078,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "expired and stale quota evidence remains visible but routing unusable" do
       identity = active_identity_fixture()
-      now = ~U[2026-04-27 12:00:00Z]
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
 
       expired_reset_at = DateTime.add(now, -60, :second)
       stale_observed_at = DateTime.add(now, -Quotas.Evidence.freshness_ttl_seconds() - 1, :second)
@@ -13000,9 +13246,7 @@ defmodule CodexPooler.UpstreamsTest do
     upstream
   end
 
-  defp configure_upstream_secret_key!(
-         key \\ Base.encode64(:crypto.hash(:sha256, "test-upstream-secret-key"))
-       ) do
+  defp configure_upstream_secret_key!(key \\ Base.encode64(:crypto.hash(:sha256, "test-upstream-secret-key"))) do
     previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams)
 
     Application.put_env(:codex_pooler, CodexPooler.Upstreams,
@@ -13024,6 +13268,93 @@ defmodule CodexPooler.UpstreamsTest do
     Scope.for_user(user, ["instance_owner"])
   end
 
+  defp insert_lifecycle_assignment!(pool, identity, status, timestamp) do
+    %PoolUpstreamAssignment{
+      pool_id: pool.id,
+      upstream_identity_id: identity.id,
+      assignment_label: "Issue 229 assignment",
+      status: status,
+      health_status: "active",
+      eligibility_status: "eligible",
+      created_at: timestamp,
+      updated_at: timestamp,
+      metadata: %{}
+    }
+    |> Repo.insert!()
+  end
+
+  defp capture_repo_queries(fun) do
+    parent = self()
+    handler_id = "upstreams-repo-query-capture-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and is_binary(metadata[:query]) do
+            send(parent, {handler_id, metadata.query})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(handler_id, queries) do
+    receive do
+      {^handler_id, query} -> drain_repo_queries(handler_id, [query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp insert_query_for?(query, table) do
+    query = String.downcase(query)
+    String.contains?(query, "insert") and String.contains?(query, ~s["#{table}"])
+  end
+
+  defp active_pools_query?(query) do
+    query = String.downcase(query)
+
+    String.contains?(query, "select") and
+      String.contains?(query, ~s[from "pools"]) and
+      String.contains?(query, ~s["status"]) and
+      String.contains?(query, "order by")
+  end
+
+  defp install_upstream_lifecycle_audit_failure_trigger! do
+    Repo.query!("""
+    CREATE FUNCTION pg_temp.reject_upstream_lifecycle_audit() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.action IN ('upstream_account.pause', 'upstream_account.reactivate') THEN
+        RAISE EXCEPTION 'forced upstream lifecycle audit failure' USING ERRCODE = '23514';
+      END IF;
+
+      RETURN NEW;
+    END
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER reject_upstream_lifecycle_audit
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_upstream_lifecycle_audit()
+    """)
+
+    :ok
+  end
+
   defp runtime_secret(label), do: Enum.join(["upstreams", label, "secret", "redacted"], "-")
 
   defp auth_json_fixture(opts) do
@@ -13041,7 +13372,7 @@ defmodule CodexPooler.UpstreamsTest do
       "tokens" => tokens,
       "last_refresh" => "2026-05-03T00:00:00Z"
     }
-    |> Jason.encode!()
+    |> CodexPooler.JSON.encode!()
   end
 
   defp id_token_fixture do
@@ -13057,7 +13388,7 @@ defmodule CodexPooler.UpstreamsTest do
 
   defp jwt_token(payload) do
     header = %{"alg" => "none", "typ" => "JWT"}
-    encode = &Base.url_encode64(Jason.encode!(&1), padding: false)
+    encode = &Base.url_encode64(CodexPooler.JSON.encode!(&1), padding: false)
 
     Enum.join([encode.(header), encode.(payload), Base.url_encode64("sig", padding: false)], ".")
   end
@@ -13374,8 +13705,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     assert candidate == %{
              "version" => 1,
-             "used_percent" =>
-               used_percent |> Decimal.new() |> Decimal.normalize() |> Decimal.to_string(:normal),
+             "used_percent" => used_percent |> Decimal.new() |> Decimal.normalize() |> Decimal.to_string(:normal),
              "reset_at" => DateTime.to_iso8601(reset_at),
              "observed_at" => DateTime.to_iso8601(observed_at),
              "count" => 1
@@ -13442,9 +13772,5 @@ defmodule CodexPooler.UpstreamsTest do
         order_by: [asc: event.occurred_at, asc: event.id]
       )
     )
-  end
-
-  defp assert_decimal_equal(%Decimal{} = actual, expected) when is_binary(expected) do
-    assert Decimal.equal?(actual, Decimal.new(expected))
   end
 end

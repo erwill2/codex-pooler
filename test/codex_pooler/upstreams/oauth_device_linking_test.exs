@@ -1,9 +1,14 @@
 defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
   use CodexPooler.DataCase, async: false
 
+  import Ecto.Query
+
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Audit.AuditEvent
+  alias CodexPooler.Events
   alias CodexPooler.FakeOpenAIAuthProvider
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Jobs.AccountReconciliationWorker
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Auth.CodexAuth
@@ -80,6 +85,38 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
            }
   end
 
+  test "nested provider pending response keeps the device flow polling" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+
+    start_provider!(
+      device_routes(%{
+        "/api/accounts/deviceauth/token" =>
+          {403,
+           %{
+             "error" => %{
+               "message" => "Device authorization is pending. Please try again.",
+               "type" => "invalid_request_error",
+               "code" => "deviceauth_authorization_pending"
+             }
+           }}
+      })
+    )
+
+    assert {:ok, %{flow: flow}} = Upstreams.start_device_oauth(scope, pool)
+    assert flow.interval_seconds == 5
+
+    assert {:ok, %{status: :pending, flow: pending}} =
+             Upstreams.poll_device_oauth(scope, flow.id)
+
+    assert pending.status == "pending"
+    assert pending.interval_seconds == 5
+    assert DateTime.diff(pending.poll_after_at, pending.last_polled_at, :second) in 4..5
+    assert Repo.aggregate(UpstreamIdentity, :count) == 0
+    assert Repo.aggregate(PoolUpstreamAssignment, :count) == 0
+    assert Repo.aggregate(EncryptedSecret, :count) == 0
+  end
+
   test "slow_down device poll increases interval and schedules the next poll later" do
     scope = fixture_owner_scope()
     pool = pool_fixture()
@@ -127,6 +164,7 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
       )
 
     assert {:ok, %{flow: flow}} = Upstreams.start_device_oauth(scope, pool)
+    observer = start_event_observer(pool.id)
 
     assert {:ok,
             %{
@@ -145,12 +183,35 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
     assert identity.chatgpt_user_id == "user_acct_device_success"
     assert identity.account_email == "device-acct_device_success@example.com"
     assert identity.onboarding_method == "device"
+    assert identity.credential_provenance == "codex_chatgpt_oauth"
     assert identity.workspace_id == "workspace-device"
     assert identity.plan_family == "team"
     assert assignment.pool_id == pool.id
     assert assignment.upstream_identity_id == identity.id
     assert active_secret_count("access_token") == 1
     assert active_secret_count("refresh_token") == 1
+
+    matching_jobs =
+      all_enqueued(worker: AccountReconciliationWorker)
+      |> Enum.filter(&(&1.args["pool_upstream_assignment_id"] == assignment.id))
+
+    assert [job] = matching_jobs
+    assert job.args["pool_id"] == pool.id
+    assert job.args["trigger_kind"] == "account_link"
+
+    assert 1 ==
+             Repo.aggregate(
+               from(event in AuditEvent,
+                 where:
+                   event.pool_id == ^pool.id and
+                     event.action == "upstream_account.oauth_device_link" and
+                     event.target_id == ^identity.id
+               ),
+               :count
+             )
+
+    events = event_snapshot(observer)
+    assert Enum.count(events, &(&1.reason == "upstream_account_oauth_linked")) == 1
 
     assert [_start_request, poll_request, token_request] =
              FakeOpenAIAuthProvider.requests(provider)
@@ -188,6 +249,7 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
     )
 
     assert {:ok, %{flow: flow}} = Upstreams.start_device_oauth(scope, pool)
+    observer = start_event_observer(pool.id)
 
     assert {:error, %{code: :expired_flow}} = Upstreams.poll_device_oauth(scope, flow.id)
 
@@ -197,6 +259,15 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
     assert Repo.aggregate(UpstreamIdentity, :count) == 0
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 0
     assert Repo.aggregate(EncryptedSecret, :count) == 0
+
+    assert Repo.aggregate(from(event in AuditEvent, where: event.pool_id == ^pool.id), :count) ==
+             0
+
+    assert [] ==
+             all_enqueued(worker: AccountReconciliationWorker)
+             |> Enum.filter(&(&1.args["pool_id"] == pool.id))
+
+    assert event_snapshot(observer) == []
   end
 
   test "provider denied device poll stores only safe failure fields" do
@@ -276,11 +347,7 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
               authorization_code: "device-authorization-code-resumed",
               code_verifier: "device-code-verifier-resumed"
             )},
-         "/oauth/token" =>
-           {200,
-            FakeOpenAIAuthProvider.token_response(
-              id_token: device_id_token("acct_device_resumed")
-            )}
+         "/oauth/token" => {200, FakeOpenAIAuthProvider.token_response(id_token: device_id_token("acct_device_resumed"))}
        })}
     )
 
@@ -339,6 +406,42 @@ defmodule CodexPooler.Upstreams.OAuthDeviceLinkingTest do
   defp fixture_owner_scope do
     %{user: user} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
     Scope.for_user(user, ["instance_owner"])
+  end
+
+  defp start_event_observer(pool_id) do
+    parent = self()
+
+    observer =
+      spawn_link(fn ->
+        :ok = Events.subscribe_pool(pool_id, "upstreams")
+        send(parent, {:event_observer_ready, self()})
+        observe_events([])
+      end)
+
+    assert_receive {:event_observer_ready, ^observer}
+    on_exit(fn -> send(observer, :stop) end)
+    observer
+  end
+
+  defp observe_events(events) do
+    receive do
+      {Events, event} ->
+        observe_events([event | events])
+
+      {:snapshot, caller, ref} ->
+        send(caller, {ref, Enum.reverse(events)})
+        observe_events(events)
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp event_snapshot(observer) do
+    ref = make_ref()
+    send(observer, {:snapshot, self(), ref})
+    assert_receive {^ref, events}
+    events
   end
 
   defp start_provider!(routes) do

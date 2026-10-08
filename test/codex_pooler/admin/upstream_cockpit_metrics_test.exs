@@ -4,11 +4,13 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetricsTest do
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
 
+  alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Admin.UpstreamCockpitMetrics
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   test "request health and pool contribution are scoped to the caller's visible pools" do
@@ -156,6 +158,159 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetricsTest do
     refute inspect(quota_health) =~ "Quota hidden assignment"
   end
 
+  test "quota health and pool contribution consume central windowless readiness" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    scope = Scope.for_user(owner)
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: unique_slug("windowless"), name: "Windowless Cockpit"})
+
+    as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
+        }
+      })
+
+    assignments = [assignment_summary(assignment, pool)]
+
+    readiness = %{
+      state: "provider_available_no_windows",
+      label: "Provider available",
+      tone: :warning,
+      routing_ready_now?: true,
+      reason_codes: [],
+      primary_window: nil,
+      primary_30d_window: nil,
+      weekly_window: nil
+    }
+
+    quota_health =
+      UpstreamCockpitMetrics.quota_health_from_readiness(scope, identity, assignments, readiness)
+
+    contribution =
+      UpstreamCockpitMetrics.pool_contribution_from_readiness(
+        scope,
+        identity,
+        assignments,
+        readiness
+      )
+
+    assert quota_health.kpis.routing_usable_count == 1
+    assert [%{state: "fresh", routing_usable?: true, reset_at: nil}] = quota_health.items
+    assert contribution.kpis.active_assignment_count == 1
+    assert [%{assignment_state: "active", routing_usable?: true}] = contribution.items
+  end
+
+  test "ready credit routing preserves included exhaustion in quota health" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    scope = Scope.for_user(owner)
+    pool = pool_fixture()
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+
+    readiness = %{
+      state: "provider_credits_ready",
+      label: "Routing ready via credits",
+      tone: :success,
+      routing_ready_now?: true,
+      conditional?: false,
+      capacity_basis: :provider_credits,
+      included_quota_state: "exhausted",
+      reason_codes: [],
+      primary_window: nil,
+      primary_30d_window: nil,
+      weekly_window: nil
+    }
+
+    health = UpstreamCockpitMetrics.quota_health_from_readiness(scope, identity, [assignment_summary(assignment, pool)], readiness)
+
+    assert health.kpis.exhausted_count == 1
+    assert health.kpis.routing_usable_count == 1
+    assert health.kpis.routing_conditional_count == 0
+    assert health.state == "exhausted"
+    assert health.degraded?
+    assert [%{state_label: "Exhausted", routing_conditional?: false, routing_usable?: true, routing_readiness_label: "Routing ready via credits"}] = health.items
+  end
+
+  test "request aggregates count retried requests once and retain the lower median latency" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    scope = Scope.for_user(owner)
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: unique_slug("request-aggregate"),
+        name: "Request Aggregate"
+      })
+
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    requests =
+      for {seconds_ago, latency_ms} <- [{10, 1_000}, {8, 2_000}, {6, 3_000}, {4, 4_000}] do
+        admitted_at = DateTime.add(now, -seconds_ago, :second)
+
+        insert_request!(pool, assignment, %{
+          status: "succeeded",
+          admitted_at: admitted_at,
+          completed_at: DateTime.add(admitted_at, latency_ms, :millisecond)
+        })
+      end
+
+    requests
+    |> Enum.at(1)
+    |> attempt_fixture(assignment, %{
+      attempt_number: 2,
+      status: "succeeded",
+      completed_at: DateTime.add(now, -1, :second)
+    })
+
+    assignments = [assignment_summary(assignment, pool)]
+    request_health = UpstreamCockpitMetrics.request_health(scope, identity, now)
+    contribution = UpstreamCockpitMetrics.pool_contribution(scope, identity, assignments)
+
+    assert request_health.kpis.total_requests_24h == 4
+    assert request_health.kpis.total_requests_7d == 4
+    assert request_health.kpis.p50_latency_ms_24h == 2_000
+    assert contribution.kpis.successful_requests_7d == 4
+    assert hd(contribution.items).successful_request_count_7d == 4
+  end
+
+  # Pool contribution probes each successful request of the 7-day window once
+  # for an attempt of the identity. With the statistics of tables nobody has
+  # analyzed yet, the join it replaced (against the identity's grouped request
+  # ids) and an EXISTS the planner may unnest both expect one window request
+  # and rescan the identity's attempts for every request: 6,011,005 and
+  # 4,008,004 plan rows here, about 4 s over 10k fresh rows (findings#206 row
+  # 206-452). The probe handles 4,003 with missing and with fresh statistics.
+  test "pool contribution work stays linear in the window with missing and fresh planner statistics" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    scope = Scope.for_user(owner)
+    {:ok, pool} = Pools.create_pool(scope, %{slug: unique_slug("contribution-plan"), name: "Contribution Plan"})
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    count = 2_000
+    insert_contribution_history!(pool, assignment, count, now)
+    assignments = [assignment_summary(assignment, pool)]
+
+    for statistics <- [:missing, :fresh] do
+      put_statistics!(statistics)
+
+      {contribution, queries} = capture_queries(fn -> UpstreamCockpitMetrics.pool_contribution(scope, identity, assignments) end)
+      assert contribution.kpis.successful_requests_7d == count + 1
+      assert [{query, params}] = Enum.filter(queries, fn {query, _params} -> String.contains?(query, "\"attempts\"") end)
+
+      %{rows: [[[explain]]]} = Repo.query!("EXPLAIN (ANALYZE, FORMAT JSON) " <> query, params)
+      handled = handled_rows(explain["Plan"])
+
+      # A handful of plan nodes each handling the window once (a bitmap scan, a sort, the
+      # grouped join's hash at 10,006 with fresh statistics); a rescan per request is count^2 / 2.
+      assert handled <= 6 * (count + 1), "pool contribution handled #{handled} plan rows for #{count} window requests with #{statistics} statistics: #{inspect(explain)}"
+    end
+  end
+
   test "recent request event rows return only safe metadata for visible retried and failed requests" do
     %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
     scope = Scope.for_user(owner)
@@ -191,7 +346,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetricsTest do
       network_error_code: "retryable_failure"
     })
 
-    rows = UpstreamCockpitMetrics.recent_request_event_rows(scope, identity, 10)
+    assert %{rows: rows, searched_attempt_limit: nil} = UpstreamCockpitMetrics.recent_request_events(scope, identity, 10)
 
     assert Enum.map(rows, & &1.id) == [failed.id, retried.id]
 
@@ -252,8 +407,7 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetricsTest do
       |> Ecto.Changeset.change(%{
         started_at: admitted_at,
         completed_at: completed_at,
-        network_error_code:
-          Map.get(attrs, :attempt_network_error_code, request_error_code(status))
+        network_error_code: Map.get(attrs, :attempt_network_error_code, request_error_code(status))
       })
       |> Repo.update!()
 
@@ -262,11 +416,84 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetricsTest do
       pool_upstream_assignment_id: assignment.id,
       upstream_identity_id: assignment.upstream_identity_id,
       occurred_at: completed_at,
-      usage_status:
-        Map.get(attrs, :settlement_usage_status, Map.get(attrs, :usage_status, "usage_known"))
+      usage_status: Map.get(attrs, :settlement_usage_status, Map.get(attrs, :usage_status, "usage_known"))
     })
 
     request
+  end
+
+  # A seed plus one succeeded request per ten seconds, each with one attempt of the assignment.
+  defp insert_contribution_history!(pool, assignment, count, now) do
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    seed = request_fixture(%{pool: pool, api_key: api_key}, %{status: "succeeded"})
+    seed_attempt = attempt_fixture(seed, assignment, %{status: "succeeded"})
+    request_fields = Request.__schema__(:fields)
+    attempt_fields = Attempt.__schema__(:fields)
+
+    requests =
+      for ordinal <- 1..count do
+        seed
+        |> Map.take(request_fields)
+        |> Map.merge(%{id: Ecto.UUID.generate(), correlation_id: "contribution-plan-#{System.unique_integer([:positive])}", admitted_at: DateTime.add(now, -10 * ordinal, :second)})
+      end
+
+    requests |> Enum.chunk_every(1_000) |> Enum.each(&Repo.insert_all(Request, &1))
+
+    requests
+    |> Enum.map(&(seed_attempt |> Map.take(attempt_fields) |> Map.merge(%{id: Ecto.UUID.generate(), request_id: &1.id, started_at: &1.admitted_at})))
+    |> Enum.chunk_every(1_000)
+    |> Enum.each(&Repo.insert_all(Attempt, &1))
+  end
+
+  # Missing: what the planner sees before a table's first ANALYZE, in a fresh
+  # database or right after a bulk load.
+  defp put_statistics!(:missing) do
+    for table <- ["requests", "attempts"] do
+      Repo.query!("SELECT pg_clear_relation_stats('public', $1)", [table])
+      Repo.query!("SELECT pg_clear_attribute_stats('public', $1, attname, false) FROM pg_attribute WHERE attrelid = $1::text::regclass AND attnum > 0 AND NOT attisdropped", [table])
+    end
+
+    assert %{rows: [[0, [-1.0, -1.0]]]} =
+             Repo.query!("SELECT (SELECT count(*) FROM pg_stats WHERE schemaname = 'public' AND tablename IN ('requests', 'attempts')), array_agg(reltuples) FROM pg_class WHERE oid IN ('public.requests'::regclass, 'public.attempts'::regclass)")
+  end
+
+  defp put_statistics!(:fresh) do
+    CodexPooler.PlannerStatistics.analyze!(["requests", "attempts"])
+  end
+
+  # Every row each plan node handled: the rows it returned and the rows its filters removed, over all its loops.
+  defp handled_rows(node) do
+    own = (node["Actual Rows"] + Map.get(node, "Rows Removed by Filter", 0) + Map.get(node, "Rows Removed by Join Filter", 0)) * node["Actual Loops"]
+    own + (node |> Map.get("Plans", []) |> Enum.sum_by(&handled_rows/1))
+  end
+
+  # Every query the call makes from this process, with its parameters.
+  defp capture_queries(fun) do
+    handler = {__MODULE__, :capture_queries, self()}
+    test_pid = self()
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if self() == test_pid, do: send(test_pid, {:captured_query, metadata.query, metadata.params})
+        end,
+        nil
+      )
+
+    result = fun.()
+    :telemetry.detach(handler)
+    {result, drain_queries([])}
+  end
+
+  defp drain_queries(acc) do
+    receive do
+      {:captured_query, query, params} -> drain_queries([{query, params} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   defp assignment_summary(assignment, pool) do
@@ -287,7 +514,6 @@ defmodule CodexPooler.Admin.UpstreamCockpitMetricsTest do
 
   defp response_status_code("succeeded"), do: 200
   defp response_status_code("rejected"), do: 429
-  defp response_status_code("cancelled"), do: 499
   defp response_status_code(_status), do: 502
 
   defp request_error_code("succeeded"), do: nil

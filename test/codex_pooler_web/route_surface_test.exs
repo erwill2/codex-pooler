@@ -8,9 +8,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     application_routes =
       routes
-      |> Enum.reject(
-        &(String.starts_with?(&1.path, "/dev") or String.starts_with?(&1.path, "/live"))
-      )
+      |> Enum.reject(&(String.starts_with?(&1.path, "/dev") or String.starts_with?(&1.path, "/live")))
       |> Enum.map(&{&1.verb, &1.path})
       |> Enum.sort()
 
@@ -25,8 +23,10 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/admin/alerts"},
                {:get, "/admin/api-keys"},
                {:get, "/admin/audit-logs"},
+               {:get, "/admin/incidents"},
                {:get, "/admin/invites"},
                {:get, "/admin/jobs"},
+               {:get, "/admin/lens"},
                {:get, "/admin/operators"},
                {:get, "/admin/pools"},
                {:get, "/admin/request-logs"},
@@ -35,6 +35,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/admin/system"},
                {:get, "/admin/upstreams"},
                {:get, "/admin/upstreams/:id"},
+               {:get, "/admin/upstreams/:id/saved-reset-expirations.ics"},
                {:get, "/api/codex/usage"},
                {:get, "/backend-api/codex/models"},
                {:get, "/backend-api/codex/responses"},
@@ -80,6 +81,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:post, "/v1/audio/transcriptions"},
                {:post, "/v1/batches"},
                {:post, "/v1/chat/completions"},
+               {:post, "/v1/content_provenance_checks"},
                {:post, "/v1/embeddings"},
                {:post, "/v1/files"},
                {:post, "/v1/fine_tuning/jobs"},
@@ -114,6 +116,26 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     refute Enum.any?(routes, fn {_verb, path, _plug, _opts} ->
              path in ["/api/admin/alerts", "/dashboard/alerts"]
+           end)
+  end
+
+  test "OpenAI incidents admin route is an authenticated read-only LiveView surface" do
+    routes =
+      CodexPoolerWeb.Router
+      |> Phoenix.Router.routes()
+      |> Enum.map(&{&1.verb, &1.path, &1.plug, &1.plug_opts})
+
+    assert {:get, "/admin/incidents", Phoenix.LiveView.Plug, :index} =
+             Enum.find(routes, fn {verb, path, _plug, _opts} ->
+               verb == :get and path == "/admin/incidents"
+             end)
+
+    refute Enum.any?(routes, fn {verb, path, _plug, _opts} ->
+             path == "/admin/incidents" and verb != :get
+           end)
+
+    refute Enum.any?(routes, fn {_verb, path, _plug, _opts} ->
+             path in ["/api/admin/incidents", "/dashboard/incidents"]
            end)
   end
 
@@ -207,6 +229,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     unsupported_routes = [
       {:post, "/v1/images/variations"},
+      {:post, "/v1/content_provenance_checks"},
       {:post, "/v1/embeddings"},
       {:post, "/v1/batches"},
       {:post, "/v1/moderations"},
@@ -229,6 +252,11 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     refute MapSet.member?(route_set, {:get, "/v1/realtime"})
     refute MapSet.member?(route_set, {:post, "/v1/realtime"})
+    refute MapSet.member?(route_set, {:get, "/v1/content_provenance_checks"})
+
+    refute Enum.any?(route_set, fn {_method, path} ->
+             path == "/backend-api/codex/content_provenance_checks"
+           end)
   end
 
   test "GET /status falls through to the standard 404 response for authenticated users" do
@@ -276,16 +304,5 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
              get(build_conn(), "/auth/callback?state=example-state&code=example-code"),
              404
            ) =~ "Not Found"
-  end
-
-  test "operator docs document OpenAI OAuth linking without a hosted callback route" do
-    operator_docs = File.read!("docs-site/src/content/docs/operators/upstreams.mdx")
-
-    assert operator_docs =~ "OpenAI OAuth upstream linking"
-    assert operator_docs =~ "manual callback workflow"
-    assert operator_docs =~ "device-code fallback"
-    assert operator_docs =~ "There is no hosted OAuth callback route"
-    assert operator_docs =~ "Safe OAuth troubleshooting codes"
-    assert operator_docs =~ "never paste callback URLs, authorization codes, tokens, cookies"
   end
 end

@@ -1,0 +1,666 @@
+defmodule CodexPoolerWeb.Runtime.VisibleOutputMarkTransientDatabaseTest do
+  # The relay stamps a Codex turn visible (`first_visible_output_at`) before
+  # it writes the turn's first visible output: the stamp is what the resend
+  # and replay fences read, and the same transaction refuses output from a
+  # superseded replay generation. A transient database failure on that stamp
+  # used to end the connection process mid-stream (findings#294).
+  #
+  # The failure is injected where it happens: a deferred constraint trigger on
+  # this test's own turns makes the stamp's COMMIT wait on an advisory lock the
+  # test holds, and the test cancels the waiting backend. A sequence the
+  # trigger advances before it waits counts the stamp's COMMITs across their
+  # rollbacks.
+  #
+  # Topology: one node, committed rows, the real listener, Mint as the client,
+  # native `POST /backend-api/codex/responses` over HTTP SSE with the released
+  # client's session headers and turn metadata (so the request has a turn),
+  # FakeUpstream, the Pool's default serving mode (Full), owner forwarding
+  # irrelevant (HTTP).
+  use CodexPoolerWeb.ConnCase, async: false
+
+  import Ecto.Query
+  import ExUnit.CaptureLog
+
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport,
+    only: [gateway_setup: 1, native_text_input: 1, register_unboxed_pool_cleanup!: 1, start_public_endpoint!: 0, start_upstream: 1]
+
+  import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport
+  alias CodexPooler.Accounting.{LedgerEntry, Request}
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.CodexTurn
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
+  alias CodexPooler.Gateway.Runtime.Finalization.SettlementRetry
+  alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder.ERPCNodeClient
+  alias CodexPooler.Repo
+  alias CodexPooler.UnboxedFixture
+  alias Ecto.Adapters.SQL.Sandbox
+
+  @native_path "/backend-api/codex/responses"
+  @detection_timeout_ms 15_000
+  @quiet_read_ms 300
+  @response_id "resp_visible_output_mark_transient"
+
+  setup do
+    Sandbox.mode(Repo, :auto)
+    on_exit(fn -> Sandbox.mode(Repo, :manual) end)
+    CodexPooler.TestAppEnv.restore_on_exit(SettlementRetry)
+    Application.put_env(:codex_pooler, SettlementRetry, initial_backoff_ms: 10, max_backoff_ms: 50)
+    :ok
+  end
+
+  test "native http sse: a visible-output stamp whose COMMIT is cancelled is retried before the output is written, and the stream completes" do
+    {setup, observer, gate, holder} = fixture!()
+    client = post!(setup)
+
+    {client, logs} =
+      with_info_log(fn ->
+        waiter = await_gate_waiter!(observer, gate, holder, 1)
+        client = read_quietly(client)
+        refute client.body =~ "response.output_text.delta"
+        assert cancel_backend!(observer, waiter)
+
+        # The retried stamp waits at its own COMMIT: the first one rolled back,
+        # the client still has no output, and the connection is still open.
+        _retried = await_gate_waiter!(observer, gate, holder, 2)
+        client = read_quietly(client)
+        assert client.outcome == nil
+        refute client.body =~ "response.output_text.delta"
+        assert %CodexTurn{first_visible_output_at: nil} = turn!(setup)
+
+        release_gate!(holder)
+        read_to_end(client)
+      end)
+
+    assert {client.status, client.outcome} == {200, :done}
+    assert client.body =~ "synthetic stamped text"
+    assert "response.completed" in event_types(client.body)
+
+    request = settled_request!(setup)
+    assert {request.status, request.last_error_code, request.usage_status} == {"succeeded", nil, "usage_known"}
+    assert recorded_settlements(request) == [{"usage_known", 5}]
+    assert %CodexTurn{status: "succeeded", first_visible_output_at: %DateTime{}} = turn!(setup)
+    assert gate_passes(observer, gate) == 2
+
+    assert logs =~ "gateway visible output mark met a transient database failure; retrying stage=visible_output request_id=#{request.id}"
+    assert logs =~ "reason_class=postgres_query_canceled"
+    assert logs =~ "gateway visible output mark completed after a transient database failure stage=visible_output request_id=#{request.id}"
+    assert logs =~ "settlement_tries=2"
+  end
+
+  test "native http sse: when the retry window closes output stays withheld and the connection ends through failure finalization" do
+    Application.put_env(:codex_pooler, SettlementRetry, window_ms: 0)
+    {setup, observer, gate, holder} = fixture!()
+    client = post!(setup)
+
+    {client, logs} =
+      with_log([level: :warning], fn ->
+        waiter = await_gate_waiter!(observer, gate, holder, 1)
+        assert cancel_backend!(observer, waiter)
+        client = read_to_end(client)
+        release_gate!(holder)
+        client
+      end)
+
+    assert {client.status, client.outcome} == {200, :done}
+    refute client.body =~ "synthetic stamped text"
+    refute "response.completed" in event_types(client.body)
+    assert "error" in event_types(client.body)
+    assert client.body =~ "gateway_accounting_failed"
+
+    request = settled_request!(setup)
+    assert request.status == "failed"
+    assert %CodexTurn{first_visible_output_at: nil} = turn!(setup)
+    assert gate_passes(observer, gate) == 1
+
+    assert [line] = Regex.scan(~r/gateway visible output mark abandoned after transient database failures[^\n]*/, logs) |> List.flatten()
+    assert line =~ "stage=visible_output request_id=#{request.id}"
+    assert line =~ "reason_class=postgres_query_canceled fallback=withheld_output"
+  end
+
+  test "collected response: visibility exhaustion returns the accounting error instead of parsing withheld output" do
+    Application.put_env(:codex_pooler, SettlementRetry, window_ms: 0)
+    %{user: owner} = CodexPooler.AccountsFixtures.committed_bootstrap_owner_fixture!()
+    fixture = CodexPooler.RequestReplayFixtures.replay_fixture(reservation?: true, owner: owner)
+    gate = install_stamp_gate!(fixture.pool.id)
+    observer = observer!()
+    holder = hold_gate!(gate)
+    opts = RequestOptions.for_websocket(%{})
+    context = %SelectedCandidateContext{auth: fixture.auth, endpoint: fixture.request.endpoint, payload: %{}, model: fixture.model, reserved: %{request: fixture.request}, request_options: opts, assignment: fixture.assignment, identity: fixture.identity, index: 0, retry_count: 0, allow_retry?: false, routing_attempt_metadata: %{}, route_class: opts.transport.route_class, attempt: fixture.attempt, started: System.monotonic_time(:millisecond)}
+    upstream = start_upstream(FakeUpstream.sse_stream([created_event(), delta_event(), completed_event()], done: false))
+
+    task =
+      Task.async(fn ->
+        response = Req.get!(FakeUpstream.url(upstream), into: :self, retry: false)
+        OpenAIStreamCollector.collect_response(response, context, %{register_continuity: fn _, _, _ -> :ok end, stream_result: fn _, _ -> :ok end})
+      end)
+
+    waiter = await_gate_waiter!(observer, gate, holder, 1)
+    assert cancel_backend!(observer, waiter)
+    assert {:error, %{status: 500, code: "gateway_accounting_failed"}} = Task.await(task, 15_000)
+    release_gate!(holder)
+    assert %CodexTurn{first_visible_output_at: nil} = Repo.get_by!(CodexTurn, request_id: fixture.request.id)
+  end
+
+  test "public Responses JSON returns an explicit accounting error on visibility exhaustion" do
+    Application.put_env(:codex_pooler, SettlementRetry, window_ms: 0)
+    {setup, observer, gate, holder} = fixture!()
+    port = start_public_endpoint!()
+    thread = Ecto.UUID.generate()
+    body = %{"model" => setup.model.exposed_model_id, "input" => native_text_input("synthetic public collector"), "stream" => false}
+    client = Task.async(fn -> Req.post!("http://127.0.0.1:#{port}/v1/responses", json: body, headers: [{"authorization", setup.authorization}, {"session-id", thread}], retry: false, receive_timeout: 15_000) end)
+    waiter = await_gate_waiter!(observer, gate, holder, 1)
+    assert cancel_backend!(observer, waiter)
+    response = Task.await(client, 15_000)
+    release_gate!(holder)
+    assert response.status == 500
+    assert response.body["error"]["code"] == "gateway_accounting_failed"
+  end
+
+  test "public Images JSON returns an accounting error on visibility exhaustion with an eligible image model" do
+    Application.put_env(:codex_pooler, SettlementRetry, window_ms: 0)
+    {setup, observer, gate, holder} = fixture!()
+    metadata = setup.model.metadata |> Map.put("input_modalities", ["text", "image"]) |> put_in(["source_assignment_models", setup.assignment.id, "slug"], "gpt-image-1") |> put_in(["source_assignment_models", setup.assignment.id, "input_modalities"], ["text", "image"])
+    model = setup.model |> Ecto.Changeset.change(exposed_model_id: "gpt-image-1", upstream_model_id: "provider-host-responses-model", metadata: metadata) |> Repo.update!()
+    port = start_public_endpoint!()
+    thread = Ecto.UUID.generate()
+    client = Task.async(fn -> Req.post!("http://127.0.0.1:#{port}/v1/images/generations", json: %{"model" => model.exposed_model_id, "prompt" => "synthetic image authority"}, headers: [{"authorization", setup.authorization}, {"session-id", thread}], retry: false, receive_timeout: 15_000) end)
+    waiter = await_gate_waiter!(observer, gate, holder, 1)
+    assert cancel_backend!(observer, waiter)
+    response = Task.await(client, 15_000)
+    release_gate!(holder)
+    assert response.status == 500
+    assert response.body["error"]["code"] == "gateway_accounting_failed"
+  end
+
+  @tag slow: "boots a real peer owner and cancels its first-visible COMMIT"
+  test "remote native websocket: a cancelled visible mark retries outside the responsive owner and settles once" do
+    ensure_test_distribution_started!()
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+    frames = [created_event(), delta_event(), completed_event()] |> Enum.map(fn {_type, event} -> CodexPooler.JSON.encode!(event) end)
+    setup = gateway_setup(start_upstream(FakeUpstream.websocket_text_frames(frames)))
+    register_unboxed_pool_cleanup!(setup)
+    {:ok, auth} = CodexPooler.Access.authenticate_authorization_header(setup.authorization)
+    peer = start_bridge_peer!(:current, setup.identity, repo: :real)
+    thread = Ecto.UUID.generate()
+    {session, owner} = start_remote_bridge_owner!(auth, thread, peer, :real)
+    {:ok, socket} = owner_socket(auth, "synthetic-visible-peer", Ecto.UUID.generate(), session_header: thread, session_header_source: "x-session-id", websocket_owner_forwarder_opts: [node_client: ERPCNodeClient, app_node_names: [Atom.to_string(peer)]])
+    gate = install_stamp_gate!(setup.pool.id)
+    observer = observer!()
+    holder = hold_gate!(gate)
+    payload = websocket_input_payload(setup, native_text_input("synthetic peer visible mark"), %{"client_metadata" => %{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"session_id" => thread, "thread_id" => thread, "turn_id" => Ecto.UUID.generate(), "request_kind" => "turn"})}})
+    assert {:ok, socket} = CodexPoolerWeb.CodexResponsesSocket.handle_in({payload, [opcode: :text]}, socket)
+    waiter = await_gate_waiter!(observer, gate, holder, 1)
+    assert %{active_turn: %{visible_output?: false} = active} = :erpc.call(peer, :sys, :get_state, [owner, 1_000])
+    authority = Map.take(active.descriptor, [:request_id, :attempt_id, :replay_generation])
+    discriminator = %TerminalDiscriminator{}
+    forged = CodexPooler.JSON.encode!(%{"type" => "response.output_text.delta", "delta" => "synthetic forged output"})
+    send(owner, {:websocket_owner_authorized_frame, active.ref, make_ref(), authority, forged, discriminator, :committed})
+    # Barrier from this sender ensures the malformed capability was handled.
+    assert :ok = GenServer.call(owner, {:writer_lifecycle_barrier, active.ref})
+    assert %{active_turn: %{visible_output?: false}} = :erpc.call(peer, :sys, :get_state, [owner, 1_000])
+    refute_receive {:websocket_owner_frame, _, _, _, {:data, ^forged}}, 0
+    assert cancel_backend!(observer, waiter)
+    _retried = await_gate_waiter!(observer, gate, holder, 2)
+    assert %{active_turn: %{visible_output?: false}} = :erpc.call(peer, :sys, :get_state, [owner, 1_000])
+    release_gate!(holder)
+    assert {:ok, socket} = receive_owner_socket_complete(socket)
+    request = settled_request!(setup)
+    assert {request.status, request.usage_status} == {"succeeded", "usage_known"}
+    assert recorded_settlements(request) == [{"usage_known", 5}]
+    assert %CodexTurn{first_visible_output_at: %DateTime{}} = Repo.get_by!(CodexTurn, request_id: request.id)
+    assert session.id == socket.codex_session.id
+  end
+
+  # --- fixture -------------------------------------------------------------
+
+  defp fixture! do
+    upstream =
+      start_upstream(
+        # provenance: synthetic_adversarial (one ordinary native Responses stream with usage; the Pooler's visible-output stamp is what fails)
+        FakeUpstream.sse_stream([created_event(), delta_event(), completed_event()], done: false, headers: [{"content-type", "text/event-stream"}])
+      )
+
+    setup = gateway_setup(upstream)
+    register_unboxed_pool_cleanup!(setup)
+    observer = observer!()
+    gate = install_stamp_gate!(setup.pool.id)
+    holder = hold_gate!(gate)
+    {setup, observer, gate, holder}
+  end
+
+  # A deferred constraint trigger runs at COMMIT. It fires only on the update
+  # that stamps one of this Pool's turns visible, counts the COMMIT on a
+  # sequence (sequences are not transactional, so the count survives the
+  # rollback), then waits on the test's advisory lock.
+  defp install_stamp_gate!(pool_id) do
+    suffix = System.unique_integer([:positive])
+    name = "visible_stamp_gate_#{suffix}"
+    key = 294_000_000 + suffix
+
+    UnboxedFixture.register_unboxed_cleanup!(fn ->
+      Repo.query!("DROP TRIGGER IF EXISTS #{name} ON codex_turns")
+      Repo.query!("DROP FUNCTION IF EXISTS #{name}()")
+      Repo.query!("DROP SEQUENCE IF EXISTS #{name}_passes")
+    end)
+
+    UnboxedFixture.run_unboxed(fn ->
+      Repo.query!("CREATE SEQUENCE #{name}_passes")
+
+      Repo.query!(
+        "CREATE FUNCTION #{name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN " <>
+          "IF EXISTS (SELECT 1 FROM requests r WHERE r.id = NEW.request_id AND r.pool_id = '#{pool_id}'::uuid) THEN " <>
+          "PERFORM nextval('#{name}_passes'); PERFORM pg_advisory_xact_lock(#{key}); END IF; RETURN NULL; END $$"
+      )
+
+      Repo.query!(
+        "CREATE CONSTRAINT TRIGGER #{name} AFTER UPDATE ON codex_turns DEFERRABLE INITIALLY DEFERRED FOR EACH ROW " <>
+          "WHEN (OLD.first_visible_output_at IS NULL AND NEW.first_visible_output_at IS NOT NULL) EXECUTE FUNCTION #{name}()"
+      )
+    end)
+
+    %{name: name, key: key}
+  end
+
+  defp hold_gate!(%{key: key}) do
+    holder = start_supervised!({Postgrex, connection_options()}, id: {:visible_stamp_gate_holder, key})
+    %{rows: [[backend]]} = Postgrex.query!(holder, "SELECT pg_backend_pid()", [])
+    %{rows: [[_void]]} = Postgrex.query!(holder, "SELECT pg_advisory_lock($1)", [key])
+    %{conn: holder, backend: backend, key: key}
+  end
+
+  defp release_gate!(%{conn: holder, key: key}) do
+    assert %{rows: [[true]]} = Postgrex.query!(holder, "SELECT pg_advisory_unlock($1)", [key])
+    :ok
+  end
+
+  # A PostgreSQL connection outside the Repo pool the listener draws from.
+  defp observer!, do: start_supervised!({Postgrex, connection_options()}, id: {:visible_stamp_gate_observer, System.unique_integer([:positive])})
+
+  defp connection_options, do: Repo.config() |> Keyword.take([:hostname, :port, :username, :password, :database, :socket_dir])
+
+  # The stamp has reached its `passes`-th COMMIT and waits on the gate;
+  # `pg_stat_activity` and the sequence are sampled again until they agree.
+  defp await_gate_waiter!(observer, gate, holder, passes) do
+    await_gate_waiter!(observer, gate, holder, passes, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+  end
+
+  defp await_gate_waiter!(observer, gate, holder, passes, deadline) do
+    %{rows: waiters} = Postgrex.query!(observer, "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [holder.backend])
+    seen = gate_passes(observer, gate)
+
+    cond do
+      seen == passes and match?([[_pid]], waiters) ->
+        [[pid]] = waiters
+        pid
+
+      seen > passes ->
+        flunk("the stamp passed its COMMIT gate #{seen} times, expected #{passes}")
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("nothing waited at COMMIT pass #{passes} (passes #{seen}, waiters #{inspect(waiters)})")
+
+      true ->
+        Process.sleep(10)
+        await_gate_waiter!(observer, gate, holder, passes, deadline)
+    end
+  end
+
+  defp gate_passes(observer, %{name: name}) do
+    %{rows: [[value, called?]]} = Postgrex.query!(observer, "SELECT last_value, is_called FROM #{name}_passes", [])
+    if called?, do: value, else: 0
+  end
+
+  defp cancel_backend!(observer, backend) do
+    %{rows: [[cancelled?]]} = Postgrex.query!(observer, "SELECT pg_cancel_backend($1)", [backend])
+    cancelled?
+  end
+
+  # --- client --------------------------------------------------------------
+
+  # The released client's native turn over HTTP: the thread in `session-id`
+  # and the turn metadata in the body.
+  defp post!(setup) do
+    port = start_public_endpoint!()
+    thread_id = Ecto.UUID.generate()
+    {:ok, conn} = Mint.HTTP.connect(:http, "127.0.0.1", port, mode: :passive, protocols: [:http1])
+
+    headers = [
+      {"authorization", setup.authorization},
+      {"content-type", "application/json"},
+      {"accept", "text/event-stream"},
+      {"session-id", thread_id},
+      {"originator", "codex_cli_rs"}
+    ]
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => native_text_input("synthetic visible stamp turn"),
+      "stream" => true,
+      "client_metadata" => %{
+        "x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"session_id" => thread_id, "thread_id" => thread_id, "turn_id" => "visible-stamp-turn", "request_kind" => "turn"})
+      }
+    }
+
+    {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", @native_path, headers, CodexPooler.JSON.encode!(payload))
+    on_exit(fn -> Mint.HTTP.close(conn) end)
+    %{conn: conn, ref: ref, status: nil, body: "", outcome: nil}
+  end
+
+  # Collects what arrives within a short quiet period without requiring more.
+  defp read_quietly(%{outcome: nil} = client) do
+    case recv(client, @quiet_read_ms) do
+      {:timeout, client} -> client
+      {:ok, client} -> read_quietly(client)
+    end
+  end
+
+  defp read_quietly(client), do: client
+
+  defp read_to_end(%{outcome: nil} = client), do: client |> recv!() |> read_to_end()
+  defp read_to_end(client), do: client
+
+  defp recv!(client) do
+    {_result, client} = recv(client, @detection_timeout_ms)
+    client
+  end
+
+  defp recv(%{conn: conn, ref: ref} = client, timeout_ms) do
+    case Mint.HTTP.recv(conn, 0, timeout_ms) do
+      {:ok, conn, responses} ->
+        {:ok, Enum.reduce(responses, %{client | conn: conn}, &apply_response(&1, &2, ref))}
+
+      {:error, conn, %Mint.TransportError{reason: :timeout}, responses} when timeout_ms == @quiet_read_ms ->
+        {:timeout, Enum.reduce(responses, %{client | conn: conn}, &apply_response(&1, &2, ref))}
+
+      {:error, conn, reason, responses} ->
+        client = Enum.reduce(responses, %{client | conn: conn}, &apply_response(&1, &2, ref))
+        {:ok, %{client | outcome: {:error, reason}}}
+    end
+  end
+
+  defp apply_response({:status, ref, status}, client, ref), do: %{client | status: status}
+  defp apply_response({:data, ref, data}, client, ref), do: %{client | body: client.body <> data}
+  defp apply_response({:done, ref}, client, ref), do: %{client | outcome: :done}
+  defp apply_response(_other, client, _ref), do: client
+
+  defp with_info_log(fun) do
+    previous = Logger.level()
+    on_exit(fn -> Logger.configure(level: previous) end)
+    Logger.configure(level: :info)
+
+    try do
+      with_log([level: :info], fun)
+    after
+      Logger.configure(level: previous)
+    end
+  end
+
+  defp event_types(body) do
+    body
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(&data_event_type/1)
+  end
+
+  defp data_event_type("data: " <> json) do
+    case CodexPooler.JSON.decode(json) do
+      {:ok, %{"type" => type}} -> [type]
+      _other -> []
+    end
+  end
+
+  defp data_event_type(_line), do: []
+
+  # --- rows ----------------------------------------------------------------
+
+  defp pool_requests(setup), do: Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+
+  defp turn!(setup) do
+    [request] = pool_requests(setup)
+    Repo.get_by!(CodexTurn, request_id: request.id)
+  end
+
+  defp settled_request!(setup), do: await_settled!(setup, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+
+  defp await_settled!(setup, deadline) do
+    case pool_requests(setup) do
+      [%Request{status: status} = request] when status not in ["accepted", "in_progress"] ->
+        request
+
+      requests ->
+        if System.monotonic_time(:millisecond) >= deadline,
+          do: flunk("the request never settled: #{inspect(Enum.map(requests, & &1.status))}"),
+          else: Process.sleep(10) && await_settled!(setup, deadline)
+    end
+  end
+
+  defp recorded_settlements(request) do
+    Repo.all(
+      from(entry in LedgerEntry,
+        where: entry.request_id == ^request.id and entry.entry_kind == "settlement" and entry.amount_status == "recorded",
+        select: {entry.usage_status, entry.total_tokens}
+      )
+    )
+  end
+
+  # --- events --------------------------------------------------------------
+
+  defp created_event, do: {"response.created", %{"type" => "response.created", "response" => %{"id" => @response_id, "status" => "in_progress"}}}
+
+  defp delta_event,
+    do: {"response.output_text.delta", %{"type" => "response.output_text.delta", "response_id" => @response_id, "output_index" => 0, "content_index" => 0, "delta" => "synthetic stamped text"}}
+
+  defp completed_event do
+    {"response.completed",
+     %{
+       "type" => "response.completed",
+       "response" => %{"id" => @response_id, "status" => "completed", "output" => [], "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}}
+     }}
+  end
+end
+
+defmodule CodexPoolerWeb.Runtime.VisibleOutputLifecycleContentionTest do
+  use CodexPoolerWeb.ConnCase, async: false
+  import Ecto.Query
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport, only: [gateway_setup: 1, native_text_input: 1, start_upstream: 1]
+  import CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport
+  alias CodexPooler.Accounting.{LedgerEntry, Request}
+  alias CodexPooler.{FakeUpstream, Repo}
+  alias CodexPooler.Gateway.Persistence.CodexTurn
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder.ERPCNodeClient
+  alias Ecto.Adapters.SQL.Sandbox
+  @detection_timeout_ms 15_000
+
+  setup_all do
+    %{peer: start_shared_bridge_peer!()}
+  end
+
+  setup do
+    Sandbox.mode(Repo, :auto)
+    on_exit(fn -> Sandbox.mode(Repo, :manual) end)
+    CodexPooler.TestAppEnv.restore_on_exit(:websocket_owner_forwarding_enabled)
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+    CodexPooler.AccountsFixtures.committed_bootstrap_owner_fixture!()
+    :ok
+  end
+
+  @tag slow: "holds actual PostgreSQL lifecycle authorization through the original five-second boundary"
+  @tag lifecycle_barrier_lock_regression: true
+  test "remote lifecycle contention withholds output while its owner and upstream remain alive", %{peer: peer} do
+    fixture = lifecycle_fixture!(peer)
+    holder = start_supervised!({Postgrex, connection_options()}, id: :lifecycle_holder)
+    observer = start_supervised!({Postgrex, connection_options()}, id: :lifecycle_observer)
+    Postgrex.query!(holder, "BEGIN", [])
+
+    try do
+      %{rows: [[holder_backend]]} = Postgrex.query!(holder, "SELECT pg_backend_pid()", [])
+      Postgrex.query!(holder, "SELECT id FROM requests WHERE id=$1 FOR UPDATE", [Ecto.UUID.dump!(fixture.authority.request_id)])
+      send(fixture.server, {:fake_upstream_release_websocket, fixture.release})
+      waiter = await_writer_wait!(observer, holder_backend, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+      refute waiter == holder_backend
+      assert :ok = GenServer.call(fixture.owner, {:writer_lifecycle_barrier, fixture.active_ref}, 1_000)
+      assert %CodexTurn{first_visible_output_at: nil} = Repo.get_by!(CodexTurn, request_id: fixture.authority.request_id)
+      refute_receive {:websocket_owner_frame, _, _, _, {:data, _}}, 0
+      forged = CodexPooler.JSON.encode!(%{"type" => "response.created", "response" => %{"id" => "resp_synthetic_forged", "status" => "in_progress"}})
+      send(fixture.owner, {:websocket_owner_authorized_frame, fixture.active_ref, make_ref(), Map.take(fixture.authority, [:request_id, :attempt_id, :replay_generation]), forged, %CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator{}, :not_committed})
+      assert :ok = GenServer.call(fixture.owner, {:writer_lifecycle_barrier, fixture.active_ref}, 1_000)
+      refute_receive {:websocket_owner_frame, _, _, _, {:data, ^forged}}, 0
+      %{active_turn: %{writer_capability: capability}} = :erpc.call(peer, :sys, :get_state, [fixture.owner, 1_000])
+      stale_authority = fixture.authority |> Map.take([:request_id, :attempt_id, :replay_generation]) |> Map.update!(:replay_generation, &(&1 + 1))
+      send(fixture.owner, {:websocket_owner_authorized_frame, fixture.active_ref, capability, stale_authority, forged, %CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.TerminalDiscriminator{}, :not_committed})
+      assert :ok = GenServer.call(fixture.owner, {:writer_lifecycle_barrier, fixture.active_ref}, 1_000)
+      refute_receive {:websocket_owner_frame, _, _, _, {:data, ^forged}}, 0
+      boundary = make_ref()
+      Process.send_after(self(), {:original_lifecycle_boundary, boundary}, 5_000)
+      assert_receive {:original_lifecycle_boundary, ^boundary}, @detection_timeout_ms
+      assert :erpc.call(peer, Process, :alive?, [fixture.upstream])
+      assert :erpc.call(peer, Process, :alive?, [fixture.owner])
+      assert :ok = GenServer.call(fixture.owner, {:writer_lifecycle_barrier, fixture.active_ref}, 1_000)
+      refute_receive {:websocket_owner_frame, _, _, _, {:data, _}}, 0
+      CodexPooler.TestDiagnostics.puts("lifecycle_pg_wait holder_backend=#{holder_backend} waiter_backend=#{waiter} owner_responsive=true original_5000ms_preserved=true")
+    after
+      Postgrex.query!(holder, "COMMIT", [])
+    end
+
+    {socket, types} = drain_frames!(fixture.socket, [])
+    assert Enum.count(types, &(&1 == "response.created")) == 1
+    assert Enum.count(types, &(&1 == "response.output_text.delta")) == 1
+    assert Enum.count(types, &(&1 == "response.completed")) == 1
+    assert {:ok, _} = receive_owner_socket_complete(socket)
+    request = await_settled!(fixture.authority.request_id, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+    assert {request.status, request.usage_status} == {"succeeded", "usage_known"}
+    assert Repo.all(from e in LedgerEntry, where: e.request_id == ^request.id and e.entry_kind == "settlement", select: {e.usage_status, e.total_tokens}) == [{"usage_known", 5}]
+    assert %CodexTurn{final_attempt_id: attempt, first_visible_output_at: %DateTime{}} = Repo.get_by!(CodexTurn, request_id: request.id)
+    assert attempt == fixture.authority.attempt_id
+    assert FakeUpstream.count(fixture.provider) == 1
+    assert :erpc.call(peer, Process, :alive?, [fixture.upstream])
+    assert :erpc.call(peer, Process, :alive?, [fixture.owner])
+  end
+
+  @tag lifecycle_barrier_lock_regression: true
+  test "cancelled lifecycle authorization never forwards an unapproved frame", %{peer: peer} do
+    fixture = lifecycle_fixture!(peer)
+    holder = start_supervised!({Postgrex, connection_options()}, id: :cancel_holder)
+    observer = start_supervised!({Postgrex, connection_options()}, id: :cancel_observer)
+    Postgrex.query!(holder, "BEGIN", [])
+
+    try do
+      %{rows: [[backend]]} = Postgrex.query!(holder, "SELECT pg_backend_pid()", [])
+      Postgrex.query!(holder, "SELECT id FROM requests WHERE id=$1 FOR UPDATE", [Ecto.UUID.dump!(fixture.authority.request_id)])
+      send(fixture.server, {:fake_upstream_release_websocket, fixture.release})
+      writer = await_writer_wait!(observer, backend, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+      assert :ok = GenServer.call(fixture.owner, {:writer_lifecycle_barrier, fixture.active_ref}, 1_000)
+      # The owner has handled everything sent before that call and the writer, the only frame producer, waits in the
+      # database: nothing may have been forwarded while its authorization waited.
+      refute_receive {:websocket_owner_frame, _, _, _, {:data, _}}, 0
+      assert %{rows: [[true]]} = Postgrex.query!(observer, "SELECT pg_cancel_backend($1)", [writer])
+      CodexPooler.TestDiagnostics.puts("lifecycle_cancel actual_writer_backend=#{writer} cancellation_confirmed=true")
+    after
+      Postgrex.query!(holder, "COMMIT", [])
+    end
+
+    # What the stand-in client was sent, before and after the cancel: nothing. Every frame of this turn (metadata, created,
+    # delta, completed) is unapproved once its authorization failed, and the turn ends with `:complete` alone.
+    assert {{:ok, _socket}, frames} = receive_owner_socket_complete_frames(fixture.socket)
+    assert frames == []
+    request = await_settled!(fixture.authority.request_id, System.monotonic_time(:millisecond) + @detection_timeout_ms)
+    # The retiring owner settles the turn it holds as an owner crash before it answers it, so the record is its interruption
+    # (499, turn `interrupted`), never the socket's 502 fallback. That needs the PubSub finalization publishes to on the peer:
+    # a peer without it rolled the interruption back (`interrupt_accounting_failed`) and left the fallback to write the record.
+    assert {request.status, request.response_status_code, request.last_error_code} == {"failed", 499, "owner_crashed"}
+    assert %CodexTurn{status: "interrupted", first_visible_output_at: nil} = Repo.get_by!(CodexTurn, request_id: request.id)
+    assert Repo.aggregate(from(e in LedgerEntry, where: e.request_id == ^request.id and e.entry_kind == "settlement"), :count) == 1
+    assert FakeUpstream.count(fixture.provider) == 1
+    refute_receive {:websocket_owner_frame, _, _, _, {:data, _}}, 0
+  end
+
+  defp lifecycle_fixture!(peer) do
+    release = make_ref()
+    id = "resp_synthetic_lifecycle_contention"
+    events = [%{"type" => "response.created", "response" => %{"id" => id, "status" => "in_progress"}}, %{"type" => "response.output_text.delta", "response_id" => id, "output_index" => 0, "content_index" => 0, "delta" => "synthetic lifecycle output"}, %{"type" => "response.completed", "response" => %{"id" => id, "status" => "completed", "output" => [], "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}}}]
+    frames = Enum.map(events, &CodexPooler.JSON.encode!/1)
+    provider = start_upstream(FakeUpstream.websocket_init_barrier(FakeUpstream.websocket_text_frames(frames), notify: self(), release_ref: release))
+    setup = gateway_setup(provider)
+    {:ok, auth} = CodexPooler.Access.authenticate_authorization_header(setup.authorization)
+    thread = Ecto.UUID.generate()
+    %{owner_pid: owner, session: _session} = start_shared_peer_session_owner!(setup, %{session_header: thread, session_header_source: "x-session-id"}, peer)
+    {:ok, socket} = owner_socket(auth, "synthetic-lifecycle-contention", Ecto.UUID.generate(), session_header: thread, session_header_source: "x-session-id", websocket_owner_forwarder_opts: [node_client: ERPCNodeClient, app_node_names: [Atom.to_string(peer)]])
+    payload = websocket_input_payload(setup, native_text_input("synthetic lifecycle contention"), %{"client_metadata" => %{"x-codex-turn-metadata" => CodexPooler.JSON.encode!(%{"session_id" => thread, "thread_id" => thread, "turn_id" => Ecto.UUID.generate(), "request_kind" => "turn"})}})
+    assert {:ok, socket} = CodexPoolerWeb.CodexResponsesSocket.handle_in({payload, [opcode: :text]}, socket)
+    assert_receive {:fake_upstream_websocket_barrier, :before_init, server, ^release}, @detection_timeout_ms
+    FakeUpstream.set_mode(provider, FakeUpstream.websocket_text_frames(frames))
+    assert %{upstream_pid: upstream, active_turn: %{ref: active_ref, descriptor: %{request_id: request, attempt_id: _} = authority}} = :erpc.call(peer, :sys, :get_state, [owner, 1_000])
+    assert is_binary(request)
+
+    on_exit(fn ->
+      send(server, {:fake_upstream_release_websocket, release})
+      if peer in Node.list(:connected), do: stop_owner!(peer, owner)
+      refute :erpc.call(peer, Process, :alive?, [owner])
+      refute :erpc.call(peer, Process, :alive?, [upstream])
+      CodexPooler.TestDiagnostics.puts("lifecycle_cleanup known_owner_alive=false known_upstream_alive=false")
+    end)
+
+    %{provider: provider, setup: setup, socket: socket, server: server, release: release, owner: owner, upstream: upstream, authority: authority, active_ref: active_ref}
+  end
+
+  # A cancelled lifecycle authorization ends the upstream session, and the owner then retires itself (`owner_crashed`) once it has
+  # settled the turn; its `terminate/2` still runs database transactions after the test body has seen the turn settle. Whether the owner
+  # is idle, retiring or gone when this cleanup runs is scheduling, so finding it alive does not promise a stop will find it alive:
+  # the retirement can win, and `GenServer.stop/3` then exits with the owner's own reason (findings#303 row 303-10, Drone 1814).
+  # The monitor's DOWN, whatever its reason, is what proves the owner is gone.
+  defp stop_owner!(peer, owner) do
+    monitor = Process.monitor(owner)
+
+    try do
+      :erpc.call(peer, GenServer, :stop, [owner, :normal, 5_000])
+    catch
+      :exit, _already_gone_or_retiring -> :ok
+    end
+
+    assert_receive {:DOWN, ^monitor, :process, ^owner, _reason}, @detection_timeout_ms
+  end
+
+  defp connection_options, do: Repo.config() |> Keyword.take([:hostname, :port, :username, :password, :database, :socket_dir])
+
+  defp await_writer_wait!(observer, holder, deadline) do
+    case Postgrex.query!(observer, "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock'", [holder]).rows do
+      [[pid] | _] ->
+        assert %{rows: [[true, true]]} = Postgrex.query!(observer, "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation WHERE l.pid=$1 AND c.relname='requests' AND l.granted), EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation WHERE l.pid=$2 AND c.relname='requests' AND l.granted)", [holder, pid])
+        pid
+
+      [] ->
+        assert System.monotonic_time(:millisecond) < deadline
+
+        receive do
+        after
+          10 -> await_writer_wait!(observer, holder, deadline)
+        end
+    end
+  end
+
+  defp drain_frames!(socket, types) do
+    case receive_owner_socket_raw_push(socket) do
+      {:push, {:text, text}, next} ->
+        type = CodexPooler.JSON.decode!(text)["type"]
+        if type == "response.completed", do: {next, Enum.reverse([type | types])}, else: drain_frames!(next, [type | types])
+    end
+  end
+
+  defp await_settled!(id, deadline) do
+    case Repo.get!(Request, id) do
+      %Request{status: status} = request when status not in ["accepted", "in_progress"] ->
+        request
+
+      _ ->
+        assert System.monotonic_time(:millisecond) < deadline
+
+        receive do
+        after
+          10 -> await_settled!(id, deadline)
+        end
+    end
+  end
+end

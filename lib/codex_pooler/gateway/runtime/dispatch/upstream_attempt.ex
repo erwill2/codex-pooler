@@ -1,17 +1,24 @@
 defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
   @moduledoc false
 
+  alias CodexPooler.Gateway.Admission
+  alias CodexPooler.Gateway.OpenAICompatibility.Error, as: OpenAICompatibilityError
   alias CodexPooler.Gateway.Payloads.ContinuityPayload
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.ModelMetadata
+  alias CodexPooler.Gateway.Runtime.Dispatch.HttpAuthRefresh
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt
   alias CodexPooler.Gateway.Runtime.Dispatch.WebsocketBridge
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Runtime.Streaming.StreamDispatch
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
+  alias CodexPooler.Gateway.Runtime.Streaming.StreamTiming
+  alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
+  alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
   alias CodexPooler.Gateway.Transports.UpstreamDispatch
   alias CodexPooler.Gateway.Transports.UpstreamDispatch.Request, as: DispatchRequest
-  alias CodexPooler.RouteClass
 
   @type callbacks :: %{
           required(:register_continuity) => (term(), term(), term() -> term()),
@@ -21,21 +28,125 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
 
   @spec dispatch(PreparedContext.t(), callbacks()) :: dispatch_result()
   def dispatch(%PreparedContext{context: context} = prepared_context, callbacks) do
-    cond do
-      websocket_upstream?(context.payload, context.request_options.transport) ->
-        dispatch_websocket(prepared_context, callbacks)
+    case Admission.checkpoint() do
+      :ok ->
+        dispatch_admitted(prepared_context, callbacks)
 
-      WebsocketBridge.eligible?(prepared_context) ->
-        dispatch_websocket_bridge(prepared_context, callbacks)
-
-      true ->
-        dispatch_http(prepared_context, callbacks)
+      {:error, error} ->
+        Finalization.Websocket.finalize_failed(context, %{
+          reason: :owner_drained,
+          error: Map.delete(error, :accounting_disposition),
+          body: "",
+          headers: [],
+          started: context.started
+        })
     end
   end
 
-  # A bridged turn that fails before the first upstream event falls back to
-  # plain HTTP dispatch on the same candidate and attempt; after the first
-  # event it finalizes through the standard HTTP streaming path.
+  defp dispatch_admitted(%PreparedContext{context: context} = prepared_context, callbacks) do
+    case transport_decision(context.request_options) do
+      :websocket ->
+        dispatch_websocket(prepared_context, callbacks)
+
+      :websocket_without_upstream ->
+        fail_closed_websocket_transport(prepared_context)
+
+      :http ->
+        cond do
+          WebsocketBridge.eligible?(prepared_context) ->
+            dispatch_websocket_bridge(prepared_context, callbacks)
+
+          public_anchor_over_http?(context.request_options) ->
+            refuse_public_anchor_over_http(prepared_context)
+
+          true ->
+            dispatch_http(prepared_context, callbacks)
+        end
+    end
+  end
+
+  # The provider resolves `previous_response_id` only on the websocket
+  # connection that produced the response and refuses it over HTTP
+  # (findings#232 rows 232-275 and 232-277). A public `/v1` request anchored on
+  # it that is not bridged onto its session's upstream websocket (no session
+  # header, not streaming, owner forwarding off, or a session pinned to another
+  # assignment) can only fail at the provider, so it is answered here, before
+  # any upstream call, with the typed error SDK fallbacks recognise.
+  @spec public_anchor_over_http?(RequestOptions.t()) :: boolean()
+  def public_anchor_over_http?(%RequestOptions{
+        continuity: %{upstream_previous_response_id?: true},
+        openai_compatibility: %{source_endpoint: source_endpoint}
+      })
+      when is_binary(source_endpoint),
+      do: true
+
+  def public_anchor_over_http?(%RequestOptions{}), do: false
+
+  defp refuse_public_anchor_over_http(%PreparedContext{context: context}) do
+    Finalization.Websocket.finalize_failed(context, %{
+      reason: :previous_response_connection_required,
+      error: OpenAICompatibilityError.previous_response_not_found(),
+      body: "",
+      headers: [],
+      started: context.started
+    })
+  end
+
+  @doc """
+  Chooses the upstream transport family for a selected attempt.
+
+  A turn whose request transport is `websocket` never falls back to HTTP: it
+  uses the upstream websocket when it has a downstream writer or a
+  connection-bound compaction collector, whatever its `stream` flag, and has
+  no upstream path otherwise. Every other transport keeps its HTTP decision,
+  where the public streaming bridge is still considered.
+  """
+  @spec transport_decision(RequestOptions.t()) ::
+          :websocket | :websocket_without_upstream | :http
+  def transport_decision(%RequestOptions{transport: %{transport: "websocket"} = transport} = request_options) do
+    if is_function(transport.websocket_writer, 1) or
+         RequestOptions.connection_bound_compaction?(request_options),
+       do: :websocket,
+       else: :websocket_without_upstream
+  end
+
+  def transport_decision(%RequestOptions{}), do: :http
+
+  @doc """
+  The fixed Pooler error for a websocket turn without a websocket upstream path.
+  """
+  @spec websocket_transport_required_error() :: %{
+          status: 500,
+          code: String.t(),
+          message: String.t(),
+          param: nil
+        }
+  def websocket_transport_required_error do
+    %{
+      status: 500,
+      code: "websocket_transport_required",
+      message: "websocket turn requires the websocket upstream transport",
+      param: nil
+    }
+  end
+
+  # Prepared websocket frames are rejected with the same decision before
+  # reservation in `Service`; a direct `Service.execute/4` caller with a
+  # websocket transport and no writer reaches this branch, which settles the
+  # reserved turn instead of posting its frame body to the HTTP endpoint.
+  defp fail_closed_websocket_transport(%PreparedContext{context: context}) do
+    Finalization.Websocket.finalize_failed(context, %{
+      reason: :websocket_transport_required,
+      error: websocket_transport_required_error(),
+      body: "",
+      headers: [],
+      started: context.started
+    })
+  end
+
+  # A bridged turn falls back to plain HTTP only with positive proof that the
+  # failure preceded upstream submission. Silence and ambiguous failures stay
+  # on the websocket attempt and finalize through the standard streaming path.
   defp dispatch_websocket_bridge(%PreparedContext{} = prepared_context, callbacks) do
     case WebsocketBridge.open(prepared_context) do
       {:ok, %PreparedContext{context: context}, response} ->
@@ -48,6 +159,17 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
       {:fallback, reason} ->
         WebsocketBridge.log_fallback(prepared_context, reason)
         dispatch_http(prepared_context, callbacks)
+
+      {:error, %{reason: :provider_credits_policy_denied} = denial} ->
+        Finalization.finalize_policy_denial(denial, prepared_context.context, elapsed_ms(prepared_context.context.started))
+
+      {:error, :owner_unavailable} ->
+        Finalization.Websocket.finalize_failed(prepared_context.context, %{
+          reason: :owner_unavailable,
+          body: "",
+          headers: [],
+          started: prepared_context.context.started
+        })
     end
   end
 
@@ -56,11 +178,18 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
 
     case UpstreamDispatch.http_request(dispatch_request) do
       {:ok, response} ->
-        Finalization.handle_http_response(
-          response,
-          context,
-          finalization_callbacks(callbacks)
-        )
+        # The headers just arrived: stamp when, from this attempt's start, for the stream timing of its row.
+        response = StreamTiming.attach(response, context.started)
+
+        if HttpAuthRefresh.eligible?(prepared_context, response) do
+          HttpAuthRefresh.handle(prepared_context, response, &dispatch_http(&1, callbacks))
+        else
+          Finalization.handle_http_response(
+            response,
+            context,
+            finalization_callbacks(callbacks)
+          )
+        end
 
       {:error, reason} ->
         Finalization.handle_dispatch_error(reason, context, elapsed_ms(context.started))
@@ -73,6 +202,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
     dispatch_request =
       dispatch_request(prepared_context,
         accounting_request: context.reserved.request,
+        accounting_attempt: context.attempt,
         writer: writer,
         original_payload: nil
       )
@@ -92,8 +222,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
       stream_result: fn response, context ->
         StreamDispatch.streaming_result(response, context, %{
           finalization_callbacks: finalization_callbacks(callbacks),
-          http_first_event_retry:
-            StreamLifecycle.http_first_event_retry(Map.fetch!(callbacks, :retry_dispatch))
+          http_first_event_retry: StreamLifecycle.http_first_event_retry(Map.fetch!(callbacks, :retry_dispatch))
         })
       end
     }
@@ -106,13 +235,29 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
       upstream_payload: prepared_context.upstream_payload,
       original_payload: Keyword.get(opts, :original_payload, context.payload),
       identity: context.identity,
-      accounting_request: Keyword.get(opts, :accounting_request),
+      provider_credits_context: ProviderCreditsAdmission.from_selected(context),
+      routing_hint_authorized?: prepared_context.routing_hint_authorized?,
+      accounting_request: Keyword.get(opts, :accounting_request, context.reserved.request),
+      accounting_attempt: Keyword.get(opts, :accounting_attempt, context.attempt),
       writer: Keyword.get(opts, :writer),
-      assignment_advertised?:
-        ModelMetadata.assignment_source?(context.model, context.assignment.id),
-      request_options: context.request_options
+      assignment_advertised?: ModelMetadata.assignment_source?(context.model, context.assignment.id),
+      native_codex_response_control: native_codex_response_control(context),
+      request_options: context.request_options,
+      client_retry_dispatch_authority: context.client_retry_dispatch_authority
     }
   end
+
+  defp native_codex_response_control(%{
+         route_state: route_state,
+         request_options: %{transport: %{transport: "websocket"}}
+       }) do
+    case RouteState.codex_models_etag(route_state) do
+      models_etag when is_binary(models_etag) -> %TurnSnapshot{models_etag: models_etag}
+      nil -> nil
+    end
+  end
+
+  defp native_codex_response_control(_context), do: nil
 
   defp release_websocket_payload(%PreparedContext{context: context} = prepared_context) do
     %{prepared_context | context: %{context | payload: continuity_payload(context.payload)}}
@@ -126,11 +271,6 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
       nil ->
         %{}
     end
-  end
-
-  defp websocket_upstream?(payload, opts) do
-    opts.transport == "websocket" and RouteClass.streaming?(payload) and
-      is_function(opts.websocket_writer, 1)
   end
 
   defp elapsed_ms(started), do: max(System.monotonic_time(:millisecond) - started, 0)

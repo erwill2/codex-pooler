@@ -1,19 +1,27 @@
 defmodule CodexPoolerWeb.Admin.PoolsLive do
   use CodexPoolerWeb, :admin_live_view
 
-  alias CodexPooler.Admin.PoolWorkflow
+  alias CodexPooler.Admin.{PoolTrafficGate, PoolWorkflow}
+  alias CodexPooler.Catalog
   alias CodexPooler.Events
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolForm
   alias CodexPoolerWeb.Admin.PoolListComponents
   alias CodexPoolerWeb.Admin.PoolsReadModel
   alias CodexPoolerWeb.Admin.PoolWizardComponents
 
-  @pool_event_topics ["pools", "upstreams", "usage"]
+  @pool_event_topics ["model_sync", "pools", "upstreams", "usage"]
   @pool_traffic_refresh_delay_ms 1_000
+  @pool_traffic_load_cooldown_ms 1_000
+  @pool_traffic_fallback_refresh_ms 60_000
+  @edit_pool_id_param "edit_pool_id"
+  @pool_editor_step_param "step"
 
   @impl true
   def mount(_params, _session, socket) do
@@ -25,14 +33,24 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
        can_manage_pools?: false,
        creating_pool: false,
        editing_pool: nil,
+       pool_editor_mode: nil,
        deleting_pool: nil,
        delete_form_version: 0,
        create_form: PoolForm.create_form(),
        edit_form: nil,
+       model_serving_form: nil,
+       model_serving_snapshot: nil,
+       model_serving_models: [],
+       model_serving_status: :idle,
+       model_serving_dirty?: false,
+       model_serving_sync_pending?: false,
+       model_serving_pending_attrs: nil,
+       model_serving_load_token: nil,
        delete_form: PoolForm.delete_form(),
        pool_wizard_step: "details",
        pool_filters: PoolForm.filter(),
        pool_filter_form: PoolForm.filter_form(),
+       pool_filters_loaded?: false,
        pool_compat_panels: %{},
        pool_metrics: PoolsReadModel.empty_metrics(),
        data_load_warnings: [],
@@ -41,13 +59,27 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
        pool_traffic_refresh_timer: nil,
        pool_traffic_refresh_token: nil,
        traffic_pool_ids: [],
+       pool_traffic_viewport_ids: MapSet.new(),
        pool_traffic_usage: nil,
        pool_traffic_loading?: true,
        pool_traffic_running?: false,
-       pool_traffic_rerun?: false
+       pool_traffic_rerun?: false,
+       pool_traffic_cooldown_timer: nil,
+       pool_traffic_cooldown_token: nil
      )
-     |> load_structural()
-     |> start_pool_traffic_load()}
+     |> NotificationCenterHooks.follow_viewer_visibility()
+     |> maybe_start_connected_refresh()}
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    socket =
+      socket
+      |> apply_pool_filters(PoolForm.filter(params))
+      |> apply_pool_editor_permalink(params)
+      |> canonicalize_pool_url(params)
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -110,35 +142,79 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
   end
 
   def handle_event("edit_pool", %{"id" => pool_id}, socket) do
+    case editable_pool(socket, pool_id) do
+      {:ok, pool} ->
+        {:noreply,
+         push_patch(socket,
+           to: pool_path(socket.assigns.pool_filters, pool, "details")
+         )}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, error_message(reason))}
+    end
+  end
+
+  def handle_event("edit_pool_models", %{"id" => pool_id}, socket) do
     case find_pool(socket, pool_id) do
       nil ->
         {:noreply, put_flash(socket, :error, "Pool was not found")}
 
       pool ->
-        {:noreply,
-         socket
-         |> close_create_dialog()
-         |> assign(:editing_pool, pool)
-         |> assign(:edit_form, PoolForm.edit_form(pool))
-         |> assign(:pool_wizard_step, "details")
-         |> clear_deleting()
-         |> defer_pool_traffic_refresh()}
+        case ensure_can_operate_pool(socket, pool) do
+          :ok ->
+            {:noreply,
+             socket
+             |> close_create_dialog()
+             |> assign(:editing_pool, pool)
+             |> assign(:pool_editor_mode, :models)
+             |> assign(:edit_form, PoolForm.edit_form(pool))
+             |> assign(:pool_wizard_step, "models")
+             |> clear_deleting()
+             |> begin_model_serving_load(pool)
+             |> defer_pool_traffic_refresh()}
+
+          {:error, reason} ->
+            {:noreply, put_flash(socket, :error, error_message(reason))}
+        end
     end
   end
 
   def handle_event("pool_wizard_step", %{"step" => step}, socket) do
-    {:noreply, assign(socket, :pool_wizard_step, PoolWizardComponents.normalize_step(step))}
+    mode =
+      cond do
+        socket.assigns.creating_pool -> :create
+        socket.assigns.pool_editor_mode == :models -> :models
+        true -> :edit
+      end
+
+    step = PoolWizardComponents.normalize_step(step, mode)
+
+    if mode == :edit && socket.assigns.editing_pool do
+      {:noreply,
+       push_patch(socket,
+         to: pool_path(socket.assigns.pool_filters, socket.assigns.editing_pool, step)
+       )}
+    else
+      {:noreply, assign(socket, :pool_wizard_step, step)}
+    end
   end
 
   def handle_event("cancel_edit", _params, socket) do
-    {:noreply, socket |> clear_editing() |> flush_deferred_pool_traffic_refresh()}
+    permalink_editor? = socket.assigns.pool_editor_mode == :edit
+    socket = socket |> clear_editing() |> flush_deferred_pool_traffic_refresh()
+
+    if permalink_editor? do
+      {:noreply, push_patch(socket, to: pool_path(socket.assigns.pool_filters))}
+    else
+      {:noreply, socket}
+    end
   end
 
   def handle_event("save_pool", %{"pool_edit" => pool_params}, socket) do
     pool_id = pool_params["id"]
 
     with :ok <- ensure_can_manage_pools(socket),
-         {:ok, _pool} <-
+         {:ok, pool} <-
            PoolWorkflow.update_pool_with_related_settings(
              socket.assigns.current_scope,
              pool_id,
@@ -148,7 +224,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
        socket
        |> put_flash(:info, "Pool updated")
        |> clear_pool_traffic_refresh()
-       |> clear_editing()
+       |> assign(editing_pool: pool, edit_form: PoolForm.edit_form(pool))
        |> load_structural()
        |> start_pool_traffic_load()}
     else
@@ -170,6 +246,73 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
          socket
          |> put_flash(:error, error_message(reason))
          |> assign(:edit_form, PoolForm.edit_form(socket.assigns.editing_pool, pool_params))}
+    end
+  end
+
+  def handle_event(
+        "validate_pool_model_serving",
+        %{"pool_model_serving" => attrs},
+        socket
+      ) do
+    if socket.assigns.editing_pool && socket.assigns.model_serving_snapshot do
+      {:noreply,
+       socket
+       |> assign(
+         :model_serving_form,
+         PoolForm.model_serving_form(
+           socket.assigns.model_serving_snapshot,
+           socket.assigns.model_serving_models,
+           attrs
+         )
+       )
+       |> assign(model_serving_dirty?: true, model_serving_pending_attrs: attrs)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("save_pool_model_serving", %{"pool_model_serving" => attrs}, socket) do
+    submission = PoolForm.model_serving_submission(attrs)
+    pool = socket.assigns.editing_pool
+
+    with %{} <- pool,
+         :ok <- ensure_can_operate_pool(socket, pool),
+         {:ok, _result} <-
+           Pools.update_model_serving_modes(
+             socket.assigns.current_scope,
+             pool,
+             submission.rows,
+             submission.revision
+           ) do
+      {:noreply,
+       socket
+       |> put_flash(:info, "Model serving modes updated")
+       |> clear_pool_traffic_refresh()
+       |> assign(pool_wizard_step: "models", model_serving_dirty?: false)
+       |> begin_model_serving_load(pool, reset?: false)}
+    else
+      nil ->
+        {:noreply, put_flash(socket, :error, "Pool was not found")}
+
+      {:error, reason} ->
+        socket = put_flash(socket, :error, error_message(reason))
+
+        if match?(%{code: :stale_revision}, reason) do
+          {:noreply,
+           socket
+           |> assign(pool_wizard_step: "models", model_serving_dirty?: true)
+           |> begin_model_serving_load(pool, reset?: false, pending_attrs: attrs)}
+        else
+          socket = reproject_model_serving_error(socket, attrs)
+
+          {:noreply,
+           assign(socket,
+             pool_wizard_step: "models",
+             model_serving_status: model_serving_error_status(reason),
+             model_serving_dirty?: true,
+             model_serving_pending_attrs: attrs
+           )}
+        end
     end
   end
 
@@ -240,11 +383,18 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     confirmation_slug = pool_params["confirmation_slug"]
 
     with :ok <- ensure_can_manage_pools(socket),
-         {:ok, _pool} <-
+         {status, _pool} when status in [:ok, :deleting] <-
            Pools.delete_archived_pool(socket.assigns.current_scope, pool_id, confirmation_slug) do
+      # A Pool with a large history is deleted by a background job; its card shows it as
+      # deleting until the job removes it (findings#206 row 206-550).
+      message =
+        if status == :ok,
+          do: "Pool deleted",
+          else: "Pool deletion started. The Pool disappears once its request history has been removed."
+
       {:noreply,
        socket
-       |> put_flash(:info, "Pool deleted")
+       |> put_flash(:info, message)
        |> clear_pool_traffic_refresh()
        |> clear_deleting()
        |> load_structural()
@@ -259,31 +409,104 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     end
   end
 
+  # A disabled or archived Pool is restored to active from its card; the
+  # editor opens only active Pools (findings#206 row 206-318). The status
+  # change is owner-only, audited, and invalidates the notification centers
+  # inside `Pools.change_pool_status/3`. The Pool is re-read first, so a card
+  # that is behind another owner's reactivation changes nothing.
+  def handle_event("reactivate_pool", %{"id" => pool_id}, socket) do
+    with :ok <- ensure_can_manage_pools(socket),
+         %{} = listed_pool <- find_pool(socket, pool_id),
+         :ok <- ensure_inactive_pool(Pools.get_pool(listed_pool.id)),
+         {:ok, _pool} <- Pools.change_pool_status(socket.assigns.current_scope, listed_pool.id, "active") do
+      {:noreply,
+       socket
+       |> put_flash(:info, "Pool reactivated")
+       |> clear_pool_traffic_refresh()
+       |> load_structural()
+       |> start_pool_traffic_load()}
+    else
+      nil ->
+        {:noreply, put_flash(socket, :error, "Pool was not found")}
+
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, error_message(reason))
+         |> load_structural()}
+    end
+  end
+
   def handle_event("filter_pools", %{"pool_filters" => filter_params}, socket) do
-    {:noreply, apply_pool_filters(socket, PoolForm.filter(filter_params))}
+    filters = PoolForm.filter(filter_params)
+
+    {:noreply,
+     push_patch(socket,
+       to: pool_path(filters, current_permalink_editor(socket), socket.assigns.pool_wizard_step),
+       replace: true
+     )}
   end
 
   def handle_event("clear_pool_query_filter", _params, socket) do
     filters = PoolForm.filter(Map.put(socket.assigns.pool_filters, "query", ""))
 
-    {:noreply, apply_pool_filters(socket, filters)}
+    {:noreply,
+     push_patch(socket,
+       to: pool_path(filters, current_permalink_editor(socket), socket.assigns.pool_wizard_step),
+       replace: true
+     )}
   end
 
   def handle_event("select_pool_status_filter", %{"status" => status}, socket) do
     filters = PoolForm.filter(Map.put(socket.assigns.pool_filters, "status", status))
 
-    {:noreply, apply_pool_filters(socket, filters)}
+    {:noreply,
+     push_patch(socket,
+       to: pool_path(filters, current_permalink_editor(socket), socket.assigns.pool_wizard_step)
+     )}
   end
 
   def handle_event("select_pool_traffic_window_filter", %{"window" => window}, socket) do
     filters = PoolForm.filter(Map.put(socket.assigns.pool_filters, "traffic_window", window))
 
-    {:noreply, apply_pool_filters(socket, filters)}
+    {:noreply,
+     push_patch(socket,
+       to: pool_path(filters, current_permalink_editor(socket), socket.assigns.pool_wizard_step)
+     )}
   end
+
+  def handle_event(
+        "set_pool_traffic_visibility",
+        %{"pool_id" => pool_id, "visible" => visible} = params,
+        socket
+      )
+      when map_size(params) == 2 and is_binary(pool_id) and is_boolean(visible) do
+    if rendered_pool_id?(socket, pool_id) do
+      previous_eligible_ids = eligible_pool_traffic_ids(socket)
+
+      socket =
+        socket
+        |> update_pool_traffic_visibility(pool_id, visible)
+        |> prune_pool_traffic_state()
+        |> apply_pool_traffic()
+        |> reconcile_pool_histogram_states(:loading)
+
+      if eligible_pool_traffic_ids(socket) == previous_eligible_ids do
+        {:noreply, socket}
+      else
+        {:noreply, start_pool_traffic_load(socket)}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("set_pool_traffic_visibility", _params, socket), do: {:noreply, socket}
 
   @impl true
   def handle_info({Events, %{pool_id: pool_id, topics: topics}}, socket) do
     case pool_event_kind(topics, pool_id) do
+      :model_sync -> {:noreply, reload_model_serving_or_defer(socket, pool_id)}
       :lifecycle -> {:noreply, reload_pools_or_defer(socket)}
       :usage -> {:noreply, schedule_pool_traffic_refresh(socket)}
       :ignore -> {:noreply, socket}
@@ -291,27 +514,27 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
   end
 
   def handle_info({:refresh_pool_traffic, refresh_token}, socket) do
-    if socket.assigns.pool_traffic_refresh_token == refresh_token do
-      {:noreply,
-       socket
-       |> clear_pool_traffic_refresh()
-       |> start_pool_traffic_load()}
-    else
-      {:noreply, socket}
+    cond do
+      socket.assigns.pool_traffic_refresh_token != refresh_token ->
+        {:noreply, socket}
+
+      # A debounce armed before the operator paused must not redraw the panel
+      # they paused to read.
+      LiveUpdatesHooks.paused?(socket) ->
+        {:noreply, socket |> clear_pool_traffic_refresh() |> LiveUpdatesHooks.hold()}
+
+      true ->
+        {:noreply, socket |> clear_pool_traffic_refresh() |> start_pool_traffic_load()}
     end
   end
 
-  def handle_info(_message, socket), do: {:noreply, socket}
-
-  @impl true
-  def handle_async(:pool_traffic, {:ok, traffic}, socket) do
-    socket = assign(socket, :pool_traffic_running?, false)
-
-    if traffic.traffic_window == current_traffic_window(socket) do
+  def handle_info({:pool_traffic_cooldown_elapsed, cooldown_token}, socket) do
+    if socket.assigns.pool_traffic_cooldown_token == cooldown_token do
       socket =
-        socket
-        |> assign(pool_traffic_usage: traffic.usage_by_pool_id, pool_traffic_loading?: false)
-        |> apply_pool_traffic()
+        assign(socket,
+          pool_traffic_cooldown_timer: nil,
+          pool_traffic_cooldown_token: nil
+        )
 
       if socket.assigns.pool_traffic_rerun? do
         {:noreply, start_pool_traffic_load(socket)}
@@ -319,29 +542,137 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
         {:noreply, socket}
       end
     else
-      # The traffic window changed while this result was in flight; the stale
-      # aggregate must not merge, so discard it and load the current window.
-      {:noreply, start_pool_traffic_load(socket)}
+      {:noreply, socket}
     end
   end
 
-  def handle_async(:pool_traffic, {:exit, _reason}, socket) do
-    socket = assign(socket, :pool_traffic_running?, false)
+  # Gateway usage events remain the fast path. This conservative fallback lets
+  # rolling-window rows age out, and retries a failed async read, even when the
+  # instance is otherwise quiet. It keeps ticking while paused so resume can
+  # catch up immediately, but the refresh itself stays behind the global gate.
+  def handle_info(:fallback_refresh_pool_traffic, socket) do
+    schedule_pool_traffic_fallback_refresh()
+    LiveUpdatesHooks.unless_paused(socket, &start_pool_traffic_load/1)
+  end
 
-    if socket.assigns.pool_traffic_rerun? do
-      {:noreply, start_pool_traffic_load(socket)}
+  # Cancelling the timer, not clearing the refresh: a replayed usage event has
+  # just armed the traffic debounce and leaving its token alive lets it fire a
+  # second async load behind this one, but `pool_traffic_dirty?` is not part of
+  # that — it is how a lifecycle event deferred behind an open dialog is
+  # remembered until the dialog closes. Clearing it here dropped the structural
+  # reload that deferral was protecting.
+  def handle_info(:live_updates_resumed, socket) do
+    {:noreply, socket |> cancel_pool_traffic_refresh_timer() |> start_pool_traffic_load()}
+  end
+
+  # The viewer's role or visible Pools changed while the page is open: a
+  # demoted owner loses the owner controls and the Pools it no longer sees, a
+  # newly assigned admin gets the new Pool's card (findings#206 row 206-325).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    {:noreply, follow_viewer_visibility_change(socket)}
+  end
+
+  def handle_info(_message, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_async(
+        {:pool_model_serving, load_token, pool_id},
+        {:ok, {:ok, data}},
+        socket
+      ) do
+    if socket.assigns.model_serving_load_token == load_token and
+         match?(%{id: ^pool_id}, socket.assigns.editing_pool) do
+      {:noreply, apply_model_serving_load(socket, data)}
     else
-      # Without merged usage the structural zeros are placeholders, not data:
-      # keep the loading affordance instead of presenting them as settled.
-      {:noreply,
-       assign(socket, :pool_traffic_loading?, is_nil(socket.assigns.pool_traffic_usage))}
+      {:noreply, socket}
     end
+  end
+
+  def handle_async(
+        {:pool_model_serving, load_token, pool_id},
+        result,
+        socket
+      )
+      when result in [{:ok, {:error, :load_failed}}, {:exit, :normal}] do
+    if socket.assigns.model_serving_load_token == load_token and
+         match?(%{id: ^pool_id}, socket.assigns.editing_pool) do
+      {:noreply, model_serving_load_error(socket)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_async({:pool_model_serving, load_token, pool_id}, {:exit, _reason}, socket) do
+    if socket.assigns.model_serving_load_token == load_token and
+         match?(%{id: ^pool_id}, socket.assigns.editing_pool) do
+      {:noreply, model_serving_load_error(socket)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def handle_async(:pool_traffic, {:ok, {:ok, traffic, cooldown_ms}}, socket) do
+    socket =
+      socket
+      |> assign(:pool_traffic_running?, false)
+      |> schedule_pool_traffic_load_cooldown(cooldown_ms)
+
+    if traffic.traffic_window == current_traffic_window(socket) do
+      eligible_ids = eligible_pool_traffic_ids(socket)
+      active_result_ids = MapSet.intersection(traffic.eligible_pool_ids, eligible_ids)
+      usage = filter_pool_traffic_histograms(traffic.usage, active_result_ids)
+
+      socket =
+        socket
+        |> assign(pool_traffic_usage: usage, pool_traffic_loading?: false)
+        |> apply_pool_traffic()
+        |> reconcile_pool_histogram_states(:loading)
+
+      {:noreply, socket}
+    else
+      # The traffic window changed while this result was in flight; the stale
+      # aggregate must not merge. Queue the current window behind the same
+      # cooldown that bounds every other completed traffic load.
+      {:noreply, assign(socket, :pool_traffic_rerun?, true)}
+    end
+  end
+
+  def handle_async(:pool_traffic, {:ok, {:busy, retry_after_ms}}, socket) do
+    {:noreply,
+     socket
+     |> assign(pool_traffic_running?: false, pool_traffic_rerun?: true)
+     |> schedule_pool_traffic_load_cooldown(retry_after_ms)}
+  end
+
+  def handle_async(:pool_traffic, {:ok, {:error, :stale_owner}}, socket) do
+    {:noreply,
+     socket
+     |> assign(pool_traffic_running?: false, pool_traffic_rerun?: true)
+     |> schedule_pool_traffic_load_cooldown(@pool_traffic_load_cooldown_ms)}
+  end
+
+  def handle_async(:pool_traffic, {:ok, {:error, :gate_unavailable}}, socket) do
+    {:noreply,
+     socket
+     |> assign(:pool_traffic_running?, false)
+     |> schedule_pool_traffic_load_cooldown(@pool_traffic_load_cooldown_ms)
+     |> pool_traffic_load_error()}
+  end
+
+  def handle_async(:pool_traffic, {:exit, _reason}, socket) do
+    {:noreply,
+     socket
+     |> assign(:pool_traffic_running?, false)
+     |> schedule_pool_traffic_load_cooldown(@pool_traffic_load_cooldown_ms)
+     |> pool_traffic_load_error()}
   end
 
   defp pool_event_kind(topics, pool_id) when is_list(topics) and is_binary(pool_id) do
     case Events.validate_topics(topics) do
       {:ok, topics} ->
         cond do
+          "model_sync" in topics -> :model_sync
           Enum.any?(topics, &(&1 in ["pools", "upstreams"])) -> :lifecycle
           "usage" in topics -> :usage
           true -> :ignore
@@ -362,12 +693,13 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
       current_scope={@current_scope}
       active_nav={:pools}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-pools-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="pool-page-header"
           title="Pools"
-          description="Create and manage the Pools that group API keys, upstream accounts, routing policy, and logs."
+          description="A Pool groups upstream accounts behind shared API keys, routing, and serving modes."
         >
           <:actions>
             <AdminComponents.action_button
@@ -451,17 +783,23 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
           current_step={@pool_wizard_step}
           upstream_options={@upstream_identity_options}
           api_key_options={@api_key_options}
+          model_serving_form={nil}
+          model_serving_status={:idle}
+          model_serving_dirty?={false}
+          model_serving_sync_pending?={false}
         />
 
         <PoolWizardComponents.pool_wizard
           :if={@editing_pool}
-          mode={:edit}
+          mode={@pool_editor_mode || :edit}
           form={@edit_form}
           current_step={@pool_wizard_step}
-          upstream_options={
-            PoolForm.edit_upstream_identity_options(@editing_pool, @upstream_identity_options)
-          }
+          upstream_options={PoolForm.edit_upstream_identity_options(@editing_pool, @upstream_identity_options)}
           api_key_options={@api_key_options}
+          model_serving_form={@model_serving_form}
+          model_serving_status={@model_serving_status}
+          model_serving_dirty?={@model_serving_dirty?}
+          model_serving_sync_pending?={@model_serving_sync_pending?}
         />
 
         <PoolListComponents.pool_inventory
@@ -471,6 +809,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
           pool_filter_form={@pool_filter_form}
           pools={@pools}
           can_manage_pools?={@can_manage_pools?}
+          can_operate_pools?={@can_operate_pools?}
           compat_panel_views={@pool_compat_panels}
         />
       </section>
@@ -488,30 +827,50 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     socket
     |> assign(page_state)
     |> maybe_subscribe_pool_events(page_state.pools)
+    |> prune_pool_traffic_state()
     |> apply_pool_traffic()
+    |> reconcile_pool_histogram_states(:loading)
   end
 
   defp apply_pool_filters(socket, filters) do
-    previous_window = current_traffic_window(socket)
+    initial_transition? = not socket.assigns.pool_filters_loaded?
+    previous_filters = pool_filter_tuple(socket.assigns.pool_filters)
+    next_filters = pool_filter_tuple(filters)
 
     socket =
       socket
       |> assign(:pool_filters, filters)
       |> assign(:pool_filter_form, PoolForm.filter_form(filters))
+      |> assign(:pool_filters_loaded?, true)
 
-    if current_traffic_window(socket) == previous_window do
-      load_structural(socket)
-    else
-      socket
-      |> assign(pool_traffic_usage: nil, pool_traffic_loading?: true)
-      |> load_structural()
-      |> start_pool_traffic_load()
+    cond do
+      initial_transition? ->
+        socket
+        |> load_structural()
+        |> start_pool_traffic_load()
+
+      next_filters == previous_filters ->
+        socket
+
+      elem(next_filters, 2) != elem(previous_filters, 2) ->
+        socket
+        |> assign(pool_traffic_usage: nil, pool_traffic_loading?: true)
+        |> load_structural()
+        |> start_pool_traffic_load()
+
+      true ->
+        load_structural(socket)
     end
   end
 
+  defp pool_filter_tuple(filters) do
+    {Map.fetch!(filters, "query"), Map.fetch!(filters, "status"), Map.fetch!(filters, "traffic_window")}
+  end
+
   # The traffic aggregate is the expensive read; running it on this process
-  # would queue clicks and dialog opens behind it. One task at a time: extra
-  # requests while one is in flight coalesce into a single re-run.
+  # would queue clicks and dialog opens behind it. One task at a time, followed
+  # by a PostgreSQL-shared operator gate: extra requests in either phase
+  # coalesce into a single re-run that reads the latest eligible set.
   defp start_pool_traffic_load(socket) do
     cond do
       not connected?(socket) ->
@@ -520,16 +879,88 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
       socket.assigns.pool_traffic_running? ->
         assign(socket, :pool_traffic_rerun?, true)
 
+      is_reference(socket.assigns.pool_traffic_cooldown_timer) ->
+        assign(socket, :pool_traffic_rerun?, true)
+
       true ->
         pool_ids = socket.assigns.traffic_pool_ids
+        eligible_pool_ids = eligible_pool_traffic_ids(socket)
         traffic_window = current_traffic_window(socket)
+        current_scope = socket.assigns.current_scope
+        owner_token = Ecto.UUID.generate()
 
         socket
         |> assign(pool_traffic_running?: true, pool_traffic_rerun?: false)
+        |> reconcile_pool_histogram_states(:loading)
         |> start_async(:pool_traffic, fn ->
-          PoolsReadModel.traffic_metrics(pool_ids, traffic_window)
+          load_pool_traffic(
+            current_scope,
+            owner_token,
+            pool_ids,
+            eligible_pool_ids,
+            traffic_window
+          )
         end)
     end
+  end
+
+  defp load_pool_traffic(current_scope, owner_token, pool_ids, eligible_pool_ids, traffic_window) do
+    PoolTrafficGate.run(current_scope, owner_token, fn ->
+      pool_ids
+      |> PoolsReadModel.traffic_metrics(MapSet.to_list(eligible_pool_ids), traffic_window)
+      |> Map.put(:eligible_pool_ids, eligible_pool_ids)
+    end)
+  end
+
+  defp schedule_pool_traffic_load_cooldown(socket, cooldown_ms)
+       when is_integer(cooldown_ms) and cooldown_ms > 0 do
+    case socket.assigns.pool_traffic_cooldown_timer do
+      timer_ref when is_reference(timer_ref) ->
+        socket
+
+      nil ->
+        cooldown_token = make_ref()
+
+        timer_ref =
+          Process.send_after(
+            self(),
+            {:pool_traffic_cooldown_elapsed, cooldown_token},
+            cooldown_ms
+          )
+
+        assign(socket,
+          pool_traffic_cooldown_timer: timer_ref,
+          pool_traffic_cooldown_token: cooldown_token
+        )
+    end
+  end
+
+  defp pool_traffic_load_error(socket) do
+    if socket.assigns.pool_traffic_rerun? do
+      socket
+    else
+      # Without merged usage the structural zeros are placeholders, not data:
+      # keep the loading affordance instead of presenting them as settled.
+      socket
+      |> assign(:pool_traffic_loading?, is_nil(socket.assigns.pool_traffic_usage))
+      |> reconcile_pool_histogram_states(:error)
+    end
+  end
+
+  defp maybe_start_connected_refresh(socket) do
+    if connected?(socket) do
+      schedule_pool_traffic_fallback_refresh()
+    end
+
+    socket
+  end
+
+  defp schedule_pool_traffic_fallback_refresh do
+    Process.send_after(
+      self(),
+      :fallback_refresh_pool_traffic,
+      @pool_traffic_fallback_refresh_ms
+    )
   end
 
   defp apply_pool_traffic(socket) do
@@ -550,8 +981,183 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     end
   end
 
+  defp reconcile_pool_histogram_states(socket, missing_state) do
+    assign(
+      socket,
+      :pools,
+      PoolsReadModel.reconcile_histogram_states(
+        socket.assigns.pools,
+        eligible_pool_traffic_ids(socket),
+        missing_state
+      )
+    )
+  end
+
+  defp update_pool_traffic_visibility(socket, pool_id, visible) do
+    assign(
+      socket,
+      :pool_traffic_viewport_ids,
+      update_pool_id_set(socket.assigns.pool_traffic_viewport_ids, pool_id, visible)
+    )
+  end
+
+  defp update_pool_id_set(pool_ids, pool_id, true), do: MapSet.put(pool_ids, pool_id)
+  defp update_pool_id_set(pool_ids, pool_id, false), do: MapSet.delete(pool_ids, pool_id)
+
+  defp eligible_pool_traffic_ids(socket) do
+    socket.assigns.pool_traffic_viewport_ids
+    |> MapSet.intersection(rendered_pool_ids(socket))
+  end
+
+  defp rendered_pool_ids(socket) do
+    socket.assigns.pools
+    |> Enum.map(& &1.pool.id)
+    |> MapSet.new()
+  end
+
+  defp rendered_pool_id?(socket, pool_id), do: MapSet.member?(rendered_pool_ids(socket), pool_id)
+
+  defp prune_pool_traffic_state(socket) do
+    rendered_ids = rendered_pool_ids(socket)
+
+    socket =
+      assign(socket,
+        pool_traffic_viewport_ids: MapSet.intersection(socket.assigns.pool_traffic_viewport_ids, rendered_ids)
+      )
+
+    eligible_ids = eligible_pool_traffic_ids(socket)
+
+    update(socket, :pool_traffic_usage, fn
+      nil -> nil
+      usage -> filter_pool_traffic_histograms(usage, eligible_ids)
+    end)
+  end
+
+  defp filter_pool_traffic_histograms(usage, eligible_ids) do
+    Map.update!(usage, :histogram_by_pool_id, fn histograms ->
+      Map.filter(histograms, fn {pool_id, _histogram} ->
+        MapSet.member?(eligible_ids, pool_id)
+      end)
+    end)
+  end
+
   defp current_traffic_window(socket),
     do: Map.get(socket.assigns.pool_filters, "traffic_window", "24h")
+
+  defp apply_pool_editor_permalink(socket, %{@edit_pool_id_param => pool_id} = params)
+       when is_binary(pool_id) do
+    step =
+      params
+      |> Map.get(@pool_editor_step_param, "details")
+      |> PoolWizardComponents.normalize_step(:edit)
+
+    case editable_pool(socket, pool_id) do
+      {:ok, pool} ->
+        open_pool_editor(socket, pool, step)
+
+      {:error, _reason} ->
+        clear_invalid_pool_editor_permalink(socket)
+    end
+  end
+
+  defp apply_pool_editor_permalink(socket, _params) do
+    if socket.assigns.pool_editor_mode == :edit do
+      socket
+      |> clear_editing()
+      |> flush_deferred_pool_traffic_refresh()
+    else
+      socket
+    end
+  end
+
+  defp open_pool_editor(socket, pool, step) do
+    if match?(%{id: pool_id} when pool_id == pool.id, socket.assigns.editing_pool) &&
+         socket.assigns.pool_editor_mode == :edit do
+      assign(socket, :pool_wizard_step, step)
+    else
+      socket
+      |> close_create_dialog()
+      |> assign(:editing_pool, pool)
+      |> assign(:pool_editor_mode, :edit)
+      |> assign(:edit_form, PoolForm.edit_form(pool))
+      |> assign(:pool_wizard_step, step)
+      |> clear_deleting()
+      |> maybe_begin_model_serving_load(pool)
+      |> defer_pool_traffic_refresh()
+    end
+  end
+
+  defp maybe_begin_model_serving_load(socket, pool) do
+    if connected?(socket), do: begin_model_serving_load(socket, pool), else: socket
+  end
+
+  defp clear_invalid_pool_editor_permalink(socket) do
+    if socket.assigns.pool_editor_mode == :edit do
+      socket
+      |> clear_editing()
+      |> flush_deferred_pool_traffic_refresh()
+    else
+      socket
+    end
+  end
+
+  defp editable_pool(socket, pool_id) do
+    with {:ok, pools} <- Pools.list_pools_for_management(socket.assigns.current_scope),
+         %{} = pool <- Enum.find(pools, &(&1.id == pool_id)),
+         {:ok, _decision} <-
+           Pools.require_capability(
+             socket.assigns.current_scope,
+             Pools.capability(:pool_manage),
+             pool_id: pool.id
+           ) do
+      {:ok, pool}
+    else
+      nil -> {:error, %{message: "Pool was not found"}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp canonicalize_pool_url(socket, params) do
+    canonical_params =
+      canonical_pool_params(
+        socket.assigns.pool_filters,
+        current_permalink_editor(socket),
+        socket.assigns.pool_wizard_step
+      )
+
+    if connected?(socket) && params != canonical_params do
+      push_patch(socket,
+        to:
+          pool_path(
+            socket.assigns.pool_filters,
+            current_permalink_editor(socket),
+            socket.assigns.pool_wizard_step
+          ),
+        replace: true
+      )
+    else
+      socket
+    end
+  end
+
+  defp pool_path(filters, editing_pool \\ nil, step \\ "details") do
+    params = canonical_pool_params(filters, editing_pool, step)
+    ~p"/admin/pools?#{params}"
+  end
+
+  defp canonical_pool_params(filters, %{id: pool_id}, step) when is_binary(pool_id) do
+    filters
+    |> PoolForm.query_params()
+    |> Map.put(@edit_pool_id_param, pool_id)
+    |> Map.put(@pool_editor_step_param, PoolWizardComponents.normalize_step(step, :edit))
+  end
+
+  defp canonical_pool_params(filters, _editing_pool, _step),
+    do: PoolForm.query_params(filters)
+
+  defp current_permalink_editor(socket) do
+    if socket.assigns.pool_editor_mode == :edit, do: socket.assigns.editing_pool
+  end
 
   defp maybe_subscribe_pool_events(socket, pool_rows) do
     pool_rows
@@ -573,6 +1179,21 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     end
   end
 
+  defp ensure_inactive_pool(%{status: status}) when status in ["disabled", "archived"], do: :ok
+  defp ensure_inactive_pool(%{status: "active"}), do: {:error, %{message: "Pool is already active"}}
+  defp ensure_inactive_pool(nil), do: {:error, %{message: "Pool was not found"}}
+
+  defp ensure_can_operate_pool(socket, pool) do
+    case Pools.require_capability(
+           socket.assigns.current_scope,
+           Pools.capability(:pool_operate),
+           pool_id: pool.id
+         ) do
+      {:ok, _decision} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp find_pool(socket, pool_id) when is_binary(pool_id) do
     socket.assigns.pools
     |> Enum.find(&(&1.pool.id == pool_id))
@@ -586,8 +1207,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
 
   @compat_flag_labels %{
     "v1_compatibility_enabled" => "/v1 compatibility",
-    "request_compression_enabled" => "Request compression",
-    "upstream_websocket_bridge_enabled" => "Upstream websocket bridge"
+    "allow_image_generation" => "Allow Image Generation",
+    "allow_audio_transcription" => "Allow Audio Transcription"
   }
 
   defp compat_flag_label(flag) do
@@ -615,7 +1236,21 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
     )
   end
 
-  defp clear_editing(socket), do: assign(socket, editing_pool: nil, edit_form: nil)
+  defp clear_editing(socket) do
+    assign(socket,
+      editing_pool: nil,
+      pool_editor_mode: nil,
+      edit_form: nil,
+      model_serving_form: nil,
+      model_serving_snapshot: nil,
+      model_serving_models: [],
+      model_serving_status: :idle,
+      model_serving_dirty?: false,
+      model_serving_sync_pending?: false,
+      model_serving_pending_attrs: nil,
+      model_serving_load_token: nil
+    )
+  end
 
   defp clear_deleting(socket),
     do: assign(socket, deleting_pool: nil, delete_form: PoolForm.delete_form())
@@ -635,6 +1270,200 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
       |> start_pool_traffic_load()
     end
   end
+
+  # The structure is re-read at once, even behind an open dialog, so no card
+  # of a Pool the viewer can no longer see stays on screen; only a create,
+  # edit or delete dialog the viewer may still use (an owner's) defers it like
+  # a lifecycle event, and an owner sees every Pool whatever its assignments.
+  # A dialog the viewer lost closes first.
+  defp follow_viewer_visibility_change(socket) do
+    socket = close_dialogs_the_viewer_lost(socket)
+
+    if owner_dialog_open?(socket) do
+      reload_pools_or_defer(socket)
+    else
+      socket
+      |> clear_pool_traffic_refresh()
+      |> load_structural()
+      |> start_pool_traffic_load()
+    end
+  end
+
+  defp close_dialogs_the_viewer_lost(socket) do
+    before = dialog_state(socket)
+
+    socket =
+      if Pools.can_manage_pools?(socket.assigns.current_scope),
+        do: socket,
+        else: socket |> close_create_dialog() |> clear_deleting()
+
+    socket = close_pool_editor_the_viewer_lost(socket)
+
+    if dialog_state(socket) == before, do: socket, else: put_flash(socket, :info, "Your Pool access changed")
+  end
+
+  defp close_pool_editor_the_viewer_lost(%{assigns: %{pool_editor_mode: :edit, editing_pool: %{id: pool_id}}} = socket) do
+    case editable_pool(socket, pool_id) do
+      {:ok, _pool} -> socket
+      {:error, _reason} -> socket |> clear_editing() |> push_patch(to: pool_path(socket.assigns.pool_filters))
+    end
+  end
+
+  defp close_pool_editor_the_viewer_lost(%{assigns: %{pool_editor_mode: :models, editing_pool: %{} = pool}} = socket) do
+    case ensure_can_operate_pool(socket, pool) do
+      :ok -> socket
+      {:error, _reason} -> clear_editing(socket)
+    end
+  end
+
+  defp close_pool_editor_the_viewer_lost(socket), do: socket
+
+  defp dialog_state(socket) do
+    {socket.assigns.creating_pool, socket.assigns.pool_editor_mode, socket.assigns.deleting_pool}
+  end
+
+  defp owner_dialog_open?(socket) do
+    socket.assigns.creating_pool or socket.assigns.pool_editor_mode == :edit or
+      not is_nil(socket.assigns.deleting_pool)
+  end
+
+  defp reload_model_serving_or_defer(socket, pool_id) do
+    socket = reload_pools_or_defer(socket)
+
+    case socket.assigns.editing_pool do
+      %{id: ^pool_id} = pool ->
+        if socket.assigns.model_serving_dirty? do
+          assign(socket,
+            model_serving_status: :stale,
+            model_serving_sync_pending?: true,
+            model_serving_load_token: nil
+          )
+        else
+          begin_model_serving_load(socket, pool, reset?: false)
+        end
+
+      _other_pool_or_closed ->
+        socket
+    end
+  end
+
+  defp begin_model_serving_load(socket, pool, opts \\ []) do
+    reset? = Keyword.get(opts, :reset?, true)
+    pending_attrs = Keyword.get(opts, :pending_attrs)
+    load_token = make_ref()
+    scope = socket.assigns.current_scope
+
+    socket =
+      socket
+      |> assign(
+        model_serving_status: :loading,
+        model_serving_sync_pending?: false,
+        model_serving_pending_attrs: pending_attrs,
+        model_serving_load_token: load_token
+      )
+      |> start_async({:pool_model_serving, load_token, pool.id}, fn ->
+        load_model_serving_data(scope, pool)
+      end)
+
+    if reset? do
+      assign(socket,
+        model_serving_form: nil,
+        model_serving_snapshot: nil,
+        model_serving_models: [],
+        model_serving_dirty?: false
+      )
+    else
+      socket
+    end
+  end
+
+  defp load_model_serving_data(scope, pool) do
+    case Pools.model_serving_modes_snapshot(scope, pool) do
+      {:ok, snapshot} ->
+        hydration = CandidateEligibility.hydrate_model_visibility(pool)
+
+        models =
+          for model <- hydration.visible_models,
+              {:ok, candidates} <- [CandidateEligibility.routable_candidates(hydration, model)] do
+            source_ids = Enum.map(candidates, fn {assignment, _identity} -> assignment.id end)
+            {model, source_ids}
+          end
+
+        catalog_state = Catalog.catalog_read_state(pool)
+
+        {:ok, %{snapshot: snapshot, models: models, catalog_state: catalog_state}}
+
+      {:error, _reason} ->
+        {:error, :load_failed}
+    end
+  end
+
+  defp apply_model_serving_load(socket, data) do
+    pending_attrs = socket.assigns.model_serving_pending_attrs
+
+    form =
+      case pending_attrs do
+        attrs when is_map(attrs) ->
+          attrs = Map.put(attrs, "revision", data.snapshot.revision)
+          PoolForm.model_serving_form(data.snapshot, data.models, attrs)
+
+        nil ->
+          PoolForm.model_serving_form(data.snapshot, data.models)
+      end
+
+    pending? = is_map(pending_attrs)
+
+    assign(socket,
+      model_serving_form: form,
+      model_serving_snapshot: data.snapshot,
+      model_serving_models: data.models,
+      model_serving_status: if(pending?, do: :stale, else: model_serving_status(data.catalog_state, form.rows)),
+      model_serving_dirty?: pending?,
+      model_serving_sync_pending?: pending?,
+      model_serving_pending_attrs: if(pending?, do: Map.put(pending_attrs, "revision", data.snapshot.revision)),
+      model_serving_load_token: nil
+    )
+  end
+
+  defp model_serving_load_error(socket) do
+    assign(socket,
+      model_serving_form: nil,
+      model_serving_snapshot: nil,
+      model_serving_models: [],
+      model_serving_status: :error,
+      model_serving_dirty?: false,
+      model_serving_sync_pending?: false,
+      model_serving_pending_attrs: nil,
+      model_serving_load_token: nil
+    )
+  end
+
+  defp reproject_model_serving_error(socket, attrs) do
+    if socket.assigns.model_serving_snapshot do
+      assign(
+        socket,
+        :model_serving_form,
+        PoolForm.model_serving_form(
+          socket.assigns.model_serving_snapshot,
+          socket.assigns.model_serving_models,
+          attrs
+        )
+      )
+    else
+      socket
+    end
+  end
+
+  defp model_serving_status(%{status: :failed}, _rows), do: :error
+  defp model_serving_status(_catalog_state, []), do: :empty
+
+  defp model_serving_status(%{status: status}, _rows)
+       when status in [:stale, :syncing, :unavailable],
+       do: :stale
+
+  defp model_serving_status(_catalog_state, _rows), do: :ready
+
+  defp model_serving_error_status(_reason), do: :error
 
   defp schedule_pool_traffic_refresh(socket) do
     socket = assign(socket, :pool_traffic_dirty?, true)

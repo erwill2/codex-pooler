@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
   alias CodexPooler.Accounts
   alias CodexPooler.Accounts.{Session, User}
+  alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Repo
 
@@ -12,6 +13,17 @@ defmodule CodexPoolerWeb.AuthControllerTest do
   setup do
     reset_bootstrap_state_fixture!()
     :ok
+  end
+
+  test "bootstrap reset restores the pending auth surface after a completed owner", %{conn: conn} do
+    bootstrap_owner_fixture(%{"email" => "completed-owner@example.com"})
+    refute Accounts.bootstrap_pending?()
+
+    reset_bootstrap_state_fixture!()
+
+    assert Accounts.bootstrap_pending?()
+    assert html_response(get(conn, ~p"/bootstrap"), 200) =~ ~s(id="bootstrap-form")
+    assert redirected_to(get(build_conn(), ~p"/login")) == ~p"/bootstrap"
   end
 
   test "bootstrap and login pages expose stable form selectors", %{conn: conn} do
@@ -126,7 +138,8 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     refute Accounts.get_user_by_session_token(token)
   end
 
-  test "browser login records the forwarded IP when the peer is a trusted proxy", %{conn: conn} do
+  test "browser login records the forwarded IP and bounded peer provenance when the peer is a trusted proxy",
+       %{conn: conn} do
     setup_trusted_proxies(["10.42.0.0/16"])
     %{user: user} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
 
@@ -140,8 +153,62 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
     assert redirected_to(conn) == ~p"/admin/pools"
     session = Repo.get!(Session, Accounts.session_id_for_token(get_session(conn, :user_token)))
+    audit = Repo.get_by!(AuditEvent, action: "auth.login", actor_user_id: user.id)
 
     assert session.ip_address == "203.0.113.55"
+    assert audit.ip_address == "203.0.113.55"
+
+    assert audit.details["ingress_peer_provenance"] == %{
+             "client_ip_source" => "x_forwarded_for",
+             "immediate_peer_ip" => "10.42.0.50",
+             "inspected_hops" => 2
+           }
+  end
+
+  test "browser login omits peer provenance when forwarding comes from an untrusted peer", %{
+    conn: conn
+  } do
+    setup_trusted_proxies(["10.42.0.0/16"])
+    %{user: user} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+
+    conn =
+      conn
+      |> Map.put(:remote_ip, {198, 51, 100, 20})
+      |> put_req_header("x-forwarded-for", "203.0.113.55")
+      |> post(~p"/login", %{
+        "user" => %{"email" => user.email, "password" => valid_user_password()}
+      })
+
+    assert redirected_to(conn) == ~p"/admin/pools"
+    session = Repo.get!(Session, Accounts.session_id_for_token(get_session(conn, :user_token)))
+    audit = Repo.get_by!(AuditEvent, action: "auth.login", actor_user_id: user.id)
+
+    assert session.ip_address == "198.51.100.20"
+    assert audit.ip_address == "198.51.100.20"
+    refute Map.has_key?(audit.details, "ingress_peer_provenance")
+  end
+
+  test "browser login falls back to the peer when trusted forwarding input is malformed", %{
+    conn: conn
+  } do
+    setup_trusted_proxies(["10.42.0.0/16"])
+    %{user: user} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+
+    conn =
+      conn
+      |> Map.put(:remote_ip, {10, 42, 0, 50})
+      |> put_req_header("x-forwarded-for", <<255>>)
+      |> post(~p"/login", %{
+        "user" => %{"email" => user.email, "password" => valid_user_password()}
+      })
+
+    assert redirected_to(conn) == ~p"/admin/pools"
+    session = Repo.get!(Session, Accounts.session_id_for_token(get_session(conn, :user_token)))
+    audit = Repo.get_by!(AuditEvent, action: "auth.login", actor_user_id: user.id)
+
+    assert session.ip_address == "10.42.0.50"
+    assert audit.ip_address == "10.42.0.50"
+    refute Map.has_key?(audit.details, "ingress_peer_provenance")
   end
 
   test "authenticated root redirects to pools", %{conn: conn} do
@@ -275,8 +342,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     assert Accounts.get_user_by_session_token(current_token)
     refute Accounts.get_user_by_session_token(parallel_token)
 
-    assert_receive {:disconnect_user_sessions,
-                    %{user_id: user_id, except_live_socket_id: except_live_socket_id}}
+    assert_receive {:disconnect_user_sessions, %{user_id: user_id, except_live_socket_id: except_live_socket_id}}
 
     assert user_id == user.id
 
@@ -302,7 +368,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     assert get_session(new_password, :user_token)
   end
 
-  test "login preserves safe return_to and ignores external return_to", %{conn: conn} do
+  test "login preserves only browser-safe local return_to paths", %{conn: conn} do
     bootstrap_owner_fixture(%{"email" => "owner@example.com"})
 
     internal_conn =
@@ -317,17 +383,24 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
     assert redirected_to(conn) == ~p"/admin/pools"
 
-    external_conn =
-      build_conn()
-      |> init_test_session(%{})
-      |> put_session(:user_return_to, "https://example.com/evil")
+    for unsafe_return_to <- [
+          "https://example.com/evil",
+          "/%09evil.example",
+          "/\tevil.example",
+          "/\nevil.example",
+          "/\revil.example",
+          "/\\evil.example"
+        ] do
+      conn =
+        build_conn()
+        |> init_test_session(%{})
+        |> put_session(:user_return_to, unsafe_return_to)
+        |> post(~p"/login", %{
+          "user" => %{"email" => "owner@example.com", "password" => valid_user_password()}
+        })
 
-    conn =
-      post(external_conn, ~p"/login", %{
-        "user" => %{"email" => "owner@example.com", "password" => valid_user_password()}
-      })
-
-    assert redirected_to(conn) == ~p"/admin/pools"
+      assert redirected_to(conn) == ~p"/admin/pools"
+    end
   end
 
   test "password change API rejects anonymous and invalid password requests", %{conn: conn} do
@@ -448,7 +521,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
       assert has_element?(
                view,
-               "#auth-footer a[href='https://docs.codex-pooler.com']",
+               "#auth-footer a[href='https://www.codex-pooler.com/']",
                "Codex Pooler"
              )
 
@@ -504,8 +577,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
       assert_redirect(view, ~p"/admin/pools")
 
-      assert_receive {:disconnect_user_sessions,
-                      %{user_id: user_id, except_live_socket_id: except_live_socket_id}}
+      assert_receive {:disconnect_user_sessions, %{user_id: user_id, except_live_socket_id: except_live_socket_id}}
 
       assert user_id == user.id
       assert except_live_socket_id == CodexPoolerWeb.UserAuth.live_socket_id_for_token(token)
@@ -566,7 +638,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
   defp setup_trusted_proxies(trusted_proxies) do
     settings = %OperationalSettings{trusted_proxies: trusted_proxies}
-    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+    previous = CodexPooler.TestAppEnv.restore_on_exit(OperationalSettings)
 
     Application.put_env(
       :codex_pooler,
@@ -575,8 +647,6 @@ defmodule CodexPoolerWeb.AuthControllerTest do
       |> Keyword.put(:settings, settings)
       |> Keyword.put(:use_instance_settings?, false)
     )
-
-    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
   end
 
   defp extracted_page_title(html) do

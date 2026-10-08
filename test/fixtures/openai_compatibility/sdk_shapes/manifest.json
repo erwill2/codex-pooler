@@ -50,10 +50,10 @@
   },
   "sdk_version_policy": {
     "rule": "Every fixture pins sdk_package and sdk_version and explains provenance without raw transport bodies.",
-    "registry_checked_at": "2026-05-24",
+    "registry_checked_at": "2026-08-03",
     "registry_versions": {
       "openai:npm": "6.39.0",
-      "openai:pypi": "2.38.0",
+      "openai:pypi": "2.52.0",
       "ai:npm": "6.0.191",
       "@ai-sdk/openai:npm": "3.0.65"
     }
@@ -69,19 +69,27 @@
     ]
   },
   "expected_decision_placeholder_policy": {
-    "task_1_value": "pending_task_2_matrix",
-    "task_2_allowed_values": ["accept", "translate", "reject", "passthrough"],
-    "matrix_file_owner": "Task 2"
+    "fixture_decision": "pending_compatibility_matrix",
+    "decision_allowed_values": ["accept", "translate", "reject", "passthrough"],
+    "matrix_file_owner": "compatibility matrix"
   },
   "fixture_files": [
     "openai-node-responses-basic.json",
+    "openai-python-responses-custom-tool.json",
+    "openai-node-audio-transcription.json",
     "openai-python-chat-basic.json",
+    "openai-node-chat-custom-tool.json",
+    "openai-python-audio-transcription.json",
     "opencode-responses-replay-continuation.json",
-    "omp-responses-gpt56-clean-first-turn.json",
+    "omp-responses-gpt6-clean-first-turn.json",
     "hermes-responses-completed-assistant-replay.json",
     "openclaw-responses-assistant-thinking-replay.json",
+    "vercel-ai-responses-url-citation-replay.json",
+    "openai-responses-websocket-stream-id.json",
     "vercel-ai-responses-tool-continuation.json",
     "vercel-ai-sdk-openai-flat-tool.json",
-    "vercel-ai-sdk-openai-detailed-reasoning-summary.json"
+    "vercel-ai-sdk-openai-detailed-reasoning-summary.json",
+    "vercel-ai-sdk-openai-programmatic-tool-calling.json",
+    "vercel-ai-sdk-openai-responses-allowed-tools.json"
   ]
 }

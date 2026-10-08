@@ -4,6 +4,8 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   alias CodexPooler.Admin.Stats
   alias CodexPooler.Events
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.StatsPresentation
@@ -28,34 +30,52 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
      assign(socket,
        page_title: "Stats",
        dashboard: nil,
+       dashboard_loading?: true,
        filter_form: to_form(%{"pool_id" => "", "window" => "24h"}, as: :filters),
        filter_error: nil,
        pool_filter_options: [],
        leaderboard_sort: :tokens,
-       subscribed_pool_ids: MapSet.new()
-     )}
+       subscribed_pool_ids: MapSet.new(),
+       current_params: %{},
+       stats_reload_timer: nil,
+       stats_dashboard_generation: 0,
+       stats_dashboard_running?: false,
+       stats_dashboard_rerun?: false,
+       stats_dashboard_preparation: nil
+     )
+     |> NotificationCenterHooks.follow_viewer_visibility()}
   end
 
   @impl true
   def handle_params(params, _uri, socket) do
-    {:noreply, load_dashboard(socket, params)}
+    canonical_params = canonical_stats_params(params)
+
+    socket =
+      if canonical_params != socket.assigns.current_params or
+           socket.assigns.stats_dashboard_generation == 0 do
+        request_stats_dashboard(socket, canonical_params)
+      else
+        socket
+      end
+
+    {:noreply, canonicalize_stats_url(socket, params, canonical_params)}
   end
 
   @impl true
   def handle_event("filter", %{"filters" => filter_params}, socket) do
-    {:noreply, push_patch(socket, to: ~p"/admin/stats?#{query_params(filter_params)}")}
+    {:noreply, push_patch(socket, to: stats_path(socket, filter_params))}
   end
 
   def handle_event("select_pool_filter", %{"pool-id" => pool_id}, socket) do
     params = socket.assigns.filter_form.params |> Map.put("pool_id", pool_id)
 
-    {:noreply, push_patch(socket, to: ~p"/admin/stats?#{query_params(params)}")}
+    {:noreply, push_patch(socket, to: stats_path(socket, params))}
   end
 
   def handle_event("select_window_filter", %{"window" => window}, socket) do
     params = socket.assigns.filter_form.params |> Map.put("window", window)
 
-    {:noreply, push_patch(socket, to: ~p"/admin/stats?#{query_params(params)}")}
+    {:noreply, push_patch(socket, to: stats_path(socket, params))}
   end
 
   def handle_event("set_leaderboard_sort", %{"sort" => sort}, socket)
@@ -74,13 +94,71 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
     end
   end
 
+  # The timer that sent this has already fired, so the assign must stop naming
+  # it before anything else: holding while it still answers `is_reference/1`
+  # leaves every later debounce coalescing onto a timer that never arrives.
   def handle_info(:reload_stats_dashboard, socket) do
-    notify_stats_reload(:executed, socket.assigns.current_params)
+    socket = assign(socket, :stats_reload_timer, nil)
 
+    if LiveUpdatesHooks.paused?(socket) do
+      {:noreply, LiveUpdatesHooks.hold(socket)}
+    else
+      reload_stats_dashboard(socket)
+    end
+  end
+
+  # Resuming replays the held events first, and a relevant one arms a fresh
+  # debounce on its way past. Cancelling it here is what keeps a resume to a
+  # single rebuild instead of this one plus the one the replay just scheduled.
+  def handle_info(:live_updates_resumed, socket) do
+    socket
+    |> cancel_stats_reload_timer()
+    |> reload_stats_dashboard()
+  end
+
+  # A role change or a Pool granted or revoked changes which Pools the figures
+  # may cover. The dashboard built from the old set goes at once, instead of
+  # staying on screen until the new one is ready, and is rebuilt for the Pools
+  # the viewer sees now (findings#206 row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
     {:noreply,
      socket
-     |> assign(:stats_reload_timer, nil)
-     |> load_dashboard(socket.assigns.current_params)}
+     |> assign(:dashboard, nil)
+     |> request_stats_dashboard(socket.assigns.current_params)}
+  end
+
+  defp reload_stats_dashboard(socket) do
+    notify_stats_reload(:executed, socket.assigns.current_params)
+
+    {:noreply, request_stats_dashboard(socket, socket.assigns.current_params)}
+  end
+
+  @impl true
+  def handle_async({:stats_dashboard, generation}, {:ok, result}, socket) do
+    socket = assign(socket, :stats_dashboard_running?, false)
+
+    if generation == socket.assigns.stats_dashboard_generation do
+      {:noreply, apply_stats_dashboard_result(socket, result)}
+    else
+      {:noreply, maybe_start_pending_stats_dashboard(socket)}
+    end
+  end
+
+  def handle_async({:stats_dashboard, generation}, {:exit, _reason}, socket) do
+    socket = assign(socket, :stats_dashboard_running?, false)
+
+    if generation == socket.assigns.stats_dashboard_generation do
+      {:noreply,
+       socket
+       |> assign(
+         dashboard: nil,
+         dashboard_loading?: false,
+         filter_error: %{code: :load_failed, message: "statistics could not be loaded"}
+       )
+       |> maybe_start_pending_stats_dashboard()}
+    else
+      {:noreply, maybe_start_pending_stats_dashboard(socket)}
+    end
   end
 
   @impl true
@@ -91,13 +169,18 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
       current_scope={@current_scope}
       active_nav={:stats}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
-      <section id="admin-stats" class="grid w-full min-w-0 gap-4 lg:gap-5">
+      <section
+        id="admin-stats"
+        class="grid w-full min-w-0 gap-4 lg:gap-5"
+        aria-busy={to_string(@dashboard_loading?)}
+      >
         <div class="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(24rem,34rem)] xl:items-end">
           <AdminComponents.page_header
             id="stats-page-header"
             title="Usage"
-            description="Usage, cost, latency, sessions, and cache activity for the current scope."
+            description="Tokens, spend, latency, and cache activity for the Pools and window you pick."
           />
 
           <AdminComponents.filter_form
@@ -129,7 +212,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
                 <summary
                   data-role="window-filter-trigger"
                   aria-label="Range"
-                  class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+                  class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
                 >
                   <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
                   <span class="truncate">{selected_window_filter_label(@filter_form)}</span>
@@ -193,10 +276,15 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
           </section>
         <% else %>
           <AdminComponents.empty_state
-            id="stats-dashboard-error"
-            title="Stats are not available"
-            description="Change filters or sign in with an operator account that can manage pools."
-            icon="hero-chart-bar"
+            id={if @dashboard_loading?, do: "stats-dashboard-loading", else: "stats-dashboard-error"}
+            title={if @dashboard_loading?, do: "Loading stats", else: "Stats are not available"}
+            description={
+              if @dashboard_loading?,
+                do: "Building the dashboard for the Pools and window you picked.",
+                else: "Change filters or sign in with an operator account that can manage pools."
+            }
+            icon={if @dashboard_loading?, do: "hero-arrow-path", else: "hero-chart-bar"}
+            loading?={@dashboard_loading?}
           />
         <% end %>
       </section>
@@ -204,50 +292,129 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
     """
   end
 
-  defp load_dashboard(socket, params) do
+  defp request_stats_dashboard(socket, params) do
     filters = stats_filters(params)
+    generation = socket.assigns.stats_dashboard_generation + 1
+    reset_dashboard? = params != socket.assigns.current_params
 
-    case build_dashboard_with_telemetry(socket.assigns.current_scope, filters) do
-      {:ok, dashboard} ->
+    case prepare_dashboard_with_telemetry(socket.assigns.current_scope, filters) do
+      {:ok, preparation} ->
         socket
-        |> assign(:current_params, params)
-        |> reconcile_pool_subscriptions(dashboard)
         |> assign(
-          dashboard: dashboard,
-          filter_form: stats_filter_form(dashboard.filters),
+          current_params: params,
+          stats_dashboard_generation: generation,
+          stats_dashboard_preparation: preparation,
+          dashboard: if(reset_dashboard?, do: nil, else: socket.assigns.dashboard),
+          dashboard_loading?: true,
+          filter_form: stats_filter_form(preparation.filters),
           filter_error: nil,
-          pool_filter_options: pool_filter_options(dashboard),
-          current_params: params
+          pool_filter_options: pool_filter_options(preparation.filters)
         )
+        |> cancel_stats_reload_timer()
+        |> reconcile_pool_subscriptions(preparation.pool_ids)
+        |> maybe_start_stats_dashboard(generation)
 
       {:error, error} ->
         socket
-        |> assign(:current_params, params)
-        |> reconcile_pool_subscriptions(nil)
         |> assign(
+          current_params: params,
+          stats_dashboard_generation: generation,
+          stats_dashboard_preparation: nil,
+          stats_dashboard_rerun?: false,
           dashboard: nil,
+          dashboard_loading?: false,
           filter_form: stats_filter_form(filters),
           filter_error: error,
-          pool_filter_options: [],
-          current_params: params
+          pool_filter_options: []
         )
+        |> cancel_stats_reload_timer()
+        |> reconcile_pool_subscriptions([])
     end
   end
 
-  defp build_dashboard_with_telemetry(scope, filters) do
+  defp prepare_dashboard_with_telemetry(scope, filters) do
     started_at = System.monotonic_time()
-    result = Stats.build_dashboard(scope, filters)
+    result = Stats.prepare_dashboard(scope, filters)
+
+    case result do
+      {:ok, _preparation} ->
+        result
+
+      {:error, _error} ->
+        emit_dashboard_build_telemetry(
+          result,
+          filters,
+          System.monotonic_time() - started_at
+        )
+
+        result
+    end
+  end
+
+  defp build_prepared_dashboard_with_telemetry(preparation) do
+    started_at = System.monotonic_time()
+    result = Stats.build_prepared_dashboard(preparation)
     duration = System.monotonic_time() - started_at
 
-    emit_dashboard_build_telemetry(result, filters, duration)
+    emit_dashboard_build_telemetry(result, preparation.filters, duration)
 
     result
   end
 
-  defp reconcile_pool_subscriptions(socket, dashboard) do
+  defp maybe_start_stats_dashboard(socket, generation) do
+    cond do
+      not connected?(socket) ->
+        socket
+
+      socket.assigns.stats_dashboard_running? ->
+        assign(socket, :stats_dashboard_rerun?, true)
+
+      true ->
+        start_stats_dashboard(socket, generation)
+    end
+  end
+
+  defp start_stats_dashboard(socket, generation) do
+    preparation = socket.assigns.stats_dashboard_preparation
+
+    socket
+    |> assign(stats_dashboard_running?: true, stats_dashboard_rerun?: false)
+    |> start_async({:stats_dashboard, generation}, fn ->
+      build_prepared_dashboard_with_telemetry(preparation)
+    end)
+  end
+
+  defp maybe_start_pending_stats_dashboard(socket) do
+    if socket.assigns.stats_dashboard_rerun? and
+         not is_nil(socket.assigns.stats_dashboard_preparation) do
+      start_stats_dashboard(socket, socket.assigns.stats_dashboard_generation)
+    else
+      socket
+    end
+  end
+
+  defp apply_stats_dashboard_result(socket, {:ok, dashboard}) do
+    assign(socket,
+      dashboard: dashboard,
+      dashboard_loading?: false,
+      filter_error: nil,
+      stats_dashboard_rerun?: false
+    )
+  end
+
+  defp apply_stats_dashboard_result(socket, {:error, error}) do
+    assign(socket,
+      dashboard: nil,
+      dashboard_loading?: false,
+      filter_error: error,
+      stats_dashboard_rerun?: false
+    )
+  end
+
+  defp reconcile_pool_subscriptions(socket, pool_ids) do
     if connected?(socket) do
       {socket, stale_pool_ids} =
-        PoolEventSubscriptions.reconcile(socket, dashboard_pool_ids(dashboard))
+        PoolEventSubscriptions.reconcile(socket, MapSet.new(pool_ids))
 
       socket
       |> PoolEventSubscriptions.maybe_cancel_timer_on_stale(
@@ -257,17 +424,6 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
     else
       socket
     end
-  end
-
-  defp dashboard_pool_ids(nil), do: MapSet.new()
-
-  defp dashboard_pool_ids(%{selected_pool: %{id: pool_id}}) when is_binary(pool_id),
-    do: MapSet.new([pool_id])
-
-  defp dashboard_pool_ids(%{filters: %{pool_options: pool_options}}) do
-    pool_options
-    |> Enum.map(& &1.id)
-    |> MapSet.new()
   end
 
   defp schedule_stats_reload(socket) do
@@ -344,10 +500,10 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   defp telemetry_error_code(%{code: code}), do: code
 
   defp stats_filters(params) do
-    params = Map.new(params)
+    params = canonical_stats_params(params)
 
     %{
-      "pool_id" => params |> Map.get("pool_id") |> blank_to_nil(),
+      "pool_id" => Map.get(params, "pool_id"),
       "window" => normalize_window(Map.get(params, "window"))
     }
     |> maybe_put_as_of(parse_as_of(Map.get(params, "as_of")))
@@ -380,18 +536,62 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
     }
   end
 
-  defp query_params(filter_params) do
-    filter_params
-    |> Map.take(~w(pool_id window))
-    |> Enum.reject(fn {_key, value} -> blank?(value) end)
-    |> Enum.sort_by(fn {key, _value} -> query_param_order(key) end)
+  defp canonical_stats_params(params) when is_map(params) do
+    %{}
+    |> maybe_put_param("pool_id", normalize_pool_id(Map.get(params, "pool_id")))
+    |> maybe_put_window(normalize_window(Map.get(params, "window")))
+    |> maybe_put_as_of_param(parse_as_of(Map.get(params, "as_of")))
   end
 
-  defp query_param_order("pool_id"), do: 0
-  defp query_param_order("window"), do: 1
-  defp query_param_order(_key), do: 2
+  defp canonical_stats_params(_params), do: %{}
 
-  defp pool_filter_options(%{filters: %{pool_options: pool_options}}) do
+  defp maybe_put_param(params, _key, nil), do: params
+  defp maybe_put_param(params, key, value), do: Map.put(params, key, value)
+
+  defp maybe_put_window(params, "24h"), do: params
+  defp maybe_put_window(params, window), do: Map.put(params, "window", window)
+
+  defp maybe_put_as_of_param(params, %DateTime{} = as_of) do
+    Map.put(params, "as_of", serialize_as_of(as_of))
+  end
+
+  defp maybe_put_as_of_param(params, _as_of), do: params
+
+  defp serialize_as_of(as_of) do
+    as_of
+    |> DateTime.truncate(:microsecond)
+    |> Map.update!(:microsecond, fn {microsecond, _precision} -> {microsecond, 6} end)
+    |> DateTime.to_iso8601()
+  end
+
+  defp normalize_pool_id(pool_id) when is_binary(pool_id), do: blank_to_nil(pool_id)
+  defp normalize_pool_id(_pool_id), do: nil
+
+  defp stats_path(socket, filter_params) do
+    params =
+      filter_params
+      |> Map.new()
+      |> preserve_current_as_of(socket.assigns.current_params)
+      |> canonical_stats_params()
+
+    ~p"/admin/stats?#{params}"
+  end
+
+  defp preserve_current_as_of(params, %{"as_of" => as_of}) do
+    Map.put(params, "as_of", as_of)
+  end
+
+  defp preserve_current_as_of(params, _current_params), do: params
+
+  defp canonicalize_stats_url(socket, params, canonical_params) do
+    if connected?(socket) and params != canonical_params do
+      push_patch(socket, to: ~p"/admin/stats?#{canonical_params}", replace: true)
+    else
+      socket
+    end
+  end
+
+  defp pool_filter_options(%{pool_options: pool_options}) do
     case pool_options do
       [] -> []
       _pool_options -> PoolFilterComponents.pool_filter_options(pool_options)
@@ -437,8 +637,4 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
       trimmed -> trimmed
     end
   end
-
-  defp blank_to_nil(value), do: value
-  defp blank?(nil), do: true
-  defp blank?(value), do: String.trim(to_string(value)) == ""
 end

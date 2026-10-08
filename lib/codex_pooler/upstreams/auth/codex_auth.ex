@@ -3,6 +3,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
   Codex OAuth/device authorization client used by invite onboarding.
   """
 
+  alias CodexPooler.Upstreams.Auth.JwtPayload
   alias CodexPooler.Upstreams.CodexClientIdentity
 
   @issuer "https://auth.openai.com"
@@ -35,13 +36,16 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
   @type token_result :: %{
           access_token: String.t(),
           refresh_token: String.t() | nil,
-          id_token: String.t()
+          id_token: String.t(),
+          expires_in: term(),
+          received_at: DateTime.t()
         }
 
   @type refresh_result :: %{
           required(:access_token) => String.t(),
           optional(:refresh_token) => String.t() | nil,
-          optional(:expires_in) => pos_integer() | String.t() | nil
+          optional(:expires_in) => term(),
+          optional(:received_at) => DateTime.t()
         }
 
   @type client_error :: auth_error() | term()
@@ -131,29 +135,39 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
 
   @spec token_info(term()) :: token_info_response()
   def token_info(id_token) when is_binary(id_token) do
-    with [_header, payload, _signature] <- String.split(id_token, "."),
-         {:ok, json} <- Base.url_decode64(payload, padding: false),
-         {:ok, claims} <- Jason.decode(json) do
-      auth_claims = claims["https://api.openai.com/auth"] || %{}
+    case decode_jwt_payload(id_token) do
+      {:ok, claims} ->
+        auth_claims = claims["https://api.openai.com/auth"] || %{}
 
-      {:ok,
-       %{
-         email: claims["email"],
-         chatgpt_account_id: auth_claims["chatgpt_account_id"],
-         chatgpt_user_id: auth_claims["chatgpt_user_id"],
-         workspace_id: claim_from_auth_or_top_level(claims, workspace_id_claim_keys()),
-         workspace_label: claim_from_auth_or_top_level(claims, workspace_label_claim_keys()),
-         seat_type: claim_from_auth_or_top_level(claims, seat_type_claim_keys()),
-         plan_family: normalize_plan(auth_claims["chatgpt_plan_type"]),
-         plan_label: auth_claims["chatgpt_plan_type"]
-       }}
-    else
-      _invalid -> {:error, %{code: :codex_id_token_invalid, message: "Codex id token is invalid"}}
+        {:ok,
+         %{
+           email: claims["email"],
+           chatgpt_account_id: auth_claims["chatgpt_account_id"],
+           chatgpt_user_id: auth_claims["chatgpt_user_id"],
+           workspace_id: claim_from_auth_or_top_level(claims, workspace_id_claim_keys()),
+           workspace_label: claim_from_auth_or_top_level(claims, workspace_label_claim_keys()),
+           seat_type: claim_from_auth_or_top_level(claims, seat_type_claim_keys()),
+           plan_family: normalize_plan(auth_claims["chatgpt_plan_type"]),
+           plan_label: auth_claims["chatgpt_plan_type"]
+         }}
+
+      _invalid ->
+        {:error, %{code: :codex_id_token_invalid, message: "Codex id token is invalid"}}
     end
   end
 
   def token_info(_id_token),
     do: {:error, %{code: :codex_id_token_invalid, message: "Codex id token is invalid"}}
+
+  @spec compute_residency(term()) :: String.t() | nil
+  def compute_residency(access_token) when is_binary(access_token) do
+    case access_token |> String.trim() |> decode_jwt_payload() do
+      {:ok, %{} = claims} -> compute_residency_from_claims(claims)
+      _invalid -> nil
+    end
+  end
+
+  def compute_residency(_access_token), do: nil
 
   @spec client_id() :: String.t()
   def client_id, do: @client_id
@@ -186,6 +200,50 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
   end
 
   defp blank_string?(value), do: !is_binary(value) or String.trim(value) == ""
+
+  defp decode_jwt_payload(token) do
+    JwtPayload.decode(token)
+  end
+
+  defp compute_residency_from_claims(claims) do
+    root_value = Map.get(claims, "chatgpt_compute_residency")
+
+    case Map.fetch(claims, "https://api.openai.com/auth") do
+      :error ->
+        valid_residency(root_value)
+
+      {:ok, nil} ->
+        valid_residency(root_value)
+
+      {:ok, %{} = auth_claims} ->
+        case Map.fetch(auth_claims, "chatgpt_compute_residency") do
+          :error -> valid_residency(root_value)
+          {:ok, nil} -> valid_residency(root_value)
+          {:ok, value} -> valid_residency(value)
+        end
+
+      {:ok, _invalid_namespace} ->
+        nil
+    end
+  end
+
+  defp valid_residency(value) when is_binary(value) do
+    if mint_header_value?(value) do
+      case String.trim(value) do
+        "" -> nil
+        "no_constraint" -> nil
+        trimmed -> trimmed
+      end
+    end
+  end
+
+  defp valid_residency(_value), do: nil
+
+  defp mint_header_value?(value) do
+    value
+    |> :binary.bin_to_list()
+    |> Enum.all?(fn byte -> byte == ?\t or byte in 0x20..0x7E end)
+  end
 
   defp auth_error(code, message, status),
     do: {:error, %{code: code, message: message, status: status}}
@@ -235,8 +293,10 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
   defmodule HTTPClient do
     @moduledoc false
 
+    alias CodexPooler.Platform.OutboundHTTP
     alias CodexPooler.Upstreams.Auth.CodexAuth
     alias CodexPooler.Upstreams.CloudflareCookies
+    alias CodexPooler.Upstreams.Reconciliation.UsagePollCooldown
 
     @browser_user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     @browser_sec_ch_ua ~S("Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99")
@@ -273,12 +333,15 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
 
     @spec request_device_code() :: CodexAuth.device_code_response()
     def request_device_code do
-      case Req.post(
-             CodexAuth.issuer() <> "/api/accounts/deviceauth/usercode",
-             headers: browser_request_headers(),
-             json: %{client_id: CodexAuth.client_id()},
+      url = CodexAuth.issuer() <> "/api/accounts/deviceauth/usercode"
+
+      case OutboundHTTP.post(
+             url,
+             headers: [{"content-type", "application/json"} | browser_request_headers()],
+             body: CodexPooler.JSON.encode_to_iodata!(%{client_id: CodexAuth.client_id()}),
              retry: false,
-             receive_timeout: 30_000
+             receive_timeout: 30_000,
+             finch: OutboundHTTP.pool_options_for_url(url)
            ) do
         {:ok, %{status: status, body: body}} when status in 200..299 ->
           decode_device_code(body)
@@ -301,12 +364,14 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
     @spec poll_device_authorization(map()) :: CodexAuth.token_response()
     def poll_device_authorization(state) do
       body = %{device_auth_id: state["device_auth_id"], user_code: state["user_code"]}
+      url = CodexAuth.issuer() <> "/api/accounts/deviceauth/token"
 
-      case Req.post(CodexAuth.issuer() <> "/api/accounts/deviceauth/token",
-             headers: browser_request_headers(),
-             json: body,
+      case OutboundHTTP.post(url,
+             headers: [{"content-type", "application/json"} | browser_request_headers()],
+             body: CodexPooler.JSON.encode_to_iodata!(body),
              retry: false,
-             receive_timeout: 30_000
+             receive_timeout: 30_000,
+             finch: OutboundHTTP.pool_options_for_url(url)
            ) do
         {:ok, %{status: status, body: body}} when status in 200..299 ->
           case body do
@@ -330,6 +395,8 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
     end
 
     defp request_tokens_for_authorization_code(code, verifier, redirect_uri) do
+      url = CodexAuth.issuer() <> "/oauth/token"
+
       form = [
         grant_type: "authorization_code",
         code: code,
@@ -338,15 +405,15 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
         code_verifier: verifier
       ]
 
-      case Req.post(CodexAuth.issuer() <> "/oauth/token",
+      case OutboundHTTP.post(url,
              headers: browser_request_headers(),
              form: form,
              retry: false,
-             receive_timeout: 30_000
+             receive_timeout: 30_000,
+             finch: OutboundHTTP.pool_options_for_url(url)
            ) do
-        {:ok, %{status: status, body: %{"access_token" => access, "id_token" => id} = body}}
-        when status in 200..299 ->
-          {:ok, %{access_token: access, refresh_token: body["refresh_token"], id_token: id}}
+        {:ok, %{status: status, body: body}} when status in 200..299 ->
+          decode_authorization_code_token_response(body)
 
         {:ok, %{status: status}} when status >= 500 ->
           auth_error(
@@ -379,28 +446,44 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       case post_with_cloudflare(token_url,
              form: form,
              retry: false,
-             receive_timeout: receive_timeout
+             receive_timeout: receive_timeout,
+             finch: OutboundHTTP.pool_options_for_url(token_url)
            ) do
-        {:ok, %{status: status, body: %{"access_token" => access} = body}}
-        when status in 200..299 ->
-          {:ok,
-           %{
-             access_token: access,
-             refresh_token: body["refresh_token"],
-             expires_in: body["expires_in"]
-           }}
+        {:ok, %{status: status, body: body}} when status in 200..299 ->
+          decode_refresh_token_response(body)
 
         {:ok, %{status: status, body: body}} when status in [400, 401, 403] ->
           refresh_error(body, status)
 
-        {:ok, %{status: status}} when status >= 500 ->
-          auth_error(:codex_auth_transient, "Codex token refresh returned a temporary error", 502)
+        {:ok, %{status: status} = response} when status >= 500 ->
+          :codex_auth_transient
+          |> auth_error("Codex token refresh returned a temporary error", 502)
+          |> with_retry_after(response)
 
-        {:ok, _response} ->
-          auth_error(:codex_oauth_refresh_failed, "Codex token refresh failed", 502)
+        {:ok, %{} = response} ->
+          :codex_oauth_refresh_failed
+          |> auth_error("Codex token refresh failed", 502)
+          |> with_retry_after(response)
 
         {:error, reason} ->
           auth_error(:codex_auth_transient, Exception.message(reason), 502)
+      end
+    end
+
+    # The provider saying when it will answer again is worth more than a fixed
+    # exponential backoff, and a refresh that is merely throttled is the case
+    # that backoff handles worst: it burns attempts against a deadline the
+    # provider already told us. Classification is untouched -- this only adds
+    # the interval, and only when the header is readable.
+    defp with_retry_after({:error, %{} = error}, %{} = response) do
+      received_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      case UsagePollCooldown.instruction(response, received_at) do
+        {:retry_after, not_before} ->
+          {:error, Map.put(error, :retry_after_seconds, DateTime.diff(not_before, received_at))}
+
+        _no_instruction ->
+          {:error, error}
       end
     end
 
@@ -413,7 +496,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       opts =
         Keyword.put(opts, :headers, headers)
 
-      result = Req.post(url, opts)
+      result = OutboundHTTP.post(url, opts)
       CloudflareCookies.store_from_result(url, result)
       result
     end
@@ -427,6 +510,9 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       end
     end
 
+    # Status and provider prose cannot prove credential revocation: OAuth 401
+    # also covers invalid_client, and request errors can mention refresh tokens.
+    # Only explicit credential-rejection codes authorize the terminal transition.
     defp refresh_error(%{} = body, _status) do
       if refresh_token_reauth_error?(body) do
         auth_error(
@@ -448,6 +534,8 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
                 "revoked",
                 "invalid_refresh_token",
                 "token_expired",
+                "refresh_token_expired",
+                "refresh_token_invalidated",
                 "refresh_token_reused"
               ],
          do: true
@@ -458,35 +546,60 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
                 "revoked",
                 "invalid_refresh_token",
                 "token_expired",
+                "refresh_token_expired",
+                "refresh_token_invalidated",
                 "refresh_token_reused"
               ],
          do: true
 
-    defp refresh_token_reauth_error?(%{} = body) do
-      body
-      |> refresh_error_texts()
-      |> Enum.any?(&refresh_token_reauth_text?/1)
+    defp refresh_token_reauth_error?(%{}), do: false
+
+    defp decode_authorization_code_token_response(%{} = body) do
+      with {:ok, access_token} <- nonblank_token(body["access_token"]),
+           {:ok, id_token} <- nonblank_token(body["id_token"]),
+           {:ok, refresh_token} <- optional_refresh_token(body["refresh_token"]) do
+        {:ok,
+         %{
+           access_token: access_token,
+           refresh_token: refresh_token,
+           id_token: id_token,
+           expires_in: body["expires_in"],
+           received_at: DateTime.utc_now()
+         }}
+      else
+        :error -> auth_error(:codex_oauth_exchange_failed, "Codex token exchange failed", 502)
+      end
     end
 
-    defp refresh_error_texts(%{"error" => %{} = error} = body),
-      do: refresh_error_texts(error) ++ refresh_error_texts(Map.delete(body, "error"))
+    defp decode_authorization_code_token_response(_body),
+      do: auth_error(:codex_oauth_exchange_failed, "Codex token exchange failed", 502)
 
-    defp refresh_error_texts(%{} = body) do
-      body
-      |> Map.take(["error", "error_description", "error_message", "message"])
-      |> Map.values()
-      |> Enum.filter(&is_binary/1)
+    defp decode_refresh_token_response(%{} = body) do
+      with {:ok, access_token} <- nonblank_token(body["access_token"]),
+           {:ok, refresh_token} <- optional_refresh_token(body["refresh_token"]) do
+        {:ok,
+         %{
+           access_token: access_token,
+           refresh_token: refresh_token,
+           expires_in: body["expires_in"],
+           received_at: DateTime.utc_now()
+         }}
+      else
+        :error -> auth_error(:codex_oauth_refresh_failed, "Codex token refresh failed", 502)
+      end
     end
 
-    defp refresh_token_reauth_text?(text) when is_binary(text) do
-      normalized = String.downcase(text)
+    defp decode_refresh_token_response(_body),
+      do: auth_error(:codex_oauth_refresh_failed, "Codex token refresh failed", 502)
 
-      String.contains?(normalized, "refresh") and
-        String.contains?(normalized, "token") and
-        Enum.any?(["revoked", "expired", "invalid"], &String.contains?(normalized, &1))
+    defp nonblank_token(value) when is_binary(value) do
+      if String.trim(value) == "", do: :error, else: {:ok, value}
     end
 
-    defp refresh_token_reauth_text?(_text), do: false
+    defp nonblank_token(_value), do: :error
+
+    defp optional_refresh_token(nil), do: {:ok, nil}
+    defp optional_refresh_token(value), do: nonblank_token(value)
 
     defp decode_device_code(%{} = body) do
       user_code = body["user_code"] || body["usercode"]
@@ -536,13 +649,15 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
           403
         )
 
-    defp poll_error(_body, _state, status) when status in [403, 404],
-      do:
-        auth_error(
-          :codex_device_authorization_pending,
-          "Codex device authorization is still pending",
-          200
-        )
+    defp poll_error(_body, state, status) when status in [403, 404] do
+      {:error,
+       %{
+         code: :codex_device_authorization_pending,
+         message: "Codex device authorization is still pending",
+         retry_after_seconds: parse_interval(state["poll_interval_seconds"]),
+         status: 200
+       }}
+    end
 
     defp poll_error(_body, _state, status) when status >= 500,
       do:

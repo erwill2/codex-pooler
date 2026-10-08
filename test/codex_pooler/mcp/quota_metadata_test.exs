@@ -28,8 +28,11 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
   }
 
   alias CodexPooler.MCP.Tools.QuotaMetadata.ReadModel
+  alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   setup do
@@ -49,7 +52,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(owner, true)
 
     assert {:ok, %{raw_token: raw_token}} =
-             MCP.create_operator_token(owner, %{label: "Task 1 quota DTO"})
+             MCP.create_operator_token(owner, %{label: "Quota metadata DTO"})
 
     assert {:ok, auth} = MCP.authenticate_token(raw_token)
     scope = Scope.for_user(auth.operator, Accounts.roles_for_user(auth.operator))
@@ -107,7 +110,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert %{items: [account], count: 1, limit: 50, offset: 0} = ReadModel.list_accounts(scope)
 
     assert account.id == identity.id
-    assert account.label == "TA***@example.com"
+    assert account.label == "RE***@example.com"
     assert account.stored_account_id == "acct-quota-fresh"
     assert String.starts_with?(account.workspace_ref, "ws:")
     assert account.workspace_label == "Quota alpha"
@@ -216,6 +219,43 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     refute Enum.any?(account.quota_windows, &(&1.window_minutes == 10_080))
   end
 
+  test "superseded raw account evidence blocks fallback but is omitted from detail and count", %{
+    scope: scope
+  } do
+    as_of = ~U[2026-09-01 12:00:00.000000Z]
+    frozen_at = DateTime.add(as_of, -(Evidence.freshness_ttl_seconds() + 1), :second)
+    pool = pool_fixture()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
+        }
+      })
+
+    assert {:ok, [_primary, _secondary]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               primary_quota_window_attrs(%{
+                 used_percent: Decimal.new("100"),
+                 reset_at: DateTime.add(as_of, -1, :second),
+                 observed_at: frozen_at,
+                 last_sync_at: frozen_at
+               }),
+               weekly_quota_window_attrs(%{
+                 used_percent: Decimal.new("100"),
+                 reset_at: DateTime.add(as_of, 6, :day),
+                 observed_at: as_of,
+                 last_sync_at: as_of
+               })
+             ])
+
+    assert %{items: [account]} = ReadModel.list_accounts(scope, at: as_of)
+    assert account.quota_summary.routing_usable == false
+    assert account.quota_summary.window_count == 1
+    assert [%{quota_kind: "account_secondary"}] = account.quota_windows
+  end
+
   test "read model reports unknown when no quota windows exist", %{scope: scope} do
     pool = pool_fixture()
 
@@ -233,6 +273,87 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
              freshness_status: "unknown",
              routing_usable: false,
              has_unknown: true,
+             has_stale: false
+           }
+  end
+
+  test "read model reports fresh available zero-window identity as routing usable", %{
+    scope: scope
+  } do
+    as_of = ~U[2026-09-01 12:00:00.000000Z]
+    pool = pool_fixture()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        chatgpt_account_id: "acct-quota-windowless",
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
+        }
+      })
+
+    assert %{items: [account]} = ReadModel.list_accounts(scope, at: as_of)
+    assert account.id == identity.id
+    assert account.quota_windows == []
+
+    assert account.quota_summary == %{
+             window_count: 0,
+             truncated: false,
+             freshness_status: "fresh",
+             routing_usable: true,
+             has_unknown: false,
+             has_stale: false
+           }
+
+    refute inspect(account) =~ AccountAvailabilityStore.metadata_key()
+    refute inspect(account) =~ "credential_epoch"
+  end
+
+  test "top-level account summary ignores unrelated model staleness while returning its detail",
+       %{
+         scope: scope
+       } do
+    as_of = ~U[2026-09-01 12:00:00.000000Z]
+    stale_at = DateTime.add(as_of, -(Evidence.freshness_ttl_seconds() + 1), :second)
+    pool = pool_fixture()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        chatgpt_account_id: "acct-quota-windowless-model-detail",
+        identity_metadata: %{
+          "credential_epoch" => 1,
+          AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, as_of, 1)
+        }
+      })
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "gpt-example-unrelated",
+                 quota_scope: "model",
+                 quota_family: "codex_model",
+                 model: "gpt-example-unrelated",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 used_percent: Decimal.new("25"),
+                 reset_at: DateTime.add(as_of, 1, :hour),
+                 observed_at: stale_at,
+                 last_sync_at: stale_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "stale"
+               }
+             ])
+
+    assert %{items: [account]} = ReadModel.list_accounts(scope, at: as_of)
+    assert [%{quota_kind: "model_primary", freshness_status: "stale"}] = account.quota_windows
+
+    assert account.quota_summary == %{
+             window_count: 1,
+             truncated: false,
+             freshness_status: "fresh",
+             routing_usable: true,
+             has_unknown: false,
              has_stale: false
            }
   end
@@ -442,6 +563,208 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
 
+  test "quota metadata keeps exhausted, capacity-backed, unknown-used, and zero-credit controls through tool dispatch",
+       %{auth: auth} do
+    pool = pool_fixture(%{name: "Quota remaining control pool"})
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    reset_at = DateTime.add(observed_at, 3_600, :second)
+
+    controls = [
+      {"D8 exhausted credits", "acct-quota-d8", %{active_limit: nil, credits: 3817, used_percent: Decimal.new("100")}},
+      {"D12 capacity credits", "acct-quota-d12", %{active_limit: 601, credits: 601, used_percent: Decimal.new("0")}},
+      {"Unknown used credits", "acct-quota-unknown-used", %{active_limit: nil, credits: 1701, used_percent: nil}},
+      {"Zero exhausted credits", "acct-quota-zero", %{active_limit: nil, credits: 0, used_percent: Decimal.new("100")}}
+    ]
+
+    for {account_label, chatgpt_account_id, attrs} <- controls do
+      %{identity: identity} =
+        upstream_assignment_fixture(pool, %{
+          account_label: account_label,
+          chatgpt_account_id: chatgpt_account_id
+        })
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 primary_quota_window_attrs(
+                   Map.merge(attrs, %{
+                     reset_at: reset_at,
+                     observed_at: observed_at,
+                     last_sync_at: observed_at
+                   })
+                 )
+               ])
+    end
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_upstream_quotas",
+               %{"limit" => 10},
+               %{auth: auth}
+             )
+
+    assert result["isError"] == false
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+
+    windows_by_account =
+      result["structuredContent"]["items"]
+      |> Map.new(fn account ->
+        [window] = account["quota_windows"]
+        {account["stored_account_id"], window}
+      end)
+
+    assert windows_by_account["acct-quota-d8"]["credits"] == 3817
+    assert windows_by_account["acct-quota-d8"]["remaining_value"] == 3817
+    assert text =~ "D8 exhausted credits status active account acct-quota-d8"
+    assert text =~ "3817/unknown remaining, 100.0% used"
+
+    assert windows_by_account["acct-quota-d12"]["credits"] == 601
+    assert windows_by_account["acct-quota-d12"]["remaining_value"] == 601
+    assert windows_by_account["acct-quota-d12"]["active_limit"] == 601
+    assert text =~ "D12 capacity credits status active account acct-quota-d12"
+    assert text =~ "601/601 remaining, 0.0% used"
+
+    assert windows_by_account["acct-quota-unknown-used"]["credits"] == 1701
+    assert windows_by_account["acct-quota-unknown-used"]["remaining_value"] == 1701
+    assert text =~ "Unknown used credits status active account acct-quota-unknown-used"
+    assert text =~ "1701/unknown remaining, unknown used"
+
+    assert windows_by_account["acct-quota-zero"]["credits"] == 0
+    assert windows_by_account["acct-quota-zero"]["remaining_value"] == 0
+    assert text =~ "Zero exhausted credits status active account acct-quota-zero"
+    assert text =~ "0/unknown remaining, 100.0% used"
+
+    assert :ok = Redaction.assert_structured_content_safe!(result["structuredContent"])
+    assert :ok = Redaction.assert_text_content_safe!(text)
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "quota metadata suppresses non-capacity remaining values while retaining raw credits", %{
+    auth: auth
+  } do
+    pool = pool_fixture(%{name: "Quota remaining unknown pool"})
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    reset_at = DateTime.add(observed_at, 3_600, :second)
+
+    targets = [
+      {"A6 missing capacity", "acct-quota-a6-nil", nil, 412},
+      {"A6 zero capacity", "acct-quota-a6-zero-limit", 0, 413},
+      {"A6 zero credits", "acct-quota-a6-zero-credits", nil, 0}
+    ]
+
+    for {account_label, chatgpt_account_id, active_limit, credits} <- targets do
+      %{identity: identity} =
+        upstream_assignment_fixture(pool, %{
+          account_label: account_label,
+          chatgpt_account_id: chatgpt_account_id
+        })
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 primary_quota_window_attrs(%{
+                   active_limit: active_limit,
+                   credits: credits,
+                   used_percent: Decimal.new("35"),
+                   reset_at: reset_at,
+                   observed_at: observed_at,
+                   last_sync_at: observed_at
+                 })
+               ])
+    end
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_upstream_quotas",
+               %{"limit" => 10},
+               %{auth: auth}
+             )
+
+    assert result["isError"] == false
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+
+    windows_by_account =
+      result["structuredContent"]["items"]
+      |> Map.new(fn account ->
+        [window] = account["quota_windows"]
+        {account["stored_account_id"], window}
+      end)
+
+    assert windows_by_account["acct-quota-a6-nil"]["credits"] == 412
+    assert windows_by_account["acct-quota-a6-nil"]["remaining_value"] == nil
+    assert windows_by_account["acct-quota-a6-zero-limit"]["credits"] == 413
+    assert windows_by_account["acct-quota-a6-zero-limit"]["remaining_value"] == nil
+    assert windows_by_account["acct-quota-a6-zero-credits"]["credits"] == 0
+    assert windows_by_account["acct-quota-a6-zero-credits"]["remaining_value"] == nil
+
+    assert text =~ "A6 missing capacity status active account acct-quota-a6-nil"
+    assert text =~ "A6 zero capacity status active account acct-quota-a6-zero-limit"
+    assert text =~ "A6 zero credits status active account acct-quota-a6-zero-credits"
+    assert text =~ "unknown remaining, 35.0% used"
+
+    assert :ok = Redaction.assert_structured_content_safe!(result["structuredContent"])
+    assert :ok = Redaction.assert_text_content_safe!(text)
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "read model and tool dispatch suppress integer below-full percent balances", %{auth: auth} do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    reset_at = DateTime.add(observed_at, 3_600, :second)
+
+    integer_percent_window = %Quota.AccountQuotaWindow{
+      quota_key: "integer-percent",
+      quota_scope: "account",
+      quota_family: "account",
+      window_kind: "primary",
+      window_minutes: 300,
+      active_limit: nil,
+      credits: 7,
+      used_percent: 99,
+      reset_at: reset_at,
+      observed_at: observed_at,
+      last_sync_at: observed_at,
+      source_precision: "observed",
+      freshness_state: "fresh"
+    }
+
+    projected = ReadModel.quota_window(integer_percent_window, observed_at)
+    assert projected.credits == 7
+    assert projected.remaining_value == nil
+    assert projected.used_percent == 99.0
+
+    pool = pool_fixture(%{name: "Integer percent quota pool"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Integer percent quota",
+        chatgpt_account_id: "acct-quota-integer-percent"
+      })
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               primary_quota_window_attrs(%{
+                 active_limit: nil,
+                 credits: 7,
+                 used_percent: 99,
+                 reset_at: reset_at,
+                 observed_at: observed_at,
+                 last_sync_at: observed_at
+               })
+             ])
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_upstream_quotas",
+               %{"limit" => 10},
+               %{auth: auth}
+             )
+
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert [%{"quota_windows" => [window]}] = result["structuredContent"]["items"]
+    assert window["credits"] == 7
+    assert window["remaining_value"] == nil
+    assert text =~ "unknown remaining, 99.0% used"
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
   test "quota metadata tool exposes monthly primary evidence without capacity or raw material", %{
     auth: auth
   } do
@@ -487,7 +810,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
     structured = result["structuredContent"]
-    serialized_structured = Jason.encode!(structured)
+    serialized_structured = CodexPooler.JSON.encode!(structured)
 
     for forbidden <- [raw_metadata, provider_payload, raw_evidence, auth_json] do
       refute serialized_structured =~ forbidden
@@ -588,7 +911,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert result["isError"] == false
     assert [%{"type" => "text", "text" => text}] = result["content"]
     structured = result["structuredContent"]
-    serialized_structured = Jason.encode!(structured)
+    serialized_structured = CodexPooler.JSON.encode!(structured)
 
     for forbidden <- [
           raw_email,
@@ -623,7 +946,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert structured["status"] == "ok"
     account = structured["item"]
     assert account["id"] == identity.id
-    assert account["label"] == "TA***@example.com"
+    assert account["label"] == "RE***@example.com"
     assert account["stored_account_id"] == "acct-quota-redaction"
     assert account["status"] == "active"
     assert account["plan_family"] == "team"
@@ -645,7 +968,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert window["source_precision"] == "observed"
 
     assert text =~
-             "account TA***@example.com status active account acct-quota-redaction plan team"
+             "account RE***@example.com status active account acct-quota-redaction plan team"
 
     assert text =~ "account_primary: 42/100 remaining, 58.0% used"
     assert text =~ "fresh, routing usable"
@@ -862,7 +1185,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert [item] = result["structuredContent"]["items"]
     assert item["id"] == visible_identity.id
     refute text =~ "Invisible quota account"
-    refute Jason.encode!(result["structuredContent"]) =~ invisible_identity.id
+    refute CodexPooler.JSON.encode!(result["structuredContent"]) =~ invisible_identity.id
 
     assert {:ok, get_result} =
              ToolDispatch.call(
@@ -981,7 +1304,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
              "count" => 1
            }
 
-    refute Jason.encode!(filtered_result["structuredContent"]) =~ identity.id
+    refute CodexPooler.JSON.encode!(filtered_result["structuredContent"]) =~ identity.id
     assert :ok = Redaction.assert_mcp_output_safe!(filtered_result)
   end
 
@@ -1171,6 +1494,32 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     assert window.upstream_model == nil
     assert window.remaining_value == 25
     assert window.active_limit == 50
+  end
+
+  @tag credits_negative: true
+  test "quota policy changes effective admission without rewriting observed quota DTOs", %{scope: scope, auth: auth} do
+    pool = pool_fixture()
+    %{identity: identity} = upstream_assignment_fixture(pool, %{identity_metadata: %{"credential_epoch" => 1}})
+    now = DateTime.utc_now()
+    identity = CodexPooler.ProviderCreditsFixtures.persist_usage!(identity, CodexPooler.ProviderCreditsFixtures.usage_payload(:weekly_credit_only, now: now), now)
+    before = ReadModel.account_summary(identity)
+    assert before.capacity_decision.reason_codes == []
+    assert before.capacity_decision.routing_usable
+    assert before.capacity_decision.qualification == "provider_attested"
+    assert before.capacity_decision.scope == "account"
+    assert {:ok, _} = CodexPooler.Upstreams.update_provider_credits_policy_for_scope(scope, identity.id, %{allow_provider_credits: false})
+    after_policy = ReadModel.account_summary(Repo.reload!(identity))
+    assert after_policy.quota_windows == before.quota_windows
+    assert after_policy.allow_provider_credits == false
+    assert after_policy.capacity_decision.reason_codes == ["provider_credits_disabled"]
+    assert {:ok, result} = ToolDispatch.call("codex_pooler_get_upstream_quota", %{"selector" => identity.id}, %{auth: auth})
+    assert result["structuredContent"]["item"]["capacity_decision"]["scope"] == "account"
+    assert result["structuredContent"]["item"]["quota_windows"] |> hd() |> Map.fetch!("credits") == 25
+    assert [%{"text" => text}] = result["content"]
+    assert text =~ "provider credits policy disabled"
+    assert text =~ "account scope (request permission and billing source not guaranteed)"
+    assert text =~ "provider_credits_disabled"
+    refute text =~ "quota_capacity_facts"
   end
 
   defp assert_dto_keys(window) do

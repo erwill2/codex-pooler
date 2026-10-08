@@ -6,43 +6,43 @@ defmodule CodexPooler.MCP.Redaction do
   @type category :: atom()
 
   @forbidden_sentinel_specs [
-    {~w(raw mcp token), "TASK5_RAW_MCP_TOKEN_SENTINEL"},
-    {~w(mcp token hash), "TASK5_MCP_TOKEN_HASH_SENTINEL"},
-    {~w(raw pool api key), "TASK5_RAW_POOL_API_KEY_SENTINEL"},
-    {~w(pool api key hash), "TASK5_POOL_API_KEY_HASH_SENTINEL"},
-    {~w(invite url), "https://example.com/invites/TASK5_INVITE_URL_SENTINEL"},
-    {~w(invite token), "TASK5_INVITE_TOKEN_SENTINEL"},
-    {~w(temporary password), "TASK5_TEMPORARY_PASSWORD_SENTINEL"},
-    {~w(session token), "TASK5_SESSION_TOKEN_SENTINEL"},
-    {~w(totp secret), "TASK5_TOTP_SECRET_SENTINEL"},
-    {~w(recovery secret), "TASK5_RECOVERY_SECRET_SENTINEL"},
-    {~w(upstream auth json), ~s({"TASK5_UPSTREAM_AUTH_JSON_SENTINEL":"secret"})},
-    {~w(access token), "TASK5_ACCESS_TOKEN_SENTINEL"},
-    {~w(refresh token), "TASK5_REFRESH_TOKEN_SENTINEL"},
-    {~w(upstream secret), "TASK5_UPSTREAM_SECRET_SENTINEL"},
-    {~w(smtp secret), "TASK5_SMTP_SECRET_SENTINEL"},
-    {~w(metrics hmac), "TASK5_METRICS_HMAC_SENTINEL"},
-    {~w(metrics fingerprint), "TASK5_METRICS_FINGERPRINT_SENTINEL"},
-    {~w(raw headers), "TASK5_RAW_HEADERS_SENTINEL"},
-    {~w(raw metadata), "TASK5_RAW_METADATA_SENTINEL"},
-    {~w(raw evidence), "TASK5_RAW_EVIDENCE_SENTINEL"},
-    {~w(provider payload), "TASK5_PROVIDER_PAYLOAD_SENTINEL"},
-    {~w(cookies), "TASK5_COOKIE_SENTINEL"},
-    {~w(upload url), "https://uploads.example.com/TASK5_UPLOAD_URL_SENTINEL"},
-    {~w(filename), "TASK5_PRIVATE_FILENAME_SENTINEL.txt"},
-    {~w(prompt), "TASK5_RAW_PROMPT_SENTINEL"},
-    {~w(request body), "TASK5_REQUEST_BODY_SENTINEL"},
-    {~w(response body), "TASK5_RESPONSE_BODY_SENTINEL"},
-    {~w(raw tool command), "TASK7_RAW_TOOL_COMMAND_SENTINEL"},
-    {~w(raw tool output), "TASK7_RAW_TOOL_OUTPUT_SENTINEL"},
-    {~w(raw tool file output), "TASK7_RAW_TOOL_FILE_OUTPUT_SENTINEL"},
-    {~w(multipart body), "TASK5_MULTIPART_BODY_SENTINEL"},
-    {~w(websocket frame), "TASK5_WEBSOCKET_FRAME_SENTINEL"},
-    {~w(raw idempotency key), "TASK5_RAW_IDEMPOTENCY_KEY_SENTINEL"},
-    {~w(audit before blob), "TASK5_AUDIT_BEFORE_BLOB_SENTINEL"},
-    {~w(audit after blob), "TASK5_AUDIT_AFTER_BLOB_SENTINEL"},
-    {~w(disallowed email), "TASK5_DISALLOWED_EMAIL_SENTINEL@example.com"},
-    {~w(disallowed pii), "TASK5_DISALLOWED_PII_SENTINEL"}
+    {~w(raw mcp token), "REDACTION_RAW_MCP_TOKEN_SENTINEL"},
+    {~w(mcp token hash), "REDACTION_MCP_TOKEN_HASH_SENTINEL"},
+    {~w(raw pool api key), "REDACTION_RAW_POOL_API_KEY_SENTINEL"},
+    {~w(pool api key hash), "REDACTION_POOL_API_KEY_HASH_SENTINEL"},
+    {~w(invite url), "https://example.com/invites/REDACTION_INVITE_URL_SENTINEL"},
+    {~w(invite token), "REDACTION_INVITE_TOKEN_SENTINEL"},
+    {~w(temporary password), "REDACTION_TEMPORARY_PASSWORD_SENTINEL"},
+    {~w(session token), "REDACTION_SESSION_TOKEN_SENTINEL"},
+    {~w(totp secret), "REDACTION_TOTP_SECRET_SENTINEL"},
+    {~w(recovery secret), "REDACTION_RECOVERY_SECRET_SENTINEL"},
+    {~w(upstream auth json), ~s({"REDACTION_UPSTREAM_AUTH_JSON_SENTINEL":"secret"})},
+    {~w(access token), "REDACTION_ACCESS_TOKEN_SENTINEL"},
+    {~w(refresh token), "REDACTION_REFRESH_TOKEN_SENTINEL"},
+    {~w(upstream secret), "REDACTION_UPSTREAM_SECRET_SENTINEL"},
+    {~w(smtp secret), "REDACTION_SMTP_SECRET_SENTINEL"},
+    {~w(metrics hmac), "REDACTION_METRICS_HMAC_SENTINEL"},
+    {~w(metrics fingerprint), "REDACTION_METRICS_FINGERPRINT_SENTINEL"},
+    {~w(raw headers), "REDACTION_RAW_HEADERS_SENTINEL"},
+    {~w(raw metadata), "REDACTION_RAW_METADATA_SENTINEL"},
+    {~w(raw evidence), "REDACTION_RAW_EVIDENCE_SENTINEL"},
+    {~w(provider payload), "REDACTION_PROVIDER_PAYLOAD_SENTINEL"},
+    {~w(cookies), "REDACTION_COOKIE_SENTINEL"},
+    {~w(upload url), "https://uploads.example.com/REDACTION_UPLOAD_URL_SENTINEL"},
+    {~w(filename), "REDACTION_PRIVATE_FILENAME_SENTINEL.txt"},
+    {~w(prompt), "REDACTION_RAW_PROMPT_SENTINEL"},
+    {~w(request body), "REDACTION_REQUEST_BODY_SENTINEL"},
+    {~w(response body), "REDACTION_RESPONSE_BODY_SENTINEL"},
+    {~w(raw tool command), "RAW_TOOL_COMMAND_SENTINEL"},
+    {~w(raw tool output), "RAW_TOOL_OUTPUT_SENTINEL"},
+    {~w(raw tool file output), "RAW_TOOL_FILE_OUTPUT_SENTINEL"},
+    {~w(multipart body), "REDACTION_MULTIPART_BODY_SENTINEL"},
+    {~w(websocket frame), "REDACTION_WEBSOCKET_FRAME_SENTINEL"},
+    {~w(raw idempotency key), "REDACTION_RAW_IDEMPOTENCY_KEY_SENTINEL"},
+    {~w(audit before blob), "REDACTION_AUDIT_BEFORE_BLOB_SENTINEL"},
+    {~w(audit after blob), "REDACTION_AUDIT_AFTER_BLOB_SENTINEL"},
+    {~w(disallowed email), "REDACTION_DISALLOWED_EMAIL_SENTINEL@example.com"},
+    {~w(disallowed pii), "REDACTION_DISALLOWED_PII_SENTINEL"}
   ]
 
   @forbidden_sentinels Enum.map(@forbidden_sentinel_specs, fn {category_parts, sentinel} ->
@@ -144,9 +144,7 @@ defmodule CodexPooler.MCP.Redaction do
   defp assert_no_forbidden_value!(_value, _surface), do: :ok
 
   defp assert_no_raw_struct!(%{__struct__: struct}, path) do
-    raise_assertion(
-      "structuredContent contains raw struct #{inspect(struct)} at #{format_path(path)}"
-    )
+    raise_assertion("structuredContent contains raw struct #{inspect(struct)} at #{format_path(path)}")
   end
 
   defp assert_no_raw_struct!(%{} = map, path) do
@@ -176,7 +174,8 @@ defmodule CodexPooler.MCP.Redaction do
         ] and raw_email?(value) ->
           raise_assertion("structuredContent leaked raw email at #{format_path(next_path)}")
 
-        normalized in ["ip", "ip_address", "client_ip"] and raw_ip?(value) ->
+        normalized in ["ip", "ip_address", "client_ip", "immediate_peer_ip"] and
+            raw_ip?(value) ->
           raise_assertion("structuredContent leaked raw ip_address at #{format_path(next_path)}")
 
         normalized in ["upload_url", "download_url", "signed_url", "sas_url"] and raw_url?(value) ->
@@ -215,7 +214,7 @@ defmodule CodexPooler.MCP.Redaction do
   defp assert_text_not_structured_mirror!(nil, _text), do: :ok
 
   defp assert_text_not_structured_mirror!(structured, text) do
-    encoded = Jason.encode!(structured)
+    encoded = CodexPooler.JSON.encode!(structured)
 
     if String.contains?(text, encoded) do
       raise_assertion("text content mirrors structuredContent")
@@ -230,8 +229,12 @@ defmodule CodexPooler.MCP.Redaction do
 
   defp raw_email?(_value), do: false
 
-  defp raw_ip?(value) when is_binary(value),
-    do: Regex.match?(~r/^\d{1,3}(?:\.\d{1,3}){3}$/, value)
+  defp raw_ip?(value) when is_binary(value) do
+    case :inet.parse_address(:binary.bin_to_list(value)) do
+      {:ok, _address} -> true
+      {:error, _reason} -> false
+    end
+  end
 
   defp raw_ip?(_value), do: false
 

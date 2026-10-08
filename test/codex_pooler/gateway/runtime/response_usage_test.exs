@@ -3,10 +3,19 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
   alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
 
+  @no_model %{"version" => 1, "coverage" => "full", "terminal_status" => nil, "terminal_model" => nil, "first_conflicting_model" => nil, "conflict" => nil}
+  @completed_no_model %{@no_model | "terminal_status" => "completed"}
+  @partial_no_model %{@no_model | "coverage" => "partial"}
+
+  defp assert_observation(usage, expected) do
+    assert Map.fetch!(usage, :model_observation) == expected
+    Map.delete(usage, :model_observation)
+  end
+
   describe "from_json/1" do
     test "extracts flat usage from JSON responses" do
       body =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "service_tier" => "priority",
           "usage" => %{
             "input_tokens" => 10,
@@ -17,7 +26,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
           }
         })
 
-      assert ResponseUsage.from_json(body) == %{
+      assert assert_observation(ResponseUsage.from_json(body), %{@no_model | "terminal_status" => "json"}) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 10,
@@ -27,6 +36,64 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
                total_tokens: 17,
                service_tier: "priority"
              }
+    end
+
+    test "prefers canonical nested reasoning and falls back to accepted flat reasoning" do
+      for {details, flat, expected} <- [
+            {%{"reasoning_tokens" => 17}, 5, 17},
+            {nil, 7, 7},
+            {%{"reasoning_tokens" => -1}, 11, 11},
+            {%{"reasoning_tokens" => "invalid"}, 13, 13},
+            {%{"reasoning_tokens" => nil}, 15, 15}
+          ] do
+        usage = %{
+          "input_tokens" => 10,
+          "output_tokens" => 20,
+          "reasoning_tokens" => flat,
+          "total_tokens" => 30
+        }
+
+        usage =
+          if is_nil(details),
+            do: usage,
+            else: Map.put(usage, "output_tokens_details", details)
+
+        assert %{reasoning_tokens: ^expected, total_tokens: 30} =
+                 ResponseUsage.from_decoded(%{"usage" => usage})
+      end
+    end
+
+    test "marks invalid canonical nested reasoning without a flat fallback as unknown" do
+      for invalid <- [-1, 1.5, "invalid", nil] do
+        decoded = %{
+          "usage" => %{
+            "input_tokens" => 10,
+            "output_tokens" => 20,
+            "output_tokens_details" => %{"reasoning_tokens" => invalid},
+            "total_tokens" => 30
+          }
+        }
+
+        assert assert_observation(ResponseUsage.from_decoded(decoded), %{@no_model | "terminal_status" => "json"}) == %{
+                 status: "usage_unknown",
+                 source: "invalid_usage_tokens"
+               }
+      end
+    end
+
+    test "matches decoded input without an encode-decode round trip" do
+      decoded = %{
+        "service_tier" => "priority",
+        "usage" => %{
+          "input_tokens" => 10,
+          "input_tokens_details" => %{"cached_tokens" => 4},
+          "output_tokens" => 7,
+          "total_tokens" => 17
+        }
+      }
+
+      assert ResponseUsage.from_decoded(decoded) ==
+               ResponseUsage.from_json(CodexPooler.JSON.encode!(decoded))
     end
 
     test "preserves absent, zero, and positive Responses cache-write counters" do
@@ -39,7 +106,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
             else: Map.put(details, "cache_write_tokens", reported)
 
         body =
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "usage" => %{
               "input_tokens" => 10,
               "input_tokens_details" => details,
@@ -61,7 +128,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
     test "preserves current absent cache-write behavior" do
       body =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "usage" => %{
             "input_tokens" => 10,
             "input_tokens_details" => %{"cached_tokens" => 4},
@@ -78,7 +145,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
     test "extracts nested response usage from output items" do
       body =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "output" => [
             %{"type" => "message"},
             %{
@@ -118,21 +185,21 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
     end
 
     test "marks malformed JSON and invalid usage token values as unknown" do
-      assert ResponseUsage.from_json("{") == %{
+      assert assert_observation(ResponseUsage.from_json("{"), @partial_no_model) == %{
                status: "usage_unknown",
                source: "json_decode_failed"
              }
 
-      body = Jason.encode!(%{"usage" => %{"input_tokens" => 1.2}})
+      body = CodexPooler.JSON.encode!(%{"usage" => %{"input_tokens" => 1.2}})
 
-      assert ResponseUsage.from_json(body) == %{
+      assert assert_observation(ResponseUsage.from_json(body), %{@no_model | "terminal_status" => "json"}) == %{
                status: "usage_unknown",
                source: "invalid_usage_tokens"
              }
 
       for invalid <- [-1, 1.5, "9", "not-an-integer", nil] do
         body =
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{
             "usage" => %{
               "input_tokens" => 10,
               "input_tokens_details" => %{
@@ -144,7 +211,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
             }
           })
 
-        assert ResponseUsage.from_json(body) == %{
+        assert assert_observation(ResponseUsage.from_json(body), %{@no_model | "terminal_status" => "json"}) == %{
                  status: "usage_unknown",
                  source: "invalid_usage_tokens"
                }
@@ -154,7 +221,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
   describe "from_sse/1" do
     test "preserves absent, zero, and positive terminal SSE cache-write counters" do
-      for {reported, expected} <- [{:absent, nil}, {0, 0}, {8, 8}] do
+      for {reported, expected} <- [{:absent, nil}, {0, 0}, {6, 6}] do
         body = terminal_sse_usage(reported)
         assert Map.get(ResponseUsage.from_sse(body), :cache_write_tokens) == expected
       end
@@ -204,7 +271,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
           }
         })
 
-      assert ResponseUsage.from_sse(body) == %{
+      assert assert_observation(ResponseUsage.from_sse(body), %{@no_model | "terminal_status" => "failed"}) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 10,
@@ -216,143 +283,31 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
              }
     end
 
-    test "extracts usage from a retained SSE suffix that starts inside a large data frame" do
-      body =
-        ~s(output_text":"truncated prefix) <>
-          ~s(","usage":{"input_tokens":214407,"input_tokens_details":{"cached_tokens":206848,"cache_write_tokens":1024},"output_tokens":512,"reasoning_tokens":0,"total_tokens":214919},"status":"completed"}}\n\n) <>
-          "data: [DONE]\n\n"
+    test "truncated records cannot provide aggregate provenance" do
+      for prefix <- [~s(output_text":"truncated prefix), ~s({"response":)],
+          usage <- [
+            %{"input_tokens" => 21, "output_tokens" => 41, "total_tokens" => 62},
+            %{"input_tokens" => 21, "output_tokens" => 41, "total_tokens" => 99}
+          ] do
+        retained = prefix <> ~s(,"usage":) <> CodexPooler.JSON.encode!(usage) <> "}}\n\n"
 
-      assert ResponseUsage.from_sse(body) == %{
-               status: "usage_known",
-               source: "upstream_usage",
-               input_tokens: 214_407,
-               cached_input_tokens: 206_848,
-               cache_write_tokens: 1_024,
-               output_tokens: 512,
-               reasoning_tokens: 0,
-               total_tokens: 214_919,
-               service_tier: nil
-             }
-    end
+        assert %{status: "usage_unknown", source: "sse_usage_missing"} =
+                 ResponseUsage.from_sse(retained)
 
-    test "rejects malformed cache-write counters in retained SSE usage" do
-      for invalid <- ["-1", "1.5", ~s("1"), "null"] do
-        body = retained_usage_with_cache_write(invalid) <> "data: [DONE]\n\n"
-
-        assert ResponseUsage.from_sse(body) == %{
-                 status: "usage_unknown",
-                 source: "invalid_usage_tokens"
-               }
+        assert %{status: "usage_unknown", source: "websocket_usage_missing"} =
+                 ResponseUsage.from_websocket_body(retained)
       end
     end
 
-    test "malformed retained terminal usage overrides earlier known SSE usage" do
-      body =
-        terminal_sse_usage(0) <>
-          retained_usage_with_cache_write(~s("9")) <>
-          "data: [DONE]\n\n"
-
-      assert ResponseUsage.from_sse(body) == %{
-               status: "usage_unknown",
-               source: "invalid_usage_tokens"
-             }
+    test "unscoped retained fragments cannot override a complete event" do
+      complete = terminal_sse_usage(0)
+      fragment = retained_usage_with_cache_write(~s("invalid"))
+      assert ResponseUsage.from_sse(complete <> fragment) == ResponseUsage.from_sse(complete)
     end
 
-    test "prefers retained terminal usage over earlier zero-token SSE usage" do
-      body =
-        sse_event("response.in_progress", %{
-          "response" => %{
-            "service_tier" => "standard",
-            "usage" => %{
-              "input_tokens" => 0,
-              "cached_input_tokens" => 0,
-              "output_tokens" => 0,
-              "reasoning_tokens" => 0,
-              "total_tokens" => 0
-            }
-          }
-        }) <>
-          ~s("service_tier":"flex","output_text":"truncated prefix) <>
-          ~s(","usage":{"input_tokens":16086,"input_tokens_details":{"cached_tokens":0},"output_tokens":117,"reasoning_tokens":0,"total_tokens":16203},"status":"completed"}}\n\n) <>
-          "data: [DONE]\n\n"
-
-      assert ResponseUsage.from_sse(body) == %{
-               status: "usage_known",
-               source: "upstream_usage",
-               input_tokens: 16_086,
-               cached_input_tokens: 0,
-               output_tokens: 117,
-               reasoning_tokens: 0,
-               total_tokens: 16_203,
-               service_tier: "flex"
-             }
-    end
-
-    test "uses retained service tier serialized after terminal usage" do
-      json_like_output_text =
-        String.duplicate(
-          ~s({"usage":{"input_tokens":999,"output_tokens":999,"total_tokens":1998},"service_tier":"printed"}),
-          80
-        )
-
-      body =
-        sse_event("response.in_progress", %{
-          "response" => %{
-            "service_tier" => "auto",
-            "usage" => %{
-              "input_tokens" => 0,
-              "cached_input_tokens" => 0,
-              "output_tokens" => 0,
-              "reasoning_tokens" => 0,
-              "total_tokens" => 0
-            }
-          }
-        }) <>
-          ~s(output_text":"truncated prefix) <>
-          ~s(","usage":{"input_tokens":16,"input_tokens_details":{"cached_tokens":0},"output_tokens":5,"reasoning_tokens":0,"total_tokens":21},"output_text":) <>
-          Jason.encode!(json_like_output_text) <>
-          ~s(,"service_tier":"flex","status":"completed"}}\n\n) <>
-          "data: [DONE]\n\n"
-
-      assert ResponseUsage.from_sse(body) == %{
-               status: "usage_known",
-               source: "upstream_usage",
-               input_tokens: 16,
-               cached_input_tokens: 0,
-               output_tokens: 5,
-               reasoning_tokens: 0,
-               total_tokens: 21,
-               service_tier: "flex"
-             }
-    end
-
-    test "inherits stream service tier when retained terminal usage starts at usage" do
-      body =
-        sse_event("response.in_progress", %{
-          "response" => %{
-            "service_tier" => "priority",
-            "usage" => %{
-              "input_tokens" => 0,
-              "cached_input_tokens" => 0,
-              "output_tokens" => 0,
-              "reasoning_tokens" => 0,
-              "total_tokens" => 0
-            }
-          }
-        }) <>
-          ~s(output_text":"truncated prefix) <>
-          ~s(","usage":{"input_tokens":11,"cached_input_tokens":2,"output_tokens":5,"reasoning_tokens":1,"total_tokens":16},"status":"completed"}}\n\n) <>
-          "data: [DONE]\n\n"
-
-      assert %{
-               status: "usage_known",
-               input_tokens: 11,
-               cached_input_tokens: 2,
-               output_tokens: 5,
-               reasoning_tokens: 1,
-               total_tokens: 16,
-               service_tier: "priority"
-             } = ResponseUsage.from_sse(body)
+    test "a complete terminal event after a truncated prefix restores provenance" do
+      body = ~s(truncated,"usage":{"input_tokens":999) <> "\n\n" <> terminal_sse_usage(0)
+      assert ResponseUsage.from_sse(body) == ResponseUsage.from_sse(terminal_sse_usage(0))
     end
 
     test "marks SSE without usage as unknown" do
@@ -363,7 +318,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
       """
 
-      assert ResponseUsage.from_sse(body) ==
+      assert assert_observation(ResponseUsage.from_sse(body), @partial_no_model) ==
                %{status: "usage_unknown", source: "sse_usage_missing"}
     end
 
@@ -374,7 +329,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
           "response" => %{"usage" => %{}}
         })
 
-      assert ResponseUsage.from_sse(body) ==
+      assert assert_observation(ResponseUsage.from_sse(body), @completed_no_model) ==
                %{status: "usage_unknown", source: "invalid_usage_tokens"}
     end
 
@@ -393,7 +348,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
           }
         })
 
-      assert ResponseUsage.from_sse(body) == %{
+      assert assert_observation(ResponseUsage.from_sse(body), @completed_no_model) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 0,
@@ -406,6 +361,124 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
     end
   end
 
+  describe "served model" do
+    test "JSON responses record the model the provider declared" do
+      body =
+        CodexPooler.JSON.encode!(%{
+          "model" => "gpt-6-luna",
+          "usage" => %{"input_tokens" => 10, "output_tokens" => 7, "total_tokens" => 17}
+        })
+
+      assert %{status: "usage_known", served_model: "gpt-6-luna"} = ResponseUsage.from_json(body)
+    end
+
+    test "JSON responses without a model record none" do
+      body =
+        CodexPooler.JSON.encode!(%{
+          "usage" => %{"input_tokens" => 10, "output_tokens" => 7, "total_tokens" => 17}
+        })
+
+      refute Map.has_key?(ResponseUsage.from_json(body), :served_model)
+    end
+
+    test "stream events take the model from the response object before the root" do
+      event = %{
+        "type" => "response.completed",
+        "model" => "root-model",
+        "response" => %{
+          "model" => "gpt-6-luna",
+          "usage" => %{"input_tokens" => 10, "output_tokens" => 7, "total_tokens" => 17}
+        }
+      }
+
+      assert %{status: "usage_known", served_model: "gpt-6-luna"} =
+               ResponseUsage.from_stream_event(event)
+
+      assert %{status: "usage_known", served_model: "root-model"} =
+               ResponseUsage.from_stream_event(Map.delete(event, "response") |> Map.put("usage", event["response"]["usage"]))
+    end
+
+    test "a lifecycle event without usage still records the declared model" do
+      assert %{status: "usage_unknown", source: "usage_missing", served_model: "gpt-6-luna"} =
+               ResponseUsage.from_stream_event(%{
+                 "type" => "response.created",
+                 "response" => %{"id" => "resp_1", "model" => "gpt-6-luna"}
+               })
+
+      assert %{status: "usage_unknown", source: "invalid_usage_tokens", served_model: "gpt-6-luna"} =
+               ResponseUsage.from_stream_event(%{
+                 "type" => "response.completed",
+                 "response" => %{"model" => "gpt-6-luna", "usage" => %{"input_tokens" => "x"}}
+               })
+    end
+
+    test "SSE and websocket bodies keep the first declared model of the stream" do
+      created = %{
+        "type" => "response.created",
+        "response" => %{"id" => "resp_1", "model" => "gpt-6-luna", "status" => "in_progress"}
+      }
+
+      completed = %{
+        "type" => "response.completed",
+        "response" => %{
+          "id" => "resp_1",
+          "model" => "gpt-6-astra",
+          "usage" => %{"input_tokens" => 10, "output_tokens" => 7, "total_tokens" => 17}
+        }
+      }
+
+      sse = sse_event("response.created", created) <> sse_event("response.completed", completed)
+
+      assert %{status: "usage_known", served_model: "gpt-6-luna"} = ResponseUsage.from_sse(sse)
+
+      websocket =
+        CodexPooler.JSON.encode!(created) <> "\n\n" <> CodexPooler.JSON.encode!(completed)
+
+      assert %{status: "usage_known", served_model: "gpt-6-luna"} =
+               ResponseUsage.from_websocket_body(websocket)
+
+      interrupted = sse_event("response.created", created)
+
+      assert %{status: "usage_unknown", source: "sse_usage_missing", served_model: "gpt-6-luna"} =
+               ResponseUsage.from_sse(interrupted)
+    end
+
+    test "the declared model is bounded, never erased" do
+      assert ResponseUsage.bounded_served_model("  gpt-6-luna  ") == "gpt-6-luna"
+      assert ResponseUsage.bounded_served_model("ft:gpt-4o:org/proj_1") == "ft:gpt-4o:org/proj_1"
+      assert ResponseUsage.bounded_served_model("") == nil
+      assert ResponseUsage.bounded_served_model("   ") == nil
+      assert ResponseUsage.bounded_served_model(nil) == nil
+      assert ResponseUsage.bounded_served_model(%{"id" => "gpt"}) == nil
+      assert ResponseUsage.bounded_served_model(42) == nil
+
+      overlong = String.duplicate("a", 81)
+      assert "sha256_" <> digest = ResponseUsage.bounded_served_model(overlong)
+      assert String.length(digest) == 12
+      assert digest =~ ~r/\A[0-9a-f]{12}\z/
+
+      assert "sha256_" <> _ = ResponseUsage.bounded_served_model("gpt 5.6 luna")
+      assert "sha256_" <> _ = ResponseUsage.bounded_served_model("gpt\u00e9")
+      assert "sha256_" <> _ = ResponseUsage.bounded_served_model("-leading-dash")
+
+      assert ResponseUsage.bounded_served_model("gpt 5.6 luna") ==
+               ResponseUsage.bounded_served_model("gpt 5.6 luna")
+
+      refute ResponseUsage.bounded_served_model("gpt 5.6 luna") ==
+               ResponseUsage.bounded_served_model("gpt 5.6 sol")
+    end
+
+    test "a non-string model is not a declaration" do
+      refute Map.has_key?(
+               ResponseUsage.from_stream_event(%{
+                 "type" => "response.created",
+                 "response" => %{"model" => %{"id" => "gpt"}}
+               }),
+               :served_model
+             )
+    end
+  end
+
   describe "from_websocket_body/1" do
     test "preserves absent, zero, and positive terminal websocket cache-write counters" do
       for {reported, expected} <- [{:absent, nil}, {0, 0}, {5, 5}] do
@@ -414,22 +487,12 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
       end
     end
 
-    test "rejects malformed cache-write counters in retained websocket usage" do
-      for invalid <- ["-1", "1.5", ~s("1"), "null"] do
-        assert ResponseUsage.from_websocket_body(retained_usage_with_cache_write(invalid)) == %{
-                 status: "usage_unknown",
-                 source: "invalid_usage_tokens"
-               }
-      end
-    end
+    test "unscoped retained websocket fragments cannot override complete frames" do
+      complete = terminal_websocket_usage(0)
+      fragment = retained_usage_with_cache_write("null")
 
-    test "malformed retained terminal usage overrides earlier known websocket usage" do
-      body = terminal_websocket_usage(0) <> "\n" <> retained_usage_with_cache_write("null")
-
-      assert ResponseUsage.from_websocket_body(body) == %{
-               status: "usage_unknown",
-               source: "invalid_usage_tokens"
-             }
+      assert ResponseUsage.from_websocket_body(complete <> "\n" <> fragment) ==
+               ResponseUsage.from_websocket_body(complete)
     end
 
     test "extracts usage from SSE-style collected websocket data chunks" do
@@ -440,7 +503,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
       """
 
-      assert ResponseUsage.from_websocket_body(body) == %{
+      assert assert_observation(ResponseUsage.from_websocket_body(body), @completed_no_model) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 11,
@@ -455,8 +518,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
     test "extracts nested response.completed usage from newline-delimited websocket JSON messages" do
       body =
         [
-          Jason.encode!(%{"type" => "response.created"}),
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{"type" => "response.created"}),
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{
               "service_tier" => "default",
@@ -464,7 +527,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
                 "input_tokens" => 17,
                 "cached_input_tokens" => 6,
                 "output_tokens" => 19,
-                "reasoning_tokens" => 3,
+                "output_tokens_details" => %{"reasoning_tokens" => 3},
                 "total_tokens" => 36
               }
             }
@@ -472,7 +535,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
         ]
         |> Enum.join("\n")
 
-      assert ResponseUsage.from_websocket_body(body) == %{
+      assert assert_observation(ResponseUsage.from_websocket_body(body), @completed_no_model) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 17,
@@ -487,8 +550,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
     test "extracts direct response payload usage from newline-delimited websocket JSON messages" do
       body =
         [
-          Jason.encode!(%{"type" => "response.in_progress"}),
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{"type" => "response.in_progress"}),
+          CodexPooler.JSON.encode!(%{
             "id" => "resp_sample",
             "service_tier" => "flex",
             "usage" => %{
@@ -501,7 +564,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
         ]
         |> Enum.join("\n")
 
-      assert ResponseUsage.from_websocket_body(body) == %{
+      assert assert_observation(ResponseUsage.from_websocket_body(body), @no_model) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 23,
@@ -515,7 +578,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
     test "extracts top-level usage envelope from direct websocket JSON messages" do
       body =
-        Jason.encode!(%{
+        CodexPooler.JSON.encode!(%{
           "usage" => %{
             "input_tokens" => 31,
             "cached_input_tokens" => 8,
@@ -525,7 +588,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
           }
         })
 
-      assert ResponseUsage.from_websocket_body(body) == %{
+      assert assert_observation(ResponseUsage.from_websocket_body(body), @no_model) == %{
                status: "usage_known",
                source: "upstream_usage",
                input_tokens: 31,
@@ -541,8 +604,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
       body =
         [
           "not json",
-          Jason.encode!(%{"type" => "response.created"}),
-          Jason.encode!(%{
+          CodexPooler.JSON.encode!(%{"type" => "response.created"}),
+          CodexPooler.JSON.encode!(%{
             "type" => "response.completed",
             "response" => %{
               "usage" => %{
@@ -571,32 +634,35 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
     test "marks non-terminal websocket frames without usage as websocket usage missing" do
       body =
         [
-          Jason.encode!(%{"type" => "response.created"}),
-          Jason.encode!(%{"type" => "response.in_progress"})
+          CodexPooler.JSON.encode!(%{"type" => "response.created"}),
+          CodexPooler.JSON.encode!(%{"type" => "response.in_progress"})
         ]
         |> Enum.join("\n")
 
-      assert ResponseUsage.from_websocket_body(body) ==
+      assert assert_observation(ResponseUsage.from_websocket_body(body), @no_model) ==
                %{status: "usage_unknown", source: "websocket_usage_missing"}
     end
 
     test "marks terminal websocket frames without usage as websocket usage missing" do
       body =
-        Jason.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_empty"}})
+        CodexPooler.JSON.encode!(%{
+          "type" => "response.completed",
+          "response" => %{"id" => "resp_empty"}
+        })
 
-      assert ResponseUsage.from_websocket_body(body) ==
+      assert assert_observation(ResponseUsage.from_websocket_body(body), @completed_no_model) ==
                %{status: "usage_unknown", source: "websocket_usage_missing"}
     end
   end
 
   defp sse_event(event, payload) do
-    "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
+    "event: " <> event <> "\n" <> "data: " <> CodexPooler.JSON.encode!(payload) <> "\n\n"
   end
 
   defp chat_usage_body(reported) do
     details = cache_write_details(reported)
 
-    Jason.encode!(%{
+    CodexPooler.JSON.encode!(%{
       "usage" => %{
         "prompt_tokens" => 10,
         "prompt_tokens_details" => details,
@@ -610,7 +676,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
     sse_event("response.completed", terminal_usage_payload(reported))
   end
 
-  defp terminal_websocket_usage(reported), do: Jason.encode!(terminal_usage_payload(reported))
+  defp terminal_websocket_usage(reported),
+    do: CodexPooler.JSON.encode!(terminal_usage_payload(reported))
 
   defp terminal_usage_payload(reported) do
     %{

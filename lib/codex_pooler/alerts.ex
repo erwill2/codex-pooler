@@ -11,6 +11,7 @@ defmodule CodexPooler.Alerts do
   alias CodexPooler.Alerts.Evaluation.Evaluator
   alias CodexPooler.Alerts.Incidents.IncidentLifecycle
   alias CodexPooler.Alerts.Incidents.IncidentNotifications
+  alias CodexPooler.Alerts.Incidents.NotificationEvents
   alias CodexPooler.Alerts.Rules.RuleEvaluation
   alias CodexPooler.Alerts.Rules.RuleManagement
 
@@ -106,6 +107,26 @@ defmodule CodexPooler.Alerts do
 
   @spec safe_projected_metadata_for_admin(map()) :: map()
   defdelegate safe_projected_metadata_for_admin(metadata), to: IncidentNotifications
+
+  @spec resolve_orphaned_incidents(DateTime.t()) :: {:ok, [AlertIncident.t()]} | {:error, Ecto.Changeset.t()}
+  defdelegate resolve_orphaned_incidents(timestamp), to: IncidentLifecycle
+
+  @spec invalidate_notifications_after_cascade(NotificationEvents.cascade_owner(), (-> {:ok, result} | {:error, reason})) ::
+          {:ok, result} | {:error, reason}
+        when result: term(), reason: term()
+  defdelegate invalidate_notifications_after_cascade(cascade_owner, delete), to: NotificationEvents, as: :invalidate_after_cascade
+
+  @spec invalidate_notifications_after_pool_status_change(Ecto.UUID.t()) :: :ok | {:error, term()}
+  defdelegate invalidate_notifications_after_pool_status_change(pool_id), to: NotificationEvents, as: :invalidate_pool_visibility
+
+  @doc """
+  Invalidates one operator's notification centers after a committed change of
+  the Pools that operator can see: a Pool assignment granted or revoked, or a
+  role changed or revoked (findings#206 row 206-319). The operator's pages
+  re-read their visible Pools and resync their Pool subscriptions.
+  """
+  @spec invalidate_notifications_after_operator_visibility_change(Ecto.UUID.t()) :: :ok | {:error, term()}
+  defdelegate invalidate_notifications_after_operator_visibility_change(operator_id), to: NotificationEvents, as: :broadcast_operator_invalidation
 
   @spec clear_incident_condition(IncidentLifecycle.clear_attrs() | map() | String.t()) ::
           IncidentLifecycle.clear_result()

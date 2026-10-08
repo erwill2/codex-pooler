@@ -3,14 +3,43 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
 
   use CodexPoolerWeb, :live_view
 
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents
+
   alias CodexPoolerWeb.Dev.{
     ComponentShowcase,
     ComponentShowcaseCatalog,
     ComponentShowcaseData,
+    ComponentShowcaseDialogs,
+    ComponentShowcasePlanBadges,
     ComponentShowcaseStats
   }
 
-  @review_states ~w(catalog flash policy-dialog request-drawer)
+  @review_states ~w(catalog dialogs flash oauth-browser-dialog policy-dialog request-drawer plan-badges)
+
+  @oauth_browser_authorization_url "https://auth.example.com/oauth/authorize?client_id=dev-component-showcase&response_type=code&state=synthetic-review-state"
+
+  # Every branch the OAuth dialog can render, so a review sees the states that
+  # only appear when something goes wrong or when a route other than the browser
+  # one is taken. `browser` stays the default: it is what the plain review URL
+  # has always shown.
+  @oauth_cases [
+    {"start", "Start"},
+    {"browser", "Browser pending"},
+    {"browser-error", "Callback rejected"},
+    {"device", "Device pending"},
+    {"device-expired", "Code expired"},
+    {"completed", "Linked"},
+    {"device-linked", "Device linked"},
+    {"relink", "Relink"},
+    {"relink-linked", "Relinked"},
+    {"relink-mismatch", "Identity mismatch"}
+  ]
+
+  @oauth_case_values Enum.map(@oauth_cases, &elem(&1, 0))
+
+  # Synthetic, but shaped like the real column so the cockpit link in the footer
+  # renders the route it would render in production.
+  @oauth_completed_identity_id "00000000-0000-4000-8000-00000000c0de"
 
   def component_contract, do: ComponentShowcaseCatalog.entries()
   def render_contracts, do: Map.new([ComponentShowcaseStats.contract()], &{&1.id, &1})
@@ -18,6 +47,7 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
   @impl true
   def mount(params, session, socket) do
     review_state = selected_review_state(params, session)
+    oauth_case = selected_oauth_case(params, session)
 
     socket =
       socket
@@ -25,12 +55,189 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
         theme: selected_theme(params, session),
         paused: false,
         review_state: review_state,
+        oauth_case: oauth_case,
+        oauth_cases: @oauth_cases,
         variants: ComponentShowcaseData.primitive_variants(),
-        observatory: ComponentShowcaseData.observatory_presentation()
+        observatory: ComponentShowcaseData.observatory_presentation(),
+        request_log: request_log_fixture(),
+        oauth_link_form:
+          to_form(%{"pool_id" => "dev-component-showcase", "callback_url" => ""},
+            as: :oauth_link
+          )
       )
+      |> assign(
+        dialog_case: selected_dialog_case(params, session),
+        dialog_cases: ComponentShowcaseDialogs.dialogs()
+      )
+      |> assign(oauth_fixture(oauth_case))
       |> select_review_state(review_state)
+      # The auth.json dialog renders a real `live_file_input`, which needs a real
+      # `UploadConfig` - there is no faking it from a fixture map.
+      |> allow_upload(:auth_json, accept: ~w(.json), max_entries: 1, max_file_size: 512_000)
 
     {:ok, socket}
+  end
+
+  defp selected_dialog_case(%{"dialog" => dialog}, _session) do
+    if dialog in ComponentShowcaseDialogs.ids(),
+      do: dialog,
+      else: ComponentShowcaseDialogs.default_id()
+  end
+
+  defp selected_dialog_case(_params, %{"dialog_case" => dialog}) do
+    if dialog in ComponentShowcaseDialogs.ids(),
+      do: dialog,
+      else: ComponentShowcaseDialogs.default_id()
+  end
+
+  defp selected_dialog_case(_params, _session), do: ComponentShowcaseDialogs.default_id()
+
+  # Params for the browser, session for `live_isolated` - the same two-door
+  # lookup `selected_review_state/2` already uses, so the finished states are
+  # reachable from a test and not only from the URL.
+  defp selected_oauth_case(%{"case" => oauth_case}, _session)
+       when oauth_case in @oauth_case_values,
+       do: oauth_case
+
+  defp selected_oauth_case(_params, %{"oauth_case" => oauth_case})
+       when oauth_case in @oauth_case_values,
+       do: oauth_case
+
+  defp selected_oauth_case(_params, _session), do: "browser"
+
+  defp select_oauth_case(socket, oauth_case) do
+    socket
+    |> assign(:oauth_case, oauth_case)
+    |> assign(oauth_fixture(oauth_case))
+  end
+
+  # Synthetic throughout: no real authorization URL, account, or device code.
+  defp oauth_fixture("start") do
+    %{
+      oauth_link_mode: :link,
+      oauth_link_target_account: nil,
+      oauth_link_flow: nil,
+      oauth_link_authorization_url: nil,
+      oauth_link_result: nil,
+      oauth_link_error: nil
+    }
+  end
+
+  defp oauth_fixture("browser-error") do
+    "browser"
+    |> oauth_fixture()
+    |> Map.put(:oauth_link_error, %{
+      message: "That callback URL is from an earlier attempt. Open the page again and paste the new one."
+    })
+  end
+
+  defp oauth_fixture("device") do
+    %{
+      oauth_link_mode: :link,
+      oauth_link_target_account: nil,
+      oauth_link_flow: %{
+        flow_kind: "device",
+        status: "pending",
+        device_user_code: "FJDK-XRQP",
+        verification_uri: "https://auth.example.com/device",
+        interval_seconds: 5,
+        expires_at: ~U[2026-08-13 17:45:00.000000Z]
+      },
+      oauth_link_authorization_url: nil,
+      oauth_link_result: %{message: "Device authorization pending"},
+      oauth_link_error: nil
+    }
+  end
+
+  # Shown the way the dialog renders it today, dead code and all: the expired
+  # code stays on screen beside the controls that would start a new one, which
+  # is the point of being able to look at this state.
+  defp oauth_fixture("device-expired") do
+    "device"
+    |> oauth_fixture()
+    |> Map.merge(%{
+      oauth_link_result: nil,
+      oauth_link_error: %{
+        message: "The authorization window expired. Start onboarding again from a fresh invite."
+      }
+    })
+  end
+
+  # The message and the identity stamp are the real ones: `complete_message/1`
+  # produces this exact string, and `mark_oauth_flow_completed/4` puts the linked
+  # identity on the flow, which is what the footer's cockpit link reads.
+  defp oauth_fixture("completed") do
+    %{
+      oauth_link_mode: :link,
+      oauth_link_target_account: nil,
+      oauth_link_flow: %{
+        flow_kind: "browser",
+        status: "completed",
+        result_upstream_identity_id: @oauth_completed_identity_id
+      },
+      oauth_link_authorization_url: nil,
+      oauth_link_result: %{message: "OpenAI account linked"},
+      oauth_link_error: nil
+    }
+  end
+
+  # The device route reaching its own end: `completed` above is the browser one,
+  # and the two differ in what the operator did to get there.
+  defp oauth_fixture("device-linked") do
+    "completed"
+    |> oauth_fixture()
+    |> Map.put(:oauth_link_flow, %{
+      flow_kind: "device",
+      status: "completed",
+      result_upstream_identity_id: @oauth_completed_identity_id
+    })
+  end
+
+  # The third finished screen: a relink ends on its own header and its own
+  # message, so reviewing only the two link ones would leave that copy unseen.
+  defp oauth_fixture("relink-linked") do
+    "relink"
+    |> oauth_fixture()
+    |> Map.merge(%{
+      oauth_link_flow: %{
+        flow_kind: "browser",
+        status: "completed",
+        result_upstream_identity_id: @oauth_completed_identity_id
+      },
+      oauth_link_authorization_url: nil,
+      oauth_link_result: %{message: "OpenAI account relinked"}
+    })
+  end
+
+  defp oauth_fixture("relink-mismatch") do
+    "relink"
+    |> oauth_fixture()
+    |> Map.merge(%{
+      oauth_link_result: nil,
+      oauth_link_error: %{
+        message: "The authorized Codex account does not match the account being relinked."
+      }
+    })
+  end
+
+  defp oauth_fixture("relink") do
+    "browser"
+    |> oauth_fixture()
+    |> Map.merge(%{
+      oauth_link_mode: :relink,
+      oauth_link_target_account: %{label: "design-review-account"}
+    })
+  end
+
+  defp oauth_fixture(_browser) do
+    %{
+      oauth_link_mode: :link,
+      oauth_link_target_account: nil,
+      oauth_link_flow: %{flow_kind: "browser", status: "pending"},
+      oauth_link_authorization_url: @oauth_browser_authorization_url,
+      oauth_link_result: %{message: "Browser authorization pending"},
+      oauth_link_error: nil
+    }
   end
 
   @impl true
@@ -54,6 +261,28 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
     {:noreply, select_review_state(socket, "catalog")}
   end
 
+  # The dialog's own controls walk the review between fixtures, so the states can
+  # be reached the way an operator reaches them rather than only by URL. Without
+  # these the door buttons had no matching clause at all and the click took the
+  # LiveView down, which is why the dialog could be looked at but not used.
+  def handle_event("start_oauth_browser", _params, socket),
+    do: {:noreply, select_oauth_case(socket, "browser")}
+
+  def handle_event("start_oauth_device", _params, socket),
+    do: {:noreply, select_oauth_case(socket, "device")}
+
+  def handle_event("cancel_oauth_link", _params, socket),
+    do: {:noreply, select_oauth_case(socket, "start")}
+
+  def handle_event("submit_oauth_callback", _params, socket),
+    do: {:noreply, select_oauth_case(socket, "completed")}
+
+  def handle_event("validate_oauth_link_pool", _params, socket), do: {:noreply, socket}
+
+  def handle_event(event, _params, socket)
+      when event in ["open_quota_observations", "close_quota_observations"],
+      do: {:noreply, socket}
+
   def handle_event("close_request_log", _params, socket),
     do: {:noreply, select_review_state(socket, "catalog")}
 
@@ -62,15 +291,142 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
     ~H"""
     <div id="showcase-theme-boundary" data-theme={@theme} class="min-h-svh">
       <Layouts.app flash={@flash} chrome={:observatory}>
+        <div
+          :if={@review_state == "oauth-browser-dialog"}
+          id="showcase-oauth-browser-dialog-fixture"
+          class="min-h-svh bg-base-200 text-base-content"
+        >
+          <.case_switcher
+            id="showcase-oauth-case-switcher"
+            label="OAuth dialog state"
+            id_prefix="showcase-oauth-case"
+            param="case"
+            state="oauth-browser-dialog"
+            theme={@theme}
+            cases={@oauth_cases}
+            current={@oauth_case}
+          />
+
+          <UpstreamPageComponents.oauth_link_dialog
+            oauth_linking
+            oauth_link_mode={@oauth_link_mode}
+            oauth_link_target_account={@oauth_link_target_account}
+            oauth_link_form={@oauth_link_form}
+            oauth_link_flow={@oauth_link_flow}
+            oauth_link_authorization_url={@oauth_link_authorization_url}
+            oauth_link_result={@oauth_link_result}
+            oauth_link_error={@oauth_link_error}
+            pool_options={[{"Design review Pool", "dev-component-showcase"}]}
+            datetime_preferences={CodexPoolerWeb.DateTimeDisplay.preferences_for_user(nil)}
+          />
+        </div>
+
+        <div
+          :if={@review_state == "dialogs"}
+          id="showcase-dialog-gallery"
+          class="min-h-svh bg-base-200 text-base-content"
+        >
+          <.case_switcher
+            id="showcase-dialog-switcher"
+            label="Admin dialog"
+            id_prefix="showcase-dialog"
+            param="dialog"
+            state="dialogs"
+            theme={@theme}
+            cases={@dialog_cases}
+            current={@dialog_case}
+          />
+
+          <ComponentShowcaseDialogs.dialog_fixture
+            dialog={@dialog_case}
+            upload={@uploads.auth_json}
+          />
+        </div>
+
+        <ComponentShowcasePlanBadges.gallery :if={@review_state == "plan-badges"} theme={@theme} />
         <ComponentShowcase.component_showcase
+          :if={@review_state not in ["oauth-browser-dialog", "dialogs", "plan-badges"]}
           theme={@theme}
           paused={@paused}
           review_state={@review_state}
           variants={@variants}
           observatory={@observatory}
+          request_log={@request_log}
         />
       </Layouts.app>
     </div>
+    """
+  end
+
+  attr :id, :string, required: true
+  attr :label, :string, required: true
+  attr :id_prefix, :string, required: true
+  attr :param, :string, required: true
+  attr :state, :string, required: true
+  attr :theme, :string, required: true
+  attr :cases, :list, required: true
+  attr :current, :string, required: true
+
+  # A disclosure holding a grid, not a row of chips. The row was fine at five
+  # cases and unusable at nineteen: on a phone it became a horizontal scroller
+  # where every case past the third was off-screen, and the reviewer had to
+  # swipe a strip to reach the thing they wanted to look at. Closed, this is one
+  # button naming the current case; open, it is a grid of all of them, and it
+  # collapses again on choosing one because the choice is a page load.
+  #
+  # Styles are inline because Tailwind's `@source` list does not include
+  # `dev_support/`, so a class written only here compiles to nothing and the
+  # element silently renders unstyled.
+  defp case_switcher(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :current_label,
+        Enum.find_value(assigns.cases, "", fn {value, label} ->
+          value == assigns.current && label
+        end)
+      )
+
+    ~H"""
+    <details
+      id={@id}
+      class="fixed left-2 top-2 rounded-box border border-base-300 bg-base-100 shadow-lg"
+      {%{"style" => "z-index:1000;max-width:calc(100vw - 1rem)"}}
+    >
+      <summary
+        id={"#{@id}-summary"}
+        class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs font-semibold text-base-content"
+        aria-label={@label}
+      >
+        <span class="text-[0.62rem] uppercase tracking-[0.08em] text-base-content/45">
+          {@label}
+        </span>
+        <span class="text-primary">{@current_label}</span>
+      </summary>
+
+      <div
+        class="grid gap-1.5 border-t border-base-300 p-2"
+        {%{
+          "style" =>
+            "grid-template-columns:repeat(auto-fill,minmax(11rem,1fr));width:min(44rem,calc(100vw - 1rem));max-height:70vh;overflow-y:auto"
+        }}
+      >
+        <a
+          :for={{value, label} <- @cases}
+          id={"#{@id_prefix}-#{value}"}
+          href={"/dev/component-showcase/#{@theme}?state=#{@state}&#{@param}=#{value}"}
+          aria-current={value == @current && "page"}
+          class={[
+            "rounded-field border px-2 py-2 text-xs font-semibold transition-colors",
+            value == @current && "border-primary bg-primary/10 text-base-content",
+            value != @current &&
+              "border-base-300 text-base-content/60 hover:border-primary/50 hover:text-base-content"
+          ]}
+        >
+          {label}
+        </a>
+      </div>
+    </details>
     """
   end
 
@@ -88,6 +444,58 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseLive do
        do: review_state
 
   defp selected_review_state(_params, _session), do: "catalog"
+
+  defp request_log_fixture do
+    %{
+      id: "showcase-request",
+      correlation_id: "showcase-terminal-diagnostics",
+      status: "failed",
+      endpoint: "/backend-api/codex/responses/compact",
+      requested_model: "sample-model",
+      reasoning_effort: nil,
+      applied_reasoning_effort: nil,
+      effective_reasoning_effort: nil,
+      transport: "http_compact_json",
+      response_status_code: 200,
+      denial_reason: "invalid_compaction_response",
+      retry_count: 0,
+      admitted_at: ~U[2026-08-24 10:00:00Z],
+      completed_at: ~U[2026-08-24 10:00:01Z],
+      pool_name: "Sample Pool",
+      upstream_account_label: "Sample upstream",
+      assignment_label: "Sample assignment",
+      api_key_id: "sample-key-id",
+      api_key_display_name: "Sample key",
+      api_key_prefix: "cxp_sample",
+      metadata: %{},
+      token_counts: nil,
+      cost: nil,
+      usage_status: "usage_unknown",
+      debug: %{
+        continuity: %{},
+        failure: %{error_code: "invalid_compaction_response", error_source: "request_error"},
+        attempt: %{attempt_count: 1, latest_attempt_number: 1},
+        terminal_state: %{state: "terminal", mismatch: false},
+        turn: %{},
+        attempts: [
+          %{
+            attempt_ref: "attempt_sample",
+            attempt_number: 1,
+            pool_upstream_assignment_id: "assignment_sample",
+            status: "failed",
+            upstream_status_code: 200,
+            network_error_code: "invalid_compaction_response",
+            upstream_error_code: "context_length_exceeded",
+            stream_terminal_type: "response.failed",
+            upstream_error_param: "input[0].content",
+            latency_ms: 120,
+            retryable: false,
+            final: true
+          }
+        ]
+      }
+    }
+  end
 
   defp select_review_state(socket, review_state) do
     socket = socket |> clear_flash() |> assign(:review_state, review_state)

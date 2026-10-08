@@ -29,10 +29,8 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
          reason: {:proxy, {:unexpected_status, 503}},
          source: %Mint.HTTPError{module: Mint.HTTP1, reason: {:proxy, {:unexpected_status, 503}}}
        }, "Finch.HTTPError", "proxy_unexpected_status_503"},
-      {%Mint.TransportError{reason: {:bad_alpn_protocol, "h3"}}, "Mint.TransportError",
-       "bad_alpn_protocol"},
-      {%Mint.HTTPError{module: Mint.HTTP1, reason: {:proxy, :tunnel_timeout}}, "Mint.HTTPError",
-       "proxy_tunnel_timeout"}
+      {%Mint.TransportError{reason: {:bad_alpn_protocol, "h3"}}, "Mint.TransportError", "bad_alpn_protocol"},
+      {%Mint.HTTPError{module: Mint.HTTP1, reason: {:proxy, :tunnel_timeout}}, "Mint.HTTPError", "proxy_tunnel_timeout"}
     ]
 
     for {exception, exception_name, reason} <- cases do
@@ -92,6 +90,20 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
            }
   end
 
+  test "permits candidate retry only for failures proven before submission" do
+    for reason <- [:econnrefused, :ehostunreach, :enetunreach, :nxdomain] do
+      error = TransportFailureReason.upstream_transport_error(reason, %{phase: :request})
+      assert TransportFailureReason.retry_safe_before_submission?(error)
+    end
+
+    for reason <- [:closed, :timeout, :econnreset] do
+      error = TransportFailureReason.upstream_transport_error(reason, %{phase: :request})
+      refute TransportFailureReason.retry_safe_before_submission?(error)
+    end
+
+    refute TransportFailureReason.retry_safe_before_submission?(%{})
+  end
+
   test "preserves websocket receive timeout phase metadata" do
     metadata =
       TransportFailureReason.transport_failure_metadata(
@@ -112,6 +124,283 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
              "terminal_seen" => false,
              "text_frame_count" => 0
            }
+  end
+
+  test "builds the fixed continuation generation guard diagnostic" do
+    for connection_use <- [:fresh, :reconnected] do
+      expected = %{
+        "connection_use" => Atom.to_string(connection_use),
+        "phase" => "send_payload",
+        "pre_visible_output" => true,
+        "reason" => "previous_response_generation_mismatch",
+        "reason_class" => "previous_response_generation_mismatch",
+        "termination_source" => "continuation_generation_guard",
+        "terminal_seen" => false,
+        "text_frame_count" => 0,
+        "upstream_committed" => false
+      }
+
+      assert TransportFailureReason.continuation_generation_guard_metadata(connection_use) ==
+               expected
+
+      assert TransportFailureReason.transport_failure_metadata(
+               :previous_response_generation_mismatch,
+               %{
+                 connection_use: connection_use,
+                 previous_response_id: "raw-response-id-sentinel",
+                 message: "raw-message-sentinel"
+               }
+             ) == expected
+
+      assert TransportFailureReason.sanitize_transport_failure_metadata(
+               Map.merge(expected, %{
+                 "previous_response_id" => "raw-response-id-sentinel",
+                 "message" => "raw-message-sentinel",
+                 "termination_source_detail" => "raw-source-sentinel"
+               })
+             ) == expected
+    end
+  end
+
+  test "builds the serving-mode guard diagnostic only for a reused connection" do
+    expected = %{
+      "connection_use" => "reused",
+      "phase" => "send_payload",
+      "pre_visible_output" => true,
+      "reason" => "previous_response_serving_mode_mismatch",
+      "reason_class" => "previous_response_serving_mode_mismatch",
+      "termination_source" => "continuation_generation_guard",
+      "terminal_seen" => false,
+      "text_frame_count" => 0,
+      "upstream_committed" => false
+    }
+
+    for connection_use <- [:reused, "reused"] do
+      assert TransportFailureReason.continuation_generation_guard_metadata(:previous_response_serving_mode_mismatch, connection_use) == expected
+
+      assert TransportFailureReason.transport_failure_metadata(:previous_response_serving_mode_mismatch, %{connection_use: connection_use, previous_response_id: "raw-response-id-sentinel"}) == expected
+    end
+
+    assert TransportFailureReason.sanitize_transport_failure_metadata(Map.put(expected, "previous_response_id", "raw-response-id-sentinel")) == expected
+
+    for connection_use <- [:fresh, :reconnected, "future", nil] do
+      assert TransportFailureReason.continuation_generation_guard_metadata(:previous_response_serving_mode_mismatch, connection_use) == %{}
+      assert TransportFailureReason.sanitize_transport_failure_metadata(%{expected | "connection_use" => connection_use}) == %{}
+    end
+
+    assert TransportFailureReason.sanitize_transport_failure_metadata(%{expected | "reason_class" => "previous_response_generation_mismatch"}) == %{}
+  end
+
+  test "rejects malformed continuation generation guard diagnostics" do
+    sentinel = "raw-response-id-and-message-sentinel"
+
+    for connection_use <- [:reused, "future", sentinel, nil, 1] do
+      assert TransportFailureReason.continuation_generation_guard_metadata(connection_use) == %{}
+
+      assert TransportFailureReason.sanitize_transport_failure_metadata(%{
+               "reason" => "previous_response_generation_mismatch",
+               "reason_class" => sentinel,
+               "phase" => "receive",
+               "termination_source" => sentinel,
+               "connection_use" => connection_use,
+               "pre_visible_output" => false,
+               "upstream_committed" => true,
+               "terminal_seen" => true,
+               "text_frame_count" => 99,
+               "previous_response_id" => sentinel,
+               "message" => sentinel
+             }) == %{}
+    end
+
+    refute inspect(
+             TransportFailureReason.sanitize_transport_failure_metadata(%{
+               "reason" => "previous_response_generation_mismatch",
+               "termination_source" => "continuation_generation_guard",
+               "connection_use" => "fresh",
+               "previous_response_id" => sentinel,
+               "message" => sentinel
+             })
+           ) =~ sentinel
+  end
+
+  test "sanitizes retained terminal delivery metadata through the strict allowlist" do
+    metadata =
+      TransportFailureReason.sanitize_transport_failure_metadata(%{
+        "phase" => "terminal_delivery",
+        "reason_class" => "owner_terminal_delivery_timeout",
+        "reason" => "upstream_websocket_terminal_delivery_timeout",
+        "upstream_committed" => true,
+        "terminal_seen" => true,
+        "terminal_forwarded" => false,
+        "raw_frame" => "sentinel-frame",
+        "authorization" => "sentinel-token"
+      })
+
+    assert metadata == %{
+             "phase" => "terminal_delivery",
+             "reason_class" => "owner_terminal_delivery_timeout",
+             "reason" => "upstream_websocket_terminal_delivery_timeout",
+             "upstream_committed" => true,
+             "terminal_seen" => true,
+             "terminal_forwarded" => false
+           }
+
+    refute inspect(metadata) =~ "sentinel"
+  end
+
+  test "keeps only bounded websocket terminal discriminator metadata" do
+    metadata =
+      TransportFailureReason.transport_failure_metadata(
+        :upstream_websocket_closed_before_terminal,
+        %{
+          phase: :upstream_close,
+          last_upstream_event_type: "response.done",
+          last_upstream_event_class: "terminal_success_candidate",
+          terminal_candidate_seen: true,
+          terminal_candidate_type: "response.done",
+          terminal_candidate_class: "success",
+          terminal_candidate_rejection: "invalid_response_status"
+        }
+      )
+
+    assert Map.take(metadata, [
+             "last_upstream_event_type",
+             "last_upstream_event_class",
+             "terminal_candidate_seen",
+             "terminal_candidate_type",
+             "terminal_candidate_class",
+             "terminal_candidate_rejection"
+           ]) == %{
+             "last_upstream_event_type" => "response.done",
+             "last_upstream_event_class" => "terminal_success_candidate",
+             "terminal_candidate_seen" => true,
+             "terminal_candidate_type" => "response.done",
+             "terminal_candidate_class" => "success",
+             "terminal_candidate_rejection" => "invalid_response_status"
+           }
+  end
+
+  test "drops caller-controlled websocket terminal discriminator values" do
+    sentinel = "private-terminal-sentinel-deadbeef"
+
+    metadata =
+      TransportFailureReason.sanitize_transport_failure_metadata(%{
+        "last_upstream_event_type" => "response.#{sentinel}",
+        "last_upstream_event_class" => sentinel,
+        "terminal_candidate_seen" => true,
+        "terminal_candidate_type" => sentinel,
+        "terminal_candidate_class" => sentinel,
+        "terminal_candidate_rejection" => sentinel,
+        "raw_frame" => sentinel,
+        "response_status" => sentinel
+      })
+
+    assert metadata == %{"terminal_candidate_seen" => true}
+    refute inspect(metadata) =~ sentinel
+  end
+
+  test "keeps only finite websocket termination and connection diagnostics" do
+    metadata =
+      TransportFailureReason.sanitize_transport_failure_metadata(%{
+        "termination_source" => "peer_close_frame",
+        "transport_signal" => "ssl_data",
+        "connection_use" => "reused",
+        "connection_request_bucket" => "requests_6_20",
+        "connection_age_bucket" => "minutes_15_30",
+        "connection_idle_bucket" => "under_5s",
+        "websocket_buffer_bucket" => "bytes_1_125",
+        "websocket_fragment_open" => true
+      })
+
+    assert metadata == %{
+             "termination_source" => "peer_close_frame",
+             "transport_signal" => "ssl_data",
+             "connection_use" => "reused",
+             "connection_request_bucket" => "requests_6_20",
+             "connection_age_bucket" => "minutes_15_30",
+             "connection_idle_bucket" => "under_5s",
+             "websocket_buffer_bucket" => "bytes_1_125",
+             "websocket_fragment_open" => true
+           }
+  end
+
+  test "keeps request caller down as a safe websocket termination source" do
+    assert TransportFailureReason.sanitize_transport_failure_metadata(%{
+             "termination_source" => "request_caller_down"
+           }) == %{"termination_source" => "request_caller_down"}
+  end
+
+  test "drops free-form websocket termination and connection diagnostics" do
+    sentinel = "private-diagnostic-sentinel-deadbeef"
+
+    metadata =
+      TransportFailureReason.sanitize_transport_failure_metadata(%{
+        "termination_source" => sentinel,
+        "transport_signal" => sentinel,
+        "connection_use" => sentinel,
+        "connection_request_bucket" => sentinel,
+        "connection_age_bucket" => sentinel,
+        "connection_idle_bucket" => sentinel,
+        "websocket_buffer_bucket" => sentinel,
+        "websocket_fragment_open" => sentinel
+      })
+
+    assert metadata == %{}
+    refute inspect(metadata) =~ sentinel
+  end
+
+  test "sanitizes peer close diagnostics before transport failure metadata is built" do
+    cases = [
+      {1000, "short",
+       %{
+         "peer_close_code" => 1000,
+         "peer_close_reason_present" => true,
+         "peer_close_reason_bytes" => 5
+       }},
+      {1000, "",
+       %{
+         "peer_close_code" => 1000,
+         "peer_close_reason_present" => false,
+         "peer_close_reason_bytes" => 0
+       }},
+      {nil, nil,
+       %{
+         "peer_close_reason_present" => false,
+         "peer_close_reason_bytes" => 0
+       }},
+      {-1, :not_binary,
+       %{
+         "peer_close_reason_present" => false,
+         "peer_close_reason_bytes" => 0
+       }},
+      {65_536, String.duplicate("x", 124),
+       %{
+         "peer_close_reason_present" => true,
+         "peer_close_reason_bytes" => 123
+       }}
+    ]
+
+    for {code, reason, expected} <- cases do
+      sanitized = TransportFailureReason.peer_close_metadata(code, reason)
+      assert sanitized == expected
+
+      metadata =
+        TransportFailureReason.transport_failure_metadata(
+          :upstream_websocket_closed_before_terminal,
+          Map.merge(
+            %{
+              phase: :upstream_close,
+              pre_visible_output: true,
+              terminal_seen: false,
+              text_frame_count: 0
+            },
+            sanitized
+          )
+        )
+
+      assert Map.take(metadata, Map.keys(expected)) == expected
+      refute inspect(metadata) =~ inspect(reason)
+    end
   end
 
   test "transport failure metadata does not persist arbitrary binary reasons" do

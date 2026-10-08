@@ -14,7 +14,14 @@ defmodule CodexPooler.Accounting.Attempt do
     field :pricing_snapshot_id, :binary_id
     field :model_id, :binary_id
     field :upstream_model_id, :string
+    field :served_model, :string
+    field :model_observation, :map
     field :transport, :string
+    field :owner_instance_id, :string
+    field :owner_instance_boot_id, :string
+    field :owner_process_id, :string
+    field :owner_execution_id, :binary_id
+    field :owner_execution_checked_at, :utc_datetime_usec
     field :status, :string
     field :started_at, :utc_datetime_usec
     field :completed_at, :utc_datetime_usec
@@ -25,5 +32,6 @@ defmodule CodexPooler.Accounting.Attempt do
     field :latency_ms, :integer
     field :usage_status, :string
     field :response_metadata, :map
+    field :replay_generation, :integer, default: 0
   end
 end

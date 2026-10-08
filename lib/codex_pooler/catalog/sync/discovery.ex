@@ -3,12 +3,13 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
   Upstream model catalog discovery and payload normalization.
   """
 
+  alias CodexPooler.Platform.OutboundHTTP
   alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.CodexClientIdentity
   alias CodexPooler.Upstreams.EndpointMetadata
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPooler.Upstreams.Secrets
 
-  @default_codex_upstream_base_url "https://chatgpt.com"
   @secret_kind "access_token"
 
   @type catalog_error :: %{required(:code) => atom(), required(:message) => String.t()}
@@ -22,8 +23,7 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
       Enum.map(assignments, fn source ->
         case fetcher.(source) do
           {:ok, models} when is_list(models) ->
-            source_models = Enum.map(models, &Map.put(normalize_model_attrs(&1), :source, source))
-            {:ok, source, source_models}
+            normalize_source_models(source, models)
 
           {:error, reason} ->
             {:error, source, reason}
@@ -51,16 +51,29 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
   defp all_failed_result([]), do: {:ok, [], [], []}
   defp all_failed_result([{_source, reason} | _rest]), do: {:error, reason}
 
+  defp normalize_source_models(source, models) do
+    if Enum.all?(models, &is_map/1) do
+      source_models = Enum.map(models, &Map.put(normalize_model_attrs(&1), :source, source))
+      {:ok, source, source_models}
+    else
+      {:error, source,
+       catalog_error(
+         :invalid_upstream_model_catalog,
+         "upstream model catalog contains invalid entries"
+       )}
+    end
+  end
+
   @spec fetch_models_for_assignment(map()) :: {:ok, [map()]} | {:error, catalog_error() | term()}
   def fetch_models_for_assignment(%{assignment: assignment, identity: identity}) do
     with {:ok, token} <-
            Secrets.decrypt_active_secret(identity, @secret_kind),
          {:ok, url} <- model_catalog_url(identity, assignment) do
-      case Req.get(url,
+      case OutboundHTTP.get(url,
              retry: false,
              receive_timeout: 30_000,
-             headers:
-               CloudflareCookies.request_headers(url, model_catalog_headers(identity, token))
+             finch: OutboundHTTP.pool_options_for_url(url),
+             headers: CloudflareCookies.request_headers(url, model_catalog_headers(identity, token))
            )
            |> store_cloudflare_cookies(url) do
         {:ok, %{status: 200, body: %{"data" => models}}} when is_list(models) ->
@@ -91,12 +104,7 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
   end
 
   defp model_catalog_url(identity, assignment) do
-    case EndpointMetadata.endpoint_url(
-           identity,
-           assignment,
-           model_catalog_path(),
-           @default_codex_upstream_base_url
-         ) do
+    case EndpointMetadata.endpoint_url(identity, assignment, model_catalog_path()) do
       {:ok, url} ->
         {:ok, url}
 
@@ -117,7 +125,11 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
         {"accept", "application/json"}
       ] ++ CodexClientIdentity.headers()
 
-    case present_string(identity.chatgpt_account_id) do
+    # Catalog discovery scopes its request the same way every other upstream
+    # call does: a synthetic `email_`/`local_` account id is not a scope the
+    # provider can resolve, so the header is omitted and the bearer token
+    # speaks for itself.
+    case UpstreamIdentity.account_scope(identity.chatgpt_account_id) do
       nil -> headers
       account_id -> [{"chatgpt-account-id", account_id} | headers]
     end
@@ -142,8 +154,7 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
       upstream_model_id: upstream_model_id,
       exposed_model_id: exposed_model_id,
       display_name: display_name,
-      supports_responses:
-        bool_attr(attrs, "supports_responses", bool_default(capabilities, "responses", true)),
+      supports_responses: bool_attr(attrs, "supports_responses", bool_default(capabilities, "responses", true)),
       supports_streaming:
         bool_attr(
           attrs,
@@ -216,11 +227,4 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
       _value -> default
     end
   end
-
-  defp present_string(value) when is_binary(value) do
-    value = String.trim(value)
-    if value == "", do: nil, else: value
-  end
-
-  defp present_string(_value), do: nil
 end

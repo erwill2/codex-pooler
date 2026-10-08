@@ -1,0 +1,354 @@
+defmodule CodexPooler.Gateway.OpenAICompatibility.HostedShellTest do
+  use ExUnit.Case, async: true
+
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.HostedShell
+
+  @moduletag :hosted_shell_history
+
+  test "accepts minimal call and output items unchanged" do
+    call = shell_call()
+    output = shell_output()
+
+    assert_accepted(call)
+    assert_accepted(output)
+  end
+
+  test "accepts the full closed call and output shapes unchanged" do
+    skills = Enum.map(1..200, &skill("skill-#{&1}"))
+
+    call =
+      shell_call(%{
+        "id" => "",
+        "caller" => %{"type" => "program", "caller_id" => "program-call"},
+        "status" => "in_progress",
+        "environment" => %{"type" => "local", "skills" => skills},
+        "action" => %{
+          "commands" => ["first synthetic command", "second synthetic command"],
+          "timeout_ms" => -1,
+          "max_output_length" => nil
+        }
+      })
+
+    output =
+      shell_output(%{
+        "id" => nil,
+        "caller" => %{"type" => "direct"},
+        "status" => "incomplete",
+        "max_output_length" => nil,
+        "output" => [
+          output_chunk("", "", %{"type" => "timeout"}),
+          output_chunk("synthetic stdout", "synthetic stderr", %{
+            "type" => "exit",
+            "exit_code" => -127
+          })
+        ]
+      })
+
+    assert_accepted(call)
+    assert_accepted(output)
+  end
+
+  test "accepts direct and program callers plus nullable or omitted callers" do
+    for caller <- [
+          :omitted,
+          nil,
+          %{"type" => "direct"},
+          %{"type" => "program", "caller_id" => "p"},
+          %{"type" => "program", "caller_id" => String.duplicate("p", 64)}
+        ],
+        builder <- [&shell_call/1, &shell_output/1] do
+      overrides = if caller == :omitted, do: %{}, else: %{"caller" => caller}
+      assert_accepted(builder.(overrides))
+    end
+  end
+
+  test "accepts local and container environments plus nullable or omitted environments" do
+    environments = [
+      :omitted,
+      nil,
+      %{"type" => "local"},
+      %{"type" => "local", "skills" => []},
+      %{"type" => "local", "skills" => [skill("")]},
+      %{"type" => "container_reference", "container_id" => ""}
+    ]
+
+    Enum.each(environments, fn environment ->
+      overrides = if environment == :omitted, do: %{}, else: %{"environment" => environment}
+      assert_accepted(shell_call(overrides))
+    end)
+  end
+
+  test "accepts every documented status plus null and omission" do
+    for status <- [:omitted, nil, "in_progress", "completed", "incomplete"],
+        builder <- [&shell_call/1, &shell_output/1] do
+      overrides = if status == :omitted, do: %{}, else: %{"status" => status}
+      assert_accepted(builder.(overrides))
+    end
+  end
+
+  test "accepts empty arrays, allowed empty strings, and signed integers" do
+    assert_accepted(
+      shell_call(%{
+        "id" => "",
+        "action" => %{"commands" => [], "timeout_ms" => -9, "max_output_length" => 7},
+        "environment" => %{"type" => "container_reference", "container_id" => ""}
+      })
+    )
+
+    assert_accepted(
+      shell_output(%{
+        "id" => "",
+        "output" => [],
+        "max_output_length" => -7
+      })
+    )
+
+    assert_accepted(shell_output(%{"output" => [output_chunk("", "", exit_outcome(-1))]}))
+  end
+
+  test "enforces identifier bounds by Unicode code point" do
+    identifiers = ["x", String.duplicate("x", 64), String.duplicate("🙂", 64)]
+
+    Enum.each(identifiers, fn identifier ->
+      assert_accepted(shell_call(%{"call_id" => identifier}))
+      assert_accepted(shell_output(%{"call_id" => identifier}))
+
+      assert_accepted(shell_call(%{"caller" => %{"type" => "program", "caller_id" => identifier}}))
+    end)
+
+    for identifier <- ["", String.duplicate("x", 65), String.duplicate("🙂", 65)] do
+      assert_rejected(shell_call(%{"call_id" => identifier}))
+      assert_rejected(shell_output(%{"call_id" => identifier}))
+
+      assert_rejected(shell_call(%{"caller" => %{"type" => "program", "caller_id" => identifier}}))
+    end
+  end
+
+  test "accepts 200 local skills and rejects 201" do
+    skills = Enum.map(1..201, &skill("skill-#{&1}"))
+
+    assert_accepted(shell_call(%{"environment" => %{"type" => "local", "skills" => Enum.take(skills, 200)}}))
+
+    assert_rejected(shell_call(%{"environment" => %{"type" => "local", "skills" => skills}}))
+  end
+
+  @tag timeout: 120_000
+  @tag slow: "validates actual 10 MiB stdout and stderr boundary values and one-byte overflows"
+  test "enforces stdout and stderr limits without materializing codepoint lists" do
+    maximum = String.duplicate("x", 10_485_760)
+    overflow = maximum <> "x"
+
+    assert_accepted(shell_output(%{"output" => [output_chunk(maximum, maximum, exit_outcome(0))]}))
+
+    assert_rejected(shell_output(%{"output" => [output_chunk(overflow, "", exit_outcome(0))]}))
+    assert_rejected(shell_output(%{"output" => [output_chunk("", overflow, exit_outcome(0))]}))
+  end
+
+  # The bound is code points, not bytes: two-byte text crosses the byte count
+  # of the limit at half the code points and must still be counted exactly.
+  @tag timeout: 120_000
+  @tag slow: "validates 10 million multibyte codepoints and the one-codepoint overflow without truncation"
+  test "enforces the output limit by code point when every code point is multi-byte" do
+    multibyte_maximum = String.duplicate("é", 10_485_760)
+    multibyte_overflow = multibyte_maximum <> "é"
+
+    assert_accepted(shell_output(%{"output" => [output_chunk(multibyte_maximum, "", exit_outcome(0))]}))
+
+    assert_rejected(shell_output(%{"output" => [output_chunk("", multibyte_overflow, exit_outcome(0))]}))
+  end
+
+  # Findings #119 item 5: a full-size output chunk used to cost ~400 ms of
+  # per-code-point scanning on the /v1 path. The claim is the work, not the
+  # runner's speed, so it is measured in reductions of this process, which a
+  # loaded scheduler does not change: classifying the chunk costs about one
+  # UTF-8 validity pass (1.50M reductions for 10 MiB), while a per-code-point
+  # walk adds about 10.9M and the old String.next_codepoint/1 scan about 37.9M.
+  test "classifies a 10 MiB output chunk with one validity pass instead of a per-code-point walk" do
+    stdout = String.duplicate("x", 10_485_760)
+    item = shell_output(%{"output" => [output_chunk(stdout, "", exit_outcome(0))]})
+
+    {validity_pass, true} = reductions(fn -> String.valid?(stdout, :fast_ascii) end)
+    {classification, result} = reductions(fn -> HostedShell.validate_item(item) end)
+
+    assert {:ok, ^item} = result
+
+    assert classification < 2 * validity_pass,
+           "10 MiB stdout classification took #{classification} reductions against #{validity_pass} for one validity pass"
+  end
+
+  test "rejects invalid UTF-8 in identifiers and output text" do
+    invalid_sequences = [
+      <<0xFF>>,
+      <<0xC3>>,
+      <<0xED, 0xA0, 0x80>>,
+      <<0xC0, 0x80>>,
+      "ok" <> <<0xFF>> <> "ok"
+    ]
+
+    Enum.each(invalid_sequences, fn bytes ->
+      assert_rejected(shell_call(%{"call_id" => bytes}))
+      assert_rejected(shell_call(%{"caller" => %{"type" => "program", "caller_id" => bytes}}))
+      assert_rejected(shell_output(%{"output" => [output_chunk(bytes, "", exit_outcome(0))]}))
+      assert_rejected(shell_output(%{"output" => [output_chunk("", bytes, exit_outcome(0))]}))
+    end)
+  end
+
+  test "rejects unknown keys at every object boundary including created_by" do
+    cases = [
+      Map.put(shell_call(), "unknown", true),
+      Map.put(shell_call(), "created_by", "response-only"),
+      Map.put(shell_output(), "unknown", true),
+      Map.put(shell_output(), "created_by", "response-only"),
+      shell_call(%{"action" => Map.put(shell_call()["action"], "unknown", true)}),
+      shell_call(%{"caller" => %{"type" => "direct", "unknown" => true}}),
+      shell_call(%{
+        "caller" => %{"type" => "program", "caller_id" => "p", "unknown" => true}
+      }),
+      shell_call(%{"environment" => %{"type" => "local", "unknown" => true}}),
+      shell_call(%{
+        "environment" => %{
+          "type" => "container_reference",
+          "container_id" => "container",
+          "unknown" => true
+        }
+      }),
+      shell_call(%{
+        "environment" => %{
+          "type" => "local",
+          "skills" => [Map.put(skill("skill"), "unknown", true)]
+        }
+      }),
+      shell_output(%{
+        "output" => [Map.put(output_chunk("", "", exit_outcome(0)), "unknown", true)]
+      }),
+      shell_output(%{
+        "output" => [output_chunk("", "", %{"type" => "timeout", "unknown" => true})]
+      }),
+      shell_output(%{
+        "output" => [
+          output_chunk("", "", %{"type" => "exit", "exit_code" => 0, "unknown" => true})
+        ]
+      })
+    ]
+
+    Enum.each(cases, &assert_rejected/1)
+  end
+
+  test "rejects missing required fields and malformed nested values" do
+    cases = [
+      %{"call_id" => "call", "action" => %{"commands" => []}},
+      %{"call_id" => "call", "output" => []},
+      %{"type" => "shell_call", "action" => %{"commands" => []}},
+      %{"type" => "shell_call", "call_id" => "call"},
+      %{"type" => "shell_call_output", "output" => []},
+      %{"type" => "shell_call_output", "call_id" => "call"},
+      shell_call(%{"call_id" => 1}),
+      shell_output(%{"call_id" => 1}),
+      shell_call(%{"action" => %{}}),
+      shell_call(%{"action" => %{"commands" => "command"}}),
+      shell_call(%{"action" => %{"commands" => ["command", 1]}}),
+      shell_call(%{"action" => %{"commands" => [], "timeout_ms" => 1.0}}),
+      shell_call(%{"action" => %{"commands" => [], "max_output_length" => "1"}}),
+      shell_call(%{"id" => 1}),
+      shell_call(%{"status" => "failed"}),
+      shell_call(%{"caller" => %{"type" => "program"}}),
+      shell_call(%{"caller" => %{"type" => "program", "caller_id" => 1}}),
+      shell_call(%{"environment" => %{"type" => "local", "skills" => %{}}}),
+      shell_call(%{"environment" => %{"type" => "local", "skills" => [%{}]}}),
+      shell_call(%{
+        "environment" => %{
+          "type" => "local",
+          "skills" => [%{"name" => "", "description" => ""}]
+        }
+      }),
+      shell_call(%{
+        "environment" => %{
+          "type" => "local",
+          "skills" => [%{"name" => 1, "description" => "", "path" => ""}]
+        }
+      }),
+      shell_call(%{"environment" => %{"type" => "container_reference"}}),
+      shell_call(%{
+        "environment" => %{"type" => "container_reference", "container_id" => 1}
+      }),
+      shell_output(%{"output" => %{}}),
+      shell_output(%{"output" => [%{}]}),
+      shell_output(%{"output" => [%{"stderr" => "", "outcome" => exit_outcome(0)}]}),
+      shell_output(%{"output" => [%{"stdout" => "", "outcome" => exit_outcome(0)}]}),
+      shell_output(%{"output" => [%{"stdout" => "", "stderr" => ""}]}),
+      shell_output(%{"output" => [output_chunk(1, "", exit_outcome(0))]}),
+      shell_output(%{"output" => [output_chunk("", 1, exit_outcome(0))]}),
+      shell_output(%{"output" => [output_chunk("", "", %{"type" => "exit"})]}),
+      shell_output(%{
+        "output" => [output_chunk("", "", %{"type" => "exit", "exit_code" => 1.0})]
+      }),
+      shell_output(%{"id" => 1}),
+      shell_output(%{"status" => "failed"}),
+      shell_output(%{"max_output_length" => "1"})
+    ]
+
+    Enum.each(cases, &assert_rejected/1)
+  end
+
+  test "rejects wrong top-level and nested discriminators" do
+    cases = [
+      %{"type" => 1, "call_id" => "call", "action" => %{"commands" => []}},
+      %{"type" => "local_shell_call", "call_id" => "call", "action" => %{"commands" => []}},
+      %{"type" => "shell_call_result", "call_id" => "call", "output" => []},
+      shell_call(%{"caller" => %{"type" => "unknown"}}),
+      shell_call(%{"environment" => %{"type" => "container", "container_id" => "id"}}),
+      shell_output(%{"output" => [output_chunk("", "", %{"type" => "unknown"})]})
+    ]
+
+    Enum.each(cases, &assert_rejected/1)
+  end
+
+  defp shell_call(overrides \\ %{}) do
+    Map.merge(
+      %{
+        "type" => "shell_call",
+        "call_id" => "call",
+        "action" => %{"commands" => []}
+      },
+      overrides
+    )
+  end
+
+  defp shell_output(overrides \\ %{}) do
+    Map.merge(
+      %{
+        "type" => "shell_call_output",
+        "call_id" => "call",
+        "output" => []
+      },
+      overrides
+    )
+  end
+
+  defp skill(name), do: %{"name" => name, "description" => "", "path" => ""}
+
+  defp output_chunk(stdout, stderr, outcome),
+    do: %{"stdout" => stdout, "stderr" => stderr, "outcome" => outcome}
+
+  defp exit_outcome(exit_code), do: %{"type" => "exit", "exit_code" => exit_code}
+
+  defp reductions(fun) do
+    {:reductions, before} = Process.info(self(), :reductions)
+    result = fun.()
+    {:reductions, after_call} = Process.info(self(), :reductions)
+    {after_call - before, result}
+  end
+
+  defp assert_accepted(item), do: assert({:ok, ^item} = HostedShell.validate_item(item))
+
+  defp assert_rejected(item) do
+    assert HostedShell.validate_item(item) ==
+             {:error,
+              %{
+                status: 400,
+                code: "invalid_request",
+                message: "input item shape is not translatable",
+                param: "input"
+              }}
+  end
+end

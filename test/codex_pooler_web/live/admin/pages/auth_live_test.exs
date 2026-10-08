@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
 
   @admin_routes [
     {"/admin/alerts", "#admin-alerts-live"},
+    {"/admin/incidents", "#admin-incidents-page"},
     {"/admin/request-logs", "#admin-request-logs-live"},
     {"/admin/pools", "#admin-pools-live"},
     {"/admin/stats", "#admin-stats"},
@@ -21,6 +22,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
     {"/admin/api-keys", "#admin-api-keys-live"},
     {"/admin/invites", "#admin-invites-live"},
     {"/admin/audit-logs", "#admin-audit-logs-live"},
+    {"/admin/lens", "#admin-model-history"},
     {"/admin/jobs", "#admin-jobs-page"},
     {"/admin/operators", "#admin-operators-live"},
     {"/admin/settings", "#admin-settings-live"}
@@ -35,10 +37,12 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
     "#admin-nav-invites",
     "#admin-nav-request-logs",
     "#admin-nav-audit-logs",
+    "#admin-nav-lens",
     "#admin-nav-jobs"
   ]
 
   @admin_footer_nav_selectors [
+    "#admin-nav-incidents",
     "#admin-nav-alerts",
     "#admin-nav-settings",
     "#admin-sidebar-logout"
@@ -186,11 +190,11 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
 
         assert has_element?(
                  view,
-                 "#admin-github-docs[href='https://docs.codex-pooler.com/'][target='_blank']",
+                 "#admin-github-docs[href='https://www.codex-pooler.com/docs/'][target='_blank']",
                  "Documentation"
                )
 
-        assert has_element?(view, "#admin-github-docs", "docs.codex-pooler.com")
+        assert has_element?(view, "#admin-github-docs", "www.codex-pooler.com/docs")
 
         assert has_element?(
                  view,

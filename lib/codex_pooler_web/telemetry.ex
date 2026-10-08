@@ -2,14 +2,72 @@ defmodule CodexPoolerWeb.Telemetry do
   use Supervisor
   import Telemetry.Metrics
 
+  alias CodexPooler.Accounting.PreAttemptRelease
+  alias CodexPooler.Gateway.Routing.AffinityTelemetry
+  alias CodexPooler.Gateway.Routing.CircuitTelemetry
+  alias CodexPooler.Gateway.Runtime.DuplicateTurnTelemetry
+  alias CodexPooler.Gateway.Transports.UpstreamConnectionProbe
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionLifecycleObservation
+  alias CodexPooler.Gateway.Transports.Websocket.OwnerErrorVocabulary
+  alias CodexPooler.Jobs.DeletionFailureNotifier
+  alias CodexPooler.Jobs.FailureLog
+  alias CodexPooler.RouteClass
+  alias CodexPooler.Upstreams.SavedResets.ConvergenceTelemetry
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.Firewall
+
   @type metric :: Telemetry.Metrics.t()
   @type repo_query_tags :: %{source: String.t(), command: String.t()}
   @type http_tags :: %{method: String.t(), status_class: String.t()}
   @type http_route_tags :: %{method: String.t(), route: String.t(), status_class: String.t()}
   @type admission_tags :: %{route_class: String.t(), transport: String.t()}
+  @type admission_saturation_tags :: %{route_class: String.t()}
   @type admin_stats_reload_tags :: %{stage: String.t(), window: String.t(), scope: String.t()}
   @type admin_stats_build_tags :: %{outcome: String.t(), window: String.t(), scope: String.t()}
   @type request_logs_reload_tags :: %{stage: String.t(), scope: String.t()}
+  @type stream_finalization_tags :: %{
+          usage_status: String.t(),
+          usage_source: String.t(),
+          downstream_transport: String.t(),
+          upstream_transport: String.t(),
+          via: String.t()
+        }
+  @type stream_outcome_tags :: %{
+          outcome: String.t(),
+          downstream_transport: String.t(),
+          upstream_transport: String.t(),
+          via: String.t()
+        }
+  @type quota_cycle_decision_tags :: %{
+          scope: String.t(),
+          decision: String.t(),
+          source: String.t(),
+          via: String.t()
+        }
+  @type circuit_transition_tags :: %{
+          transition: String.t(),
+          route_class: String.t(),
+          reason_class: String.t()
+        }
+  @type affinity_stale_write_tags :: %{operation: String.t(), affinity_kind: String.t()}
+  @type duplicate_turn_refused_tags :: %{stage: String.t(), transport: String.t()}
+  @type native_compaction_admission_clear_tags :: %{reason: String.t(), stage: String.t(), topology: String.t()}
+  @type bridge_fallback_tags :: %{reason: String.t()}
+  @type pre_attempt_release_tags :: %{phase: String.t(), transport: String.t(), via: String.t()}
+  @type saved_reset_convergence_tags :: %{source: String.t(), outcome: String.t()}
+
+  @native_compaction_topologies ~w(direct forwarded)
+  @native_compaction_admission_stages %{
+    ordinary_success: "armed",
+    pending_compact: "armed",
+    reserved_compact: "compacting",
+    accounting_started_compact: "compacting",
+    consumed_compact: "compacting",
+    collected_unconfirmed: "compacting",
+    pending_final: "finalizing",
+    reserved_final: "finalizing",
+    accounting_started_final: "finalizing",
+    consumed_final: "finalizing"
+  }
 
   @repo_query_buckets [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5]
   @admission_queue_buckets [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5]
@@ -20,6 +78,37 @@ defmodule CodexPoolerWeb.Telemetry do
   @admin_stats_build_outcomes ~w(ok error)
   @request_logs_reload_stages ~w(initial_load filter_patch event_refresh)
   @request_logs_reload_scopes ~w(selected_pool all_pools)
+  @stream_usage_statuses ~w(usage_known usage_unknown)
+  @stream_usage_sources ~w(upstream_usage websocket_upstream_usage unknown)
+  @pre_attempt_release_transports ~w(http_json http_sse http_compact_json websocket unknown)
+  @stream_downstream_transports ~w(http_sse websocket unknown)
+  @stream_upstream_transports ~w(http_sse websocket unknown)
+  @stream_outcomes ~w(succeeded failed settlement_failed interrupted)
+  @bridge_fallback_structural_reasons ~w(
+    bridge_submit_crash
+    owner_call_timeout
+    owner_not_running
+    task_down
+    bridge_no_first_event
+    upstream_websocket_closed_before_terminal
+    upstream_websocket_error
+  )
+  @bridge_fallback_reasons Enum.uniq(
+                             @bridge_fallback_structural_reasons ++
+                               OwnerErrorVocabulary.owner_error_codes() ++ ["unknown"]
+                           )
+
+  @quota_cycle_scopes ~w(account model)
+  @quota_cycle_decisions ~w(
+    same_cycle_refreshed
+    anchored_confirmed
+    floating_confirmed
+    candidate
+    rejected
+    superseded_primary_rejected
+  )
+  @quota_cycle_sources ~w(provider_usage runtime unknown)
+  @saved_reset_convergence_buckets [0, 1, 5, 15, 30, 60, 120, 300, 600, 900]
   @prometheus_reporter_disabled_oban_modes ~w(worker scheduler)
   @repo_source_pattern ~r/\A[a-zA-Z0-9_.-]+\z/
   @safe_route_pattern ~r/\A[a-zA-Z0-9_.*:\/{}-]+\z/
@@ -40,14 +129,28 @@ defmodule CodexPoolerWeb.Telemetry do
   @impl true
   def init(_arg) do
     CodexPoolerWeb.RequestLogger.attach()
+    # Websocket delivery receipts read their connection's failed writes from it
+    # (findings#232 row 232-256), on every role that serves sockets.
+    CodexPoolerWeb.WebsocketDownstreamWriteWatch.attach()
+    # The stream timing of an upstream HTTP SSE attempt names whether its request opened its connection or reused a
+    # pooled one; Finch reports that only through these events, on every role that dispatches upstream requests.
+    UpstreamConnectionProbe.attach()
+    # Every role attaches it: the job roles run no Prometheus reporter, and a
+    # failed job's row is pruned after a day (findings#206 row 206-90).
+    FailureLog.attach()
+    # Deletion pages learn that a Pool or API key deletion job gave up only after Oban wrote its
+    # final state (findings#206 row 206-602).
+    DeletionFailureNotifier.attach()
 
     children =
       [
         perf_probe_child(),
         CodexPoolerWeb.Telemetry.MemorySampler,
         {:telemetry_poller, period: 10_000},
-        prometheus_reporter_child()
+        prometheus_reporter_children(),
+        admission_sampler_child()
       ]
+      |> List.flatten()
       |> Enum.reject(&is_nil/1)
 
     Supervisor.init(children, strategy: :one_for_one)
@@ -104,8 +207,7 @@ defmodule CodexPoolerWeb.Telemetry do
       ),
       summary("codex_pooler.repo.query.idle_time",
         unit: {:native, :millisecond},
-        description:
-          "The time the connection spent waiting before being checked out for the query"
+        description: "The time the connection spent waiting before being checked out for the query"
       ),
 
       # VM Metrics
@@ -118,7 +220,43 @@ defmodule CodexPoolerWeb.Telemetry do
 
   @spec prometheus_metrics() :: [metric()]
   def prometheus_metrics do
+    # Prometheus Core 1.2.1 enumerates metric.tags and invokes metric.tag_values.
+    # Keep this split until the reporter supports Telemetry.Metrics 1.2 function-valued tags.
     [
+      last_value("codex_pooler.telemetry_relay.backlog.rows",
+        event_name: [:codex_pooler, :telemetry_relay, :health],
+        measurement: :backlog_rows,
+        description: "Shared unclaimed relay rows, including expired backlog. Read once per web observer; use max across replicas, never sum."
+      ),
+      counter("codex_pooler.gateway.websocket_control.failure.count",
+        event_name: [:codex_pooler, :gateway, :websocket_control, :failure],
+        measurement: :count,
+        tags: [:phase, :reason],
+        tag_values: &websocket_control_tag_values/1,
+        description: "Websocket control-path failures and deferred cleanup on serving nodes, including failures before request reservation. This measures observed callback failures, not inferred TCP resets."
+      ),
+      last_value("codex_pooler.telemetry_relay.backlog.samples",
+        event_name: [:codex_pooler, :telemetry_relay, :health],
+        measurement: :backlog_samples,
+        description: "Shared unclaimed relay samples. Use max across replicas, never sum."
+      ),
+      last_value("codex_pooler.telemetry_relay.consumers.fresh",
+        event_name: [:codex_pooler, :telemetry_relay, :health],
+        measurement: :fresh_consumers,
+        description: "Shared count of non-quiesced consumers reporting within 60 seconds. Consumer health does not gate producer insertion."
+      ),
+      last_value("codex_pooler.telemetry_relay.loss.rows",
+        event_name: [:codex_pooler, :telemetry_relay, :loss],
+        measurement: :rows,
+        tags: [:reason],
+        description: "Durable shared cumulative known lost rows by fixed reason. Use max across replicas, never sum; database-unavailable hard-stop loss remains unknown."
+      ),
+      last_value("codex_pooler.telemetry_relay.loss.samples",
+        event_name: [:codex_pooler, :telemetry_relay, :loss],
+        measurement: :samples,
+        tags: [:reason],
+        description: "Durable shared cumulative known lost samples by fixed reason. Use max across replicas, never sum; post-claim pre-scrape loss remains unquantified."
+      ),
       counter("phoenix.endpoint.stop.count",
         event_name: [:phoenix, :endpoint, :stop],
         measurement: :duration,
@@ -151,12 +289,28 @@ defmodule CodexPoolerWeb.Telemetry do
         tag_values: &http_route_tag_values/1,
         description: "Total routed HTTP requests by route, method, and status class."
       ),
+      counter("codex_pooler.ingress.firewall.denied.count",
+        event_name: [:codex_pooler, :ingress, :firewall, :denied],
+        measurement: :count,
+        tags: [:scope, :reason],
+        tag_values: &Firewall.telemetry_tag_values/1,
+        description: "Total runtime ingress firewall denials by bounded scope and reason."
+      ),
       counter("codex_pooler.repo.query.count",
         event_name: [:codex_pooler, :repo, :query],
         measurement: :total_time,
         tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
         description: "Total Ecto repository queries by source and SQL command."
+      ),
+      counter("codex_pooler.instance_presence.heartbeat_failure.count",
+        event_name: [:codex_pooler, :instance_presence, :heartbeat],
+        measurement: :failures,
+        tags: [],
+        description:
+          "Total instance heartbeat write failures on scraped roles. OBAN_MODE=worker and scheduler " <>
+            "run InstanceHeartbeat without a Prometheus reporter, so their failures are not measured here. " <>
+            "Use instance_presences.last_seen_at for durable presence freshness on every role."
       ),
       counter("codex_pooler.admin.stats.reload.count",
         event_name: [:codex_pooler, :admin, :stats_live, :reload],
@@ -360,6 +514,20 @@ defmodule CodexPoolerWeb.Telemetry do
         description: "Gateway admission queue time for timed-out requests.",
         reporter_options: [buckets: @admission_queue_buckets]
       ),
+      last_value("codex_pooler.gateway.admission.running",
+        event_name: [:codex_pooler, :gateway, :admission, :saturation],
+        measurement: &admission_saturation_measurement(&1, :running),
+        tags: [:route_class],
+        tag_values: &admission_saturation_tag_values/1,
+        description: "Current locally admitted gateway requests by route class."
+      ),
+      last_value("codex_pooler.gateway.admission.queued",
+        event_name: [:codex_pooler, :gateway, :admission, :saturation],
+        measurement: &admission_saturation_measurement(&1, :queued),
+        tags: [:route_class],
+        tag_values: &admission_saturation_tag_values/1,
+        description: "Current locally queued gateway requests by route class."
+      ),
       counter("codex_pooler.gateway.stream_buffer.oversized.count",
         event_name: [:codex_pooler, :gateway, :stream_buffer, :oversized],
         measurement: :count,
@@ -368,11 +536,13 @@ defmodule CodexPoolerWeb.Telemetry do
       ),
       distribution("codex_pooler.gateway.stream_buffer.oversized.bytes",
         event_name: [:codex_pooler, :gateway, :stream_buffer, :oversized],
-        measurement: :bytes,
+        measurement: fn measurements -> min(Map.fetch!(measurements, :bytes), 134_217_728) end,
         tags: [:buffer, :transport, :route_class, :endpoint],
         unit: :byte,
         description: "Size of oversized incomplete stream buffers.",
-        reporter_options: [buckets: [65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152]]
+        reporter_options: [
+          buckets: [1_048_576, 2_097_152, 8_388_608, 16_777_216, 33_554_432, 134_217_728]
+        ]
       ),
       counter("codex_pooler.gateway.stream_buffer.truncated.count",
         event_name: [:codex_pooler, :gateway, :stream_buffer, :truncated],
@@ -387,6 +557,147 @@ defmodule CodexPoolerWeb.Telemetry do
         unit: :byte,
         description: "Pre-truncation retained stream body sizes.",
         reporter_options: [buckets: [65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152]]
+      ),
+      counter("codex_pooler.gateway.stream.finalization.count",
+        event_name: [:codex_pooler, :gateway, :stream, :finalization],
+        measurement: :count,
+        tags: [:usage_status, :usage_source, :downstream_transport, :upstream_transport],
+        tag_values: &stream_finalization_tag_values/1,
+        description: "Finalized gateway streams by bounded usage and transport metadata."
+      ),
+      sum("codex_pooler.gateway.stream.outcome.count",
+        event_name: [:codex_pooler, :gateway, :stream, :outcome],
+        measurement: :count,
+        tags: [:outcome, :downstream_transport, :upstream_transport, :via],
+        tag_values: &stream_outcome_tag_values/1,
+        description:
+          "Gateway stream outcomes by bounded outcome and transport metadata. " <>
+            "Expired-owner recovery settles abandoned turns from the runtime cleanup job on " <>
+            "OBAN_MODE=worker or scheduler, which run no reporter; that share reaches this metric " <>
+            "through the PostgreSQL relay under the job_relay via label (best effort, at most once), " <>
+            "while the in_process via label is the request path; the request and attempt rows are complete."
+      ),
+      counter("codex_pooler.gateway.websocket_bridge.fallback.count",
+        event_name: [:codex_pooler, :gateway, :websocket_bridge, :fallback],
+        measurement: :count,
+        tags: [:reason],
+        tag_values: &bridge_fallback_tag_values/1,
+        description: "Websocket bridge fallbacks by bounded reason."
+      ),
+      counter("codex_pooler.gateway.websocket_bridge.precommit_overflow.count",
+        event_name: [:codex_pooler, :gateway, :websocket_bridge, :precommit_overflow],
+        measurement: :count,
+        description: "Websocket bridge precommit buffer overflows."
+      ),
+      sum("codex_pooler.quota.cycle.decision.count",
+        event_name: [:codex_pooler, :quota, :cycle, :decision],
+        measurement: :count,
+        tags: [:scope, :decision, :source, :via],
+        tag_values: &quota_cycle_decision_tag_values/1,
+        description:
+          "Quota cycle decisions by bounded scope, decision, and source class. " <>
+            "Account reconciliation, saved-reset redemption, and alert evaluation also decide " <>
+            "cycles on OBAN_MODE=worker or scheduler, which run no reporter; that share reaches " <>
+            "this counter through the PostgreSQL relay under the job_relay via label (best effort, at " <>
+            "most once), while the in_process via label is the request path; the quota window rows are complete."
+      ),
+      sum("codex_pooler.saved_reset.convergence.count",
+        event_name: [:codex_pooler, :saved_reset, :convergence],
+        measurement: :count,
+        tags: [:source, :outcome, :via],
+        tag_values: &convergence_tag_values/1,
+        description:
+          "Committed saved-reset convergence transitions observed on scraped web nodes. " <>
+            "OBAN_MODE=worker or scheduler run no reporter; transitions committed by the " <>
+            "redemption and reconciliation jobs reach this counter through the PostgreSQL relay " <>
+            "under the job_relay via label (best effort, at most once); the upstream identity " <>
+            "saved_reset_redemption lifecycle metadata is complete."
+      ),
+      distribution("codex_pooler.saved_reset.convergence.applied_to_canonical.seconds",
+        event_name: [:codex_pooler, :saved_reset, :convergence],
+        measurement: :applied_to_canonical_ms,
+        unit: {:millisecond, :second},
+        tags: [:source, :outcome, :via],
+        tag_values: &convergence_tag_values/1,
+        description:
+          "Applied-to-canonical saved-reset latency observed on scraped web nodes. " <>
+            "OBAN_MODE=worker or scheduler run no reporter; job-committed samples reach this " <>
+            "histogram through the PostgreSQL relay under the job_relay via label (best effort, at " <>
+            "most once); the upstream identity saved_reset_redemption lifecycle metadata is complete.",
+        reporter_options: [buckets: @saved_reset_convergence_buckets]
+      ),
+      distribution("codex_pooler.saved_reset.convergence.canonical_to_lifecycle.seconds",
+        event_name: [:codex_pooler, :saved_reset, :convergence],
+        measurement: :canonical_to_lifecycle_ms,
+        unit: {:millisecond, :second},
+        tags: [:source, :outcome, :via],
+        tag_values: &convergence_tag_values/1,
+        description:
+          "Canonical-to-lifecycle saved-reset latency observed on scraped web nodes. " <>
+            "OBAN_MODE=worker or scheduler run no reporter; job-committed samples reach this " <>
+            "histogram through the PostgreSQL relay under the job_relay via label (best effort, at " <>
+            "most once); the upstream identity saved_reset_redemption lifecycle metadata is complete.",
+        reporter_options: [buckets: @saved_reset_convergence_buckets]
+      ),
+      distribution("codex_pooler.saved_reset.convergence.applied_to_lifecycle.seconds",
+        event_name: [:codex_pooler, :saved_reset, :convergence],
+        measurement: :applied_to_lifecycle_ms,
+        unit: {:millisecond, :second},
+        tags: [:source, :outcome, :via],
+        tag_values: &convergence_tag_values/1,
+        description:
+          "Applied-to-lifecycle saved-reset latency observed on scraped web nodes. " <>
+            "OBAN_MODE=worker or scheduler run no reporter; job-committed samples reach this " <>
+            "histogram through the PostgreSQL relay under the job_relay via label (best effort, at " <>
+            "most once); the upstream identity saved_reset_redemption lifecycle metadata is complete.",
+        reporter_options: [buckets: @saved_reset_convergence_buckets]
+      ),
+      counter("codex_pooler.gateway.routing.circuit.transition.count",
+        event_name: [:codex_pooler, :gateway, :routing, :circuit, :transition],
+        measurement: :count,
+        tags: [:transition, :route_class, :reason_class],
+        tag_values: &circuit_transition_tag_values/1,
+        description: "Routing circuit status transitions by bounded route and reason class."
+      ),
+      sum("codex_pooler.accounting.reservation.pre_attempt_release.count",
+        event_name: PreAttemptRelease.telemetry_event(),
+        measurement: :count,
+        tags: [:phase, :transport, :via],
+        tag_values: &pre_attempt_release_tag_values/1,
+        description:
+          "Reservations released with no attempt row, by bounded pre-attempt phase and transport. " <>
+            "The stale_sweep phase is emitted by the runtime cleanup job (every 15 minutes, " <>
+            "releasing reservations older than six hours) on OBAN_MODE=worker or scheduler, which " <>
+            "run no reporter; it reaches this counter through the PostgreSQL relay under " <>
+            "the job_relay via label (best effort, at most once), and the release ledger is complete."
+      ),
+      counter("codex_pooler.gateway.routing.affinity.stale_write.count",
+        event_name: [:codex_pooler, :gateway, :routing, :affinity, :stale_write],
+        measurement: :count,
+        tags: [:operation, :affinity_kind],
+        tag_values: &affinity_stale_write_tag_values/1,
+        description: "Affinity writes the updated_at fence refused, by bounded operation and affinity kind."
+      ),
+      counter("codex_pooler.gateway.native_compaction.admission_clear.count",
+        event_name: [:codex_pooler, :gateway, :native_compaction, :lifecycle],
+        measurement: :count,
+        keep: &native_compaction_admission_clear?/1,
+        tags: [:reason, :stage, :topology],
+        tag_values: &native_compaction_admission_clear_tag_values/1,
+        description:
+          "Native compaction admissions cleared on serving nodes, by bounded clear reason, the admission stage " <>
+            "the clear ended (armed, compacting or finalizing) and the direct or owner-forwarded topology. " <>
+            "A clear on a connection that held no admission is not counted."
+      ),
+      counter("codex_pooler.gateway.duplicate_turn.refused.count",
+        event_name: DuplicateTurnTelemetry.event(),
+        measurement: :count,
+        tags: [:stage, :transport],
+        tag_values: &duplicate_turn_refused_tag_values/1,
+        description:
+          "Client-visible 409 duplicate_turn refusals that get no request row, by bounded refusing stage and transport class, " <>
+            "so request-log counts never include these. A guided content-filter retry that dispatch refuses for its account binding " <>
+            "is also answered 409 duplicate_turn, but its request has a row (409, invalid_content_filter_retry_binding) and is not counted."
       )
     ]
   end
@@ -395,15 +706,25 @@ defmodule CodexPoolerWeb.Telemetry do
     CodexPooler.Dev.gateway_perf_probe_child()
   end
 
-  @spec prometheus_reporter_child() :: {module(), keyword()} | nil
-  defp prometheus_reporter_child do
+  @spec prometheus_reporter_children() :: [term()]
+  defp prometheus_reporter_children do
     if prometheus_reporter_enabled?() do
       {TelemetryMetricsPrometheus.Core, metrics: prometheus_metrics()}
+      |> then(&[&1, CodexPoolerWeb.Telemetry.PrometheusReporter])
+    else
+      []
+    end
+  end
+
+  @spec admission_sampler_child() :: module() | nil
+  defp admission_sampler_child do
+    if prometheus_reporter_enabled?() do
+      CodexPoolerWeb.Telemetry.AdmissionSampler
     end
   end
 
   @spec prometheus_reporter_enabled?() :: boolean()
-  defp prometheus_reporter_enabled? do
+  def prometheus_reporter_enabled? do
     System.get_env("OBAN_MODE") not in @prometheus_reporter_disabled_oban_modes
   end
 
@@ -506,6 +827,19 @@ defmodule CodexPoolerWeb.Telemetry do
     }
   end
 
+  @spec admission_saturation_tag_values(map()) :: admission_saturation_tags()
+  defp admission_saturation_tag_values(metadata) do
+    %{route_class: admin_stats_enum_value(metadata[:route_class], RouteClass.all())}
+  end
+
+  @spec admission_saturation_measurement(map(), :running | :queued) :: non_neg_integer()
+  defp admission_saturation_measurement(measurements, key) do
+    case Map.get(measurements, key) do
+      value when is_integer(value) -> max(value, 0)
+      _value -> 0
+    end
+  end
+
   @spec admin_stats_reload_tag_values(map()) :: admin_stats_reload_tags()
   defp admin_stats_reload_tag_values(metadata) do
     %{
@@ -556,6 +890,117 @@ defmodule CodexPoolerWeb.Telemetry do
 
   defp request_logs_reload_scope(value),
     do: admin_stats_enum_value(value, @request_logs_reload_scopes)
+
+  @spec stream_finalization_tag_values(map()) :: stream_finalization_tags()
+  defp websocket_control_tag_values(metadata) do
+    %{
+      phase: if(metadata[:phase] in [:init, :serve, :terminate], do: metadata[:phase], else: :unknown),
+      reason:
+        if(metadata[:reason] in [:database_error, :exception, :process_exit, :cleanup_deferred],
+          do: metadata[:reason],
+          else: :unknown
+        )
+    }
+  end
+
+  defp stream_finalization_tag_values(metadata) do
+    %{
+      usage_status: admin_stats_enum_value(metadata[:usage_status], @stream_usage_statuses),
+      usage_source: admin_stats_enum_value(metadata[:usage_source], @stream_usage_sources),
+      downstream_transport: admin_stats_enum_value(metadata[:downstream_transport], @stream_downstream_transports),
+      upstream_transport: admin_stats_enum_value(metadata[:upstream_transport], @stream_upstream_transports),
+      via: via_tag(metadata[:via])
+    }
+  end
+
+  @spec stream_outcome_tag_values(map()) :: stream_outcome_tags()
+  defp stream_outcome_tag_values(metadata) do
+    %{
+      outcome: admin_stats_enum_value(metadata[:outcome], @stream_outcomes),
+      downstream_transport: admin_stats_enum_value(metadata[:downstream_transport], @stream_downstream_transports),
+      upstream_transport: admin_stats_enum_value(metadata[:upstream_transport], @stream_upstream_transports),
+      via: via_tag(metadata[:via])
+    }
+  end
+
+  @spec pre_attempt_release_tag_values(map()) :: pre_attempt_release_tags()
+  defp pre_attempt_release_tag_values(metadata) do
+    %{
+      phase: admin_stats_enum_value(metadata[:phase], PreAttemptRelease.phases()),
+      transport: admin_stats_enum_value(metadata[:transport], @pre_attempt_release_transports),
+      via: via_tag(metadata[:via])
+    }
+  end
+
+  @spec bridge_fallback_tag_values(map()) :: bridge_fallback_tags()
+  defp bridge_fallback_tag_values(metadata) do
+    %{reason: bridge_fallback_reason(metadata[:reason])}
+  end
+
+  @spec bridge_fallback_reason(term()) :: String.t()
+  defp bridge_fallback_reason(reason) when is_binary(reason) do
+    if reason in @bridge_fallback_reasons, do: reason, else: "unknown"
+  end
+
+  defp bridge_fallback_reason(_reason), do: "unknown"
+
+  @spec quota_cycle_decision_tag_values(map()) :: quota_cycle_decision_tags()
+  defp quota_cycle_decision_tag_values(metadata) do
+    %{
+      scope: admin_stats_enum_value(metadata[:scope], @quota_cycle_scopes),
+      decision: admin_stats_enum_value(metadata[:decision], @quota_cycle_decisions),
+      source: admin_stats_enum_value(metadata[:source], @quota_cycle_sources),
+      via: via_tag(metadata[:via])
+    }
+  end
+
+  defp convergence_tag_values(metadata),
+    do: Map.put(ConvergenceTelemetry.tag_values(metadata), :via, via_tag(metadata[:via]))
+
+  defp via_tag(v) when v in ["in_process", "job_relay"], do: v
+  defp via_tag(nil), do: "in_process"
+  defp via_tag(_), do: "unknown"
+
+  @spec circuit_transition_tag_values(map()) :: circuit_transition_tags()
+  defp circuit_transition_tag_values(metadata) do
+    %{
+      transition: admin_stats_enum_value(metadata[:transition], CircuitTelemetry.transitions()),
+      route_class: admin_stats_enum_value(metadata[:route_class], RouteClass.all()),
+      reason_class: admin_stats_enum_value(metadata[:reason_class], CircuitTelemetry.reason_classes())
+    }
+  end
+
+  @spec affinity_stale_write_tag_values(map()) :: affinity_stale_write_tags()
+  defp affinity_stale_write_tag_values(metadata) do
+    %{
+      operation: admin_stats_enum_value(metadata[:operation], AffinityTelemetry.operations()),
+      affinity_kind: admin_stats_enum_value(metadata[:affinity_kind], AffinityTelemetry.affinity_kinds())
+    }
+  end
+
+  # Every upstream websocket connection close runs the clear path, admission or
+  # not; only a clear that ended an admission is a lifecycle fact worth counting.
+  @spec native_compaction_admission_clear?(map()) :: boolean()
+  defp native_compaction_admission_clear?(metadata) do
+    metadata[:operation] == :clear and metadata[:phase_from] != :cleared
+  end
+
+  @spec native_compaction_admission_clear_tag_values(map()) :: native_compaction_admission_clear_tags()
+  defp native_compaction_admission_clear_tag_values(metadata) do
+    %{
+      reason: admin_stats_enum_value(metadata[:reason], Enum.map(NativeCompactionLifecycleObservation.reasons(), &Atom.to_string/1)),
+      stage: Map.get(@native_compaction_admission_stages, metadata[:phase_from], "unknown"),
+      topology: admin_stats_enum_value(metadata[:topology], @native_compaction_topologies)
+    }
+  end
+
+  @spec duplicate_turn_refused_tag_values(map()) :: duplicate_turn_refused_tags()
+  defp duplicate_turn_refused_tag_values(metadata) do
+    %{
+      stage: admin_stats_enum_value(metadata[:stage], DuplicateTurnTelemetry.stages()),
+      transport: admin_stats_enum_value(metadata[:transport], DuplicateTurnTelemetry.transports())
+    }
+  end
 
   @spec admin_stats_enum_value(term(), [String.t()]) :: String.t()
   defp admin_stats_enum_value(value, allowed_values) when is_atom(value) do

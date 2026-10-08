@@ -3,26 +3,19 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
   import Plug.Conn
 
-  alias CodexPooler.Access
   alias CodexPooler.Gateway.Admission, as: GatewayAdmission
+  alias CodexPooler.Gateway.ErrorClassification
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Pools.Routing, as: PoolRouting
-  alias CodexPoolerWeb.Plugs.RuntimeIngress.{CompressedBody, Firewall}
+  alias CodexPoolerWeb.GatewayControllerHelpers
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.{CompressedBody, Firewall, Path}
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.Firewall.Decision
   alias CodexPoolerWeb.V1.UnsupportedRoutes
   alias Plug.Conn.Query
   alias Plug.Conn.Utils
 
-  @runtime_prefixes [
-    ["backend-api", "codex"],
-    ["backend-api", "files"],
-    ["backend-api", "transcribe"],
-    ["api", "codex", "usage"],
-    ["wham", "usage"],
-    ["backend-api", "wham", "usage"],
-    ["v1"]
-  ]
-
-  @json_error_type "invalid_request_error"
+  @parser_settings_private_key :codex_pooler_runtime_ingress_settings
+  @parser_error_scope_private_key :codex_pooler_json_parse_error_scope
 
   @pruned_runtime_helper_routes [
     {"GET", ["backend-api", "codex", "agent-identities", "jwks"]},
@@ -43,29 +36,46 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   def init(opts), do: opts
 
   def call(conn, _opts) do
+    conn = Path.populate(conn)
+    route_request(conn, Path.fetch(conn))
+  end
+
+  defp route_request(conn, %{scope: :mcp, unsafe_segment?: true}) do
+    send_mcp_error(conn, 400, -32_600, "invalid request")
+  end
+
+  defp route_request(conn, %{scope: :runtime, unsafe_segment?: true}) do
+    send_runtime_error(conn, 400, "invalid_request", "request path is invalid")
+  end
+
+  defp route_request(conn, %{scope: :mcp}) do
+    settings = operational_settings(conn)
+
+    conn
+    |> put_json_parser_context(settings, :mcp)
+    |> enforce_mcp_firewall(settings)
+    |> admit_mcp_request()
+    |> prepare_mcp_body(settings)
+  end
+
+  defp route_request(conn, path) do
     cond do
-      mcp_request?(conn) ->
-        settings = OperationalSettings.current()
+      path.scope == :runtime ->
+        settings = operational_settings(conn)
 
         conn
-        |> enforce_mcp_firewall(settings)
-        |> admit_mcp_request()
-        |> prepare_mcp_body(settings)
-
-      pruned_runtime_helper_request?(conn) ->
-        send_pruned_runtime_helper_absent(conn)
-
-      runtime_path?(conn.path_info) ->
-        settings = OperationalSettings.current()
-
-        conn
+        |> put_json_parser_context(settings, json_parse_error_scope(conn))
         |> enforce_firewall(settings)
+        |> reject_pruned_runtime_helper()
         |> authenticate_v1_request()
         |> reject_unsupported_v1_request()
-        |> authenticate_multipart_transcribe_request()
-        |> authenticate_protected_backend_raw_request()
         |> authenticate_protected_backend_json_request()
+        |> enforce_image_generation_permission()
+        |> enforce_audio_transcription_permission()
         |> maybe_decode_compressed_body(settings)
+
+      json_request?(conn) ->
+        put_json_parser_context(conn, operational_settings(conn), :passthrough)
 
       true ->
         conn
@@ -85,13 +95,17 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   def send_mcp_parse_error(conn), do: send_mcp_error(conn, 400, -32_700, "parse error")
 
   @spec mcp_request?(Plug.Conn.t() | term()) :: boolean()
-  def mcp_request?(%Plug.Conn{path_info: ["mcp"]}), do: true
+  def mcp_request?(%Plug.Conn{} = conn), do: Path.fetch(conn).scope == :mcp
   def mcp_request?(_conn), do: false
 
   defp enforce_mcp_firewall(conn, settings) do
-    case Firewall.enforce(conn, settings) do
-      {:ok, conn} -> conn
-      {:error, reason} -> send_mcp_error(conn, reason.status, -32_600, reason.message)
+    case Firewall.evaluate(conn, settings) do
+      {conn, %Decision{outcome: :allow}} ->
+        conn
+
+      {conn, %Decision{outcome: :deny} = decision} ->
+        :ok = Firewall.observe_denial(decision, :mcp)
+        send_mcp_firewall_error(conn, decision)
     end
   end
 
@@ -170,6 +184,33 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     end
   end
 
+  defp json_request?(conn) do
+    conn
+    |> get_req_header("content-type")
+    |> List.first()
+    |> case do
+      nil -> false
+      content_type -> json_content_type?(content_type)
+    end
+  end
+
+  defp json_parse_error_scope(conn) do
+    if protected_backend_json_request?(conn), do: :protected_backend, else: :passthrough
+  end
+
+  defp put_json_parser_context(conn, settings, error_scope) do
+    conn
+    |> put_private(@parser_settings_private_key, settings)
+    |> put_private(@parser_error_scope_private_key, error_scope)
+  end
+
+  defp operational_settings(%Plug.Conn{
+         private: %{@parser_settings_private_key => %OperationalSettings{} = settings}
+       }),
+       do: settings
+
+  defp operational_settings(_conn), do: OperationalSettings.current()
+
   defp read_mcp_body(conn, settings) do
     read_opts = [
       length: settings.max_decompressed_body_bytes,
@@ -186,7 +227,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   end
 
   defp decode_mcp_body(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, value} when is_list(value) -> {:ok, %{"_json" => value}}
       {:ok, value} when is_map(value) -> {:ok, value}
       {:ok, _value} -> {:ok, %{"_json_scalar" => true}}
@@ -212,19 +253,43 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   defp make_empty_if_unfetched(params), do: params
 
   defp enforce_firewall(conn, settings) do
-    case Firewall.enforce(conn, settings) do
-      {:ok, conn} -> conn
-      {:error, reason} -> send_runtime_error(conn, reason)
+    case Firewall.evaluate(conn, settings) do
+      {conn, %Decision{outcome: :allow}} ->
+        conn
+
+      {conn, %Decision{outcome: :deny} = decision} ->
+        :ok = Firewall.observe_denial(decision, :runtime)
+        send_runtime_error(conn, firewall_error(decision))
     end
+  end
+
+  defp firewall_error(%Decision{reason: :settings_unavailable}) do
+    %{
+      status: 503,
+      code: "settings_unavailable",
+      message: "runtime settings are temporarily unavailable"
+    }
+  end
+
+  defp firewall_error(%Decision{}) do
+    %{status: 403, code: "access_denied", message: "client IP is not allowed"}
+  end
+
+  defp send_mcp_firewall_error(conn, %Decision{reason: :settings_unavailable}) do
+    send_mcp_error(conn, 503, -32_000, "runtime settings are temporarily unavailable")
+  end
+
+  defp send_mcp_firewall_error(conn, %Decision{}) do
+    send_mcp_error(conn, 403, -32_600, "client IP is not allowed")
   end
 
   defp authenticate_v1_request(%Plug.Conn{halted: true} = conn), do: conn
 
   defp authenticate_v1_request(conn) do
     if v1_request?(conn) do
-      case authenticate_runtime_api_request(conn) do
-        {:ok, conn} -> ensure_v1_compatibility(conn)
-        {:error, reason, conn} -> send_runtime_error(conn, reason)
+      case GatewayControllerHelpers.authenticate_v1(conn) do
+        {:ok, auth} -> put_private(conn, :runtime_api_auth, auth)
+        {:error, reason} -> send_runtime_error(conn, reason)
       end
     else
       conn
@@ -234,19 +299,11 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   defp reject_unsupported_v1_request(%Plug.Conn{halted: true} = conn), do: conn
 
   defp reject_unsupported_v1_request(conn) do
-    if UnsupportedRoutes.unsupported?(conn) do
-      send_runtime_error(conn, unsupported_v1_error())
-    else
-      conn
+    cond do
+      UnsupportedRoutes.unsupported?(conn) -> send_runtime_error(conn, unsupported_v1_error())
+      UnsupportedRoutes.agents_family?(conn) -> send_runtime_error(conn, unsupported_agents_error())
+      true -> conn
     end
-  end
-
-  defp authenticate_multipart_transcribe_request(conn) do
-    authenticate_when(conn, &multipart_transcribe_request?/1)
-  end
-
-  defp authenticate_protected_backend_raw_request(conn) do
-    authenticate_when(conn, &protected_backend_raw_request?/1)
   end
 
   defp authenticate_protected_backend_json_request(conn) do
@@ -288,119 +345,87 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     do: {:ok, conn}
 
   defp authenticate_runtime_api_request(conn) do
-    conn
-    |> get_req_header("authorization")
-    |> List.first()
-    |> authenticate_authorization_header(conn)
-    |> case do
+    case GatewayControllerHelpers.authenticate(conn) do
       {:ok, auth} -> {:ok, put_private(conn, :runtime_api_auth, auth)}
-      {:error, reason} -> {:error, Map.put(reason, :status, 401), conn}
+      {:error, reason} -> {:error, reason, conn}
     end
   end
 
-  defp authenticate_authorization_header(header, conn) do
-    if v1_request?(conn) do
-      Access.authenticate_v1_authorization_header(header)
-    else
-      Access.authenticate_authorization_header(header)
-    end
-  end
+  defp enforce_image_generation_permission(%Plug.Conn{halted: true} = conn), do: conn
 
-  defp ensure_v1_compatibility(%Plug.Conn{private: %{runtime_api_auth: %{pool: pool}}} = conn) do
-    if pool.status == "active" and PoolRouting.v1_compatibility_enabled?(pool) do
-      conn
-    else
+  defp enforce_image_generation_permission(%Plug.Conn{private: %{runtime_api_auth: %{pool: pool}}} = conn) do
+    if image_generation_request?(conn) and not PoolRouting.allow_image_generation?(pool) do
       send_runtime_error(conn, %{
         status: 403,
-        code: "v1_compatibility_disabled",
-        message: "OpenAI /v1 compatibility is disabled for this pool"
+        code: "image_generation_disabled",
+        message: "Image generation is disabled for this pool"
       })
+    else
+      conn
     end
   end
 
-  defp ensure_v1_compatibility(conn), do: conn
+  defp enforce_image_generation_permission(conn), do: conn
 
-  defp multipart_transcribe_request?(conn) do
-    conn.method == "POST" and conn.path_info == ["backend-api", "transcribe"] and
-      multipart_content_type?(conn)
+  defp image_generation_request?(%Plug.Conn{method: "POST"} = conn) do
+    Path.decoded_segments(conn) in [
+      ["backend-api", "codex", "images", "generations"],
+      ["backend-api", "codex", "images", "edits"],
+      ["v1", "images", "generations"],
+      ["v1", "images", "edits"]
+    ]
   end
 
-  defp multipart_content_type?(conn) do
-    conn
-    |> get_req_header("content-type")
-    |> List.first()
-    |> case do
-      nil ->
-        false
+  defp image_generation_request?(_conn), do: false
 
-      content_type ->
-        content_type |> String.downcase() |> String.starts_with?("multipart/form-data")
+  defp enforce_audio_transcription_permission(%Plug.Conn{halted: true} = conn), do: conn
+
+  defp enforce_audio_transcription_permission(%Plug.Conn{method: "POST", private: %{runtime_api_auth: %{pool: pool}}} = conn) do
+    if Path.decoded_segments(conn) in [["backend-api", "transcribe"], ["v1", "audio", "transcriptions"]] and not PoolRouting.allow_audio_transcription?(pool) do
+      send_runtime_error(conn, %{
+        status: 403,
+        code: "audio_transcription_disabled",
+        message: "Audio transcription is disabled for this pool"
+      })
+    else
+      conn
     end
   end
+
+  defp enforce_audio_transcription_permission(conn), do: conn
 
   @spec protected_backend_json_request?(Plug.Conn.t() | term()) :: boolean()
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "responses"]
-      }),
-      do: true
+  def protected_backend_json_request?(%Plug.Conn{method: method} = conn) when method in ["POST", "PUT", "PATCH", "DELETE"] do
+    path_info = Path.decoded_segments(conn)
 
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "v1", "responses"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "v1", "chat", "completions"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "images", "generations"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "images", "edits"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "responses", "compact"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "v1", "responses", "compact"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "files"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "files", file_id, "uploaded"]
-      })
-      when is_binary(file_id),
-      do: true
+    path_info in [
+      ["backend-api", "codex", "responses"],
+      ["backend-api", "codex", "v1", "responses"],
+      ["backend-api", "codex", "v1", "chat", "completions"],
+      ["backend-api", "codex", "images", "generations"],
+      ["backend-api", "codex", "images", "edits"],
+      ["backend-api", "codex", "responses", "compact"],
+      ["backend-api", "codex", "v1", "responses", "compact"],
+      ["backend-api", "transcribe"],
+      ["backend-api", "files"]
+    ] or match?(["backend-api", "files", file_id, "uploaded"] when is_binary(file_id), path_info)
+  end
 
   def protected_backend_json_request?(_conn), do: false
 
-  def protected_backend_raw_request?(_conn), do: false
-
   @spec pruned_runtime_helper_request?(Plug.Conn.t()) :: boolean()
-  defp pruned_runtime_helper_request?(%Plug.Conn{method: method, path_info: path_info}) do
-    {method, path_info} in @pruned_runtime_helper_routes
+  defp pruned_runtime_helper_request?(%Plug.Conn{method: method} = conn) do
+    {method, Path.decoded_segments(conn)} in @pruned_runtime_helper_routes
+  end
+
+  defp reject_pruned_runtime_helper(%Plug.Conn{halted: true} = conn), do: conn
+
+  defp reject_pruned_runtime_helper(conn) do
+    if pruned_runtime_helper_request?(conn) do
+      send_pruned_runtime_helper_absent(conn)
+    else
+      conn
+    end
   end
 
   defp decode_or_send_compressed_body(conn, settings) do
@@ -418,11 +443,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     |> halt()
   end
 
-  defp runtime_path?(path_info) do
-    Enum.any?(@runtime_prefixes, &List.starts_with?(path_info, &1))
-  end
-
-  defp v1_request?(conn), do: List.starts_with?(conn.path_info, ["v1"])
+  defp v1_request?(conn), do: List.starts_with?(Path.decoded_segments(conn), ["v1"])
 
   defp unsupported_v1_error do
     %{
@@ -432,15 +453,27 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     }
   end
 
+  defp unsupported_agents_error do
+    %{
+      status: 404,
+      code: "unsupported_endpoint",
+      message: "Unsupported OpenAI /v1 endpoint: the beta Agents API is not supported"
+    }
+  end
+
   defp send_runtime_error(conn, reason) do
     send_runtime_error(conn, reason.status, reason.code, reason.message)
   end
 
+  # findings#191: this plug answers before the controller does, so it authors
+  # its own envelope. It used to hardcode the client class, which typed the
+  # `settings_unavailable` 503 as the caller's fault; the classification is
+  # shared with every other Codex Pooler-authored error instead.
   defp send_runtime_error(conn, status, code, message) do
     body = %{
       "error" => %{
         "message" => message,
-        "type" => @json_error_type,
+        "type" => ErrorClassification.error_type(code, status),
         "code" => to_string(code),
         "param" => nil
       }
@@ -448,7 +481,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(body))
+    |> send_resp(status, CodexPooler.JSON.encode!(body))
     |> halt()
   end
 
@@ -461,7 +494,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(body))
+    |> send_resp(status, CodexPooler.JSON.encode!(body))
     |> halt()
   end
 end

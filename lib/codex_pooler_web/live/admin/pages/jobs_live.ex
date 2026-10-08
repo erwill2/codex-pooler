@@ -13,6 +13,8 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   alias CodexPoolerWeb.Admin.JobsPageComponents.Filters
   alias CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards
   alias CodexPoolerWeb.Admin.JobsReadModel
+  alias CodexPoolerWeb.Admin.LiveUpdatesHooks
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -40,6 +42,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
       )
       |> assign_page_state(empty_page_state, %{})
       |> assign(:jobs_page_loaded?, false)
+      |> NotificationCenterHooks.follow_viewer_visibility()
 
     if socket.assigns.owner_authorized? do
       {:ok, maybe_start_connected_refresh(socket)}
@@ -64,8 +67,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
   @impl true
   def handle_event("filter", %{"filters" => filter_params}, socket) do
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/jobs?#{JobFilterForm.query_params(filter_params)}")}
+    {:noreply, push_patch(socket, to: ~p"/admin/jobs?#{JobFilterForm.query_params(filter_params)}")}
   end
 
   def handle_event("select_attention_filter", %{"attention" => attention}, socket) do
@@ -78,10 +80,6 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
   def handle_event("select_worker_filter", %{"worker" => worker}, socket) do
     {:noreply, patch_filter(socket, "worker", worker)}
-  end
-
-  def handle_event("select_queue_filter", %{"queue" => queue}, socket) do
-    {:noreply, patch_filter(socket, "queue", queue)}
   end
 
   def handle_event("select_target_kind_filter", %{"target-kind" => target_kind}, socket) do
@@ -102,8 +100,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   def handle_event("open_job", %{"job-id" => job_id}, socket) do
     {:noreply,
      push_patch(socket,
-       to:
-         ~p"/admin/jobs?#{JobFilterForm.open_job_query_params(socket.assigns.current_params, job_id)}"
+       to: ~p"/admin/jobs?#{JobFilterForm.open_job_query_params(socket.assigns.current_params, job_id)}"
      )}
   end
 
@@ -119,8 +116,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
     {:noreply,
      push_patch(socket,
-       to:
-         ~p"/admin/jobs?#{toggle_worker_failure_query_params(socket.assigns.current_params, socket.assigns.selected_worker_failure_job_id, failure_job_id)}"
+       to: ~p"/admin/jobs?#{toggle_worker_failure_query_params(socket.assigns.current_params, socket.assigns.selected_worker_failure_job_id, failure_job_id)}"
      )}
   end
 
@@ -143,8 +139,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
            |> refresh_jobs()}
 
         {:error, reason} ->
-          {:noreply,
-           put_flash(socket, :error, enqueue_worker_group_error(socket, worker_group, reason))}
+          {:noreply, put_flash(socket, :error, enqueue_worker_group_error(socket, worker_group, reason))}
       end
     else
       {:noreply, put_flash(socket, :error, "System jobs require owner access")}
@@ -160,12 +155,35 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
     end
   end
 
+  # The debounce timer has fired by the time this arrives. Clearing the assign
+  # first keeps a hold from latching it: a stale reference makes every later
+  # `schedule_jobs_reload/1` coalesce onto a timer that will never send.
   def handle_info(:refresh_jobs, socket) do
-    {:noreply, refresh_jobs(socket)}
+    socket
+    |> assign(:jobs_reload_timer, nil)
+    |> LiveUpdatesHooks.unless_paused(&refresh_jobs/1)
   end
 
+  # The fallback keeps ticking so the page is current the moment it resumes,
+  # but it must not redraw the table while the operator is reading it.
   def handle_info(:fallback_refresh_jobs, socket) do
     schedule_fallback_refresh()
+    LiveUpdatesHooks.unless_paused(socket, &refresh_jobs/1)
+  end
+
+  # Jobs belong to owners. A viewer who lost or gained the owner role reloads
+  # the page, which mounts it again with the role it has now; any other change
+  # of the viewer's Pools does not change what an owner sees here (findings#206
+  # row 206-329).
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    if Pools.owner?(socket.assigns.current_scope) == socket.assigns.owner_authorized? do
+      {:noreply, socket}
+    else
+      {:noreply, push_navigate(socket, to: ~p"/admin/jobs?#{socket.assigns[:current_params] || %{}}")}
+    end
+  end
+
+  def handle_info(:live_updates_resumed, socket) do
     {:noreply, refresh_jobs(socket)}
   end
 
@@ -177,6 +195,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
       current_scope={@current_scope}
       active_nav={:jobs}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <div id="job-detail-drawer-root" class="drawer drawer-end">
         <input
@@ -191,7 +210,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
             <AdminComponents.page_header
               id="admin-jobs-page-header"
               title="System Jobs"
-              description="Monitor background work and quickly check whether jobs are queued, running, completed, or need attention."
+              description="Background jobs across the instance: queued, running, retrying, or done."
             />
 
             <AdminComponents.empty_state
@@ -357,8 +376,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
     cond do
       errors_count > 0 ->
-        {:error,
-         "#{title} enqueue partially failed: #{inserted_count} queued, #{conflicts_count} already queued, #{errors_count} failed"}
+        {:error, "#{title} enqueue partially failed: #{inserted_count} queued, #{conflicts_count} already queued, #{errors_count} failed"}
 
       inserted_count == 1 and conflicts_count == 0 ->
         {:info, "#{title} queued"}
@@ -370,8 +388,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
         {:info, enqueue_worker_group_empty_message(socket, worker_group)}
 
       true ->
-        {:info,
-         "#{title} enqueue requested: #{inserted_count} queued, #{conflicts_count} already queued"}
+        {:info, "#{title} enqueue requested: #{inserted_count} queued, #{conflicts_count} already queued"}
     end
   end
 
@@ -467,8 +484,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
       filter_warnings: filter_warnings,
       filter_errors: filter_warnings,
       selected_job: selected_job(filters.job_id, socket.assigns.explorer.items),
-      selected_worker_failure_job_id:
-        selected_worker_failure_job_id(params, socket.assigns.worker_cards)
+      selected_worker_failure_job_id: selected_worker_failure_job_id(params, socket.assigns.worker_cards)
     )
   end
 

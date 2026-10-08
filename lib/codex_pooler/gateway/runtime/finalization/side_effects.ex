@@ -1,12 +1,19 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
   @moduledoc false
 
+  require Logger
+
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
   alias CodexPooler.Gateway.Routing.RouteLifecycle, as: RoutingRouteLifecycle
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
+  alias CodexPooler.Gateway.Runtime.Finalization.UsageLimitRefusal
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
+  alias CodexPooler.Gateway.Transports.ProviderCreditsAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
   alias CodexPooler.Jobs
+  alias CodexPooler.Jobs.UpstreamEnqueue
   alias CodexPooler.Upstreams.SavedResets.ProbeLease
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
 
@@ -25,48 +32,210 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
         request_options,
         callbacks
       ) do
-    RoutingRouteLifecycle.log_optional_result(
-      "route_lifecycle_success",
-      route_lifecycle_metadata(context),
-      DispatchLifecycle.success(context)
+    if stale_replay_generation?(context) do
+      :ok
+    else
+      record_continuity_result(
+        fn ->
+          callbacks.register_continuity.(
+            with_assignment(request_options, context.assignment),
+            payload,
+            body
+          )
+        end,
+        context
+      )
+    end
+  end
+
+  defp record_continuity_result(callback, context) when is_function(callback, 0) do
+    callback.()
+    |> consume_continuity_result(context)
+  rescue
+    exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
+      log_continuity_failure(context, continuity_exception_code(exception))
+  end
+
+  defp consume_continuity_result(:ok, _context), do: :ok
+  defp consume_continuity_result({:ok, _value}, _context), do: :ok
+
+  defp consume_continuity_result(result, context),
+    do: log_continuity_failure(context, continuity_failure_code(result))
+
+  # The line names the failure with a bounded code, never the raw result: a
+  # fixed rollback reason (`stale_owner`, `owner_unavailable`,
+  # `continuity_deadlock`, ...) renders as itself through the websocket
+  # diagnostic sanitizer, anything else as a fixed class (findings#225, row
+  # 225-96: the production line gave no way to tell why it failed).
+  defp continuity_failure_code({:error, reason}) do
+    case DiagnosticTaxonomy.reason_code(reason) do
+      code when is_binary(code) -> code
+      nil -> "unclassified_error"
+    end
+  end
+
+  defp continuity_failure_code(_result), do: "unexpected_result"
+
+  defp continuity_exception_code(%DBConnection.ConnectionError{}), do: "database_connection_error"
+  defp continuity_exception_code(%Ecto.QueryError{}), do: "query_error"
+  defp continuity_exception_code(%Postgrex.Error{}), do: "database_error"
+
+  defp log_continuity_failure(%SelectedCandidateContext{} = context, reason_code) do
+    Logger.warning(
+      "gateway continuity registration failed " <>
+        "pool_upstream_assignment_id=#{context.assignment.id} " <>
+        "reason_code=#{reason_code}",
+      continuity_registration_metadata(context)
     )
 
-    callbacks.register_continuity.(
-      with_assignment(request_options, context.assignment),
-      payload,
-      body
-    )
+    :ok
+  end
+
+  defp continuity_registration_metadata(%SelectedCandidateContext{} = context) do
+    [
+      request_id: context.reserved.request.id,
+      pool_upstream_assignment_id: context.assignment.id
+    ]
+  end
+
+  @spec before_finalize_success(SelectedCandidateContext.t(), RequestOptions.t() | map()) :: :ok
+  def before_finalize_success(%SelectedCandidateContext{} = context, request_options) do
+    maybe_enqueue_gateway_reconciliation(context.reserved.request.pool_id, context.assignment)
+
+    unless replay_dispatch?(context) do
+      RoutingRouteLifecycle.log_optional_result(
+        "route_lifecycle_success",
+        route_lifecycle_metadata(context),
+        DispatchLifecycle.success(context)
+      )
+    end
 
     maybe_confirm_reset_probe(context, request_options)
 
     :ok
   end
 
-  # A successful request that was force-routed as a guarded reset probe confirms
-  # the redeemed identity as temporarily routeable. Best-effort and scoped: only
-  # the exact redeemed identity is confirmed, and only while its probe token
-  # still holds the claim.
-  defp maybe_confirm_reset_probe(%SelectedCandidateContext{identity: identity}, request_options)
-       when not is_nil(identity) do
-    case reset_probe_context(request_options) do
-      %{"token" => token, "upstream_identity_id" => identity_id}
-      when is_binary(token) and identity_id == identity.id ->
-        safe_confirm_reset_probe(identity_id, token)
+  @spec observe_http_response(SelectedCandidateContext.t(), Req.Response.t(), binary()) :: :ok
+  def observe_http_response(
+        %SelectedCandidateContext{identity: identity} = context,
+        response,
+        body
+      ) do
+    # A usage-limit `429` records its windows as the provider's denial, the
+    # refusal code read from its drained body (findings#206 row 206-594).
+    RateLimitObserver.record_headers(identity, response, context.model.upstream_model_id, UsageLimitRefusal.denial_code(response))
+    RateLimitObserver.record_error(identity, body)
+    :ok
+  end
 
-      _no_probe_context ->
-        :ok
+  @spec observe_stream_response(
+          SelectedCandidateContext.t(),
+          Req.Response.t(),
+          binary(),
+          map() | nil
+        ) :: :ok
+  def observe_stream_response(
+        %SelectedCandidateContext{identity: identity} = context,
+        response,
+        body,
+        state
+      ) do
+    RateLimitObserver.record_headers(identity, response, context.model.upstream_model_id)
+
+    rate_limit_state =
+      if is_map(state) do
+        Map.get(state, :rate_limit, state)
+      else
+        {:ok, collected} = RateLimitObserver.collect_events(body, RateLimitObserver.event_state())
+        collected
+      end
+
+    RateLimitObserver.commit_events(identity, rate_limit_state)
+
+    :ok
+  end
+
+  @spec observe_websocket_response(SelectedCandidateContext.t(), map()) :: :ok
+  def observe_websocket_response(
+        %SelectedCandidateContext{identity: identity} = context,
+        response
+      ) do
+    RateLimitObserver.record_websocket_upgrade_headers(
+      identity,
+      websocket_upgrade_headers(response),
+      context.model.upstream_model_id
+    )
+
+    RateLimitObserver.record_websocket_frame_headers(
+      identity,
+      Map.get(response, :websocket_frame_headers, %{}),
+      context.model.upstream_model_id,
+      websocket_denial_code(response)
+    )
+
+    :ok
+  end
+
+  defp websocket_denial_code(%{terminal: terminal, upstream_error_code: code})
+       when terminal in ["response.failed", "response.incomplete", "error"],
+       do: code
+
+  defp websocket_denial_code(%{reason: {:quota_exhausted_first_event, %{code: code}}}), do: code
+  defp websocket_denial_code(_response), do: nil
+
+  defp websocket_upgrade_headers(%{reason: {:websocket_upgrade_failed, status, headers}})
+       when is_integer(status) and is_list(headers),
+       do: headers
+
+  defp websocket_upgrade_headers(response), do: Map.get(response, :headers, [])
+
+  defp stale_replay_generation?(%SelectedCandidateContext{
+         attempt: %{replay_generation: 0},
+         request_options: %{runtime: %{replay_generation: generation}}
+       })
+       when is_integer(generation) and generation > 0,
+       do: true
+
+  defp stale_replay_generation?(%SelectedCandidateContext{}), do: false
+
+  defp replay_dispatch?(%SelectedCandidateContext{
+         attempt: %{replay_generation: generation},
+         request_options: %{runtime: %{replay_generation: generation}}
+       })
+       when generation > 0,
+       do: true
+
+  defp replay_dispatch?(%SelectedCandidateContext{}), do: false
+
+  defp maybe_confirm_reset_probe(
+         %SelectedCandidateContext{} = context,
+         %RequestOptions{} = options
+       ) do
+    case options.routing.reset_probe do
+      %ResetProbe{} = probe -> maybe_confirm_bound_reset_probe(context, probe)
+      nil -> :ok
     end
   end
 
   defp maybe_confirm_reset_probe(_context, _request_options), do: :ok
 
-  defp reset_probe_context(%RequestOptions{routing: %{quota_decision: %{} = decision}}),
-    do: Map.get(decision, "reset_probe")
+  defp maybe_confirm_bound_reset_probe(%SelectedCandidateContext{} = context, probe) do
+    if ProviderCreditsAdmission.confirms_probe?(context.provider_credits_admission, context, probe) do
+      admitted = context.provider_credits_admission.context
 
-  defp reset_probe_context(_request_options), do: nil
+      safe_confirm_reset_probe(
+        context.identity.id,
+        admitted.redemption_generation,
+        admitted.redemption_attempt_id,
+        %ProbeLease.VerifiedConfirmation{credential_epoch: admitted.credential_epoch, probe: probe, upstream_model: admitted.upstream_model, serving_mode: admitted.serving_mode, transport: admitted.transport}
+      )
+    else
+      :ok
+    end
+  end
 
-  defp safe_confirm_reset_probe(identity_id, token) do
-    ProbeLease.confirm_upstream(identity_id, token)
+  defp safe_confirm_reset_probe(identity_id, generation, attempt_id, %ProbeLease.VerifiedConfirmation{} = confirmation) do
+    ProbeLease.confirm_upstream(identity_id, generation, attempt_id, confirmation)
     :ok
   rescue
     exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
@@ -81,13 +250,23 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
 
   @spec maybe_enqueue_gateway_reconciliation(Jobs.pool_ref(), PoolUpstreamAssignment.t()) :: :ok
   def maybe_enqueue_gateway_reconciliation(pool_id, assignment) do
-    result = Jobs.enqueue_gateway_account_reconciliation(pool_id, assignment)
+    case UpstreamEnqueue.claim_gateway_reconciliation_gate(assignment.upstream_identity_id) do
+      :duplicate ->
+        :ok
 
-    case result do
+      :ok ->
+        enqueue_gateway_reconciliation(pool_id, assignment)
+    end
+  end
+
+  defp enqueue_gateway_reconciliation(pool_id, assignment) do
+    case Jobs.enqueue_gateway_account_reconciliation(pool_id, assignment) do
       {:ok, _job} ->
         :ok
 
       {:error, reason} ->
+        UpstreamEnqueue.release_gateway_reconciliation_gate(assignment.upstream_identity_id)
+
         RateLimitObserver.log_failure(
           "gateway_reconciliation_enqueue",
           [pool_id: pool_id, pool_upstream_assignment_id: assignment.id],

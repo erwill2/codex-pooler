@@ -2,21 +2,59 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
+  import ExUnit.CaptureLog
 
-  alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
+  alias CodexPooler.Gateway.Transports.Streaming.DeferredStreamRegistry
+  alias CodexPooler.Gateway.Transports.Websocket.{ActivityRegistry, RolloutDrain}
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Gateway.Websocket.ResponseTask
 
   alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport.{
     ActiveShutdownProbeOwner,
-    DrainProbeOwner
+    DrainProbeOwner,
+    FinishingStartingOwner,
+    SlowFinalStatusOwner,
+    UnresponsiveOwner,
+    VirtualDeadline,
+    WaitingOwner
   }
 
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
+
+  # Failure-detection budget for an expected message: a green run returns as
+  # soon as the message arrives, so only a missing one spends it.
+  @detection_timeout_ms 15_000
+
+  # Two independent clocks run in most tests here: the drain's own `timeout_ms`,
+  # which is the budget under test, and the test's wait for the result. When they
+  # are set to the same value the wait has no headroom, and a loaded machine turns
+  # a drain that was merely slow into an await crash. Keep the detection budget
+  # well above every scenario budget so only the drain's own clock decides an
+  # outcome.
+  @drain_timeout_ms 1_000
+  @await_timeout_ms 10_000
+  @owner_registry_key {__MODULE__, :owner_registry}
 
   setup do
     previous_config = Application.get_env(:codex_pooler, RolloutDrain)
     previous_timeout = System.get_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS")
     drain_name = :"rollout-drain-#{System.unique_integer([:positive])}"
-    start_supervised!({RolloutDrain, name: drain_name})
+    activity_registry = :"rollout-drain-activity-#{System.unique_integer([:positive])}"
+    stream_registry = :"rollout-drain-streams-#{System.unique_integer([:positive])}"
+    start_supervised!({ActivityRegistry, name: activity_registry})
+    # A drain marks its registries drained for good. Keep the deferred-stream
+    # registry local to this test so draining here cannot signal another test's
+    # HTTP SSE stream through the global registry.
+    start_supervised!({DeferredStreamRegistry, name: stream_registry})
+
+    # Every drain and probe owner here uses this test's own owner registry: the application one also
+    # holds any owner an earlier test left running, and a drain counts every owner it enumerates
+    # (findings#206 row 206-375, Drone 1531: a leaked pair made one failing owner `owners_seen: 3`).
+    owner_registry = start_owner_registry!()
+    Process.put(@owner_registry_key, owner_registry)
+
+    start_supervised!({RolloutDrain, name: drain_name, activity_registry: activity_registry, stream_registry: stream_registry, owner_registry: owner_registry})
 
     on_exit(fn ->
       if previous_config do
@@ -28,27 +66,29 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
       restore_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS", previous_timeout)
     end)
 
-    {:ok, drain_name: drain_name}
+    {:ok, activity_registry: activity_registry, drain_name: drain_name, stream_registry: stream_registry}
   end
 
-  test "flips the app drain flag and drains local owner sessions with a compact summary",
-       %{drain_name: drain_name} do
+  # The real `WebsocketOwnerSession`s start in this test's own owner registry (`registry:`), which
+  # the drain reads, so an owner another test left in the application registry cannot change its
+  # counts (findings#206 row 206-386).
+  test "flips the app drain flag and drains local owner sessions with a compact summary" do
+    drain_name = :"rollout-drain-application-owners-#{System.unique_integer([:positive])}"
+    start_isolated_rollout_drain!(drain_name, [])
     first_context = owner_context()
     second_context = owner_context()
-
-    on_exit(fn ->
-      cleanup_owner_session(first_context.codex_session_id)
-      cleanup_owner_session(second_context.codex_session_id)
-    end)
 
     first_upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
     second_upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
 
     assert RolloutDrain.draining?(name: drain_name) == false
-    assert {:ok, first_owner} = start_owner(first_context, upstream: first_upstream)
+    assert {:ok, first_owner} = start_owner(first_context, upstream: first_upstream, registry: own_owner_registry())
+    on_exit(fn -> stop_owner_pid(first_owner) end)
     assert_receive {:websocket_owner_harness_upstream_started, first_upstream_pid}
-    assert {:ok, second_owner} = start_owner(second_context, upstream: second_upstream)
+    assert {:ok, second_owner} = start_owner(second_context, upstream: second_upstream, registry: own_owner_registry())
+    on_exit(fn -> stop_owner_pid(second_owner) end)
     assert_receive {:websocket_owner_harness_upstream_started, second_upstream_pid}
+    assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(first_context.codex_session_id)
 
     first_ref = Process.monitor(first_owner)
     second_ref = Process.monitor(second_owner)
@@ -57,11 +97,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
              result: :ok,
              owners_seen: 2,
              owners_drained: 2,
+             owners_idle: 2,
              owners_failed: 0,
-             timeout_ms: 1_000,
+             turns_completed: 0,
+             turns_aborted: 0,
+             timeout_ms: @drain_timeout_ms,
              elapsed_ms: elapsed_ms,
              already_draining?: false
-           } = RolloutDrain.start_drain(name: drain_name, timeout_ms: 1_000)
+           } = RolloutDrain.start_drain(name: drain_name, timeout_ms: @drain_timeout_ms)
 
     assert is_integer(elapsed_ms) and elapsed_ms >= 0
     assert RolloutDrain.draining?(name: drain_name)
@@ -77,11 +120,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
     first_key = owner_key()
     second_key = owner_key()
 
-    first_owner = start_supervised!({DrainProbeOwner, key: first_key, parent: self()})
+    first_owner = start_probe_owner!({DrainProbeOwner, key: first_key, parent: self()})
 
     first_task =
       Task.async(fn ->
-        RolloutDrain.start_drain(name: drain_name, timeout_ms: 1_000)
+        RolloutDrain.start_drain(name: drain_name, timeout_ms: @drain_timeout_ms)
       end)
 
     assert_receive {:rollout_drain_probe_started, ^first_key}
@@ -89,7 +132,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
 
     second_task =
       Task.async(fn ->
-        RolloutDrain.start_drain(name: drain_name, timeout_ms: 1_000)
+        RolloutDrain.start_drain(name: drain_name, timeout_ms: @drain_timeout_ms)
       end)
 
     send(first_owner, {:release_rollout_drain_probe, first_key})
@@ -98,24 +141,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
              result: :ok,
              owners_seen: 1,
              owners_drained: 1,
+             owners_idle: 1,
              owners_failed: 0,
-             timeout_ms: 1_000
-           } = Task.await(first_task, 1_000)
+             timeout_ms: @drain_timeout_ms
+           } = Task.await(first_task, @await_timeout_ms)
 
     assert %{
              result: :ok,
              owners_seen: 1,
              owners_drained: 1,
+             owners_idle: 1,
              owners_failed: 0,
-             timeout_ms: 1_000
-           } = Task.await(second_task, 1_000)
+             timeout_ms: @drain_timeout_ms
+           } = Task.await(second_task, @await_timeout_ms)
 
     second_owner =
-      start_supervised!({DrainProbeOwner, key: second_key, parent: self()})
+      start_probe_owner!({DrainProbeOwner, key: second_key, parent: self()})
 
     repeated_task =
       Task.async(fn ->
-        RolloutDrain.start_drain(name: drain_name, timeout_ms: 1_000)
+        RolloutDrain.start_drain(name: drain_name, timeout_ms: @drain_timeout_ms)
       end)
 
     assert_receive {:rollout_drain_probe_started, ^second_key}
@@ -125,10 +170,52 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
              result: :ok,
              owners_seen: 1,
              owners_drained: 1,
+             owners_idle: 1,
              owners_failed: 0,
-             timeout_ms: 1_000,
+             timeout_ms: @drain_timeout_ms,
              already_draining?: true
-           } = Task.await(repeated_task, 1_000)
+           } = Task.await(repeated_task, @await_timeout_ms)
+  end
+
+  test "isolated harness joins its unlinked drain worker before supervised teardown" do
+    harness = start_own_rollout_drain_harness()
+
+    assert %{result: :ok, owners_seen: 0} =
+             RolloutDrain.start_drain(
+               [name: harness.name, timeout_ms: 25] ++
+                 deadline_options(harness.deadline)
+             )
+
+    assert :ok = await_rollout_drain_harness(harness)
+    assert %{active_drain: nil} = :sys.get_state(harness.name)
+    assert ActivityRegistry.draining?(name: harness.activity_registry)
+  end
+
+  test "harness deadline tracking records the calling worker rather than the tracker" do
+    harness = start_own_rollout_drain_harness()
+    %{drain_policy: policy} = :sys.get_state(harness.name)
+    parent = self()
+
+    worker =
+      Task.async(fn ->
+        now_ms = policy.now_ms.()
+        send(parent, {:drain_clock_read, self()})
+
+        receive do
+          :release_clock_reader -> now_ms
+        end
+      end)
+
+    worker_pid = worker.pid
+    monitor = Process.monitor(worker_pid)
+    assert_receive {:drain_clock_read, ^worker_pid}, @await_timeout_ms
+
+    assert Agent.get(harness.worker_tracker, & &1) == MapSet.new([worker_pid])
+
+    send(worker_pid, :release_clock_reader)
+    assert Task.await(worker, @await_timeout_ms) == 0
+    assert_receive {:DOWN, ^monitor, :process, ^worker_pid, :normal}, @await_timeout_ms
+    assert :ok = await_rollout_drain_harness(harness)
   end
 
   test "release-callable shutdown drain is idempotent through configured app server",
@@ -137,7 +224,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
     System.put_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS", "750")
 
     owner_key = owner_key()
-    owner = start_supervised!({DrainProbeOwner, key: owner_key, parent: self()})
+    owner = start_probe_owner!({DrainProbeOwner, key: owner_key, parent: self()})
 
     first_task = Task.async(fn -> RolloutDrain.drain_for_shutdown() end)
 
@@ -151,7 +238,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
              owners_failed: 0,
              timeout_ms: 750,
              already_draining?: false
-           } = Task.await(first_task, 1_000)
+           } = Task.await(first_task, @await_timeout_ms)
 
     assert %{
              result: :ok,
@@ -171,9 +258,17 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
     System.put_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS", "120")
 
     owner_key = owner_key()
-    _owner = start_supervised!({DrainProbeOwner, key: owner_key, parent: self()})
 
-    {first_elapsed_us, first_summary} = :timer.tc(fn -> RolloutDrain.drain_for_shutdown() end)
+    # Never released, so the drain reports a failed owner and the shutdown budget
+    # ends up exhausted. The drain keeps waiting on the owner call well past its
+    # own 120ms deadline, so this timeout is what actually ends the call: keep it
+    # just above that deadline rather than at the generous default, which would
+    # cost the suite a second of pure waiting. The assertions below hold
+    # whichever of the two elapses first.
+    _owner =
+      start_probe_owner!({DrainProbeOwner, key: owner_key, parent: self(), release_timeout_ms: 250})
+
+    first_summary = RolloutDrain.drain_for_shutdown()
 
     assert_receive {:rollout_drain_probe_started, ^owner_key}
 
@@ -186,15 +281,27 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
              already_draining?: false
            } = first_summary
 
-    {second_elapsed_us, second_summary} = :timer.tc(fn -> RolloutDrain.drain_for_shutdown() end)
+    # A live owner that a restarted budget would have to enumerate and drain.
+    # Spending a fresh timeout is now observable rather than inferred from how
+    # long the second call took: an exhausted budget returns without ever asking
+    # this probe to drain, and echoes the original 120ms budget, where a
+    # `{:remaining, n}` drain would report the smaller leftover instead.
+    survivor_key = owner_key()
 
-    assert second_elapsed_us < first_elapsed_us / 2
+    _survivor =
+      start_probe_owner!({DrainProbeOwner, key: survivor_key, parent: self(), release_timeout_ms: 1_000})
+
+    second_summary = RolloutDrain.drain_for_shutdown()
+
+    refute_received {:rollout_drain_probe_started, ^survivor_key}
 
     assert %{
              result: :ok,
              owners_seen: 0,
              owners_drained: 0,
              owners_failed: 0,
+             timeout_ms: 120,
+             elapsed_ms: 0,
              already_draining?: true
            } = second_summary
   end
@@ -214,13 +321,145 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
            } = RolloutDrain.drain_for_shutdown()
   end
 
+  # A drain keeps 10.7 s of its budget for its own owner calls, poll and finish, so a budget at or
+  # under that margin leaves an active turn only the 10 ms floor and every drain cuts every turn in
+  # flight at once: the instance-termination lane's 5 s did (findings#270 row 270-222). The server
+  # says so when it starts, and only then.
+  test "warns at start when the configured budget leaves active turns only the floor" do
+    for {budget, warned?} <- [{"5000", true}, {"10710", true}, {"10711", false}, {"15000", false}] do
+      System.put_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS", budget)
+      drain_name = :"rollout-drain-budget-warning-#{System.unique_integer([:positive])}"
+
+      log = capture_log(fn -> start_isolated_rollout_drain!(drain_name, []) end)
+
+      if warned? do
+        assert log =~
+                 "websocket rollout drain budget leaves active turns no time " <>
+                   "timeout_ms=#{budget} margin_ms=10700 turn_window_ms=10 " <>
+                   "setting=CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS",
+               budget
+      else
+        refute log =~ "websocket rollout drain budget", budget
+      end
+    end
+  end
+
+  # Each drain names the window it gives active turns, from the deadline it actually set.
+  test "names on its start line the window a drain gives active turns" do
+    frozen = %{
+      now_ms: fn -> 0 end,
+      schedule_wait: fn recipient, wait_token, wait_ms ->
+        Process.send_after(recipient, {:rollout_drain_wait_elapsed, wait_token}, wait_ms)
+      end,
+      cancel_wait: fn wait_ref, _wait_token -> Process.cancel_timer(wait_ref) end
+    }
+
+    for {timeout_ms, window_ms} <- [{15_000, 4_300}, {5_000, 10}] do
+      drain_name = :"rollout-drain-turn-window-#{System.unique_integer([:positive])}"
+      start_isolated_rollout_drain!(drain_name, deadline: frozen)
+
+      log =
+        capture_info_log(fn ->
+          assert %{result: :ok, owners_seen: 0, timeout_ms: ^timeout_ms} =
+                   RolloutDrain.start_drain(name: drain_name, timeout_ms: timeout_ms, deadline: frozen)
+        end)
+
+      assert log =~
+               "websocket rollout drain started timeout_ms=#{timeout_ms} " <>
+                 "already_draining=false turn_window_ms=#{window_ms}"
+    end
+  end
+
+  # The drain asks a starting owner whether its queued turn is active, then asks
+  # again once it drains the owner after that turn. A turn that ended between
+  # the two looks was counted as an idle owner (Drone 1708 and the boundary
+  # test's `owners_idle: 1, turns_completed: 0`); the drain saw it active, so
+  # it is a completed turn.
+  test "a starting owner's turn that ends between the drain's two looks counts as completed",
+       %{drain_name: drain_name} do
+    owner_key = owner_key()
+    _owner = start_probe_owner!({FinishingStartingOwner, key: owner_key, parent: self()})
+
+    assert %{
+             result: :ok,
+             owners_seen: 1,
+             owners_drained: 1,
+             owners_idle: 0,
+             owners_failed: 0,
+             turns_completed: 1,
+             turns_aborted: 0
+           } = RolloutDrain.start_drain(name: drain_name, timeout_ms: @drain_timeout_ms)
+
+    assert_receive {:rollout_drain_status_call, ^owner_key, 1}
+    assert_receive {:rollout_drain_status_call, ^owner_key, 2}
+    assert_receive {:rollout_drain_owner_stopped, ^owner_key, 2}
+  end
+
+  test "owner post-deadline call budget defaults to two owner calls and stays per server",
+       %{drain_name: drain_name} do
+    harness = start_own_rollout_drain_harness()
+    default_budget_ms = WebsocketOwnerContract.default_owner_call_timeout_ms() * 2
+
+    assert %{
+             owner_post_deadline_call_budget_ms: ^default_budget_ms,
+             margin_ms: 10_700
+           } = :sys.get_state(drain_name).drain_policy
+
+    assert %{
+             owner_post_deadline_call_budget_ms: 1_000,
+             margin_ms: 1_700
+           } = :sys.get_state(harness.name).drain_policy
+  end
+
+  test "budget-only policy derives a consistent default deadline margin" do
+    drain_name = :"rollout-drain-budget-only-#{System.unique_integer([:positive])}"
+
+    start_isolated_rollout_drain!(drain_name, owner_post_deadline_call_budget_ms: 100)
+
+    assert %{
+             owner_post_deadline_call_budget_ms: 100,
+             margin_ms: 800
+           } = :sys.get_state(drain_name).drain_policy
+  end
+
+  test "explicit deadline margin overrides the budget-derived default" do
+    drain_name = :"rollout-drain-explicit-margin-#{System.unique_integer([:positive])}"
+
+    start_isolated_rollout_drain!(drain_name,
+      owner_post_deadline_call_budget_ms: 100,
+      deadline_margin_ms: 20
+    )
+
+    assert %{
+             owner_post_deadline_call_budget_ms: 100,
+             margin_ms: 20
+           } = :sys.get_state(drain_name).drain_policy
+  end
+
+  test "invalid owner post-deadline call budgets fall back to the production default" do
+    default_budget_ms = WebsocketOwnerContract.default_owner_call_timeout_ms() * 2
+
+    for invalid_budget <- [0, "100"] do
+      drain_name = :"rollout-drain-invalid-budget-#{System.unique_integer([:positive])}"
+
+      start_isolated_rollout_drain!(drain_name,
+        owner_post_deadline_call_budget_ms: invalid_budget
+      )
+
+      assert %{
+               owner_post_deadline_call_budget_ms: ^default_budget_ms,
+               margin_ms: 10_700
+             } = :sys.get_state(drain_name).drain_policy
+    end
+  end
+
   test "application prep_stop drains through the release-callable coordinator before shutdown",
        %{drain_name: drain_name} do
     configure_rollout_drain_server(drain_name)
     System.put_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS", "750")
 
     owner_key = owner_key()
-    owner = start_supervised!({DrainProbeOwner, key: owner_key, parent: self()})
+    owner = start_probe_owner!({DrainProbeOwner, key: owner_key, parent: self()})
 
     prep_stop_task = Task.async(fn -> CodexPooler.Application.prep_stop(:shutdown_state) end)
 
@@ -229,7 +468,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
 
     send(owner, {:release_rollout_drain_probe, owner_key})
 
-    assert :shutdown_state = Task.await(prep_stop_task, 1_000)
+    assert :shutdown_state = Task.await(prep_stop_task, @await_timeout_ms)
     assert RolloutDrain.draining?(name: drain_name)
   end
 
@@ -241,7 +480,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
     owner_key = owner_key()
 
     owner =
-      start_supervised!({ActiveShutdownProbeOwner, key: owner_key, parent: self()})
+      start_probe_owner!({ActiveShutdownProbeOwner, key: owner_key, parent: self()})
 
     first_task = Task.async(fn -> RolloutDrain.drain_for_shutdown() end)
 
@@ -260,9 +499,687 @@ defmodule CodexPooler.Gateway.Transports.Websocket.RolloutDrainTest do
              owners_failed: 0,
              timeout_ms: 240,
              already_draining?: false
-           } = Task.await(first_task, 1_000)
+           } = Task.await(first_task, @await_timeout_ms)
 
-    assert :duplicate_shutdown_state = Task.await(prep_stop_task, 1_000)
-    assert GenServer.call(owner, :drain_calls, 250) == 1
+    assert :duplicate_shutdown_state = Task.await(prep_stop_task, @await_timeout_ms)
+    assert GenServer.call(owner, :drain_calls, @await_timeout_ms) == 1
+  end
+
+  @tag :rollout_drain_t1
+  test "T1 drain waits for an active turn terminal before stopping its owner", %{
+    drain_name: _drain_name
+  } do
+    harness = start_own_rollout_drain_harness()
+    deadline = harness.deadline
+    owner_key = owner_key()
+    owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+    owner_ref = Process.monitor(owner)
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    assert_receive {:rollout_drain_begin_wait, ^owner_key, 1}
+    assert_receive {:rollout_drain_deadline_wait, ^deadline, wait_ms}
+    refute_received {:rollout_drain_owner_stopped, ^owner_key, _outcome, _calls}
+
+    assert :ok = WaitingOwner.complete_turn(owner)
+    assert_receive {:rollout_drain_terminal_delivered, ^owner_key}
+    assert :ok = VirtualDeadline.advance(harness.deadline, wait_ms)
+
+    assert_receive {:rollout_drain_owner_stopped, ^owner_key, :completed, 1}
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+
+    assert %{
+             result: :ok,
+             owners_seen: 1,
+             owners_drained: 1,
+             owners_failed: 0,
+             turns_completed: 1,
+             turns_aborted: 0
+           } = Task.await(drain_task, @await_timeout_ms)
+
+    assert VirtualDeadline.waiter_pids(deadline) == []
+  end
+
+  test "an active local owner turn contributes exactly one owner-derived completed turn" do
+    harness = start_own_rollout_drain_harness()
+    owner_key = owner_key()
+    owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    assert_receive {:rollout_drain_begin_wait, ^owner_key, 1}
+    assert_receive {:rollout_drain_deadline_wait, deadline, wait_ms}
+    assert :ok = WaitingOwner.complete_turn(owner)
+    assert_receive {:rollout_drain_terminal_delivered, ^owner_key}
+    assert :ok = VirtualDeadline.advance(deadline, wait_ms)
+
+    assert %{
+             owners_seen: 1,
+             owners_drained: 1,
+             turns_completed: 1,
+             turns_aborted: 0,
+             direct_turns_seen: 0,
+             proxy_turns_seen: 0
+           } = Task.await(drain_task, @await_timeout_ms)
+  end
+
+  test "drain waits for a registered direct response task and counts its completion" do
+    harness = start_own_rollout_drain_harness()
+    parent = self()
+
+    {:ok, response_task} =
+      ResponseTask.start(
+        parent,
+        :direct,
+        fn _task_pid ->
+          send(parent, {:direct_turn_started, self()})
+
+          receive do
+            :complete_direct_turn -> :ok
+          end
+        end,
+        fn _task_pid, _reason -> send(parent, :unexpected_direct_cancel) end,
+        activity_registry: harness.activity_registry
+      )
+
+    assert_receive {:direct_turn_started, direct_worker}
+    deadline = harness.deadline
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    assert_receive {:rollout_drain_deadline_wait, ^deadline, _wait_ms}
+    send(direct_worker, :complete_direct_turn)
+    assert_receive {:websocket_response_activity, ^response_task, activity_token}
+    assert_receive {:codex_response_done, ^response_task, :ok}
+    assert Process.alive?(drain_task.pid)
+    assert :ok = ResponseTask.acknowledge_delivery(response_task, activity_token)
+
+    assert %{
+             direct_turns_seen: 1,
+             direct_turns_completed: 1,
+             direct_turns_aborted: 0,
+             direct_turns_failed: 0,
+             proxy_turns_seen: 0,
+             owners_seen: 0
+           } = Task.await(drain_task, @await_timeout_ms)
+
+    refute_received :unexpected_direct_cancel
+  end
+
+  test "drain deadline cancels a registered proxy task once and counts one abort" do
+    harness = start_own_rollout_drain_harness()
+    parent = self()
+
+    {:ok, response_task} =
+      ResponseTask.start(
+        parent,
+        :proxy,
+        fn _task_pid ->
+          send(parent, {:proxy_turn_started, self()})
+
+          receive do
+            :never_released -> :ok
+          end
+        end,
+        fn task_pid, reason ->
+          send(parent, {:proxy_turn_cancelled, task_pid, reason})
+          :kill_worker
+        end,
+        activity_registry: harness.activity_registry
+      )
+
+    assert_receive {:proxy_turn_started, _proxy_worker}
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain(
+          [
+            name: harness.name,
+            timeout_ms: 25,
+            deadline_margin_ms: 20,
+            deadline_floor_ms: 10
+          ] ++ deadline_options(harness.deadline)
+        )
+      end)
+
+    assert_receive {:rollout_drain_deadline_wait, deadline, 10}
+    response_task_monitor = Process.monitor(response_task)
+    assert :ok = VirtualDeadline.advance(deadline, 10)
+    assert_receive {:proxy_turn_cancelled, ^response_task, :owner_drained}
+    assert_receive {:websocket_response_activity, ^response_task, activity_token}
+
+    assert_receive {:websocket_response_activity_cancelled, ^response_task, ^activity_token, ack_pid, :owner_drained}
+
+    assert :ok = ResponseTask.acknowledge_delivery(ack_pid, activity_token)
+    assert_receive {:codex_response_done, ^response_task, {:error, :owner_drained}}
+    assert_receive {:DOWN, ^response_task_monitor, :process, ^response_task, :killed}
+    refute_received {:proxy_turn_cancelled, ^response_task, :owner_drained}
+    refute_received {:codex_response_done, ^response_task, {:error, :owner_drained}}
+
+    assert %{
+             proxy_turns_seen: 1,
+             proxy_turns_completed: 0,
+             proxy_turns_aborted: 1,
+             proxy_turns_failed: 0,
+             direct_turns_seen: 0,
+             owners_seen: 0
+           } = Task.await(drain_task, @await_timeout_ms)
+  end
+
+  test "a restarted rollout coordinator re-enumerates the registry's active proxy task" do
+    harness = start_own_rollout_drain_harness()
+    parent = self()
+
+    {:ok, response_task} =
+      ResponseTask.start(
+        parent,
+        :proxy,
+        fn _task_pid ->
+          send(parent, {:restart_proxy_turn_started, self()})
+
+          receive do
+            :complete_restart_proxy_turn -> :ok
+          end
+        end,
+        fn _task_pid, _reason -> :kill_worker end,
+        activity_registry: harness.activity_registry
+      )
+
+    assert_receive {:restart_proxy_turn_started, worker}
+    old_coordinator = Process.whereis(harness.name)
+    old_ref = Process.monitor(old_coordinator)
+
+    first_caller =
+      spawn(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    first_caller_ref = Process.monitor(first_caller)
+    assert_receive {:rollout_drain_deadline_wait, _deadline, _wait_ms}
+    Process.exit(old_coordinator, :kill)
+    assert_receive {:DOWN, ^old_ref, :process, ^old_coordinator, :killed}
+    assert_receive {:DOWN, ^first_caller_ref, :process, ^first_caller, _reason}
+
+    new_coordinator = await_restarted_coordinator(harness.name, old_coordinator)
+    assert Process.alive?(new_coordinator)
+
+    second_drain =
+      Task.async(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    assert_receive {:rollout_drain_deadline_wait, _deadline, _wait_ms}
+    send(worker, :complete_restart_proxy_turn)
+    assert_receive {:websocket_response_activity, ^response_task, activity_token}
+    assert_receive {:codex_response_done, ^response_task, :ok}
+    assert Process.alive?(second_drain.pid)
+    assert :ok = ResponseTask.acknowledge_delivery(response_task, activity_token)
+
+    assert %{proxy_turns_seen: 1, proxy_turns_completed: 1, proxy_turns_failed: 0} =
+             Task.await(second_drain, @await_timeout_ms)
+  end
+
+  @tag :rollout_drain_t2
+  test "T2 injectable deadline clamps a tiny budget and preserves exact abort fallback" do
+    harness = start_own_rollout_drain_harness()
+    deadline = harness.deadline
+    owner_key = owner_key()
+    owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+    owner_ref = Process.monitor(owner)
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain(
+          [
+            name: harness.name,
+            timeout_ms: 25,
+            deadline_margin_ms: 20,
+            deadline_floor_ms: 10
+          ] ++ deadline_options(harness.deadline)
+        )
+      end)
+
+    assert_receive {:rollout_drain_begin_wait, ^owner_key, 1}
+    assert_receive {:rollout_drain_deadline_wait, ^deadline, 10}
+    assert :ok = VirtualDeadline.advance(harness.deadline, 10)
+
+    assert_receive {:rollout_drain_owner_stopped, ^owner_key, :aborted, 1}
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+
+    assert %{
+             result: :ok,
+             owners_seen: 1,
+             owners_drained: 1,
+             owners_failed: 0,
+             turns_completed: 0,
+             turns_aborted: 1,
+             timeout_ms: 25
+           } = Task.await(drain_task, @await_timeout_ms)
+  end
+
+  @tag :rollout_drain_t4
+  test "T4 joined shutdown drains share one active-turn wait and one abort decision" do
+    harness = start_own_rollout_drain_harness()
+    deadline = harness.deadline
+    configure_rollout_drain_server(harness.name)
+    System.put_env("CODEX_POOLER_WEBSOCKET_DRAIN_TIMEOUT_MS", "240")
+
+    owner_key = owner_key()
+    owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+
+    first_task = Task.async(fn -> RolloutDrain.drain_for_shutdown() end)
+    assert_receive {:rollout_drain_begin_wait, ^owner_key, 1}
+    assert_receive {:rollout_drain_deadline_wait, ^deadline, wait_ms}
+
+    second_task = Task.async(fn -> RolloutDrain.drain_for_shutdown() end)
+    assert :ok = await_active_drain_waiters(harness.name, 2)
+
+    assert :ok = WaitingOwner.complete_turn(owner)
+    assert_receive {:rollout_drain_terminal_delivered, ^owner_key}
+    assert :ok = VirtualDeadline.advance(harness.deadline, wait_ms)
+    assert_receive {:rollout_drain_owner_stopped, ^owner_key, :completed, 1}
+    refute_received {:rollout_drain_owner_stopped, ^owner_key, _outcome, 2}
+
+    first_summary = Task.await(first_task, @await_timeout_ms)
+    assert Task.await(second_task, @await_timeout_ms) == first_summary
+    assert first_summary.turns_completed == 1
+    assert first_summary.turns_aborted == 0
+  end
+
+  @tag :rollout_drain_t5
+  test "T5 client disconnect wins during rollout wait without blocking socket cleanup" do
+    harness = start_own_rollout_drain_harness()
+    owner_key = owner_key()
+    owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+    owner_ref = Process.monitor(owner)
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    assert_receive {:rollout_drain_begin_wait, ^owner_key, 1}
+    assert :ok = WebsocketOwnerSession.drain_owner(owner)
+    assert_receive {:rollout_drain_owner_stopped, ^owner_key, :aborted, 1}
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
+
+    assert %{owners_failed: 1, turns_completed: 0} = Task.await(drain_task, @await_timeout_ms)
+    refute_received {:rollout_drain_owner_stopped, ^owner_key, _outcome, 2}
+    assert VirtualDeadline.waiter_pids(harness.deadline) == []
+  end
+
+  @tag :rollout_drain_t6
+  test "T6 owner crash during rollout wait is failed rather than completed" do
+    assert_waiting_owner_failure(:crash)
+  end
+
+  @tag :rollout_drain_t6
+  test "T6 lease loss during rollout wait is failed rather than completed" do
+    assert_waiting_owner_failure(:lease_loss)
+  end
+
+  test "tiny deadline reserves the final owner status and near-timeout drain calls" do
+    harness = start_own_rollout_drain_harness()
+    owner_key = owner_key()
+    owner = start_probe_owner!({SlowFinalStatusOwner, key: owner_key, parent: self()})
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain(
+          [
+            name: harness.name,
+            timeout_ms: 25,
+            deadline_margin_ms: 20,
+            deadline_floor_ms: 10
+          ] ++ deadline_options(harness.deadline)
+        )
+      end)
+
+    assert_receive {:rollout_drain_deadline_wait, deadline, 10}
+    assert :ok = VirtualDeadline.advance(deadline, 10)
+    assert_receive {:slow_final_owner_status_started, ^owner_key}
+    Process.send_after(owner, {:release_slow_final_owner_status, owner_key}, 10)
+    assert_receive {:slow_final_owner_drain_started, ^owner_key}, @detection_timeout_ms
+    Process.send_after(owner, {:release_slow_final_owner_drain, owner_key}, 80)
+
+    assert %{
+             result: :ok,
+             owners_drained: 1,
+             owners_failed: 0,
+             turns_completed: 1,
+             turns_aborted: 0
+           } = Task.await(drain_task, 11_000)
+  end
+
+  @tag :rollout_drain_cleanup_budget
+  @tag slow: "proves the real post-deadline owner shutdown budget"
+  test "harness budget leaves room for a normal post-deadline owner shutdown" do
+    harness = start_own_rollout_drain_harness()
+    owner_key = owner_key()
+    owner = start_probe_owner!({DrainProbeOwner, key: owner_key, parent: self()})
+    started_at = System.monotonic_time(:millisecond)
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain(
+          [
+            name: harness.name,
+            timeout_ms: 25,
+            deadline_margin_ms: 20,
+            deadline_floor_ms: 10
+          ] ++ deadline_options(harness.deadline)
+        )
+      end)
+
+    assert_receive {:rollout_drain_probe_started, ^owner_key}
+    Process.send_after(owner, {:release_rollout_drain_probe, owner_key}, 1_100)
+
+    assert %{
+             result: :ok,
+             owners_seen: 1,
+             owners_drained: 1,
+             owners_idle: 1,
+             owners_failed: 0,
+             turns_completed: 0,
+             turns_aborted: 0
+           } = Task.await(drain_task, @await_timeout_ms)
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    assert elapsed_ms >= 1_100
+    assert elapsed_ms < 2_000
+  end
+
+  # The owner task times out at floor + post-deadline budget + finish margin
+  # (10 + 100 + 500 ms here); the property is the waiter cleanup after that
+  # kill, so a small explicit budget replaces the harness default of 1_000 ms.
+  @task_timeout_owner_budget_ms 100
+  @task_timeout_min_elapsed_ms 600
+
+  test "task timeout leaves no hung deadline waiter process" do
+    harness = start_own_rollout_drain_harness()
+    owner_key = owner_key()
+    _owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+
+    started_at = System.monotonic_time(:millisecond)
+
+    summary =
+      RolloutDrain.start_drain(
+        [
+          name: harness.name,
+          timeout_ms: 25,
+          deadline_margin_ms: 20,
+          deadline_floor_ms: 10,
+          owner_post_deadline_call_budget_ms: @task_timeout_owner_budget_ms
+        ] ++ deadline_options(harness.deadline)
+      )
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+
+    assert %{
+             result: :error,
+             owners_seen: 1,
+             owners_drained: 0,
+             owners_idle: 0,
+             owners_failed: 1,
+             turns_completed: 0,
+             turns_aborted: 0,
+             timeout_ms: 25,
+             elapsed_ms: summary_elapsed_ms,
+             already_draining?: false
+           } = summary
+
+    assert summary_elapsed_ms >= @task_timeout_min_elapsed_ms
+    assert summary_elapsed_ms < 2_000
+    assert elapsed_ms >= @task_timeout_min_elapsed_ms
+    assert elapsed_ms < 2_000
+    assert VirtualDeadline.waiter_pids(harness.deadline) == []
+  end
+
+  # An owner that receives the drain's call and never answers it holds
+  # `WebsocketOwnerSession`'s compile-time owner call timeout, five seconds, which no runner
+  # setting shortens. Only the drain's own owner-task budget bounds it: floor + post-deadline
+  # budget + finish margin, 10 + 100 + 500 ms here. Both arms therefore assert an elapsed time
+  # below that call timeout, which is what a drain waiting for the owner would spend.
+  @unresponsive_owner_budget_ms 100
+  @unresponsive_owner_min_elapsed_ms 600
+  @unresponsive_owner_max_elapsed_ms 2_000
+
+  test "an owner that never answers owner_status fails within the drain's own budget" do
+    %{drain: drain, key: owner_key, owner: owner, ref: owner_ref} =
+      start_unresponsive_owner_drain!("status", answer_status?: false)
+
+    {summary, elapsed_ms} = drain_unresponsive!(drain)
+
+    assert %{
+             result: :error,
+             owners_seen: 1,
+             owners_drained: 0,
+             owners_idle: 0,
+             owners_failed: 1,
+             turns_completed: 0,
+             turns_aborted: 0
+           } = summary
+
+    assert_received {:unresponsive_owner_begin_drain, ^owner_key}
+    assert_received {:unresponsive_owner_call, ^owner_key, :owner_status, :unanswered}
+    refute_received {:unresponsive_owner_call, ^owner_key, :drain, _outcome}
+
+    assert_unresponsive_owner_budget(elapsed_ms)
+    assert_unresponsive_owner_survived(owner, owner_ref, drain)
+  end
+
+  test "an owner that answers owner_status and never drains fails within the drain's own budget" do
+    %{drain: drain, key: owner_key, owner: owner, ref: owner_ref} =
+      start_unresponsive_owner_drain!("drain", answer_status?: true)
+
+    {summary, elapsed_ms} = drain_unresponsive!(drain)
+
+    assert %{
+             result: :error,
+             owners_seen: 1,
+             owners_drained: 0,
+             owners_idle: 0,
+             owners_failed: 1,
+             turns_completed: 0,
+             turns_aborted: 0
+           } = summary
+
+    assert_received {:unresponsive_owner_begin_drain, ^owner_key}
+    assert_received {:unresponsive_owner_call, ^owner_key, :owner_status, :answered}
+
+    assert_received {:unresponsive_owner_call, ^owner_key, :drain, :unanswered},
+                    "the drain never reached the post-deadline drain call it must bound"
+
+    assert_unresponsive_owner_budget(elapsed_ms)
+    assert_unresponsive_owner_survived(owner, owner_ref, drain)
+  end
+
+  test "wait callback failure leaves no waiter process or stale elapsed message" do
+    parent = self()
+    drain_name = :"rollout-drain-wait-error-#{System.unique_integer([:positive])}"
+
+    # A frozen clock keeps the poll window open however long the first
+    # `owner_status` takes: on the real clock this 500 ms drain gets the 10 ms
+    # floor, and an owner answering later than that aborts the turn before the
+    # wait under test is ever scheduled.
+    deadline = %{
+      now_ms: fn -> 0 end,
+      schedule_wait: fn _recipient, wait_token, _wait_ms ->
+        send(parent, {:rollout_drain_wait_callback_started, wait_token})
+        raise "synthetic wait callback failure"
+      end,
+      cancel_wait: fn _wait_ref, _wait_token -> :ok end
+    }
+
+    start_isolated_rollout_drain!(drain_name, deadline: deadline)
+
+    owner_key = owner_key()
+    _owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+
+    assert %{owners_failed: 1, owners_drained: 0} =
+             RolloutDrain.start_drain(name: drain_name, timeout_ms: 500, deadline: deadline)
+
+    assert_receive {:rollout_drain_wait_callback_started, wait_token}
+    refute_received {:rollout_drain_wait_elapsed, ^wait_token}
+  end
+
+  defp assert_waiting_owner_failure(failure) do
+    harness = start_own_rollout_drain_harness()
+    owner_key = owner_key()
+    owner = start_probe_owner!({WaitingOwner, key: owner_key, parent: self()})
+    owner_ref = Process.monitor(owner)
+
+    drain_task =
+      Task.async(fn ->
+        RolloutDrain.start_drain([name: harness.name, timeout_ms: 500] ++ deadline_options(harness.deadline))
+      end)
+
+    assert_receive {:rollout_drain_begin_wait, ^owner_key, 1}
+
+    expected_reason =
+      case failure do
+        :crash ->
+          Process.exit(owner, :kill)
+          :killed
+
+        :lease_loss ->
+          assert :ok = WaitingOwner.lose_lease(owner)
+          assert_receive {:rollout_drain_lease_lost, ^owner_key}
+          {:shutdown, :stale_owner}
+      end
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, ^expected_reason}
+
+    assert %{
+             owners_failed: 1,
+             turns_completed: 0,
+             turns_aborted: 0
+           } = Task.await(drain_task, @await_timeout_ms)
+  end
+
+  defp await_restarted_coordinator(name, old_pid) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != old_pid ->
+        pid
+
+      _not_restarted ->
+        :erlang.yield()
+        await_restarted_coordinator(name, old_pid)
+    end
+  end
+
+  defp start_unresponsive_owner_drain!(label, opts) do
+    drain_name = :"rollout-drain-unresponsive-#{label}-#{System.unique_integer([:positive])}"
+
+    start_isolated_rollout_drain!(drain_name,
+      owner_post_deadline_call_budget_ms: @unresponsive_owner_budget_ms
+    )
+
+    key = owner_key()
+    owner = start_probe_owner!({UnresponsiveOwner, [key: key, parent: self()] ++ opts})
+
+    %{drain: drain_name, key: key, owner: owner, ref: Process.monitor(owner)}
+  end
+
+  defp drain_unresponsive!(drain_name) do
+    started_at = System.monotonic_time(:millisecond)
+
+    summary =
+      RolloutDrain.start_drain(
+        name: drain_name,
+        timeout_ms: 25,
+        deadline_margin_ms: 20,
+        deadline_floor_ms: 10,
+        owner_post_deadline_call_budget_ms: @unresponsive_owner_budget_ms
+      )
+
+    {summary, System.monotonic_time(:millisecond) - started_at}
+  end
+
+  defp assert_unresponsive_owner_budget(elapsed_ms) do
+    owner_call_timeout_ms = WebsocketOwnerContract.default_owner_call_timeout_ms()
+
+    assert elapsed_ms >= @unresponsive_owner_min_elapsed_ms,
+           "the drain returned in #{elapsed_ms} ms, before its own owner task budget"
+
+    assert elapsed_ms < @unresponsive_owner_max_elapsed_ms,
+           "the drain spent #{elapsed_ms} ms on an owner that never answers; its own owner task " <>
+             "budget is #{@unresponsive_owner_min_elapsed_ms} ms and waiting for the owner would " <>
+             "cost the #{owner_call_timeout_ms} ms owner call timeout"
+
+    assert @unresponsive_owner_max_elapsed_ms < owner_call_timeout_ms,
+           "the ceiling must stay below the owner call timeout, or it cannot tell a drain bounded " <>
+             "by its own budget from one that waited for the owner"
+  end
+
+  defp assert_unresponsive_owner_survived(owner, owner_ref, drain_name) do
+    refute_received {:DOWN, ^owner_ref, :process, ^owner, _reason}
+    assert Process.alive?(owner)
+    assert is_pid(GenServer.whereis(drain_name))
+  end
+
+  defp capture_info_log(fun) when is_function(fun, 0) do
+    previous_level = Logger.level()
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+    Logger.configure(level: :info)
+
+    try do
+      capture_log([level: :info], fun)
+    after
+      Logger.configure(level: previous_level)
+    end
+  end
+
+  defp start_isolated_rollout_drain!(drain_name, opts) do
+    activity_registry = :"#{drain_name}-activity"
+    stream_registry = :"#{drain_name}-streams"
+    start_supervised!({ActivityRegistry, name: activity_registry})
+    start_supervised!({DeferredStreamRegistry, name: stream_registry})
+
+    {RolloutDrain,
+     [name: drain_name, activity_registry: activity_registry, stream_registry: stream_registry] ++
+       Keyword.put_new(opts, :owner_registry, own_owner_registry())}
+    |> Supervisor.child_spec(id: {RolloutDrain, drain_name})
+    |> start_supervised!()
+  end
+
+  # The owner registry is test-supervised and already stopped when `on_exit` runs; an owner that
+  # registered there survives it, so it is stopped by pid.
+  defp stop_owner_pid(owner) do
+    owner_ref = Process.monitor(owner)
+
+    try do
+      GenServer.stop(owner, :normal, @detection_timeout_ms)
+    catch
+      :exit, _reason -> :ok
+    end
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, _reason}, @detection_timeout_ms
+  end
+
+  defp start_probe_owner!({module, opts}) do
+    start_supervised!({module, Keyword.put(opts, :registry, own_owner_registry())})
+  end
+
+  defp start_own_rollout_drain_harness do
+    start_rollout_drain_harness(self(), owner_registry: own_owner_registry())
+  end
+
+  # Set by `setup` in the test process, which is the process that runs every test body here.
+  defp own_owner_registry do
+    case Process.get(@owner_registry_key) do
+      registry when is_atom(registry) and not is_nil(registry) -> registry
+      nil -> raise "the owner registry is started by this module's setup"
+    end
   end
 end

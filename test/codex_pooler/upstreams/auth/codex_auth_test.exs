@@ -2,6 +2,8 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
   use CodexPooler.DataCase, async: false
 
   alias CodexPooler.FakeOpenAIAuthProvider
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.UpstreamConnPoolTelemetry
   alias CodexPooler.Upstreams.Auth.CodexAuth
 
   @browser_redirect_uri "http://localhost:1455/auth/callback"
@@ -107,8 +109,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
              }}
         })
 
-      assert {:error,
-              %{code: :codex_oauth_exchange_failed, message: message, status: 502} = error} =
+      assert {:error, %{code: :codex_oauth_exchange_failed, message: message, status: 502} = error} =
                CodexAuth.exchange_authorization_code(
                  "authorization-code-example",
                  "code-verifier-example"
@@ -117,6 +118,105 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
       assert message == "Codex token exchange failed"
       refute inspect(error) =~ raw_provider_value
       assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "authorization code exchange preserves raw lifetime terms and a UTC receipt after a valid response" do
+      for expires_in <- [3600, "3600", "opaque-lifetime", nil, []] do
+        provider =
+          start_provider!(%{
+            "/oauth/token" =>
+              {200,
+               %{
+                 "access_token" => "opaque-access-token",
+                 "id_token" => "opaque-id-token",
+                 "refresh_token" => nil,
+                 "expires_in" => expires_in
+               }}
+          })
+
+        assert {:ok,
+                %{
+                  access_token: "opaque-access-token",
+                  id_token: "opaque-id-token",
+                  refresh_token: nil,
+                  expires_in: ^expires_in,
+                  received_at: %DateTime{time_zone: "Etc/UTC", utc_offset: 0, std_offset: 0}
+                }} =
+                 CodexAuth.exchange_authorization_code(
+                   "authorization-code-example",
+                   "code-verifier-example"
+                 )
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+
+    test "authorization code exchange rejects malformed 2xx token fields without a partial result" do
+      valid = %{
+        "access_token" => "opaque-access-token",
+        "id_token" => "opaque-id-token",
+        "refresh_token" => "rotated-refresh-token"
+      }
+
+      malformed_bodies =
+        Enum.map(
+          [
+            {"access_token", ""},
+            {"access_token", " \t "},
+            {"access_token", nil},
+            {"access_token", []},
+            {"access_token", 42},
+            {"id_token", ""},
+            {"id_token", " \t "},
+            {"id_token", nil},
+            {"id_token", []},
+            {"id_token", 42},
+            {"refresh_token", ""},
+            {"refresh_token", " \t "},
+            {"refresh_token", []},
+            {"refresh_token", 42}
+          ],
+          fn {field, value} -> Map.put(valid, field, value) end
+        ) ++ [Map.delete(valid, "access_token"), Map.delete(valid, "id_token")]
+
+      for body <- malformed_bodies do
+        provider =
+          start_provider!(%{
+            "/oauth/token" => {200, body}
+          })
+
+        assert {:error,
+                %{
+                  code: :codex_oauth_exchange_failed,
+                  message: "Codex token exchange failed",
+                  status: 502
+                }} =
+                 CodexAuth.exchange_authorization_code(
+                   "authorization-code-example",
+                   "code-verifier-example"
+                 )
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+
+    test "authorization code exchange rejects malformed 2xx response bodies" do
+      for body <- [nil, [], %{}] do
+        provider = start_provider!(%{"/oauth/token" => {200, body}})
+
+        assert {:error,
+                %{
+                  code: :codex_oauth_exchange_failed,
+                  message: "Codex token exchange failed",
+                  status: 502
+                }} =
+                 CodexAuth.exchange_authorization_code(
+                   "authorization-code-example",
+                   "code-verifier-example"
+                 )
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
     end
 
     test "invalid authorization code verifier is rejected before provider I/O" do
@@ -324,14 +424,106 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
 
       assert [_request] = FakeOpenAIAuthProvider.requests(slow_down_provider)
     end
+
+    test "nested device-code pending responses retain the configured poll interval" do
+      raw_provider_value = "raw-nested-device-error-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/api/accounts/deviceauth/token" =>
+            {403,
+             %{
+               "error" => %{
+                 "message" => raw_provider_value,
+                 "type" => "invalid_request_error",
+                 "code" => "deviceauth_authorization_pending"
+               }
+             }}
+        })
+
+      assert {:error,
+              %{
+                code: :codex_device_authorization_pending,
+                message: "Codex device authorization is still pending",
+                retry_after_seconds: 7,
+                status: 200
+              } = error} =
+               CodexAuth.poll_device_authorization(%{
+                 "device_auth_id" => "device-auth-nested-pending",
+                 "user_code" => "NESTED",
+                 "poll_interval_seconds" => 7
+               })
+
+      refute inspect(error) =~ raw_provider_value
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "404 device-code responses retain the configured poll interval" do
+      raw_provider_value = "raw-not-found-device-error-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/api/accounts/deviceauth/token" => {404, %{"error" => %{"message" => raw_provider_value}}}
+        })
+
+      assert {:error,
+              %{
+                code: :codex_device_authorization_pending,
+                message: "Codex device authorization is still pending",
+                retry_after_seconds: 9,
+                status: 200
+              } = error} =
+               CodexAuth.poll_device_authorization(%{
+                 "device_auth_id" => "device-auth-not-found-pending",
+                 "user_code" => "NOT-FOUND",
+                 "poll_interval_seconds" => 9
+               })
+
+      refute inspect(error) =~ raw_provider_value
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
   end
 
   describe "refresh-token OAuth protocol" do
+    test "device-code, token exchange, and refresh POSTs carry the upstream connection idle bound from settings" do
+      provider =
+        start_provider!(%{
+          "/api/accounts/deviceauth/usercode" => {200, FakeOpenAIAuthProvider.device_code_response()},
+          "/api/accounts/deviceauth/token" => {200, FakeOpenAIAuthProvider.authorization_code_response()},
+          "/oauth/token" => {200, FakeOpenAIAuthProvider.token_response()}
+        })
+
+      UpstreamConnPoolTelemetry.put_idle_bound!(0)
+      UpstreamConnPoolTelemetry.attach!(FakeOpenAIAuthProvider.url(provider))
+
+      assert {:ok, _device_code} = CodexAuth.request_device_code()
+
+      assert {:ok, %{access_token: "access-token-example"}} =
+               CodexAuth.poll_device_authorization(%{
+                 "device_auth_id" => "device-auth-123",
+                 "user_code" => "USER-CODE",
+                 "poll_interval_seconds" => 5
+               })
+
+      assert {:ok, %{access_token: "access-token-example"}} =
+               CodexAuth.refresh_token("refresh-token-example")
+
+      assert provider |> FakeOpenAIAuthProvider.requests() |> Enum.map(&{&1.method, &1.path}) ==
+               [
+                 {"POST", "/api/accounts/deviceauth/usercode"},
+                 {"POST", "/api/accounts/deviceauth/token"},
+                 {"POST", "/oauth/token"},
+                 {"POST", "/oauth/token"}
+               ]
+
+      assert UpstreamConnPoolTelemetry.drain_events() ==
+               List.duplicate(:conn_max_idle_time_exceeded, 3)
+    end
+
     test "refresh token exchange posts the refresh grant and client id" do
       provider =
         start_provider!(%{
-          "/oauth/token" =>
-            {200, %{"access_token" => "new-access-token-example", "expires_in" => 3600}}
+          "/oauth/token" => {200, %{"access_token" => "new-access-token-example", "expires_in" => 3600}}
         })
 
       assert {:ok,
@@ -347,6 +539,419 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
       assert form["grant_type"] == "refresh_token"
       assert form["refresh_token"] == "refresh-token-example"
       assert form["client_id"] == CodexAuth.client_id()
+    end
+
+    test "refresh token exchange preserves raw lifetime terms and a UTC receipt after a valid response" do
+      for expires_in <- [3600, "3600", "opaque-lifetime", nil, []] do
+        provider =
+          start_provider!(%{
+            "/oauth/token" =>
+              {200,
+               %{
+                 "access_token" => "opaque-access-token",
+                 "refresh_token" => nil,
+                 "expires_in" => expires_in
+               }}
+          })
+
+        assert {:ok,
+                %{
+                  access_token: "opaque-access-token",
+                  refresh_token: nil,
+                  expires_in: ^expires_in,
+                  received_at: %DateTime{time_zone: "Etc/UTC", utc_offset: 0, std_offset: 0}
+                }} = CodexAuth.refresh_token("refresh-token-example")
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+
+    test "refresh token exchange rejects malformed 2xx token fields without a partial result" do
+      valid = %{
+        "access_token" => "opaque-access-token",
+        "refresh_token" => "rotated-refresh-token"
+      }
+
+      malformed_bodies =
+        Enum.map(
+          [
+            {"access_token", ""},
+            {"access_token", " \t "},
+            {"access_token", nil},
+            {"access_token", []},
+            {"access_token", 42},
+            {"refresh_token", ""},
+            {"refresh_token", " \t "},
+            {"refresh_token", []},
+            {"refresh_token", 42}
+          ],
+          fn {field, value} -> Map.put(valid, field, value) end
+        ) ++ [Map.delete(valid, "access_token")]
+
+      for body <- malformed_bodies do
+        provider =
+          start_provider!(%{
+            "/oauth/token" => {200, body}
+          })
+
+        assert {:error,
+                %{
+                  code: :codex_oauth_refresh_failed,
+                  message: "Codex token refresh failed",
+                  status: 502
+                }} = CodexAuth.refresh_token("refresh-token-example")
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+
+    test "refresh token exchange rejects malformed 2xx response bodies" do
+      for body <- [nil, [], %{}] do
+        provider = start_provider!(%{"/oauth/token" => {200, body}})
+
+        assert {:error,
+                %{
+                  code: :codex_oauth_refresh_failed,
+                  message: "Codex token refresh failed",
+                  status: 502
+                }} = CodexAuth.refresh_token("refresh-token-example")
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+  end
+
+  describe "refresh rejection classification" do
+    # The same rejection table the TokenRefresh lifecycle acts on, pinned at the
+    # HTTP boundary so it is readable without a database. `:codex_refresh_token_revoked`
+    # (401) is the terminal reauthorization verdict; `:codex_oauth_refresh_failed`
+    # (502) is the retryable one.
+
+    test "an unauthorized_client rejection stays retryable regardless of its prose" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" =>
+            {400,
+             %{
+               "error" => "unauthorized_client",
+               "error_description" => "The client is not authorized to use grant type refresh_token; token exchange is invalid for this client."
+             }}
+        })
+
+      assert {:error,
+              %{
+                code: :codex_oauth_refresh_failed,
+                message: "Codex token refresh failed",
+                status: 502
+              } = error} = CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute inspect(error) =~ "unauthorized_client"
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "a request-error code echoed into its own description stays retryable" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" =>
+            {400,
+             %{
+               "error" => "invalid_request",
+               "error_description" => "invalid_request: refresh_token is a required parameter"
+             }}
+        })
+
+      assert {:error, %{code: :codex_oauth_refresh_failed, status: 502} = error} =
+               CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute inspect(error) =~ "required parameter"
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "a non-OAuth message envelope stays retryable" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" => {400, %{"message" => "Invalid request: refresh_token parameter missing"}}
+        })
+
+      assert {:error, %{code: :codex_oauth_refresh_failed, status: 502} = error} =
+               CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute inspect(error) =~ "parameter missing"
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "a nested provider envelope whose code is not allowlisted stays retryable" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" =>
+            {400,
+             %{
+               "error" => %{
+                 "message" => "Invalid refresh token provided.",
+                 "type" => "invalid_request_error",
+                 "code" => "invalid_api_key"
+               }
+             }}
+        })
+
+      assert {:error, %{code: :codex_oauth_refresh_failed, status: 502} = error} =
+               CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute inspect(error) =~ "invalid_api_key"
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    for http_status <- [400, 401, 403],
+        code <- ~w(invalid_grant revoked invalid_refresh_token token_expired refresh_token_expired refresh_token_invalidated refresh_token_reused),
+        envelope <- [:flat, :nested] do
+      test "structured #{code} at #{http_status} in #{envelope} requires reauthorization" do
+        code = unquote(code)
+        body = if unquote(envelope) == :flat, do: %{"error" => code}, else: %{"error" => %{"code" => code}}
+        provider = start_provider!(%{"/oauth/token" => {unquote(http_status), body}})
+
+        assert {:error, %{code: :codex_refresh_token_revoked, status: 401}} =
+                 CodexAuth.HTTPClient.refresh_token("refresh-token-must-not-leak")
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+
+    for http_status <- [400, 401, 403],
+        {label, body} <- [
+          {"client rejection", %{"error" => %{"code" => "invalid_client", "message" => "Invalid client for refresh token exchange"}}},
+          {"missing parameter", %{"error" => %{"code" => "missing_required_parameter", "message" => "Missing refresh_token"}}},
+          {"bare unauthorized detail", %{"detail" => "Unauthorized"}},
+          {"revocation prose", %{"error_description" => "The refresh token has been revoked"}},
+          {"nested negated prose", %{"error" => %{"message" => "The refresh token is not invalid"}}},
+          {"revocation detail", %{"detail" => "The refresh token is revoked"}}
+        ] do
+      test "#{label} at #{http_status} stays retryable without a recognized credential code" do
+        provider = start_provider!(%{"/oauth/token" => {unquote(http_status), unquote(Macro.escape(body))}})
+
+        assert {:error, %{code: :codex_oauth_refresh_failed, status: 502}} =
+                 CodexAuth.HTTPClient.refresh_token("refresh-token-must-not-leak")
+
+        assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+      end
+    end
+
+    test "keyword matches split across separate fields stay retryable" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" =>
+            {400,
+             %{
+               "error" => "invalid_grant_type",
+               "error_description" => "refresh token mismatch"
+             }}
+        })
+
+      assert {:error,
+              %{
+                code: :codex_oauth_refresh_failed,
+                message: "Codex token refresh failed",
+                status: 502
+              } = error} = CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute inspect(error) =~ "mismatch"
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "a non-JSON refresh rejection body stays retryable" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" =>
+            FakeUpstream.raw_response(
+              "<html><body>Your refresh token is invalid and has been revoked.</body></html>",
+              status: 403,
+              headers: [{"content-type", "text/html; charset=utf-8"}]
+            )
+        })
+
+      assert {:error, %{code: :codex_oauth_refresh_failed, status: 502} = error} =
+               CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute inspect(error) =~ "revoked"
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    test "a 429 refresh rejection never reaches the classifier" do
+      refresh_token = "refresh-token-must-not-leak"
+
+      provider =
+        start_provider!(%{
+          "/oauth/token" => {429, %{"error" => "invalid_grant"}}
+        })
+
+      assert {:error, %{code: :codex_oauth_refresh_failed, status: 502} = error} =
+               CodexAuth.HTTPClient.refresh_token(refresh_token)
+
+      refute inspect(error) =~ refresh_token
+      refute Map.has_key?(error, :retry_after_seconds)
+      assert [_request] = FakeOpenAIAuthProvider.requests(provider)
+    end
+
+    # findings#243. A throttled refresh is the case a fixed exponential backoff
+    # handles worst: it burns attempts against an interval the provider already
+    # stated. The classification is unchanged; only the interval is carried.
+    test "a provider-stated retry interval travels with the rejection" do
+      for {status, code} <- [{429, :codex_oauth_refresh_failed}, {503, :codex_auth_transient}] do
+        provider =
+          start_provider!(%{
+            "/oauth/token" => {:json_headers, status, %{"error" => "slow_down"}, [{"retry-after", "900"}]}
+          })
+
+        assert {:error, %{code: ^code, retry_after_seconds: seconds}} =
+                 CodexAuth.HTTPClient.refresh_token("refresh-token-must-not-leak")
+
+        assert seconds in 895..900
+
+        FakeOpenAIAuthProvider.stop(provider)
+      end
+    end
+
+    # A duplicated header is covered where it can actually be built:
+    # `Plug.Conn.put_resp_header/3` replaces, so this harness cannot emit one.
+    # `usage_poll_cooldown_test.exs` pins that case against the parser directly.
+    test "an unreadable retry interval carries nothing and changes nothing" do
+      for header <- [[], [{"retry-after", "whenever"}], [{"retry-after", "-30"}]] do
+        provider =
+          start_provider!(%{
+            "/oauth/token" => {:json_headers, 429, %{"error" => "slow_down"}, header}
+          })
+
+        assert {:error, %{code: :codex_oauth_refresh_failed} = error} =
+                 CodexAuth.HTTPClient.refresh_token("refresh-token-must-not-leak")
+
+        refute Map.has_key?(error, :retry_after_seconds), "expected #{inspect(header)} to be ignored"
+
+        FakeOpenAIAuthProvider.stop(provider)
+      end
+    end
+  end
+
+  describe "token_info/1" do
+    test "returns the sanitized invalid-token error for malformed and non-object payloads" do
+      expected =
+        {:error, %{code: :codex_id_token_invalid, message: "Codex id token is invalid"}}
+
+      assert CodexAuth.token_info("malformed") == expected
+      assert CodexAuth.token_info(jwt("scalar")) == expected
+      assert CodexAuth.token_info(jwt([%{"email" => "person@example.test"}])) == expected
+    end
+  end
+
+  describe "compute_residency/1" do
+    test "prefers and trims the namespaced claim" do
+      token =
+        jwt(%{
+          "https://api.openai.com/auth" => %{
+            "chatgpt_compute_residency" => "  region-a\t"
+          },
+          "chatgpt_compute_residency" => "region-b"
+        })
+
+      assert CodexAuth.compute_residency(token) == "region-a"
+      assert CodexAuth.compute_residency(" \t#{token}\n") == "region-a"
+    end
+
+    test "falls back to the root claim only when the namespaced claim is missing or null" do
+      root_claims = %{"chatgpt_compute_residency" => "root-region"}
+
+      assert CodexAuth.compute_residency(jwt(root_claims)) == "root-region"
+
+      assert CodexAuth.compute_residency(
+               jwt(
+                 Map.put(root_claims, "https://api.openai.com/auth", %{
+                   "chatgpt_compute_residency" => nil
+                 })
+               )
+             ) == "root-region"
+    end
+
+    test "a present non-map namespace suppresses a valid root claim" do
+      for namespace <- ["", "no_constraint", 123, [], true] do
+        token =
+          jwt(%{
+            "https://api.openai.com/auth" => namespace,
+            "chatgpt_compute_residency" => "root-region"
+          })
+
+        assert CodexAuth.compute_residency(token) == nil
+      end
+    end
+
+    test "a present invalid namespaced claim suppresses a valid root claim" do
+      for invalid <- [
+            "",
+            " \t ",
+            "no_constraint",
+            123,
+            "line\nbreak",
+            "carriage\rreturn",
+            "nul\0byte",
+            "control\bbyte",
+            "unicode-π"
+          ] do
+        token =
+          jwt(%{
+            "https://api.openai.com/auth" => %{
+              "chatgpt_compute_residency" => invalid
+            },
+            "chatgpt_compute_residency" => "root-region"
+          })
+
+        assert CodexAuth.compute_residency(token) == nil
+      end
+    end
+
+    test "accepts the full Mint header-value character set without a fixed length limit" do
+      long_value = String.duplicate("visible-value ", 500)
+      value = "!~\tinterior space " <> long_value <> "z"
+
+      assert CodexAuth.compute_residency(
+               jwt(%{
+                 "https://api.openai.com/auth" => %{
+                   "chatgpt_compute_residency" => " \t#{value}\t "
+                 }
+               })
+             ) == value
+    end
+
+    test "rejects malformed and non-object JWT payloads" do
+      assert CodexAuth.compute_residency("malformed") == nil
+      assert CodexAuth.compute_residency("e30.invalid.signature") == nil
+      assert CodexAuth.compute_residency(jwt("scalar")) == nil
+      assert CodexAuth.compute_residency(jwt([%{"chatgpt_compute_residency" => "region"}])) == nil
+    end
+
+    test "ignores unrelated data residency claims" do
+      assert CodexAuth.compute_residency(
+               jwt(%{
+                 "https://api.openai.com/auth" => %{
+                   "chatgpt_data_residency" => "data-region"
+                 },
+                 "chatgpt_data_residency" => "root-data-region"
+               })
+             ) == nil
     end
   end
 
@@ -379,5 +984,9 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
     on_exit(fn -> FakeOpenAIAuthProvider.stop(provider) end)
     Application.put_env(:codex_pooler, CodexAuth, issuer: FakeOpenAIAuthProvider.url(provider))
     provider
+  end
+
+  defp jwt(payload) do
+    "e30." <> Base.url_encode64(CodexPooler.JSON.encode!(payload), padding: false) <> ".signature"
   end
 end

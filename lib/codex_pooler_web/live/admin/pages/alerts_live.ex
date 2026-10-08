@@ -9,7 +9,9 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
   alias CodexPoolerWeb.Admin.AlertRuleForm
   alias CodexPoolerWeb.Admin.AlertsPageComponents
   alias CodexPoolerWeb.Admin.AlertsPageComponents.{Channels, Incidents, Rules}
+  alias CodexPoolerWeb.Admin.AlertsPageComponents.Dialogs, as: AlertsDialogs
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.NotificationCenterHooks
 
   @default_tab "rules"
   @tabs ~w(rules channels incidents)
@@ -36,6 +38,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
       |> assign_alert_state()
       |> reset_rule_form()
       |> reset_channel_form()
+      |> NotificationCenterHooks.follow_viewer_visibility()
 
     {:ok, socket}
   end
@@ -109,6 +112,53 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
   def handle_event("confirm_delete_channel", params, socket),
     do: {:noreply, confirm_delete_channel(socket, params)}
 
+  # A role change or a Pool granted or revoked changes which Pools, rules,
+  # channels and incidents this page may show. It re-reads them at once and
+  # closes a rule or channel editor or delete dialog on one the viewer can no
+  # longer see; a new rule's form moves off a Pool the viewer lost
+  # (findings#206 row 206-410). An incident filter on a Pool, rule or channel
+  # the viewer lost leaves the address bar too, so the URL keeps naming what the
+  # page shows instead of an error for a filter the operator did not change
+  # (206-416).
+  @impl true
+  def handle_info({NotificationCenterHooks, :viewer_visibility_changed}, socket) do
+    previous_filter_values = socket.assigns.incident_filter_values
+    socket = socket |> assign_alert_state() |> drop_lost_incident_filters(previous_filter_values)
+    %{rules: rules, channels: channels} = socket.assigns
+    lost_rule? = &(match?(%AlertRule{}, &1) and is_nil(find_visible_rule(rules, &1.id)))
+    lost_channel? = &(match?(%{id: _id}, &1) and is_nil(find_visible_channel(channels, &1.id)))
+
+    {socket, closed?} =
+      {socket, false}
+      |> close_if(lost_rule?.(socket.assigns.editing_rule), &cancel_rule_form/1)
+      |> close_if(lost_rule?.(socket.assigns.deleting_rule), &cancel_delete_rule/1)
+      |> close_if(lost_channel?.(socket.assigns.editing_channel), &cancel_channel_form/1)
+      |> close_if(lost_channel?.(socket.assigns.deleting_channel), &cancel_delete_channel/1)
+
+    socket = if new_rule_on_lost_pool?(socket), do: reset_rule_form(socket), else: socket
+    {:noreply, if(closed?, do: put_flash(socket, :info, "Your Pool access changed"), else: socket)}
+  end
+
+  defp close_if({socket, _closed?}, true, close), do: {close.(socket), true}
+  defp close_if({socket, closed?}, false, _close), do: {socket, closed?}
+
+  # The filter values hold only what the page accepted, so a value set before
+  # the change and blank after it names something the viewer can no longer see.
+  defp drop_lost_incident_filters(socket, previous_filter_values) do
+    lost = for {key, value} <- previous_filter_values, value != "", socket.assigns.incident_filter_values[key] == "", do: key
+
+    if lost == [] do
+      socket
+    else
+      push_patch(socket, to: ~p"/admin/alerts?#{Map.drop(socket.assigns.current_params, lost)}")
+    end
+  end
+
+  defp new_rule_on_lost_pool?(%{assigns: %{rule_form_mode: :create, rule_form: form, pool_lookup: pool_lookup}}),
+    do: not Map.has_key?(pool_lookup, form.params["pool_id"])
+
+  defp new_rule_on_lost_pool?(_socket), do: false
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -117,12 +167,13 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
       current_scope={@current_scope}
       active_nav={:alerts}
       alert_notification_center={@alert_notification_center}
+      openai_status_aggregate={@openai_status_aggregate}
     >
       <section id="admin-alerts-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="alerts-page-header"
           title="Alerts"
-          description="Configure Pool-scoped alert rules and safe delivery channels for serving risk, quota evidence, and upstream account state."
+          description="Rules that watch Pools and upstream accounts, delivering incidents by email or signed webhook."
         />
 
         <section id="alerts-workspace" class="grid gap-4">
@@ -160,111 +211,12 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
             incident_page_size={@incident_page_size}
           />
         </section>
-        <dialog :if={@deleting_rule} id="alert-rule-delete-dialog" class="modal" open>
-          <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-            <div class="border-b border-base-300 px-6 py-5">
-              <p class="text-sm font-semibold uppercase tracking-wide text-error">Delete rule</p>
-              <h2 class="mt-1 text-2xl font-bold text-base-content">Delete alert rule</h2>
-              <p class="mt-2 text-sm leading-6 text-base-content/70">
-                This removes the rule definition. Existing incident records stay available to later alert workflows.
-              </p>
-            </div>
+        <AlertsDialogs.rule_delete_dialog rule={@deleting_rule} form={@rule_delete_form} />
 
-            <.form
-              id="alert-rule-delete-form"
-              for={@rule_delete_form}
-              phx-submit="confirm_delete_rule"
-              autocomplete="off"
-              class="grid gap-5 p-6"
-            >
-              <.input field={@rule_delete_form[:id]} type="hidden" />
-              <div class="alert alert-warning items-start">
-                <.icon name="hero-exclamation-triangle" class="size-5" />
-                <div class="grid gap-1">
-                  <p class="font-semibold">This deletes {@deleting_rule.display_name}.</p>
-                  <p class="text-sm">
-                    Create it again later if this condition should be evaluated again.
-                  </p>
-                </div>
-              </div>
-            </.form>
-
-            <AdminComponents.dialog_footer id="alert-rule-delete-dialog-footer">
-              <:actions>
-                <AdminComponents.action_button
-                  id="alert-rule-delete-cancel"
-                  label="Cancel"
-                  variant={:ghost}
-                  phx-click="cancel_delete_rule"
-                />
-                <AdminComponents.action_button
-                  id="alert-rule-delete-submit"
-                  icon="hero-trash"
-                  label="Delete rule"
-                  type="submit"
-                  form="alert-rule-delete-form"
-                  variant={:danger}
-                />
-              </:actions>
-            </AdminComponents.dialog_footer>
-          </div>
-          <form method="dialog" class="modal-backdrop">
-            <button type="button" phx-click="cancel_delete_rule">close</button>
-          </form>
-        </dialog>
-
-        <dialog :if={@deleting_channel} id="alert-channel-delete-dialog" class="modal" open>
-          <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-            <div class="border-b border-base-300 px-6 py-5">
-              <p class="text-sm font-semibold uppercase tracking-wide text-error">Delete channel</p>
-              <h2 class="mt-1 text-2xl font-bold text-base-content">Delete alert channel</h2>
-              <p class="mt-2 text-sm leading-6 text-base-content/70">
-                This removes the delivery target. Existing delivery attempts stay available to later alert workflows.
-              </p>
-            </div>
-
-            <.form
-              id="alert-channel-delete-form"
-              for={@channel_delete_form}
-              phx-submit="confirm_delete_channel"
-              autocomplete="off"
-              class="grid gap-5 p-6"
-            >
-              <.input field={@channel_delete_form[:id]} type="hidden" />
-              <div class="alert alert-warning items-start">
-                <.icon name="hero-exclamation-triangle" class="size-5" />
-                <div class="grid gap-1">
-                  <p class="font-semibold">This deletes {@deleting_channel.display_name}.</p>
-                  <p class="text-sm">
-                    Rules using this channel will no longer deliver to it.
-                  </p>
-                </div>
-              </div>
-            </.form>
-
-            <AdminComponents.dialog_footer id="alert-channel-delete-dialog-footer">
-              <:actions>
-                <AdminComponents.action_button
-                  id="alert-channel-delete-cancel"
-                  label="Cancel"
-                  variant={:ghost}
-                  phx-click="cancel_delete_channel"
-                />
-                <AdminComponents.action_button
-                  id="alert-channel-delete-submit"
-                  icon="hero-trash"
-                  label="Delete channel"
-                  type="submit"
-                  form="alert-channel-delete-form"
-                  variant={:danger}
-                />
-              </:actions>
-            </AdminComponents.dialog_footer>
-          </div>
-          <form method="dialog" class="modal-backdrop">
-            <button type="button" phx-click="cancel_delete_channel">close</button>
-          </form>
-        </dialog>
+        <AlertsDialogs.channel_delete_dialog
+          channel={@deleting_channel}
+          form={@channel_delete_form}
+        />
       </section>
     </AdminComponents.admin_shell>
     """

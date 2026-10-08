@@ -9,6 +9,7 @@ defmodule CodexPooler.Audit do
   alias CodexPooler.Accounts.User
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Pools
+  alias CodexPooler.Pools.ModelServingOverride
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
 
@@ -32,24 +33,32 @@ defmodule CodexPooler.Audit do
     {"Pool updated", "pool.update"},
     {"Pool status changed", "pool.status_update"},
     {"Pool routing updated", "pool.routing_update"},
+    {"Pool model serving modes updated", "pool.model_serving_modes_update"},
+    {"Pool upstream account assigned", "pool.assignment_add"},
+    {"Pool upstream account unassigned", "pool.assignment_remove"},
+    {"Pool deletion requested", "pool.delete_requested"},
     {"Pool deleted", "pool.delete"},
     {"Pool invite created", "invite.create"},
     {"Pool invite revoked", "invite.revoke"},
     {"Upstream account imported", "upstream_account.import"},
-    {"Upstream account assigned to Pool", "upstream_account.assign_pool"},
+    {"Upstream account linked via browser OAuth", "upstream_account.oauth_browser_link"},
+    {"Upstream account linked via device code", "upstream_account.oauth_device_link"},
+    {"Upstream account renamed", "upstream_account.rename"},
     {"Upstream account paused", "upstream_account.pause"},
     {"Upstream account reactivated", "upstream_account.reactivate"},
     {"Upstream account token refresh queued", "upstream_account.refresh_enqueue"},
+    {"Upstream account deletion requested", "upstream_account.delete_requested"},
     {"Upstream account deleted", "upstream_account.delete"},
     {"Upstream account saved reset policy updated", "upstream_account.saved_reset_policy_update"},
-    {"Upstream account saved reset redemption queued",
-     "upstream_account.saved_reset_redeem_enqueue"},
+    {"Upstream account provider credits policy updated", "upstream_account.provider_credits_policy_update"},
+    {"Upstream account saved reset redemption queued", "upstream_account.saved_reset_redeem_enqueue"},
     {"API key created", "api_key.create"},
     {"API key updated", "api_key.update"},
     {"API key paused", "api_key.pause"},
     {"API key resumed", "api_key.resume"},
     {"API key revoked", "api_key.revoke"},
     {"API key rotated", "api_key.rotate"},
+    {"API key deletion requested", "api_key.delete_requested"},
     {"API key deleted", "api_key.delete"},
     {"Operator MCP enabled", "mcp.operator_enable"},
     {"Operator MCP disabled", "mcp.operator_disable"},
@@ -76,6 +85,12 @@ defmodule CodexPooler.Audit do
 
   @type action :: String.t()
   @type action_option :: {String.t(), action()}
+  @type model_serving_mode_transition :: %{
+          required(:exposed_model_id) => String.t(),
+          required(:from_mode) => String.t(),
+          required(:to_mode) => String.t(),
+          optional(atom() | String.t()) => term()
+        }
   @type audit_attrs :: %{optional(atom()) => term()}
   @type audit_filters :: Enumerable.t()
   @type list_opts :: [
@@ -84,6 +99,7 @@ defmodule CodexPooler.Audit do
           | {:filters, audit_filters()}
           | {:visible_pool_ids, [Ecto.UUID.t()]}
           | {:include_global_events, boolean()}
+          | {:count_limit, non_neg_integer()}
         ]
   @type audit_result ::
           {:ok, AuditEvent.t()}
@@ -110,6 +126,7 @@ defmodule CodexPooler.Audit do
   @type audit_page :: %{
           items: [audit_event_row()],
           total: non_neg_integer(),
+          total_exact?: boolean(),
           limit: pos_integer(),
           offset: non_neg_integer()
         }
@@ -131,6 +148,28 @@ defmodule CodexPooler.Audit do
   @spec record_user_event(User.t(), audit_attrs()) :: audit_result()
   def record_user_event(%User{} = user, attrs) when is_map(attrs) do
     record_event(Map.merge(attrs, %{actor_type: "user", actor_user_id: user.id}))
+  end
+
+  @spec record_model_serving_modes_update(
+          User.t(),
+          Pool.t(),
+          [model_serving_mode_transition()]
+        ) :: audit_result() | :noop
+  def record_model_serving_modes_update(%User{} = user, %Pool{} = pool, transitions)
+      when is_list(transitions) do
+    case model_serving_mode_transition_details(transitions) do
+      %{changed_count: 0} ->
+        :noop
+
+      details ->
+        record_user_event(user, %{
+          pool_id: pool.id,
+          action: "pool.model_serving_modes_update",
+          target_type: "pool",
+          target_id: pool.id,
+          details: details
+        })
+    end
   end
 
   @spec record_event(audit_attrs()) :: audit_result()
@@ -156,6 +195,42 @@ defmodule CodexPooler.Audit do
     }
     |> Repo.insert()
   end
+
+  defp model_serving_mode_transition_details(transitions) do
+    safe_transitions =
+      transitions
+      |> Enum.flat_map(&safe_model_serving_mode_transition/1)
+      |> Enum.sort_by(& &1.exposed_model_id)
+
+    %{
+      changed_count: length(safe_transitions),
+      transitions: Enum.take(safe_transitions, 50)
+    }
+  end
+
+  defp safe_model_serving_mode_transition(transition) when is_map(transition) do
+    exposed_model_id = transition_attr(transition, :exposed_model_id)
+    from_mode = transition_attr(transition, :from_mode)
+    to_mode = transition_attr(transition, :to_mode)
+
+    if safe_canonical_model_id?(exposed_model_id) and from_mode in ~w(auto lite full) and
+         to_mode in ~w(auto lite full) and from_mode != to_mode do
+      [%{exposed_model_id: exposed_model_id, from_mode: from_mode, to_mode: to_mode}]
+    else
+      []
+    end
+  end
+
+  defp safe_model_serving_mode_transition(_transition), do: []
+
+  defp safe_canonical_model_id?(value) when is_binary(value) do
+    ModelServingOverride.canonical_exposed_model_id(value) == value
+  end
+
+  defp safe_canonical_model_id?(_value), do: false
+
+  defp transition_attr(transition, key),
+    do: Map.get(transition, key, Map.get(transition, Atom.to_string(key)))
 
   @spec list_events(Pool.t() | Ecto.UUID.t() | nil, list_opts()) :: audit_page()
   def list_events(pool_or_id, opts \\ []) do
@@ -195,7 +270,7 @@ defmodule CodexPooler.Audit do
       |> maybe_filter_pool(pool_id)
       |> apply_event_filters(filters)
 
-    total = Repo.aggregate(query, :count, :id)
+    {total, total_exact?} = count_events(query, Keyword.get(opts, :count_limit))
 
     items =
       Repo.all(
@@ -226,8 +301,25 @@ defmodule CodexPooler.Audit do
         }
       end)
 
-    %{items: items, total: total, limit: limit, offset: offset}
+    %{items: items, total: total, total_exact?: total_exact?, limit: limit, offset: offset}
   end
+
+  # The exact total reads every matching event, and `audit_events` has no
+  # retention, so the all-Pools count grows with the whole history (findings#206
+  # row 206-414). With a `count_limit` the count stops one row past the limit:
+  # the reader learns either the exact total or that more than `count_limit`
+  # events match (`total_exact?: false`), and never pays for more.
+  defp count_events(query, nil), do: {Repo.aggregate(query, :count, :id), true}
+
+  defp count_events(query, count_limit) when is_integer(count_limit) do
+    count_limit = max(count_limit, 0)
+    bounded = from([event, ...] in query, select: %{id: event.id}, limit: ^(count_limit + 1))
+    counted = Repo.one(from(row in subquery(bounded), select: count()))
+
+    if counted > count_limit, do: {count_limit, false}, else: {counted, true}
+  end
+
+  defp count_events(query, _count_limit), do: count_events(query, nil)
 
   defp id_for(%{id: id}), do: id
   defp id_for(id) when is_binary(id), do: id
@@ -261,6 +353,8 @@ defmodule CodexPooler.Audit do
     |> maybe_filter_request(Map.get(filters, :request))
     |> maybe_filter_date_from(Map.get(filters, :date_from))
     |> maybe_filter_date_to(Map.get(filters, :date_to))
+    |> maybe_filter_at_or_before(Map.get(filters, :at_or_before))
+    |> maybe_filter_after(Map.get(filters, :after))
   end
 
   defp maybe_filter_id(query, nil), do: query
@@ -282,7 +376,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_actor(query, nil), do: query
 
   defp maybe_filter_actor(query, actor) do
-    pattern = "%#{actor}%"
+    pattern = CodexPooler.SearchPattern.contains(actor)
 
     from([event, user, _pool] in query,
       where:
@@ -301,7 +395,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_target(query, nil), do: query
 
   defp maybe_filter_target(query, target) do
-    pattern = "%#{target}%"
+    pattern = CodexPooler.SearchPattern.contains(target)
 
     from([event, ...] in query,
       where:
@@ -313,7 +407,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_request(query, nil), do: query
 
   defp maybe_filter_request(query, request) do
-    pattern = "%#{request}%"
+    pattern = CodexPooler.SearchPattern.contains(request)
 
     from([event, ...] in query,
       where:
@@ -331,6 +425,31 @@ defmodule CodexPooler.Audit do
 
   defp maybe_filter_date_to(query, date_to),
     do: from([event, ...] in query, where: event.occurred_at <= ^date_to)
+
+  # Cursor bounds in the list's own sort key, so a page keeps naming the same
+  # records while a reader walks it. A bound on occurred_at alone is not enough:
+  # events written in one transaction share it exactly and only id orders them,
+  # so `occurred_at <= t` would admit a row inserted after the cursor that sorts
+  # above it and shift every page behind.
+  defp maybe_filter_at_or_before(query, nil), do: query
+
+  defp maybe_filter_at_or_before(query, {occurred_at, id}) do
+    from([event, ...] in query,
+      where:
+        event.occurred_at < ^occurred_at or
+          (event.occurred_at == ^occurred_at and event.id <= ^id)
+    )
+  end
+
+  defp maybe_filter_after(query, nil), do: query
+
+  defp maybe_filter_after(query, {occurred_at, id}) do
+    from([event, ...] in query,
+      where:
+        event.occurred_at > ^occurred_at or
+          (event.occurred_at == ^occurred_at and event.id > ^id)
+    )
+  end
 
   defp clamp_limit(limit) when is_integer(limit) and limit > 0 and limit <= 200, do: limit
   defp clamp_limit(_limit), do: 50

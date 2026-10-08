@@ -1,13 +1,17 @@
 defmodule CodexPooler.Access.APIKeys do
   @moduledoc false
 
+  import Ecto.Query
+
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Access.DashboardSessions
   alias CodexPooler.Access.DashboardSessions.Lifecycle, as: DashboardSessionLifecycle
 
   alias CodexPooler.Access.APIKeys.{
     Assignment,
     AuditLog,
     Authentication,
+    Deletion,
     Errors,
     Material,
     Notifications,
@@ -15,10 +19,13 @@ defmodule CodexPooler.Access.APIKeys do
     PolicyPersistence,
     PolicyUpdate,
     Queries,
-    ReasoningEffortPolicy
+    ReasoningEffortPolicy,
+    RuntimeAuthorization
   }
 
+  alias CodexPooler.Accounting
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Authorization, as: PoolAuthorization
   alias CodexPooler.Pools.Pool
@@ -27,6 +34,14 @@ defmodule CodexPooler.Access.APIKeys do
   @status_active "active"
   @status_paused "paused"
   @status_revoked "revoked"
+  @binding_fields [:default_policy, "default_policy", :model_policies, "model_policies"]
+  @key_row_policy_fields [
+    :allowed_model_identifiers,
+    :enforced_model_identifier,
+    :enforced_reasoning_effort,
+    :maximum_reasoning_effort,
+    :enforced_service_tier
+  ]
   @policy_denial_precedence [
     :api_key_missing,
     :api_key_disabled,
@@ -48,9 +63,43 @@ defmodule CodexPooler.Access.APIKeys do
   @type api_key_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | access_error()}
   @type policy_result :: {:ok, map()} | {:error, atom() | access_error()}
 
+  @spec capture_runtime_authorization_epoch(APIKey.t() | Ecto.UUID.t()) ::
+          {:ok, RuntimeAuthorization.epoch()} | {:error, RuntimeAuthorization.disposition()}
+  defdelegate capture_runtime_authorization_epoch(api_key_or_id),
+    to: RuntimeAuthorization,
+    as: :capture
+
+  @spec authorize_runtime_turn(APIKey.t() | Ecto.UUID.t(), RuntimeAuthorization.epoch()) ::
+          {:ok, RuntimeAuthorization.authorization()}
+          | {:error, RuntimeAuthorization.disposition()}
+  defdelegate authorize_runtime_turn(api_key_or_id, captured_epoch),
+    to: RuntimeAuthorization,
+    as: :authorize_turn
+
+  @spec authorize_runtime_turn_for_read(
+          APIKey.t() | Ecto.UUID.t(),
+          RuntimeAuthorization.epoch()
+        ) ::
+          {:ok, RuntimeAuthorization.authorization()}
+          | {:error, RuntimeAuthorization.disposition()}
+  defdelegate authorize_runtime_turn_for_read(api_key_or_id, captured_epoch),
+    to: RuntimeAuthorization,
+    as: :authorize_turn_for_read
+
+  @spec lock_runtime_api_key_for_read(Ecto.UUID.t() | nil) :: APIKey.t() | nil
+  defdelegate lock_runtime_api_key_for_read(api_key_id),
+    to: RuntimeAuthorization,
+    as: :lock_for_read
+
+  @spec runtime_epoch_for_status_change(APIKey.t(), String.t()) ::
+          RuntimeAuthorization.epoch()
+  defdelegate runtime_epoch_for_status_change(api_key, target_status),
+    to: RuntimeAuthorization,
+    as: :epoch_for_status_change
+
   @spec resolve_reasoning_effort(
           APIKey.t(),
-          String.t() | nil,
+          String.t() | non_neg_integer() | nil,
           [String.t()] | nil,
           String.t() | nil
         ) :: ReasoningEffortPolicy.resolution()
@@ -67,7 +116,7 @@ defmodule CodexPooler.Access.APIKeys do
     to: ReasoningEffortPolicy,
     as: :project_metadata
 
-  @spec project_reasoning_effort_denial_metadata(APIKey.t(), String.t() | nil) ::
+  @spec project_reasoning_effort_denial_metadata(APIKey.t(), String.t() | non_neg_integer() | nil) ::
           ReasoningEffortPolicy.denial_metadata()
   defdelegate project_reasoning_effort_denial_metadata(api_key, requested_effort),
     to: ReasoningEffortPolicy,
@@ -164,15 +213,8 @@ defmodule CodexPooler.Access.APIKeys do
   @spec update_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t(), map()) ::
           {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
   def update_api_key(%Scope{} = scope, %APIKey{} = api_key, attrs) when is_map(attrs) do
-    with {:ok, target_pool_id} <- authorize_api_key_update(scope, api_key, attrs) do
-      update_attrs = api_key_update_attrs(attrs, target_pool_id)
-
-      api_key
-      |> update_api_key_record(update_attrs)
-      |> Notifications.notify_api_key_change("api_key_updated", api_key.pool_id)
-      |> AuditLog.audit_api_key_change(scope, "api_key.update", fn updated ->
-        AuditLog.api_key_update_audit_details(updated, api_key, attrs)
-      end)
+    with :ok <- refuse_binding_fields(attrs) do
+      do_update_api_key(scope, api_key, attrs)
     end
   end
 
@@ -184,6 +226,39 @@ defmodule CodexPooler.Access.APIKeys do
 
   def update_api_key(_scope, _api_key, _attrs),
     do: {:error, Errors.access_error(:invalid_request, "user scope is required")}
+
+  # This path writes the key row only. A caller that sends binding limits
+  # would otherwise believe it changed a limit while nothing happened, so they
+  # are refused before any lock or write (findings#206 row 206-505).
+  defp refuse_binding_fields(attrs) do
+    nested_policy = Map.get(attrs, :policy) || Map.get(attrs, "policy")
+
+    if Enum.any?(@binding_fields, &(Map.has_key?(attrs, &1) or (is_map(nested_policy) and Map.has_key?(nested_policy, &1)))) do
+      {:error, Errors.access_error(:unsupported_field, "default_policy and model_policies change bindings; use update_api_key_with_policy")}
+    else
+      :ok
+    end
+  end
+
+  defp do_update_api_key(scope, api_key, attrs) do
+    case update_api_key_transaction(scope, api_key, attrs) do
+      {:ok, {updated_api_key, previous_api_key, invalidate_dashboard_sessions?, notification}} ->
+        maybe_broadcast_dashboard_invalidation(
+          updated_api_key,
+          "api_key_updated",
+          invalidate_dashboard_sessions?
+        )
+
+        {:ok, updated_api_key}
+        |> notify_api_key_update(previous_api_key, notification)
+        |> AuditLog.audit_api_key_change(scope, "api_key.update", fn updated ->
+          AuditLog.api_key_update_audit_details(updated, previous_api_key, attrs)
+        end)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   @spec update_api_key_with_policy(
           Scope.t(),
@@ -215,15 +290,61 @@ defmodule CodexPooler.Access.APIKeys do
     end
   end
 
-  defp update_api_key_record(api_key, update_attrs) do
+  defp update_api_key_transaction(scope, api_key, attrs) do
+    Repo.transact(fn ->
+      target_status = requested_status(attrs, api_key.status)
+
+      with {:ok, transition} <-
+             RuntimeAuthorization.prepare_status_transition(api_key, target_status),
+           previous_api_key = transition.api_key,
+           {:ok, target_pool_id} <- authorize_api_key_update(scope, previous_api_key, attrs),
+           transition =
+             RuntimeAuthorization.advance_epoch_for_pool_move(transition, target_pool_id),
+           {:ok, policy_attrs} <- key_row_policy_attrs(scope, target_pool_id, previous_api_key, attrs),
+           update_attrs = attrs |> api_key_update_attrs(target_pool_id) |> Map.merge(policy_attrs),
+           {:ok, update_attrs} <- RuntimeAuthorization.prepare_status_update_attrs(previous_api_key, update_attrs),
+           {:ok, updated_api_key} <-
+             update_api_key_record(previous_api_key, update_attrs, transition) do
+        {:ok,
+         {
+           updated_api_key,
+           previous_api_key,
+           dashboard_session_invalidation_required?(previous_api_key, update_attrs),
+           api_key_update_notification(attrs, transition, previous_api_key, updated_api_key)
+         }}
+      end
+    end)
+  end
+
+  # A policy field on the key row goes through the policy path's merge and
+  # validation: an omitted group keeps the stored value read under the writer
+  # lock, the allow list is lowercased, and a list that drops the stored
+  # enforced model is refused (findings#206 row 206-505). This path never
+  # writes bindings, so the stored bindings are not read.
+  defp key_row_policy_attrs(scope, target_pool_id, api_key, attrs) do
+    if Policy.key_policy_submitted?(attrs) do
+      with {:ok, normalized} <- Policy.normalize_attrs(scope, target_pool_id, Policy.merge_stored(attrs, api_key, [])) do
+        {:ok, Map.take(normalized, @key_row_policy_fields)}
+      end
+    else
+      {:ok, %{}}
+    end
+  end
+
+  defp update_api_key_record(api_key, update_attrs, transition) do
     mutation = fn ->
-      api_key
-      |> APIKey.changeset(update_attrs)
+      changeset = APIKey.changeset(api_key, update_attrs)
+
+      changeset
+      |> Ecto.Changeset.put_change(
+        :runtime_revocation_epoch,
+        RuntimeAuthorization.epoch_for_policy_change(transition.runtime_revocation_epoch, api_key, changeset)
+      )
       |> Repo.update()
     end
 
     if dashboard_session_invalidation_required?(api_key, update_attrs) do
-      DashboardSessionLifecycle.run(api_key, "api_key_updated", mutation)
+      DashboardSessionLifecycle.run_in_transaction(api_key, "api_key_updated", mutation)
     else
       mutation.()
     end
@@ -232,10 +353,28 @@ defmodule CodexPooler.Access.APIKeys do
   @spec pause_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
           {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
   def pause_api_key(%Scope{} = scope, %APIKey{} = api_key),
-    do: change_api_key_status(scope, api_key, @status_active, @status_paused)
+    do:
+      change_api_key_status(
+        scope,
+        api_key,
+        [@status_active],
+        @status_paused,
+        "api_key_status_updated",
+        "api_key.pause",
+        %{}
+      )
 
   def pause_api_key(%Scope{} = scope, api_key_id) when is_binary(api_key_id),
-    do: APIKey |> Repo.get(api_key_id) |> then(&pause_api_key(scope, &1))
+    do:
+      change_api_key_status(
+        scope,
+        api_key_id,
+        [@status_active],
+        @status_paused,
+        "api_key_status_updated",
+        "api_key.pause",
+        %{}
+      )
 
   def pause_api_key(%Scope{}, _api_key),
     do: {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
@@ -246,10 +385,28 @@ defmodule CodexPooler.Access.APIKeys do
   @spec resume_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
           {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
   def resume_api_key(%Scope{} = scope, %APIKey{} = api_key),
-    do: change_api_key_status(scope, api_key, @status_paused, @status_active)
+    do:
+      change_api_key_status(
+        scope,
+        api_key,
+        [@status_paused],
+        @status_active,
+        "api_key_status_updated",
+        "api_key.resume",
+        %{}
+      )
 
   def resume_api_key(%Scope{} = scope, api_key_id) when is_binary(api_key_id),
-    do: APIKey |> Repo.get(api_key_id) |> then(&resume_api_key(scope, &1))
+    do:
+      change_api_key_status(
+        scope,
+        api_key_id,
+        [@status_paused],
+        @status_active,
+        "api_key_status_updated",
+        "api_key.resume",
+        %{}
+      )
 
   def resume_api_key(%Scope{}, _api_key),
     do: {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
@@ -270,9 +427,7 @@ defmodule CodexPooler.Access.APIKeys do
       {key_prefix, raw_key, key_hash} = Material.generate()
 
       mutation = fn ->
-        api_key
-        |> APIKey.changeset(%{key_prefix: key_prefix, key_hash: key_hash})
-        |> Repo.update()
+        rotate_api_key_record(scope, api_key.id, %{key_prefix: key_prefix, key_hash: key_hash})
       end
 
       api_key
@@ -299,37 +454,29 @@ defmodule CodexPooler.Access.APIKeys do
 
   @spec revoke_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
           {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
-  def revoke_api_key(%Scope{} = scope, %APIKey{} = api_key) do
-    with {:ok, _decision} <-
-           PoolAuthorization.require_capability(
-             scope,
-             PoolAuthorization.capability(:pool_api_key_manage),
-             pool_id: api_key.pool_id
-           ) do
-      mutation = fn ->
-        api_key
-        |> APIKey.changeset(%{status: @status_revoked, revoked_at: now()})
-        |> Repo.update()
-      end
-
-      if api_key.status == @status_revoked do
-        {:ok, api_key}
-      else
-        api_key
-        |> DashboardSessionLifecycle.run("api_key_revoked", mutation)
-        |> Notifications.notify_api_key_change("api_key_revoked")
-        |> AuditLog.audit_api_key_status_change(
-          scope,
-          "api_key.revoke",
-          api_key.status,
-          @status_revoked
-        )
-      end
-    end
-  end
+  def revoke_api_key(%Scope{} = scope, %APIKey{} = api_key),
+    do:
+      change_api_key_status(
+        scope,
+        api_key,
+        [@status_active, @status_paused],
+        @status_revoked,
+        "api_key_revoked",
+        "api_key.revoke",
+        %{revoked_at: now()}
+      )
 
   def revoke_api_key(%Scope{} = scope, api_key_id) when is_binary(api_key_id),
-    do: APIKey |> Repo.get(api_key_id) |> then(&revoke_api_key(scope, &1))
+    do:
+      change_api_key_status(
+        scope,
+        api_key_id,
+        [@status_active, @status_paused],
+        @status_revoked,
+        "api_key_revoked",
+        "api_key.revoke",
+        %{revoked_at: now()}
+      )
 
   def revoke_api_key(%Scope{}, _api_key),
     do: {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
@@ -337,8 +484,25 @@ defmodule CodexPooler.Access.APIKeys do
   def revoke_api_key(_scope, _api_key),
     do: {:error, Errors.access_error(:invalid_request, "user scope is required")}
 
+  defp rotate_api_key_record(scope, api_key_id, attrs) do
+    locked = Repo.one!(from key in APIKey, where: key.id == ^api_key_id, lock: "FOR UPDATE")
+
+    with :ok <- ensure_api_key_rotatable(locked),
+         {:ok, _decision} <- authorize_status_change(scope, locked) do
+      locked
+      |> APIKey.changeset(attrs)
+      |> Ecto.Changeset.put_change(:runtime_revocation_epoch, locked.runtime_revocation_epoch + 1)
+      |> Repo.update()
+    end
+  end
+
+  @doc """
+  Deletes an API key. A key with a small history is deleted at once (`{:ok, api_key}`); a larger
+  one is revoked at once and deleted by a background job (`{:deleting, api_key}`), see
+  `CodexPooler.Access.APIKeys.Deletion` (findings#206 row 206-561).
+  """
   @spec delete_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
-          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+          {:ok, APIKey.t()} | {:deleting, APIKey.t()} | {:error, term()}
   def delete_api_key(%Scope{} = scope, %APIKey{} = api_key) do
     with {:ok, _decision} <-
            PoolAuthorization.require_capability(
@@ -346,12 +510,7 @@ defmodule CodexPooler.Access.APIKeys do
              PoolAuthorization.capability(:pool_api_key_manage),
              pool_id: api_key.pool_id
            ) do
-      mutation = fn -> Repo.delete(api_key) end
-
-      api_key
-      |> DashboardSessionLifecycle.run("api_key_deleted", mutation)
-      |> Notifications.notify_api_key_change("api_key_deleted")
-      |> AuditLog.audit_api_key_change(scope, "api_key.delete")
+      Deletion.request(scope, api_key)
     end
   end
 
@@ -363,6 +522,192 @@ defmodule CodexPooler.Access.APIKeys do
 
   def delete_api_key(_scope, _api_key),
     do: {:error, Errors.access_error(:invalid_request, "user scope is required")}
+
+  @doc """
+  Deletes the key row under `statement_timeout_ms` and writes its `api_key.delete` audit event in
+  the same transaction, for `delete_api_key/2` and the deletion job. `{:error, :statement_timeout}`
+  when the delete ran out of its bound; nothing was deleted then.
+  """
+  @spec delete_api_key_row(Scope.t(), APIKey.t(), pos_integer()) ::
+          {:ok, APIKey.t()} | {:error, :statement_timeout | term()}
+  def delete_api_key_row(%Scope{} = scope, %APIKey{} = api_key, statement_timeout_ms) do
+    delete_context = %{scope: scope, statement_timeout_ms: statement_timeout_ms}
+
+    api_key
+    |> delete_api_key_serialized(session_ids_for_api_key(api_key.id), 3, delete_context)
+  end
+
+  defp delete_api_key_serialized(api_key, session_ids, attempts_left, delete_context) do
+    maybe_wait_after_api_key_delete_snapshot(api_key.id, session_ids, attempts_left)
+
+    result = Repo.transact(fn -> delete_api_key_with_locked_sessions(api_key, session_ids, delete_context) end)
+
+    case normalize_api_key_delete_result(result) do
+      {:error, %{code: :api_key_delete_conflict}} when attempts_left > 1 ->
+        delete_api_key_serialized(api_key, session_ids_for_api_key(api_key.id), attempts_left - 1, delete_context)
+
+      normalized ->
+        normalized
+    end
+  rescue
+    exception in Postgrex.Error ->
+      cond do
+        match?(%{postgres: %{code: :query_canceled}}, exception) -> {:error, :statement_timeout}
+        api_key_delete_retryable_postgres_error?(exception) -> retry_api_key_delete_after_conflict(api_key, attempts_left, delete_context)
+        true -> reraise exception, __STACKTRACE__
+      end
+
+    exception in Ecto.ConstraintError ->
+      if exception.type == :foreign_key do
+        retry_api_key_delete_after_conflict(api_key, attempts_left, delete_context)
+      else
+        reraise exception, __STACKTRACE__
+      end
+  end
+
+  defp delete_api_key_with_locked_sessions(api_key, session_ids, %{scope: scope, statement_timeout_ms: statement_timeout_ms}) do
+    Repo.query!("SELECT set_config('statement_timeout', $1, true)", ["#{statement_timeout_ms}ms"])
+    lock_api_key_sessions(session_ids)
+
+    with %APIKey{} = locked_api_key <- lock_api_key(api_key.id),
+         :ok <- require_current_api_key_sessions(locked_api_key.id, session_ids),
+         :ok <- close_api_key_replays(locked_api_key.id) do
+      # The audit event commits with the delete or not at all (findings#206 row 206-561).
+      DashboardSessionLifecycle.run_in_transaction(
+        locked_api_key,
+        "api_key_deleted",
+        fn -> locked_api_key |> Repo.delete() |> AuditLog.audit_api_key_change(scope, "api_key.delete") end
+      )
+      |> tap(fn
+        {:ok, deleted_api_key} -> DashboardSessions.broadcast_invalidation(deleted_api_key, "api_key_deleted")
+        {:error, _reason} -> :ok
+      end)
+      |> Notifications.notify_api_key_change("api_key_deleted")
+    else
+      nil -> {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp retry_api_key_delete_after_conflict(api_key, attempts_left, delete_context) when attempts_left > 1,
+    do: delete_api_key_serialized(api_key, session_ids_for_api_key(api_key.id), attempts_left - 1, delete_context)
+
+  defp retry_api_key_delete_after_conflict(_api_key, _attempts_left, _delete_context),
+    do: api_key_delete_conflict()
+
+  defp api_key_delete_retryable_postgres_error?(%Postgrex.Error{
+         postgres: %{code: code}
+       })
+       when code in [:deadlock_detected, :serialization_failure, :foreign_key_violation],
+       do: true
+
+  defp api_key_delete_retryable_postgres_error?(%Postgrex.Error{}), do: false
+
+  defp session_ids_for_api_key(api_key_id) do
+    Repo.all(
+      from session in CodexSession,
+        where: session.api_key_id == ^api_key_id,
+        order_by: [asc: session.id],
+        select: session.id
+    )
+  end
+
+  if Mix.env() == :test do
+    defp maybe_wait_after_api_key_delete_snapshot(_api_key_id, session_ids, attempts_left) do
+      case Application.get_env(:codex_pooler, :api_key_delete_test_barrier) do
+        %{
+          test_pid: test_pid,
+          ref: ref,
+          block_attempts_left: blocked_attempts
+        }
+        when is_pid(test_pid) and is_reference(ref) and is_list(blocked_attempts) ->
+          send(
+            test_pid,
+            {:api_key_delete_session_snapshot, ref, self(), attempts_left, session_ids}
+          )
+
+          if attempts_left in blocked_attempts do
+            receive do
+              {:release_api_key_delete_snapshot, ^ref} -> :ok
+            end
+          end
+
+        _no_barrier ->
+          :ok
+      end
+
+      :ok
+    end
+  else
+    defp maybe_wait_after_api_key_delete_snapshot(_api_key_id, _session_ids, _attempts_left),
+      do: :ok
+  end
+
+  defp lock_api_key_sessions([]), do: :ok
+
+  defp lock_api_key_sessions(session_ids) do
+    Repo.all(
+      from session in CodexSession,
+        where: session.id in ^session_ids,
+        order_by: [asc: session.id],
+        lock: "FOR UPDATE"
+    )
+
+    :ok
+  end
+
+  defp lock_api_key(api_key_id) do
+    Repo.one(from api_key in APIKey, where: api_key.id == ^api_key_id, lock: "FOR UPDATE")
+  end
+
+  defp require_current_api_key_sessions(api_key_id, expected_session_ids) do
+    if session_ids_for_api_key(api_key_id) == expected_session_ids do
+      :ok
+    else
+      api_key_delete_conflict()
+    end
+  end
+
+  defp close_api_key_replays(api_key_id) do
+    case api_key_delete_replay_close_override() do
+      close when is_function(close, 1) ->
+        close.(api_key_id)
+
+      nil ->
+        api_key_id
+        |> Accounting.request_replay_ids_for_api_key()
+        |> Enum.reduce_while(:ok, &close_deleted_request_replay/2)
+    end
+  end
+
+  defp close_deleted_request_replay(request_id, :ok) do
+    case Accounting.close_request_replay(request_id, :deleted) do
+      {:ok, _result} -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
+
+  defp api_key_delete_replay_close_override do
+    if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and Mix.env() == :test do
+      Application.get_env(:codex_pooler, :api_key_delete_replay_close_test_override)
+    end
+  end
+
+  defp normalize_api_key_delete_result({:ok, %APIKey{} = api_key}), do: {:ok, api_key}
+  defp normalize_api_key_delete_result({:error, %{code: _code} = error}), do: {:error, error}
+
+  defp normalize_api_key_delete_result({:error, %Ecto.Changeset{} = changeset}),
+    do: {:error, changeset}
+
+  defp normalize_api_key_delete_result({:error, reason}), do: {:error, reason}
+
+  defp api_key_delete_conflict do
+    {:error,
+     Errors.access_error(
+       :api_key_delete_conflict,
+       "api key deletion conflicts with active runtime work"
+     )}
+  end
 
   @spec authenticate_api_key(term()) :: {:ok, auth_context()} | {:error, access_error()}
   defdelegate authenticate_api_key(raw_key), to: Authentication
@@ -400,55 +745,150 @@ defmodule CodexPooler.Access.APIKeys do
   @spec access_error(atom(), String.t()) :: access_error()
   defdelegate access_error(code, message), to: Errors
 
-  defp change_api_key_status(%Scope{} = scope, %APIKey{} = api_key, from_status, to_status) do
-    with {:ok, _decision} <-
-           PoolAuthorization.require_capability(
-             scope,
-             PoolAuthorization.capability(:pool_api_key_manage),
-             pool_id: api_key.pool_id
-           ) do
-      cond do
-        api_key.status == @status_revoked ->
-          {:error, Errors.access_error(:api_key_revoked, "revoked api keys cannot be changed")}
+  defp change_api_key_status(
+         %Scope{} = scope,
+         api_key_or_id,
+         from_statuses,
+         to_status,
+         event_reason,
+         audit_action,
+         extra_attrs
+       ) do
+    case status_change_transaction(
+           scope,
+           api_key_or_id,
+           from_statuses,
+           to_status,
+           event_reason,
+           extra_attrs
+         ) do
+      {:ok, {updated_api_key, _previous_api_key, false, _invalidate_dashboard_sessions?}} ->
+        {:ok, updated_api_key}
 
-        api_key.status == to_status ->
-          {:ok, api_key}
+      {:ok, {updated_api_key, previous_api_key, true, invalidate_dashboard_sessions?}} ->
+        maybe_broadcast_dashboard_invalidation(
+          updated_api_key,
+          event_reason,
+          invalidate_dashboard_sessions?
+        )
 
-        api_key.status != from_status ->
-          {:error,
-           Errors.access_error(
-             :api_key_status_conflict,
-             "api key is not in a status that allows this action"
-           )}
+        {:ok, updated_api_key}
+        |> Notifications.notify_api_key_change(event_reason)
+        |> AuditLog.audit_api_key_status_change(
+          scope,
+          audit_action,
+          previous_api_key.status,
+          to_status
+        )
 
-        true ->
-          mutation = api_key_status_mutation(api_key, to_status)
-          result = run_status_mutation(api_key, to_status, mutation)
-
-          result
-          |> Notifications.notify_api_key_change("api_key_status_updated")
-          |> AuditLog.audit_api_key_status_change(
-            scope,
-            AuditLog.api_key_status_audit_action(to_status),
-            api_key.status,
-            to_status
-          )
-      end
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp api_key_status_mutation(%APIKey{} = api_key, to_status) do
+  defp status_change_transaction(
+         scope,
+         api_key_or_id,
+         from_statuses,
+         to_status,
+         event_reason,
+         extra_attrs
+       ) do
+    Repo.transact(fn ->
+      with {:ok, transition} <-
+             prepare_lifecycle_status_transition(api_key_or_id, to_status),
+           previous_api_key = transition.api_key,
+           {:ok, _decision} <- authorize_status_change(scope, previous_api_key) do
+        persist_status_change(
+          transition,
+          from_statuses,
+          to_status,
+          event_reason,
+          extra_attrs
+        )
+      end
+    end)
+  end
+
+  defp persist_status_change(transition, from_statuses, to_status, event_reason, extra_attrs) do
+    previous_api_key = transition.api_key
+
+    cond do
+      previous_api_key.status == to_status ->
+        {:ok, {previous_api_key, previous_api_key, false, false}}
+
+      previous_api_key.status == @status_revoked ->
+        {:error, Errors.access_error(:api_key_revoked, "revoked api keys cannot be changed")}
+
+      previous_api_key.status not in from_statuses ->
+        {:error,
+         Errors.access_error(
+           :api_key_status_conflict,
+           "api key is not in a status that allows this action"
+         )}
+
+      true ->
+        apply_status_change(transition, to_status, event_reason, extra_attrs)
+    end
+  end
+
+  defp apply_status_change(transition, to_status, event_reason, extra_attrs) do
+    previous_api_key = transition.api_key
+
+    mutation =
+      api_key_status_mutation(
+        previous_api_key,
+        to_status,
+        transition.runtime_revocation_epoch,
+        extra_attrs
+      )
+
+    case run_status_mutation(previous_api_key, to_status, event_reason, mutation) do
+      {:ok, updated_api_key} ->
+        {:ok, {updated_api_key, previous_api_key, true, to_status != @status_active}}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp authorize_status_change(%Scope{} = scope, %APIKey{} = api_key) do
+    PoolAuthorization.require_capability(
+      scope,
+      PoolAuthorization.capability(:pool_api_key_manage),
+      pool_id: api_key.pool_id
+    )
+  end
+
+  defp prepare_lifecycle_status_transition(api_key_or_id, to_status) do
+    case RuntimeAuthorization.prepare_status_transition(api_key_or_id, to_status) do
+      {:error, %{code: :api_key_missing}} ->
+        {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
+
+      result ->
+        result
+    end
+  end
+
+  defp api_key_status_mutation(
+         %APIKey{} = api_key,
+         to_status,
+         runtime_revocation_epoch,
+         extra_attrs
+       ) do
     fn ->
       api_key
-      |> APIKey.changeset(%{status: to_status})
+      |> APIKey.changeset(Map.put(extra_attrs, :status, to_status))
+      |> Ecto.Changeset.put_change(:runtime_revocation_epoch, runtime_revocation_epoch)
       |> Repo.update()
     end
   end
 
-  defp run_status_mutation(%APIKey{} = _api_key, @status_active, mutation), do: mutation.()
+  defp run_status_mutation(%APIKey{} = _api_key, @status_active, _event_reason, mutation),
+    do: mutation.()
 
-  defp run_status_mutation(%APIKey{} = api_key, _to_status, mutation),
-    do: DashboardSessionLifecycle.run(api_key, "api_key_status_updated", mutation)
+  defp run_status_mutation(%APIKey{} = api_key, _to_status, event_reason, mutation),
+    do: DashboardSessionLifecycle.run_in_transaction(api_key, event_reason, mutation)
 
   defp ensure_api_key_rotatable(%APIKey{status: @status_revoked}),
     do: {:error, Errors.access_error(:api_key_revoked, "revoked api keys cannot be rotated")}
@@ -460,8 +900,8 @@ defmodule CodexPooler.Access.APIKeys do
       :display_name,
       :status,
       :dashboard_access,
+      :max_active_requests,
       :expires_at,
-      :allowed_model_identifiers,
       :metadata
     ]
     |> Enum.reduce(%{}, &put_update_attr(&2, attrs, &1))
@@ -491,6 +931,56 @@ defmodule CodexPooler.Access.APIKeys do
       true -> acc
     end
   end
+
+  defp requested_status(attrs, fallback) do
+    Map.get(attrs, :status) || Map.get(attrs, "status") || fallback
+  end
+
+  defp maybe_broadcast_dashboard_invalidation(api_key, cause, true) do
+    DashboardSessions.broadcast_invalidation(api_key, cause)
+  end
+
+  defp maybe_broadcast_dashboard_invalidation(_api_key, _cause, false), do: :ok
+
+  defp notify_api_key_update(result, previous_api_key, :effective_disabling_transition) do
+    Notifications.notify_api_key_runtime_transition(
+      result,
+      "api_key_updated",
+      api_key_from_result(result).pool_id,
+      previous_api_key.pool_id
+    )
+  end
+
+  defp notify_api_key_update(result, _previous_api_key, :status_without_disable), do: result
+
+  defp notify_api_key_update(result, previous_api_key, :ordinary_update) do
+    Notifications.notify_api_key_change(result, "api_key_updated", previous_api_key.pool_id)
+  end
+
+  defp api_key_update_notification(attrs, transition, previous_api_key, updated_api_key) do
+    cond do
+      transition.effective_disabling_transition? ->
+        :effective_disabling_transition
+
+      previous_api_key.max_active_requests != updated_api_key.max_active_requests ->
+        :ordinary_update
+
+      RuntimeAuthorization.reread_required?(previous_api_key, updated_api_key) ->
+        :ordinary_update
+
+      status_submitted?(attrs) ->
+        :status_without_disable
+
+      true ->
+        :ordinary_update
+    end
+  end
+
+  defp status_submitted?(attrs) do
+    Map.has_key?(attrs, :status) or Map.has_key?(attrs, "status")
+  end
+
+  defp api_key_from_result({:ok, %APIKey{} = api_key}), do: api_key
 
   defp normalize_pool(%Pool{} = pool), do: pool
   defp normalize_pool(id) when is_binary(id), do: Pools.get_active_pool(id)

@@ -11,6 +11,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
   attr :filter_values, :map, required: true
   attr :filter_errors, :list, required: true
   attr :pool_filter_options, :list, required: true
+  attr :timezone, :string, required: true
 
   def audit_log_filters(assigns) do
     ~H"""
@@ -18,6 +19,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
       id="audit-log-filter-form"
       for={@filter_form}
       advanced_open
+      mobile_single_column
       phx-submit="filter"
     >
       <PoolFilterComponents.pool_filter_dropdown
@@ -42,7 +44,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
           <summary
             data-role="outcome-filter-trigger"
             aria-label="Outcome"
-            class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+            class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
           >
             <span
               data-role="outcome-filter-trigger-icon"
@@ -104,7 +106,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
           <summary
             data-role="action-filter-trigger"
             aria-label="Event"
-            class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+            class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
           >
             <span
               data-role="action-filter-trigger-icon"
@@ -164,8 +166,8 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
           label="Target"
           placeholder="user or id"
         />
-        <AdminComponents.cally_date_filter field={@filter_form[:date_from]} label="Date from" />
-        <AdminComponents.cally_date_filter field={@filter_form[:date_to]} label="Date to" />
+        <AdminComponents.cally_date_filter field={@filter_form[:date_from]} label="Date from" timezone={@timezone} />
+        <AdminComponents.cally_date_filter field={@filter_form[:date_to]} label="Date to" timezone={@timezone} />
       </:advanced>
     </AdminComponents.filter_form>
 

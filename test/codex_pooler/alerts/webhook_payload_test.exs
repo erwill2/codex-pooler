@@ -45,9 +45,17 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayloadTest do
              },
              "safe_evidence_summary" => %{
                "assignment_count" => 0,
-               "model" => "gpt-5.5",
+               "circuit_blocked_assignment_count" => 2,
+               "circuit_blocked_lane_count" => 3,
+               "circuit_blocked_reasons" => ["open_cooldown", "probe_saturated"],
+               "circuit_blocked_route_classes" => ["proxy_stream", "proxy_websocket"],
+               "circuit_recency_seconds" => 900,
+               "model" => "gpt-6-sol",
+               "model_membership_resolved" => true,
+               "non_serving_assignment_count" => 1,
                "quota_state" => "exhausted",
                "reason_code" => "no_usable_assignments",
+               "route_class_scope" => "proxy_stream",
                "status" => "active",
                "threshold_used_percent" => "97.5",
                "used_percent" => 98.25,
@@ -71,8 +79,20 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayloadTest do
 
     assert %{event_id: event_id, body: body} = WebhookPayload.encode(incident, channel, attempt)
     assert event_id == "alert.#{incident.id}.#{channel.id}.2"
-    assert Jason.decode!(body) == WebhookPayload.payload(incident, channel, attempt)
+    assert CodexPooler.JSON.decode!(body) == WebhookPayload.payload(incident, channel, attempt)
     assert body == WebhookPayload.encode(incident, channel, attempt).body
+
+    %CodexPooler.JSON.OrderedObject{values: entries} =
+      CodexPooler.JSON.decode!(body, objects: :ordered_objects)
+
+    keys = Enum.map(entries, &elem(&1, 0))
+    assert keys == Enum.sort(keys)
+
+    %CodexPooler.JSON.OrderedObject{values: evidence_entries} =
+      List.keyfind(entries, "safe_evidence_summary", 0) |> elem(1)
+
+    evidence_keys = Enum.map(evidence_entries, &elem(&1, 0))
+    assert evidence_keys == Enum.sort(evidence_keys)
 
     refute_forbidden_values(body)
   end
@@ -82,16 +102,24 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayloadTest do
 
     assert summary == %{
              "assignment_count" => 0,
-             "model" => "gpt-5.5",
+             "circuit_blocked_assignment_count" => 2,
+             "circuit_blocked_lane_count" => 3,
+             "circuit_blocked_reasons" => ["open_cooldown", "probe_saturated"],
+             "circuit_blocked_route_classes" => ["proxy_stream", "proxy_websocket"],
+             "circuit_recency_seconds" => 900,
+             "model" => "gpt-6-sol",
+             "model_membership_resolved" => true,
+             "non_serving_assignment_count" => 1,
              "quota_state" => "exhausted",
              "reason_code" => "no_usable_assignments",
+             "route_class_scope" => "proxy_stream",
              "status" => "active",
              "threshold_used_percent" => "97.5",
              "used_percent" => 98.25,
              "window_selector" => "weekly"
            }
 
-    refute_forbidden_values(Jason.encode!(summary))
+    refute_forbidden_values(CodexPooler.JSON.encode!(summary))
   end
 
   @tag :saved_reset_banked_first_seen
@@ -111,7 +139,7 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayloadTest do
              "source" => "persisted_saved_resets"
            }
 
-    encoded = Jason.encode!(summary)
+    encoded = CodexPooler.JSON.encode!(summary)
     refute encoded =~ "provider-credit-hidden"
     refute encoded =~ "provider payload sentinel"
     refute encoded =~ "raw-auth-json-hidden"
@@ -172,8 +200,26 @@ defmodule CodexPooler.Alerts.Delivery.WebhookPayloadTest do
     %{
       "reason_code" => "no_usable_assignments",
       "assignment_count" => 0,
-      "model" => "gpt-5.5",
+      "circuit_blocked_assignment_count" => 2,
+      "circuit_blocked_lane_count" => 3,
+      "circuit_blocked_reasons" => [
+        "probe_saturated",
+        "unbounded-provider-reason",
+        "open_cooldown",
+        "probe_saturated"
+      ],
+      "circuit_blocked_route_classes" => [
+        "proxy_websocket",
+        "unknown_route",
+        "proxy_stream",
+        "proxy_websocket"
+      ],
+      "circuit_recency_seconds" => 900,
+      "model" => "gpt-6-sol",
+      "model_membership_resolved" => true,
+      "non_serving_assignment_count" => 1,
       "quota_state" => "exhausted",
+      "route_class_scope" => "proxy_stream",
       "status" => "active",
       "threshold_used_percent" => Decimal.new("97.5"),
       "used_percent" => 98.25,

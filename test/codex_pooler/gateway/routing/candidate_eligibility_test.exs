@@ -9,16 +9,47 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       upstream_assignment_fixture: 2
     ]
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Routing.CandidateEligibility
+  alias CodexPooler.Gateway.Persistence.RoutingCircuitState
+
+  alias CodexPooler.Gateway.Routing.{
+    BridgeRing,
+    CandidateEligibility,
+    RoutePlanInput,
+    RoutingSelection
+  }
+
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
-  alias CodexPooler.Gateway.Routing.{RoutePlanInput, RoutingSelection}
+  alias CodexPooler.Gateway.Routing.CandidateEligibility.Quota, as: CandidateQuota
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
-  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Quota.{AccountAvailabilityStore, AccountQuotaWindow}
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   describe "hydrated model visibility" do
+    test "catalog presence canonicalizes identifiers and includes every model status" do
+      for status <- ~w(active stale retired suppressed) do
+        pool = pool_fixture()
+        identifier = unique_model_id("catalog-presence-#{status}")
+
+        _model =
+          model_fixture(pool, %{
+            exposed_model_id: identifier,
+            status: status
+          })
+
+        assert CandidateEligibility.catalog_model_present?(
+                 pool,
+                 "  #{String.upcase(identifier)}  "
+               )
+
+        refute CandidateEligibility.catalog_model_present?(pool, "absent-#{identifier}")
+      end
+    end
+
     test "uses one hydrated assignment snapshot for visible models and routable candidates" do
       pool = pool_fixture()
       routed = upstream_assignment_fixture(pool, %{plan_family: "pro"})
@@ -129,6 +160,96 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
   end
 
   describe "filter_runtime_compatible_candidates/1" do
+    test "mixed-key image input narrows candidates by image capability" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-image" => %{
+              "capabilities" => %{"responses" => true, "image_input" => true}
+            },
+            "assignment-text" => %{
+              "capabilities" => %{"responses" => true, "image_input" => false}
+            }
+          }
+        }
+      }
+
+      payload = %{
+        "model" => "gpt-4.1",
+        "input" => [%{:type => "input_image", "image_url" => "https://example.com/image.png"}]
+      }
+
+      candidates = [candidate("assignment-image"), candidate("assignment-text")]
+      request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+      assert {:ok, filtered} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
+
+      assert candidate_ids(filtered) == ["assignment-image"]
+    end
+
+    test "a websocket turn requires streaming support whatever its stream flag" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-streaming" => %{
+              "capabilities" => %{"responses" => true, "streaming" => true}
+            },
+            "assignment-no-streaming" => %{
+              "capabilities" => %{"responses" => true, "streaming" => false}
+            }
+          }
+        }
+      }
+
+      payload = %{"model" => "gpt-4.1", "input" => []}
+      candidates = [candidate("assignment-streaming"), candidate("assignment-no-streaming")]
+      endpoint = "/backend-api/codex/responses"
+
+      http_options = RequestOptions.build(%{}, endpoint, payload)
+      websocket_options = RequestOptions.build(%{transport: "websocket"}, endpoint, payload)
+
+      assert {:ok, http_filtered} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, http_options, candidates))
+
+      assert candidate_ids(http_filtered) == ["assignment-streaming", "assignment-no-streaming"]
+
+      for websocket_payload <- [payload, Map.put(payload, "stream", true)] do
+        assert {:ok, websocket_filtered} =
+                 CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, websocket_payload, websocket_options, candidates))
+
+        assert candidate_ids(websocket_filtered) == ["assignment-streaming"]
+      end
+    end
+
+    test "string type false wins over a conflicting atom input_image type" do
+      model = model_with_image_support("assignment-text", false)
+
+      payload = %{
+        "model" => "gpt-4.1",
+        "input" => [%{:type => "input_image", "type" => false}]
+      }
+
+      candidates = [candidate("assignment-text")]
+      request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+      assert {:ok, filtered} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
+
+      assert candidate_ids(filtered) == ["assignment-text"]
+    end
+
+    test "mixed-key image detection matches the prior normalization traversal" do
+      :rand.seed(:exsss, {20_260_730, 311, 907})
+
+      for _iteration <- 1..1_000 do
+        payload = %{"input" => random_image_input(3)}
+
+        assert CandidateEligibility.payload_has_input_image?(payload) ==
+                 legacy_payload_has_input_image?(payload)
+      end
+    end
+
     test "auto and default do not narrow the candidate set" do
       model = model_with_tier_support("assignment-supported", "priority")
       candidates = [candidate("assignment-supported"), candidate("assignment-plain")]
@@ -137,9 +258,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
       assert {:ok, filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
       assert candidate_ids(filtered) == ["assignment-supported", "assignment-plain"]
 
@@ -149,9 +268,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
         RequestOptions.build(%{}, "/backend-api/codex/responses", auto_payload)
 
       assert {:ok, auto_filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, auto_payload, auto_request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, auto_payload, auto_request_options, candidates))
 
       assert candidate_ids(auto_filtered) == ["assignment-supported", "assignment-plain"]
     end
@@ -164,11 +281,132 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
       assert {:ok, filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
       assert candidate_ids(filtered) == ["assignment-supported"]
+    end
+
+    test "fast and priority match either advertised service-tier alias without mutating metadata" do
+      for {requested, advertised} <- [{"fast", "priority"}, {"priority", "fast"}] do
+        model = model_with_tier_support("assignment-supported", advertised)
+        original_metadata = model.metadata
+        candidates = [candidate("assignment-supported"), candidate("assignment-plain")]
+        payload = %{"model" => "gpt-4.1", "input" => "hello", "service_tier" => requested}
+        request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+        assert {:ok, filtered} =
+                 CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
+
+        assert candidate_ids(filtered) == ["assignment-supported"]
+        assert model.metadata == original_metadata
+
+        assert get_in(model.metadata, [
+                 "source_assignment_models",
+                 "assignment-supported",
+                 "service_tiers",
+                 Access.at(0),
+                 "id"
+               ]) == advertised
+      end
+    end
+
+    test "fast and priority match either advertised additional-speed-tier alias" do
+      for {requested, advertised} <- [{"fast", "priority"}, {"priority", "fast"}] do
+        model = model_with_speed_tier_support("assignment-supported", advertised)
+        candidates = [candidate("assignment-supported"), candidate("assignment-plain")]
+        payload = %{"model" => "gpt-4.1", "input" => "hello", "service_tier" => requested}
+        request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+        assert {:ok, filtered} =
+                 CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
+
+        assert candidate_ids(filtered) == ["assignment-supported"]
+      end
+    end
+
+    test "ultrafast requires an exact per-assignment advertisement without changing model metadata" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-service-ultrafast" => tier_metadata(service_tiers: ["ultrafast"]),
+            "assignment-speed-ultrafast" => tier_metadata(additional_speed_tiers: ["ultrafast"]),
+            "assignment-priority" => tier_metadata(service_tiers: ["priority"]),
+            "assignment-fast" => tier_metadata(additional_speed_tiers: ["fast"]),
+            "assignment-flex" => tier_metadata(service_tiers: ["flex"])
+          }
+        }
+      }
+
+      original_metadata = :erlang.term_to_binary(model.metadata)
+
+      candidates =
+        Enum.map(
+          [
+            "assignment-service-ultrafast",
+            "assignment-speed-ultrafast",
+            "assignment-priority",
+            "assignment-fast",
+            "assignment-flex",
+            "assignment-absent"
+          ],
+          &candidate/1
+        )
+
+      ultrafast_payload = %{
+        "model" => "gpt-4.1",
+        "input" => "hello",
+        "service_tier" => "ultrafast"
+      }
+
+      ultrafast_request_options =
+        RequestOptions.build(%{}, "/backend-api/codex/responses", ultrafast_payload)
+
+      assert {:ok, ultrafast_filtered} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, ultrafast_payload, ultrafast_request_options, candidates))
+
+      assert candidate_ids(ultrafast_filtered) == [
+               "assignment-service-ultrafast",
+               "assignment-speed-ultrafast"
+             ]
+
+      priority_payload = Map.put(ultrafast_payload, "service_tier", "priority")
+
+      priority_request_options =
+        RequestOptions.build(%{}, "/backend-api/codex/responses", priority_payload)
+
+      assert {:ok, priority_filtered} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, priority_payload, priority_request_options, candidates))
+
+      assert candidate_ids(priority_filtered) == ["assignment-priority", "assignment-fast"]
+      assert :erlang.term_to_binary(model.metadata) == original_metadata
+    end
+
+    test "ultrafast returns no compatible backend when no candidate advertises it" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-priority" => tier_metadata(service_tiers: ["priority"]),
+            "assignment-fast" => tier_metadata(additional_speed_tiers: ["fast"]),
+            "assignment-flex" => tier_metadata(service_tiers: ["flex"])
+          }
+        }
+      }
+
+      original_metadata = :erlang.term_to_binary(model.metadata)
+
+      candidates =
+        Enum.map(
+          ["assignment-priority", "assignment-fast", "assignment-flex", "assignment-absent"],
+          &candidate/1
+        )
+
+      payload = %{"model" => "gpt-4.1", "input" => "hello", "service_tier" => "ultrafast"}
+      request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+      assert {:error, %{code: "no_compatible_backend"}} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
+
+      assert :erlang.term_to_binary(model.metadata) == original_metadata
     end
 
     test "a concrete unsupported tier produces no compatible backend" do
@@ -179,9 +417,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
       assert {:error, %{code: "no_compatible_backend"}} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
     end
 
     test "a concrete tier excludes source assignments missing per-assignment metadata" do
@@ -192,9 +428,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
       assert {:error, %{code: "no_compatible_backend"}} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
     end
 
     test "SDK-internal serviceTier alias does not narrow candidate eligibility" do
@@ -205,9 +439,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
       assert {:ok, filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
       assert candidate_ids(filtered) == ["assignment-missing"]
     end
@@ -220,9 +452,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
       assert {:ok, filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
       assert candidate_ids(filtered) == ["assignment-missing"]
     end
@@ -236,9 +466,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
         request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
         assert {:ok, filtered} =
-                 CandidateEligibility.filter_runtime_compatible_candidates(
-                   filter_input(model, payload, request_options, candidates)
-                 )
+                 CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
         assert candidate_ids(filtered) == ["assignment-missing"]
       end
@@ -257,9 +485,25 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
         )
 
       assert {:ok, filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
+
+      assert candidate_ids(filtered) == ["assignment-supported"]
+    end
+
+    test "an api-key enforced fast alias matches advertised priority and overrides the client tier" do
+      model = model_with_tier_support("assignment-supported", "priority")
+      candidates = [candidate("assignment-supported"), candidate("assignment-plain")]
+      payload = %{"model" => "gpt-4.1", "input" => "hello", "service_tier" => "latency_preview"}
+
+      request_options =
+        RequestOptions.build(
+          %{api_key_policy: %{enforced_service_tier: "fast"}},
+          "/backend-api/codex/responses",
+          payload
+        )
+
+      assert {:ok, filtered} =
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
       assert candidate_ids(filtered) == ["assignment-supported"]
     end
@@ -277,15 +521,327 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
         )
 
       assert {:ok, filtered} =
-               CandidateEligibility.filter_runtime_compatible_candidates(
-                 filter_input(model, payload, request_options, candidates)
-               )
+               CandidateEligibility.filter_runtime_compatible_candidates(filter_input(model, payload, request_options, candidates))
 
       assert candidate_ids(filtered) == ["assignment-supported", "assignment-plain"]
     end
   end
 
+  describe "prefer_reasoning_effort_candidates/3" do
+    test "an explicit effort routes to the assignments whose own catalog advertises it" do
+      # The Pool-wide union advertises `max` because one assignment contributes
+      # it. Dispatching the turn to the assignment whose own catalog stops at
+      # `high` is a backend 400 for a level the Pool promised (findings#221).
+      model = model_with_reasoning_levels()
+      request_options = request_options_with_effort("max")
+
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-max"]
+    end
+
+    test "an effort every assignment advertises narrows nothing" do
+      model = model_with_reasoning_levels()
+      request_options = request_options_with_effort("high")
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-high", "assignment-max"]
+    end
+
+    test "an effort no assignment advertises keeps every candidate" do
+      # Preference, not admission: the Pool never advertised this level, so the
+      # upstream refusal is the honest answer. Narrowing to nothing here would
+      # turn that 400 into a 503 no_compatible_backend.
+      model = model_with_reasoning_levels()
+      request_options = request_options_with_effort("none")
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-high", "assignment-max"]
+    end
+
+    test "an assignment with no reasoning evidence loses to one that advertises the effort" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-silent" => %{"capabilities" => %{"responses" => true}},
+            "assignment-max" => %{"supported_reasoning_levels" => ~w(low medium high max)}
+          }
+        }
+      }
+
+      request_options = request_options_with_effort("max")
+      candidates = [candidate("assignment-silent"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-max"]
+    end
+
+    test "no assignment carrying reasoning evidence keeps every candidate" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-a" => %{"capabilities" => %{"responses" => true}},
+            "assignment-b" => %{"capabilities" => %{"responses" => true}}
+          }
+        }
+      }
+
+      request_options = request_options_with_effort("max")
+      candidates = [candidate("assignment-a"), candidate("assignment-b")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-a", "assignment-b"]
+    end
+
+    test "ultra keeps every candidate because it is rewritten per assignment" do
+      # `ReasoningEffort.rewrite_backend_upstream/2` lands `ultra` on a level the
+      # selected assignment advertises, so every candidate can serve it.
+      model = model_with_reasoning_levels()
+      request_options = request_options_with_effort("ultra")
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-high", "assignment-max"]
+    end
+
+    test "minimal is judged as the low it is rewritten to" do
+      model = %Model{
+        metadata: %{
+          "source_assignment_models" => %{
+            "assignment-low" => %{"supported_reasoning_levels" => ~w(low medium high)},
+            "assignment-no-low" => %{"supported_reasoning_levels" => ~w(medium high)}
+          }
+        }
+      }
+
+      request_options = request_options_with_effort("minimal")
+      candidates = [candidate("assignment-low"), candidate("assignment-no-low")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-low"]
+    end
+
+    test "the applied effort an API key enforced decides, not the level the client asked for" do
+      model = model_with_reasoning_levels()
+
+      request_options =
+        request_options_with_effort("max", requested_effort: "high", mode: :always_use)
+
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-max"]
+    end
+
+    test "a request with no reasoning effort narrows nothing" do
+      model = model_with_reasoning_levels()
+
+      request_options =
+        RequestOptions.build(%{}, "/backend-api/codex/responses", %{"model" => "gpt-4.1"})
+
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-high", "assignment-max"]
+    end
+
+    test "an unknown effort string is left to the upstream to refuse" do
+      model = model_with_reasoning_levels()
+      request_options = request_options_with_effort("turbo")
+      candidates = [candidate("assignment-high"), candidate("assignment-max")]
+
+      assert {:ok, filtered} =
+               CandidateEligibility.prefer_reasoning_effort_candidates(
+                 model,
+                 request_options,
+                 candidates
+               )
+
+      assert candidate_ids(filtered) == ["assignment-high", "assignment-max"]
+    end
+  end
+
+  describe "filter_allowed_canonical_candidates/3" do
+    @tag :external_issues_229_231
+    @tag :issue_231
+    test "keeps allowed canonical and continuity assignments in input order" do
+      selected = candidate("assignment-selected")
+      pinned = candidate("assignment-pinned")
+      divergent = candidate("assignment-divergent")
+
+      assert {:ok, filtered} =
+               CandidateEligibility.filter_allowed_canonical_candidates(
+                 [selected, pinned, divergent],
+                 ["assignment-pinned"],
+                 ["assignment-selected"]
+               )
+
+      assert candidate_ids(filtered) == ["assignment-selected", "assignment-pinned"]
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_231
+    test "restricts an unpinned backend Codex catalog-driven turn to the selected partition" do
+      selected = candidate("assignment-selected")
+      divergent = candidate("assignment-divergent")
+
+      assert {:ok, [^selected]} =
+               CandidateEligibility.filter_allowed_canonical_candidates(
+                 [selected, divergent],
+                 ["assignment-selected"],
+                 []
+               )
+    end
+
+    @tag :external_issues_229_231
+    @tag :issue_231
+    test "returns an empty shortlist when neither a selected nor continuity assignment remains" do
+      assert {:ok, []} =
+               CandidateEligibility.filter_allowed_canonical_candidates(
+                 [candidate("assignment-divergent")],
+                 [],
+                 []
+               )
+    end
+  end
+
   describe "preloaded routing state" do
+    test "quota classification keeps windowless provider availability after every ordinary group" do
+      snapshot_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      precise_identity = upstream_identity("precise-windowless-order")
+      windowless_identity = available_upstream_identity("windowless-order", snapshot_at)
+      precise_candidate = {assignment("precise-order", precise_identity), precise_identity}
+
+      windowless_candidate =
+        {assignment("windowless-order", windowless_identity), windowless_identity}
+
+      route_state =
+        RouteState.new(%{
+          visible_model: quota_model(),
+          candidates: [windowless_candidate, precise_candidate]
+        })
+        |> put_test_quota_snapshots(
+          %{
+            precise_identity.id => [account_window_at(Decimal.new("15"), snapshot_at)],
+            windowless_identity.id => []
+          },
+          snapshot_at
+        )
+
+      assert {:ok, [^precise_candidate, ^windowless_candidate], decision} =
+               CandidateEligibility.filter_quota_eligible_candidates(
+                 filter_input(quota_model(), %{"model" => "sample-model"}, request_options(), [
+                   windowless_candidate,
+                   precise_candidate
+                 ]),
+                 route_state
+               )
+
+      assert decision["routing_state"] == "precise"
+      assert decision["windowless_provider_available_candidate_count"] == 1
+      assert decision["eligible_candidate_count"] == 2
+    end
+
+    test "a coherent lower account measurement is ordinary instead of windowless provider availability" do
+      snapshot_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      retained_identity = available_upstream_identity("retained-measurement", snapshot_at)
+      ordinary_identity = upstream_identity("ordinary-measurement")
+
+      retained_candidate =
+        {assignment("retained-measurement-assignment", retained_identity), retained_identity}
+
+      ordinary_candidate =
+        {assignment("ordinary-measurement-assignment", ordinary_identity), ordinary_identity}
+
+      route_state =
+        RouteState.new(%{
+          visible_model: quota_model(),
+          candidates: [retained_candidate, ordinary_candidate]
+        })
+        |> put_test_quota_snapshots(
+          %{
+            retained_identity.id => [account_window_at(Decimal.new("32"), snapshot_at)],
+            ordinary_identity.id => [account_window_at(Decimal.new("20"), snapshot_at)]
+          },
+          snapshot_at
+        )
+
+      refute CandidateQuota.windowless_candidate?(
+               quota_model(),
+               retained_candidate,
+               route_state
+             )
+
+      assert {:ok, [^retained_candidate, ^ordinary_candidate], decision} =
+               CandidateEligibility.filter_quota_eligible_candidates(
+                 filter_input(quota_model(), %{"model" => "sample-model"}, request_options(), [
+                   retained_candidate,
+                   ordinary_candidate
+                 ]),
+                 route_state
+               )
+
+      assert decision["routing_state"] == "precise"
+      assert decision["windowless_provider_available_candidate_count"] == 0
+    end
+
     test "quota eligibility consumes route-state windows without querying the repository" do
       eligible_identity = upstream_identity("eligible-identity")
       missing_identity = upstream_identity("missing-identity")
@@ -295,15 +851,20 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
 
       missing_candidate = {assignment("missing-assignment", missing_identity), missing_identity}
 
+      snapshots = %{
+        eligible_identity.id => [account_window(Decimal.new("15"))],
+        missing_identity.id => [account_window(Decimal.new("100"))]
+      }
+
       route_state =
         RouteState.new(%{
           visible_model: quota_model(),
           candidates: [eligible_candidate, missing_candidate]
         })
-        |> RouteState.put_quota_window_snapshots(%{
-          eligible_identity.id => [account_window(Decimal.new("15"))],
-          missing_identity.id => [account_window(Decimal.new("100"))]
-        })
+        |> put_test_quota_snapshots(
+          snapshots,
+          DateTime.utc_now() |> DateTime.truncate(:microsecond)
+        )
 
       assert {:ok, [^eligible_candidate], %{"routing_state" => "precise"}} =
                CandidateEligibility.filter_quota_eligible_candidates(
@@ -315,7 +876,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
                )
     end
 
-    test "quota classification orders precise credit-backed and weekly probe candidates" do
+    test "quota classification preserves compatible non-credit order without an unqualified credit grant" do
       precise_identity = upstream_identity("precise-identity")
       credit_identity = upstream_identity("credit-identity")
       weekly_identity = upstream_identity("weekly-identity")
@@ -324,16 +885,21 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       credit_candidate = {assignment("credit-assignment", credit_identity), credit_identity}
       weekly_candidate = {assignment("weekly-assignment", weekly_identity), weekly_identity}
 
+      snapshots = %{
+        precise_identity.id => [account_window(Decimal.new("15"))],
+        credit_identity.id => [credit_backed_secondary_window()],
+        weekly_identity.id => [weekly_probe_window()]
+      }
+
       route_state =
         RouteState.new(%{
           visible_model: quota_model(),
           candidates: [weekly_candidate, credit_candidate, precise_candidate]
         })
-        |> RouteState.put_quota_window_snapshots(%{
-          precise_identity.id => [account_window(Decimal.new("15"))],
-          credit_identity.id => [credit_backed_secondary_window()],
-          weekly_identity.id => [weekly_probe_window()]
-        })
+        |> put_test_quota_snapshots(
+          snapshots,
+          DateTime.utc_now() |> DateTime.truncate(:microsecond)
+        )
 
       assert {:ok, candidates, decision} =
                CandidateEligibility.filter_quota_eligible_candidates(
@@ -347,18 +913,86 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
 
       assert candidate_ids(candidates) == [
                "precise-assignment",
-               "credit-assignment",
                "weekly-assignment"
              ]
 
       assert decision["routing_state"] == "precise"
       assert decision["precise_candidate_count"] == 1
-      assert decision["credit_backed_probe_candidate_count"] == 1
+      assert decision["credit_backed_probe_candidate_count"] == 0
       assert decision["weekly_probe_candidate_count"] == 1
-      assert decision["eligible_candidate_count"] == 3
+      assert decision["eligible_candidate_count"] == 2
+    end
 
-      assert decision["summary"] ==
-               "allowed by fresh, credit-backed secondary, and weekly quota evidence"
+    test "quota eligibility excludes a post-snapshot observation until the snapshot instant advances" do
+      snapshot_at = ~U[2026-07-25 12:00:00.000000Z]
+      refreshed_at = ~U[2026-07-25 12:00:00.000001Z]
+      identity = upstream_identity("snapshot-boundary-identity")
+      candidate = {assignment("snapshot-boundary-assignment", identity), identity}
+
+      snapshots = %{
+        identity.id => [
+          account_window_at(Decimal.new("15"), DateTime.add(snapshot_at, -1, :microsecond)),
+          account_window_at(Decimal.new("15"), snapshot_at),
+          account_window_at(Decimal.new("100"), refreshed_at)
+        ]
+      }
+
+      filter_input =
+        filter_input(quota_model(), %{"model" => "sample-model"}, request_options(), [candidate])
+
+      route_state =
+        RouteState.new(%{
+          visible_model: quota_model(),
+          candidates: [candidate]
+        })
+        |> put_test_quota_snapshots(snapshots, snapshot_at)
+
+      before_only_route_state =
+        put_test_quota_snapshots(
+          route_state,
+          %{identity.id => [hd(snapshots[identity.id])]},
+          snapshot_at
+        )
+
+      assert {:ok, [^candidate], %{"routing_state" => "precise"}} =
+               CandidateEligibility.filter_quota_eligible_candidates(
+                 filter_input,
+                 before_only_route_state
+               )
+
+      equal_only_route_state =
+        put_test_quota_snapshots(
+          route_state,
+          %{identity.id => [account_window_at(Decimal.new("100"), snapshot_at)]},
+          snapshot_at
+        )
+
+      assert {:refreshable_quota, %{candidate_exclusions: [_exclusion]}} =
+               CandidateEligibility.filter_quota_eligible_candidates(
+                 filter_input,
+                 equal_only_route_state
+               )
+
+      assert {:ok, [^candidate], %{"routing_state" => "precise"}} =
+               CandidateEligibility.filter_quota_eligible_candidates(filter_input, route_state)
+
+      refreshed_route_state =
+        put_test_quota_snapshots(route_state, snapshots, refreshed_at)
+
+      assert {:refreshable_quota,
+              %{
+                candidate_exclusions: [
+                  %{
+                    reasons: [
+                      %{"code" => "quota_window_unusable", "reason_codes" => ["exhausted"]}
+                    ]
+                  }
+                ]
+              }} =
+               CandidateEligibility.filter_quota_eligible_candidates(
+                 filter_input,
+                 refreshed_route_state
+               )
     end
 
     test "selected route skips an open snapshot and admits a later eligible candidate" do
@@ -387,6 +1021,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
             second.assignment.id => true
           }
         })
+        |> RouteState.put_quota_snapshots(RouteState.load_quota_snapshots(candidates))
 
       assert {:ok, %RoutingSelection{} = selection} =
                RoutingSelection.select_and_begin_circuit(%{
@@ -401,6 +1036,73 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
                })
 
       assert selection.assignment.id == second.assignment.id
+      assert selection.circuit_admission == :none
+    end
+
+    test "selected route retains the admitted half-open probe ownership" do
+      pool = pool_fixture()
+      %{api_key: api_key} = active_api_key_fixture(pool)
+      %{assignment: assignment, identity: identity} = upstream_assignment_fixture(pool, %{})
+
+      model =
+        model_fixture(pool, %{
+          exposed_model_id: unique_model_id("gpt-probe-selection"),
+          metadata: %{"source_assignment_ids" => [assignment.id]}
+        })
+
+      request_options = request_options()
+
+      route_plan =
+        BridgeRing.plan_route(%{
+          auth: %{pool: pool, api_key: api_key},
+          model: model,
+          candidates: [{assignment, identity}],
+          route_plan_input: RoutePlanInput.from_request_opts(request_options),
+          request_options: request_options
+        })
+
+      selection =
+        RoutingSelection.prepare_candidate(%{
+          route_plan: route_plan,
+          assignment: assignment,
+          identity: identity,
+          index: 0,
+          route_class: RequestOptions.route_class(request_options)
+        })
+
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      circuit =
+        %RoutingCircuitState{
+          pool_id: pool.id,
+          pool_upstream_assignment_id: assignment.id,
+          upstream_identity_id: identity.id,
+          model_identifier: model.exposed_model_id,
+          route_class: RequestOptions.route_class(request_options),
+          status: "open",
+          reason_code: "test_open",
+          failure_count: 3,
+          success_count: 0,
+          opened_at: DateTime.add(now, -120, :second),
+          next_probe_at: DateTime.add(now, -1, :second),
+          metadata: %{"probe_in_flight_count" => 0},
+          created_at: DateTime.add(now, -120, :second),
+          updated_at: now
+        }
+        |> Repo.insert!()
+
+      assert {:ok,
+              %RoutingSelection{
+                circuit_admission: :probe,
+                circuit_state: %RoutingCircuitState{id: circuit_id}
+              }} =
+               RoutingSelection.begin_circuit(
+                 selection,
+                 %{pool: pool, api_key: api_key},
+                 model
+               )
+
+      assert circuit_id == circuit.id
     end
 
     test "circuit eligibility consumes route-state snapshots without live circuit reads" do
@@ -436,6 +1138,9 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
   defp count_repo_commands(fun) do
     parent = self()
     handler_id = "candidate-eligibility-test-#{System.unique_integer([:positive])}"
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     :ok =
       :telemetry.attach(
@@ -491,6 +1196,14 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
     %UpstreamIdentity{id: id, metadata: %{}}
   end
 
+  defp available_upstream_identity(id, observed_at) do
+    metadata = %{
+      AccountAvailabilityStore.metadata_key() => AccountAvailabilityStore.encode!(:available, observed_at, 1)
+    }
+
+    %UpstreamIdentity{id: id, metadata: metadata}
+  end
+
   defp request_options do
     RequestOptions.build(%{}, "/backend-api/codex/responses", %{"model" => "sample-model"})
   end
@@ -502,12 +1215,16 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
   defp account_window(used_percent) do
     observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
 
+    account_window_at(used_percent, observed_at)
+  end
+
+  defp account_window_at(used_percent, observed_at) do
     %AccountQuotaWindow{
       quota_key: "account",
       window_kind: "primary",
       window_minutes: 300,
       used_percent: used_percent,
-      reset_at: DateTime.add(observed_at, 900, :second),
+      reset_at: DateTime.add(observed_at, 300, :second),
       source: "codex_usage_api",
       source_precision: "observed",
       quota_scope: "account",
@@ -588,6 +1305,33 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
     }
   end
 
+  defp model_with_speed_tier_support(supported_assignment_id, supported_tier) do
+    %Model{
+      metadata: %{
+        "source_assignment_models" => %{
+          supported_assignment_id => %{
+            "capabilities" => %{"responses" => true},
+            "service_tiers" => [],
+            "additional_speed_tiers" => [supported_tier]
+          },
+          "assignment-plain" => %{
+            "capabilities" => %{"responses" => true},
+            "service_tiers" => [],
+            "additional_speed_tiers" => []
+          }
+        }
+      }
+    }
+  end
+
+  defp tier_metadata(options) do
+    %{
+      "capabilities" => %{"responses" => true},
+      "service_tiers" => Keyword.get(options, :service_tiers, []),
+      "additional_speed_tiers" => Keyword.get(options, :additional_speed_tiers, [])
+    }
+  end
+
   defp model_missing_assignment_metadata(assignment_id) do
     %Model{
       metadata: %{
@@ -595,5 +1339,101 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
         "source_assignment_models" => %{}
       }
     }
+  end
+
+  # The Pool-wide union advertises `max`; only one of the two assignments does.
+  defp model_with_reasoning_levels do
+    %Model{
+      metadata: %{
+        "upstream_model" => %{"supported_reasoning_levels" => ~w(low medium high max)},
+        "source_assignment_models" => %{
+          "assignment-high" => %{"supported_reasoning_levels" => ~w(low medium high)},
+          "assignment-max" => %{"supported_reasoning_levels" => ~w(low medium high max)}
+        }
+      }
+    }
+  end
+
+  defp request_options_with_effort(applied_effort, opts \\ []) do
+    requested_effort = Keyword.get(opts, :requested_effort, applied_effort)
+    payload = %{"model" => "gpt-4.1", "reasoning" => %{"effort" => requested_effort}}
+
+    %{}
+    |> RequestOptions.build("/backend-api/codex/responses", payload)
+    |> RequestOptions.put_routing(
+      reasoning_effort_decision: %Decision{
+        mode: Keyword.get(opts, :mode, :unrestricted),
+        configured_effort: Keyword.get(opts, :configured_effort),
+        requested_effort: requested_effort,
+        applied_effort: applied_effort
+      }
+    )
+  end
+
+  defp model_with_image_support(assignment_id, image_input?) do
+    %Model{
+      metadata: %{
+        "source_assignment_models" => %{
+          assignment_id => %{
+            "capabilities" => %{"responses" => true, "image_input" => image_input?}
+          }
+        }
+      }
+    }
+  end
+
+  defp random_image_input(0), do: Enum.random([nil, false, "input_image", "input_text"])
+
+  defp random_image_input(depth) do
+    case :rand.uniform(4) do
+      1 ->
+        %{
+          :type => Enum.random([nil, false, "input_image", "input_text"]),
+          "type" => Enum.random([nil, false, "input_image", "input_text"]),
+          :nested => random_image_input(depth - 1),
+          "nested" => random_image_input(depth - 1)
+        }
+
+      2 ->
+        %{:type => Enum.random([nil, false, "input_image", "input_text"])}
+
+      3 ->
+        %{"type" => Enum.random([nil, false, "input_image", "input_text"])}
+
+      4 ->
+        [random_image_input(depth - 1), random_image_input(depth - 1)]
+    end
+  end
+
+  defp legacy_payload_has_input_image?(payload) do
+    payload
+    |> Map.get("input")
+    |> legacy_has_input_image?()
+  end
+
+  defp legacy_has_input_image?(%{} = value) do
+    value = Map.new(value, fn {key, item_value} -> {to_string(key), item_value} end)
+
+    case value do
+      %{"type" => "input_image"} -> true
+      _value -> value |> Map.values() |> Enum.any?(&legacy_has_input_image?/1)
+    end
+  end
+
+  defp legacy_has_input_image?(values) when is_list(values),
+    do: Enum.any?(values, &legacy_has_input_image?/1)
+
+  defp legacy_has_input_image?(_value), do: false
+
+  defp put_test_quota_snapshots(route_state, windows_by_identity_id, as_of) do
+    identities =
+      Map.new(route_state.candidates, fn {_assignment, identity} -> {identity.id, identity} end)
+
+    snapshots =
+      Map.new(windows_by_identity_id, fn {identity_id, windows} ->
+        {identity_id, RoutingQuotaSnapshot.from_identity(Map.fetch!(identities, identity_id), windows, as_of)}
+      end)
+
+    RouteState.put_quota_snapshots(route_state, snapshots)
   end
 end

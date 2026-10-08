@@ -17,32 +17,46 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Continuity do
     :accepted_turn_state,
     :previous_response_id,
     :response_id,
+    :resolved_previous_response_assignment_id,
+    :previous_response_serving_mode,
     :session_header,
     :session_header_source,
     :session_key,
-    :conversation_key,
     :owner_instance_id,
+    :owner_instance_boot_id,
     :bridge_owner_lease_ttl_seconds,
     :reconnect_window_seconds,
     :codex_session,
-    :codex_turn_id,
-    :authenticated_owner_attach
+    :semantic_turn_key,
+    :turn_claim_key,
+    :request_claim_key,
+    :replay_claim_digest,
+    :authenticated_owner_attach,
+    upstream_previous_response_id?: false,
+    pooler_issued_turn_state?: false
   ]
 
   @type t :: %__MODULE__{
           accepted_turn_state: String.t() | nil,
           previous_response_id: String.t() | nil,
           response_id: String.t() | nil,
+          resolved_previous_response_assignment_id: Ecto.UUID.t() | nil,
+          previous_response_serving_mode: String.t() | nil,
           session_header: String.t() | nil,
           session_header_source: String.t() | nil,
           session_key: String.t() | nil,
-          conversation_key: String.t() | nil,
           owner_instance_id: String.t() | nil,
+          owner_instance_boot_id: String.t() | nil,
           bridge_owner_lease_ttl_seconds: pos_integer() | nil,
           reconnect_window_seconds: non_neg_integer() | nil,
           codex_session: term(),
-          codex_turn_id: Ecto.UUID.t() | nil,
-          authenticated_owner_attach: boolean()
+          semantic_turn_key: <<_::256>> | nil,
+          turn_claim_key: String.t() | nil,
+          request_claim_key: String.t() | nil,
+          replay_claim_digest: <<_::256>> | nil,
+          authenticated_owner_attach: boolean(),
+          upstream_previous_response_id?: boolean(),
+          pooler_issued_turn_state?: boolean()
         }
 
   @spec build(map() | keyword()) :: t()
@@ -56,22 +70,35 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Continuity do
       session_header: Map.get(opts, :session_header),
       session_header_source: session_header_source(Map.get(opts, :session_header_source)),
       session_key: Map.get(opts, :session_key),
-      conversation_key: Map.get(opts, :conversation_key),
       owner_instance_id: Map.get(opts, :owner_instance_id),
-      bridge_owner_lease_ttl_seconds:
-        Normalization.optional_positive_integer(Map.get(opts, :bridge_owner_lease_ttl_seconds)),
-      reconnect_window_seconds:
-        Normalization.optional_non_negative_integer(Map.get(opts, :reconnect_window_seconds)),
+      owner_instance_boot_id: Map.get(opts, :owner_instance_boot_id),
+      bridge_owner_lease_ttl_seconds: Normalization.optional_positive_integer(Map.get(opts, :bridge_owner_lease_ttl_seconds)),
+      reconnect_window_seconds: Normalization.optional_non_negative_integer(Map.get(opts, :reconnect_window_seconds)),
       codex_session: Map.get(opts, :codex_session),
-      codex_turn_id: Map.get(opts, :codex_turn_id),
-      authenticated_owner_attach: Map.get(opts, :authenticated_owner_attach, false) == true
+      semantic_turn_key: semantic_turn_key(Map.get(opts, :semantic_turn_key)),
+      turn_claim_key: turn_claim_key(Map.get(opts, :turn_claim_key)),
+      request_claim_key: request_claim_key(Map.get(opts, :request_claim_key)),
+      replay_claim_digest: digest(Map.get(opts, :replay_claim_digest)),
+      authenticated_owner_attach: Map.get(opts, :authenticated_owner_attach, false) == true,
+      upstream_previous_response_id?: false,
+      pooler_issued_turn_state?: false
     }
   end
 
+  # `pooler_issued_turn_state?` marks an `accepted_turn_state` the Pooler
+  # minted for a websocket upgrade that carried none. The released Codex client
+  # never sends that token on an upgrade (it is server-issued), so the issued
+  # value names the connection, not the client's continuity, and must not
+  # outrank the window when the session is keyed. Any other turn state put
+  # later comes from the client's own frame, so an update that replaces
+  # `accepted_turn_state` with a different value and does not restate the
+  # marker clears it; restating the same value keeps it.
   @spec update(t(), map() | keyword()) :: t()
   def update(%__MODULE__{} = continuity, updates) do
     updates
     |> Map.new()
+    |> Map.drop([:codex_turn_id])
+    |> clear_issued_turn_state_marker(continuity)
     |> Normalization.normalize_optional_update(
       :bridge_owner_lease_ttl_seconds,
       &Normalization.optional_positive_integer/1
@@ -81,8 +108,26 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Continuity do
       &Normalization.optional_non_negative_integer/1
     )
     |> Normalization.normalize_optional_update(:session_header_source, &session_header_source/1)
+    |> Normalization.normalize_optional_update(:semantic_turn_key, &semantic_turn_key/1)
+    |> Normalization.normalize_optional_update(:turn_claim_key, &turn_claim_key/1)
+    |> Normalization.normalize_optional_update(:request_claim_key, &request_claim_key/1)
+    |> Normalization.normalize_optional_update(:replay_claim_digest, &digest/1)
+    |> Normalization.normalize_optional_update(:previous_response_serving_mode, &serving_mode/1)
+    |> Normalization.normalize_optional_update(:upstream_previous_response_id?, &(&1 == true))
+    |> Normalization.normalize_optional_update(:pooler_issued_turn_state?, &(&1 == true))
     |> then(&struct!(continuity, &1))
   end
+
+  defp clear_issued_turn_state_marker(%{pooler_issued_turn_state?: _marker} = updates, _continuity),
+    do: updates
+
+  defp clear_issued_turn_state_marker(%{accepted_turn_state: value} = updates, %__MODULE__{accepted_turn_state: value}),
+    do: updates
+
+  defp clear_issued_turn_state_marker(%{accepted_turn_state: _other} = updates, _continuity),
+    do: Map.put(updates, :pooler_issued_turn_state?, false)
+
+  defp clear_issued_turn_state_marker(updates, _continuity), do: updates
 
   @spec session_header_source(term()) :: String.t() | nil
   def session_header_source(value) when is_atom(value) do
@@ -100,4 +145,47 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Continuity do
   end
 
   def session_header_source(_value), do: nil
+
+  @spec semantic_turn_key(term()) :: <<_::256>> | nil
+  defp semantic_turn_key(value) when is_binary(value) and byte_size(value) == 32, do: value
+  defp semantic_turn_key(_value), do: nil
+
+  @spec turn_claim_key(term()) :: String.t() | nil
+  defp turn_claim_key("codex-turn:" <> encoded = value) when byte_size(encoded) == 43 do
+    case Base.url_decode64(encoded, padding: false) do
+      {:ok, digest} when byte_size(digest) == 32 -> value
+      _invalid -> nil
+    end
+  end
+
+  defp turn_claim_key(_value), do: nil
+
+  @spec request_claim_key(term()) :: String.t() | nil
+  defp request_claim_key("codex-turn:" <> _encoded = value), do: turn_claim_key(value)
+
+  defp request_claim_key(prefix_and_encoded) when is_binary(prefix_and_encoded) do
+    with {prefix, encoded} <- split_request_claim(prefix_and_encoded),
+         true <- prefix in ["codex-request:", "codex-resume:", "codex-kind:"],
+         true <- byte_size(encoded) == 43,
+         {:ok, digest} when byte_size(digest) == 32 <- Base.url_decode64(encoded, padding: false) do
+      prefix <> encoded
+    else
+      _invalid -> nil
+    end
+  end
+
+  defp request_claim_key(_value), do: nil
+
+  defp split_request_claim(value) do
+    case :binary.split(value, ":") do
+      [name, encoded] -> {name <> ":", encoded}
+      _invalid -> :error
+    end
+  end
+
+  defp serving_mode(mode) when mode in ["full", "lite"], do: mode
+  defp serving_mode(_mode), do: nil
+
+  defp digest(value) when is_binary(value) and byte_size(value) == 32, do: value
+  defp digest(_value), do: nil
 end

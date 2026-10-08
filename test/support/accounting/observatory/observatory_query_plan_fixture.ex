@@ -8,11 +8,6 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanFixture do
   alias CodexPooler.Accounting.{LedgerEntry, Request, RequestLogFact}
   alias CodexPooler.Repo
 
-  @scope_indexes [
-    "requests_api_key_pool_admitted_idx",
-    "request_log_facts_pkey"
-  ]
-
   def set_statement_timeout do
     Repo.query!("SET LOCAL statement_timeout = '30s'")
 
@@ -24,8 +19,13 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanFixture do
     Repo.query!("SET LOCAL enable_hashjoin = off")
     Repo.query!("SET LOCAL enable_mergejoin = off")
 
+    # Incremental sort can prefer an unrelated admitted-at prefix index and
+    # filter API-key scope rows after the scan. The contract exercises the
+    # dedicated fully ordered scope index instead.
+    Repo.query!("SET LOCAL enable_incremental_sort = off")
+
     # Keep the scoped-request bitmap exact. With a lossy (page-level) bitmap the
-    # heap recheck rereads whole pages of the 7k-row fixture and removes the
+    # heap recheck rereads whole pages of the fixture and removes the
     # non-matching rows, which is non-deterministic and inflates the bounded
     # relation-work assertion; ample work_mem keeps the bitmap tuple-exact.
     Repo.query!("SET LOCAL work_mem = '256MB'")
@@ -37,11 +37,24 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanFixture do
     Repo.query!("SET LOCAL max_parallel_workers_per_gather = 0")
   end
 
+  # The plan choice is a cost comparison at fixture scale, so it follows the
+  # physical size of every `requests` and `request_log_facts` relation, and
+  # every earlier test's rolled-back rows leave dead heap and index pages in
+  # them. Rebuilding only the scope indexes kept any other index bloated: a
+  # competitor that wins on a fresh database (the full Pool/model index of
+  # findings#206 row 206-389) lost in a gate partition, so the contract passed
+  # there and failed alone. Rebuilding every index still left the heap bloated,
+  # and a compact `requests_model_id_index` then beat the composite over the
+  # bloated heap. Truncating both tables inside the sandbox transaction (it is
+  # rolled back with the test, cascading to the tables that reference them)
+  # gives the fixture new empty relations, so every run plans exactly as on a
+  # fresh database whatever ran before it (findings#206 row 206-391).
+  def start_from_empty_relations! do
+    Repo.query!("TRUNCATE requests, request_log_facts CASCADE")
+  end
+
   def refresh_statistics do
-    # Repeated sandbox rollbacks leave dead pages in these local test indexes.
-    Enum.each(@scope_indexes, &Repo.query!("REINDEX INDEX " <> &1))
-    Repo.query!("ANALYZE requests")
-    Repo.query!("ANALYZE request_log_facts")
+    CodexPooler.PlannerStatistics.analyze!(["requests", "request_log_facts"])
   end
 
   def insert_representative_rows! do
@@ -72,7 +85,6 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanFixture do
           model_id: model_id,
           admitted_at: timestamp,
           completed_at: timestamp,
-          idempotency_key: nil,
           correlation_id: "observatory-plan-#{fixture_ref}-#{index}"
         })
 
@@ -106,23 +118,18 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanFixture do
         timestamp = DateTime.add(upper_bound, -(rem(index * 13, 3_500) + 1), :second)
         build_pair.(index, pool.id, api_key.id, model.id, timestamp)
       end ++
-        for index <- 1..2_000 do
+        for index <- 1..480 do
           timestamp = DateTime.add(upper_bound, -(7_200 + index), :second)
           build_pair.(10_000 + index, pool.id, api_key.id, model.id, timestamp)
         end ++
-        for index <- 1..5_000 do
+        for index <- 1..480 do
           timestamp = DateTime.add(upper_bound, -(rem(index * 17, 3_500) + 1), :second)
           build_pair.(20_000 + index, pool.id, other_api_key.id, model.id, timestamp)
         end ++
-        [
-          build_pair.(
-            30_001,
-            wrong_pool.id,
-            api_key.id,
-            wrong_model.id,
-            DateTime.add(upper_bound, -100)
-          )
-        ]
+        for index <- 1..480 do
+          timestamp = DateTime.add(upper_bound, -(rem(index * 19, 3_500) + 1), :second)
+          build_pair.(30_000 + index, wrong_pool.id, api_key.id, wrong_model.id, timestamp)
+        end
 
     rows
     |> Enum.map(&elem(&1, 0))

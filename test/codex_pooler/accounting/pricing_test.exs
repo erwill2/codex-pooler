@@ -6,6 +6,7 @@ defmodule CodexPooler.Accounting.PricingTest do
   alias CodexPooler.Accounting.{LedgerEntry, RequestLogFact}
   alias CodexPooler.Catalog.{OpenAIPricingImporter, PricingSnapshot}
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Admin.ApiKeyPolicyForm
 
   import CodexPooler.AccountingTestSupport
   import CodexPooler.PoolerFixtures
@@ -59,10 +60,12 @@ defmodule CodexPooler.Accounting.PricingTest do
     test "explicit pricing refs price models from imported snapshots" do
       setup = accounting_setup()
 
+      # Only the pricing ref names the imported snapshot: neither the served upstream id nor
+      # the requested model has a price of its own, so a priced reservation proves the ref.
       priced_model =
         model_fixture(setup.pool, %{
-          exposed_model_id: "gpt-priced-ref",
-          upstream_model_id: "gpt-priced-ref",
+          exposed_model_id: "gpt-priced-exposed",
+          upstream_model_id: "provider-gpt-priced-upstream",
           pricing_ref: "gpt-priced-ref"
         })
 
@@ -99,6 +102,134 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(800))
     end
 
+    test "historical mixed-case identifiers resolve across exact and suffix availability paths" do
+      setup = accounting_setup()
+      unique = System.unique_integer([:positive])
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      cases = [
+        %{path: :exact, availability: :priced},
+        %{path: :exact, availability: :unavailable},
+        %{path: :suffix, availability: :priced},
+        %{path: :suffix, availability: :unavailable}
+      ]
+
+      Enum.each(cases, fn test_case ->
+        base_identifier =
+          "gpt-legacy-case-#{test_case.path}-#{test_case.availability}-#{unique}"
+
+        requested_identifier =
+          if test_case.path == :suffix, do: base_identifier <> "-spark", else: base_identifier
+
+        model =
+          model_fixture(setup.pool, %{
+            exposed_model_id: requested_identifier,
+            upstream_model_id: requested_identifier,
+            pricing_ref: requested_identifier
+          })
+
+        pricing_snapshot_fixture(setup.pricing, %{
+          model_identifier: base_identifier,
+          price_version: "older-canonical-#{test_case.path}-#{test_case.availability}",
+          config: pricing_config(%{"service_tier" => "priority"}),
+          effective_at: DateTime.add(timestamp, -120, :second),
+          captured_at: DateTime.add(timestamp, -120, :second)
+        })
+
+        historical_config =
+          case test_case.availability do
+            :priced ->
+              pricing_config(%{"service_tier" => "fast"})
+
+            :unavailable ->
+              pricing_config(%{
+                "service_tier" => "fast",
+                "availability" => "unavailable"
+              })
+          end
+
+        historical_attrs = %{
+          model_identifier: String.upcase(base_identifier),
+          price_version: "newer-historical-#{test_case.path}-#{test_case.availability}",
+          config: historical_config,
+          effective_at: DateTime.add(timestamp, -60, :second),
+          captured_at: DateTime.add(timestamp, -60, :second)
+        }
+
+        historical_attrs =
+          if test_case.availability == :unavailable do
+            Map.merge(historical_attrs, %{
+              input_token_micros: nil,
+              cached_input_token_micros: nil,
+              output_token_micros: nil,
+              reasoning_token_micros: nil,
+              request_base_micros: nil
+            })
+          else
+            historical_attrs
+          end
+
+        historical = pricing_snapshot_fixture(setup.pricing, historical_attrs)
+
+        assert {:ok, reserved} =
+                 Accounting.reserve(
+                   setup.auth,
+                   model,
+                   %{"model" => requested_identifier, "service_tier" => "priority"},
+                   %{
+                     correlation_id: "corr-legacy-case-#{test_case.path}-#{test_case.availability}-#{unique}"
+                   }
+                 )
+
+        case test_case.availability do
+          :priced ->
+            assert reserved.pricing_status == "priced"
+            assert reserved.pricing_snapshot.id == historical.id
+
+          :unavailable ->
+            assert reserved.pricing_status == "unpriced_unavailable_price_bucket"
+            assert is_nil(reserved.pricing_snapshot)
+        end
+
+        if test_case.path == :suffix do
+          assert reserved.reservation.details["alias"] == %{
+                   "source" => "suffix_inference",
+                   "from" => requested_identifier,
+                   "to" => String.upcase(base_identifier)
+                 }
+        else
+          refute Map.has_key?(reserved.reservation.details, "alias")
+        end
+      end)
+
+      missing_tier_identifier = "gpt-legacy-case-missing-tier-#{unique}"
+
+      missing_tier_model =
+        model_fixture(setup.pool, %{
+          exposed_model_id: missing_tier_identifier,
+          upstream_model_id: missing_tier_identifier,
+          pricing_ref: missing_tier_identifier
+        })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: String.upcase(missing_tier_identifier),
+        price_version: "historical-missing-tier",
+        config: pricing_config(%{"service_tier" => "standard"}),
+        effective_at: DateTime.add(timestamp, -60, :second),
+        captured_at: DateTime.add(timestamp, -60, :second)
+      })
+
+      assert {:ok, missing_tier_reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 missing_tier_model,
+                 %{"model" => missing_tier_identifier, "service_tier" => "flex"},
+                 %{correlation_id: "corr-legacy-case-missing-tier-#{unique}"}
+               )
+
+      assert missing_tier_reserved.pricing_status == "unpriced_missing_tier"
+    end
+
     test "models without pricing refs use upstream model pricing" do
       setup = accounting_setup()
 
@@ -123,6 +254,111 @@ defmodule CodexPooler.Accounting.PricingTest do
 
       assert reserved.pricing_status == "priced"
       assert reserved.pricing_snapshot.model_identifier == "gpt-unmapped"
+    end
+
+    # findings#236 item 11: `pricing_identifiers/3` is a precedence, not a set.
+    # A pricing import stamps one `effective_at` on every model it writes, so
+    # a model whose explicit ref and whose upstream model are both in the
+    # catalog used to tie, and row id picked the winner.
+    test "an explicit pricing ref outranks the upstream model identifier at every relative age" do
+      for {label, ref_offset, upstream_offset} <- [
+            {"equal", -60, -60},
+            {"ref-newer", -30, -60},
+            {"ref-older", -60, -30}
+          ] do
+        setup = accounting_setup()
+        unique = System.unique_integer([:positive])
+        now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+        ref_identifier = "pricing-ref-#{unique}"
+        upstream_identifier = "upstream-model-#{unique}"
+
+        model =
+          setup.pool
+          |> model_fixture(%{
+            exposed_model_id: "exposed-model-#{unique}",
+            upstream_model_id: upstream_identifier
+          })
+          |> Ecto.Changeset.change(pricing_ref: ref_identifier)
+          |> Repo.update!()
+
+        ref_pricing =
+          pricing_snapshot_fixture(setup.pricing, %{
+            model_identifier: ref_identifier,
+            input_token_micros: Decimal.new(1000),
+            output_token_micros: Decimal.new(2000),
+            effective_at: DateTime.add(now, ref_offset, :second),
+            captured_at: DateTime.add(now, ref_offset, :second)
+          })
+
+        pricing_snapshot_fixture(setup.pricing, %{
+          model_identifier: upstream_identifier,
+          input_token_micros: Decimal.new(1),
+          output_token_micros: Decimal.new(2),
+          effective_at: DateTime.add(now, upstream_offset, :second),
+          captured_at: DateTime.add(now, upstream_offset, :second)
+        })
+
+        assert {:ok, reserved} =
+                 Accounting.reserve(
+                   setup.auth,
+                   model,
+                   %{"model" => model.exposed_model_id},
+                   %{correlation_id: "corr-pricing-ref-#{label}-#{unique}"}
+                 )
+
+        assert reserved.pricing_snapshot.id == ref_pricing.id,
+               "expected the explicit pricing ref to win with #{label} snapshots"
+
+        assert reserved.request.request_metadata["pricing"]["snapshot"]["model_identifier"] ==
+                 ref_identifier
+      end
+    end
+
+    # Under an enforced-model key the requested model is only what the client
+    # typed; it need not name the model that was served, and it must never
+    # outrank the served model's own identifiers.
+    test "the requested model never outprices the model that was actually served" do
+      setup = accounting_setup()
+      unique = System.unique_integer([:positive])
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      served_identifier = "served-model-#{unique}"
+      asked_identifier = "asked-model-#{unique}"
+
+      served_model =
+        model_fixture(setup.pool, %{
+          exposed_model_id: served_identifier,
+          upstream_model_id: served_identifier
+        })
+
+      served_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          model_identifier: served_identifier,
+          input_token_micros: Decimal.new(1000),
+          output_token_micros: Decimal.new(2000),
+          effective_at: DateTime.add(now, -120, :second),
+          captured_at: DateTime.add(now, -120, :second)
+        })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: asked_identifier,
+        input_token_micros: Decimal.new(1),
+        output_token_micros: Decimal.new(2),
+        effective_at: DateTime.add(now, -30, :second),
+        captured_at: DateTime.add(now, -30, :second)
+      })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 served_model,
+                 %{"model" => asked_identifier},
+                 %{correlation_id: "corr-enforced-model-#{unique}", requested_model: asked_identifier}
+               )
+
+      assert reserved.pricing_snapshot.id == served_pricing.id
+
+      assert reserved.request.request_metadata["pricing"]["snapshot"]["model_identifier"] ==
+               served_identifier
     end
 
     test "exact pricing wins when both exact and suffix-inferred snapshots exist" do
@@ -479,6 +715,795 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert reserved.reservation.details["service_tier"] == "priority"
     end
 
+    test "new fast tier accounting facts are canonical while provider metadata stays unchanged" do
+      setup = accounting_setup()
+
+      priority_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "priority"}),
+          input_token_micros: Decimal.new(50),
+          output_token_micros: Decimal.new(75)
+        })
+
+      sensitive_prompt = "accounting-fast-tier-prompt-must-not-persist"
+      sensitive_token = "Bearer accounting-fast-tier-token-must-not-persist"
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "service_tier" => "fast",
+                   "input" => sensitive_prompt,
+                   "max_output_tokens" => 1
+                 },
+                 %{
+                   correlation_id: "corr-fast-tier-canonical-facts",
+                   request_metadata: %{"authorization" => sensitive_token}
+                 }
+               )
+
+      assert reserved.pricing_snapshot.id == priority_pricing.id
+      assert reserved.pricing_service_tier == "priority"
+      assert reserved.request.requested_service_tier == "priority"
+      assert reserved.request.service_tier == "priority"
+      assert reserved.request.request_metadata["pricing"]["requested_service_tier"] == "priority"
+      assert reserved.reservation.details["requested_service_tier"] == "priority"
+      assert reserved.reservation.details["service_tier"] == "priority"
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 2,
+                   output_tokens: 1,
+                   total_tokens: 3,
+                   service_tier: "fast"
+                 },
+                 %{
+                   response_status_code: 200,
+                   attempt_metadata: %{"service_tier" => "fast"}
+                 }
+               )
+
+      request = Repo.get!(CodexPooler.Accounting.Request, reserved.request.id)
+      persisted_attempt = Repo.get!(CodexPooler.Accounting.Attempt, attempt.id)
+
+      assert request.requested_service_tier == "priority"
+      assert request.actual_service_tier == "priority"
+      assert request.service_tier == "priority"
+      assert request.request_metadata["pricing"]["requested_service_tier"] == "priority"
+      assert request.request_metadata["pricing"]["actual_service_tier"] == "priority"
+      assert request.request_metadata["pricing"]["service_tier"] == "priority"
+      assert result.settlement.details["requested_service_tier"] == "priority"
+      assert result.settlement.details["actual_service_tier"] == "priority"
+      assert result.settlement.details["service_tier"] == "priority"
+      assert result.release.details["requested_service_tier"] == "priority"
+      assert result.release.details["actual_service_tier"] == "priority"
+      assert result.release.details["service_tier"] == "priority"
+      assert persisted_attempt.response_metadata["service_tier"] == "fast"
+
+      assert %{items: [log], total: 1} =
+               Accounting.list_request_logs(setup.pool,
+                 filters: [request_id: "corr-fast-tier-canonical-facts"]
+               )
+
+      assert log.requested_service_tier == "priority"
+      assert log.actual_service_tier == "priority"
+      assert log.service_tier == "priority"
+
+      accounting_text =
+        inspect([request, reserved.reservation, result.settlement, result.release, log])
+
+      refute accounting_text =~ sensitive_prompt
+      refute accounting_text =~ sensitive_token
+    end
+
+    @tag :ultrafast_service_tier
+    test "ultrafast reserves and settles against its exact snapshot without an alias" do
+      setup = accounting_setup()
+
+      ultrafast_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "ultrafast"}),
+          input_token_micros: Decimal.new(100),
+          output_token_micros: Decimal.new(200)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "service_tier" => "ultrafast",
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-ultrafast-exact-snapshot"}
+               )
+
+      assert reserved.pricing_status == "priced"
+      assert reserved.pricing_snapshot.id == ultrafast_pricing.id
+      assert reserved.pricing_service_tier == "ultrafast"
+      assert reserved.request.requested_service_tier == "ultrafast"
+      assert is_nil(reserved.request.actual_service_tier)
+      assert reserved.request.service_tier == "ultrafast"
+      assert reserved.request.request_metadata["pricing"]["requested_service_tier"] == "ultrafast"
+      assert reserved.request.request_metadata["pricing"]["actual_service_tier"] == nil
+      assert reserved.request.request_metadata["pricing"]["service_tier"] == "ultrafast"
+      refute Map.has_key?(reserved.request.request_metadata["pricing"], "alias")
+      assert reserved.reservation.pricing_snapshot_id == ultrafast_pricing.id
+      assert reserved.reservation.details["pricing_status"] == "priced"
+      assert reserved.reservation.details["requested_service_tier"] == "ultrafast"
+      assert reserved.reservation.details["actual_service_tier"] == nil
+      assert reserved.reservation.details["service_tier"] == "ultrafast"
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+      assert attempt.pricing_snapshot_id == ultrafast_pricing.id
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{status: "usage_known", input_tokens: 2, output_tokens: 1, total_tokens: 3},
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.pricing_snapshot_id == ultrafast_pricing.id
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.details["requested_service_tier"] == "ultrafast"
+      assert result.settlement.details["actual_service_tier"] == nil
+      assert result.settlement.details["service_tier"] == "ultrafast"
+      assert result.release.details["pricing_status"] == "priced"
+      assert result.release.details["requested_service_tier"] == "ultrafast"
+      assert result.release.details["actual_service_tier"] == nil
+      assert result.release.details["service_tier"] == "ultrafast"
+
+      persisted_attempt = Repo.get!(CodexPooler.Accounting.Attempt, attempt.id)
+      assert persisted_attempt.pricing_snapshot_id == ultrafast_pricing.id
+
+      assert %{items: [log], total: 1} =
+               Accounting.list_request_logs(setup.pool,
+                 filters: [request_id: "corr-ultrafast-exact-snapshot"]
+               )
+
+      assert log.requested_service_tier == "ultrafast"
+      assert is_nil(log.actual_service_tier)
+      assert log.service_tier == "ultrafast"
+      assert log.cost.status == "priced"
+    end
+
+    @tag :ultrafast_service_tier
+    test "actual ultrafast pricing overrides requested priority" do
+      setup = accounting_setup()
+
+      priority_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "priority"}),
+          input_token_micros: Decimal.new(50),
+          output_token_micros: Decimal.new(75)
+        })
+
+      ultrafast_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "ultrafast"}),
+          input_token_micros: Decimal.new(100),
+          output_token_micros: Decimal.new(200)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "service_tier" => "priority",
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-ultrafast-actual-overrides-priority"}
+               )
+
+      assert reserved.pricing_snapshot.id == priority_pricing.id
+      assert reserved.reservation.details["requested_service_tier"] == "priority"
+      assert reserved.reservation.details["actual_service_tier"] == nil
+      assert reserved.reservation.details["service_tier"] == "priority"
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 2,
+                   output_tokens: 1,
+                   total_tokens: 3,
+                   service_tier: "ultrafast"
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.pricing_snapshot_id == ultrafast_pricing.id
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.details["requested_service_tier"] == "priority"
+      assert result.settlement.details["actual_service_tier"] == "ultrafast"
+      assert result.settlement.details["service_tier"] == "ultrafast"
+      assert result.release.details["pricing_status"] == "priced"
+      assert result.release.details["requested_service_tier"] == "priority"
+      assert result.release.details["actual_service_tier"] == "ultrafast"
+      assert result.release.details["service_tier"] == "ultrafast"
+
+      request = Repo.get!(CodexPooler.Accounting.Request, reserved.request.id)
+      persisted_attempt = Repo.get!(CodexPooler.Accounting.Attempt, attempt.id)
+      assert request.requested_service_tier == "priority"
+      assert request.actual_service_tier == "ultrafast"
+      assert request.service_tier == "ultrafast"
+      assert request.request_metadata["pricing"]["status"] == "priced"
+      assert request.request_metadata["pricing"]["requested_service_tier"] == "priority"
+      assert request.request_metadata["pricing"]["actual_service_tier"] == "ultrafast"
+      assert request.request_metadata["pricing"]["service_tier"] == "ultrafast"
+      assert persisted_attempt.pricing_snapshot_id == priority_pricing.id
+
+      assert %{items: [log], total: 1} =
+               Accounting.list_request_logs(setup.pool,
+                 filters: [request_id: "corr-ultrafast-actual-overrides-priority"]
+               )
+
+      assert log.requested_service_tier == "priority"
+      assert log.actual_service_tier == "ultrafast"
+      assert log.service_tier == "ultrafast"
+      assert log.cost.status == "priced"
+    end
+
+    @tag :ultrafast_service_tier
+    test "missing ultrafast snapshots do not fall back to priority, fast, or standard" do
+      setup = accounting_setup()
+
+      priority_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "priority"}),
+          input_token_micros: Decimal.new(50),
+          output_token_micros: Decimal.new(75)
+        })
+
+      fast_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "fast"}),
+          input_token_micros: Decimal.new(125),
+          output_token_micros: Decimal.new(250)
+        })
+
+      assert {:ok, requested_missing} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "service_tier" => "ultrafast",
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-ultrafast-requested-missing-no-fallback"}
+               )
+
+      assert requested_missing.pricing_status == "unpriced_missing_tier"
+      assert is_nil(requested_missing.pricing_snapshot)
+      assert requested_missing.request.requested_service_tier == "ultrafast"
+      assert is_nil(requested_missing.request.actual_service_tier)
+      assert requested_missing.request.service_tier == "ultrafast"
+
+      assert requested_missing.request.request_metadata["pricing"]["status"] ==
+               "unpriced_missing_tier"
+
+      assert requested_missing.reservation.details["requested_service_tier"] == "ultrafast"
+      assert requested_missing.reservation.details["actual_service_tier"] == nil
+      assert requested_missing.reservation.details["service_tier"] == "ultrafast"
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "service_tier" => "priority",
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-ultrafast-missing-no-fallback"}
+               )
+
+      assert reserved.pricing_status == "priced"
+
+      assert reserved.pricing_snapshot.id in [
+               setup.pricing.id,
+               priority_pricing.id,
+               fast_pricing.id
+             ]
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 2,
+                   output_tokens: 1,
+                   total_tokens: 3,
+                   service_tier: "ultrafast"
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert is_nil(result.settlement.pricing_snapshot_id)
+      assert result.settlement.details["pricing_status"] == "unpriced_missing_tier"
+      assert result.settlement.details["requested_service_tier"] == "priority"
+      assert result.settlement.details["actual_service_tier"] == "ultrafast"
+      assert result.settlement.details["service_tier"] == "ultrafast"
+      assert result.release.details["pricing_status"] == "unpriced_missing_tier"
+      assert result.release.details["requested_service_tier"] == "priority"
+      assert result.release.details["actual_service_tier"] == "ultrafast"
+      assert result.release.details["service_tier"] == "ultrafast"
+
+      request = Repo.get!(CodexPooler.Accounting.Request, reserved.request.id)
+      persisted_attempt = Repo.get!(CodexPooler.Accounting.Attempt, attempt.id)
+      assert request.requested_service_tier == "priority"
+      assert request.actual_service_tier == "ultrafast"
+      assert request.service_tier == "ultrafast"
+      assert request.request_metadata["pricing"]["status"] == "unpriced_missing_tier"
+      assert request.request_metadata["pricing"]["requested_service_tier"] == "priority"
+      assert request.request_metadata["pricing"]["actual_service_tier"] == "ultrafast"
+      assert request.request_metadata["pricing"]["service_tier"] == "ultrafast"
+      assert persisted_attempt.pricing_snapshot_id == reserved.pricing_snapshot.id
+
+      assert %{items: [log], total: 1} =
+               Accounting.list_request_logs(setup.pool,
+                 filters: [request_id: "corr-ultrafast-missing-no-fallback"]
+               )
+
+      assert log.requested_service_tier == "priority"
+      assert log.actual_service_tier == "ultrafast"
+      assert log.service_tier == "ultrafast"
+      assert log.cost.status == "unpriced_missing_tier"
+    end
+
+    test "priority pricing aliases use recency before canonical tie breaking" do
+      setup = accounting_setup()
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      cases = [
+        %{
+          suffix: "newer-effective",
+          priority_effective_at: DateTime.add(timestamp, -180, :second),
+          priority_captured_at: DateTime.add(timestamp, -180, :second),
+          fast_effective_at: DateTime.add(timestamp, -120, :second),
+          fast_captured_at: DateTime.add(timestamp, -120, :second),
+          expected_tier: "fast"
+        },
+        %{
+          suffix: "newer-captured-revision",
+          priority_effective_at: DateTime.add(timestamp, -120, :second),
+          priority_captured_at: DateTime.add(timestamp, -180, :second),
+          fast_effective_at: DateTime.add(timestamp, -120, :second),
+          fast_captured_at: DateTime.add(timestamp, -60, :second),
+          expected_tier: "fast"
+        },
+        %{
+          suffix: "canonical-tie",
+          priority_effective_at: DateTime.add(timestamp, -120, :second),
+          priority_captured_at: DateTime.add(timestamp, -60, :second),
+          fast_effective_at: DateTime.add(timestamp, -120, :second),
+          fast_captured_at: DateTime.add(timestamp, -60, :second),
+          expected_tier: "priority"
+        }
+      ]
+
+      for test_case <- cases do
+        identifier = "gpt-priority-alias-#{test_case.suffix}"
+
+        model =
+          model_fixture(setup.pool, %{
+            exposed_model_id: identifier,
+            upstream_model_id: identifier,
+            pricing_ref: identifier
+          })
+
+        priority =
+          pricing_snapshot_fixture(setup.pricing, %{
+            model_identifier: identifier,
+            price_version: "priority-#{test_case.suffix}",
+            config: pricing_config(%{"service_tier" => "priority"}),
+            input_token_micros: Decimal.new(100),
+            output_token_micros: Decimal.new(200),
+            effective_at: test_case.priority_effective_at,
+            captured_at: test_case.priority_captured_at
+          })
+
+        fast =
+          pricing_snapshot_fixture(setup.pricing, %{
+            model_identifier: identifier,
+            price_version: "fast-#{test_case.suffix}",
+            config: pricing_config(%{"service_tier" => "fast"}),
+            input_token_micros: Decimal.new(300),
+            output_token_micros: Decimal.new(400),
+            effective_at: test_case.fast_effective_at,
+            captured_at: test_case.fast_captured_at
+          })
+
+        expected = if test_case.expected_tier == "priority", do: priority, else: fast
+
+        assert {:ok, reserved} =
+                 Accounting.reserve(
+                   setup.auth,
+                   model,
+                   %{"model" => identifier, "service_tier" => "priority"},
+                   %{correlation_id: "corr-priority-alias-#{test_case.suffix}"}
+                 )
+
+        assert reserved.pricing_snapshot.id == expected.id
+        assert reserved.reservation.details["service_tier"] == "priority"
+      end
+    end
+
+    test "priority pricing aliases order exact and suffix unavailable markers deterministically" do
+      setup = accounting_setup()
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      exact_identifier = "gpt-priority-unavailable-exact"
+
+      exact_model =
+        model_fixture(setup.pool, %{
+          exposed_model_id: exact_identifier,
+          upstream_model_id: exact_identifier,
+          pricing_ref: exact_identifier
+        })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: exact_identifier,
+        price_version: "exact-older-priority-priced",
+        config: pricing_config(%{"service_tier" => "priority"}),
+        effective_at: DateTime.add(timestamp, -180, :second),
+        captured_at: DateTime.add(timestamp, -180, :second)
+      })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: exact_identifier,
+        price_version: "exact-newer-fast-unavailable",
+        config: pricing_config(%{"service_tier" => "fast", "availability" => "unavailable"}),
+        input_token_micros: nil,
+        cached_input_token_micros: nil,
+        output_token_micros: nil,
+        reasoning_token_micros: nil,
+        request_base_micros: nil,
+        effective_at: DateTime.add(timestamp, -60, :second),
+        captured_at: DateTime.add(timestamp, -60, :second)
+      })
+
+      assert {:ok, exact_reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 exact_model,
+                 %{"model" => exact_identifier, "service_tier" => "priority"},
+                 %{correlation_id: "corr-priority-unavailable-exact"}
+               )
+
+      assert exact_reserved.pricing_status == "unpriced_unavailable_price_bucket"
+      assert is_nil(exact_reserved.pricing_snapshot)
+
+      suffix_base = "gpt-priority-unavailable-suffix"
+      suffix_identifier = suffix_base <> "-spark"
+
+      suffix_model =
+        model_fixture(setup.pool, %{
+          exposed_model_id: suffix_identifier,
+          upstream_model_id: suffix_identifier,
+          pricing_ref: suffix_identifier
+        })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: suffix_base,
+        price_version: "suffix-fast-priced-tie",
+        config: pricing_config(%{"service_tier" => "fast"}),
+        effective_at: DateTime.add(timestamp, -60, :second),
+        captured_at: DateTime.add(timestamp, -60, :second)
+      })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: suffix_base,
+        price_version: "suffix-priority-unavailable-tie",
+        config: pricing_config(%{"service_tier" => "priority", "availability" => "unavailable"}),
+        input_token_micros: nil,
+        cached_input_token_micros: nil,
+        output_token_micros: nil,
+        reasoning_token_micros: nil,
+        request_base_micros: nil,
+        effective_at: DateTime.add(timestamp, -60, :second),
+        captured_at: DateTime.add(timestamp, -60, :second)
+      })
+
+      assert {:ok, suffix_reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 suffix_model,
+                 %{"model" => suffix_identifier, "service_tier" => "fast"},
+                 %{correlation_id: "corr-priority-unavailable-suffix"}
+               )
+
+      assert suffix_reserved.pricing_status == "unpriced_unavailable_price_bucket"
+      assert is_nil(suffix_reserved.pricing_snapshot)
+
+      assert suffix_reserved.reservation.details["alias"] == %{
+               "source" => "suffix_inference",
+               "from" => suffix_identifier,
+               "to" => suffix_base
+             }
+    end
+
+    test "suffix-inferred priced aliases use the newest compatible tier spelling" do
+      setup = accounting_setup()
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      base_identifier = "gpt-priority-priced-suffix"
+      suffix_identifier = base_identifier <> "-spark"
+
+      model =
+        model_fixture(setup.pool, %{
+          exposed_model_id: suffix_identifier,
+          upstream_model_id: suffix_identifier,
+          pricing_ref: suffix_identifier
+        })
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: base_identifier,
+        price_version: "suffix-older-priority-priced",
+        config: pricing_config(%{"service_tier" => "priority"}),
+        input_token_micros: Decimal.new(100),
+        output_token_micros: Decimal.new(200),
+        effective_at: DateTime.add(timestamp, -120, :second),
+        captured_at: DateTime.add(timestamp, -120, :second)
+      })
+
+      newer_fast =
+        pricing_snapshot_fixture(setup.pricing, %{
+          model_identifier: base_identifier,
+          price_version: "suffix-newer-fast-priced",
+          config: pricing_config(%{"service_tier" => "fast"}),
+          input_token_micros: Decimal.new(300),
+          output_token_micros: Decimal.new(400),
+          effective_at: DateTime.add(timestamp, -60, :second),
+          captured_at: DateTime.add(timestamp, -60, :second)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 model,
+                 %{"model" => suffix_identifier, "service_tier" => "priority"},
+                 %{correlation_id: "corr-priority-priced-suffix"}
+               )
+
+      assert reserved.pricing_status == "priced"
+      assert reserved.pricing_snapshot.id == newer_fast.id
+      assert reserved.reservation.details["service_tier"] == "priority"
+
+      assert reserved.reservation.details["alias"] == %{
+               "source" => "suffix_inference",
+               "from" => suffix_identifier,
+               "to" => base_identifier
+             }
+    end
+
+    test "new priority revisions do not rewrite historical fast attempt references" do
+      setup = accounting_setup()
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      legacy_fast =
+        pricing_snapshot_fixture(setup.pricing, %{
+          price_version: "legacy-fast-attempt-reference",
+          config: pricing_config(%{"service_tier" => "fast"}),
+          effective_at: DateTime.add(timestamp, -120, :second),
+          captured_at: DateTime.add(timestamp, -120, :second)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "service_tier" => "priority"},
+                 %{correlation_id: "corr-legacy-fast-attempt-reference"}
+               )
+
+      assert reserved.pricing_snapshot.id == legacy_fast.id
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+      assert attempt.pricing_snapshot_id == legacy_fast.id
+
+      newer_priority =
+        pricing_snapshot_fixture(setup.pricing, %{
+          price_version: "newer-priority-after-fast-attempt",
+          config: pricing_config(%{"service_tier" => "priority"}),
+          effective_at: DateTime.add(timestamp, -60, :second),
+          captured_at: DateTime.add(timestamp, -60, :second)
+        })
+
+      assert {:ok, newer_reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "service_tier" => "fast"},
+                 %{correlation_id: "corr-new-priority-after-fast-attempt"}
+               )
+
+      assert newer_reserved.pricing_snapshot.id == newer_priority.id
+
+      assert Repo.get!(CodexPooler.Accounting.Attempt, attempt.id).pricing_snapshot_id ==
+               legacy_fast.id
+
+      assert Repo.get!(PricingSnapshot, legacy_fast.id).config["service_tier"] == "fast"
+    end
+
+    # findings#244. With no scale snapshot and no tier reported on the response,
+    # the resolver keeps tier isolation instead of borrowing standard or
+    # priority rates. The settled zero is only readable alongside its unpriced
+    # status; it does not mean the usage was free.
+    test "a requested scale tier with no snapshot and no reported tier settles unpriced" do
+      setup = accounting_setup()
+
+      pricing_snapshot_fixture(setup.pricing, %{
+        config: pricing_config(%{"service_tier" => "priority"}),
+        input_token_micros: Decimal.new(50),
+        output_token_micros: Decimal.new(75)
+      })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "service_tier" => "scale"},
+                 %{correlation_id: "corr-scale-unpriced"}
+               )
+
+      # Not `unpriced_unsupported_tier`: the tier is understood, the rate is
+      # simply not published.
+      assert reserved.pricing_status == "unpriced_missing_tier"
+      assert is_nil(reserved.pricing_snapshot)
+      assert reserved.reservation.details["service_tier"] == "scale"
+      assert reserved.reservation.details["requested_service_tier"] == "scale"
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{status: "usage_known", input_tokens: 100, output_tokens: 10, total_tokens: 110},
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.details["pricing_status"] == "unpriced_missing_tier"
+      assert is_nil(result.settlement.pricing_snapshot_id)
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(0))
+    end
+
+    # Snapshot lookup and settlement only: the snapshot is inserted directly, so
+    # this says nothing about whether the importer accepts a scale tier.
+    test "a stored scale snapshot is the one a scale request resolves and settles against" do
+      setup = accounting_setup()
+
+      scale_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"service_tier" => "scale"}),
+          input_token_micros: Decimal.new(10),
+          output_token_micros: Decimal.new(20)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "service_tier" => "scale"},
+                 %{correlation_id: "corr-scale-priced"}
+               )
+
+      assert reserved.pricing_status == "priced"
+      assert reserved.pricing_snapshot.id == scale_pricing.id
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{status: "usage_known", input_tokens: 100, output_tokens: 10, total_tokens: 110},
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.pricing_snapshot_id == scale_pricing.id
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.details["service_tier"] == "scale"
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(1200))
+    end
+
+    # Requesting scale does not by itself decide the priced tier: a tier the
+    # response reports takes precedence, exactly as it does for every other
+    # requested tier.
+    test "a reported tier outranks a requested scale tier at settlement" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "service_tier" => "scale"},
+                 %{correlation_id: "corr-scale-actual-precedence"}
+               )
+
+      assert reserved.pricing_status == "unpriced_missing_tier"
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 100,
+                   output_tokens: 10,
+                   total_tokens: 110,
+                   service_tier: "default"
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.details["requested_service_tier"] == "scale"
+      assert result.settlement.details["actual_service_tier"] == "default"
+      assert result.settlement.details["service_tier"] == "standard"
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.pricing_snapshot_id == setup.pricing.id
+    end
+
+    # The guard that makes this class of drift impossible rather than fixing
+    # this instance of it: a tier an operator can pin must never reach pricing
+    # as an unknown one.
+    test "every service tier an operator can pin is a tier pricing understands" do
+      for {label, tier} <- ApiKeyPolicyForm.service_tier_options(), tier != "" do
+        setup = accounting_setup()
+
+        assert {:ok, reserved} =
+                 Accounting.reserve(
+                   setup.auth,
+                   setup.model,
+                   %{"model" => setup.model.exposed_model_id},
+                   %{
+                     correlation_id: "corr-pinned-#{tier}-#{System.unique_integer([:positive])}",
+                     api_key_policy: %{enforced_service_tier: tier}
+                   }
+                 )
+
+        refute reserved.pricing_status == "unpriced_unsupported_tier",
+               "#{label} (#{tier}) reaches pricing as an unsupported tier"
+      end
+    end
+
+    test "only a tier pricing has never heard of reports an unsupported tier" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "service_tier" => "turbocharged"},
+                 %{correlation_id: "corr-unknown-tier"}
+               )
+
+      assert reserved.pricing_status == "unpriced_unsupported_tier"
+      assert is_nil(reserved.pricing_snapshot)
+    end
+
     test "auto service tier is unpriced until actual response tier is known" do
       setup = accounting_setup()
 
@@ -527,7 +1552,11 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert request.request_metadata["pricing"]["actual_service_tier"] == "priority"
     end
 
-    test "explicit priority settles at standard pricing when upstream returns default" do
+    # The ChatGPT Codex backend echoes `default` for every request that asked
+    # for `priority`, while it serves and meters it as Fast (the provider bills
+    # Fast at a multiple of the standard credit rate), so a `default` echo does
+    # not downgrade the priced tier (findings#206 row 206-271).
+    test "explicit priority keeps priority pricing when the Codex backend echoes default" do
       setup = accounting_setup()
 
       priority_pricing =
@@ -561,11 +1590,29 @@ defmodule CodexPooler.Accounting.PricingTest do
                  %{response_status_code: 200, attempt_metadata: %{"service_tier" => "default"}}
                )
 
-      assert result.settlement.pricing_snapshot_id == setup.pricing.id
+      assert result.settlement.pricing_snapshot_id == priority_pricing.id
       assert result.settlement.details["requested_service_tier"] == "priority"
       assert result.settlement.details["actual_service_tier"] == "default"
-      assert result.settlement.details["service_tier"] == "standard"
-      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(40))
+      assert result.settlement.details["service_tier"] == "priority"
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(400))
+
+      # The ChatGPT Codex backend reports `default` for priority requests. The
+      # request row and the request log keep all three tiers apart, so the
+      # requested-versus-reported mismatch is derivable without extra metadata.
+      request = Repo.get!(CodexPooler.Accounting.Request, reserved.request.id)
+      assert request.requested_service_tier == "priority"
+      assert request.actual_service_tier == "default"
+      assert request.service_tier == "priority"
+
+      assert %{items: [log], total: 1} =
+               Accounting.list_request_logs(setup.pool,
+                 filters: [request_id: "corr-priority-downgraded-to-default"]
+               )
+
+      assert log.requested_service_tier == "priority"
+      assert log.actual_service_tier == "default"
+      assert log.service_tier == "priority"
+      assert log.cost.pricing_availability == "priced"
     end
 
     test "auto service tier settles from normalized upstream usage tier" do
@@ -656,7 +1703,60 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert result.settlement.pricing_snapshot_id == long_context_pricing.id
       assert result.settlement.details["pricing_status"] == "priced"
       assert result.settlement.details["price_bucket"] == "long_context"
+      refute Map.has_key?(result.settlement.details, "price_bucket_fallback")
+      refute Map.has_key?(result.request.request_metadata["pricing"], "price_bucket_fallback")
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(5_440_080))
+    end
+
+    # The gap findings#236 names: the settled bucket alone cannot distinguish a
+    # long-context turn priced at default rates from an ordinary one. The
+    # substitution is recorded beside the bucket, and it changes nothing else.
+    test "long-context usage with no long-context snapshot records the default-bucket substitution" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id},
+                 %{correlation_id: "corr-long-context-exact-fallback"}
+               )
+
+      assert reserved.pricing_status == "priced"
+      assert reserved.reservation.details["price_bucket"] == "default"
+      refute Map.has_key?(reserved.reservation.details, "price_bucket_fallback")
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 272_001,
+                   output_tokens: 2,
+                   total_tokens: 272_003
+                 },
+                 %{response_status_code: 200}
+               )
+
+      expected_fallback = %{
+        "requested" => "long_context",
+        "selected" => "default",
+        "reason" => "long_context_pricing_absent"
+      }
+
+      assert result.settlement.pricing_snapshot_id == setup.pricing.id
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.details["price_bucket"] == "default"
+      assert result.settlement.details["price_bucket_fallback"] == expected_fallback
+      refute Map.has_key?(result.settlement.details, "alias")
+
+      assert result.request.request_metadata["pricing"]["price_bucket_fallback"] ==
+               expected_fallback
+
+      assert result.request.request_metadata["pricing"]["price_bucket"] == "default"
     end
 
     test "explicit unavailable default bucket overrides older priced snapshot" do
@@ -751,6 +1851,11 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert result.settlement.details["pricing_status"] == "unpriced_unavailable_price_bucket"
       assert result.settlement.details["price_bucket"] == "long_context"
       assert result.settlement.details["settled_cost_micros"] == nil
+
+      # The requested bucket is the one that was resolved, so nothing was
+      # substituted: an explicitly unavailable bucket is its own status.
+      refute Map.has_key?(result.settlement.details, "price_bucket_fallback")
+
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(0))
     end
 
@@ -811,6 +1916,18 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert result.settlement.details["pricing_status"] == "priced"
       assert result.settlement.details["price_bucket"] == "default"
       assert result.settlement.details["alias"] == expected_alias
+
+      # A suffix-inferred fallback carries both provenance facts: the alias
+      # says which identifier was priced, the substitution says which bucket.
+      assert result.settlement.details["price_bucket_fallback"] == %{
+               "requested" => "long_context",
+               "selected" => "default",
+               "reason" => "long_context_pricing_absent"
+             }
+
+      assert result.request.request_metadata["pricing"]["price_bucket_fallback"] ==
+               result.settlement.details["price_bucket_fallback"]
+
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(27_200_500))
     end
 
@@ -962,6 +2079,96 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert Decimal.equal?(log.cost.usd, Decimal.new("0.000910"))
     end
 
+    test "settlement preserves absent and explicit-zero cached reads through request facts" do
+      setup = accounting_setup()
+
+      for {suffix, cached_input_tokens} <- [{"absent", :absent}, {"zero", 0}, {"positive", 4}] do
+        assert {:ok, reserved} =
+                 Accounting.reserve(
+                   setup.auth,
+                   setup.model,
+                   %{"model" => setup.model.exposed_model_id, "max_output_tokens" => 1},
+                   %{correlation_id: "corr-cached-read-#{suffix}"}
+                 )
+
+        assert is_nil(reserved.reservation.cached_input_tokens)
+        assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+        usage = %{
+          status: "usage_known",
+          input_tokens: 10,
+          output_tokens: 2,
+          total_tokens: 12
+        }
+
+        usage =
+          if cached_input_tokens == :absent,
+            do: usage,
+            else: Map.put(usage, :cached_input_tokens, cached_input_tokens)
+
+        assert {:ok, result} =
+                 Accounting.finalize_success(
+                   reserved.request,
+                   attempt,
+                   usage,
+                   %{response_status_code: 200}
+                 )
+
+        expected = if cached_input_tokens == :absent, do: nil, else: cached_input_tokens
+        fact = Repo.get!(RequestLogFact, reserved.request.id)
+
+        assert result.settlement.cached_input_tokens == expected
+        assert fact.latest_cached_input_tokens == expected
+
+        assert %{items: [log], total: 1} =
+                 Accounting.list_request_logs(setup.pool,
+                   filters: %{request_id: reserved.request.id}
+                 )
+
+        assert log.token_counts.cached_input_tokens == expected
+      end
+    end
+
+    test "distinct output rates charge reasoning as an output subset without changing totals" do
+      setup =
+        accounting_setup(%{
+          input_token_micros: Decimal.new(0),
+          cached_input_token_micros: Decimal.new(0),
+          output_token_micros: Decimal.new(20),
+          reasoning_token_micros: Decimal.new(70),
+          request_base_micros: Decimal.new(0)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "max_output_tokens" => 1},
+                 %{correlation_id: "corr-distinct-reasoning-rate"}
+               )
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 5,
+                   output_tokens: 10,
+                   reasoning_tokens: 3,
+                   total_tokens: 15
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.output_tokens == 10
+      assert result.settlement.reasoning_tokens == 3
+      assert result.settlement.total_tokens == 15
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(350))
+    end
+
     test "cache-write usage preserves nil, zero, and positive counters in ledger and request facts" do
       setup = accounting_setup()
 
@@ -1101,13 +2308,22 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert result.settlement.details["price_bucket"] == "default"
 
       assert result.settlement.details["price_version"] ==
-               "#{DateTime.to_iso8601(generated_at)}:importer-format-1"
+               "#{DateTime.to_iso8601(generated_at)}:importer-format-2"
 
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(99))
       assert result.settlement.details["cache_write_rate_status"] == "available"
-      assert result.settlement.details["cache_write_token_micros"] == "7"
-      assert result.settlement.details["cache_write_cost_micros"] == "21"
-      assert result.settlement.details["pricing_importer_revision"] == 1
+
+      assert Decimal.equal?(
+               Decimal.new(result.settlement.details["cache_write_token_micros"]),
+               Decimal.new(7)
+             )
+
+      assert Decimal.equal?(
+               Decimal.new(result.settlement.details["cache_write_cost_micros"]),
+               Decimal.new(21)
+             )
+
+      assert result.settlement.details["pricing_importer_revision"] in [2, "2"]
     end
 
     test "explicit zero cache writes remain priced without a cache-write rate" do
@@ -1309,8 +2525,7 @@ defmodule CodexPooler.Accounting.PricingTest do
         })
 
       for {suffix, payload, usage, expected_snapshot, expected_rate} <- [
-            {"priority-short", %{"service_tier" => "priority"}, %{input_tokens: 10},
-             priority_pricing, "11"},
+            {"priority-short", %{"service_tier" => "priority"}, %{input_tokens: 10}, priority_pricing, "11"},
             {"standard-long", %{}, %{input_tokens: 272_001}, long_context_pricing, "13"}
           ] do
         assert {:ok, reserved} =

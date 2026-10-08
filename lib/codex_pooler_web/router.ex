@@ -2,14 +2,15 @@ defmodule CodexPoolerWeb.Router do
   use CodexPoolerWeb, :router
 
   import CodexPoolerWeb.UserAuth
-  alias CodexPoolerWeb.V1.UnsupportedRoutes
+  alias CodexPoolerWeb.Layouts
+  alias CodexPoolerWeb.Plugs.{AdminBrowserAdmission, ObservatoryAuth}
   require CodexPoolerWeb.DevRoutes
 
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
     plug :fetch_live_flash
-    plug :put_root_layout, html: {CodexPoolerWeb.Layouts, :root}
+    plug :put_browser_root_layout
     plug :protect_from_forgery
 
     plug :put_secure_browser_headers, %{
@@ -17,14 +18,14 @@ defmodule CodexPoolerWeb.Router do
     }
 
     plug :fetch_current_scope_for_user
-    plug CodexPoolerWeb.Plugs.AdminBrowserAdmission
+    plug :admin_browser_admission
   end
 
   pipeline :observatory_browser do
     plug :accepts, ["html"]
     plug :fetch_session
     plug :fetch_live_flash
-    plug :put_root_layout, html: {CodexPoolerWeb.Layouts, :root}
+    plug :put_browser_root_layout
     plug :protect_from_forgery
 
     plug :put_secure_browser_headers, %{
@@ -33,7 +34,7 @@ defmodule CodexPoolerWeb.Router do
   end
 
   pipeline :observatory_authenticated_browser do
-    plug CodexPoolerWeb.Plugs.ObservatoryAuth
+    plug :observatory_auth
   end
 
   pipeline :api do
@@ -146,15 +147,27 @@ defmodule CodexPoolerWeb.Router do
     post "/images/generations", V1.ImagesController, :generations
     post "/images/edits", V1.ImagesController, :edits
 
-    for {method, path, action} <- UnsupportedRoutes.router_routes() do
-      match method, path, V1.UnsupportedController, action
-    end
+    post "/images/variations", V1.UnsupportedController, :unsupported_post
+    post "/content_provenance_checks", V1.UnsupportedController, :unsupported_post
+    post "/embeddings", V1.UnsupportedController, :unsupported_post
+    post "/batches", V1.UnsupportedController, :unsupported_post
+    post "/moderations", V1.UnsupportedController, :unsupported_post
+    post "/fine_tuning/jobs", V1.UnsupportedController, :unsupported_post
+    get "/responses/:response_id", V1.UnsupportedController, :unsupported_get
+    post "/responses/:response_id/cancel", V1.UnsupportedController, :unsupported_post
+    delete "/responses/:response_id", V1.UnsupportedController, :unsupported_delete
   end
 
   scope "/v1", CodexPoolerWeb do
     pipe_through [:binary_accept_json, :api]
 
     get "/files/:file_id/content", V1.FilesController, :content
+  end
+
+  scope "/admin", CodexPoolerWeb.Admin do
+    pipe_through [:browser, :require_authenticated_password_current]
+
+    get "/upstreams/:id/saved-reset-expirations.ics", UpstreamCalendarController, :download
   end
 
   scope "/", CodexPoolerWeb do
@@ -171,10 +184,12 @@ defmodule CodexPoolerWeb.Router do
       on_mount: [{CodexPoolerWeb.UserAuth, :require_authenticated_password_current}] do
       live "/admin/operators", Admin.OperatorsLive, :index
       live "/admin/request-logs", Admin.RequestLogsLive, :index
+      live "/admin/lens", Admin.LensLive, :index
       live "/admin/pools", Admin.PoolsLive, :index
       live "/admin/stats", Admin.StatsLive, :index
       live "/admin/jobs", Admin.JobsLive, :index
       live "/admin/system", Admin.SystemLive, :index
+      live "/admin/incidents", Admin.IncidentsLive, :index
       live "/admin/alerts", Admin.AlertsLive, :index
       live "/admin/upstreams", Admin.UpstreamsLive, :index
       live "/admin/upstreams/:id", Admin.UpstreamCockpitLive, :show
@@ -187,6 +202,18 @@ defmodule CodexPoolerWeb.Router do
 
   # Enable LiveDashboard and Swoosh mailbox preview in development.
   CodexPoolerWeb.DevRoutes.live_dashboard_routes()
+
+  defp put_browser_root_layout(conn, _opts) do
+    Phoenix.Controller.put_root_layout(conn, html: {Layouts, :root})
+  end
+
+  defp admin_browser_admission(conn, opts) do
+    AdminBrowserAdmission.call(conn, opts)
+  end
+
+  defp observatory_auth(conn, opts) do
+    ObservatoryAuth.call(conn, opts)
+  end
 
   defp put_secure_browser_headers(conn, _baseline_headers) do
     Phoenix.Controller.put_secure_browser_headers(

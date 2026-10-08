@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
   @moduledoc false
 
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.EventTaxonomy
   alias CodexPooler.TransportFailureReason, as: SharedTransportFailureReason
 
   @max_reason_length 96
@@ -13,8 +14,78 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
     request
     send_control
     send_payload
+    terminal_delivery
     unexpected_frame
     upstream_close
+  )
+  @allowed_terminal_candidate_types [
+    "response.completed",
+    "response.done",
+    "response.failed",
+    "response.incomplete",
+    "error",
+    "legacy_response"
+  ]
+  @allowed_terminal_candidate_classes ~w(success failure legacy_success)
+  @allowed_terminal_candidate_rejections ~w(
+    missing_response_object
+    invalid_response_status
+    invalid_legacy_id
+    parser_rejected
+  )
+  @allowed_termination_sources ~w(
+    connection_establish_error
+    continuation_generation_guard
+    mint_stream_done
+    mint_transport_error
+    payload_send_error
+    peer_close_frame
+    pooler_pong_deadline
+    pooler_receive_timeout
+    request_caller_down
+    session_unavailable
+    unexpected_binary_frame
+    upstream_terminal_event
+    websocket_control_send_error
+    websocket_decode_error
+  )
+  @allowed_transport_signals ~w(
+    ssl_closed
+    ssl_data
+    ssl_error
+    tcp_closed
+    tcp_data
+    tcp_error
+  )
+  @allowed_connection_uses ~w(fresh reconnected reused)
+  @allowed_connection_request_buckets ~w(
+    first
+    requests_2_5
+    requests_6_20
+    requests_21_50
+    requests_51_plus
+  )
+  @allowed_connection_age_buckets ~w(
+    under_1m
+    minutes_1_5
+    minutes_5_15
+    minutes_15_30
+    minutes_30_plus
+  )
+  @allowed_connection_idle_buckets ~w(
+    first_request
+    under_5s
+    seconds_5_30
+    seconds_30_to_2m
+    minutes_2_10
+    minutes_10_30
+    minutes_30_plus
+  )
+  @allowed_websocket_buffer_buckets ~w(
+    empty
+    bytes_1_125
+    bytes_126_1024
+    bytes_1025_plus
   )
 
   @type transport_failure_metadata :: %{String.t() => String.t() | non_neg_integer() | boolean()}
@@ -33,15 +104,157 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
   defdelegate safe_exception(reason), to: SharedTransportFailureReason
 
   @spec transport_failure_metadata(term(), map()) :: transport_failure_metadata()
+  def transport_failure_metadata(reason, attrs)
+      when reason in [:previous_response_generation_mismatch, :previous_response_serving_mode_mismatch] and is_map(attrs) do
+    continuation_generation_guard_metadata(reason, metadata_attr(attrs, "connection_use", :connection_use))
+  end
+
   def transport_failure_metadata(reason, attrs) when is_map(attrs) do
     %{
       "exception" => safe_exception(reason),
       "reason_class" => safe_reason_class(reason),
       "reason" => safe_metadata_reason(reason),
       "phase" => safe_phase(Map.get(attrs, :phase) || Map.get(attrs, "phase")),
+      "termination_source" => safe_termination_source(metadata_attr(attrs, "termination_source", :termination_source)),
+      "transport_signal" => safe_transport_signal(metadata_attr(attrs, "transport_signal", :transport_signal)),
+      "connection_use" => safe_connection_use(metadata_attr(attrs, "connection_use", :connection_use)),
+      "connection_request_bucket" => safe_connection_request_bucket(metadata_attr(attrs, "connection_request_bucket", :connection_request_bucket)),
+      "connection_age_bucket" => safe_connection_age_bucket(metadata_attr(attrs, "connection_age_bucket", :connection_age_bucket)),
+      "connection_idle_bucket" => safe_connection_idle_bucket(metadata_attr(attrs, "connection_idle_bucket", :connection_idle_bucket)),
+      "websocket_buffer_bucket" => safe_websocket_buffer_bucket(metadata_attr(attrs, "websocket_buffer_bucket", :websocket_buffer_bucket)),
+      "websocket_fragment_open" => safe_boolean(metadata_attr(attrs, "websocket_fragment_open", :websocket_fragment_open)),
       "pre_visible_output" => safe_boolean(Map.get(attrs, :pre_visible_output)),
+      "upstream_committed" => safe_boolean(metadata_attr(attrs, "upstream_committed", :upstream_committed)),
       "terminal_seen" => safe_boolean(Map.get(attrs, :terminal_seen)),
-      "text_frame_count" => safe_non_negative_integer(Map.get(attrs, :text_frame_count))
+      "terminal_forwarded" => safe_boolean(metadata_attr(attrs, "terminal_forwarded", :terminal_forwarded)),
+      "last_upstream_event_type" => safe_last_upstream_event_type(metadata_attr(attrs, "last_upstream_event_type", :last_upstream_event_type)),
+      "last_upstream_event_class" => safe_last_upstream_event_class(metadata_attr(attrs, "last_upstream_event_class", :last_upstream_event_class)),
+      "terminal_candidate_seen" => safe_boolean(metadata_attr(attrs, "terminal_candidate_seen", :terminal_candidate_seen)),
+      "terminal_candidate_type" => safe_terminal_candidate_type(metadata_attr(attrs, "terminal_candidate_type", :terminal_candidate_type)),
+      "terminal_candidate_class" => safe_terminal_candidate_class(metadata_attr(attrs, "terminal_candidate_class", :terminal_candidate_class)),
+      "terminal_candidate_rejection" =>
+        safe_terminal_candidate_rejection(
+          metadata_attr(
+            attrs,
+            "terminal_candidate_rejection",
+            :terminal_candidate_rejection
+          )
+        ),
+      "text_frame_count" => safe_non_negative_integer(Map.get(attrs, :text_frame_count)),
+      "peer_close_code" => safe_peer_close_code(metadata_attr(attrs, "peer_close_code", :peer_close_code)),
+      "peer_close_reason_present" => safe_boolean(metadata_attr(attrs, "peer_close_reason_present", :peer_close_reason_present)),
+      "peer_close_reason_bytes" => safe_peer_close_reason_bytes(metadata_attr(attrs, "peer_close_reason_bytes", :peer_close_reason_bytes))
+    }
+    |> compact_metadata()
+  end
+
+  @spec sanitize_transport_failure_metadata(term()) :: transport_failure_metadata()
+  def sanitize_transport_failure_metadata(metadata) when is_map(metadata) do
+    if continuation_generation_guard_candidate?(metadata) do
+      sanitize_continuation_generation_guard_metadata(metadata)
+    else
+      sanitize_general_transport_failure_metadata(metadata)
+    end
+  end
+
+  def sanitize_transport_failure_metadata(_metadata), do: %{}
+
+  @spec continuation_generation_guard_metadata(term()) :: transport_failure_metadata()
+  def continuation_generation_guard_metadata(connection_use),
+    do: continuation_generation_guard_metadata(:previous_response_generation_mismatch, connection_use)
+
+  # The guard refuses a connection-bound anchor before sending: on a fresh or
+  # reconnected connection because the anchor belongs to another one, and on a
+  # reused connection only because its provider context was built under the
+  # other Full/Lite serving mode (findings#232 row 232-210).
+  @spec continuation_generation_guard_metadata(term(), term()) :: transport_failure_metadata()
+  def continuation_generation_guard_metadata(:previous_response_generation_mismatch = reason, connection_use)
+      when connection_use in [:fresh, :reconnected, "fresh", "reconnected"],
+      do: continuation_generation_guard_diagnostic(reason, connection_use)
+
+  def continuation_generation_guard_metadata(:previous_response_serving_mode_mismatch = reason, connection_use)
+      when connection_use in [:reused, "reused"],
+      do: continuation_generation_guard_diagnostic(reason, connection_use)
+
+  def continuation_generation_guard_metadata(_reason, _connection_use), do: %{}
+
+  defp continuation_generation_guard_diagnostic(reason, connection_use) do
+    %{
+      "connection_use" => to_string(connection_use),
+      "phase" => "send_payload",
+      "pre_visible_output" => true,
+      "reason" => Atom.to_string(reason),
+      "reason_class" => Atom.to_string(reason),
+      "termination_source" => "continuation_generation_guard",
+      "terminal_seen" => false,
+      "text_frame_count" => 0,
+      "upstream_committed" => false
+    }
+  end
+
+  @spec sanitize_continuation_generation_guard_metadata(term()) ::
+          transport_failure_metadata()
+  def sanitize_continuation_generation_guard_metadata(metadata) when is_map(metadata) do
+    expected =
+      continuation_generation_guard_metadata(
+        continuation_guard_reason(metadata_attr(metadata, "reason", :reason)),
+        metadata_attr(metadata, "connection_use", :connection_use)
+      )
+
+    if guard_metadata_matches_expected?(metadata, expected) do
+      expected
+    else
+      %{}
+    end
+  end
+
+  def sanitize_continuation_generation_guard_metadata(_metadata), do: %{}
+
+  defp sanitize_general_transport_failure_metadata(metadata) do
+    %{
+      "exception" => safe_exception_name(metadata_attr(metadata, "exception", :exception)),
+      "reason_class" => safe_reason_class_name(metadata_attr(metadata, "reason_class", :reason_class)),
+      "reason" => safe_metadata_identifier(metadata_attr(metadata, "reason", :reason)),
+      "phase" => safe_phase(metadata_attr(metadata, "phase", :phase)),
+      "termination_source" => safe_termination_source(metadata_attr(metadata, "termination_source", :termination_source)),
+      "transport_signal" => safe_transport_signal(metadata_attr(metadata, "transport_signal", :transport_signal)),
+      "connection_use" => safe_connection_use(metadata_attr(metadata, "connection_use", :connection_use)),
+      "connection_request_bucket" => safe_connection_request_bucket(metadata_attr(metadata, "connection_request_bucket", :connection_request_bucket)),
+      "connection_age_bucket" => safe_connection_age_bucket(metadata_attr(metadata, "connection_age_bucket", :connection_age_bucket)),
+      "connection_idle_bucket" => safe_connection_idle_bucket(metadata_attr(metadata, "connection_idle_bucket", :connection_idle_bucket)),
+      "websocket_buffer_bucket" => safe_websocket_buffer_bucket(metadata_attr(metadata, "websocket_buffer_bucket", :websocket_buffer_bucket)),
+      "websocket_fragment_open" => safe_boolean(metadata_attr(metadata, "websocket_fragment_open", :websocket_fragment_open)),
+      "pre_visible_output" => safe_boolean(metadata_attr(metadata, "pre_visible_output", :pre_visible_output)),
+      "upstream_committed" => safe_boolean(metadata_attr(metadata, "upstream_committed", :upstream_committed)),
+      "terminal_seen" => safe_boolean(metadata_attr(metadata, "terminal_seen", :terminal_seen)),
+      "terminal_forwarded" => safe_boolean(metadata_attr(metadata, "terminal_forwarded", :terminal_forwarded)),
+      "last_upstream_event_type" => safe_last_upstream_event_type(metadata_attr(metadata, "last_upstream_event_type", :last_upstream_event_type)),
+      "last_upstream_event_class" => safe_last_upstream_event_class(metadata_attr(metadata, "last_upstream_event_class", :last_upstream_event_class)),
+      "terminal_candidate_seen" => safe_boolean(metadata_attr(metadata, "terminal_candidate_seen", :terminal_candidate_seen)),
+      "terminal_candidate_type" => safe_terminal_candidate_type(metadata_attr(metadata, "terminal_candidate_type", :terminal_candidate_type)),
+      "terminal_candidate_class" => safe_terminal_candidate_class(metadata_attr(metadata, "terminal_candidate_class", :terminal_candidate_class)),
+      "terminal_candidate_rejection" =>
+        safe_terminal_candidate_rejection(
+          metadata_attr(
+            metadata,
+            "terminal_candidate_rejection",
+            :terminal_candidate_rejection
+          )
+        ),
+      "text_frame_count" => safe_non_negative_integer(metadata_attr(metadata, "text_frame_count", :text_frame_count)),
+      "peer_close_code" => safe_peer_close_code(metadata_attr(metadata, "peer_close_code", :peer_close_code)),
+      "peer_close_reason_present" => safe_boolean(metadata_attr(metadata, "peer_close_reason_present", :peer_close_reason_present)),
+      "peer_close_reason_bytes" => safe_peer_close_reason_bytes(metadata_attr(metadata, "peer_close_reason_bytes", :peer_close_reason_bytes))
+    }
+    |> compact_metadata()
+  end
+
+  @spec peer_close_metadata(term(), term()) :: transport_failure_metadata()
+  def peer_close_metadata(code, reason) do
+    %{
+      "peer_close_code" => safe_peer_close_code(code),
+      "peer_close_reason_present" => is_binary(reason) and reason != "",
+      "peer_close_reason_bytes" => peer_close_reason_bytes(reason)
     }
     |> compact_metadata()
   end
@@ -89,6 +302,15 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
     }
     |> maybe_put_transport_failure(transport_failure_metadata(reason, attrs))
   end
+
+  @spec retry_safe_before_submission?(term()) :: boolean()
+  def retry_safe_before_submission?(%{
+        transport_failure: %{"reason" => reason, "phase" => "request"}
+      })
+      when reason in ["econnrefused", "ehostunreach", "enetunreach", "nxdomain"],
+      do: true
+
+  def retry_safe_before_submission?(_reason), do: false
 
   defp safe_tuple_reason(value) when is_atom(value), do: safe_reason(value)
   defp safe_tuple_reason(value) when is_tuple(value), do: safe_reason(value)
@@ -163,11 +385,123 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
   defp allow_phase(phase) when phase in @allowed_phases, do: phase
   defp allow_phase(_phase), do: nil
 
+  defp safe_termination_source(value),
+    do: safe_allowed_value(value, @allowed_termination_sources)
+
+  defp safe_transport_signal(value),
+    do: safe_allowed_value(value, @allowed_transport_signals)
+
+  defp safe_connection_use(value),
+    do: safe_allowed_value(value, @allowed_connection_uses)
+
+  defp safe_connection_request_bucket(value),
+    do: safe_allowed_value(value, @allowed_connection_request_buckets)
+
+  defp safe_connection_age_bucket(value),
+    do: safe_allowed_value(value, @allowed_connection_age_buckets)
+
+  defp safe_connection_idle_bucket(value),
+    do: safe_allowed_value(value, @allowed_connection_idle_buckets)
+
+  defp safe_websocket_buffer_bucket(value),
+    do: safe_allowed_value(value, @allowed_websocket_buffer_buckets)
+
+  defp safe_allowed_value(value, allowed) when is_atom(value),
+    do: value |> Atom.to_string() |> safe_allowed_value(allowed)
+
+  defp safe_allowed_value(value, allowed) when is_binary(value) do
+    if value in allowed, do: value
+  end
+
+  defp safe_allowed_value(_value, _allowed), do: nil
+
   defp safe_boolean(value) when is_boolean(value), do: value
   defp safe_boolean(_value), do: nil
 
   defp safe_non_negative_integer(value) when is_integer(value) and value >= 0, do: value
   defp safe_non_negative_integer(_value), do: nil
+
+  defp safe_last_upstream_event_type(value) do
+    if EventTaxonomy.allowed_event_type?(value), do: value
+  end
+
+  defp safe_last_upstream_event_class(value) do
+    if EventTaxonomy.allowed_event_class?(value), do: value
+  end
+
+  defp safe_terminal_candidate_type(value)
+       when value in @allowed_terminal_candidate_types,
+       do: value
+
+  defp safe_terminal_candidate_type(_value), do: nil
+
+  defp safe_terminal_candidate_class(value)
+       when value in @allowed_terminal_candidate_classes,
+       do: value
+
+  defp safe_terminal_candidate_class(_value), do: nil
+
+  defp safe_terminal_candidate_rejection(value)
+       when value in @allowed_terminal_candidate_rejections,
+       do: value
+
+  defp safe_terminal_candidate_rejection(_value), do: nil
+
+  defp safe_peer_close_code(value) when is_integer(value) and value in 0..65_535, do: value
+  defp safe_peer_close_code(_value), do: nil
+
+  defp safe_peer_close_reason_bytes(value) when is_integer(value) and value in 0..123, do: value
+  defp safe_peer_close_reason_bytes(_value), do: nil
+
+  defp safe_exception_name(value) when is_binary(value) do
+    if String.match?(value, ~r/\A[A-Z][A-Za-z0-9_.]{0,95}\z/), do: value
+  end
+
+  defp safe_exception_name(_value), do: nil
+
+  defp safe_reason_class_name(value) when is_binary(value) do
+    if String.match?(value, ~r/\A[A-Za-z0-9_.]{1,96}\z/), do: value
+  end
+
+  defp safe_reason_class_name(_value), do: nil
+
+  defp safe_metadata_identifier(value) when is_binary(value) do
+    if String.match?(value, ~r/\A[a-z0-9_]{1,96}\z/), do: value
+  end
+
+  defp safe_metadata_identifier(_value), do: nil
+
+  defp peer_close_reason_bytes(reason) when is_binary(reason), do: min(byte_size(reason), 123)
+  defp peer_close_reason_bytes(_reason), do: 0
+
+  defp metadata_attr(attrs, string_key, atom_key) do
+    case Map.fetch(attrs, string_key) do
+      {:ok, value} -> value
+      :error -> Map.get(attrs, atom_key)
+    end
+  end
+
+  defp continuation_generation_guard_candidate?(metadata) do
+    continuation_guard_reason(metadata_attr(metadata, "reason", :reason)) != nil or
+      metadata_attr(metadata, "termination_source", :termination_source) ==
+        "continuation_generation_guard"
+  end
+
+  defp continuation_guard_reason(reason) when reason in [:previous_response_generation_mismatch, "previous_response_generation_mismatch"],
+    do: :previous_response_generation_mismatch
+
+  defp continuation_guard_reason(reason) when reason in [:previous_response_serving_mode_mismatch, "previous_response_serving_mode_mismatch"],
+    do: :previous_response_serving_mode_mismatch
+
+  defp continuation_guard_reason(_reason), do: nil
+
+  defp guard_metadata_matches_expected?(metadata, expected) when map_size(expected) > 0 do
+    Enum.all?(expected, fn {key, value} ->
+      metadata_attr(metadata, key, String.to_existing_atom(key)) == value
+    end)
+  end
+
+  defp guard_metadata_matches_expected?(_metadata, _expected), do: false
 
   defp truncate_reason(reason) when byte_size(reason) > @max_reason_length,
     do: binary_part(reason, 0, @max_reason_length)

@@ -3,7 +3,7 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
 
   import Ecto.Query
 
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting.{Attempt, Request, RequestReplayEntitlement}
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
   alias CodexPooler.Gateway.Persistence.{
@@ -12,33 +12,23 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
     CodexTurn
   }
 
+  alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
+  alias CodexPooler.Gateway.Persistence.StatusVocabulary.OwnerLease, as: OwnerLeaseStatus
+  alias CodexPooler.Gateway.Persistence.StatusVocabulary.Session, as: SessionStatus
+  alias CodexPooler.Gateway.Persistence.StatusVocabulary.Turn, as: TurnStatus
   alias CodexPooler.Repo
+  alias Ecto.Adapters.SQL
 
   @type turn_result :: {:ok, CodexTurn.t()} | {:error, term()}
   @type request_ref :: Request.t() | Ecto.UUID.t()
   @type opts :: RequestOptions.t()
 
-  @turn_in_progress CodexTurn.in_progress_status()
-  @turn_succeeded CodexTurn.succeeded_status()
-  @turn_interrupted CodexTurn.interrupted_status()
-  @session_active CodexSession.active_status()
-  @owner_lease_active BridgeOwnerLease.active_status()
-
-  @spec duplicate_codex_turn?(CodexSession.t(), Ecto.UUID.t() | String.t()) :: boolean()
-  def duplicate_codex_turn?(%CodexSession{id: session_id}, request_id)
-      when is_binary(request_id) do
-    request_id = String.trim(request_id)
-
-    request_id != "" and
-      Repo.exists?(
-        from turn in CodexTurn,
-          join: request in Request,
-          on: request.id == turn.request_id,
-          where: turn.codex_session_id == ^session_id and request.correlation_id == ^request_id
-      )
-  end
-
-  def duplicate_codex_turn?(_session, _request_id), do: false
+  @turn_in_progress TurnStatus.in_progress_status()
+  @turn_succeeded TurnStatus.succeeded_status()
+  @turn_interrupted TurnStatus.interrupted_status()
+  @session_active SessionStatus.active_status()
+  @session_reconnectable_statuses SessionStatus.reconnectable_statuses()
+  @owner_lease_active OwnerLeaseStatus.active_status()
 
   @spec start_codex_turn(CodexSession.t(), Request.t(), opts()) :: turn_result()
   def start_codex_turn(
@@ -46,51 +36,42 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
         %Request{} = request,
         %RequestOptions{} = opts
       ) do
-    now = now()
-    opts = turn_opts(opts)
+    request_options = opts
+    turn_opts = turn_opts(opts)
 
     Repo.transaction(fn ->
-      locked_session = Repo.get!(CodexSession, session.id, lock: "FOR UPDATE")
-      ensure_codex_turn_is_unique!(locked_session, opts)
+      {locked_session, now} = lock_turn_owner!(session, request_options)
 
-      sequence =
-        Repo.one(
-          from turn in CodexTurn,
-            where: turn.codex_session_id == ^locked_session.id,
-            select: max(turn.turn_sequence)
-        ) || 0
+      turn = insert_next_codex_turn!(locked_session, request, turn_opts, now)
 
-      turn =
-        %CodexTurn{
-          codex_session_id: locked_session.id,
-          request_id: request.id,
-          turn_sequence: sequence + 1,
-          transport_kind: codex_turn_transport_kind(request.transport),
-          status: @turn_in_progress,
-          started_at: now,
-          created_at: now,
-          updated_at: now
-        }
-        |> Repo.insert!()
-
-      case Map.get(opts, :pool_upstream_assignment_id) do
-        assignment_id when is_binary(assignment_id) ->
-          locked_session
-          |> Ecto.Changeset.change(%{
-            pool_upstream_assignment_id: assignment_id,
-            status: @session_active,
-            last_heartbeat_at: now,
-            updated_at: now
-          })
-          |> Repo.update!()
-
-        _value ->
-          locked_session
-      end
+      # Turn start marks the session active and alive, and deliberately does not
+      # touch `pool_upstream_assignment_id`. That column is a routing preference
+      # for *later* turns, and writing it from the candidate this turn is about
+      # to dispatch to recorded dispatch rather than outcome: it overwrote on
+      # every turn start with no guard, so a turn refused by every candidate in
+      # the ring left the session pinned to the last one it tried. The durable
+      # binding belongs to `update_session_assignment/3`, which runs at terminal
+      # completion from the attempt that actually served, under owner-witness
+      # authorization; a session with no pin also takes it earlier, from the
+      # account serving its first client output (`AssignmentClaim`,
+      # findings#324), never from dispatch.
+      locked_session
+      |> Ecto.Changeset.change(%{
+        status: @session_active,
+        last_heartbeat_at: now,
+        updated_at: now
+      })
+      |> Repo.update!()
 
       turn
     end)
     |> unwrap_transaction()
+  end
+
+  @doc false
+  @spec lock_codex_session_for_turn(CodexSession.t()) :: CodexSession.t()
+  def lock_codex_session_for_turn(%CodexSession{id: session_id}) do
+    codex_session_for_update!(session_id)
   end
 
   @spec complete_codex_turn(
@@ -104,26 +85,55 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
         status,
         error_code
       ) do
-    now = now()
     attempt = Map.get(lifecycle_result, :attempt)
 
-    CodexTurn
-    |> Repo.get_by(request_id: request.id)
-    |> finalize_codex_turn_state(status, error_code, attempt, now)
+    complete_codex_turn_atomic(request.id, attempt, status, error_code)
 
     result
   end
 
   def complete_codex_turn(result, _status, _error_code), do: result
 
+  @spec complete_codex_turn(term(), String.t(), term(), Attempt.t()) :: term()
+  def complete_codex_turn(result, status, error_code, %Attempt{} = attempt),
+    do: complete_codex_turn(result, status, error_code, attempt, nil)
+
+  @spec complete_codex_turn(
+          term(),
+          String.t(),
+          term(),
+          Attempt.t(),
+          OwnerWitness.t() | nil
+        ) :: term()
+  def complete_codex_turn(
+        {:ok, %{request: request}} = result,
+        status,
+        error_code,
+        %Attempt{} = attempt,
+        owner_witness
+      ) do
+    complete_codex_turn_atomic(request.id, attempt, status, error_code, owner_witness)
+
+    result
+  end
+
+  def complete_codex_turn(result, _status, _error_code, %Attempt{}, _owner_witness), do: result
+
   @spec mark_codex_turn_visible(request_ref()) :: :ok
   def mark_codex_turn_visible(%Request{id: request_id}), do: mark_codex_turn_visible(request_id)
 
   def mark_codex_turn_visible(request_id) when is_binary(request_id) do
-    now = now()
+    now = lifecycle_now(request_id, nil)
 
     CodexTurn
-    |> where([turn], turn.request_id == ^request_id and is_nil(turn.first_visible_output_at))
+    |> where(
+      [turn],
+      turn.request_id == ^request_id and is_nil(turn.first_visible_output_at) and
+        fragment(
+          "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ?)",
+          turn.request_id
+        )
+    )
     |> Repo.update_all(set: [first_visible_output_at: now, updated_at: now])
 
     :ok
@@ -131,126 +141,469 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity.TurnLifecycle do
 
   def mark_codex_turn_visible(_request_id), do: :ok
 
-  defp turn_opts(%RequestOptions{continuity: continuity, file_bridge: file_bridge}) do
-    %{
-      codex_turn_id: continuity.codex_turn_id,
-      pool_upstream_assignment_id: file_bridge.pool_upstream_assignment_id
-    }
-    |> drop_nil_values()
+  @spec mark_codex_turn_visible(request_ref(), CodexPooler.Accounting.Attempt.t()) ::
+          :ok | {:error, :stale_generation}
+  def mark_codex_turn_visible(%Request{id: request_id}, attempt),
+    do: mark_codex_turn_visible(request_id, attempt)
+
+  def mark_codex_turn_visible(request_id, %{
+        id: attempt_id,
+        request_id: request_id,
+        replay_generation: generation
+      })
+      when is_binary(request_id) and is_binary(attempt_id) and is_integer(generation) do
+    case authorize_codex_turn_visibility(request_id, %{
+           id: attempt_id,
+           request_id: request_id,
+           replay_generation: generation
+         }) do
+      {:ok, _visibility} -> :ok
+      {:error, :stale_generation} = error -> error
+    end
   end
 
-  defp ensure_codex_turn_is_unique!(%CodexSession{} = session, opts) do
-    case opts |> Map.get(:codex_turn_id) |> blank_to_nil() do
-      nil ->
-        :ok
+  def mark_codex_turn_visible(_request_id, _attempt), do: {:error, :stale_generation}
 
-      turn_id ->
-        case duplicate_codex_turn?(session, turn_id) do
-          true ->
-            Repo.rollback(%{
-              status: 409,
-              code: "duplicate_turn",
-              message: "duplicate Codex turn was already recorded for this session",
-              param: "request_id"
-            })
+  @type visibility_witness :: :committed | :uncommitted | :untracked
 
-          false ->
-            :ok
+  @spec authorize_codex_turn_visibility(request_ref(), map()) ::
+          {:ok, visibility_witness()} | {:error, :stale_generation}
+  def authorize_codex_turn_visibility(%Request{id: request_id}, attempt),
+    do: authorize_codex_turn_visibility(request_id, attempt)
+
+  def authorize_codex_turn_visibility(request_id, %{
+        id: attempt_id,
+        request_id: request_id,
+        replay_generation: generation
+      })
+      when is_binary(request_id) and is_binary(attempt_id) and is_integer(generation) do
+    nested? = Repo.in_transaction?()
+
+    {:ok, result} =
+      Repo.transaction(fn ->
+        # Arm locks this row without updating it. A single UPDATE with joined
+        # eligibility checks can otherwise retain its pre-wait MVCC snapshot.
+        turn =
+          Repo.one(
+            from turn in CodexTurn,
+              where: turn.request_id == ^request_id,
+              lock: "FOR UPDATE"
+          )
+
+        case mark_locked_turn_visible(turn, request_id, attempt_id, generation) do
+          :visible -> {:ok, if(nested?, do: :uncommitted, else: :committed)}
+          :untracked -> {:ok, :untracked}
+          {:error, :stale_generation} = error -> error
         end
+      end)
+
+    result
+  end
+
+  def authorize_codex_turn_visibility(_request, _attempt), do: {:error, :stale_generation}
+
+  defp mark_locked_turn_visible(nil, request_id, _attempt_id, _generation) do
+    mark_codex_turn_visible(request_id)
+    :untracked
+  end
+
+  defp mark_locked_turn_visible(%CodexTurn{}, request_id, attempt_id, generation) do
+    now = lifecycle_now(request_id, %{replay_generation: generation})
+
+    {count, _rows} =
+      CodexTurn
+      |> join(:inner, [turn], attempt in CodexPooler.Accounting.Attempt, on: attempt.id == ^attempt_id and attempt.request_id == turn.request_id)
+      |> where(
+        [turn, attempt],
+        turn.request_id == ^request_id and
+          attempt.replay_generation == ^generation and attempt.status == "in_progress" and
+          fragment(
+            "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ? AND e.replay_generation <> ?)",
+            turn.request_id,
+            ^generation
+          ) and
+          is_nil(turn.first_visible_output_at)
+      )
+      |> Repo.update_all(set: [first_visible_output_at: now, updated_at: now])
+
+    visibility_update_result(count, request_id, attempt_id, generation)
+  end
+
+  defp visibility_update_result(count, request_id, attempt_id, generation) do
+    cond do
+      count == 1 or visible_attempt_current?(request_id, attempt_id, generation) ->
+        :visible
+
+      replay_entitlement?(request_id) ->
+        {:error, :stale_generation}
+
+      true ->
+        mark_codex_turn_visible(request_id)
+        :untracked
     end
+  end
+
+  defp visible_attempt_current?(request_id, attempt_id, generation) do
+    Repo.exists?(
+      from turn in CodexTurn,
+        join: attempt in CodexPooler.Accounting.Attempt,
+        on: attempt.id == ^attempt_id and attempt.request_id == turn.request_id,
+        where:
+          turn.request_id == ^request_id and not is_nil(turn.first_visible_output_at) and
+            attempt.replay_generation == ^generation and attempt.status == "in_progress" and
+            fragment(
+              "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ? AND e.replay_generation <> ?)",
+              turn.request_id,
+              ^generation
+            )
+    )
+  end
+
+  defp replay_entitlement?(request_id) do
+    Repo.exists?(
+      from entitlement in RequestReplayEntitlement,
+        where: entitlement.request_id == ^request_id
+    )
+  end
+
+  defp complete_codex_turn_atomic(request_id, nil, status, error_code) do
+    now = lifecycle_now(request_id, nil)
+
+    request_id
+    |> legacy_completion_query(status)
+    |> update_completion(status, error_code, nil, now)
+
+    :ok
+  end
+
+  defp complete_codex_turn_atomic(request_id, %Attempt{} = attempt, status, error_code),
+    do: complete_codex_turn_atomic(request_id, attempt, status, error_code, nil)
+
+  defp complete_codex_turn_atomic(
+         request_id,
+         %Attempt{id: attempt_id, replay_generation: generation} = attempt,
+         status,
+         error_code,
+         owner_witness
+       ) do
+    Repo.transaction(fn ->
+      now = lifecycle_now(request_id, attempt)
+
+      # Canonical lock order is session, then turn. Every session-first path
+      # (owner binding, replay, interruption) locks the session by id and then
+      # the turn by session and request; completing the turn first and locking
+      # the session afterwards inverted that order and deadlocked in production.
+      assignment = lock_session_assignment(turn_session_id(request_id))
+
+      {count, _rows} =
+        request_id
+        |> generation_completion_query(attempt_id, generation, status)
+        |> update_completion(status, error_code, attempt_id, now)
+
+      if count == 1 and status == @turn_succeeded do
+        update_session_assignment(assignment, attempt, owner_witness)
+      end
+    end)
+
+    :ok
+  end
+
+  defp legacy_completion_query(request_id, status) do
+    CodexTurn
+    |> where(
+      [turn],
+      turn.request_id == ^request_id and
+        fragment(
+          "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ?)",
+          turn.request_id
+        ) and
+        (turn.status == ^@turn_in_progress or
+           (turn.status == ^@turn_interrupted and ^status == ^@turn_succeeded))
+    )
+  end
+
+  defp generation_completion_query(request_id, attempt_id, generation, status) do
+    CodexTurn
+    |> join(:inner, [turn], attempt in Attempt, on: attempt.id == ^attempt_id and attempt.request_id == turn.request_id)
+    |> where(
+      [turn, attempt],
+      turn.request_id == ^request_id and attempt.replay_generation == ^generation and
+        fragment(
+          "NOT EXISTS (SELECT 1 FROM request_replay_entitlements e WHERE e.request_id = ? AND e.replay_generation <> ?)",
+          turn.request_id,
+          ^generation
+        ) and
+        (turn.status == ^@turn_in_progress or
+           (turn.status == ^@turn_interrupted and ^status == ^@turn_succeeded))
+    )
+  end
+
+  defp update_completion(query, status, _error_code, attempt_id, now)
+       when status == @turn_succeeded do
+    query
+    |> update([turn],
+      set: [
+        status: ^status,
+        error_code: nil,
+        final_attempt_id: ^attempt_id,
+        first_visible_output_at: fragment("COALESCE(?, ?)", turn.first_visible_output_at, ^now),
+        completed_at: ^now,
+        updated_at: ^now
+      ]
+    )
+    |> Repo.update_all([])
+  end
+
+  defp update_completion(query, status, error_code, attempt_id, now) do
+    query
+    |> Repo.update_all(
+      set: [
+        status: status,
+        error_code: error_code && to_string(error_code),
+        final_attempt_id: attempt_id,
+        completed_at: now,
+        updated_at: now
+      ]
+    )
+  end
+
+  @spec codex_session_for_update!(Ecto.UUID.t()) :: CodexSession.t()
+  defp codex_session_for_update!(session_id) do
+    Repo.one!(
+      from session in CodexSession,
+        where: session.id == ^session_id,
+        lock: "FOR UPDATE"
+    )
+  end
+
+  defp lock_turn_owner!(
+         %CodexSession{id: session_id},
+         %RequestOptions{
+           runtime: %{
+             session_owner_witness: %OwnerWitness{
+               session_id: session_id,
+               lease_token: lease_token
+             }
+           }
+         }
+       ) do
+    case codex_session_for_update(session_id) do
+      %CodexSession{} = session ->
+        now = lock_and_validate_owner!(session, lease_token)
+        {session, now}
+
+      nil ->
+        Repo.rollback(:owner_unavailable)
+    end
+  end
+
+  defp lock_turn_owner!(%CodexSession{}, %RequestOptions{
+         runtime: %{session_owner_witness: %OwnerWitness{}}
+       }) do
+    Repo.rollback(:stale_owner)
+  end
+
+  defp lock_turn_owner!(%CodexSession{id: session_id}, %RequestOptions{}) do
+    {codex_session_for_update!(session_id), now()}
+  end
+
+  defp codex_session_for_update(session_id) do
+    Repo.one(
+      from session in CodexSession,
+        where: session.id == ^session_id,
+        lock: "FOR UPDATE"
+    )
+  end
+
+  defp lock_and_validate_owner!(%CodexSession{} = session, lease_token) do
+    case active_owner_lease_for_update(session.id) do
+      %BridgeOwnerLease{} = lease ->
+        now = db_now()
+
+        cond do
+          session.status not in @session_reconnectable_statuses ->
+            Repo.rollback(:owner_unavailable)
+
+          expired_at?(session.owner_lease_expires_at, now) ->
+            Repo.rollback(:owner_unavailable)
+
+          expired_at?(lease.expires_at, now) ->
+            Repo.rollback(:owner_unavailable)
+
+          session.owner_lease_token != lease_token ->
+            Repo.rollback(:stale_owner)
+
+          lease.lease_token != lease_token ->
+            Repo.rollback(:stale_owner)
+
+          true ->
+            now
+        end
+
+      nil ->
+        Repo.rollback(:owner_unavailable)
+    end
+  end
+
+  defp active_owner_lease_for_update(session_id) do
+    Repo.one(
+      from lease in BridgeOwnerLease,
+        where: lease.codex_session_id == ^session_id and lease.status == ^@owner_lease_active,
+        order_by: [desc: lease.renewed_at, desc: lease.created_at],
+        limit: 1,
+        lock: "FOR UPDATE"
+    )
+  end
+
+  defp expired_at?(%DateTime{} = expires_at, now), do: DateTime.compare(expires_at, now) != :gt
+  defp expired_at?(_expires_at, _now), do: true
+
+  defp db_now do
+    %{rows: [[now]]} = Repo.query!("SELECT clock_timestamp()", [])
+    now
+  end
+
+  defp insert_next_codex_turn!(%CodexSession{} = session, %Request{} = request, opts, now) do
+    query = """
+    INSERT INTO codex_turns (
+      id,
+      codex_session_id,
+      request_id,
+      turn_sequence,
+      transport_kind,
+      semantic_turn_digest,
+      status,
+      started_at,
+      created_at,
+      updated_at
+    )
+    SELECT
+      $1::uuid,
+      $2::uuid,
+      $3::uuid,
+      COALESCE(MAX(turn_sequence), 0) + 1,
+      $4,
+      $5,
+      $6,
+      $7,
+      $7,
+      $7
+    FROM codex_turns
+    WHERE codex_session_id = $2::uuid
+    RETURNING *
+    """
+
+    params = [
+      Ecto.UUID.generate() |> Ecto.UUID.dump!(),
+      Ecto.UUID.dump!(session.id),
+      Ecto.UUID.dump!(request.id),
+      codex_turn_transport_kind(request.transport),
+      Map.get(opts, :semantic_turn_digest),
+      @turn_in_progress,
+      now
+    ]
+
+    %{columns: columns, rows: [row]} = SQL.query!(Repo, query, params)
+    Repo.load(CodexTurn, {columns, row})
+  end
+
+  # No assignment here any more: nothing in the turn path consumes one, and
+  # carrying it would suggest the turn still records which account served it.
+  # It does not — `attempts` holds that per dispatch, and the session's durable
+  # pin is written at terminal completion.
+  defp turn_opts(%RequestOptions{continuity: continuity}) do
+    %{
+      turn_claim_key: continuity.turn_claim_key,
+      semantic_turn_digest: continuity.semantic_turn_key
+    }
+    |> drop_nil_values()
   end
 
   defp codex_turn_transport_kind("http_compact_json"), do: "http_json"
   defp codex_turn_transport_kind(transport), do: transport
 
-  defp finalize_codex_turn_state(
-         %CodexTurn{status: current_status} = turn,
-         target_status,
-         error_code,
-         attempt,
-         now
-       )
-       when current_status == @turn_in_progress do
-    turn
-    |> Ecto.Changeset.change(%{
-      status: target_status,
-      error_code: error_code && to_string(error_code),
-      final_attempt_id: attempt && attempt.id,
-      first_visible_output_at:
-        turn.first_visible_output_at || if(target_status == @turn_succeeded, do: now),
-      completed_at: now,
-      updated_at: now
-    })
-    |> Repo.update!()
-
-    maybe_update_session_assignment(turn.codex_session_id, attempt, now)
+  defp turn_session_id(request_id) do
+    Repo.one(
+      from turn in CodexTurn,
+        where: turn.request_id == ^request_id,
+        select: turn.codex_session_id
+    )
   end
 
-  defp finalize_codex_turn_state(
-         %CodexTurn{status: status} = turn,
-         succeeded_status,
-         _error_code,
-         attempt,
-         now
-       )
-       when status == @turn_interrupted and succeeded_status == @turn_succeeded do
-    turn
-    |> Ecto.Changeset.change(%{
-      status: @turn_succeeded,
-      error_code: nil,
-      final_attempt_id: attempt && attempt.id,
-      first_visible_output_at: turn.first_visible_output_at || now,
-      completed_at: now,
-      updated_at: now
-    })
-    |> Repo.update!()
+  defp lock_session_assignment(nil), do: nil
 
-    maybe_update_session_assignment(turn.codex_session_id, attempt, now)
+  defp lock_session_assignment(session_id) do
+    case codex_session_for_update(session_id) do
+      %CodexSession{} = session -> {session, active_owner_lease_for_update(session_id)}
+      nil -> nil
+    end
   end
 
-  defp finalize_codex_turn_state(%CodexTurn{} = turn, _status, _error_code, attempt, now) do
-    maybe_update_session_assignment(turn.codex_session_id, attempt, now)
-  end
+  defp update_session_assignment(nil, _attempt, _owner_witness), do: :ok
 
-  defp finalize_codex_turn_state(nil, _status, _error_code, _attempt, _now), do: :ok
+  defp update_session_assignment({session, lease}, %Attempt{} = attempt, owner_witness) do
+    now = db_now()
 
-  defp maybe_update_session_assignment(_session_id, nil, _now), do: :ok
-
-  defp maybe_update_session_assignment(session_id, %Attempt{} = attempt, now) do
-    CodexSession
-    |> where([session], session.id == ^session_id)
-    |> Repo.update_all(
-      set: [
+    if session_assignment_authorized?(session, lease, owner_witness, now) do
+      session
+      |> Ecto.Changeset.change(%{
         pool_upstream_assignment_id: attempt.pool_upstream_assignment_id,
         last_heartbeat_at: now,
         updated_at: now
-      ]
-    )
+      })
+      |> Repo.update!()
 
-    BridgeOwnerLease
-    |> where(
-      [lease],
-      lease.codex_session_id == ^session_id and lease.status == ^@owner_lease_active
-    )
-    |> Repo.update_all(
-      set: [
-        pool_upstream_assignment_id: attempt.pool_upstream_assignment_id,
-        renewed_at: now,
-        updated_at: now
-      ]
-    )
+      if lease do
+        lease
+        |> Ecto.Changeset.change(%{
+          pool_upstream_assignment_id: attempt.pool_upstream_assignment_id,
+          renewed_at: now,
+          updated_at: now
+        })
+        |> Repo.update!()
+      end
+    end
 
     :ok
   end
 
-  defp blank_to_nil(value) when is_binary(value) do
-    value = String.trim(value)
-    if value == "", do: nil, else: value
+  defp session_assignment_authorized?(%CodexSession{}, _lease, nil, _now), do: true
+
+  defp session_assignment_authorized?(
+         %CodexSession{id: session_id} = session,
+         %BridgeOwnerLease{} = lease,
+         %OwnerWitness{session_id: session_id, lease_token: lease_token},
+         now
+       ) do
+    session.status in @session_reconnectable_statuses and
+      not expired_at?(session.owner_lease_expires_at, now) and
+      not expired_at?(lease.expires_at, now) and
+      session.owner_lease_token == lease_token and lease.lease_token == lease_token
   end
 
-  defp blank_to_nil(_value), do: nil
+  defp session_assignment_authorized?(_session, _lease, %OwnerWitness{}, _now), do: false
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  defp lifecycle_now(request_id, %{replay_generation: generation}) when generation > 0,
+    do: replay_db_now(request_id)
+
+  defp lifecycle_now(request_id, nil) do
+    if Repo.exists?(from replay in RequestReplayEntitlement, where: replay.request_id == ^request_id),
+      do: replay_db_now(request_id),
+      else: now()
+  end
+
+  defp lifecycle_now(_request_id, _attempt), do: now()
+
+  defp replay_db_now(request_id) do
+    Repo.one!(
+      from turn in CodexTurn,
+        where: turn.request_id == ^request_id,
+        limit: 1,
+        select: type(fragment("request_replay_db_now()"), :utc_datetime_usec)
+    )
+  end
 
   defp drop_nil_values(opts) do
     opts

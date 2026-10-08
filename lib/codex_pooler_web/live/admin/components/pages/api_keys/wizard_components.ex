@@ -5,6 +5,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPooler.Catalog.ModelInfo
+  alias CodexPoolerWeb.Admin.ApiKeyPolicyForm
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PolicyEditorComponents
@@ -17,7 +19,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
     %{id: :review, label: "Review", description: "Effective policy"}
   ]
   @step_ids Enum.map(@steps, &Atom.to_string(&1.id))
-  @api_key_docs_url "https://docs.codex-pooler.com/operators/api-keys/#create-api-key"
+  @api_key_docs_url "https://www.codex-pooler.com/docs/operators/api-keys/#create-api-key"
 
   @spec steps() :: [map()]
   def steps, do: @steps
@@ -39,6 +41,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
   attr :disabled, :boolean, default: false
 
   def api_key_basics_step(assigns) do
+    assigns = assign(assigns, :expiry_valid?, ApiKeyPolicyForm.expiry_errors(assigns.form.params) == [])
+
     ~H"""
     <section id="api-key-step-basics-panel" class="grid min-w-0 gap-5">
       <div class="grid gap-1">
@@ -70,12 +74,18 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           options={status_options()}
           disabled={@disabled}
         />
-        <.input
-          field={@form[:expires_at]}
-          type="datetime-local"
-          label="Expires at"
-          disabled={@disabled}
-        />
+        <div class="grid min-w-0 content-start gap-1">
+          <.input
+            field={@form[:expires_at]}
+            type="datetime-local"
+            label={"Expires at - #{ApiKeyPolicyForm.expiry_timezone(@form.params)}"}
+            aria-describedby={if @expiry_valid?, do: "api-key-expiry-summary"}
+            disabled={@disabled}
+          />
+          <p :if={@expiry_valid?} id="api-key-expiry-summary" class="text-sm leading-5 text-base-content/65">
+            {ApiKeyPolicyForm.expiry_summary(@form.params)}
+          </p>
+        </div>
         <div
           id="api-key-dashboard-access-control"
           class="grid gap-1 border-t border-base-300 pt-4 md:col-span-2"
@@ -95,6 +105,9 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           </p>
         </div>
       </div>
+      <p id="api-key-availability-help" class="text-sm leading-5 text-base-content/65">
+        To stop access immediately, set Status to Paused. Resume it later without changing the expiry.
+      </p>
       <.input
         field={@form[:operator_notes]}
         type="textarea"
@@ -134,6 +147,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           value="all_models"
           label="All models"
           description="Allow current and future routable models."
+          default
         />
         <.policy_mode_card
           id="api-key-model-mode-selected"
@@ -181,27 +195,42 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           </p>
 
           <div id="api-key-model-options" class="grid max-h-[13rem] gap-2 overflow-y-auto">
-            <label
+            <div
               :for={option <- @sorted_model_options}
               id={"api-key-model-option-#{dom_token(option.identifier)}"}
-              class="flex min-h-12 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
+              class="flex min-h-12 min-w-0 items-center rounded-box border border-base-300 bg-base-100 transition-colors hover:border-primary/50 hover:bg-primary/5"
             >
-              <input
-                type="checkbox"
-                class="checkbox checkbox-primary checkbox-sm shrink-0"
-                name={field_array_name(@form[:allowed_model_identifiers])}
-                value={option.identifier}
-                checked={selected_value?(@form[:allowed_model_identifiers].value, option.identifier)}
+              <label class="flex min-h-12 min-w-0 flex-1 cursor-pointer items-center gap-3 px-3 py-2">
+                <input
+                  type="checkbox"
+                  class="checkbox checkbox-primary checkbox-sm shrink-0"
+                  name={field_array_name(@form[:allowed_model_identifiers])}
+                  value={option.identifier}
+                  checked={
+                    selected_value?(
+                      @form[:allowed_model_identifiers].value,
+                      option.identifier
+                    )
+                  }
+                />
+                <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
+                  <span class="min-w-0 truncate text-sm font-medium text-base-content">
+                    {option.display_name || option.identifier}
+                  </span>
+                  <span class="truncate text-[10.5px] tracking-[0.015em] text-base-content/50">
+                    {option.identifier}
+                  </span>
+                </span>
+              </label>
+              <AdminComponents.model_info_popover
+                :if={ModelInfo.present?(option.model_info)}
+                id={"api-key-model-option-#{dom_token(option.identifier)}-model-info"}
+                model_id={option.identifier}
+                info={option.model_info}
+                placement={:end}
+                class="mr-2 shrink-0"
               />
-              <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
-                <span class="min-w-0 truncate text-sm font-medium text-base-content">
-                  {option.display_name || option.identifier}
-                </span>
-                <span class="truncate font-mono text-xs text-base-content/50">
-                  {option.identifier}
-                </span>
-              </span>
-            </label>
+            </div>
             <p :if={@selector_state.options == []} class="text-sm text-base-content/60">
               No routable catalog models are available for this Pool.
             </p>
@@ -224,7 +253,9 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
                 checked={selected_value?(@form[:allowed_model_identifiers].value, chip.identifier)}
               />
               <span class="grid min-w-0 gap-1">
-                <span class="break-all font-mono font-semibold text-base-content">{chip.label}</span>
+                <span class="break-all text-[10.5px] font-semibold tracking-[0.015em] text-base-content">
+                  {chip.label}
+                </span>
                 <span class="text-base-content/65">{chip.warning}</span>
               </span>
             </label>
@@ -284,6 +315,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
             value="unrestricted"
             label="Unrestricted"
             description="Keep request values unchanged."
+            default
           />
           <.reasoning_policy_mode
             id="api_key_reasoning_policy_mode_allow_up_to"
@@ -488,8 +520,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
   defp title(:edit), do: "Edit API key"
 
   defp description(:create),
-    do:
-      "Define Pool ownership, model access, enforced request fields, and limits before copying the generated secret once."
+    do: "Define Pool ownership, model access, enforced request fields, and limits before copying the generated secret once."
 
   defp description(:edit), do: "Update policy sections without exposing stored secret material."
 
@@ -505,29 +536,33 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
   attr :value, :string, required: true
   attr :label, :string, required: true
   attr :description, :string, required: true
+  attr :default, :boolean, default: false
 
   defp policy_mode_card(assigns) do
     ~H"""
     <label
       id={@id}
-      class={[
-        "grid cursor-pointer gap-2 rounded-box border p-3 transition-colors hover:bg-base-200",
-        field_string_value(@field) == @value && "border-primary bg-primary/10",
-        field_string_value(@field) != @value && "border-base-300 bg-base-100"
-      ]}
+      class="group/policymode relative flex min-w-0 cursor-pointer items-start gap-2.5 rounded-box border border-base-300 bg-base-100 p-2.5 transition-colors hover:border-primary/50 has-[.policy-mode-radio:checked]:border-primary/60 has-[.policy-mode-radio:checked]:bg-primary/5 has-[.policy-mode-radio:focus-visible]:outline has-[.policy-mode-radio:focus-visible]:outline-2 has-[.policy-mode-radio:focus-visible]:outline-offset-2 has-[.policy-mode-radio:focus-visible]:outline-primary"
     >
-      <span class="flex items-start gap-3">
-        <input
-          type="radio"
-          class="radio radio-primary radio-sm mt-1"
-          name={@field.name}
-          value={@value}
-          checked={field_string_value(@field) == @value}
+      <span class="pointer-events-none absolute right-2.5 top-3 inline-flex items-center gap-1">
+        <.icon
+          name="hero-check"
+          class="hidden size-3 text-primary group-has-[.policy-mode-radio:checked]/policymode:inline-block"
         />
-        <span class="grid gap-1">
-          <span class="font-semibold text-base-content">{@label}</span>
-          <span class="text-sm leading-5 text-base-content/60">{@description}</span>
+        <span :if={@default} class="text-[0.56rem] font-bold uppercase tracking-wide text-primary/70">
+          Default
         </span>
+      </span>
+      <input
+        type="radio"
+        class="policy-mode-radio sr-only"
+        name={@field.name}
+        value={@value}
+        checked={field_string_value(@field) == @value}
+      />
+      <span class="grid min-w-0 gap-0.5">
+        <span class="text-[13px] font-semibold leading-tight text-base-content">{@label}</span>
+        <span class="text-[11px] leading-4 text-base-content/55">{@description}</span>
       </span>
     </label>
     """
@@ -538,25 +573,31 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
   attr :value, :string, required: true
   attr :label, :string, required: true
   attr :description, :string, required: true
+  attr :default, :boolean, default: false
 
   defp reasoning_policy_mode(assigns) do
     ~H"""
-    <label class={[
-      "flex min-w-0 cursor-pointer items-start gap-3 rounded-box border p-3 transition-colors hover:bg-base-200",
-      field_string_value(@field) == @value && "border-primary bg-primary/10",
-      field_string_value(@field) != @value && "border-base-300 bg-base-100"
-    ]}>
+    <label class="group/policymode relative flex min-w-0 cursor-pointer items-start gap-2.5 rounded-box border border-base-300 bg-base-100 p-2.5 transition-colors hover:border-primary/50 has-[.policy-mode-radio:checked]:border-primary/60 has-[.policy-mode-radio:checked]:bg-primary/5 has-[.policy-mode-radio:focus-visible]:outline has-[.policy-mode-radio:focus-visible]:outline-2 has-[.policy-mode-radio:focus-visible]:outline-offset-2 has-[.policy-mode-radio:focus-visible]:outline-primary">
+      <span class="pointer-events-none absolute right-2.5 top-3 inline-flex items-center gap-1">
+        <.icon
+          name="hero-check"
+          class="hidden size-3 text-primary group-has-[.policy-mode-radio:checked]/policymode:inline-block"
+        />
+        <span :if={@default} class="text-[0.56rem] font-bold uppercase tracking-wide text-primary/70">
+          Default
+        </span>
+      </span>
       <input
         id={@id}
         type="radio"
-        class="radio radio-primary radio-sm mt-1"
+        class="policy-mode-radio sr-only"
         name={@field.name}
         value={@value}
         checked={field_string_value(@field) == @value}
       />
-      <span class="grid gap-1">
-        <span class="font-semibold text-base-content">{@label}</span>
-        <span class="text-sm leading-5 text-base-content/60">{@description}</span>
+      <span class="grid min-w-0 gap-0.5">
+        <span class="text-[13px] font-semibold leading-tight text-base-content">{@label}</span>
+        <span class="text-[11px] leading-4 text-base-content/55">{@description}</span>
       </span>
     </label>
     """

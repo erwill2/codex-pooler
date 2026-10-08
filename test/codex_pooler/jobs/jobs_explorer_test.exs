@@ -84,7 +84,7 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
       assert completed_id == completed_job.id
     end
 
-    test "filters by state, attention, worker, queue, and safe target ids" do
+    test "filters by state, attention, worker, and safe target ids" do
       now = ~U[2026-06-02 10:30:00Z]
       pool = pool_fixture()
       %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
@@ -128,11 +128,7 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
       assert_ids(filters(%{"state" => "retryable"}), [retry_job.id], now: now)
       assert_ids(filters(%{"attention" => "retry_pressure"}), [retry_job.id], now: now)
 
-      assert_ids(filters(%{"worker" => worker_name(TokenRefreshWorker)}), [retry_job.id],
-        now: now
-      )
-
-      assert_ids(filters(%{"queue" => "critical"}), [api_key_job.id], now: now)
+      assert_ids(filters(%{"worker" => worker_name(TokenRefreshWorker)}), [retry_job.id], now: now)
 
       assert_ids(
         filters(%{"target_kind" => "assignment", "target_id" => assignment.id}),
@@ -146,9 +142,7 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
         now: now
       )
 
-      assert_ids(filters(%{"target_kind" => "pool", "target_id" => pool.id}), [assignment_job.id],
-        now: now
-      )
+      assert_ids(filters(%{"target_kind" => "pool", "target_id" => pool.id}), [assignment_job.id], now: now)
 
       assert_ids(
         filters(%{"target_kind" => "api_key", "target_id" => api_key.id}),
@@ -165,9 +159,7 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
       assert_ids(filters(%{"target_kind" => "system"}), [system_job.id], now: now)
 
       assert %{items: [%{attention_state: :retry_pressure}]} =
-               ReadModel.list_explorer_jobs(:system, filters(%{"attention" => "retry_pressure"}),
-                 now: now
-               )
+               ReadModel.list_explorer_jobs(:system, filters(%{"attention" => "retry_pressure"}), now: now)
     end
 
     test "returns metadata-only rows without args, meta, raw errors, or sensitive strings" do

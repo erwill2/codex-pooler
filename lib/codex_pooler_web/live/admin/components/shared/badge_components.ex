@@ -4,18 +4,39 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
   """
   use CodexPoolerWeb, :html
 
+  # Keys cover both the raw `chatgpt_plan_type` claim values (underscored, kept
+  # in plan_label) and their slugified plan_family forms (dashed). The raw
+  # value set tracks the Codex reference `KnownPlan` enum.
+  # Pro display names follow https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers.
   @canonical_plan_labels %{
     "business" => "Business",
     "chatgpt plus" => "ChatGPT Plus",
     "chatgpt pro" => "ChatGPT Pro",
     "chatgpt team" => "ChatGPT Team",
     "edu" => "Edu",
+    "edu-plus" => "Edu Plus",
+    "edu-pro" => "Edu Pro",
+    "edu_plus" => "Edu Plus",
+    "edu_pro" => "Edu Pro",
     "education" => "Education",
+    "ent26" => "Enterprise",
     "enterprise" => "Enterprise",
+    "enterprise-cbp-automation" => "Enterprise Automation",
+    "enterprise_cbp_automation" => "Enterprise Automation",
+    "enterprise-cbp-usage-based" => "Enterprise CBP Usage Based",
+    "enterprise_cbp_usage_based" => "Enterprise CBP Usage Based",
     "free" => "Free",
     "free plan" => "Free",
+    "go" => "Go",
+    "hc" => "Enterprise",
     "plus" => "Plus",
-    "pro" => "Pro",
+    "pro" => "Pro 200",
+    "prolite" => "Pro 100",
+    "promax" => "Pro 500",
+    "self-serve-business-prolite" => "Self Serve Business ProLite",
+    "self_serve_business_prolite" => "Self Serve Business ProLite",
+    "self-serve-business-usage-based" => "Self Serve Business Usage Based",
+    "self_serve_business_usage_based" => "Self Serve Business Usage Based",
     "team" => "Team"
   }
 
@@ -36,6 +57,25 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
       label: "Quota first",
       icon: "hero-chart-bar-square"
     }
+  }
+
+  @consumer_plan_tones %{
+    "go" => :go,
+    "plus" => :plus,
+    "chatgpt plus" => :plus,
+    "pro" => :pro,
+    "promax" => :pro,
+    "chatgpt pro" => :pro,
+    "prolite" => :prolite,
+    "pro lite" => :prolite
+  }
+
+  @plan_text_tone_classes %{
+    primary: "text-primary",
+    success: "text-success",
+    warning: "text-warning",
+    error: "text-error",
+    info: "text-info"
   }
 
   def status_chip_class(status) when is_atom(status),
@@ -149,29 +189,33 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
     |> plan_badge_class_for_tone()
   end
 
+  @spec plan_text_class(String.t() | nil) :: String.t()
+  def plan_text_class(plan_label) do
+    case plan_tone(plan_label) do
+      :unknown -> "text-base-content/70"
+      :free -> "admin-plan-text"
+      {:generated, key} -> Map.fetch!(@plan_text_tone_classes, generated_chip_tone(key))
+      tone -> "admin-plan-text admin-plan-badge--#{tone}"
+    end
+  end
+
   defp chip_class(:primary),
-    do:
-      "inline-flex items-center rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-xs font-medium leading-none text-primary"
+    do: "inline-flex items-center rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-xs font-medium leading-none text-primary"
 
   defp chip_class(:success),
-    do:
-      "inline-flex items-center rounded-full border border-success/20 bg-success/10 px-2.5 py-1 text-xs font-medium leading-none text-success"
+    do: "inline-flex items-center rounded-full border border-success/20 bg-success/10 px-2.5 py-1 text-xs font-medium leading-none text-success"
 
   defp chip_class(:warning),
-    do:
-      "inline-flex items-center rounded-full border border-warning/20 bg-warning/10 px-2.5 py-1 text-xs font-medium leading-none text-warning"
+    do: "inline-flex items-center rounded-full border border-warning/20 bg-warning/10 px-2.5 py-1 text-xs font-medium leading-none text-warning"
 
   defp chip_class(:error),
-    do:
-      "inline-flex items-center rounded-full border border-error/20 bg-error/10 px-2.5 py-1 text-xs font-medium leading-none text-error"
+    do: "inline-flex items-center rounded-full border border-error/20 bg-error/10 px-2.5 py-1 text-xs font-medium leading-none text-error"
 
   defp chip_class(:info),
-    do:
-      "inline-flex items-center rounded-full border border-info/20 bg-info/10 px-2.5 py-1 text-xs font-medium leading-none text-info"
+    do: "inline-flex items-center rounded-full border border-info/20 bg-info/10 px-2.5 py-1 text-xs font-medium leading-none text-info"
 
   defp chip_class(_tone),
-    do:
-      "inline-flex items-center rounded-full border border-base-300 bg-base-200 px-2.5 py-1 text-xs font-medium leading-none text-base-content/70"
+    do: "inline-flex items-center rounded-full border border-base-300 bg-base-200 px-2.5 py-1 text-xs font-medium leading-none text-base-content/70"
 
   defp plan_badge_label(plan_label, plan_family, placeholder) do
     label = plan_badge_text(plan_label || plan_family, placeholder)
@@ -212,21 +256,52 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
     normalized = plan_label |> String.downcase() |> String.trim()
 
     cond do
-      normalized in ["free", "free plan"] -> :free
-      normalized in ["pro", "plus", "chatgpt pro", "chatgpt plus"] -> :pro
-      normalized in ["team", "business", "chatgpt team"] -> :team
-      normalized in ["enterprise", "edu", "education"] -> :enterprise
-      normalized == "" -> :unknown
-      true -> {:generated, normalized}
+      normalized in ["free", "free plan"] ->
+        :free
+
+      Map.has_key?(@consumer_plan_tones, normalized) ->
+        Map.fetch!(@consumer_plan_tones, normalized)
+
+      normalized in [
+        "team",
+        "chatgpt team",
+        "self-serve-business-prolite",
+        "self_serve_business_prolite",
+        "self-serve-business-usage-based",
+        "self_serve_business_usage_based"
+      ] ->
+        :team
+
+      normalized == "business" ->
+        :business
+
+      normalized in ["edu", "edu-plus", "edu-pro", "edu_plus", "edu_pro", "education"] ->
+        :edu
+
+      normalized in [
+        "enterprise",
+        "ent26",
+        "hc",
+        "enterprise-cbp-automation",
+        "enterprise_cbp_automation",
+        "enterprise-cbp-usage-based",
+        "enterprise_cbp_usage_based"
+      ] ->
+        :enterprise
+
+      normalized == "" ->
+        :unknown
+
+      true ->
+        {:generated, normalized}
     end
   end
 
   defp plan_tone(_plan_label), do: :unknown
 
-  defp plan_badge_class_for_tone(:free), do: chip_class(:success)
-  defp plan_badge_class_for_tone(:pro), do: chip_class(:primary)
-  defp plan_badge_class_for_tone(:team), do: chip_class(:info)
-  defp plan_badge_class_for_tone(:enterprise), do: chip_class(:warning)
+  defp plan_badge_class_for_tone(tone)
+       when tone in [:free, :go, :plus, :pro, :prolite, :team, :business, :enterprise, :edu],
+       do: "admin-plan-badge admin-plan-badge--#{tone}"
 
   defp plan_badge_class_for_tone({:generated, key}),
     do: key |> generated_chip_tone() |> chip_class()

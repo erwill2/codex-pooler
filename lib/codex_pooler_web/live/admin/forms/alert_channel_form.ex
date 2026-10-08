@@ -4,13 +4,14 @@ defmodule CodexPoolerWeb.Admin.AlertChannelForm do
   import Phoenix.Component, only: [to_form: 2]
 
   alias CodexPooler.Alerts.Schemas.AlertChannel
+  alias CodexPooler.Alerts.StatusVocabulary.Channel, as: ChannelStatus
 
   @type attrs :: %{String.t() => term()}
   @type channel_projection :: CodexPooler.Alerts.channel_projection()
   @type option :: {String.t(), String.t()}
 
   @default_channel_type "email"
-  @default_state AlertChannel.active_state()
+  @default_state ChannelStatus.active_state()
 
   @channel_type_options [
     {"Email", "email"},
@@ -166,8 +167,7 @@ defmodule CodexPoolerWeb.Admin.AlertChannelForm do
     do: Map.drop(attrs, ["email_to"])
 
   defp prune_channel_type_fields(attrs),
-    do:
-      Map.drop(attrs, ["endpoint_url", "webhook_signing_secret", "webhook_signing_secret_action"])
+    do: Map.drop(attrs, ["endpoint_url", "webhook_signing_secret", "webhook_signing_secret_action"])
 
   defp drop_blank_optional_values(attrs, mode) do
     Enum.reduce(

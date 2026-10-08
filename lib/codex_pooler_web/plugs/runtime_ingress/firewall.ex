@@ -1,138 +1,185 @@
 defmodule CodexPoolerWeb.Plugs.RuntimeIngress.Firewall do
   @moduledoc false
 
-  import Bitwise
   import Plug.Conn
+  require Logger
 
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.OperationalSettings.IPRules
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP
+  alias CodexPoolerWeb.Plugs.RuntimeIngress.ForwardedClientIP.Resolution
+
+  @denial_event [:codex_pooler, :ingress, :firewall, :denied]
+  @denial_reasons [
+    :invalid_trusted_proxy_rules,
+    :invalid_forwarded_bytes,
+    :forwarded_entry_too_long,
+    :invalid_forwarded_entry,
+    :forwarded_hop_limit_exceeded,
+    :forwarded_chain_unresolved,
+    :forwarded_header_missing,
+    :forwarded_depth_unsatisfied,
+    :duplicate_x_real_ip,
+    :invalid_allowlist_rules,
+    :not_allowed,
+    :settings_unavailable,
+    :websocket_revoked
+  ]
+  @scopes [:runtime, :mcp]
+  @denial_reason_values Enum.map(@denial_reasons, &Atom.to_string/1)
+  @scope_values Enum.map(@scopes, &Atom.to_string/1)
 
   @type conn :: Plug.Conn.t()
-  @type firewall_error :: %{
-          required(:status) => 403,
-          required(:code) => String.t(),
-          required(:message) => String.t()
-        }
-  @type ip_address :: :inet.ip_address()
+  @type denial_reason ::
+          :invalid_trusted_proxy_rules
+          | :invalid_forwarded_bytes
+          | :forwarded_entry_too_long
+          | :invalid_forwarded_entry
+          | :forwarded_hop_limit_exceeded
+          | :forwarded_chain_unresolved
+          | :forwarded_header_missing
+          | :forwarded_depth_unsatisfied
+          | :duplicate_x_real_ip
+          | :invalid_allowlist_rules
+          | :not_allowed
+          | :settings_unavailable
+          | :websocket_revoked
+  @type scope :: :runtime | :mcp
   @type settings :: OperationalSettings.t()
 
-  @spec enforce(conn(), settings()) :: {:ok, conn()} | {:error, firewall_error()}
-  def enforce(conn, settings) do
-    if OperationalSettings.firewall_enabled?(settings) do
-      client_ip = client_ip(conn, settings)
+  defmodule Decision do
+    @moduledoc false
 
-      if ip_allowed?(client_ip, settings.firewall_allowlist) do
-        {:ok, %{conn | remote_ip: client_ip}}
-      else
-        {:error, %{status: 403, code: "access_denied", message: "client IP is not allowed"}}
-      end
-    else
-      {:ok, conn}
-    end
+    @enforce_keys [:outcome, :reason, :client_ip]
+    defstruct [:outcome, :reason, :client_ip]
+
+    @type t :: %__MODULE__{
+            outcome: :allow | :deny,
+            reason: nil | CodexPoolerWeb.Plugs.RuntimeIngress.Firewall.denial_reason(),
+            client_ip: :inet.ip_address() | nil
+          }
   end
 
-  @spec client_ip(conn(), settings()) :: ip_address()
-  def client_ip(conn, settings) do
-    if ip_allowed?(conn.remote_ip, settings.trusted_proxies) do
-      forwarded_client_ip(conn, settings) || conn.remote_ip
-    else
-      conn.remote_ip
-    end
-  end
+  @spec denial_reasons() :: [denial_reason()]
+  def denial_reasons, do: @denial_reasons
 
-  defp forwarded_client_ip(conn, settings) do
-    conn
-    |> get_req_header("x-forwarded-for")
-    |> forwarded_for_ip(settings)
-    |> case do
-      nil -> conn |> get_req_header("x-real-ip") |> List.first() |> parse_ip()
-      ip -> ip
-    end
-  end
+  @spec evaluate(conn(), settings()) :: {conn(), Decision.t()}
+  def evaluate(conn, settings) do
+    cond do
+      OperationalSettings.settings_unavailable?(settings) ->
+        {conn, denied(:settings_unavailable, conn.remote_ip)}
 
-  defp forwarded_for_ip([], _settings), do: nil
-
-  defp forwarded_for_ip(values, settings) do
-    values
-    |> Enum.join(",")
-    |> String.split(",")
-    |> Enum.map(&parse_ip/1)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reverse()
-    |> Enum.drop_while(&ip_allowed?(&1, settings.trusted_proxies))
-    |> List.first()
-  end
-
-  defp ip_allowed?(ip, rules) do
-    Enum.any?(rules, &ip_matches_rule?(ip, &1))
-  end
-
-  defp ip_matches_rule?(ip, rule) do
-    case parse_rule(rule) do
-      {:ip, rule_ip} -> ip == rule_ip
-      {:cidr, network, prefix} -> cidr_match?(ip, network, prefix)
-      :error -> false
-    end
-  end
-
-  defp parse_rule(rule) do
-    case String.split(rule, "/", parts: 2) do
-      [address] ->
-        case parse_ip(address) do
-          nil -> :error
-          ip -> {:ip, ip}
+      OperationalSettings.firewall_enabled?(settings) ->
+        case settings.firewall_allowlist_compiled do
+          {:ok, allowlist} -> evaluate_resolved_client(conn, settings, allowlist)
+          {:error, :invalid_rule} -> {conn, denied(:invalid_allowlist_rules, conn.remote_ip)}
         end
 
-      [address, prefix] ->
-        with ip when not is_nil(ip) <- parse_ip(address),
-             {prefix, ""} <- Integer.parse(prefix),
-             true <- valid_prefix?(ip, prefix) do
-          {:cidr, ip, prefix}
-        else
-          _invalid -> :error
-        end
+      true ->
+        {conn, allowed(conn.remote_ip)}
     end
   end
 
-  defp parse_ip(nil), do: nil
+  @spec evaluate_client_ip(:inet.ip_address(), settings()) :: Decision.t()
+  def evaluate_client_ip(client_ip, settings) do
+    cond do
+      OperationalSettings.settings_unavailable?(settings) ->
+        denied(:settings_unavailable, client_ip)
 
-  defp parse_ip(value) when is_binary(value) do
+      OperationalSettings.firewall_enabled?(settings) ->
+        case settings.firewall_allowlist_compiled do
+          {:ok, allowlist} -> evaluate_compiled_client_ip(client_ip, allowlist)
+          {:error, :invalid_rule} -> denied(:invalid_allowlist_rules, client_ip)
+        end
+
+      true ->
+        allowed(client_ip)
+    end
+  end
+
+  @spec denied(denial_reason(), :inet.ip_address() | nil) :: Decision.t()
+  def denied(reason, client_ip \\ nil) when reason in @denial_reasons do
+    %Decision{outcome: :deny, reason: reason, client_ip: client_ip}
+  end
+
+  @spec observe_denial(Decision.t(), scope()) :: :ok
+  def observe_denial(%Decision{outcome: :deny, reason: reason}, scope)
+      when reason in @denial_reasons and scope in @scopes do
+    metadata = %{scope: Atom.to_string(scope), reason: Atom.to_string(reason)}
+
+    :telemetry.execute(@denial_event, %{count: 1}, metadata)
+    log_denial(metadata)
+  end
+
+  @spec telemetry_tag_values(map()) :: %{scope: String.t(), reason: String.t()}
+  def telemetry_tag_values(metadata) do
+    %{
+      scope: bounded_tag(metadata[:scope], @scope_values),
+      reason: bounded_tag(metadata[:reason], @denial_reason_values)
+    }
+  end
+
+  defp evaluate_resolved_client(conn, settings, allowlist) do
+    case client_ip_resolution(conn, settings) do
+      {conn, %Resolution{status: :ok, client_ip: client_ip}} ->
+        decision = evaluate_compiled_client_ip(client_ip, allowlist)
+        conn = if decision.outcome == :allow, do: %{conn | remote_ip: client_ip}, else: conn
+        {conn, decision}
+
+      {conn, %Resolution{status: :error, client_ip: client_ip, reason: reason}} ->
+        {conn, denied(reason, client_ip)}
+    end
+  end
+
+  defp evaluate_compiled_client_ip(client_ip, allowlist) do
+    if IPRules.allowed?(client_ip, allowlist) do
+      allowed(client_ip)
+    else
+      denied(:not_allowed, client_ip)
+    end
+  end
+
+  defp allowed(client_ip), do: %Decision{outcome: :allow, reason: nil, client_ip: client_ip}
+
+  defp log_denial(metadata) do
+    previous_metadata = Logger.metadata()
+
+    try do
+      Logger.reset_metadata(scope: metadata.scope, reason: metadata.reason)
+      Logger.warning("ingress firewall denied")
+    after
+      Logger.reset_metadata(previous_metadata)
+    end
+  end
+
+  defp client_ip_resolution(
+         %Plug.Conn{private: %{codex_pooler_client_ip_resolution: %Resolution{} = resolution}} =
+           conn,
+         _settings
+       ) do
+    {conn, resolution}
+  end
+
+  defp client_ip_resolution(conn, settings) do
+    peer_ip = conn.private[:codex_pooler_peer_ip] || conn.remote_ip
+    resolution = ForwardedClientIP.resolve(%{conn | remote_ip: peer_ip}, settings)
+
+    conn =
+      conn
+      |> put_private(:codex_pooler_peer_ip, peer_ip)
+      |> put_private(:codex_pooler_client_ip_resolution, resolution)
+
+    {conn, resolution}
+  end
+
+  defp bounded_tag(value, allowed_values) when is_atom(value) do
     value
-    |> String.trim()
-    |> String.to_charlist()
-    |> :inet.parse_address()
-    |> case do
-      {:ok, ip} -> ip
-      {:error, _reason} -> nil
-    end
+    |> Atom.to_string()
+    |> bounded_tag(allowed_values)
   end
 
-  defp valid_prefix?(ip, prefix), do: prefix >= 0 and prefix <= ip_total_bits(ip)
+  defp bounded_tag(value, allowed_values) when is_binary(value),
+    do: if(value in allowed_values, do: value, else: "unknown")
 
-  defp cidr_match?(ip, network, prefix) when tuple_size(ip) == tuple_size(network) do
-    ip_bits = ip_to_integer(ip)
-    network_bits = ip_to_integer(network)
-    total_bits = ip_total_bits(ip)
-    mask = mask(total_bits, prefix)
-    Bitwise.band(ip_bits, mask) == Bitwise.band(network_bits, mask)
-  end
-
-  defp cidr_match?(_ip, _network, _prefix), do: false
-
-  defp ip_to_integer(ip) do
-    bits_per_segment = ip_segment_bits(ip)
-
-    ip
-    |> Tuple.to_list()
-    |> Enum.reduce(0, fn part, acc -> (acc <<< bits_per_segment) + part end)
-  end
-
-  defp ip_total_bits(ip), do: tuple_size(ip) * ip_segment_bits(ip)
-  defp ip_segment_bits(ip) when tuple_size(ip) == 4, do: 8
-  defp ip_segment_bits(ip) when tuple_size(ip) == 8, do: 16
-
-  defp mask(_total_bits, 0), do: 0
-
-  defp mask(total_bits, prefix) do
-    ((1 <<< prefix) - 1) <<< (total_bits - prefix)
-  end
+  defp bounded_tag(_value, _allowed_values), do: "unknown"
 end

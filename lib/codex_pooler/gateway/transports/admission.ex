@@ -12,6 +12,17 @@ defmodule CodexPooler.Gateway.Transports.Admission do
 
   @default_queue_timeout_ms 5_000
   @telemetry_prefix [:codex_pooler, :gateway, :admission]
+  @overload_code "server_is_overloaded"
+  @overload_message "gateway route class is temporarily overloaded"
+  @bulkhead_reasons ~w(bulkhead_rejected bulkhead_queue_timeout)
+  @class_defaults %{
+    running: 0,
+    queue: :queue.new(),
+    leases: MapSet.new(),
+    monitors: %{},
+    lease_monitors: %{},
+    lease_owners: %{}
+  }
 
   defstruct classes: %{}
 
@@ -26,7 +37,15 @@ defmodule CodexPooler.Gateway.Transports.Admission do
           required(:code) => String.t(),
           required(:message) => String.t(),
           required(:param) => nil,
-          required(:route_class) => String.t()
+          required(:route_class) => String.t(),
+          optional(:internal_reason) => String.t(),
+          optional(:accounting_disposition) => :zero_work
+        }
+  @type saturation_snapshot :: %{
+          required(RouteClass.t()) => %{
+            required(:running) => non_neg_integer(),
+            required(:queued) => non_neg_integer()
+          }
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -36,6 +55,15 @@ defmodule CodexPooler.Gateway.Transports.Admission do
 
   @spec route_classes() :: [String.t()]
   def route_classes, do: @route_classes
+
+  @spec saturation(GenServer.server(), timeout()) ::
+          {:ok, saturation_snapshot()} | {:error, :timeout | :unavailable}
+  def saturation(server \\ __MODULE__, timeout \\ 1_000) do
+    {:ok, GenServer.call(server, :saturation, timeout)}
+  catch
+    :exit, {:timeout, _call} -> {:error, :timeout}
+    :exit, _reason -> {:error, :unavailable}
+  end
 
   @spec acquire(String.t(), map(), map()) :: {:ok, lease()} | {:error, overload_reason()}
   def acquire(route_class, metadata \\ %{}, opts \\ %{})
@@ -92,6 +120,8 @@ defmodule CodexPooler.Gateway.Transports.Admission do
   @impl GenServer
   def handle_call(:reset, _from, _state), do: {:reply, :ok, %__MODULE__{}}
 
+  def handle_call(:saturation, _from, state), do: {:reply, saturation_snapshot(state), state}
+
   def handle_call({:acquire, route_class, metadata, settings, server}, from, state) do
     config = bulkhead_config(settings, route_class)
     class = class_state(state, route_class)
@@ -119,7 +149,13 @@ defmodule CodexPooler.Gateway.Transports.Admission do
         {:noreply, put_class(state, route_class, class)}
 
       true ->
-        emit(:rejected, route_class, metadata, %{queued: :queue.len(class.queue)})
+        emit(
+          :rejected,
+          route_class,
+          metadata,
+          %{queued: :queue.len(class.queue)},
+          "bulkhead_rejected"
+        )
 
         {:reply, {:error, %{code: "bulkhead_rejected", route_class: route_class}}, state}
     end
@@ -149,7 +185,13 @@ defmodule CodexPooler.Gateway.Transports.Admission do
           {:error, %{code: "bulkhead_queue_timeout", route_class: route_class}}
         )
 
-        emit(:timeout, route_class, queued.metadata, %{queued_ms: elapsed_ms(queued.enqueued_at)})
+        emit(
+          :timeout,
+          route_class,
+          queued.metadata,
+          %{queued_ms: elapsed_ms(queued.enqueued_at)},
+          "bulkhead_queue_timeout"
+        )
 
         {:noreply, put_class(state, route_class, class)}
     end
@@ -291,22 +333,23 @@ defmodule CodexPooler.Gateway.Transports.Admission do
   end
 
   defp normalize_class(class) do
-    Map.merge(class_defaults(), class || %{})
-  end
-
-  defp class_defaults do
-    %{
-      running: 0,
-      queue: :queue.new(),
-      leases: MapSet.new(),
-      monitors: %{},
-      lease_monitors: %{},
-      lease_owners: %{}
-    }
+    Map.merge(@class_defaults, class || %{})
   end
 
   defp put_class(state, route_class, class) do
     %{state | classes: Map.put(state.classes, route_class, class)}
+  end
+
+  defp saturation_snapshot(state) do
+    Map.new(@route_classes, fn route_class ->
+      class = class_state(state, route_class)
+
+      {route_class,
+       %{
+         running: max(class.running, 0),
+         queued: max(:queue.len(class.queue), 0)
+       }}
+    end)
   end
 
   defp lease(server, route_class),
@@ -332,23 +375,46 @@ defmodule CodexPooler.Gateway.Transports.Admission do
     }
   end
 
+  defp error(%{code: code, route_class: route_class}) when code in @bulkhead_reasons do
+    %{
+      status: 503,
+      code: @overload_code,
+      message: @overload_message,
+      param: nil,
+      route_class: route_class,
+      internal_reason: code,
+      accounting_disposition: :zero_work
+    }
+  end
+
   defp error(%{code: code, route_class: route_class}) do
     %{
       status: 503,
       code: code,
-      message: "gateway route class is temporarily overloaded",
+      message: @overload_message,
       param: nil,
       route_class: route_class
     }
   end
 
-  defp emit(event, route_class, metadata, measurements) do
+  defp emit(event, route_class, metadata, measurements, internal_reason \\ nil) do
+    metadata =
+      metadata
+      |> Map.merge(%{route_class: route_class})
+      |> maybe_put_internal_reason(internal_reason)
+
     :telemetry.execute(
       @telemetry_prefix ++ [event],
       Map.merge(%{count: 1}, measurements),
-      Map.merge(metadata, %{route_class: route_class})
+      metadata
     )
   end
+
+  defp maybe_put_internal_reason(metadata, internal_reason)
+       when internal_reason in @bulkhead_reasons,
+       do: Map.put(metadata, :internal_reason, internal_reason)
+
+  defp maybe_put_internal_reason(metadata, _internal_reason), do: metadata
 
   defp sanitize_metadata(metadata) when is_map(metadata) do
     metadata

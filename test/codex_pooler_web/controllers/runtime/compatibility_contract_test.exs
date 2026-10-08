@@ -12,43 +12,266 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files
   alias CodexPooler.Files.FileRecord
+  alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.ErrorClassification
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.TransportEnvelope
+  alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
+  alias CodexPooler.Gateway.Runtime.RateLimitObserver
+  alias CodexPooler.Gateway.Runtime.Streaming.CompactionResultCollector
+  alias CodexPooler.Gateway.Transports.Websocket.ResponseInterrupt
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.CloseDiagnostics
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.EventTaxonomy
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.Logger, as: WebsocketOwnerLogger
+  alias CodexPooler.Gateway.Websocket, as: GatewayWebsocket
+  alias CodexPooler.Gateway.Websocket.Adapter, as: WebsocketAdapter
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
+  alias CodexPooler.Quotas
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
+  alias CodexPoolerWeb.WebsocketConnectionLogger
 
-  @expected_features ~w(
-    files
-    backend_transcription
-    backend_image_proxy_surface
-    backend_models_etag
-    backend_responses_etag
-    backend_responses_envelope
-    upstream_error_param
-    responses_chat
-    response_body_cap
-    backend_v1_alias_surface
-    websocket_continuity
-    reasoning_minimal
-    reasoning_none
-    reasoning_ultra
-    api_key_reasoning_availability
-    reasoning_context
-    unsupported_upstream_fields
-    firewall
-    decompression
-    bulkheads
-    degraded_routing
-    strict_schema_validation
-    unsupported_input_image_reference
-    first_event_stream_retry
-    request_compression
-    upstream_websocket_bridge
-    function_tool_schema_lowering
-    v1_supported_surface
-    v1_unsupported_public_surface
-  )a
+  @expected_feature_categories [
+    files: [:route, :auth, :error, :ownership],
+    backend_transcription: [:route, :auth, :multipart, :ownership],
+    backend_image_proxy_surface: [:route, :auth, :error, :ownership],
+    backend_models_etag: [:route, :auth, :error, :ownership],
+    backend_responses_etag: [:route, :auth, :error, :streaming, :ownership, :degraded],
+    pool_model_serving_modes: [:route, :error, :streaming, :ownership, :degraded],
+    backend_responses_envelope: [:route, :auth, :error, :streaming, :ownership],
+    upstream_error_param: [:error, :ownership, :degraded],
+    terminal_failure_diagnostics: [:error, :ownership, :degraded],
+    rejection_metadata: [:error, :ownership, :degraded],
+    upstream_validation_rejection_relay: [:error, :streaming],
+    pooler_authored_error_type: [:error, :route, :overload, :ownership],
+    backend_fast_service_tier: [:route, :auth, :error, :streaming, :ownership],
+    responses_chat: [:route, :auth, :error, :streaming, :ownership],
+    response_body_cap: [:error, :degraded, :ownership],
+    backend_v1_alias_surface: [:route, :auth, :error, :streaming, :ownership],
+    usage_alias_meter_identity: [:route, :auth, :ownership],
+    websocket_continuity: [:route, :auth, :streaming, :ownership, :degraded],
+    duplicate_turn_fence: [:route, :auth, :error, :ownership],
+    reasoning_minimal: [:route, :auth, :ownership],
+    reasoning_none: [:route, :auth, :ownership],
+    reasoning_ultra: [:route, :auth, :ownership],
+    api_key_reasoning_availability: [:route, :auth, :error, :streaming, :ownership],
+    api_key_reservation_policy_refusals: [:route, :auth, :error, :streaming, :ownership],
+    api_key_terminal_policy_denials: [:route, :auth, :error, :streaming],
+    exhausted_pool_usage_limit: [:route, :error, :streaming, :ownership],
+    desktop_pool_usage_limit_answer: [:route, :error, :streaming, :ownership],
+    reasoning_context: [:route, :auth, :error, :ownership],
+    unsupported_upstream_fields: [:route, :auth, :ownership],
+    api_key_websocket_revocation: [:auth, :error, :streaming, :ownership],
+    native_websocket_upstream_close: [:streaming, :ownership],
+    native_websocket_owner_exit: [:streaming, :ownership],
+    native_websocket_provider_controls: [:streaming, :ownership],
+    native_websocket_response_interrupt: [:streaming, :ownership],
+    firewall: [:route, :auth, :error, :ownership],
+    pruned_runtime_helper_firewall: [:route, :error],
+    decompression: [:route, :error, :overload],
+    bulkheads: [:overload, :degraded],
+    database_unavailable: [:error, :degraded],
+    degraded_routing: [:route, :error, :ownership, :degraded],
+    strict_schema_validation: [:route, :auth, :error, :ownership],
+    public_strict_schema_object_roots: [:route, :auth, :error, :streaming, :ownership],
+    unsupported_input_image_reference: [:route, :auth, :error, :ownership],
+    first_event_stream_retry: [:route, :auth, :error, :streaming, :ownership, :degraded],
+    tool_output_preservation: [:route, :auth, :error, :streaming, :ownership, :degraded],
+    upstream_websocket_bridge: [:route, :auth, :error, :streaming, :ownership, :degraded],
+    image_generation_permission: [:route, :auth, :error],
+    audio_transcription_permission: [:route, :auth, :error],
+    responses_access_programs: [:route, :auth, :error, :streaming],
+    responses_allowed_tools: [:route, :auth, :error, :streaming, :ownership],
+    responses_executable_custom_tools: [:route, :auth, :error, :streaming, :ownership],
+    backend_agent_v2_handoffs: [:route, :streaming, :ownership],
+    multi_agent_product_certification: [:route, :streaming, :ownership],
+    function_tool_schema_lowering: [:route, :auth, :error, :streaming, :ownership],
+    direct_responses_strict_schema_repair: [:route, :auth, :error, :streaming, :ownership],
+    v1_supported_surface: [:route, :auth, :error, :multipart, :streaming, :ownership],
+    v1_unsupported_public_surface: [:route, :auth, :error],
+    v1_unsupported_agents_surface: [:route, :auth, :error]
+  ]
+  @expected_features Keyword.keys(@expected_feature_categories)
+
+  @expected_route_features %{
+    {:delete, "/v1/files/:file_id"} => ~w(v1_supported_surface)a,
+    {:delete, "/v1/responses/:response_id"} => ~w(v1_unsupported_public_surface)a,
+    {:get, "/api/codex/usage"} => ~w(firewall usage_alias_meter_identity)a,
+    {:get, "/backend-api/codex/models"} => ~w(api_key_reasoning_availability backend_models_etag database_unavailable firewall pool_model_serving_modes)a,
+    {:get, "/backend-api/codex/responses"} => ~w(api_key_reasoning_availability api_key_reservation_policy_refusals api_key_terminal_policy_denials api_key_websocket_revocation backend_agent_v2_handoffs backend_fast_service_tier backend_responses_envelope backend_responses_etag bulkheads database_unavailable desktop_pool_usage_limit_answer duplicate_turn_fence exhausted_pool_usage_limit firewall function_tool_schema_lowering multi_agent_product_certification native_websocket_owner_exit native_websocket_provider_controls native_websocket_response_interrupt native_websocket_upstream_close pool_model_serving_modes pooler_authored_error_type rejection_metadata terminal_failure_diagnostics tool_output_preservation upstream_error_param upstream_validation_rejection_relay websocket_continuity)a,
+    {:get, "/backend-api/codex/v1/models"} => ~w(backend_models_etag backend_v1_alias_surface pool_model_serving_modes)a,
+    {:get, "/backend-api/codex/v1/responses"} => ~w(api_key_reasoning_availability api_key_websocket_revocation backend_agent_v2_handoffs backend_fast_service_tier backend_responses_envelope backend_responses_etag backend_v1_alias_surface desktop_pool_usage_limit_answer duplicate_turn_fence function_tool_schema_lowering multi_agent_product_certification native_websocket_owner_exit native_websocket_provider_controls native_websocket_upstream_close pool_model_serving_modes tool_output_preservation)a,
+    {:get, "/backend-api/wham/usage"} => ~w(firewall usage_alias_meter_identity)a,
+    {:get, "/v1/files"} => ~w(v1_supported_surface)a,
+    {:get, "/v1/files/:file_id"} => ~w(v1_supported_surface)a,
+    {:get, "/v1/files/:file_id/content"} => ~w(v1_supported_surface)a,
+    {:get, "/v1/models"} => ~w(firewall v1_supported_surface)a,
+    {:get, "/v1/responses"} => ~w(api_key_reasoning_availability api_key_reservation_policy_refusals api_key_terminal_policy_denials api_key_websocket_revocation backend_responses_envelope direct_responses_strict_schema_repair exhausted_pool_usage_limit firewall function_tool_schema_lowering pool_model_serving_modes pooler_authored_error_type public_strict_schema_object_roots responses_access_programs responses_allowed_tools responses_executable_custom_tools tool_output_preservation upstream_validation_rejection_relay v1_supported_surface)a,
+    {:get, "/v1/responses/:response_id"} => ~w(v1_unsupported_public_surface)a,
+    {:get, "/v1/usage"} => ~w(v1_supported_surface)a,
+    {:get, "/wham/usage"} => ~w(firewall usage_alias_meter_identity)a,
+    {:post, "/backend-api/codex/images/edits"} => ~w(api_key_terminal_policy_denials backend_image_proxy_surface image_generation_permission)a,
+    {:post, "/backend-api/codex/images/generations"} => ~w(api_key_terminal_policy_denials backend_image_proxy_surface image_generation_permission)a,
+    {:post, "/backend-api/codex/responses"} => ~w(api_key_reasoning_availability api_key_reservation_policy_refusals api_key_terminal_policy_denials backend_fast_service_tier backend_responses_envelope backend_responses_etag bulkheads database_unavailable decompression degraded_routing desktop_pool_usage_limit_answer duplicate_turn_fence exhausted_pool_usage_limit firewall first_event_stream_retry function_tool_schema_lowering pool_model_serving_modes pooler_authored_error_type reasoning_minimal reasoning_none reasoning_ultra rejection_metadata response_body_cap responses_chat strict_schema_validation terminal_failure_diagnostics tool_output_preservation unsupported_input_image_reference unsupported_upstream_fields upstream_error_param upstream_validation_rejection_relay)a,
+    {:post, "/backend-api/codex/responses/compact"} => ~w(api_key_reasoning_availability bulkheads desktop_pool_usage_limit_answer duplicate_turn_fence pool_model_serving_modes pooler_authored_error_type reasoning_ultra tool_output_preservation)a,
+    {:post, "/backend-api/codex/v1/chat/completions"} => ~w(api_key_reasoning_availability backend_responses_envelope backend_v1_alias_surface pool_model_serving_modes public_strict_schema_object_roots tool_output_preservation upstream_validation_rejection_relay)a,
+    {:post, "/backend-api/codex/v1/responses"} => ~w(api_key_reasoning_availability backend_fast_service_tier backend_responses_envelope backend_responses_etag backend_v1_alias_surface desktop_pool_usage_limit_answer function_tool_schema_lowering pool_model_serving_modes response_body_cap tool_output_preservation upstream_validation_rejection_relay)a,
+    {:post, "/backend-api/codex/v1/responses/compact"} => ~w(api_key_reasoning_availability backend_v1_alias_surface desktop_pool_usage_limit_answer pool_model_serving_modes tool_output_preservation)a,
+    {:post, "/backend-api/files"} => ~w(files firewall pooler_authored_error_type)a,
+    {:post, "/backend-api/files/:file_id/uploaded"} => ~w(files firewall)a,
+    {:post, "/backend-api/transcribe"} => ~w(audio_transcription_permission backend_transcription firewall response_body_cap)a,
+    {:post, "/mcp"} => ~w(firewall)a,
+    {:post, "/v1/audio/transcriptions"} => ~w(audio_transcription_permission v1_supported_surface)a,
+    {:post, "/v1/batches"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/chat/completions"} => ~w(api_key_reasoning_availability api_key_reservation_policy_refusals api_key_terminal_policy_denials backend_responses_envelope exhausted_pool_usage_limit pool_model_serving_modes public_strict_schema_object_roots response_body_cap responses_chat responses_executable_custom_tools tool_output_preservation unsupported_input_image_reference upstream_validation_rejection_relay v1_supported_surface)a,
+    {:post, "/v1/content_provenance_checks"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/embeddings"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/files"} => ~w(v1_supported_surface)a,
+    {:post, "/v1/fine_tuning/jobs"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/images/edits"} => ~w(image_generation_permission v1_supported_surface)a,
+    {:post, "/v1/images/generations"} => ~w(image_generation_permission v1_supported_surface)a,
+    {:post, "/v1/images/variations"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/moderations"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/responses"} => ~w(api_key_reasoning_availability api_key_reservation_policy_refusals api_key_terminal_policy_denials backend_responses_envelope database_unavailable direct_responses_strict_schema_repair exhausted_pool_usage_limit firewall function_tool_schema_lowering pool_model_serving_modes pooler_authored_error_type public_strict_schema_object_roots reasoning_context response_body_cap responses_access_programs responses_allowed_tools responses_chat responses_executable_custom_tools tool_output_preservation unsupported_input_image_reference upstream_validation_rejection_relay upstream_websocket_bridge v1_supported_surface)a,
+    {:post, "/v1/responses/:response_id/cancel"} => ~w(v1_unsupported_public_surface)a,
+    {:post, "/v1/responses/compact"} => ~w(v1_supported_surface)a
+  }
+
+  @url_citation_fixture_id "vercel-ai.responses.url_citation_replay.v1"
+  @stream_id_fixture_id "openai.responses.websocket_stream_id.v1"
+  @responses_allowed_tools_fixture_id "vercel-ai-sdk-openai.responses.allowed_tools.v1"
+  @responses_allowed_tools_fixture_file "vercel-ai-sdk-openai-responses-allowed-tools.json"
+  @url_citation_keys ["type", "start_index", "end_index", "url", "title"]
+  @stream_id_contract %{
+    scope: "GET /v1/responses websocket response.create only",
+    validator: %{
+      type: "string",
+      byte_length: 1..256,
+      pattern: "^[A-Za-z0-9_.-]+$"
+    },
+    conditional_echo: "every attributable Open Responses server event for an accepted create",
+    same_id_fifo: "guaranteed_by_existing_per_connection_serialization",
+    cross_id_concurrency: "unspecified; different IDs remain per-connection serialized",
+    previous_response_id: "independent_conversation_lineage",
+    upstream: "stripped_before_coercion_request_options_continuity_and_upstream_dispatch",
+    privacy: "transient_queue_and_active_socket_turn_only; excluded_from_persistence_accounting_logs_telemetry_metadata_and_owner_contracts",
+    exclusions: [
+      "POST /v1/responses",
+      "native backend HTTP and WebSockets",
+      "Chat",
+      "compact",
+      "batches",
+      "response-output storage"
+    ]
+  }
+  @api_key_websocket_revocation_contract %{
+    disabling_statuses: [:paused, :revoked],
+    disabling_changes: [
+      :pause,
+      :revoke,
+      :key_delete,
+      :expiry,
+      :pool_disable,
+      :pool_archive,
+      :pool_delete,
+      :pool_move
+    ],
+    new_authentication: :blocked,
+    prompt_delivery: %{
+      channel: :pool_scoped_post_commit_event,
+      role: :prompt_only,
+      authorization_authority: :durable_api_key_row,
+      newer_epoch_event: :latches_revocation,
+      reread_events: [
+        :api_key_deleted,
+        :api_key_updated,
+        :pool_status_updated,
+        :inactive_pool_updated,
+        :pool_deleted
+      ]
+    },
+    durable_fence: %{
+      authority: :locked_api_key_row,
+      captured_epoch: :must_match,
+      missed_relay: :reject_later_frame,
+      key_missing: :refused_with_captured_epoch,
+      expiry: :compared_with_database_clock,
+      pool_status: :read_with_key_row,
+      response_processed: :authorized_before_upstream_forward,
+      claim_and_reservation_refusal: :latches_revocation,
+      pool_move: :advances_runtime_epoch
+    },
+    idle_expiry: %{
+      event: :none,
+      check: :scheduled_at_expires_at,
+      authority: :durable_reread
+    },
+    close: %{
+      code: 1008,
+      reason: "api key is no longer active",
+      synthetic_error_frame: false
+    },
+    work: %{
+      pre_admitted: :drains_and_settles_once,
+      queued_and_later: :dropped
+    },
+    legacy_epochless_event: %{
+      fallback: :reread_durable_authorization,
+      delayed_after_resume: :ignored_when_active
+    },
+    resume: :fresh_connection_required,
+    rolling_release: :full_cluster_protection_after_all_app_replicas_updated,
+    firewall: :unchanged
+  }
+
+  @native_compaction_admission_contract %{
+    semantic_sequence: ["anchor", "compact", "final"],
+    first_compact: %{
+      authority: "ordinary_durable_turn_claim",
+      capability_required: false,
+      replay: "duplicate_turn_without_new_side_effects"
+    },
+    mid_turn_transitions: %{
+      compact: "owner_capability_plus_sealed_runtime_proof",
+      final: "owner_capability_plus_sealed_runtime_proof",
+      payload_shape_or_client_metadata_alone: "never_authoritative",
+      final_resume_claim: "durable_codex_turn_or_resume_claim_so_a_verified_resend_is_chained"
+    },
+    binding: [
+      "phase",
+      "semantic_turn",
+      "prepared_frame_control",
+      "owner_epoch_and_lease",
+      "serving_mode",
+      "physical_websocket_lifecycle_and_generation"
+    ],
+    legitimate_accounting: %{
+      distinct_correlations: 3,
+      requests: 3,
+      attempts: 3,
+      codex_turns: 3,
+      reservations: 3,
+      settlements: 3,
+      semantic_client_turns: 1,
+      websocket_lifecycles: 1,
+      websocket_generations: 1,
+      http_fallbacks: 0
+    },
+    rejected_frames: %{
+      new_rows: 0,
+      upstream_calls: 0,
+      saved_reset_probe_or_redeem: false,
+      hidden_replay_retry_or_fallback: false
+    },
+    public_v1: %{
+      inherits_owner_capability_or_proof: false,
+      replay_and_bridge_semantics: "unchanged",
+      relayed_bytes_and_terminal_shape: "unchanged"
+    }
+  }
 
   setup do
     old_config = Application.get_env(:codex_pooler, Files, [])
@@ -64,6 +287,72 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
   end
 
   describe "compatibility matrix" do
+    @tag :responses_allowed_tools
+    test "loads registered Vercel allowed-tools provenance with narrow public Responses scope" do
+      assert @responses_allowed_tools_fixture_file in sdk_shape_manifest_fixture_files!()
+
+      fixture = sdk_shape_fixture!(@responses_allowed_tools_fixture_id)
+      row = sdk_shape_row!(@responses_allowed_tools_fixture_id)
+
+      assert fixture["scenario_id"] == @responses_allowed_tools_fixture_id
+      assert fixture["sdk_package"] == "@ai-sdk/openai"
+      assert fixture["sdk_version"] == "4.0.43"
+
+      assert fixture["version_provenance"] =~
+               "a062795bbe22ecc96a38d114bf8b8ea4af070914"
+
+      assert fixture["endpoint"] == "/v1/responses"
+      assert fixture["http_method"] == "POST or WEBSOCKET response.create"
+      assert fixture["expected_decision"]["status"] == "accept"
+
+      assert fixture["structural_summary"] == %{
+               "payload_kind" => "responses_allowed_tools",
+               "tool_choice_root" => "type=allowed_tools",
+               "allowed_modes" => ["auto", "required"],
+               "direct_named_entry_forms" => ["function:name", "custom:name"],
+               "type_only_builtin_entry_forms" => ["web_search", "image_generation"],
+               "entry_order_preserved" => true,
+               "duplicate_entries_preserved" => true,
+               "declaration_scope" => "already_declared_top_level_tools_only",
+               "excluded_entry_forms" => [
+                 "mcp",
+                 "namespace",
+                 "deferred",
+                 "tool_search",
+                 "programmatic_tool_calling",
+                 "web_search_preview",
+                 "unknown"
+               ],
+               "raw_payload_stored" => false,
+               "placeholder_values_only" => true,
+               "notes" => [
+                 "This is public Responses HTTP and narrow public Responses WebSocket response.create provenance, not Realtime or broad OpenAI tool compatibility.",
+                 "The accepted vocabulary is deliberately narrower than the Vercel client inventory and excludes MCP, namespace, deferred, tool-search, and unknown entries, and the programmatic_tool_calling and web_search_preview built-ins the Codex backend refuses on a Full request (findings#333)."
+               ]
+             }
+
+      assert fixture["redaction_status"] == %{
+               "metadata_only" => true,
+               "contains_real_prompt" => false,
+               "contains_credentials" => false,
+               "contains_headers" => false,
+               "contains_real_hostname" => false,
+               "contains_provider_frames" => false,
+               "contains_account_data" => false,
+               "contains_raw_payload_body" => false,
+               "contains_media_or_file_bytes" => false
+             }
+
+      assert row == %{
+               source: "Vercel AI SDK OpenAI provider `@ai-sdk/openai`",
+               version: "`4.0.43`, commit `a062795bbe22ecc96a38d114bf8b8ea4af070914`",
+               endpoint: "`POST /v1/responses` and `GET /v1/responses` websocket `response.create`",
+               decision: "accept",
+               observed_shape: "`tool_choice` is `type=allowed_tools` with mode `auto` or `required`; direct function/custom entries are named, while supported built-ins are type-only `web_search` or `image_generation`; order and duplicates remain significant",
+               notes: "Vercel client provenance only. Pooler accepts this deliberately narrow, declaration-backed vocabulary on public Responses HTTP and the narrow public WebSocket `response.create` surface. MCP, namespace, deferred, tool-search, and unknown entries remain excluded, and so do the client's `programmatic_tool_calling` and `web_search_preview` built-ins, which the Codex backend refuses on a Full request (findings#333). This does not claim broad OpenAI compatibility, Realtime compatibility, or availability of any declared tool on every model or account"
+             }
+    end
+
     test "lists every in-scope Codex compatibility feature with sanitized fixtures" do
       assert CompatibilityMatrix.feature_slugs() == @expected_features
 
@@ -84,10 +373,778 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> Enum.sort()
 
       assert covered_categories == Enum.sort(CompatibilityMatrix.required_categories())
+
+      for {slug, categories} <- @expected_feature_categories do
+        feature = CompatibilityMatrix.by_slug!(slug)
+        assert Enum.sort(feature.categories) == Enum.sort(categories), "regression categories changed for #{slug}"
+      end
+    end
+
+    test "every matrix route resolves to an actual Phoenix route" do
+      routes = CodexPoolerWeb.Router |> Phoenix.Router.routes() |> MapSet.new(&{router_method(&1.verb), &1.path})
+
+      for feature <- CompatibilityMatrix.features(), route <- feature.routes do
+        assert MapSet.member?(routes, {route.method, route.path}), "missing route for #{feature.slug}: #{route.method} #{route.path}"
+      end
+    end
+
+    test "each route retains the compatibility features that own its regression coverage" do
+      actual =
+        for feature <- CompatibilityMatrix.features(), route <- feature.routes, reduce: %{} do
+          acc -> Map.update(acc, {route.method, route.path}, [feature.slug], &[feature.slug | &1])
+        end
+
+      actual = Map.new(actual, fn {route, slugs} -> {route, Enum.sort(Enum.uniq(slugs))} end)
+      assert actual == @expected_route_features
     end
 
     test "has no pending compatibility gaps" do
       assert CompatibilityMatrix.pending_gaps() == []
+    end
+
+    test "keeps routeable windowless quota distinct from preserved 503 failures" do
+      feature = CompatibilityMatrix.by_slug!(:degraded_routing)
+      fixture = CompatibilityMatrix.fixture!(:degraded_routing)
+
+      assert feature.quota_evidence.lower_priority_fallback ==
+               "provider_attested_windowless_availability"
+
+      assert feature.quota_evidence.normal_authority == "fresh_reset_bearing_windows"
+      assert feature.quota_evidence.operator_or_sku_gate == false
+      assert feature.quota_evidence.synthetic_window_or_reset == false
+
+      assert fixture.windowless_provider_availability.routing_state ==
+               "windowless_provider_available"
+
+      assert fixture.windowless_provider_availability.required_metadata == [
+               "version",
+               "state",
+               "observed_at",
+               "credential_epoch"
+             ]
+
+      assert fixture.fail_closed.status == 503
+      assert fixture.fail_closed.blocked_error_code == "quota_exhausted"
+      assert fixture.fail_closed.unavailable_error_code == "quota_evidence_unavailable"
+    end
+
+    test "keeps the registered usage aliases on the shared dynamic freshness contract" do
+      feature =
+        Enum.find(CompatibilityMatrix.features(), &(&1.slug == :usage_alias_meter_identity))
+
+      assert feature
+      fixture = CompatibilityMatrix.fixture!(:usage_alias_meter_identity)
+
+      assert feature.routes == [
+               %{method: :get, path: "/api/codex/usage"},
+               %{method: :get, path: "/wham/usage"},
+               %{method: :get, path: "/backend-api/wham/usage"}
+             ]
+
+      assert feature.contract =~ "dynamically stale additional rows are omitted"
+
+      assert fixture.additional_rate_limits == %{
+               stale: "omitted_by_dynamic_freshness",
+               unknown: "preserved",
+               ordering: ["quota_key", "canonical_meter_token", "window_kind", "window_minutes"],
+               repeated_legacy_quota_key: true,
+               cross_meter_window_pairing: false
+             }
+
+      assert fixture.wire_schema == %{
+               legacy_fields_and_types: "unchanged",
+               freshness_fields: false,
+               raw_identity_fields: false
+             }
+    end
+
+    test "keeps the baseline matrix characterization intact before specialized contracts" do
+      assert CompatibilityMatrix.feature_slugs() == @expected_features
+      assert CompatibilityMatrix.pending_gaps() == []
+
+      assert Enum.all?(CompatibilityMatrix.features(), fn feature ->
+               feature.status == :supported and not is_nil(feature.current) and
+                 is_map(CompatibilityMatrix.fixture!(feature.fixture))
+             end)
+    end
+
+    test "locks the exact URL citation and Responses WebSocket stream ID machine contracts" do
+      citation_fixture = sdk_shape_fixture!(@url_citation_fixture_id)
+      stream_fixture = sdk_shape_fixture!(@stream_id_fixture_id)
+      v1_fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
+      openclaw_fixture = v1_fixture.openclaw_assistant_thinking_replay
+      stream_contract = v1_fixture.open_responses_websocket_stream_id
+
+      assert citation_fixture["endpoint"] == "/v1/responses"
+      assert citation_fixture["http_method"] == "POST or WEBSOCKET response.create"
+      assert citation_fixture["expected_decision"]["status"] == "translate"
+
+      assert citation_fixture["structural_summary"] == %{
+               "payload_kind" => "vercel_ai_open_responses_url_citation_replay",
+               "assistant_output_text_annotations_present" => true,
+               "annotation_type" => "url_citation",
+               "annotation_exact_keys" => @url_citation_keys,
+               "annotation_order_preserved" => true,
+               "explicit_empty_annotations_preserved" => true,
+               "omitted_annotations_preserved" => true,
+               "malformed_or_unsupported_annotations" => "reject_before_dispatch",
+               "raw_payload_stored" => false,
+               "placeholder_values_only" => true,
+               "notes" => [
+                 "Only the exact URL-citation schema is accepted for assistant output_text replay.",
+                 "The fixture intentionally omits raw assistant text and citation values."
+               ]
+             }
+
+      assert openclaw_fixture.output_text_annotations == %{
+               accepted_type: "url_citation",
+               exact_keys: @url_citation_keys,
+               preserves: ["order", "exact_values", "explicit_empty_list", "omission"],
+               malformed: "reject_before_dispatch"
+             }
+
+      assert stream_fixture["endpoint"] == "/v1/responses"
+      assert stream_fixture["http_method"] == "WEBSOCKET response.create"
+      assert stream_fixture["expected_decision"]["status"] == "accept"
+
+      assert stream_contract == @stream_id_contract
+
+      assert stream_fixture["structural_summary"] == %{
+               "payload_kind" => "openai_responses_websocket_stream_id",
+               "websocket_only" => true,
+               "rest_post_responses_excluded" => true,
+               "native_backend_routes_excluded" => true,
+               "validator" => %{
+                 "type" => "string",
+                 "byte_length" => [1, 256],
+                 "pattern" => "^[A-Za-z0-9_.-]+$"
+               },
+               "conditional_echo" => "every attributable Open Responses server event when the accepted response.create supplied stream_id",
+               "same_stream_id_ordering" => "FIFO",
+               "cross_stream_id_concurrency" => "unspecified",
+               "previous_response_id_relation" => "independent conversation lineage",
+               "upstream_handling" => "stripped before upstream dispatch",
+               "privacy" => "transient socket-turn state only; excluded from request options, persistence, accounting, logs, telemetry, and metadata",
+               "raw_payload_stored" => false,
+               "placeholder_values_only" => true
+             }
+    end
+
+    test "rejects a temporary malformed stream contract copy missing a required field" do
+      contract =
+        CompatibilityMatrix.fixture!(:v1_supported_surface).open_responses_websocket_stream_id
+
+      malformed_contract = Map.delete(contract, :upstream)
+
+      assert exact_stream_id_contract?(contract)
+      refute exact_stream_id_contract?(malformed_contract)
+    end
+
+    test "locks API-key websocket revocation separately from firewall revocation" do
+      feature = CompatibilityMatrix.by_slug!(:api_key_websocket_revocation)
+      fixture = CompatibilityMatrix.fixture!(:api_key_websocket_revocation)
+      firewall_fixture = CompatibilityMatrix.fixture!(:firewall)
+
+      assert feature.current == :durable_api_key_epoch_fence
+      assert feature.categories == [:auth, :error, :streaming, :ownership]
+      assert feature.future_routes == []
+
+      assert feature.routes == [
+               %{
+                 method: :get,
+                 path: "/backend-api/codex/responses",
+                 transport: :websocket
+               },
+               %{
+                 method: :get,
+                 path: "/backend-api/codex/v1/responses",
+                 transport: :websocket
+               },
+               %{method: :get, path: "/v1/responses", transport: :websocket}
+             ]
+
+      assert fixture == @api_key_websocket_revocation_contract
+
+      assert firewall_fixture.revoked_websocket == %{
+               close_code: 1008,
+               admitted_work: :finishes,
+               new_work: :refused,
+               reason: :websocket_revoked
+             }
+
+      malformed_fixture = put_in(fixture.prompt_delivery.role, :authorization_authority)
+
+      assert exact_api_key_websocket_revocation_contract?(fixture)
+      refute exact_api_key_websocket_revocation_contract?(malformed_fixture)
+    end
+
+    # findings#270: the fixture names the runtime's own vocabularies, so the
+    # contract cannot drift from the causes, close and skip reasons in use.
+    test "locks the native websocket close after an upstream connection close" do
+      feature = CompatibilityMatrix.by_slug!(:native_websocket_upstream_close)
+      fixture = CompatibilityMatrix.fixture!(:native_websocket_upstream_close)
+
+      assert feature.current == :idle_native_socket_closes_after_upstream_close
+      assert feature.future_routes == []
+
+      assert feature.routes == [
+               %{method: :get, path: "/backend-api/codex/responses", transport: :websocket},
+               %{method: :get, path: "/backend-api/codex/v1/responses", transport: :websocket}
+             ]
+
+      assert fixture.topologies == [:owner_forwarding_off, :owner_forwarding_on]
+      assert {fixture.close.code, fixture.close.reason} == WebsocketAdapter.close_detail(:upstream_connection_closed)
+      assert fixture.causes == CloseDiagnostics.anchor_invalidating_causes()
+      assert Enum.all?(fixture.excluded_causes, &(not CloseDiagnostics.anchor_invalidating_cause?(&1)))
+      assert fixture.latch.skip_reasons == WebsocketConnectionLogger.upstream_close_skip_reasons()
+      assert fixture.owner.skip_reasons == WebsocketOwnerLogger.upstream_close_skip_reasons()
+
+      assert WebsocketOwnerContract.upstream_closed_message?({fixture.owner.message, "corr-compat", 1, %{cause: hd(fixture.causes), lifecycle_id: Ecto.UUID.generate(), generation: 1}})
+      assert fixture.observability.closed == WebsocketConnectionLogger.downstream_closed_after_upstream_close_message()
+      assert fixture.observability.kept_open == WebsocketConnectionLogger.downstream_kept_open_after_upstream_close_message()
+      assert fixture.observability.queued_request == WebsocketConnectionLogger.upstream_close_queued_requests()
+      assert fixture.observability.metric == :none
+    end
+
+    # findings#276: the fixture names the runtime's own closes and line
+    # vocabularies, so the contract cannot drift from the ones in use.
+    test "locks the native websocket close after its websocket owner exits" do
+      feature = CompatibilityMatrix.by_slug!(:native_websocket_owner_exit)
+      fixture = CompatibilityMatrix.fixture!(:native_websocket_owner_exit)
+
+      assert feature.current == :idle_native_socket_closes_after_owner_exit
+      assert feature.future_routes == []
+
+      assert feature.routes == [
+               %{method: :get, path: "/backend-api/codex/responses", transport: :websocket},
+               %{method: :get, path: "/backend-api/codex/v1/responses", transport: :websocket}
+             ]
+
+      assert fixture.topologies == [:owner_on_this_node, :owner_on_another_node]
+      assert {fixture.close.owner_drained.code, fixture.close.owner_drained.reason} == WebsocketAdapter.close_detail(:owner_drained)
+      assert {fixture.close.owner_crashed.code, fixture.close.owner_crashed.reason} == WebsocketAdapter.close_detail(:owner_crashed)
+      assert fixture.reason_codes == WebsocketConnectionLogger.owner_exit_reason_codes()
+      assert fixture.latch.skip_reasons == WebsocketConnectionLogger.owner_exit_skip_reasons()
+      assert fixture.observability.closed == WebsocketConnectionLogger.downstream_closed_after_owner_exit_message()
+      assert fixture.observability.kept_open == WebsocketConnectionLogger.downstream_kept_open_after_owner_exit_message()
+      assert fixture.observability.metric == :none
+    end
+
+    # findings#279 point 1: every control the fixture names goes through the
+    # native socket's own frame decision, the public socket's and the quota
+    # observer, so the contract cannot drift from what a client is sent or
+    # from what is recorded.
+    test "locks the native websocket relay of provider controls" do
+      feature = CompatibilityMatrix.by_slug!(:native_websocket_provider_controls)
+      fixture = CompatibilityMatrix.fixture!(:native_websocket_provider_controls)
+
+      assert feature.current == :served_account_rate_limits_dropped
+      assert feature.future_routes == []
+
+      assert feature.routes == [
+               %{method: :get, path: "/backend-api/codex/responses", transport: :websocket},
+               %{method: :get, path: "/backend-api/codex/v1/responses", transport: :websocket}
+             ]
+
+      assert fixture.topologies == [:owner_forwarding_off, :owner_on_this_node, :owner_on_another_node]
+      assert fixture.serving_modes == ~w(full lite)
+      public_turn_state = WebsocketAdapter.public_responses_turn_state()
+      reset_at = DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_unix()
+
+      for type <- fixture.dropped do
+        event = %{"type" => type, "rate_limits" => %{"primary" => %{"used_percent" => 92, "window_minutes" => 300, "reset_at" => reset_at}}}
+        frame = CodexPooler.JSON.encode!(event)
+
+        assert WebsocketAdapter.native_downstream_response_chunk(frame, fn -> false end) == :drop
+        assert {:ok, %{pending_events: [_recorded]}} = RateLimitObserver.collect_events(frame, RateLimitObserver.event_state())
+        assert [_ | _] = evidence = Quotas.parse_codex_rate_limit_event(event)
+        assert Enum.uniq_by(evidence, & &1.source) |> Enum.map(& &1.source) == [fixture.dropped_frame.quota_evidence]
+        assert {:drop, _state} = WebsocketAdapter.downstream_response_chunk(frame, public_turn_state)
+      end
+
+      assert fixture.unknown_controls == :relayed_unchanged
+      unknown = CodexPooler.JSON.encode!(%{"type" => "codex.future_control", "sequence" => 1})
+
+      for frame <- Enum.map(fixture.relayed, &CodexPooler.JSON.encode!(%{"type" => &1})) ++ [unknown] do
+        assert WebsocketAdapter.native_downstream_response_chunk(frame, fn -> false end) == frame
+        assert {:drop, _state} = WebsocketAdapter.downstream_response_chunk(frame, public_turn_state)
+      end
+
+      assert fixture.public_v1_websocket == :relays_no_codex_control
+      assert CompatibilityMatrix.fixture!(fixture.provider_metadata).provider_metadata_event.x_models_etag == :removed
+      assert fixture.observability == %{line: :none, metric: :none}
+    end
+
+    # findings#270 row 270-272: the fixture's frame is the one the parser reads
+    # and the upstream session writes, its dropped outcomes are every line the
+    # interrupt can end on, and the reasons it names are the ones the receipt
+    # and the compaction collector give.
+    test "locks the native websocket response interrupt" do
+      feature = CompatibilityMatrix.by_slug!(:native_websocket_response_interrupt)
+      fixture = CompatibilityMatrix.fixture!(:native_websocket_response_interrupt)
+
+      assert feature.current == :relayed_to_the_running_turn
+      assert feature.future_routes == []
+      assert feature.routes == [%{method: :get, path: "/backend-api/codex/responses", transport: :websocket}]
+      assert fixture.topologies == [:owner_forwarding_off, :owner_on_this_node, :owner_on_another_node]
+      assert fixture.serving_modes == ~w(full lite)
+
+      assert {:ok, interrupt} = ResponseInterrupt.parse(fixture.frame)
+      assert CodexPooler.JSON.decode!(ResponseInterrupt.frame(interrupt)) == fixture.frame
+      assert ResponseInterrupt.outcomes() == [:written | fixture.dropped]
+      assert fixture.dropped_answer == :none
+
+      for type <- fixture.provider_answer do
+        assert {_family, class} = EventTaxonomy.classify(type)
+        refute class == "response_unknown_event"
+      end
+
+      assert fixture.settlement.incomplete_reason in DeliveryReceipt.incomplete_reason_values()
+
+      assert %{"response" => %{"incomplete_details" => %{"reason" => reason}}} =
+               CompactionResultCollector.provider_failure_websocket_event(%{event_type: "response.incomplete", code: "interrupted", upstream_code: "interrupted"})
+
+      assert reason == fixture.compaction_interrupted_reason
+      assert fixture.observability.metric == :none
+    end
+
+    # findings#279 point 2: the fixture's answer is the one the gateway renders
+    # for the Codex Desktop originator, and every other originator keeps the
+    # Pool-exhausted 429, so the contract cannot drift from what is sent.
+    test "locks the Codex Desktop answer to an exhausted Pool" do
+      feature = CompatibilityMatrix.by_slug!(:desktop_pool_usage_limit_answer)
+      fixture = CompatibilityMatrix.fixture!(:desktop_pool_usage_limit_answer)
+
+      assert feature.current == :desktop_400_invalid_prompt_with_pool_reset
+      assert feature.future_routes == []
+
+      assert Enum.map(feature.routes, &{&1.method, &1.path, Map.get(&1, :transport, :http)}) == [
+               {:post, "/backend-api/codex/responses", :http},
+               {:get, "/backend-api/codex/responses", :websocket},
+               {:post, "/backend-api/codex/v1/responses", :http},
+               {:get, "/backend-api/codex/v1/responses", :websocket},
+               {:post, "/backend-api/codex/responses/compact", :http},
+               {:post, "/backend-api/codex/v1/responses/compact", :http}
+             ]
+
+      assert fixture.refusal == :exhausted_pool_usage_limit
+      terminal = CompatibilityMatrix.fixture!(fixture.refusal).terminal
+      refusal = %{status: terminal.status, code: terminal.code, message: CompatibilityMatrix.fixture!(fixture.refusal).v1_message, param: "model", usage_limit: %{resets_at: 1_790_904_430, resets_in_seconds: 5_008}}
+      answer = Contracts.native_usage_limit_answer(refusal, fixture.originator)
+
+      assert Map.take(answer, [:status, :code, :message, :param]) == Map.take(fixture.answer, [:status, :code, :message, :param])
+      assert ErrorClassification.error_type(answer.code, answer.status) == fixture.answer.type
+      assert answer |> Contracts.usage_limit_error_fields() |> Map.keys() |> Enum.sort() == fixture.answer.fields
+      assert Contracts.usage_limit_response_headers(answer) == fixture.answer.http_headers
+      assert fixture.answer.websocket_headers == :none
+      assert %{"type" => "error", "status" => 400, "error" => %{"code" => "invalid_prompt"}} = event = WebsocketAdapter.websocket_error(answer)
+      refute Map.has_key?(event, "headers")
+
+      assert fixture.unchanged == %{originators: ["codex-tui", "codex_exec", "codex_vscode", nil], routes: :public_v1, retryable_503: :unchanged}
+
+      for originator <- fixture.unchanged.originators do
+        assert Contracts.native_usage_limit_answer(refusal, originator) == refusal
+      end
+
+      assert fixture.recorded == %{status: terminal.status, code: terminal.code, usage_limit: :advised_reset, http_request_line_status: 400, websocket_answered_line: %{status: terminal.status, answered_status: answer.status}}
+      assert Contracts.usage_limit_record(answer) == Contracts.usage_limit_record(refusal)
+      assert fixture.topologies == [:owner_forwarding_off, :owner_on_this_node]
+    end
+
+    test "documents the pruned runtime helper firewall matrix" do
+      feature = CompatibilityMatrix.by_slug!(:pruned_runtime_helper_firewall)
+      fixture = CompatibilityMatrix.fixture!(:pruned_runtime_helper_firewall)
+
+      assert feature.current == :firewall_before_fixed_absence
+      assert feature.categories == [:route, :error]
+      assert feature.routes == []
+
+      assert %{method: :post, path: "/backend-api/codex/analytics-events/events"} in fixture.routes
+
+      assert fixture.disabled == %{
+               status: 404,
+               content_type: "text/html; charset=utf-8",
+               body: "Not Found"
+             }
+
+      assert fixture.admitted == fixture.disabled
+      assert fixture.denied == %{status: 403, error_code: "access_denied"}
+
+      assert fixture.settings_unavailable == %{
+               status: 503,
+               error_code: "settings_unavailable"
+             }
+
+      assert Map.take(fixture, [
+               :authentication,
+               :body_read,
+               :upstream_dispatch,
+               :reservation,
+               :accounting,
+               :denial_observation
+             ]) == %{
+               authentication: :not_attempted,
+               body_read: false,
+               upstream_dispatch: false,
+               reservation: false,
+               accounting: false,
+               denial_observation: :exactly_one_bounded_event
+             }
+    end
+
+    test "characterizes structured firewall and image permission seams" do
+      firewall = CompatibilityMatrix.by_slug!(:firewall)
+      firewall_fixture = CompatibilityMatrix.fixture!(:firewall)
+      image_permission = CompatibilityMatrix.by_slug!(:image_generation_permission)
+      image_fixture = CompatibilityMatrix.fixture!(:image_generation_permission)
+
+      assert firewall.routes == [
+               %{family: :backend_codex, method: :get, path: "/backend-api/codex/models"},
+               %{family: :backend_codex, method: :post, path: "/backend-api/codex/responses"},
+               %{
+                 family: :backend_codex,
+                 method: :get,
+                 path: "/backend-api/codex/responses",
+                 transport: :websocket
+               },
+               %{family: :backend_files, method: :post, path: "/backend-api/files"},
+               %{
+                 family: :backend_files,
+                 method: :post,
+                 path: "/backend-api/files/:file_id/uploaded"
+               },
+               %{family: :backend_transcribe, method: :post, path: "/backend-api/transcribe"},
+               %{family: :codex_usage, method: :get, path: "/api/codex/usage"},
+               %{family: :wham_usage, method: :get, path: "/wham/usage"},
+               %{family: :backend_wham_usage, method: :get, path: "/backend-api/wham/usage"},
+               %{family: :public_v1, method: :get, path: "/v1/models"},
+               %{family: :public_v1, method: :post, path: "/v1/responses"},
+               %{
+                 family: :public_v1,
+                 method: :get,
+                 path: "/v1/responses",
+                 transport: :websocket
+               },
+               %{family: :mcp, method: :post, path: "/mcp"}
+             ]
+
+      assert Map.take(firewall_fixture, [
+               :protected_route_families,
+               :canonical_path,
+               :allowlist
+             ]) == %{
+               protected_route_families: [
+                 :backend_codex,
+                 :backend_files,
+                 :backend_transcribe,
+                 :codex_usage,
+                 :wham_usage,
+                 :backend_wham_usage,
+                 :public_v1,
+                 :mcp
+               ],
+               canonical_path: %{
+                 decode_passes: 1,
+                 decoded_segments_mutated: false,
+                 candidate_separators: ["/", "\\"],
+                 candidate_nul: %{classification: :truncate, runtime: :reject_invalid_path}
+               },
+               allowlist: %{empty: :disabled}
+             }
+
+      forwarded_client_ip = firewall_fixture.forwarded_client_ip
+
+      assert Map.take(forwarded_client_ip, [
+               :sources,
+               :default_source,
+               :default_proxy_depth,
+               :source_depths,
+               :trusted_peer_required_for_x_forwarded_for,
+               :trusted_peer_required_for_x_real_ip,
+               :selected_source_fallback,
+               :xff_duplicate_fields,
+               :x_real_ip_fields,
+               :positional_depth,
+               :max_hops,
+               :max_entry_bytes,
+               :accepted_ports,
+               :nonruntime_client_ip,
+               :strict_ip_cidr
+             ]) == %{
+               sources: [:peer, :x_forwarded_for, :x_real_ip],
+               default_source: :x_forwarded_for,
+               default_proxy_depth: 0,
+               source_depths: %{peer: [0], x_forwarded_for: 0..16, x_real_ip: [0]},
+               trusted_peer_required_for_x_forwarded_for: true,
+               trusted_peer_required_for_x_real_ip: true,
+               selected_source_fallback: false,
+               xff_duplicate_fields: :combined_in_wire_order,
+               x_real_ip_fields: :exactly_one,
+               positional_depth: %{
+                 range: 1..16,
+                 selected_entry: :nth_from_right,
+                 peer_counts_as_proxy: true,
+                 peer_is_xff_entry: false
+               },
+               max_hops: 32,
+               max_entry_bytes: 64,
+               accepted_ports: %{ipv4: true, bracketed_ipv6: true, range: 1..65_535},
+               nonruntime_client_ip: :peer,
+               strict_ip_cidr: %{
+                 outer_whitespace: :ascii_space_or_tab,
+                 prefix: :canonical_unsigned_decimal,
+                 ipv4_mapped_ipv6: :normalized_to_ipv4,
+                 invalid_stored_rules: :fail_closed
+               }
+             }
+
+      assert firewall.current == :explicit_forwarded_client_policy
+
+      assert Map.take(firewall_fixture, [
+               :allowlist,
+               :cold_settings,
+               :warm_settings,
+               :revoked_websocket,
+               :denial_telemetry
+             ]) == %{
+               allowlist: %{empty: :disabled},
+               cold_settings: %{status: 503, runtime_and_mcp: :fail_closed},
+               warm_settings: :last_known_good_enforced,
+               revoked_websocket: %{
+                 close_code: 1008,
+                 admitted_work: :finishes,
+                 new_work: :refused,
+                 reason: :websocket_revoked
+               },
+               denial_telemetry: %{
+                 metric: "codex_pooler_ingress_firewall_denied_count",
+                 labels: [:scope, :reason],
+                 accounting: :before_authenticated_request_accounting
+               }
+             }
+
+      assert image_permission.routes == [
+               %{method: :post, path: "/backend-api/codex/images/generations"},
+               %{method: :post, path: "/backend-api/codex/images/edits"},
+               %{method: :post, path: "/v1/images/generations"},
+               %{method: :post, path: "/v1/images/edits"}
+             ]
+
+      assert Map.take(image_fixture, [
+               :controller_actions,
+               :authoritative_gateway,
+               :enforcement
+             ]) == %{
+               controller_actions: [
+                 %{
+                   action: :image_generations,
+                   controller: :backend_codex,
+                   image_generation_permission_required?: true
+                 },
+                 %{
+                   action: :image_edits,
+                   controller: :backend_codex,
+                   image_generation_permission_required?: true
+                 },
+                 %{
+                   action: :generations,
+                   controller: :v1_images,
+                   image_generation_permission_required?: true
+                 },
+                 %{
+                   action: :edits,
+                   controller: :v1_images,
+                   image_generation_permission_required?: true
+                 }
+               ],
+               authoritative_gateway: :runtime_ingress,
+               enforcement: %{
+                 after: :runtime_authentication,
+                 before: [:request_parsing, :upstream_dispatch, :body_decompression]
+               }
+             }
+    end
+
+    test "locks Pool-model serving modes as a machine-readable runtime contract" do
+      feature = CompatibilityMatrix.by_slug!(:pool_model_serving_modes)
+      fixture = CompatibilityMatrix.fixture!(:pool_model_serving_modes)
+
+      assert feature.current == :pool_model_pair_request_or_turn_snapshot
+
+      assert feature.routes == [
+               %{family: :backend_models, method: :get, path: "/backend-api/codex/models"},
+               %{family: :backend_models, method: :get, path: "/backend-api/codex/v1/models"},
+               %{
+                 family: :ordinary_responses,
+                 method: :post,
+                 path: "/backend-api/codex/responses",
+                 transport: :http_sse
+               },
+               %{
+                 family: :ordinary_responses,
+                 method: :post,
+                 path: "/backend-api/codex/v1/responses",
+                 transport: :http_sse
+               },
+               %{
+                 family: :ordinary_responses,
+                 method: :get,
+                 path: "/backend-api/codex/responses",
+                 transport: :websocket
+               },
+               %{
+                 family: :ordinary_responses,
+                 method: :get,
+                 path: "/backend-api/codex/v1/responses",
+                 transport: :websocket
+               },
+               %{
+                 family: :compact,
+                 method: :post,
+                 path: "/backend-api/codex/responses/compact"
+               },
+               %{
+                 family: :compact,
+                 method: :post,
+                 path: "/backend-api/codex/v1/responses/compact"
+               },
+               %{
+                 family: :ordinary_responses,
+                 method: :post,
+                 path: "/backend-api/codex/v1/chat/completions"
+               },
+               %{
+                 family: :public_ordinary_responses,
+                 method: :post,
+                 path: "/v1/responses"
+               },
+               %{
+                 family: :public_ordinary_responses,
+                 method: :get,
+                 path: "/v1/responses",
+                 transport: :websocket
+               },
+               %{
+                 family: :public_ordinary_responses,
+                 method: :post,
+                 path: "/v1/chat/completions"
+               }
+             ]
+
+      assert fixture.persistence == %{
+               scope: :pool_model_pair,
+               shared_store: :postgres,
+               persisted_modes: [:lite, :full],
+               auto_representation: :row_absence,
+               canonical_model_id: true,
+               survives_catalog_churn: true,
+               client_visible_model_ids: 1
+             }
+
+      assert fixture.auto_truth_table == %{
+               any_routable_source_literal_true: :lite,
+               all_routable_source_values_false_missing_or_malformed: :full,
+               source_map_present_ignores_legacy_aggregate: true,
+               absent_or_non_map_source_map_with_legacy_aggregate_literal_true: :lite,
+               absent_or_non_map_source_map_with_other_aggregate_value: :full,
+               zero_routable_sources: :no_runtime_model
+             }
+
+      assert fixture.snapshot_lifetime == %{
+               http: :request,
+               websocket: :response_create_turn,
+               retry: :preserve,
+               cross_assignment_failover: :preserve,
+               owner_forwarding: :preserve,
+               next_websocket_turn: :reresolve
+             }
+
+      assert fixture.catalog_etag == %{
+               backend_field: "use_responses_lite",
+               backend_value: :effective_boolean,
+               digest_scope: :final_policy_visible_body,
+               public_v1_models: :unchanged
+             }
+
+      assert fixture.accounting == %{
+               request_namespace: "request_metadata",
+               request_nested_namespace: "routing",
+               attempt_namespace: "response_metadata",
+               keys: [
+                 "model_serving_mode_configured",
+                 "model_serving_mode",
+                 "model_serving_mode_source"
+               ],
+               retry_snapshot: :identical,
+               raw_payload_fields: false
+             }
+
+      assert fixture.compact == %{
+               backend_uses_snapshot: true,
+               backend_transforms_payload: true,
+               public_path: "/v1/responses/compact",
+               public_status: 404,
+               public_error_code: "unsupported_endpoint",
+               public_upstream_dispatch: false
+             }
+
+      assert fixture.public_v1_exclusions == %{
+               models_mode_fields: false,
+               models_body_changed: false,
+               compact_supported: false
+             }
+
+      assert fixture.assignment_eligibility == %{
+               use_responses_lite_candidate_filter: false,
+               membership_contract: :unchanged
+             }
+
+      assert fixture.configuration == %{
+               client_api_key: :unchanged,
+               client_model_id: :unchanged,
+               client_configuration: :unchanged,
+               global_env_switch: false,
+               helm_value: false
+             }
+
+      assert fixture.full_rejection_diagnostic == %{
+               error_code: "upstream_status",
+               applies_to: :explicit_full_ordinary_responses_http_non_rate_limit_4xx_rejection,
+               error_code_varies_by_serving_mode: false,
+               serving_mode_diagnostic_source: :request_and_attempt_routing_metadata,
+               rate_limit_error_code: "upstream_rate_limited",
+               ordinary_5xx_error_code: "upstream_status",
+               upstream_status_retained: true,
+               client_error: %{
+                 "code" => "invalid_request",
+                 "message" => "upstream rejected parameter tools.defer_loading (invalid_request)",
+                 "param" => "tools.defer_loading",
+                 "type" => "invalid_request_error"
+               },
+               client_error_message_source: :relayed_code_and_param_and_persisted_supported_values,
+               client_error_message_matches_non_full_relay: true,
+               supported_values_suffix_relayed: true,
+               supported_values_source: :persisted_bounded_attempt_metadata,
+               client_error_without_sanitized_rejection_type: %{
+                 "code" => "server_error",
+                 "message" => "upstream request failed",
+                 "type" => "server_error"
+               },
+               relayed_sanitized_rejection_fields: [:type, :code, :param],
+               relayed_rejection_code_fallback_by_type: %{
+                 "invalid_request_error" => "invalid_request"
+               },
+               relay_window: :rejection_metadata_status,
+               provider_message_forwarded: false,
+               unchanged_client_response_scopes: [
+                 :auto,
+                 :lite,
+                 :compact_and_unrelated_routes,
+                 :established_model_miss
+               ],
+               silent_downgrade: false,
+               raw_upstream_error_text: false
+             }
     end
 
     test "documents bounded non-streaming upstream response body behavior" do
@@ -116,16 +1173,141 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              }
     end
 
-    test "documents catalog, envelope, and safe error diagnostics as separate contracts" do
+    @tag :external_issues_229_231
+    test "documents catalog capacity, envelope, and safe error diagnostics as separate contracts" do
       models_etag = CompatibilityMatrix.by_slug!(:backend_models_etag)
       responses_etag = CompatibilityMatrix.by_slug!(:backend_responses_etag)
       envelope = CompatibilityMatrix.by_slug!(:backend_responses_envelope)
       error_param = CompatibilityMatrix.by_slug!(:upstream_error_param)
+      terminal_failure_diagnostics = CompatibilityMatrix.by_slug!(:terminal_failure_diagnostics)
 
-      assert models_etag.contract =~ "policy-visible effective catalog body"
+      assert models_etag.contract =~ "policy-visible native catalog body"
       assert models_etag.contract =~ "eventual"
+
+      assert models_etag.canonical_partition.new_turn_capacity == %{
+               backend_codex_catalog_driven: "selected_partition_only",
+               translated_openai_responses: "all_valid_canonical_assignments"
+             }
+
+      assert models_etag.canonical_partition.shell_type == %{
+               equivalent_known_values: ["default", "local", "shell_command", "unified_exec"],
+               digest_value: "shell_command",
+               disabled: "separate_partition",
+               non_collapsing_values: ["unknown", "missing", "malformed"]
+             }
+
+      assert models_etag.canonical_partition.quota_routing == %{
+               snapshot: "one_shared_candidate_identity_snapshot",
+               classification: "independent_per_model",
+               input: "quota_evidence_only"
+             }
+
+      assert models_etag.canonical_partition.selection == "largest_quota_routable_partition"
+
+      assert models_etag.canonical_partition.selection_fallback ==
+               "largest_partition_when_none_routable"
+
+      assert models_etag.canonical_partition.reasoning_variants == %{
+               stable_catalog_projection: "routable_capability_family_reasoning_union",
+               canonical_allowance: "all_reasoning_variants_in_quota_selected_capability_family",
+               native_turn_selection: "post_eligibility_assignment_advertising_effective_known_effort",
+               non_reasoning_capability_boundary: "never_crossed",
+               no_advertiser_fallback: "quota_selected_partition",
+               circuit_state_input: false
+             }
+
+      assert models_etag.canonical_partition.pinned_continuation == %{
+               valid_canonical_hard_pin: "may_cross_partition",
+               malformed_or_retired_source: "unavailable"
+             }
+
+      assert models_etag.contract =~
+               "backend Codex catalog-driven new turns use the selected capability family"
+
+      assert models_etag.contract =~
+               "translated OpenAI Responses capacity includes all valid canonical assignments"
+
+      assert models_etag.contract =~
+               "unknown, missing, or malformed values do not silently collapse"
+
+      assert models_etag.contract =~ "classifies it independently per model"
+
       assert responses_etag.contract =~ "exact authenticated backend models ETag"
+      assert responses_etag.contract =~ "backward-compatible connection-opening value"
+      assert responses_etag.contract =~ "authoritative codex.response.metadata"
+      assert responses_etag.contract =~ "current predispatch snapshot"
       assert responses_etag.contract =~ "never relayed from upstream"
+      assert responses_etag.contract =~ "native websocket replay re-emits"
+
+      assert responses_etag.contract =~
+               "relayed after the Pooler event with x-models-etag removed"
+
+      assert responses_etag.contract =~ "only from metadata events that carry it"
+
+      assert terminal_failure_diagnostics.contract =~ "failed and retryable_failed"
+
+      assert terminal_failure_diagnostics.contract =~
+               "strict ASCII identifiers through 80 bytes remain cleartext"
+
+      assert terminal_failure_diagnostics.contract =~
+               "malformed control invalid-UTF8 or overlong identifiers fingerprint"
+
+      assert terminal_failure_diagnostics.contract =~ "raw provider messages, bodies, and frames"
+
+      assert CompatibilityMatrix.fixture!(:terminal_failure_diagnostics) == %{
+               fields: ~w(upstream_error_code stream_terminal_type compaction_invalid_reason upstream_error_param),
+               projection: "failed_and_retryable_failed_attempt_detail_only",
+               readable_identifier: "strict_ascii_80_bytes_or_less_cleartext",
+               malformed_identifier: "sha256_12",
+               invalid_or_successful_or_historical_attempt: "omitted",
+               raw_provider_message_body_or_frame: "never_projected"
+             }
+
+      assert CompatibilityMatrix.fixture!(:backend_responses_etag) == %{
+               header: "x-models-etag",
+               equals: "authenticated_backend_models_etag",
+               http_json: :excluded,
+               http_sse: %{surface: :response_header, authority: :request_snapshot},
+               websocket: %{
+                 upgrade: %{
+                   surface: :response_header,
+                   authority: :backward_compatible_connection_open
+                 },
+                 turn: %{
+                   surface: :codex_response_metadata_event,
+                   authority: :current_turn_snapshot,
+                   event_type: "codex.response.metadata"
+                 }
+               },
+               snapshot_lifetime: %{
+                 http: :request,
+                 websocket: :response_create_turn,
+                 retry: :preserve,
+                 native_replay: :preserve,
+                 owner_forwarding: :preserve,
+                 next_websocket_turn: :reresolve
+               },
+               upstream_etag_relay: false,
+               representation_selector: "user_agent_package_version",
+               provider_metadata_event: %{
+                 order: :after_pooler_event,
+                 x_models_etag: :removed,
+                 consumer_etag_source: :metadata_event_carrying_x_models_etag
+               },
+               included_routes: [
+                 "/backend-api/codex/responses",
+                 "/backend-api/codex/v1/responses"
+               ],
+               excluded_surfaces: [
+                 "backend_json",
+                 "backend_compact",
+                 "public_v1",
+                 "usage",
+                 "unauthenticated",
+                 "unrelated_routes"
+               ]
+             }
+
       assert envelope.contract =~ "exactly one reasoning.encrypted_content include"
       assert envelope.contract =~ "compact routes remain excluded"
       assert error_param.contract =~ "failed-attempt detail only"
@@ -144,12 +1326,25 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                "strips backend-only upstream-unsupported controls"
     end
 
+    test "characterizes accepted public prompt cache controls" do
+      fixture = CompatibilityMatrix.fixture!(:responses_chat)
+
+      assert fixture.upstream_prompt_cache_controls.request_options_field ==
+               "prompt_cache_options"
+
+      assert fixture.upstream_prompt_cache_controls.content_breakpoint_field ==
+               "prompt_cache_breakpoint"
+
+      assert fixture.upstream_prompt_cache_controls.breakpoint_mode == "explicit"
+      assert fixture.prompt_cache_routing.typed_input == "prompt_cache_key"
+    end
+
     test "documents upstream prompt cache controls separately from Pool affinity" do
       feature = CompatibilityMatrix.by_slug!(:responses_chat)
       fixture = CompatibilityMatrix.fixture!(:responses_chat)
 
-      assert feature.contract =~ "validate and preserve prompt_cache_options"
-      assert feature.contract =~ "prompt_cache_breakpoint"
+      assert feature.contract =~ "accept prompt_cache_options"
+      assert feature.contract =~ "account-backed egress omits both explicit controls"
       assert feature.contract =~ "Pool affinity remains exclusively keyed by prompt_cache_key"
 
       assert fixture.upstream_prompt_cache_controls == %{
@@ -157,7 +1352,12 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                content_breakpoint_field: "prompt_cache_breakpoint",
                breakpoint_mode: "explicit",
                routing_input: false,
-               preserved_surfaces: ["/v1/responses", "/v1/chat/completions"]
+               accepted_public_surfaces: ["/v1/responses", "/v1/chat/completions"],
+               account_backed_upstream_payload: %{
+                 omitted_fields: ["prompt_cache_options", "prompt_cache_breakpoint"],
+                 preserved_fields: ["prompt_cache_key"]
+               },
+               public_response_headers: %{downgrade_marker: :absent}
              }
 
       assert fixture.prompt_cache_routing.typed_input == "prompt_cache_key"
@@ -195,12 +1395,39 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       feature = CompatibilityMatrix.by_slug!(:unsupported_input_image_reference)
       fixture = CompatibilityMatrix.fixture!(:unsupported_input_image_reference)
 
-      assert feature.contract =~ "input_image.file_id"
+      assert feature.contract =~ "input_image.file_id references are forwarded unchanged"
+      assert feature.contract =~ "pins the request to the assignment holding the file"
       assert feature.contract =~ "Codex sediment://"
       assert feature.contract =~ "unsupported URL schemes"
 
       assert fixture.accepted_url_schemes == ["https", "data:image"]
       assert fixture.unsupported_url_schemes == ["http", "sediment", "file"]
+
+      # findings#206 row 206-476: /v1 forwards a tool-output image detail on
+      # Full and refuses one outside the provider's enum before dispatch.
+      assert %{method: :post, path: "/v1/responses"} in feature.routes
+      assert feature.contract =~ "forwards input_image.detail from message and tool-output images alike on a Full model"
+      assert feature.contract =~ "400 invalid_value on the provider's field path"
+      assert fixture.v1_image_details == ["low", "high", "auto", "original"]
+      assert fixture.v1_invalid_image_detail.param == "input[2].output[1].detail"
+
+      # Chat carries image_url.detail under the same rules and refuses an
+      # invalid one under the Chat field path.
+      assert %{method: :post, path: "/v1/chat/completions"} in feature.routes
+      assert feature.contract =~ "carries image_url.detail into the rebuilt input_image detail"
+      assert fixture.v1_chat_invalid_image_detail.param == "messages[0].content[1].image_url.detail"
+
+      # A Chat tool message carries its image_url parts into the rebuilt
+      # function_call_output, as Hermes sends a screenshot in Chat mode.
+      assert feature.contract =~ "carries image_url parts of a role tool message into the rebuilt function_call_output"
+      assert fixture.v1_chat_tool_message_image_parts == ["image_url"]
+
+      # findings#206 row 206-494: the tool-result extension shapes carry and
+      # validate image_url.detail under the field the client sent.
+      assert feature.contract =~ "refused at input[i].content[j].image_url.detail"
+      assert feature.contract =~ "refused at messages[i].content[j].output[k].image_url.detail"
+      assert fixture.v1_role_tool_invalid_image_detail.param == "input[1].content[1].image_url.detail"
+      assert fixture.v1_chat_tool_result_invalid_image_detail.param == "messages[1].content[0].output[1].image_url.detail"
     end
 
     test "documents non-strict function tool schema lowering scope" do
@@ -225,6 +1452,9 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       assert fixture.strict_function_tools_lowered == false
       assert fixture.strict_structured_outputs_lowered == false
+      assert fixture.public_v1_nested_lowering.encrypted_markers == "boolean_true_preserved"
+      assert fixture.top_level_function_encrypted_markers == "dropped"
+      assert feature.contract =~ "preserving their boolean encrypted: true parameter markers"
       assert "$schema" in fixture.unsupported_json_schema_keywords_dropped
       assert "$ref" in fixture.supported_schema_keywords_preserved
       assert "const_to_single_value_enum" in fixture.schema_repairs
@@ -239,65 +1469,317 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              ]
     end
 
-    test "documents request compression search and diff input shapes" do
-      feature = CompatibilityMatrix.by_slug!(:request_compression)
-      fixture = CompatibilityMatrix.fixture!(:request_compression)
+    test "documents canonical encrypted agent v2 websocket handoffs" do
+      feature = CompatibilityMatrix.by_slug!(:backend_agent_v2_handoffs)
+      fixture = CompatibilityMatrix.fixture!(:backend_agent_v2_handoffs)
+
+      assert feature.current == :canonical_encrypted_agent_handoff_preservation
+      assert feature.contract =~ "NEW_TASK and MESSAGE"
+      assert feature.contract =~ "/morpheus or /root paths"
+      assert feature.contract =~ "task name and sender exactly match recipient and author"
+      assert feature.contract =~ "durable request or attempt metadata never stores"
+
+      assert feature.routes == [
+               %{
+                 method: :get,
+                 path: "/backend-api/codex/responses",
+                 transport: "websocket"
+               },
+               %{
+                 method: :get,
+                 path: "/backend-api/codex/v1/responses",
+                 transport: "websocket"
+               }
+             ]
+
+      assert fixture.preserved_message_types == ["NEW_TASK", "MESSAGE"]
+      assert fixture.content_shape == ["input_text", "encrypted_content"]
+      assert fixture.protocol_bindings == %{task_name: "recipient", sender: "author"}
+      assert fixture.other_encrypted_agent_messages == "removed"
+      assert fixture.durable_metadata == "encrypted_content_omitted"
+    end
+
+    test "pins Full-mode multi-agent certification and staged external disposition" do
+      feature = CompatibilityMatrix.by_slug!(:multi_agent_product_certification)
+      fixture = CompatibilityMatrix.fixture!(:multi_agent_product_certification)
+
+      assert feature.current == :pinned_full_mode_v1_v2_stage_classification
+      assert feature.contract =~ "gpt-5.5 resolves v1 through feature fallback"
+      assert feature.contract =~ "gpt-5.6-terra resolves v2"
+      assert feature.contract =~ "instruction_observation_missing"
+      assert feature.contract =~ "without a production transport change"
+
+      assert fixture.source_pin == "c9c6c0daa994109cec50fddcb57d076fdf9e738c"
+      assert fixture.primary_serving_mode == "full"
+      assert fixture.preflight.catalog_use_responses_lite == false
+      assert fixture.preflight.http_lite_header_present == false
+      assert fixture.preflight.websocket_lite_metadata_present == false
+
+      assert fixture.protocol_matrix.v1 == %{
+               model: "gpt-5.5",
+               selection: "feature_fallback",
+               multi_agent: true,
+               multi_agent_v2: false
+             }
+
+      assert fixture.protocol_matrix.v2 == %{
+               model: "gpt-5.6-terra",
+               selection: "feature_override",
+               multi_agent_v2: true
+             }
+
+      assert fixture.protocol_matrix.same_model_causal_pair == ["v2", "direct_control"]
+      assert fixture.live_text_disposition.pooler_delivery == "present"
+      assert fixture.live_text_disposition.first_failing_stage == "codex_app_server_boundary"
+      assert fixture.live_text_disposition.production_transport_change == "none"
+
+      assert fixture.done_claim_disposition == %{
+               v2_exact_instruction: "instruction_observation_missing",
+               reason: "opaque_encrypted_arguments_without_permitted_external_resolution_source",
+               downstream_stages: "not_attributed_past_first_missing_observation"
+             }
+
+      assert fixture.implemented_runtime_outcomes.overload == %{
+               public_status: 503,
+               wire_code: "server_is_overloaded",
+               internal_reasons: ["bulkhead_rejected", "bulkhead_queue_timeout"]
+             }
+
+      assert fixture.implemented_runtime_outcomes.compact_projection.preserves == [
+               "model",
+               "input",
+               "instructions",
+               "tools",
+               "parallel_tool_calls",
+               "reasoning",
+               "service_tier",
+               "prompt_cache_key",
+               "text"
+             ]
+
+      assert fixture.implemented_runtime_outcomes.public_v1 == %{
+               unknown_typed_input: "reject_before_dispatch",
+               nested_tool_search: "forward_for_provider_validation",
+               encrypted_function_args: "validated_and_round_tripped"
+             }
+
+      assert fixture.implemented_runtime_outcomes.routing_hint ==
+               "trusted_effective_model_and_service_tier_native_and_v1_translated"
+
+      assert fixture.implemented_runtime_outcomes.schema_bound_function_output_preservation ==
+               "byte_exact_json_preserved"
+
+      assert fixture.implemented_runtime_outcomes.responses_lite_full.auto_source ==
+               "health_level_aggregate"
+
+      assert fixture.deployment_certification == "exact_tested_commit_sha_required"
+      assert fixture.reporting == "metadata_only"
+      refute fixture.metrics_added
+      refute fixture.runtime_config_added
+      refute fixture.dashboards_changed
+      refute fixture.helm_changed
+    end
+
+    @tag :responses_allowed_tools
+    test "locks allowed-tools as a distinct public Responses compatibility contract" do
+      feature = CompatibilityMatrix.by_slug!(:responses_allowed_tools)
+      fixture = CompatibilityMatrix.fixture!(:responses_allowed_tools)
 
       assert feature.status == :supported
-      assert feature.contract =~ "grouped heading matches"
-      assert feature.contract =~ "portable NUL-delimited matches"
-      assert feature.contract =~ "additions-only"
-      assert feature.contract =~ "deletions-only"
-      assert feature.contract =~ "minimal unified diffs"
-      assert feature.contract =~ "combined unified diffs"
-      assert feature.contract =~ "long-preamble diffs"
-      assert feature.contract =~ "protected exact-output function tool outputs"
-      assert feature.contract =~ "WebSearch, WebFetch, web_search, web_fetch"
-      assert feature.contract =~ "external retrieval"
-      assert feature.contract =~ "output-only function tool results fail closed"
+      assert feature.current == :declaration_backed_full_mode_choice
+      assert feature.categories == [:route, :auth, :error, :streaming, :ownership]
+      assert feature.future_routes == []
+      assert feature.fixture == :responses_allowed_tools
+      assert feature.routes == responses_allowed_tools_routes()
+      assert feature.contract == responses_allowed_tools_summary()
+      assert fixture == responses_allowed_tools_contract()
+    end
 
-      assert fixture.protected_tool_outputs == %{
-               default_function_names: [
-                 "Read",
-                 "Glob",
-                 "Grep",
-                 "Write",
-                 "Edit",
-                 "WebSearch",
-                 "WebFetch",
-                 "web_search",
-                 "web_fetch"
-               ],
-               lowercase_variants: true,
-               external_retrieval: true,
-               unknown_function_output_behavior: "protected_original_output_preserved",
-               output_behavior: "original_output_preserved",
-               metadata: "aggregate_counts_only"
+    test "documents executable custom tools separately from custom replay" do
+      feature = CompatibilityMatrix.by_slug!(:responses_executable_custom_tools)
+      fixture = CompatibilityMatrix.fixture!(:responses_executable_custom_tools)
+
+      assert feature.current == :responses_and_chat_custom_tool_admission
+
+      assert feature.routes == [
+               %{method: :post, path: "/v1/responses"},
+               %{method: :get, path: "/v1/responses", transport: "websocket"},
+               %{method: :post, path: "/v1/chat/completions"}
+             ]
+
+      assert fixture.scope == "direct_public_responses_and_translated_chat"
+      assert fixture.formats == ["omitted", "text", "grammar_lark", "grammar_regex"]
+      assert fixture.allowed_callers_null == true
+
+      assert fixture.nested_definitions == %{
+               container: "namespace",
+               transports: ["http", "websocket_response_create"],
+               public_scope: "direct_public_responses",
+               full_mode: "preserved",
+               typed_choice_scope: "namespace_nested_custom"
              }
 
-      assert feature.contract =~ "ordinary prose"
+      assert fixture.typed_choice.resolves_same_kind == true
+      assert fixture.typed_choice.full_mode == "preserved"
+      assert fixture.typed_choice.lite_mode == "rejected_unsupported_parameter_before_dispatch"
 
-      assert fixture.supported_input_shapes == %{
-               search_results: [
-                 "classic_path_line",
-                 "grouped_heading",
-                 "portable_nul_delimited"
-               ],
-               diffs: [
-                 "hunk_additions_only",
-                 "hunk_deletions_only",
-                 "hunk_replacement",
-                 "minimal_unified_hunk",
-                 "combined_unified_hunk",
-                 "long_preamble_diff"
-               ],
-               false_positive_guards: [
-                 "path_like_group_heading",
-                 "minimum_grouped_matches",
-                 "hunk_header_required"
-               ],
-               log_output: ["failure_summary_guard"]
+      assert fixture.response_namespace_restoration == %{
+               transports: ["http", "sse", "websocket_direct", "websocket_owner_forwarded"],
+               when: "missing_or_null_provider_namespace_with_one_exact_namespaced_custom_declaration",
+               preserves: "explicit_provider_namespace",
+               unchanged: ["flat", "unknown", "non_unique"]
              }
+
+      assert fixture.executable_name_collision_scope == [
+               "flat_function",
+               "namespace_nested_function",
+               "namespace_nested_custom",
+               "custom"
+             ]
+
+      assert fixture.custom_replay_contract == "separate_input_item_shape"
+      assert fixture.chat_supported == true
+      assert fixture.chat.streamed_input == "free_form_fragments_not_json_parsed"
+      assert fixture.provider_availability == "selected_model_and_account_dependent"
+      assert fixture.broad_openai_tool_parity == false
+    end
+
+    test "locks the namespace custom contract and its provenance boundaries" do
+      namespace_tool = CompatibilityMatrix.fixture!(:responses_chat).namespace_tool
+
+      expected_namespace_tool = %{
+        shape: "top_level_namespace_tool",
+        required: ["type", "name", "description", "tools"],
+        namespace_name: "nonblank",
+        nested_tool_types: ["function", "custom"],
+        nested_function_optional: ["strict", "defer_loading"],
+        nested_custom_required: ["type", "name"],
+        nested_custom_optional: ["description", "defer_loading", "allowed_callers", "format"],
+        nested_custom_formats: ["omitted", "text", "grammar_lark", "grammar_regex"],
+        nested_custom_allowed_callers: ["direct", "programmatic"],
+        nested_custom_allowed_callers_null: true,
+        excluded_nested_tool_types: ["hosted", "mcp", "namespace", "tool_search"],
+        satisfies_tool_choice: true,
+        executable_name_collision_scope: "global"
+      }
+
+      assert namespace_tool == expected_namespace_tool
+
+      stale_function_only_expected_namespace_tool =
+        Map.put(expected_namespace_tool, :nested_tool_types, ["function"])
+
+      refute namespace_tool == stale_function_only_expected_namespace_tool
+
+      assert %{
+               source: "OpenAI Python `openai`",
+               version: "`2.52.0`",
+               decision: "accept",
+               observed_shape: "Custom tool requires `type=custom` and nonblank `name`; optional description, boolean `defer_loading`, nullable direct/programmatic `allowed_callers`, and omitted/text/lark/regex format; typed choice has exact `type` and `name`"
+             } = sdk_shape_row!("openai-python.responses.executable_custom_tool.v1")
+
+      assert %{
+               source: "OpenAI Node `openai`",
+               version: "commit `6fa9152eb97b7a36e3c555fbdeaaa241423ae91e`",
+               endpoint: "`POST /v1/chat/completions`",
+               decision: "translate",
+               observed_shape: "Request tools use exact outer `type=custom` and nested `custom` with required nonblank `name` plus optional `description` and `format`; named choice nests the custom name; output calls use `type=custom` with nested `custom.name` and free-form `custom.input`"
+             } = sdk_shape_row!("openai-node.chat.custom_tool.v1")
+
+      assert %{
+               source: "Vercel OpenAI provider `@ai-sdk/openai`",
+               version: "`3.0.65+`",
+               decision: "accept",
+               observed_shape: "Top-level `tools` entry has `type=namespace`, nonblank `name`, nonblank `description`, and nested function tools with flat `type`, `name`, `description`, `parameters`, optional `strict`, and optional `defer_loading`"
+             } = sdk_shape_row!("vercel-ai-sdk-openai.responses.namespace_function_tool.v1")
+
+      assert sdk_shape_row!("codex.responses.namespace_custom_tool.v1") == %{
+               source: "Codex native Responses shape",
+               version: "Codex commits `f21dc4638803f40046c9e294b0349782928f6b36` and `d4fb78bfc59009a2bbc3245d125bf8ba92a8e33e`",
+               endpoint: "`POST /v1/responses` and `GET /v1/responses` websocket `response.create`",
+               decision: "accept",
+               observed_shape: "Top-level `tools` entry has exact `type=namespace`, nonblank `name` and `description`, and a nonempty `tools` list whose children are exact flat `function` or exact executable `custom` definitions; typed custom choice has exact `type` and `name`",
+               notes: "Direct public Responses HTTP and websocket preserve valid namespace custom definitions and exact typed custom choices in Full mode. HTTP, SSE, direct websocket, and owner-forwarded websocket output restore a missing or null custom_tool_call namespace only when one exact namespaced custom declaration matches, while explicit, flat, unknown, and non-unique namespaces remain unchanged. Lite keeps the existing pre-dispatch `unsupported_parameter` rejection for map-shaped `tool_choice`; hosted/MCP/tool_search/nested namespace children, blank namespace names, malformed custom fields, and global executable-name collisions remain excluded. Chat uses a separate official nested wrapper and does not add namespace support. This Codex provenance is separate from the OpenAI Python direct-custom, OpenAI Node Chat-custom, and Vercel namespace-function rows."
+             }
+    end
+
+    test "documents direct Responses strict repair separately from non-strict lowering" do
+      feature = CompatibilityMatrix.by_slug!(:direct_responses_strict_schema_repair)
+      fixture = CompatibilityMatrix.fixture!(:direct_responses_strict_schema_repair)
+
+      assert feature.current == :nested_missing_type_repair
+      assert feature.contract =~ "missing nested object or array type"
+      assert feature.contract =~ "not repaired"
+      assert feature.contract =~ "excluded from non-strict lowering"
+      assert fixture.scope == "direct_public_responses_strict_flat_function_parameters"
+      assert fixture.inserted_types == ["object", "array"]
+
+      assert fixture.target_tool_shapes == [
+               "top_level_flat_function",
+               "namespace_child_flat_function"
+             ]
+
+      assert fixture.requires_typed_object_root == true
+      assert fixture.requires_unambiguous_structural_evidence == true
+      assert "parameters_root" in fixture.exclusions
+      assert "combinators_and_descendants" in fixture.exclusions
+      assert "chat" in fixture.exclusions
+      assert "backend_routes" in fixture.exclusions
+      assert fixture.malformed_duplicate_or_unsupported_explicit_type == "reject"
+      assert fixture.strict_function_tools_lowered == false
+      assert fixture.strict_structured_outputs_lowered == false
+    end
+
+    test "locks public strict object roots without broadening backend validation or repair" do
+      feature = CompatibilityMatrix.by_slug!(:public_strict_schema_object_roots)
+      fixture = CompatibilityMatrix.fixture!(:public_strict_schema_object_roots)
+      backend = CompatibilityMatrix.by_slug!(:strict_schema_validation)
+      repair = CompatibilityMatrix.by_slug!(:direct_responses_strict_schema_repair)
+
+      assert feature.current == :public_pre_dispatch_object_root_rejection
+
+      assert feature.routes == [
+               %{method: :post, path: "/v1/responses"},
+               %{method: :get, path: "/v1/responses", transport: "websocket"},
+               %{method: :post, path: "/v1/chat/completions", translation: "backend_responses"},
+               %{
+                 method: :post,
+                 path: "/backend-api/codex/v1/chat/completions",
+                 translation: "backend_responses"
+               }
+             ]
+
+      assert fixture.errors.structured_output == %{
+               status: 400,
+               code: "invalid_json_schema",
+               root_param: "text.format.schema"
+             }
+
+      assert fixture.errors.function_parameters.code == "invalid_function_parameters"
+      assert fixture.rejection_boundary.upstream_dispatch == false
+      assert fixture.rejection_boundary.request_created == false
+      assert fixture.rejection_boundary.attempt_created == false
+      assert fixture.rejection_boundary.ledger_entry_created == false
+      assert fixture.rejection_boundary.request_log_fact_created == false
+      assert fixture.privacy == "schema_shape_only"
+
+      assert backend.routes == [%{method: :post, path: "/backend-api/codex/responses"}]
+      assert backend.fixture == :strict_schema_rejection
+
+      assert repair.routes == [
+               %{method: :post, path: "/v1/responses"},
+               %{method: :get, path: "/v1/responses", transport: "websocket"}
+             ]
+    end
+
+    test "documents tool-output preservation across the accepted corpus" do
+      feature = CompatibilityMatrix.by_slug!(:tool_output_preservation)
+      fixture = CompatibilityMatrix.fixture!(:tool_output_preservation)
+      assert feature.status == :supported
+      assert fixture.corpus == ["pretty_json_object", "pretty_json_array", "ndjson", "concatenated_json", "embedded_json", "numeric_lexemes_escapes_duplicate_keys", "malformed_json_text", "multiline_diagnostics", "search_context", "multi_file_diff", "source_unicode", "over_one_mib", "over_fifty_outputs"]
+      assert fixture.adapter_oracle == "original_strings_or_ordered_concatenated_text_parts"
+      assert fixture.privacy.new_compression_metadata == false
+      bridge = CompatibilityMatrix.fixture!(:upstream_websocket_bridge)
+      assert bridge.accounting.tool_output_preservation_subject == "websocket_envelope"
     end
 
     test "documents narrow chat input fallback and non-executable additional_tools" do
@@ -316,6 +1798,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~ "never merged into executable tools"
       assert responses_chat.contract =~ "never used to satisfy tool_choice"
       assert responses_chat.contract =~ "truncation accepts auto and disabled locally"
+      assert responses_chat.contract =~ "metadata is accepted with the public API's shape and stripped before dispatch"
       assert responses_chat.contract =~ "remote MCP tool definitions"
       assert responses_chat.contract =~ "additional_tools.tools"
       assert responses_chat.contract =~ "not forwarded upstream"
@@ -351,22 +1834,96 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       expected_remote_mcp_tools = %{
         supported: false,
-        locations: ["tools", "input.additional_tools.tools"],
+        locations: ["tools", "input.additional_tools.tools", "input.tool_search_output.tools"],
         error_code: "invalid_request",
         dispatch: false
       }
 
       expected_responses_builtin_tools = %{
-        web_search_preview: %{accepted_shape: "type_only"},
+        web_search_preview: %{accepted: false, serving_modes: ["full", "lite"], refusal: %{status: 400, code: "invalid_request", param: "tools", upstream_dispatch: false}, rewritten: false},
         web_search: %{
-          accepted_required: ["type", "external_web_access"],
-          accepted_optional: ["index_gated_web_access"],
+          accepted_required: ["type"],
+          accepted_optional: [
+            "external_web_access",
+            "indexed_web_access",
+            "filters",
+            "user_location",
+            "search_context_size",
+            "search_content_types"
+          ],
           valid_combinations: [
+            "type_only",
             "external_web_access=false",
             "external_web_access=true",
-            "external_web_access=true,index_gated_web_access=true"
+            "external_web_access=true,indexed_web_access=true"
           ],
-          rejected_options: ["filters", "search_context_size", "user_location"]
+          filters: %{
+            shape: "nonempty_object",
+            allowed_keys: ["allowed_domains", "blocked_domains"],
+            lists: %{
+              allowed_domains: %{
+                minimum_items: 1,
+                maximum_items: 100,
+                item_shape: "nonblank_string_without_http_scheme",
+                forwarding: "unchanged"
+              },
+              blocked_domains: %{
+                minimum_items: 1,
+                maximum_items: 100,
+                item_shape: "nonblank_string_without_http_scheme",
+                forwarding: "unchanged"
+              }
+            },
+            valid_combinations: [
+              "allowed_domains",
+              "blocked_domains",
+              "allowed_domains,blocked_domains"
+            ]
+          },
+          user_location: %{
+            shape: "object",
+            required: ["type"],
+            allowed_keys: ["type", "country", "region", "city", "timezone"],
+            type: "approximate",
+            fields: "nonblank_strings",
+            forwarding: "unchanged"
+          },
+          search_context_size: %{accepted_values: ["low", "medium", "high"], forwarding: "unchanged"},
+          search_content_types: %{
+            shape: "nonempty_list",
+            accepted_values: ["text", "image"],
+            forwarding: "unchanged"
+          },
+          rejected_options: ["index_gated_web_access"],
+          upstream_confidence: %{
+            pooler_contract: "validation_and_unchanged_forwarding",
+            availability_and_enforcement: "selected_model_and_account_dependent",
+            blocked_domains: "hosted_codex_enforcement_not_locally_proven",
+            broad_parity_claim: false
+          }
+        },
+        tool_search: %{
+          accepted_required: ["type"],
+          accepted_optional: ["execution", "description", "parameters"],
+          execution_values: ["server", "client"],
+          nullable_optional: ["description", "parameters"],
+          companion: "deferred_function_custom_or_namespace_child_with_defer_loading_true",
+          pairing_rules: "provider_enforced_full_refusal_relayed_lite_manifest_not_enforced",
+          lite: "forwarded_in_manifest_validated_search_not_performed",
+          output_items: ["tool_search_call", "tool_search_output", "function_call_with_namespace"],
+          replay_items: %{
+            tool_search_call: %{required: ["type", "arguments"], optional: ["id", "call_id", "execution", "status"], arguments: "object"},
+            tool_search_output: %{required: ["type", "tools"], optional: ["id", "call_id", "execution", "status"], tools: "list_remote_mcp_refused_rest_provider_validated"},
+            nullable: ["id", "call_id", "status"],
+            status_values: ["in_progress", "completed", "incomplete"],
+            provider_named_id_prefixes: "not_second_guessed_provider_refusal_relayed"
+          },
+          allowed_tools_entry: "excluded",
+          upstream_confidence: %{
+            pooler_contract: "validation_and_unchanged_forwarding",
+            probed: "gpt-6-luna_codex_backend_full_and_lite",
+            broad_parity_claim: false
+          }
         },
         image_generation: %{accepted_shape: "type_only_or_exact_known_image_options"}
       }
@@ -384,8 +1941,267 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              }
 
       assert v1_fixture.responses_truncation == responses_fixture.responses_truncation
+
+      assert responses_fixture.responses_metadata == %{
+               accepted: ["null", "object"],
+               max_properties: 16,
+               max_property_name_length: 64,
+               value: "string",
+               max_value_length: 512,
+               refusal_codes: ["invalid_type", "object_above_max_properties", "property_name_above_max_length", "string_above_max_length"],
+               refusal_param: "metadata",
+               forwarded_upstream: false,
+               native_routes: "stripped"
+             }
+
+      assert v1_fixture.responses_metadata == responses_fixture.responses_metadata
       refute Map.has_key?(responses_fixture, :responses_builtin_tools)
       assert v1_fixture.responses_builtin_tools == expected_responses_builtin_tools
+    end
+
+    test "documents closed-world Responses programmatic-tool calling" do
+      feature = CompatibilityMatrix.by_slug!(:responses_chat)
+      fixture = CompatibilityMatrix.fixture!(:responses_chat)
+
+      assert feature.programmatic_tool_calling_contract =~ "closed-world"
+      assert feature.programmatic_tool_calling_contract =~ "remote MCP"
+      assert feature.programmatic_tool_calling_contract =~ "unrelated hosted tools"
+      assert feature.programmatic_tool_calling_contract =~ "no full OpenAI parity claim"
+
+      programmatic = fixture.programmatic_tool_calling
+
+      assert programmatic.input_items.program.required == [
+               "type",
+               "id",
+               "call_id",
+               "code",
+               "fingerprint"
+             ]
+
+      assert programmatic.input_items.program.exact_keys == true
+
+      assert programmatic.input_items.program_output.required == [
+               "type",
+               "id",
+               "call_id",
+               "result",
+               "status"
+             ]
+
+      assert programmatic.input_items.program_output.exact_keys == true
+      assert programmatic.input_items.program_output.statuses == ["completed", "incomplete"]
+
+      assert programmatic.input_items.function_call_output == %{
+               paired: %{
+                 call_id: "required_nonblank_string",
+                 output: "required",
+                 name: ["omitted", "null", "nonblank_string"],
+                 namespace: ["omitted", "null", "nonblank_string"],
+                 legacy_result: "accepted"
+               },
+               standalone: %{
+                 call_id: ["omitted", "null"],
+                 name: "required_nonblank_string",
+                 namespace: ["omitted", "null", "nonblank_string"],
+                 output: "required",
+                 legacy_result: "rejected"
+               },
+               classifier_debug_privacy: %{
+                 classifier: "exact_named_function_call_output_only",
+                 collected_call_id: "nil_without_synthetic_identifier",
+                 debug_summary: "metadata_only",
+                 raw_output_name_anchor_or_request_body: "not_stored"
+               },
+               caller: %{
+                 types: ["direct", "program"],
+                 program_requires: ["caller_id"],
+                 direct_forbids: ["caller_id"]
+               }
+             }
+
+      for caller <- [
+            programmatic.input_items.function_call.caller,
+            programmatic.input_items.function_call_output.caller
+          ] do
+        assert caller.types == ["direct", "program"]
+        assert caller.program_requires == ["caller_id"]
+        assert caller.direct_forbids == ["caller_id"]
+      end
+
+      assert programmatic.hosted_tool.type == "programmatic_tool_calling"
+      assert programmatic.hosted_tool.exact_keys == ["type"]
+      assert programmatic.hosted_tool.serving_modes == %{full: "refused_before_dispatch", lite: "forwarded_in_manifest"}
+      assert programmatic.tool_choice.type == "programmatic_tool_calling"
+      assert programmatic.tool_choice.refusal == %{status: 400, code: "invalid_request", param: "tool_choice", upstream_dispatch: false}
+      assert feature.programmatic_tool_calling_contract =~ "refused before dispatch when the model is served Full"
+      assert programmatic.function_options.scopes == ["flat", "namespace"]
+      assert programmatic.function_options.optional_boolean_keys == ["strict", "defer_loading"]
+      assert programmatic.function_options.allowed_callers == ["direct", "programmatic"]
+      assert programmatic.function_options.output_schema.shape == "opaque_json_map"
+      assert programmatic.function_options.output_schema.strict == false
+      assert programmatic.stateless_policy.vercel_store == false
+      assert programmatic.stateless_policy.upstream_stream == true
+      assert programmatic.stateless_policy.upstream_store == false
+      assert programmatic.stateless_policy.reference_only_continuation == "reject"
+      assert programmatic.stateless_policy.ordinary_continuation == "reject"
+      assert programmatic.stateless_policy.semantic_tool_result_continuation == "accept"
+
+      assert programmatic.relay_surfaces == [
+               "collected_json",
+               "public_sse",
+               "public_responses_websocket"
+             ]
+
+      assert programmatic.tool_output_preservation.program_output == "byte_exact"
+      assert programmatic.privacy.mode == "metadata_only"
+      assert programmatic.privacy.stored_program_code == false
+      assert programmatic.privacy.stored_program_results == false
+      assert programmatic.privacy.stored_schema_values == false
+      assert programmatic.privacy.stored_identifiers == false
+      assert programmatic.privacy.stored_prompts == false
+      assert programmatic.privacy.stored_frames == false
+      assert programmatic.exclusions.remote_mcp == false
+      assert programmatic.exclusions.unrelated_hosted_tools == false
+      assert programmatic.exclusions.full_openai_parity == false
+    end
+
+    @tag :hosted_shell_history
+    test "documents hosted shell history replay without hosted tool execution" do
+      feature = CompatibilityMatrix.by_slug!(:responses_chat)
+      fixture = CompatibilityMatrix.fixture!(:responses_chat)
+      v1_feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+
+      assert feature.hosted_shell_history_contract =~ "closed-key hosted-shell history replay"
+      assert feature.hosted_shell_history_contract =~ "without executing commands"
+      assert feature.hosted_shell_history_contract =~ "shell tool declarations"
+      assert feature.hosted_shell_history_contract =~ "local shell"
+      assert feature.hosted_shell_history_contract =~ "remote MCP"
+
+      hosted_shell = fixture.hosted_shell_history
+
+      assert hosted_shell.accepted_items == ["shell_call", "shell_call_output"]
+
+      assert hosted_shell.request_policy.closed_key_objects == [
+               "shell_call",
+               "shell_call.action",
+               "shell_call.caller",
+               "shell_call.environment",
+               "shell_call.environment.skills[]",
+               "shell_call_output",
+               "shell_call_output.caller",
+               "shell_call_output.output[]",
+               "shell_call_output.output[].outcome"
+             ]
+
+      assert hosted_shell.request_policy.unknown_or_response_only_keys == "rejected"
+      assert hosted_shell.request_policy.upstream_open_properties == "not_admitted"
+      assert hosted_shell.input_items.shell_call.required == ["type", "call_id", "action"]
+
+      assert hosted_shell.input_items.shell_call.optional_nullable == [
+               "id",
+               "caller",
+               "status",
+               "environment"
+             ]
+
+      assert hosted_shell.input_items.shell_call.action.commands == "string_array_empty_allowed"
+      assert hosted_shell.input_items.shell_call.caller.accepted == ["null", "direct", "program"]
+
+      assert hosted_shell.input_items.shell_call.environment.accepted == [
+               "null",
+               "local",
+               "container_reference"
+             ]
+
+      assert hosted_shell.input_items.shell_call_output.required == ["type", "call_id", "output"]
+
+      assert hosted_shell.input_items.shell_call_output.optional_nullable == [
+               "id",
+               "caller",
+               "status",
+               "max_output_length"
+             ]
+
+      assert hosted_shell.input_items.shell_call_output.output_chunk_required == [
+               "stdout",
+               "stderr",
+               "outcome"
+             ]
+
+      assert hosted_shell.input_items.shell_call_output.outcomes == %{
+               timeout: ["type"],
+               exit: ["type", "exit_code"]
+             }
+
+      assert hosted_shell.codepoint_limits == %{
+               call_id: %{minimum: 1, maximum: 64},
+               program_caller_id: %{minimum: 1, maximum: 64},
+               stdout: %{maximum: 10_485_760},
+               stderr: %{maximum: 10_485_760},
+               local_skills: %{maximum_items: 200}
+             }
+
+      assert hosted_shell.status_values == ["in_progress", "completed", "incomplete", nil]
+
+      assert hosted_shell.edge_semantics.empty_allowed == [
+               "action.commands",
+               "shell_call_output.output",
+               "id",
+               "container_id",
+               "local_skill.name",
+               "local_skill.description",
+               "local_skill.path"
+             ]
+
+      assert hosted_shell.edge_semantics.signed_integer_fields == [
+               "action.timeout_ms",
+               "action.max_output_length",
+               "shell_call_output.max_output_length",
+               "shell_call_output.output[].outcome.exit_code"
+             ]
+
+      assert hosted_shell.continuation == %{
+               stateless_full_history_replay: "accepted",
+               previous_response_id_semantic_tool_output: "producing_websocket_connection_only",
+               call_output_pairing: "not_enforced",
+               item_order: "not_enforced"
+             }
+
+      assert hosted_shell.relay.event_types == [
+               "response.shell_call_command.added",
+               "response.shell_call_command.delta",
+               "response.shell_call_command.done",
+               "response.shell_call_output_content.delta",
+               "response.shell_call_output_content.done"
+             ]
+
+      assert hosted_shell.relay.normalization == %{
+               sequence_number: "existing_public_responses_normalization_only",
+               stream_id: "existing_public_responses_websocket_addition_only"
+             }
+
+      assert hosted_shell.privacy == %{
+               mode: "metadata_only",
+               command_persisted: false,
+               output_persisted: false,
+               command_logged: false,
+               output_logged: false
+             }
+
+      assert hosted_shell.exclusions == %{
+               command_execution: false,
+               shell_tool_declarations: false,
+               local_shell_history: false,
+               remote_mcp: false,
+               command_index_accumulation: false,
+               full_openai_hosted_tool_parity: false
+             }
+
+      assert v1_feature.contract =~ "hosted-shell history replay"
+      assert v1_feature.contract =~ "does not execute commands"
+      assert v1_feature.contract =~ "shell tool declarations"
+      assert v1_feature.contract =~ "local shell"
+      assert v1_feature.contract =~ "remote MCP"
     end
 
     @tag :input_audio_backport
@@ -456,9 +2272,42 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       responses_chat = CompatibilityMatrix.by_slug!(:responses_chat)
       fixture = CompatibilityMatrix.fixture!(:responses_chat)
 
-      assert responses_chat.contract =~ "terminal compaction_trigger backend payloads bridge"
+      assert responses_chat.contract =~
+               "terminal compaction_trigger backend payloads on either backend Responses alias retain the final trigger"
+
+      assert responses_chat.contract =~
+               "public /v1/responses HTTP and Responses websocket turns accept exactly one final compaction_trigger after visible input"
+
+      assert responses_chat.contract =~ "/backend-api/codex/responses"
       assert responses_chat.contract =~ "/backend-api/codex/responses/compact"
+      assert responses_chat.contract =~ "streamed Responses compaction"
+      assert responses_chat.contract =~ "compact accounting"
+
+      assert responses_chat.contract =~
+               "classify streamed compaction from the request trigger independently of client declarations"
+
+      assert responses_chat.contract =~ "ignoring unrelated additive metadata"
+      assert responses_chat.contract =~ "never inspecting returned compaction items"
+
+      assert responses_chat.contract =~
+               "set upstream stream true for Responses compaction triggers"
+
+      assert responses_chat.contract =~ "direct compact aliases preserve their canonical legacy"
+      assert responses_chat.contract =~ "while omitting store, stream, and the trigger"
+
+      assert responses_chat.contract =~
+               "native fallback provider unsupported requires an admitted failed"
+
+      assert responses_chat.contract =~ "public /v1/responses/compact remains unsupported"
+
+      assert responses_chat.contract =~
+               "returned compaction-item normalization preserves only schema-backed string replay identity"
+
+      assert responses_chat.contract =~ "drops other compact-result fields"
       assert responses_chat.contract =~ "malformed trigger placement is rejected before dispatch"
+
+      refute responses_chat.contract =~ "terminal_trigger_bridges_to_compact"
+      refute responses_chat.contract =~ "strips compaction_trigger"
 
       assert responses_chat.contract =~
                "public /v1 Responses accepts encrypted compaction output replay items"
@@ -467,7 +2316,10 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~ "request-scoped x-codex-turn-state"
       assert responses_chat.contract =~ "relay upstream x-codex-turn-state response headers"
       assert responses_chat.contract =~ "x-codex-window-id"
-      assert responses_chat.contract =~ "x-codex-installation-id"
+      assert responses_chat.contract =~ "x-openai-memgen-request"
+      assert responses_chat.contract =~ "x-codex-guardian"
+      assert responses_chat.contract =~ "x-codex-inference-call-id"
+      refute responses_chat.contract =~ "x-codex-installation-id"
       assert responses_chat.contract =~ "public /v1 and websocket request-header lanes do not"
       assert responses_chat.contract =~ "context-overflow recovery stays client/upstream-owned"
       assert responses_chat.contract =~ "no server-side hidden replay"
@@ -481,38 +2333,343 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       assert fixture.compaction_recovery_boundary == %{
                backend_compaction_trigger: %{
-                 routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
-                 behavior: "terminal_trigger_bridges_to_compact",
-                 compact_endpoint: "/backend-api/codex/responses/compact",
+                 client_routes: [
+                   "/backend-api/codex/responses",
+                   "/backend-api/codex/v1/responses"
+                 ],
+                 upstream_endpoint: "/backend-api/codex/responses",
+                 accounting_endpoint: "/backend-api/codex/responses/compact",
+                 admission_endpoint: :original_client_route,
                  route_class: "proxy_compact",
                  transport: "http_compact_json",
                  valid_trigger: "exactly_one_final_input_item",
                  malformed_trigger: %{status: 400, param: "input", upstream_dispatch: false},
-                 strips: ["compaction_trigger", "stream", "include", "store"],
-                 preserves: [
-                   "model",
-                   "instructions",
-                   "input",
-                   "reasoning",
-                   "service_tier",
-                   "prompt_cache_key",
-                   "previous_response_id",
-                   "conversation"
-                 ],
-                 output_events: ["response.output_item.done", "response.completed", "[DONE]"],
+                 retained: ["final_compaction_trigger", "client_metadata", "include", "tool_choice"],
+                 strips: ["prompt_cache_options"],
+                 result_classification: %{
+                   source: "request_input_compaction_trigger",
+                   marker: "terminal_compaction_trigger",
+                   additive_metadata: "ignored",
+                   returned_compaction_items: "not_inspected"
+                 },
+                 upstream_payload: %{
+                   mode: "responses_sse",
+                   terminal_trigger: "retained",
+                   store: false,
+                   stream: true
+                 },
+                 response_adaptation: %{
+                   upstream: "responses_sse",
+                   downstream: "backend_responses_sse",
+                   output_events: ["response.output_item.done", "response.completed", "[DONE]"]
+                 },
                  output_item: %{
                    "type" => "compaction",
                    "encrypted_content" => "encrypted_content"
                  },
-                 websocket_bridge: false,
-                 hidden_replay: false
+                 accepted_result_shapes: [
+                   %{location: "output", type: "compaction"},
+                   %{location: "output", type: "compaction_summary"},
+                   %{location: "top_level", key: "compaction_summary"}
+                 ],
+                 output_item_policy: %{
+                   required: ["type", "encrypted_content"],
+                   optional_string: ["id"],
+                   unknown_fields: "dropped",
+                   terminal_events_share_identical_item: true
+                 },
+                 websocket_bridge: %{
+                   client_routes: [
+                     "/backend-api/codex/responses",
+                     "/backend-api/codex/v1/responses"
+                   ],
+                   admission: %{
+                     outer_route_class: "proxy_websocket",
+                     nested_route_class: "proxy_compact",
+                     nested_timing: "after_coercion_before_compact_execution"
+                   },
+                   canonical_identity: %{
+                     upstream_endpoint: "/backend-api/codex/responses",
+                     accounting_endpoint: "/backend-api/codex/responses/compact",
+                     transport_contracts: %{
+                       incremental_websocket: %{
+                         input_mode: "nonblank_top_level_previous_response_id",
+                         request_transport: "websocket",
+                         attempt_transport: "websocket",
+                         connection: "current_live_matching_generation_reused_only",
+                         delivery: "collect_compaction_before_validation_settlement_and_adapter",
+                         retry_or_fallback: false
+                       },
+                       full_history_http: %{
+                         input_mode: "no_top_level_previous_response_id",
+                         request_transport: "http_compact_json",
+                         attempt_transport: "http_compact_json"
+                       }
+                     }
+                   },
+                   result_transports: %{
+                     trigger: "responses_sse_independent_of_client_metadata"
+                   },
+                   turn_state: %{
+                     source: "client_metadata.x-codex-turn-state_or_upgrade_header",
+                     forwarded_header: "x-codex-turn-state",
+                     persistence: "hashed_alias_only"
+                   },
+                   native_frames: ["response.output_item.done", "response.completed"],
+                   collected_result: %{
+                     source: "collect_delivery_accumulator_not_diagnostic_retention",
+                     max_bytes: 8_388_608,
+                     diagnostic_retention_bytes: 65_536,
+                     overflow_reason: "compaction_result_too_large"
+                   },
+                   errors: %{
+                     malformed_trigger: "pre_dispatch_invalid_request",
+                     compact_saturation: "server_is_overloaded",
+                     invalid_result: "invalid_compaction_response",
+                     oversized_result: "invalid_compaction_response",
+                     provider_terminal: "canonical_provider_terminal",
+                     provider_usage_limit: %{
+                       delivery: "single_dispatch_result_message",
+                       native: %{
+                         capacity: "usage_limit_capacity_before_connection_pin_every_partition",
+                         seat_can_serve_or_return_unknown: "retryable_503_pinned_continuation_unavailable",
+                         every_seat_exhausted: "pool_usage_limit_terminal_earliest_return",
+                         client_resend: "409_duplicate_turn_before_dispatch",
+                         client_fallback: "https_compaction_routed_over_every_partition"
+                       },
+                       public: "anchor_account_usage_limit_429_with_retry_after",
+                       recorded_status: 429
+                     }
+                   },
+                   socket_reuse: "ordinary_follow_up_same_downstream_socket",
+                   collector_retry: "one_client_full_history_successor_when_codex_retryable",
+                   diagnostic: %{
+                     request_metadata: "compaction_bridge",
+                     applied: true,
+                     result_transport: ["buffered", "sse"],
+                     raw_payload_or_frame: false
+                   }
+                 },
+                 hidden_replay: false,
+                 direct_compact_preservation: %{
+                   client_routes: [
+                     "/backend-api/codex/responses/compact",
+                     "/backend-api/codex/v1/responses/compact"
+                   ],
+                   upstream_endpoint: "/backend-api/codex/responses/compact",
+                   behavior: "legacy_compact_route_unchanged",
+                   upstream_payload: %{
+                     compaction_trigger: "omitted",
+                     store: "omitted",
+                     stream: "omitted"
+                   }
+                 }
+               },
+               harness_applicability: %{
+                 codex: %{
+                   version: "rust-v0.153.3",
+                   peeled_commit: "b1a547b1f73ce86205d9222ac19cff334b3b7a2e",
+                   sanitized_fixtures: [
+                     "test/fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_request.json",
+                     "test/fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_incremental_request.json"
+                   ],
+                   applicability: "native_v2",
+                   classifier_authority: true,
+                   verification: "commit_blocking"
+                 },
+                 omp: %{
+                   version: "18.0.4",
+                   applicability: "distinct_v2_and_configured_direct_fallback_adapter",
+                   classifier_authority: false
+                 },
+                 cursor: %{
+                   applicability: "http_sse_openai_base_url_override",
+                   support: "local_contract_tested",
+                   request: %{path: "/v1/chat/completions", shape: "responses_shaped_body"},
+                   response: %{formats: ["chat_completions_json", "chat_completions_sse"]},
+                   classifier_authority: false,
+                   websocket_support: false,
+                   compaction_support: false,
+                   verification: "authenticated_live_smoke_required",
+                   verified: false
+                 },
+                 opencode: %{
+                   applicability: "http_and_websocket_replay_only",
+                   classifier_authority: false
+                 },
+                 hermes: %{
+                   applicability: "no_independent_native_classifier_authority",
+                   classifier_authority: false
+                 },
+                 pi: %{
+                   applicability: "native_remote_compaction_unverified",
+                   classifier_authority: false,
+                   verification: "not_applicable"
+                 }
+               },
+               public_v1_compaction_trigger: %{
+                 client_route: "/v1/responses",
+                 surfaces: ["http_json", "http_sse", "responses_websocket"],
+                 upstream_endpoint: "/backend-api/codex/responses",
+                 accounting_endpoint: "/backend-api/codex/responses/compact",
+                 admission_endpoint: "/v1/responses",
+                 route_class: "proxy_compact",
+                 websocket_admission: %{
+                   outer_route_class: "proxy_websocket",
+                   nested_route_class: "proxy_compact",
+                   timing: "after_coercion_before_compact_execution",
+                   completion: "local_websocket_completion"
+                 },
+                 transport_contracts: %{
+                   incremental_websocket: %{
+                     surface: "responses_websocket",
+                     input_mode: "nonblank_top_level_previous_response_id",
+                     request_transport: "websocket",
+                     attempt_transport: "websocket",
+                     connection: "current_live_matching_generation_reused_only",
+                     delivery: "collect_compaction_before_validation_settlement_and_adapter",
+                     retry_or_fallback: false
+                   },
+                   full_history_http: %{
+                     surfaces: ["http_json", "http_sse", "responses_websocket"],
+                     input_mode: "no_top_level_previous_response_id",
+                     request_transport: "http_compact_json",
+                     attempt_transport: "http_compact_json"
+                   }
+                 },
+                 closed_item: %{"type" => "compaction_trigger"},
+                 valid_trigger: "exactly_one_final_after_visible_input",
+                 malformed_trigger: %{status: 400, param: "input", upstream_dispatch: false},
+                 retained: ["final_compaction_trigger"],
+                 strips: ["include", "prompt_cache_options"],
+                 upstream_payload: %{
+                   mode: "responses_sse",
+                   terminal_trigger: "retained",
+                   store: false,
+                   stream: true
+                 },
+                 response_adaptation: %{
+                   upstream: "responses_sse",
+                   downstream: %{
+                     http_json: ["response"],
+                     http_sse: [
+                       "response.created",
+                       "response.output_item.added",
+                       "response.output_item.done",
+                       "response.completed",
+                       "[DONE]"
+                     ],
+                     responses_websocket: [
+                       "response.created",
+                       "response.output_item.added",
+                       "response.output_item.done",
+                       "response.completed"
+                     ]
+                   }
+                 },
+                 public_compact_route_supported: false,
+                 hidden_replay: false,
+                 public_item_id: %{
+                   upstream_nonblank_string: "preserved",
+                   absent_null_or_blank: "cmp_ plus 40 hex of a domain-separated SHA-256 of encrypted_content",
+                   replay: "a derived id is dropped before upstream dispatch"
+                 }
+               },
+               anchor_lineage_and_smoke: %{
+                 explicit_anchor: "preserve_nonblank_opaque_top_level_anchor_semantically",
+                 no_anchor: "send_full_history",
+                 provenance: %{
+                   stages: ["downstream", "projection", "upstream"],
+                   durable_output: "bounded_safe_projection_only",
+                   client_proof: "post_projection_absence_is_not_client_proof"
+                 },
+                 routing: %{
+                   anchored_continuation: "assignment_hard_pin",
+                   unavailable_assignment: "fail_closed_without_fallback",
+                   recovery: "new_full_history_request_without_anchor"
+                 },
+                 authentic_smoke: %{
+                   client: "exact_released_codex_app_server",
+                   provider_modes: [
+                     "http_only_full_history_control",
+                     "websocket_anchored_compaction"
+                   ],
+                   required_lifecycle: [
+                     "tool_execution",
+                     "automatic_same_turn_compaction",
+                     "anchored_compact_request",
+                     "compact_terminal",
+                     "same_turn_final_response",
+                     "correlated_accounting_and_cleanup"
+                   ],
+                   insufficient_evidence: ["client_exit_zero", "receipt_without_lifecycle"]
+                 }
+               },
+               native_fallback: %{
+                 provider_unsupported: %{
+                   request: %{
+                     admitted: true,
+                     endpoint: "/backend-api/codex/responses/compact",
+                     last_error_code: "upstream_status",
+                     response_status_code: 404,
+                     status: "failed"
+                   },
+                   attempt: %{
+                     matching_request_id: true,
+                     status: "failed",
+                     upstream_status_code: 404
+                   },
+                   local_route_404: false
+                 },
+                 omp_terminal: "configured_local_fallback_from_pinned_configuration"
                },
                context_overflow: %{
                  recovery_owner: "client_or_upstream",
-                 public_v1_compaction_replay_item: %{
+                 public_v1_compaction_replay: %{
                    route: "/v1/responses",
-                   item: %{"type" => "compaction", "encrypted_content" => "encrypted_content"},
-                   upstream_dispatch: true
+                   surfaces: ["http_json", "http_sse", "responses_websocket"],
+                   required: %{
+                     "type" => "compaction",
+                     "encrypted_content" => "nonblank_string"
+                   },
+                   public_id: %{
+                     presence: "optional",
+                     accepted_types: ["string", "null"],
+                     preserved_exactly: true
+                   },
+                   verified_variants: [
+                     %{name: "public_id_absent", exact_keys: ["type", "encrypted_content"]},
+                     %{
+                       name: "public_id_string",
+                       exact_keys: ["type", "encrypted_content", "id"],
+                       id_type: "string"
+                     },
+                     %{
+                       name: "public_id_null",
+                       exact_keys: ["type", "encrypted_content", "id"],
+                       id_type: "null"
+                     },
+                     %{
+                       name: "native_turn_metadata",
+                       exact_keys: [
+                         "type",
+                         "encrypted_content",
+                         "id",
+                         "internal_chat_message_metadata_passthrough"
+                       ],
+                       id_type: "nonblank_string",
+                       metadata: %{
+                         exact_keys: ["turn_id"],
+                         turn_id_type: "nonblank_string",
+                         public_documentation: false
+                       }
+                     }
+                   ],
+                   item_order: "preserved",
+                   continuation: "new_chain_without_previous_response_id",
+                   unknown_fields: "reject_before_dispatch",
+                   upstream_dispatch: true,
+                   privacy: "opaque_values_not_persisted_or_logged"
                  },
                  server_side_compaction: false,
                  hidden_replay: false,
@@ -534,17 +2691,136 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                  "x-codex-turn-metadata",
                  "x-codex-window-id",
                  "x-codex-parent-thread-id",
-                 "x-codex-installation-id",
-                 "x-openai-subagent"
+                 "x-openai-subagent",
+                 "x-openai-memgen-request",
+                 "x-codex-guardian",
+                 "x-codex-inference-call-id",
+                 "session-id",
+                 "thread-id",
+                 "x-client-request-id"
                ],
+               bounded_header_values: %{
+                 "x-openai-memgen-request" => %{accepted: ["true"], otherwise: "dropped"},
+                 "x-codex-guardian" => %{accepted: ["reviewer", "classifier"], otherwise: "dropped"},
+                 "x-codex-inference-call-id" => %{accepted: "ascii_identifier_max_128_bytes", otherwise: "dropped"}
+               },
+               client_metadata_only_names: ["x-codex-installation-id"],
+               file_bridge: %{
+                 routes: ["/backend-api/files", "/backend-api/files/:file_id/uploaded"],
+                 policy: "same_allowlist_and_value_bounds_as_native_responses",
+                 never_forwarded: ["x-codex-routing-hint", "x-codex-beta-features"]
+               },
+               provider_session_headers: %{
+                 names: ["session-id", "thread-id", "x-client-request-id"],
+                 value_contract: "ascii_identifier_max_128_bytes",
+                 purpose: "provider_sticky_routing_for_prompt_cache",
+                 local_only_headers: ["x-session-id", "x-session-affinity"],
+                 native_websocket_handshake: %{
+                   routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+                   source: "authenticated_downstream_native_websocket_upgrade_headers",
+                   value_contract: "ascii_identifier_max_128_bytes",
+                   duplicate_headers: "first_valid_value_per_name",
+                   upstream_connection_reuse_key: "included_differing_or_absent_values_open_a_new_connection",
+                   owner_forwarded_turns: "carried_in_owner_request_headers_built_on_the_proxy_node",
+                   public_v1_origins: "caller_values_never_forwarded_derived_session_id_only"
+                 },
+                 native_http_derived_session_id: %{
+                   routes: [
+                     "/backend-api/codex/responses",
+                     "/backend-api/codex/v1/responses",
+                     "/backend-api/codex/responses/compact",
+                     "/backend-api/codex/v1/responses/compact"
+                   ],
+                   transports: ["http_json", "http_sse"],
+                   applies_when: "no_client_session_id_within_the_provider_bound",
+                   precedence: "client_session_id_then_prompt_cache_key_then_local_continuity_alias",
+                   alias_namespace: TransportEnvelope.continuity_alias_session_namespace(),
+                   alias_derivation: "uuid_v5_distinct_namespace_over_pool_id_api_key_id_and_raw_alias_never_forwarded_raw",
+                   client_session_id: "forwarded_unchanged_never_replaced",
+                   derivation: "same_as_public_v1_same_pool_api_key_and_prompt_cache_key_yield_the_same_value",
+                   local_session: "keyed_by_the_client_continuity_header_unchanged",
+                   native_websocket_handshake: "unchanged_only_the_upgrade_session_headers",
+                   privacy: "derived_value_not_persisted_or_logged"
+                 },
+                 public_v1: %{
+                   client_headers: "local_only_never_forwarded",
+                   synthesized_header: "session-id",
+                   derived_from: "prompt_cache_key",
+                   derivation: "uuid_v5_fixed_pooler_namespace_over_pool_id_api_key_id_and_raw_key",
+                   name_encoding: "netstring_pool_id_then_netstring_api_key_id_then_raw_key",
+                   namespace: TransportEnvelope.prompt_cache_session_namespace(),
+                   scope: "authenticated_pool_and_api_key",
+                   missing_scope: "no_header_fail_closed_no_unscoped_derivation",
+                   model: "excluded_from_derivation",
+                   key_contract: "non_empty_string_max_512_bytes",
+                   routes: ["/v1/responses", "/v1/chat/completions"],
+                   transports: ["http_json", "http_sse", "websocket"],
+                   websocket_surfaces: "derived_session_id_on_the_upstream_websocket_handshake",
+                   websocket_source: "raw_prompt_cache_key_of_the_final_upstream_body",
+                   websocket_upstream_connection_reuse_key: "included_changed_or_absent_prompt_cache_key_opens_a_new_connection",
+                   local_session: "none_bridge_eligibility_stays_fail_closed",
+                   client_key_contract: "shared_key_within_one_api_key_shares_one_provider_session_id_never_across_api_keys_or_pools",
+                   privacy: "derived_value_not_persisted_or_logged"
+                 }
+               },
                relayed_response_headers: ["x-codex-turn-state"],
                not_forwarded_on: [
                  "/v1/responses",
                  "backend_websocket_response.create",
                  "public_v1_websocket_response.create"
                ],
-               privacy: "raw_values_not_persisted"
+               privacy: "raw_values_not_persisted",
+               turn_metadata_projection: %{
+                 direct_header_removes_top_level: ["code_mode_tool_names"],
+                 structured_output: "ascii_safe_json",
+                 object_without_target: "original_bytes",
+                 opaque_or_non_object: "original_bytes",
+                 duplicate_headers: "project_each_preserve_order",
+                 canonical_client_metadata: "full_value_preserved",
+                 websocket_upgrade_header_forwarded: false,
+                 generic_size_cap_added: false
+               }
              }
+    end
+
+    @tag :compatibility_contract
+    test "exposes semantic compaction classification and bounded harness applicability" do
+      boundary =
+        CompatibilityMatrix.fixture!(:responses_chat).compaction_recovery_boundary
+
+      assert boundary.backend_compaction_trigger.result_classification.marker ==
+               "terminal_compaction_trigger"
+
+      assert boundary.backend_compaction_trigger.result_classification.additive_metadata ==
+               "ignored"
+
+      assert boundary.backend_compaction_trigger.result_classification.returned_compaction_items ==
+               "not_inspected"
+
+      assert boundary.harness_applicability.codex.verification == "commit_blocking"
+      assert boundary.harness_applicability.omp.version == "18.0.4"
+
+      assert boundary.harness_applicability.opencode.applicability ==
+               "http_and_websocket_replay_only"
+
+      refute boundary.harness_applicability.hermes.classifier_authority
+      assert boundary.harness_applicability.pi.verification == "not_applicable"
+
+      assert boundary.anchor_lineage_and_smoke.explicit_anchor ==
+               "preserve_nonblank_opaque_top_level_anchor_semantically"
+
+      assert boundary.anchor_lineage_and_smoke.no_anchor == "send_full_history"
+
+      assert boundary.anchor_lineage_and_smoke.provenance.client_proof ==
+               "post_projection_absence_is_not_client_proof"
+
+      assert boundary.anchor_lineage_and_smoke.routing.unavailable_assignment ==
+               "fail_closed_without_fallback"
+
+      assert boundary.anchor_lineage_and_smoke.authentic_smoke.insufficient_evidence == [
+               "client_exit_zero",
+               "receipt_without_lifecycle"
+             ]
     end
 
     test "documents backend websocket request-scoped turn-state carrier" do
@@ -567,214 +2843,281 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                "response.create.client_metadata_over_upgrade_header"
 
       assert fixture.privacy == "raw_value_not_persisted"
-    end
 
-    test "documents v1 supported surface as authenticated OpenAI compatibility" do
-      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
-      fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
-
-      assert feature.status == :supported
-      assert feature.current == :authenticated_openai_compatibility
-      assert :route in feature.categories
-      assert :auth in feature.categories
-      assert :multipart in feature.categories
-      assert :streaming in feature.categories
-      assert :ownership in feature.categories
-
-      assert Enum.any?(feature.routes, &(&1.method == :get and &1.path == "/v1/models"))
-      assert Enum.any?(feature.routes, &(&1.method == :get and &1.path == "/v1/responses"))
-      assert Enum.any?(feature.routes, &(&1.method == :post and &1.path == "/v1/responses"))
-      assert feature.contract =~ "OpenAI-compatible /v1 routes"
-      assert feature.contract =~ "narrow GET /v1/responses Responses websocket compatibility only"
-      assert feature.contract =~ "exclude broad /v1/realtime routes"
-      assert feature.contract =~ "POST /v1/responses/compact"
-      assert feature.contract =~ "unsupported_endpoint"
-      assert feature.contract =~ "no upstream compact dispatch"
-      assert feature.contract =~ "documented local precedence"
+      assert feature.contract =~ "native websocket continuation"
+      assert feature.contract =~ "reused upstream connection"
+      assert feature.contract =~ "exact previous_response_not_found client retry signal"
+      assert feature.contract =~ "public /v1 terminal masking and shape remain unchanged"
 
       assert feature.contract =~
-               "without forwarding session-id, x-session-id, or x-session-affinity"
+               "a mid-stream upstream death after visible output authors exactly one native type:error frame with status 502, wire code upstream_request_failed, and the pinned message upstream request failed"
 
-      assert feature.contract =~ "pinned /v1/responses continuations"
-      assert feature.contract =~ "restart_with_full_context recovery guidance"
-      assert feature.contract =~ "accept Responses truncation auto and disabled locally"
-      assert feature.contract =~ "accept Codex-native Responses web_search hosted tool shapes"
-      assert feature.contract =~ "keeping web_search_preview type-only"
-      assert feature.contract =~ "emit sanitized response.failed upstream_stream_error"
-      assert feature.contract =~ "preserve backend raw/websocket stream behavior"
+      assert feature.contract =~
+               "carrying no terminal event, no sequence_number, and no socket close so the same socket serves later turns"
 
-      assert fixture.stream_interruption_contract == %{
-               applies_to: "POST /v1/responses HTTP SSE after public Responses data",
-               terminal_event: "response.failed",
-               error_code: "upstream_stream_error",
-               safe_message:
-                 "upstream request failed: stream interrupted before terminal response event",
-               backend_raw_streams: "unchanged",
-               websocket_streams: "unchanged",
-               raw_error_details: false
+      assert feature.contract =~
+               "an owner-forwarded native turn instead delivers the owner's single relayed status-502 server_error frame and the socket authors no second error frame for that turn"
+
+      assert feature.contract =~
+               "a failure of the turn's task after the turn's terminal reached the client, a success terminal followed by a settlement failure included, sends the client nothing more and is recorded on the turn's rows only"
+
+      assert feature.contract =~ "an error the turn's owner relays after that terminal is not sent either"
+
+      assert feature.contract =~
+               "every frame authored through the shared websocket error envelope classifies its error type from the same enumerated code vocabulary the HTTP relay uses instead of a catch-all default, so owner-lifecycle and overload codes carry error type server_error while a replaced or stale downstream carries invalid_request_error, and a code outside that vocabulary follows its status class alone, carrying rate_limit_error at 429 and server_error at any 5xx whatever the reason declares about its own retryability, defaulting independently to status 500 when its reason has no status and to wire code websocket_request_failed with error type server_error when its reason has no code and message"
+
+      assert feature.contract =~
+               "a native backend websocket response.create turn uses the upstream websocket whether its stream flag is true or omitted and never falls back to the HTTP Responses endpoint"
+
+      assert feature.contract =~
+               "an explicit stream false is rejected before admission, accounting, or upstream work with status 400 wire code invalid_request and param stream"
+
+      assert feature.contract =~
+               "fails closed before reservation with one type:error frame carrying status 500 and wire code websocket_transport_required"
+
+      assert feature.contract =~
+               "a stream-less websocket turn on a non-streaming model receives the same local 400 unsupported_model_capability param stream rejection as stream true"
+
+      assert feature.contract =~
+               "an unresolved previous-response alias retains the current authenticated runtime"
+
+      assert feature.contract =~
+               "successful native turns register hashed previous-response aliases independent of retained-body completeness"
+
+      assert fixture.native_continuation_generation_guard == %{
+               scope: "native_backend_websocket_exact_previous_response_not_found",
+               marked_continuation_connection_use: "reused_only",
+               guarded_connection_uses: ["fresh", "reconnected"],
+               guard: %{
+                 upstream_payload_send: false,
+                 client_error_code: "previous_response_not_found",
+                 client_error_type: "invalid_request_error",
+                 client_status: 400,
+                 client_retry: "later_explicit_full_request_without_previous_response_id",
+                 automatic_replay: false
+               },
+               public_v1: "generic_terminal_masking_and_shape_unchanged",
+               diagnostic: %{
+                 reason: "previous_response_generation_mismatch",
+                 reason_class: "previous_response_generation_mismatch",
+                 termination_source: "continuation_generation_guard",
+                 raw_payloads_or_response_values: false
+               },
+               serving_mode_guard: %{
+                 connection_use: "reused",
+                 condition: "lite_continuation_after_a_full_served_last_completed_response_on_the_connection",
+                 full_after_lite: "sent",
+                 unknown_mode: "reuse_rule_only",
+                 reason: "previous_response_serving_mode_mismatch"
+               },
+               provider_refusal: %{
+                 upstream_message_class: "invalid_previous_response_id",
+                 client_error_code: "previous_response_not_found",
+                 attempt_rejection_error_code: "absent"
+               },
+               full_resend: "one_linked_successor_with_or_without_owner_forwarding"
              }
 
-      assert get_in(CompatibilityMatrix.fixture!(:v1_supported_surface), [
-               :responses_builtin_tools,
-               :web_search,
-               :valid_combinations
-             ]) == [
-               "external_web_access=false",
-               "external_web_access=true",
-               "external_web_access=true,index_gated_web_access=true"
-             ]
+      assert feature.contract =~ "share one semantic client turn"
+      assert feature.contract =~ "three distinct accounting lifecycles"
+      assert feature.contract =~ "ordinary durable turn claim"
+      assert feature.contract =~ "owner capability plus sealed runtime proof"
+      assert feature.contract =~ "saved-reset probe or redeem activity"
+      assert feature.contract =~ "public /v1 never inherits the native owner capability or proof"
+      assert fixture.native_compaction_admission == @native_compaction_admission_contract
 
-      assert feature.contract =~ "without forwarding it upstream"
-      assert feature.contract =~ "lift Responses system/developer input-message text"
-      assert feature.contract =~ "early public streaming terminal errors"
-      assert feature.contract =~ "accept safe Hermes assistant replay status values"
-      assert feature.contract =~ "drop known OMP function_call replay status fields"
-      assert feature.contract =~ "translate OpenClaw assistant thinking replays before validation"
-      assert feature.contract =~ "chat input fallback"
-      assert feature.contract =~ "Responses additional_tools support narrow and non-executable"
-      refute feature.contract =~ "metadata"
-
-      assert fixture.auth == "required_bearer_api_key"
-      assert fixture.default_enabled == true
-      assert fixture.websocket_route == %{method: :get, path: "/v1/responses"}
-      assert fixture.websocket_contract == "narrow_responses_websocket_only"
-
-      assert fixture.unsupported_compact == %{
-               method: :post,
-               path: "/v1/responses/compact",
-               status: 404,
-               error_code: "unsupported_endpoint",
-               upstream_dispatch: false
-             }
-
-      assert fixture.continuity_precedence == [
-               "x-codex-window-id",
-               "x-codex-session-id",
-               "session-id",
-               "x-session-id",
-               "x-session-affinity",
-               "session_id",
-               "x-codex-conversation-id"
-             ]
-
-      assert fixture.local_continuity_headers_not_forwarded == [
-               "session-id",
-               "x-session-id",
-               "x-session-affinity"
-             ]
-
-      assert fixture.pinned_continuation_reauth == %{
-               routes: [
-                 %{method: :post, path: "/v1/responses"},
-                 %{method: :get, path: "/v1/responses", transport: "websocket"}
-               ],
-               status: 503,
-               error_code: "pinned_continuation_reauth_required",
-               recovery_kind: "restart_with_full_context",
-               anchor_removal: %{
-                 body: ["previous_response_id"],
-                 headers: [
-                   "x-codex-previous-response-id",
-                   "x-codex-turn-state",
-                   "x-codex-window-id",
-                   "x-codex-session-id",
-                   "session-id",
-                   "x-session-id",
-                   "x-session-affinity",
-                   "session_id",
-                   "x-codex-conversation-id"
-                 ]
+      assert fixture.native_tool_continuation == %{
+               logical_turn: %{
+                 identity: "semantic_turn_key_and_turn_claim_key",
+                 client_turns: 1
+               },
+               request_claim: %{
+                 kind: "deterministic_continuation_claim",
+                 separate_from_logical_turn_identity: true
+               },
+               accepted_semantic_continuation: %{
+                 requests: 2,
+                 attempts: 2,
+                 codex_turns: 2,
+                 settlements: 2,
+                 sequences: [1, 2]
+               },
+               exact_replay: %{
+                 status: 409,
+                 new_request_attempt_codex_turn_or_settlement: false,
+                 upstream_dispatch: false
                }
              }
 
-      assert fixture.pinned_continuation_unavailable == %{
-               routes: [
-                 %{method: :post, path: "/v1/responses"},
-                 %{method: :get, path: "/v1/responses", transport: "websocket"}
+      assert fixture.released_native_metadata == %{
+               request_kinds: [:turn, :prewarm, :compaction, :memory],
+               canonical_envelope: %{
+                 accepted_encodings: [:map, :json_string],
+                 ordinary_and_prewarm: %{
+                   optional: [:window_id, :context_window_id, :window_number],
+                   explicit_null: "rejected",
+                   compaction: "omitted_only"
+                 },
+                 compaction: %{
+                   authority: "strict_complete_enum_map",
+                   malformed: "pre_dispatch_rejected"
+                 },
+                 memory: %{
+                   semantic_turn_identity: false,
+                   ordinary_websocket_accounting_continuity_owner_or_compaction_lifecycle: false
+                 }
+               },
+               prewarm: %{
+                 admitted_without_compaction_authority: true
+               },
+               rejection_diagnostics: %{
+                 vocabulary: :fixed,
+                 metadata_only: true,
+                 raw_metadata_values: false
+               }
+             }
+    end
+
+    test "locks native websocket reconnect identity, handoff, and release boundaries" do
+      feature = CompatibilityMatrix.by_slug!(:websocket_continuity)
+      fixture = CompatibilityMatrix.fixture!(:websocket_turn)
+
+      assert feature.contract =~ "strict native turn-identity precedence"
+      assert feature.contract =~ "same active non-cancelled replay"
+      assert feature.contract =~ "bounded cancellation handoff"
+      assert feature.contract =~ "no hidden automatic replay"
+
+      assert fixture.native_turn_identity == %{
+               source_precedence: [
+                 "client_metadata.turn_id",
+                 "client_metadata.x-codex-turn-metadata.turn_id",
+                 "turn_id",
+                 "request_id"
                ],
-               status: 503,
-               error_code: "pinned_continuation_unavailable",
-               recovery_kind: "restart_with_full_context",
-               examples: ["quota_exhausted", "assignment_unavailable", "identity_unavailable"],
-               hard_pin_fallback: false,
-               soft_pin_fallback: true,
-               anchor_removal: %{
-                 body: ["previous_response_id"],
-                 headers: [
-                   "x-codex-previous-response-id",
-                   "x-codex-turn-state",
-                   "x-codex-window-id",
-                   "x-codex-session-id",
-                   "session-id",
-                   "x-session-id",
-                   "x-session-affinity",
-                   "session_id",
-                   "x-codex-conversation-id"
-                 ]
+               validation: %{
+                 accepted: "1_to_256_byte_ascii_[A-Za-z0-9_.:-]+",
+                 present_invalid: "source_specific_invalid_request_without_fallback",
+                 missing: "no_native_turn_identity"
+               },
+               semantic_key: "opaque_claim_scoped_sha256_32_bytes",
+               claim_key: "opaque_claim_scoped_full_base64url_sha256_claim",
+               claim_scope: %{
+                 thread_named: "hmac_of_pool_api_key_and_thread",
+                 thread_absent: "codex_session_id"
                }
              }
 
-      assert fixture.timeout_contract == %{
-               route_specific_defaults_added: false,
-               progress_receive_timeout_ms: 250,
-               progress_interval_ms: 100,
-               idle_receive_timeout_ms: 150,
-               idle_silent_gap_min_ms: 250,
-               idle_error_code: "stream_idle_timeout"
+      assert feature.contract =~ "an HMAC of Pool, API key and client thread when the turn metadata names a thread and the Codex session otherwise"
+      assert_native_turn_claim_scope!(fixture.native_turn_identity.claim_scope)
+
+      assert fixture.active_reconnect == %{
+               same_active_non_cancelled: %{
+                 disposition: "same_turn_replay",
+                 result: "suppressed_without_new_task_or_accounting_rows",
+                 terminal: "predecessor_terminal_only"
+               },
+               bounded_busy: %{
+                 cancelled_equal_identity: "owner_busy",
+                 noncancelled_different_identity: "owner_busy",
+                 missing_identity: "owner_busy",
+                 public_response_create: "owner_busy",
+                 non_native_active_descriptor: "owner_busy",
+                 response_processed: "owner_busy"
+               },
+               owner_replay_preflight: %{
+                 new_turn_refused_by_occupied_owner: "owner_error_payload_not_duplicate_turn",
+                 live_owner_refusal_code: "owner_busy",
+                 running_request_lost_race: "duplicate_turn_counted_as_owner_replay_preflight",
+                 resend_of_recorded_turn: "duplicate_turn_counted_as_owner_replay_preflight",
+                 newer_socket_turn_at_armed_previsible_replay: "retires_replay_settles_predecessor_once_then_dispatches",
+                 request_from_socket_that_inherited_visible_turn: "owner_cancels_inherited_turn_awaits_settlement_then_judges_request",
+                 inherited_visible_turn_at_owner_without_take_over: "refusal_kept"
+               },
+               runtime_replay_pre_classification: %{
+                 session_not_reconnectable: "owner_unavailable",
+                 session_binding_mismatch: "owner_unavailable",
+                 session_pool_mismatch: "owner_unavailable",
+                 pool_inactive: "pool_inactive_revocation",
+                 pool_missing: "pool_inactive_revocation",
+                 invalid_replay_context: "server_error",
+                 counted_as_duplicate_turn: false
+               }
              }
 
-      assert fixture.instruction_lifting == %{
-               roles: ["system", "developer"],
-               destination: "instructions",
-               merge_order: ["existing_instructions", "input_order_instruction_text"],
-               residual_non_text_role: "user",
-               blank_text: "omitted",
-               malformed_content: "sanitized_invalid_request"
+      assert fixture.prewarm == %{
+               generate_false: "local_created_completed",
+               accounting_rows: "none",
+               active_reconnect: "neutral",
+               pending_handoff: "neutral",
+               reconnect_events: "none",
+               owner_cancellation: "none"
              }
 
-      assert fixture.early_stream_errors == %{
-               responses_first_events: ["response.failed", "error"],
-               responses_suppresses_synthetic_success_prefix_before_output: true,
-               chat_first_chunk: "data_error_object",
-               chat_omits_assistant_role_before_output: true,
-               chat_omits_done_before_output: true,
-               late_failures_retry: false,
-               non_stream_errors: "json_error"
+      assert fixture.edited_replacement_handoff == %{
+               eligibility: "cancelled_predecessor_with_different_native_identity",
+               admission: "matching_fenced_ready_only",
+               before_ready_accounting_rows: "none",
+               soft_cancellation_bound_ms: 1_000,
+               absolute_handoff_bound_ms: 5_000,
+               absolute_failure: "owner_forward_timeout",
+               duplicate_pending_identity: "suppressed_without_second_task_or_rows",
+               third_identity: "owner_busy"
              }
 
-      assert fixture.hermes_assistant_tool_call_replay.ordinary_replay_status_values == [
-               "completed",
-               "incomplete",
-               "in_progress"
-             ]
-
-      assert fixture.openclaw_assistant_thinking_replay == %{
-               input_role: "assistant",
-               dropped_content_part_type: "thinking",
-               normalized_content_part_type: "output_text",
-               source_text_part_type: "text",
-               requires_previous_response_id: false,
-               metadata_only: true
+      assert fixture.exactly_once == %{
+               predecessor: "client_disconnected_once",
+               replacement: "success_once_after_ready",
+               later_turn: "success_once",
+               accounting: "one_request_attempt_turn_and_settlement_per_turn",
+               replacement_connection: "new_generation",
+               later_connection: "reuse_replacement_connection",
+               automatic_replay: false
              }
 
-      assert fixture.unsupported_realtime_routes == [
-               %{method: :get, path: "/v1/realtime"},
-               %{method: :post, path: "/v1/realtime"}
-             ]
+      assert fixture.mixed_release == %{
+               new_new: "identity_aware_handoff",
+               new_old: "identity_aware_handoff_fails_owner_unavailable_before_accounting",
+               old_new: "legacy_submission_behavior_without_new_handoff_protection",
+               old_old: "legacy_behavior_unchanged"
+             }
+    end
 
-      refute Map.has_key?(fixture, :metadata)
+    test "starts a local Codex session in the scope the matrix names for the continuity headers" do
+      fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
+      owner = CodexPooler.AccountsFixtures.bootstrap_owner_fixture().user
+      pool = pool_fixture(%{created_by_user_id: owner.id})
+      %{api_key: key} = active_api_key_fixture(pool, %{created_by_user_id: owner.id})
+      %{api_key: other_key} = active_api_key_fixture(pool, %{created_by_user_id: owner.id})
+      [window_header | _] = fixture.continuity_precedence
+      opts = RequestOptions.for_websocket(%{session_header: "window-#{System.unique_integer([:positive])}:0", session_header_source: window_header})
 
-      assert fixture.routes |> Enum.sort() == [
-               "/v1/audio/transcriptions",
-               "/v1/chat/completions",
-               "/v1/files",
-               "/v1/images/edits",
-               "/v1/images/generations",
-               "/v1/models",
-               "/v1/responses",
-               "/v1/responses/compact",
-               "/v1/usage"
-             ]
+      assert {:ok, session} = GatewayWebsocket.start_codex_session(%{pool: pool, api_key: key}, opts)
+      assert {:ok, same_key} = GatewayWebsocket.start_codex_session(%{pool: pool, api_key: key}, opts)
+      assert {:ok, other} = GatewayWebsocket.start_codex_session(%{pool: pool, api_key: other_key}, opts)
+      assert same_key.id == session.id
+
+      # The client sends the same window and session headers whichever key it
+      # holds, so the scope decides whether a second key of the Pool shares the
+      # first key's session or opens its own (findings#255).
+      case fixture.local_session_scope do
+        "authenticated_pool_and_api_key" ->
+          refute other.id == session.id
+          assert other.api_key_id == other_key.id
+
+        "authenticated_pool" ->
+          assert other.id == session.id
+      end
+
+      assert fixture.local_session_scope == "authenticated_pool_and_api_key"
+    end
+
+    test "keeps backend transcription fixture independent from v1 Audio compatibility" do
+      assert CompatibilityMatrix.fixture!(:backend_transcription) == %{
+               fields: %{"prompt" => "synthetic backend glossary"},
+               filename: "fixture-backend-audio.wav",
+               content_type: "audio/wav",
+               bytes: "synthetic backend wav bytes"
+             }
     end
 
     test "keeps broad public realtime routes outside the router surface" do
@@ -852,7 +3195,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       end
     end
 
-    test "does not list pruned control-plane or reset-credit surfaces as supported features" do
+    test "lists pruned helpers only in their fixed-absence firewall contract" do
       matrix_routes =
         CompatibilityMatrix.features()
         |> Enum.flat_map(& &1.routes)
@@ -869,25 +3212,19 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       refute :backend_reset_credit_consume in CompatibilityMatrix.feature_slugs()
       refute :backend_alpha_search in CompatibilityMatrix.feature_slugs()
 
-      for route <- [
-            {:post, "/api/codex/rate-limit-reset-credits/consume"},
-            {:post, "/wham/rate-limit-reset-credits/consume"},
-            {:post, "/backend-api/wham/rate-limit-reset-credits/consume"},
-            {:get, "/backend-api/codex/thread/goal/get"},
-            {:post, "/backend-api/codex/thread/goal/get"},
-            {:post, "/backend-api/codex/thread/goal/set"},
-            {:post, "/backend-api/codex/thread/goal/clear"},
-            {:post, "/backend-api/codex/analytics-events/events"},
-            {:post, "/backend-api/codex/memories/trace_summarize"},
-            {:post, "/backend-api/codex/alpha/search"},
-            {:post, "/backend-api/codex/realtime/calls"},
-            {:post, "/backend-api/codex/safety/arc"},
-            {:get, "/backend-api/codex/agent-identities/jwks"},
-            {:get, "/backend-api/wham/agent-identities/jwks"}
-          ] do
+      pruned_routes =
+        CompatibilityMatrix.fixture!(:pruned_runtime_helper_firewall)
+        |> Map.fetch!(:routes)
+        |> Enum.map(&{&1.method, &1.path})
+        |> MapSet.new()
+
+      for route <- pruned_routes do
         refute MapSet.member?(matrix_routes, route)
         refute MapSet.member?(router_routes, route)
       end
+
+      refute MapSet.member?(matrix_routes, {:get, "/backend-api/codex/thread/goal/get"})
+      refute MapSet.member?(router_routes, {:get, "/backend-api/codex/thread/goal/get"})
     end
 
     test "documents unsupported v1 public surface with exact OpenAI-shaped error contract" do
@@ -896,6 +3233,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       expected_routes = [
         %{method: :post, path: "/v1/images/variations"},
+        %{method: :post, path: "/v1/content_provenance_checks"},
         %{method: :post, path: "/v1/embeddings"},
         %{method: :post, path: "/v1/batches"},
         %{method: :post, path: "/v1/moderations"},
@@ -918,6 +3256,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       assert fixture.routes == [
                %{method: :post, path: "/v1/images/variations"},
+               %{method: :post, path: "/v1/content_provenance_checks"},
                %{method: :post, path: "/v1/embeddings"},
                %{method: :post, path: "/v1/batches"},
                %{method: :post, path: "/v1/moderations"},
@@ -926,6 +3265,55 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                %{method: :post, path: "/v1/responses/resp_fixture/cancel"},
                %{method: :delete, path: "/v1/responses/resp_fixture"}
              ]
+    end
+
+    test "documents the unsupported beta Agents family and answers it as the fixture states", %{conn: conn} do
+      feature = CompatibilityMatrix.by_slug!(:v1_unsupported_agents_surface)
+      fixture = CompatibilityMatrix.fixture!(:v1_unsupported_agents_surface)
+
+      assert feature.status == :supported
+      assert feature.current == :openai_shaped_unsupported_agents_family
+      assert feature.categories == [:route, :auth, :error]
+      assert feature.routes == []
+      assert feature.future_routes == []
+      assert feature.contract =~ "the Codex backend behind the gateway serves no such route"
+      assert feature.contract =~ "before body parsing, decompression, admission, upstream dispatch, reservation or accounting"
+      assert feature.contract =~ "keep their own contracts without enabling the family"
+
+      assert fixture.families == [
+               %{prefix: "/v1/agents", methods: :any, depth: :any},
+               %{prefix: "/v1/vaults", methods: :any, depth: :any}
+             ]
+
+      assert fixture.order == [:runtime_firewall, :bearer_api_key, :v1_compatibility, :refusal]
+
+      assert Map.take(fixture, [:body_read, :decompression, :upstream_dispatch, :reservation, :accounting, :generic_files_route]) == %{
+               body_read: false,
+               decompression: false,
+               upstream_dispatch: false,
+               reservation: false,
+               accounting: false,
+               generic_files_route: :unchanged
+             }
+
+      setup = active_api_key_fixture()
+
+      for %{method: method, path: path} <- fixture.sdk_routes do
+        conn = conn |> recycle() |> auth(setup) |> put_req_header("accept", "application/json")
+        conn = if method == :get, do: get(conn, path), else: post(conn, path, %{})
+
+        assert json_response(conn, fixture.status) == %{
+                 "error" => %{
+                   "message" => fixture.error_message,
+                   "type" => fixture.error_type,
+                   "code" => fixture.error_code,
+                   "param" => nil
+                 }
+               }
+      end
+
+      assert Repo.aggregate(Request, :count) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
     end
 
     test "documents backend v1 alias surface as explicit authenticated backend aliases" do
@@ -950,6 +3338,10 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "explicit authenticated backend routes"
       assert feature.contract =~ "chat alias fallback limited to top-level input"
       assert feature.contract =~ "messages is absent or empty"
+
+      assert feature.contract =~
+               "translated chat alias emits the nested server_error terminal after visible output"
+
       assert fixture.auth == "required_bearer_api_key"
       assert fixture.default_enabled == true
 
@@ -1016,7 +3408,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       end
     end
 
-    test "documents backend image proxy surface as explicit authenticated JSON proxy routes" do
+    test "documents model-agnostic native image routing through eligible visible capacity" do
       feature = CompatibilityMatrix.by_slug!(:backend_image_proxy_surface)
       fixture = CompatibilityMatrix.fixture!(:backend_image_proxy_surface)
 
@@ -1033,18 +3425,205 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              ]
 
       assert feature.contract =~ "JSON proxy routes"
+      assert feature.contract =~ "any policy-authorized effective image model"
+      assert feature.contract =~ "genuinely absent from the Pool catalog"
+      assert feature.contract =~ "eligible visible host capacity"
+      assert feature.contract =~ "preserving that effective identifier exactly"
+      assert feature.contract =~ "catalog-present invisible targets remain invalid"
       assert feature.contract =~ "public /v1 image translator surface"
       refute feature.contract =~ "placeholder"
 
       assert fixture.auth == "required_bearer_api_key"
       assert fixture.default_enabled == true
       assert fixture.route_class == "proxy_http"
+      assert fixture.json["model"] == "gpt-image-2"
 
       assert fixture.routes == [
                "/backend-api/codex/images/generations",
                "/backend-api/codex/images/edits"
              ]
     end
+  end
+
+  defp sdk_shape_row!(id) do
+    matrix_path =
+      Path.expand("../../../fixtures/openai_compatibility/sdk_shapes/MATRIX.md", __DIR__)
+
+    matrix_path
+    |> File.stream!()
+    |> Enum.find(&String.starts_with?(&1, "| `#{id}` |"))
+    |> case do
+      nil ->
+        flunk("missing SDK-shape provenance row: #{id}")
+
+      row ->
+        [
+          _id,
+          source,
+          version,
+          endpoint,
+          _scenario,
+          observed_shape,
+          decision,
+          _owner,
+          _code_target,
+          _test_target,
+          notes
+        ] =
+          row
+          |> String.trim()
+          |> String.split("|", trim: true)
+          |> Enum.map(&String.trim/1)
+
+        %{
+          source: source,
+          version: version,
+          endpoint: endpoint,
+          decision: String.trim(decision, "`"),
+          observed_shape: observed_shape,
+          notes: notes
+        }
+    end
+  end
+
+  defp sdk_shape_fixture!(scenario_id) do
+    fixtures_dir = Path.expand("../../../fixtures/openai_compatibility/sdk_shapes", __DIR__)
+
+    fixtures_dir
+    |> Path.join("*.json")
+    |> Path.wildcard()
+    |> Enum.map(&CodexPooler.JSON.decode!(File.read!(&1)))
+    |> Enum.find(&(&1["scenario_id"] == scenario_id))
+    |> case do
+      nil -> flunk("missing SDK-shape fixture: #{scenario_id}")
+      fixture -> fixture
+    end
+  end
+
+  defp sdk_shape_manifest_fixture_files! do
+    manifest_path =
+      Path.expand("../../../fixtures/openai_compatibility/sdk_shapes/manifest.json", __DIR__)
+
+    manifest_path
+    |> File.read!()
+    |> CodexPooler.JSON.decode!()
+    |> Map.fetch!("fixture_files")
+  end
+
+  defp exact_stream_id_contract?(contract), do: contract == @stream_id_contract
+
+  defp exact_api_key_websocket_revocation_contract?(contract),
+    do: contract == @api_key_websocket_revocation_contract
+
+  defp responses_allowed_tools_routes do
+    [
+      %{method: :post, path: "/v1/responses"},
+      %{method: :get, path: "/v1/responses", transport: "websocket"}
+    ]
+  end
+
+  defp responses_allowed_tools_summary do
+    "direct public Responses HTTP and websocket response.create accept an exact type=allowed_tools choice only in Full mode, with mode auto or required and a nonempty ordered tools list; named function and custom entries must resolve to undeferred direct top-level same-kind declarations, while type-only web_search and image_generation entries require a declared top-level tool of the same type; order and duplicates are forwarded unchanged after only the existing tool-definition schema lowering; malformed or undeclared Full choices fail before admission or accounting, valid Lite choices create one rejected Request without Attempts or Ledger rows, top-level MCP declarations retain the tools error while MCP allow-list members use the tool_choice error, and Chat, native backend Responses, namespaces, additional_tools, deferred tools, aliases, unsupported entries, Realtime, and broad OpenAI tool parity remain excluded"
+  end
+
+  defp responses_allowed_tools_contract do
+    %{
+      scope: "direct_public_responses_only",
+      transports: ["http", "websocket_response_create"],
+      root: %{
+        exact_keys: ["type", "mode", "tools"],
+        type: "allowed_tools",
+        modes: ["auto", "required"],
+        tools: "nonempty_list"
+      },
+      entries: %{
+        direct_named: %{
+          types: ["function", "custom"],
+          exact_keys: ["type", "name"],
+          name: "nonblank_string",
+          declaration_scope: "direct_top_level_tools_only",
+          resolution: "same_kind_and_exact_name",
+          defer_loading: ["absent", false]
+        },
+        built_in: %{
+          types: ["web_search", "image_generation"],
+          exact_keys: ["type"],
+          declaration_scope: "top_level_tools_only",
+          resolution: "at_least_one_same_type_declaration",
+          multiple_same_type_declarations: "accepted"
+        }
+      },
+      preservation: %{
+        entry_order: "caller_order_unchanged",
+        duplicate_entries: "preserved",
+        full_mode_forwarding: "structurally_identical_tool_choice"
+      },
+      definition_normalization: %{
+        existing_non_strict_function_schema_lowering: "unchanged",
+        additional_tool_definition_rewrite: false,
+        tool_choice_rewrite: false
+      },
+      errors: %{
+        full_malformed_or_undeclared: %{
+          status: 400,
+          code: "invalid_request",
+          message: "tool_choice shape is not translatable",
+          param: "tool_choice"
+        },
+        lite_valid: %{
+          status: 400,
+          code: "unsupported_parameter",
+          message: "Unsupported parameter: tool_choice",
+          param: "tool_choice"
+        },
+        mcp_split: %{
+          top_level_declaration: %{
+            status: 400,
+            code: "invalid_request",
+            message: "remote MCP tools are not supported",
+            param: "tools"
+          },
+          allowed_tools_member: %{
+            status: 400,
+            code: "invalid_request",
+            message: "tool_choice shape is not translatable",
+            param: "tool_choice"
+          }
+        }
+      },
+      lifecycle: %{
+        full_malformed: %{
+          phase: "pre_admission",
+          request_rows: 0,
+          attempt_rows: 0,
+          ledger_rows: 0,
+          upstream_dispatch: false
+        },
+        lite_valid: %{
+          phase: "post_admission_mode_rejection",
+          request_status: "rejected",
+          request_rows: 1,
+          attempt_rows: 0,
+          ledger_rows: 0,
+          upstream_dispatch: false
+        }
+      },
+      exclusions: [
+        "chat_completions",
+        "native_backend_responses",
+        "namespace_children",
+        "input_additional_tools",
+        "deferred_direct_function_or_custom",
+        "unknown_or_cross_kind_names",
+        "extra_root_or_entry_keys",
+        "entry_aliases",
+        "unsupported_or_mcp_entry_types",
+        "realtime",
+        "broad_openai_tool_parity"
+      ],
+      provider_availability: "selected_model_and_account_dependent",
+      privacy: "schema_shape_only"
+    }
   end
 
   describe "baseline route and gap contracts" do
@@ -1174,11 +3753,23 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "upstream validation secret text",
+          "input" => native_text_input("upstream validation secret text"),
           "stream" => true
         })
 
-      assert response(conn, 400) == ""
+      # The refusal answers the Pooler-authored error from the sanitized code,
+      # never the provider message; it used to be an empty body (findings#254
+      # row 254-70).
+      assert CodexPooler.JSON.decode!(response(conn, 400)) == %{
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "code" => "invalid_request_error",
+                 "param" => nil,
+                 "message" => "upstream rejected the request (invalid_request_error)"
+               }
+             }
+
+      refute response(conn, 400) =~ "synthetic upstream validation failure"
       refute response(conn, 400) =~ "quota_evidence_unavailable"
 
       assert [captured] = FakeUpstream.requests(upstream)
@@ -1200,6 +3791,13 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert attempt.status == "failed"
       assert attempt.network_error_code == "upstream_status"
       assert attempt.upstream_status_code == 400
+      assert attempt.response_metadata["rejection_error_code"] == "invalid_request_error"
+      assert attempt.response_metadata["rejection_message_present"] == true
+
+      assert attempt.response_metadata["rejection_message_bytes"] ==
+               byte_size("synthetic upstream validation failure")
+
+      assert attempt.response_metadata["upstream_request_id"] == nil
 
       metadata_text = inspect({request.request_metadata, attempt.response_metadata})
       refute metadata_text =~ "upstream validation secret text"
@@ -1229,7 +3827,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic oversized context request",
+          "input" => native_text_input("synthetic oversized context request"),
           "stream" => false
         })
 
@@ -1251,6 +3849,11 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert attempt.status == "failed"
       assert attempt.network_error_code == "upstream_status"
       assert attempt.upstream_status_code == 400
+      assert attempt.response_metadata["rejection_error_code"] == "context_length_exceeded"
+      assert attempt.response_metadata["rejection_message_present"] == true
+
+      assert attempt.response_metadata["rejection_message_bytes"] ==
+               byte_size("synthetic context overflow failure")
 
       metadata_text = inspect({request.request_metadata, attempt.response_metadata})
       refute metadata_text =~ "synthetic oversized context request"
@@ -1281,7 +3884,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic safe field request",
+          "input" => native_text_input("synthetic safe field request"),
           "text" => %{"format" => %{"type" => "json_object"}},
           "store" => false,
           "include" => ["message.input_image.image_url"],
@@ -1306,7 +3909,8 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       assert captured.json["parallel_tool_calls"] == true
       assert captured.json["prompt_cache_key"] == "synthetic-cache-key"
-      assert captured.json["metadata"] == %{"purpose" => "synthetic"}
+      # The Codex backend refuses `metadata` (findings#333): stripped with the other upstream-unsupported controls.
+      refute Map.has_key?(captured.json, "metadata")
       refute Map.has_key?(captured.json, "previous_response_id")
       refute Map.has_key?(captured.json, "service_tier")
     end
@@ -1335,7 +3939,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic chat",
+          "input" => native_text_input("synthetic chat"),
           "stream" => true
         })
 
@@ -1352,7 +3956,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic reasoning request",
+          "input" => native_text_input("synthetic reasoning request"),
           "reasoning" => %{"effort" => "minimal"}
         })
 
@@ -1371,7 +3975,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic reasoning request",
+          "input" => native_text_input("synthetic reasoning request"),
           "reasoning" => %{"effort" => "none"}
         })
 
@@ -1390,13 +3994,73 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic reasoning request",
+          "input" => native_text_input("synthetic reasoning request"),
           "reasoning" => %{"effort" => "ultra"}
         })
 
       assert %{"id" => "resp_reasoning_ultra"} = json_response(conn, 200)
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.json["reasoning"] == %{"effort" => "max"}
+    end
+
+    test "supported reasoning ultra contract rewrites ultra to the highest catalog level when the model lacks max",
+         %{conn: conn} do
+      upstream =
+        start_upstream(FakeUpstream.json_response(%{"id" => "resp_reasoning_ultra_catalog"}))
+
+      setup =
+        upstream
+        |> gateway_setup()
+        |> put_catalog_reasoning_levels!(~w(low medium high xhigh))
+
+      conn =
+        conn
+        |> auth(setup)
+        |> post(~p"/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("synthetic reasoning request"),
+          "reasoning" => %{"effort" => "ultra"}
+        })
+
+      assert %{"id" => "resp_reasoning_ultra_catalog"} = json_response(conn, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["reasoning"] == %{"effort" => "xhigh"}
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      assert attempt.response_metadata["reasoning"] == %{
+               "requested_effort" => "ultra",
+               "applied_effort" => "ultra",
+               "effective_effort" => "xhigh",
+               "policy_mode" => "unrestricted",
+               "source" => "client",
+               "rewrite" => "ultra_to_xhigh"
+             }
+    end
+
+    test "supported reasoning none contract forwards none unchanged when the catalog omits none",
+         %{conn: conn} do
+      upstream =
+        start_upstream(FakeUpstream.json_response(%{"id" => "resp_reasoning_none_catalog"}))
+
+      setup =
+        upstream
+        |> gateway_setup()
+        |> put_catalog_reasoning_levels!(~w(low medium high xhigh max ultra))
+
+      conn =
+        conn
+        |> auth(setup)
+        |> post(~p"/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("synthetic reasoning request"),
+          "reasoning" => %{"effort" => "none"}
+        })
+
+      assert %{"id" => "resp_reasoning_none_catalog"} = json_response(conn, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["reasoning"] == %{"effort" => "none"}
     end
 
     test "supported reasoning contract preserves non-minimal efforts", %{conn: conn} do
@@ -1408,7 +4072,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> auth(setup)
         |> post(~p"/backend-api/codex/responses", %{
           "model" => setup.model.exposed_model_id,
-          "input" => "synthetic reasoning request",
+          "input" => native_text_input("synthetic reasoning request"),
           "reasoning" => %{"effort" => "medium"}
         })
 
@@ -1416,6 +4080,30 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.json["reasoning"] == %{"effort" => "medium"}
     end
+  end
+
+  # Catalog sync derives the Pool-wide union from the assignment sources, so a
+  # test that changes the union must change the selected assignment's source
+  # the same way; the ultra rewrite reads the selected source (findings#221).
+  defp put_catalog_reasoning_levels!(setup, levels) do
+    metadata =
+      update_in(
+        setup.model.metadata,
+        [Access.key("upstream_model", %{})],
+        &Map.put(&1, "supported_reasoning_levels", levels)
+      )
+
+    metadata =
+      Enum.reduce(Map.get(metadata, "source_assignment_ids", []), metadata, fn id, acc ->
+        update_in(
+          acc,
+          [Access.key("source_assignment_models", %{}), Access.key(id, %{})],
+          &Map.put(&1, "supported_reasoning_levels", levels)
+        )
+      end)
+
+    model = setup.model |> Ecto.Changeset.change(metadata: metadata) |> Repo.update!()
+    Map.put(setup, :model, model)
   end
 
   defp gateway_setup(upstream, opts \\ []) do
@@ -1433,7 +4121,20 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         exposed_model_id: "gpt-contract-model",
         upstream_model_id: "provider-gpt-contract-model",
         pricing_ref: "provider-gpt-contract-model",
-        metadata: %{"source_assignment_ids" => [upstream.assignment.id]},
+        metadata: %{
+          "source_assignment_ids" => [upstream.assignment.id],
+          "source_assignment_models" => %{
+            upstream.assignment.id => %{
+              "slug" => "gpt-contract-model",
+              "capabilities" => %{
+                "reasoning" => true,
+                "responses" => true,
+                "streaming" => true,
+                "tools" => true
+              }
+            }
+          }
+        },
         supports_responses: true,
         supports_streaming: true
       })
@@ -1446,6 +4147,75 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       model: model,
       upstream_token: upstream_token
     })
+  end
+
+  test "documents the narrow issue-101 private-native detail projections beside generic redaction" do
+    fixture = CompatibilityMatrix.fixture!(:misalignment_policy_violation)
+
+    assert fixture.code == "misalignment_policy_violation"
+
+    assert fixture.eligibility == %{
+             immediate_pre_stream_http_json: %{
+               routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+               statuses: [400, 403],
+               exact_error_code: "misalignment_policy_violation",
+               stream_true_rejected_before_sse_starts: true,
+               optional_fields: ["error_type", "detailed_explanation", "steer.message"]
+             },
+             private_native_app_server_response_failed_sse: %{
+               routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+               statuses: [400, 403],
+               exact_error_code: "misalignment_policy_violation",
+               stream_true: true,
+               terminal_event: "response.failed",
+               optional_fields: ["error_type", "detailed_explanation", "steer.message"]
+             }
+           }
+
+    assert fixture.lifecycle == %{
+             retryable: false,
+             health_neutral: true,
+             demotion: false,
+             circuit_failure: false,
+             settlement: "exactly_once"
+           }
+
+    assert fixture.public_error == %{
+             code: "misalignment_policy_violation",
+             type: "invalid_request_error",
+             message: "nonblank_provider_message_or_fixed_safe_fallback",
+             provider_param: false,
+             provider_body: false,
+             provider_siblings: false
+           }
+
+    assert fixture.durable_metadata == %{
+             exact_code: true,
+             accounting_message: "fixed",
+             bounded_facts_only: true,
+             raw_provider_message: false,
+             raw_provider_body: false
+           }
+
+    assert fixture.redaction == %{
+             native_websocket: false,
+             native_compact: false,
+             public_v1_responses_chat_sse_websocket: false,
+             generic_errors: false,
+             logs: false,
+             request_or_attempt_metadata: false,
+             audit: false,
+             telemetry: false,
+             receipts: false,
+             stored_errors: false,
+             durable_event_history: false
+           }
+
+    assert fixture.generic_provider_errors == %{
+             message: "upstream request failed",
+             type: "server_error",
+             unchanged: true
+           }
   end
 
   defp gateway_upstream(pool, upstream, token) do
@@ -1554,6 +4324,16 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
   defp multipart_boundary, do: "codex-pooler-compat-boundary"
 
+  defp native_text_input(text) do
+    [
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [%{"type" => "input_text", "text" => text}]
+      }
+    ]
+  end
+
   defp multipart_body(filename, contents) do
     [
       "--#{multipart_boundary()}\r\n",
@@ -1580,4 +4360,28 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
   defp generated_secret(label),
     do: "fixture-secret-#{label}-#{System.unique_integer([:positive])}"
+
+  # The fixture's claim scope, derived through the same functions the codec
+  # uses for a frame's semantic key (`WebsocketTurnIdentity.claim_scope/2` over
+  # the frame's session and thread, then `resolve/2`), so the matrix cannot
+  # claim a scope the key derivation does not have (findings#225, row 225-92).
+  defp assert_native_turn_claim_scope!(%{thread_named: "hmac_of_pool_api_key_and_thread", thread_absent: "codex_session_id"}) do
+    session = %{id: Ecto.UUID.generate(), pool_id: Ecto.UUID.generate(), api_key_id: Ecto.UUID.generate()}
+    next_session = %{session | id: Ecto.UUID.generate()}
+    other_key = %{session | api_key_id: Ecto.UUID.generate()}
+
+    key = fn codex_session, thread_id ->
+      scope = WebsocketTurnIdentity.claim_scope(codex_session, thread_id)
+      payload = %{"client_metadata" => %{"turn_id" => "matrix-claim-scope-turn"}}
+      {:ok, %{semantic_turn_key: semantic_key}} = WebsocketTurnIdentity.resolve(payload, scope)
+      semantic_key
+    end
+
+    assert byte_size(key.(session, "matrix-thread")) == 32
+    assert key.(session, "matrix-thread") == key.(next_session, "matrix-thread")
+    refute key.(session, "matrix-thread") == key.(other_key, "matrix-thread")
+    refute key.(session, "matrix-thread") == key.(session, "matrix-other-thread")
+    refute key.(session, nil) == key.(next_session, nil)
+    assert key.(session, nil) == key.(%{other_key | id: session.id}, nil)
+  end
 end

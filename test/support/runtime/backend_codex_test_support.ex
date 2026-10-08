@@ -16,7 +16,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     statics: CodexPoolerWeb.static_paths()
 
   alias CodexPooler.Access
-  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestReplayEntitlement}
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files.FileRecord
@@ -26,28 +26,34 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   alias CodexPooler.Gateway.Persistence.{
     BridgeAffinity,
     BridgeDemotion,
+    CodexTurn,
     RoutingCircuitState
   }
 
+  alias CodexPooler.Gateway.Runtime.Streaming.StreamTiming
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.UpstreamConnectionProbe
+  alias CodexPooler.Gateway.Transports.Websocket.ActivityRegistry
+  alias CodexPooler.Gateway.Websocket.DeliveryReceipt
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPoolerWeb.CodexResponsesSocket
+  alias CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingSupport
+  alias CodexPoolerWeb.Runtime.WebsocketCleanupFence
   alias Ecto.Adapters.SQL.Sandbox
 
-  @endpoint CodexPoolerWeb.Endpoint
-  @websocket_frame_timeout 1_000
+  @detection_timeout_ms 15_000
   def stream_retry_setup(first_mode, second_mode \\ stream_success_sse()) do
     first_upstream = start_upstream(first_mode)
     second_upstream = start_upstream(second_mode)
     setup = gateway_setup(first_upstream)
 
     second =
-      gateway_upstream(setup.pool, second_upstream, "upstream-token-stream-retry",
-        compact?: false
-      )
+      gateway_upstream(setup.pool, second_upstream, "upstream-token-stream-retry", compact?: false)
 
     prime_routing_quota!(second.identity)
     use_deterministic_rotation!(setup.pool, 2)
@@ -73,7 +79,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
                "/backend-api/codex/responses",
                %{
                  "model" => setup.model.exposed_model_id,
-                 "input" => "stream retry fixture",
+                 "input" => native_text_input("stream retry fixture"),
                  "stream" => true
                },
                RequestOptions.build(
@@ -84,7 +90,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
                  "/backend-api/codex/responses",
                  %{
                    "model" => setup.model.exposed_model_id,
-                   "input" => "stream retry fixture",
+                   "input" => native_text_input("stream retry fixture"),
                    "stream" => true
                  }
                )
@@ -166,14 +172,89 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     refute metadata_text =~ "auth.json"
   end
 
+  def assert_upstream_transport_warning!(logs, setup, transport, reason, sentinels \\ []) do
+    warnings =
+      logs
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.contains?(&1, "gateway upstream transport failed"))
+
+    assert [warning] = warnings
+    assert warning =~ "transport=#{transport}"
+    assert warning =~ "endpoint=/backend-api/codex/responses"
+    assert warning =~ "exception=Req.TransportError"
+    assert warning =~ "reason=#{reason}"
+    assert warning =~ "upstream_identity_id=#{setup.identity.id}"
+    assert warning =~ "pool_upstream_assignment_id=#{setup.assignment.id}"
+
+    Enum.each([setup.authorization, setup.raw_key, "upstream-token" | sentinels], fn sentinel ->
+      refute logs =~ sentinel
+    end)
+  end
+
   def assert_safe_stream_metadata!(request, attempts) do
+    response_metadata = Enum.map(attempts, &(&1.response_metadata || %{}))
+    Enum.each(response_metadata, &assert_bounded_downstream_delivery!/1)
+    Enum.each(response_metadata, &assert_bounded_stream_timing!/1)
+
     metadata_text =
-      inspect({request.request_metadata, Enum.map(attempts, & &1.response_metadata)})
+      inspect({
+        request.request_metadata,
+        Enum.map(response_metadata, &Map.drop(&1, [DeliveryReceipt.metadata_key(), StreamTiming.metadata_key()]))
+      })
 
     refute metadata_text =~ "data:"
     refute metadata_text =~ "visible"
     refute metadata_text =~ "call_fixture"
   end
+
+  # The downstream delivery receipt is a fixed vocabulary whose key names
+  # contain the delta sentinel ("frames_after_visible"), so it is checked on
+  # its own bounded shape instead of being scanned for stream bytes. A pushed
+  # `response.completed` also names the provider's `end_turn` class.
+  defp assert_bounded_downstream_delivery!(metadata) do
+    case Map.fetch(metadata, DeliveryReceipt.metadata_key()) do
+      {:ok, receipt} ->
+        expected = ~w(frames_after_visible outcome pushed_at terminal_class transport)
+        expected = if Map.has_key?(receipt, "end_turn"), do: ["end_turn" | expected], else: expected
+        assert Enum.sort(Map.keys(receipt)) == Enum.sort(expected)
+
+        if Map.has_key?(receipt, "end_turn") do
+          assert receipt["terminal_class"] == "response.completed"
+          assert receipt["end_turn"] in DeliveryReceipt.end_turn_class_values()
+        end
+
+        assert receipt["outcome"] in (DeliveryReceipt.outcomes() ++ ["unknown"])
+
+        assert receipt["terminal_class"] in ~w(response.completed response.failed response.incomplete error none unknown)
+
+        assert is_integer(receipt["frames_after_visible"]) and
+                 receipt["frames_after_visible"] >= 0
+
+        assert receipt["transport"] in ~w(websocket http_sse)
+
+        assert is_nil(receipt["pushed_at"]) or
+                 match?({:ok, _pushed_at, 0}, DateTime.from_iso8601(receipt["pushed_at"]))
+
+      :error ->
+        :ok
+    end
+  end
+
+  # The stream timing is a fixed vocabulary too, and its `first_visible_ms`
+  # key carries the same sentinel, so it is checked on its own bounded shape.
+  defp assert_bounded_stream_timing!(metadata) do
+    case Map.fetch(metadata, StreamTiming.metadata_key()) do
+      {:ok, timing} ->
+        assert Map.keys(timing) -- ~w(connection first_event_ms first_visible_ms headers_ms) == []
+        Enum.each(timing, &assert_bounded_stream_timing_field!/1)
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp assert_bounded_stream_timing_field!({"connection", value}), do: assert(value in UpstreamConnectionProbe.connections())
+  defp assert_bounded_stream_timing_field!({_mark, value}), do: assert(is_integer(value) and value >= 0)
 
   def stream_success_sse do
     FakeUpstream.sse_stream([
@@ -299,8 +380,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   end
 
   def assert_request_reserved! do
-    assert_receive {CodexPooler.Events,
-                    %{reason: "request_reserved", payload: %{"request_id" => request_id}}},
+    assert_receive {CodexPooler.Events, %{reason: "request_reserved", payload: %{"request_id" => request_id}}},
                    5_000
 
     request_id
@@ -316,14 +396,25 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     )
   end
 
-  def register_unboxed_pool_cleanup!(pool) do
-    pool_id = pool.id
-
+  def register_unboxed_pool_cleanup!(%{pool: pool, pricing: _} = fixture) do
     on_exit(fn ->
+      # A session cleanup deferred past its socket's terminate can still write
+      # this Pool's rows (a ledger entry of a committed attempt); deleting them
+      # first failed on a foreign key and left the whole graph committed
+      # (findings#206 row 206-405).
+      # If the barrier fails, deliberately leave the graph intact and fail
+      # teardown. An unconditional after-delete would race those live writers.
+      :ok = WebsocketCleanupFence.await_session_cleanups!()
+
       unboxed_run(fn ->
-        cleanup_unboxed_pool!(pool_id)
+        cleanup_unboxed_pool!(fixture)
       end)
     end)
+
+    # Registered after the deletion so it runs first: the Pool's owners stop while
+    # their committed sessions still exist, since the stop that `gateway_setup/2`
+    # registered runs after the rows are gone and would find no session.
+    BackendCodexWebsocketOwnerForwardingSupport.stop_pool_owners_on_exit(pool)
   end
 
   def unboxed_run(fun) when is_function(fun, 0) do
@@ -365,7 +456,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     end
   end
 
-  def cleanup_unboxed_pool!(pool_id) do
+  def cleanup_unboxed_pool!(%{pool: %{id: pool_id}, pricing: %{id: pricing_id}}) do
     request_ids =
       Repo.all(from(request in Request, where: request.pool_id == ^pool_id, select: request.id))
 
@@ -377,14 +468,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
         )
       )
 
-    model_refs =
-      Repo.all(
-        from(model in CodexPooler.Catalog.Model,
-          where: model.pool_id == ^pool_id,
-          select: model.upstream_model_id
-        )
-      )
-
     api_key_ids =
       Repo.all(
         from(api_key in CodexPooler.Access.APIKey,
@@ -393,14 +476,47 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
         )
       )
 
+    # Remove jobs while assignment rows still make ownership discoverable. Identity-only jobs
+    # are removed only for identities not assigned to another pool.
+    Repo.delete_all(
+      from job in Oban.Job,
+        where:
+          fragment("?->>'pool_id'", job.args) == ^pool_id or
+            fragment("?->>'pool_upstream_assignment_id'", job.args) in ^Repo.all(
+              from a in CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment,
+                where: a.pool_id == ^pool_id,
+                select: a.id
+            ) or
+            (fragment("?->>'upstream_identity_id'", job.args) in ^identity_ids and
+               fragment("?->>'upstream_identity_id'", job.args) not in subquery(
+                 from a in CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment,
+                   where: a.pool_id != ^pool_id,
+                   select: fragment("?::text", a.upstream_identity_id)
+               ))
+    )
+
+    # Read before the keys go: the fixture owner is only recorded as their creator.
+    owner_ids = CodexPooler.PoolerFixtures.api_key_creator_ids([pool_id])
+
     Repo.delete_all(
       from(entry in LedgerEntry,
         where: entry.pool_id == ^pool_id or entry.request_id in ^request_ids
       )
     )
 
+    Repo.delete_all(from(rollup in CodexPooler.Accounting.DailyRollup, where: rollup.pool_id == ^pool_id))
+
+    Repo.delete_all(from(entitlement in RequestReplayEntitlement, where: entitlement.request_id in ^request_ids))
+
+    Repo.delete_all(from(turn in CodexTurn, where: turn.request_id in ^request_ids))
+
+    # Keyed by attempt without a foreign key (findings#290).
     Repo.delete_all(
-      from(rollup in CodexPooler.Accounting.DailyRollup, where: rollup.pool_id == ^pool_id)
+      from(ending in CodexPooler.Platform.ForwardedGenerationEnd,
+        join: attempt in Attempt,
+        on: attempt.id == ending.attempt_id,
+        where: attempt.request_id in ^request_ids
+      )
     )
 
     Repo.delete_all(from(attempt in Attempt, where: attempt.request_id in ^request_ids))
@@ -429,15 +545,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
 
     Repo.delete_all(
       from(identity in CodexPooler.Upstreams.Schemas.UpstreamIdentity,
-        where: identity.id in ^identity_ids
+        where:
+          identity.id in ^identity_ids and
+            identity.id not in subquery(
+              from assignment in CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment,
+                where: assignment.pool_id != ^pool_id,
+                select: assignment.upstream_identity_id
+            )
       )
     )
 
     Repo.delete_all(
       from(snapshot in PricingSnapshot,
-        where:
-          snapshot.model_identifier in ^model_refs and
-            snapshot.price_version == "backend-codex-test-v1"
+        where: snapshot.id == ^pricing_id
       )
     )
 
@@ -449,52 +569,156 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
       )
     )
 
-    Repo.delete_all(
-      from(api_key in CodexPooler.Access.APIKey, where: api_key.pool_id == ^pool_id)
-    )
+    Repo.delete_all(from(api_key in CodexPooler.Access.APIKey, where: api_key.pool_id == ^pool_id))
 
-    Repo.delete_all(
-      from(settings in CodexPooler.Pools.RoutingSettings, where: settings.pool_id == ^pool_id)
-    )
+    Repo.delete_all(from(settings in CodexPooler.Pools.RoutingSettings, where: settings.pool_id == ^pool_id))
 
-    Repo.delete_all(from(pool in CodexPooler.Pools.Pool, where: pool.id == ^pool_id))
+    CodexPooler.PoolerFixtures.delete_committed_pools!([pool_id], owner_ids)
   end
 
   def gateway_setup(upstream, opts \\ []) do
-    key = active_api_key_fixture()
+    key = if slug = Keyword.get(opts, :pool_slug), do: active_api_key_fixture(pool_fixture(%{slug: slug})), else: active_api_key_fixture()
     pool = key.pool
+    # Registered before the fence so it runs after it: the owners this Pool's
+    # sockets start are stopped once those sockets and their cleanup are done,
+    # and before the sandbox owner stops (findings#206 rows 206-377/206-387).
+    :ok = register_pool_owner_stop(pool)
+    # Socket callback tests terminate sockets from the test process; their
+    # deferred cleanup must finish before the sandbox owner stops.
+    :ok = WebsocketCleanupFence.install!()
     compact? = Keyword.get(opts, :compact?, false)
-    upstream = gateway_upstream(pool, upstream, "upstream-token", compact?: compact?)
+
+    upstream =
+      gateway_upstream(pool, upstream, "upstream-token",
+        compact?: compact?,
+        credential_provenance: Keyword.get(opts, :credential_provenance, :codex_chatgpt)
+      )
 
     if Keyword.get(opts, :quota?, true) do
       prime_routing_quota!(upstream.identity)
     end
 
-    model_metadata =
-      %{"source_assignment_ids" => [upstream.assignment.id]}
-      |> Map.merge(Keyword.get(opts, :model_metadata, %{}))
-
     exposed_model_id = Keyword.get(opts, :exposed_model_id, "gpt-test-model")
     upstream_model_id = Keyword.get(opts, :upstream_model_id, "provider-gpt-test-model")
+    display_name = Keyword.get(opts, :display_name, "GPT 6 Luna")
+
+    requested_metadata = Keyword.get(opts, :model_metadata, %{})
+
+    model_metadata =
+      %{
+        "source_assignment_ids" => [upstream.assignment.id],
+        "source_assignment_models" => %{
+          upstream.assignment.id => default_codex_source(exposed_model_id, upstream_model_id, display_name)
+        }
+      }
+      |> Map.merge(requested_metadata)
+      |> enrich_test_source_models(
+        exposed_model_id,
+        upstream_model_id,
+        display_name,
+        requested_metadata
+      )
 
     model =
       model_fixture(pool, %{
         exposed_model_id: exposed_model_id,
         upstream_model_id: upstream_model_id,
+        display_name: display_name,
         pricing_ref: Keyword.get(opts, :pricing_ref, upstream_model_id),
         metadata: model_metadata,
         supports_responses: true,
         supports_streaming: true
       })
 
-    pricing_snapshot!(model)
-    Map.merge(key, %{identity: upstream.identity, assignment: upstream.assignment, model: model})
+    pricing = pricing_snapshot!(model)
+
+    Map.merge(key, %{
+      identity: upstream.identity,
+      assignment: upstream.assignment,
+      model: model,
+      pricing: pricing
+    })
+  end
+
+  # A fixture built inside a helper task (not the test process) cannot register an
+  # `on_exit` callback; like `WebsocketCleanupFence.install!/1`, that call registers
+  # nothing and the test's own Pool cleanup, if any, covers it.
+  defp register_pool_owner_stop(pool) do
+    BackendCodexWebsocketOwnerForwardingSupport.stop_pool_owners_on_exit(pool)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # A catalog entry the released Codex client decodes (findings#206 row
+  # 206-444): `priority`, `support_verbosity` and `experimental_supported_tools`
+  # are required by every client in `CodexModelDecodeContract`'s verified window,
+  # so an in-window client is served this model instead of having it left out.
+  defp default_codex_source(exposed_model_id, upstream_model_id, display_name) do
+    %{
+      "slug" => exposed_model_id,
+      "priority" => 1,
+      "support_verbosity" => false,
+      "experimental_supported_tools" => [],
+      "display_name" => display_name,
+      "description" => display_name,
+      "supported_reasoning_levels" => [
+        %{"effort" => "low", "description" => "low"},
+        %{"effort" => "medium", "description" => "medium"},
+        %{"effort" => "high", "description" => "high"},
+        %{"effort" => "xhigh", "description" => "xhigh"}
+      ],
+      "default_reasoning_level" => "medium",
+      "shell_type" => "shell_command",
+      "visibility" => "list",
+      "base_instructions" => "",
+      "truncation_policy" => %{"mode" => "bytes", "limit" => 10_000},
+      "include_skills_usage_instructions" => false,
+      "supports_parallel_tool_calls" => true,
+      "input_modalities" => ["text"],
+      "upstream_model_id" => upstream_model_id,
+      "supported_in_api" => true,
+      "use_responses_lite" => false
+    }
+  end
+
+  defp enrich_test_source_models(
+         metadata,
+         exposed_model_id,
+         upstream_model_id,
+         display_name,
+         requested_metadata
+       ) do
+    if Map.has_key?(requested_metadata, "source_assignment_models") do
+      metadata
+    else
+      requested_source_fields =
+        requested_metadata
+        |> Map.get("upstream_model", %{})
+        |> Map.merge(
+          Map.drop(requested_metadata, [
+            "source_assignment_ids",
+            "source_assignment_missing_sync_run_ids",
+            "upstream_model"
+          ])
+        )
+
+      put_in(
+        metadata["source_assignment_models"],
+        %{
+          hd(metadata["source_assignment_ids"]) =>
+            exposed_model_id
+            |> default_codex_source(upstream_model_id, display_name)
+            |> Map.merge(requested_source_fields)
+        }
+      )
+    end
   end
 
   def strict_text_format_payload(schema, strict \\ true) do
     %{
       "model" => "gpt-test-model",
-      "input" => "answer in json",
+      "input" => native_text_input("answer in json"),
       "text" => %{
         "format" => %{
           "type" => "json_schema",
@@ -504,6 +728,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
         }
       }
     }
+  end
+
+  def native_text_input(text) do
+    [
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [%{"type" => "input_text", "text" => text}]
+      }
+    ]
   end
 
   def prime_routing_quota!(identity, overrides \\ %{}) do
@@ -535,12 +769,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
              ])
   end
 
-  def prime_exhausted_routing_quota!(identity) do
+  def prime_exhausted_routing_quota!(identity, overrides \\ %{}) do
     reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
 
     assert {:ok, [_window]} =
              QuotaWindows.upsert_quota_windows(identity, [
-               primary_quota_window_attrs(%{reset_at: reset_at, used_percent: Decimal.new("100")})
+               primary_quota_window_attrs(Map.merge(%{reset_at: reset_at, used_percent: Decimal.new("100")}, overrides))
              ])
   end
 
@@ -555,6 +789,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
                  source: "codex_usage_api"
                })
              ])
+
+    # Automatic redemption requires two corroborating provider receipts on
+    # the exhausted window; identities without the policy or bank get none.
+    CodexPooler.SavedResetConfirmationFixtures.confirm_automatic_pressure!(identity)
   end
 
   def prime_stale_routing_quota!(identity) do
@@ -726,11 +964,26 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
 
   def put_model_source_assignments!(model, assignments) do
     assignment_ids = Enum.map(assignments, & &1.id)
+    source_models = Map.get(model.metadata || %{}, "source_assignment_models", %{})
+
+    source_template =
+      assignment_ids
+      |> Enum.find_value(&Map.get(source_models, &1))
+      |> Kernel.||(%{"slug" => model.exposed_model_id})
+
+    source_models =
+      Map.new(assignment_ids, fn assignment_id ->
+        {assignment_id, Map.get(source_models, assignment_id, source_template)}
+      end)
 
     model
     |> Ecto.Changeset.change(%{
       source_assignment_count: length(assignment_ids),
-      metadata: %{"source_assignment_ids" => assignment_ids}
+      metadata:
+        model.metadata
+        |> Kernel.||(%{})
+        |> Map.put("source_assignment_ids", assignment_ids)
+        |> Map.put("source_assignment_models", source_models)
     })
     |> Repo.update!()
   end
@@ -765,6 +1018,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   def gateway_upstream(pool, upstream, token, opts) do
     compact? = Keyword.get(opts, :compact?, false)
     metadata = %{"base_url" => FakeUpstream.url(upstream)}
+    now = DateTime.utc_now()
 
     metadata =
       if compact?, do: Map.put(metadata, "supports_compact_responses", true), else: metadata
@@ -774,11 +1028,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
                chatgpt_account_id: "acct_#{System.unique_integer([:positive])}",
                account_label: "Gateway upstream",
                onboarding_method: "import",
+               status: UpstreamIdentity.active_status(),
+               auth_verified_at: now,
+               auth_fresh_at: now,
+               created_at: now,
+               updated_at: now,
                metadata: metadata
              })
 
-    assert {:ok, identity} =
-             IdentityLifecycle.activate_upstream_identity(identity)
+    identity =
+      identity
+      |> Ecto.Changeset.change()
+      |> UpstreamIdentity.put_credential_provenance(Keyword.get(opts, :credential_provenance, :codex_chatgpt))
+      |> Repo.update!()
 
     assert {:ok, _secret} =
              Upstreams.store_encrypted_secret(identity, %{
@@ -789,11 +1051,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     assert {:ok, assignment} =
              PoolAssignments.create_pool_assignment(pool, identity, %{
                assignment_label: "Gateway assignment",
+               status: PoolUpstreamAssignment.active_status(),
+               health_status: PoolUpstreamAssignment.active_health_status(),
+               eligibility_status: PoolUpstreamAssignment.eligible_status(),
                metadata: metadata
              })
-
-    assert {:ok, assignment} =
-             PoolAssignments.activate_pool_assignment(assignment)
 
     %{identity: identity, assignment: assignment}
   end
@@ -842,6 +1104,60 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   def auth(conn, setup), do: put_req_header(conn, "authorization", setup.authorization)
 
   def start_public_endpoint! do
+    {_server, port} = start_public_endpoint_with_server!()
+    port
+  end
+
+  @spec curl_json_request!(pos_integer(), String.t(), map(), String.t()) ::
+          {String.t(), String.t()}
+  def curl_json_request!(
+        port,
+        authorization,
+        request_body,
+        path \\ "/backend-api/codex/responses"
+      ) do
+    temp_root =
+      Path.join(System.tmp_dir!(), "backend-codex-curl-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(temp_root)
+    File.chmod!(temp_root, 0o700)
+    on_exit(fn -> File.rm_rf!(temp_root) end)
+
+    request_path = Path.join(temp_root, "request.json")
+    curl_config_path = Path.join(temp_root, "curl.conf")
+
+    File.write!(request_path, CodexPooler.JSON.encode!(request_body))
+
+    File.write!(
+      curl_config_path,
+      "url = \"http://127.0.0.1:#{port}#{path}\"\n" <>
+        "request = \"POST\"\n" <>
+        "header = \"content-type: application/json\"\n" <>
+        "header = \"authorization: #{authorization}\"\n" <>
+        "data-binary = \"@#{String.replace(request_path, "\\", "/")}\"\n"
+    )
+
+    File.chmod!(request_path, 0o600)
+    File.chmod!(curl_config_path, 0o600)
+
+    {curl_output, exit_code} =
+      System.cmd(
+        "curl",
+        ["-i", "--silent", "--show-error", "--max-time", "10", "--config", curl_config_path],
+        stderr_to_stdout: true
+      )
+
+    assert exit_code == 0
+    assert [headers, response_body] = String.split(curl_output, "\r\n\r\n", parts: 2)
+    {headers, response_body}
+  end
+
+  def start_public_endpoint_with_server! do
+    # The fence's on_exit is registered before the listener's own, so the
+    # listener stops first and the fence then waits for its sockets' cleanup
+    # while the sandbox owner is still alive (findings#206, row 206-28).
+    :ok = WebsocketCleanupFence.install!()
+
     {:ok, server} =
       Bandit.start_link(
         plug: CodexPoolerWeb.Endpoint,
@@ -858,8 +1174,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
       end
     end)
 
+    :ok = WebsocketCleanupFence.install!(server: server)
     {:ok, {_ip, port}} = ThousandIsland.listener_info(server)
-    port
+    {server, port}
   end
 
   def public_websocket_connect!(port, setup, turn_state, path \\ "/backend-api/codex/responses") do
@@ -875,12 +1192,23 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
         turn_state,
         path \\ "/backend-api/codex/responses"
       ) do
+    public_websocket_connect_with_request_headers!(port, setup, turn_state, path, [])
+  end
+
+  def public_websocket_connect_with_request_headers!(
+        port,
+        setup,
+        turn_state,
+        path,
+        request_headers
+      ) do
     {:ok, conn} = Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http1])
 
-    headers = [
-      {"authorization", setup.authorization},
-      {"x-codex-turn-state", turn_state}
-    ]
+    headers =
+      [
+        {"authorization", setup.authorization},
+        {"x-codex-turn-state", turn_state}
+      ] ++ request_headers
 
     {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, conn, path, headers)
 
@@ -907,28 +1235,43 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   end
 
   def await_public_websocket_upgrade(conn, ref, status, response_headers) do
-    receive do
-      message ->
-        case Mint.WebSocket.stream(conn, message) do
-          {:ok, conn, responses} ->
-            status = websocket_status_part(responses, ref) || status
-            response_headers = websocket_headers_part(responses, ref) || response_headers
+    message = receive_mint_socket_message!(conn, @detection_timeout_ms, "timed out waiting for websocket upgrade")
 
-            if Enum.any?(responses, &match?({:done, ^ref}, &1)) do
-              complete_public_websocket_upgrade(conn, status, response_headers)
-            else
-              await_public_websocket_upgrade(conn, ref, status, response_headers)
-            end
+    case Mint.WebSocket.stream(conn, message) do
+      {:ok, conn, responses} ->
+        status = websocket_status_part(responses, ref) || status
+        response_headers = websocket_headers_part(responses, ref) || response_headers
 
-          {:error, conn, reason, _responses} ->
-            Mint.HTTP.close(conn)
-            flunk("websocket upgrade failed: #{inspect(reason)}")
-
-          :unknown ->
-            await_public_websocket_upgrade(conn, ref, status, response_headers)
+        if Enum.any?(responses, &match?({:done, ^ref}, &1)) do
+          complete_public_websocket_upgrade(conn, status, response_headers)
+        else
+          await_public_websocket_upgrade(conn, ref, status, response_headers)
         end
+
+      {:error, conn, reason, _responses} ->
+        Mint.HTTP.close(conn)
+        flunk("websocket upgrade failed: #{inspect(reason)}")
+
+      :unknown ->
+        await_public_websocket_upgrade(conn, ref, status, response_headers)
+    end
+  end
+
+  @doc """
+  Receives the next message Mint delivers for `conn`'s own socket, and only
+  that: `{:tcp | :ssl, socket, data}`, `{:tcp_closed | :ssl_closed, socket}` or
+  `{:tcp_error | :ssl_error, socket, reason}`. Every other message stays in the
+  test mailbox, in order: a fake upstream's barrier or control notice, a pool
+  event, a telemetry message or another connection's socket data.
+  """
+  def receive_mint_socket_message!(conn, timeout_ms, timeout_message) do
+    socket = Mint.HTTP.get_socket(conn)
+
+    receive do
+      {tag, ^socket, _data_or_reason} = message when tag in [:tcp, :ssl, :tcp_error, :ssl_error] -> message
+      {tag, ^socket} = message when tag in [:tcp_closed, :ssl_closed] -> message
     after
-      @websocket_frame_timeout -> flunk("timed out waiting for websocket upgrade")
+      timeout_ms -> flunk(timeout_message)
     end
   end
 
@@ -978,58 +1321,80 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
         conn,
         websocket,
         ref,
-        timeout_ms \\ @websocket_frame_timeout
+        timeout_ms \\ @detection_timeout_ms
       ) do
-    receive do
-      message ->
-        case Mint.WebSocket.stream(conn, message) do
-          {:ok, conn, responses} ->
-            case decode_public_websocket_close(websocket, ref, responses) do
-              {:ok, websocket, code, reason} ->
-                {conn, websocket, code, reason}
+    message = receive_mint_socket_message!(conn, timeout_ms, "timed out waiting for websocket close")
 
-              {:cont, websocket} ->
-                public_websocket_receive_close!(conn, websocket, ref, timeout_ms)
-            end
+    case Mint.WebSocket.stream(conn, message) do
+      {:ok, conn, responses} ->
+        case decode_public_websocket_close(websocket, ref, responses) do
+          {:ok, websocket, code, reason} ->
+            {conn, websocket, code, reason}
 
-          {:error, conn, reason, _responses} ->
-            Mint.HTTP.close(conn)
-            flunk("websocket close receive failed: #{inspect(reason)}")
-
-          :unknown ->
+          {:cont, websocket} ->
             public_websocket_receive_close!(conn, websocket, ref, timeout_ms)
         end
-    after
-      timeout_ms -> flunk("timed out waiting for websocket close")
+
+      {:error, conn, reason, _responses} ->
+        Mint.HTTP.close(conn)
+        flunk("websocket close receive failed: #{inspect(reason)}")
+
+      :unknown ->
+        public_websocket_receive_close!(conn, websocket, ref, timeout_ms)
     end
   end
 
   def public_websocket_receive_text!(conn, websocket, ref) do
-    receive do
-      message ->
-        case Mint.WebSocket.stream(conn, message) do
-          {:ok, conn, responses} ->
-            case decode_public_websocket_text(websocket, ref, responses) do
-              {:ok, websocket, text} -> {conn, websocket, text}
-              {:cont, websocket} -> public_websocket_receive_text!(conn, websocket, ref)
-            end
+    case dequeue_public_websocket_text(ref) do
+      {:ok, text} when is_binary(text) ->
+        continue_public_websocket_receive(conn, websocket, ref, text)
 
-          {:error, conn, reason, _responses} ->
-            Mint.HTTP.close(conn)
-            flunk("websocket receive failed: #{inspect(reason)}")
+      :empty ->
+        receive_public_websocket_text!(conn, websocket, ref)
+    end
+  end
 
-          :unknown ->
+  defp continue_public_websocket_receive(conn, websocket, ref, text) do
+    if internal_control_frame?(text) do
+      public_websocket_receive_text!(conn, websocket, ref)
+    else
+      {conn, websocket, text}
+    end
+  end
+
+  defp receive_public_websocket_text!(conn, websocket, ref) do
+    message = receive_mint_socket_message!(conn, @detection_timeout_ms, "timed out waiting for websocket frame")
+
+    case Mint.WebSocket.stream(conn, message) do
+      {:ok, conn, responses} ->
+        case decode_public_websocket_text(websocket, ref, responses) do
+          {:ok, websocket, text} ->
+            continue_public_websocket_receive(conn, websocket, ref, text)
+
+          {:cont, websocket} ->
             public_websocket_receive_text!(conn, websocket, ref)
         end
-    after
-      @websocket_frame_timeout -> flunk("timed out waiting for websocket frame")
+
+      {:error, conn, reason, _responses} ->
+        Mint.HTTP.close(conn)
+        flunk("websocket receive failed: #{inspect(reason)}")
+
+      :unknown ->
+        public_websocket_receive_text!(conn, websocket, ref)
     end
   end
 
   def decode_public_websocket_text(websocket, ref, responses) do
     Enum.reduce_while(responses, {:cont, websocket}, fn
       {:data, ^ref, data}, {:cont, websocket} ->
-        decode_public_websocket_data!(websocket, data)
+        case decode_public_websocket_data!(websocket, data) do
+          {:ok, websocket, [text | queued_texts]} ->
+            enqueue_public_websocket_texts(ref, queued_texts)
+            {:halt, {:ok, websocket, text}}
+
+          {:cont, websocket} ->
+            {:cont, {:cont, websocket}}
+        end
 
       {:done, ^ref}, _acc ->
         flunk("websocket closed before a response frame")
@@ -1042,10 +1407,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   def decode_public_websocket_data!(websocket, data) do
     case Mint.WebSocket.decode(websocket, data) do
       {:ok, websocket, frames} ->
-        case decoded_public_websocket_text(websocket, frames) do
-          {:ok, websocket, text} -> {:halt, {:ok, websocket, text}}
-          {:cont, websocket} -> {:cont, {:cont, websocket}}
-        end
+        decoded_public_websocket_text(websocket, frames)
 
       {:error, _websocket, reason} ->
         flunk("websocket decode failed: #{inspect(reason)}")
@@ -1053,12 +1415,42 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   end
 
   def decoded_public_websocket_text(websocket, frames) do
-    Enum.reduce_while(frames, {:cont, websocket}, fn
-      {:text, text}, _acc -> {:halt, {:ok, websocket, text}}
-      {:close, code, reason}, _acc -> flunk("websocket closed: #{inspect({code, reason})}")
-      _frame, acc -> {:cont, acc}
-    end)
+    texts =
+      Enum.reduce(frames, [], fn
+        {:text, text}, texts -> [text | texts]
+        {:close, code, reason}, _texts -> flunk("websocket closed: #{inspect({code, reason})}")
+        _frame, texts -> texts
+      end)
+
+    case Enum.reverse(texts) do
+      [] -> {:cont, websocket}
+      texts -> {:ok, websocket, texts}
+    end
   end
+
+  defp dequeue_public_websocket_text(ref) do
+    case Process.get(public_websocket_text_queue_key(ref), []) do
+      [] ->
+        :empty
+
+      [text] ->
+        Process.delete(public_websocket_text_queue_key(ref))
+        {:ok, text}
+
+      [text | queued_texts] ->
+        Process.put(public_websocket_text_queue_key(ref), queued_texts)
+        {:ok, text}
+    end
+  end
+
+  defp enqueue_public_websocket_texts(_ref, []), do: :ok
+
+  defp enqueue_public_websocket_texts(ref, texts) do
+    key = public_websocket_text_queue_key(ref)
+    Process.put(key, Process.get(key, []) ++ texts)
+  end
+
+  defp public_websocket_text_queue_key(ref), do: {__MODULE__, :public_websocket_text_queue, ref}
 
   def decode_public_websocket_close(websocket, ref, responses) do
     Enum.reduce_while(responses, {:cont, websocket}, fn
@@ -1153,7 +1545,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
 
       receive do
         {:websocket_frame, frame} ->
-          decoded_frame = Jason.decode!(frame)
+          decoded_frame = CodexPooler.JSON.decode!(frame)
           decoded_type = decoded_frame["type"]
           collected_types = [decoded_type | collected_types]
 
@@ -1185,19 +1577,126 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
 
   def receive_socket_push(state) do
     receive do
-      {:codex_response_chunk, frame} ->
-        CodexResponsesSocket.handle_info({:codex_response_chunk, frame}, state)
+      {:codex_response_chunk, task_pid, frame} ->
+        result = CodexResponsesSocket.handle_info({:codex_response_chunk, task_pid, frame}, state)
+
+        if internal_control_frame?(frame) do
+          receive_socket_push(state)
+        else
+          result
+        end
     after
-      1_000 -> flunk("expected websocket response chunk")
+      @detection_timeout_ms -> flunk("expected websocket response chunk")
     end
   end
 
-  def receive_socket_done(state, timeout_ms \\ 1_000) do
+  defp internal_control_frame?(frame) when is_binary(frame) do
+    StreamProtocol.internal_control_event?(frame)
+  end
+
+  # Takes only the task's result. The activity token the task reported ahead of
+  # it stays unprocessed, so the socket settles the task as untracked and the
+  # task stays parked on its delivery acknowledgement until the socket process
+  # exits. Use receive_socket_turn_done/2 to model the WebSock loop.
+  def receive_socket_done(state, timeout_ms \\ @detection_timeout_ms) do
     receive do
       {:codex_response_done, pid, result} ->
         CodexResponsesSocket.handle_info({:codex_response_done, pid, result}, state)
     after
       timeout_ms -> flunk("expected websocket response completion")
+    end
+  end
+
+  # Drives a turn's completion the way the WebSock loop does: the activity
+  # token the task reports ahead of its result is taken in mailbox order, and
+  # the delivery completion the socket schedules for itself while handling the
+  # result is processed, so the task receives its delivery acknowledgement and
+  # exits. The turn must have pushed its terminal first, as on a real socket.
+  def receive_socket_turn_done(state, timeout_ms \\ @detection_timeout_ms) do
+    receive do
+      {:websocket_response_activity, pid, token} ->
+        {:ok, state} =
+          CodexResponsesSocket.handle_info({:websocket_response_activity, pid, token}, state)
+
+        receive_socket_turn_done(state, timeout_ms)
+
+      {:codex_response_done, pid, result} ->
+        {:codex_response_done, pid, result}
+        |> CodexResponsesSocket.handle_info(state)
+        |> complete_scheduled_socket_delivery(pid)
+    after
+      timeout_ms -> flunk("expected websocket response completion")
+    end
+  end
+
+  defp complete_scheduled_socket_delivery({:ok, state}, pid),
+    do: {:ok, process_scheduled_socket_delivery(state, pid)}
+
+  defp complete_scheduled_socket_delivery({:push, frame, state}, pid),
+    do: {:push, frame, process_scheduled_socket_delivery(state, pid)}
+
+  defp complete_scheduled_socket_delivery(result, _pid), do: result
+
+  # The socket schedules delivery completion with a message to itself, so it
+  # is already in the mailbox when the result callback returns.
+  defp process_scheduled_socket_delivery(state, pid) do
+    receive do
+      {:websocket_response_delivery_complete, ^pid, token} ->
+        message = {:websocket_response_delivery_complete, pid, token}
+
+        case CodexResponsesSocket.handle_info(message, state) do
+          {:ok, state} -> state
+          other -> flunk("delivery completion did not keep the socket open: #{elem(other, 0)}")
+        end
+    after
+      0 -> state
+    end
+  end
+
+  # Failure-detection budget for response tasks a finished socket must release;
+  # never a scenario timer.
+  @response_task_release_detection_ms 15_000
+
+  @doc """
+  Asserts that no response task registered with `socket` as its parent is
+  still parked on a delivery acknowledgement: each exits within the detection
+  budget and leaves no activity registry entry. A task still parked when the
+  budget runs out is killed so it cannot leak into later tests.
+  """
+  def assert_socket_response_tasks_released!(socket \\ self()) do
+    registered = socket_response_activities(socket)
+    monitors = Map.new(registered, &{Process.monitor(&1.pid), &1.pid})
+    deadline = System.monotonic_time(:millisecond) + @response_task_release_detection_ms
+    parked = await_response_tasks_down(monitors, deadline)
+
+    if map_size(parked) > 0 do
+      Enum.each(parked, fn {ref, pid} ->
+        Process.demonitor(ref, [:flush])
+        Process.exit(pid, :kill)
+      end)
+
+      flunk(
+        "#{map_size(parked)} of #{length(registered)} response tasks still parked " <>
+          "on a delivery acknowledgement after the socket finished"
+      )
+    end
+
+    assert socket_response_activities(socket) == []
+    :ok
+  end
+
+  defp socket_response_activities(socket),
+    do: Enum.filter(ActivityRegistry.activities(), &(Map.get(&1, :direct_parent) == socket))
+
+  defp await_response_tasks_down(monitors, _deadline) when map_size(monitors) == 0,
+    do: monitors
+
+  defp await_response_tasks_down(monitors, deadline) do
+    receive do
+      {:DOWN, ref, :process, _pid, _reason} when is_map_key(monitors, ref) ->
+        await_response_tasks_down(Map.delete(monitors, ref), deadline)
+    after
+      max(deadline - System.monotonic_time(:millisecond), 0) -> monitors
     end
   end
 
@@ -1212,7 +1711,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
       build_conn()
       |> auth(setup)
       |> put_req_header("content-type", "application/json")
-      |> post(~p"/backend-api/files", %{
+      |> Phoenix.ConnTest.dispatch(CodexPoolerWeb.Endpoint, :post, ~p"/backend-api/files", %{
         "file_name" => file_name,
         "file_size" => file_size,
         "use_case" => "codex"
@@ -1228,7 +1727,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     conn =
       build_conn()
       |> auth(setup)
-      |> post(~p"/backend-api/files/#{file_id}/uploaded", %{})
+      |> Phoenix.ConnTest.dispatch(
+        CodexPoolerWeb.Endpoint,
+        :post,
+        ~p"/backend-api/files/#{file_id}/uploaded",
+        %{}
+      )
 
     assert %{"status" => "success"} = json_response(conn, 200)
     file_id

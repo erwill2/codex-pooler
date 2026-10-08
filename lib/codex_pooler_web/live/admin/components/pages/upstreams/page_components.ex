@@ -6,18 +6,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: ResetFormatting
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection
   alias CodexPoolerWeb.Admin.UpstreamFilterForm
+  alias CodexPoolerWeb.Admin.UpstreamOAuthDialogComponents
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AssignPoolDialog
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ProviderCreditsComponents
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents
+  alias CodexPoolerWeb.RelativeTime
   alias Phoenix.HTML.Form
 
-  @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
-  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
-  @saved_reset_docs_url "https://docs.codex-pooler.com/operators/upstreams/#saved-resets"
+  @oauth_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#openai-oauth-upstream-linking"
+  @upstream_actions_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#card-action-menu"
+  @saved_reset_docs_url "https://www.codex-pooler.com/docs/operators/upstreams/#saved-resets"
 
   attr :pools, :list, required: true
+  attr :can_manage_pools?, :boolean, required: true
   attr :pool_options, :list, required: true
   attr :dialog_pool_options, :list, required: true
   attr :filter_form, :any, required: true
@@ -43,6 +48,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :assign_pool_form, :any, required: true
   attr :editing_saved_reset_policy, :map, default: nil
   attr :saved_reset_policy_form, :any, required: true
+  attr :editing_provider_credits_policy, :map, default: nil
+  attr :provider_credits_policy_form, :any, default: nil
   attr :confirming_saved_reset_redemption, :map, default: nil
   attr :account_panel_views, :map, required: true
   attr :upstream_accounts, :list, required: true
@@ -51,11 +58,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   def upstreams_page(assigns) do
     ~H"""
-    <section id="admin-upstreams-live" class="grid min-w-0 gap-6">
+    <section id="admin-upstreams-live" phx-hook="SavedResetConnection" class="grid min-w-0 gap-6">
+      <AdminComponents.saved_reset_connection_notice id="saved-reset-connection-list" in_flight={Enum.any?(@upstream_accounts, &saved_reset_open?/1)} />
       <AdminComponents.page_header
         id="upstream-account-page-header"
         title="Upstreams"
-        description="Link upstream accounts, monitor routing capacity, and manage credential, quota, and saved-reset recovery."
+        description="The accounts your Pools serve from: token health, quota windows, and the saved-reset bank."
       >
         <:actions>
           <AdminComponents.action_button
@@ -67,7 +75,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             size={:md}
             variant={:primary}
           />
-          <.upstream_page_actions :if={@pools != []} />
+          <.upstream_page_actions :if={@pools != []} filter_values={@filter_values} />
         </:actions>
       </AdminComponents.page_header>
 
@@ -89,6 +97,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         oauth_link_result={@oauth_link_result}
         oauth_link_error={@oauth_link_error}
         pool_options={@dialog_pool_options}
+        datetime_preferences={@datetime_preferences}
       />
 
       <.rename_account_dialog account={@renaming_account} form={@rename_account_form} />
@@ -104,6 +113,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
         datetime_preferences={@datetime_preferences}
       />
+      <.provider_credits_policy_dialog account={@editing_provider_credits_policy} form={@provider_credits_policy_form} />
 
       <section id="upstream-account-surface" class="grid min-w-0 gap-4">
         <.upstream_filter_form
@@ -139,6 +149,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           accounts={@upstream_accounts}
           account_panel_views={@account_panel_views}
           datetime_preferences={@datetime_preferences}
+          can_manage_pools?={@can_manage_pools?}
+          filter_values={@filter_values}
         />
       </section>
     </section>
@@ -158,6 +170,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
       phx-change="filter"
       phx-submit="filter"
       autocomplete="off"
+      fields_class="upstream-filter-fields"
     >
       <.upstream_query_filter_input field={@form[:query]} />
       <PoolFilterComponents.pool_filter_dropdown
@@ -181,7 +194,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
     assigns = assign(assigns, :value, assigns.field.value || "")
 
     ~H"""
-    <div id="upstream-query-filter" class="grid gap-2">
+    <div id="upstream-query-filter" class="upstream-filter-query grid gap-2">
       <label for={@field.id} class="sr-only">Search</label>
       <div class="input input-bordered flex min-h-10 w-full items-center gap-2">
         <input
@@ -222,7 +235,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         <summary
           data-role="status-filter-trigger"
           aria-label="Status"
-          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+          class="select flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.status_filter_icon option={@selected} />
           <span class="truncate">{@selected.label}</span>
@@ -267,7 +280,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   defp status_filter_icon_class(:primary), do: "shrink-0 text-primary"
   defp status_filter_icon_class(_tone), do: "shrink-0 text-base-content/60"
 
+  attr :filter_values, :map, required: true
+
   defp upstream_page_actions(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :invite_path,
+        upstreams_dialog_path(assigns.filter_values, %{"create_invite" => "1"})
+      )
+
     ~H"""
     <div
       id="upstream-page-actions"
@@ -285,7 +307,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
       </button>
       <.link
         id="upstream-page-create-invite-action"
-        navigate={~p"/admin/invites?create=1"}
+        patch={@invite_path}
         aria-label="Invite account"
         class="btn btn-secondary min-w-0 justify-center gap-2 px-4"
       >
@@ -315,36 +337,60 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :oauth_link_result, :map, default: nil
   attr :oauth_link_error, :map, default: nil
   attr :pool_options, :list, required: true
+  attr :datetime_preferences, :map, default: %{}
 
-  defp oauth_link_dialog(assigns) do
+  def oauth_link_dialog(assigns) do
     assigns =
       assigns
       |> assign(:oauth_docs_url, @oauth_docs_url)
-      |> assign(:oauth_dialog_title, oauth_dialog_title(assigns.oauth_link_mode))
+      |> assign(
+        :oauth_dialog_title,
+        oauth_dialog_title(
+          assigns.oauth_link_mode,
+          assigns.oauth_link_target_account,
+          assigns.oauth_link_form,
+          assigns.pool_options,
+          assigns.oauth_link_flow
+        )
+      )
       |> assign(
         :oauth_dialog_description,
-        oauth_dialog_description(assigns.oauth_link_mode, assigns.oauth_link_target_account)
+        oauth_dialog_description(
+          assigns.oauth_link_mode,
+          assigns.oauth_link_target_account,
+          assigns.oauth_link_flow
+        )
       )
       |> assign(
         :oauth_callback_submit_label,
         oauth_callback_submit_label(assigns.oauth_link_mode)
       )
+      |> assign(:oauth_cockpit_path, oauth_cockpit_path(assigns.oauth_link_flow))
 
     ~H"""
-    <dialog :if={@oauth_linking} id="oauth-link-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-primary">
+    <dialog
+      :if={@oauth_linking}
+      id="oauth-link-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-xs font-semibold uppercase tracking-wide text-primary">
             OpenAI OAuth
           </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">{@oauth_dialog_title}</h2>
-          <p class="mt-2 text-sm leading-6 text-base-content/70">
+          <h2 class="mt-1 text-xl font-bold text-base-content sm:text-2xl">{@oauth_dialog_title}</h2>
+          <p class="mt-1.5 max-w-xl text-sm leading-5 text-base-content/65">
             {@oauth_dialog_description}
           </p>
         </div>
 
-        <div class="grid gap-5 p-6">
-          <div :if={@oauth_link_result} id="oauth-link-status" class="alert alert-success">
+        <div class="grid gap-5 p-5 sm:p-6">
+          <div
+            :if={@oauth_link_result && !oauth_pending_flow?(@oauth_link_flow)}
+            id="oauth-link-status"
+            class="alert alert-success"
+          >
             <.icon name="hero-check-circle" class="size-5" />
             <span>{@oauth_link_result.message}</span>
           </div>
@@ -362,17 +408,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             autocomplete="off"
             class="grid gap-4"
           >
-            <div
-              :if={oauth_relink_mode?(@oauth_link_mode)}
-              id="oauth-link-relink-target"
-              class="rounded-lg border border-base-300 bg-base-200/40 p-4 text-sm text-base-content"
-            >
-              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-                Account
-              </p>
-              <p class="mt-1 font-medium">{oauth_target_label(@oauth_link_target_account)}</p>
-            </div>
-
             <div :if={!oauth_relink_mode?(@oauth_link_mode)} class="grid gap-2">
               <label
                 for="oauth_link_pool_id"
@@ -383,7 +418,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               <select
                 id="oauth_link_pool_id"
                 name={@oauth_link_form[:pool_id].name}
-                class="select select-bordered w-full"
+                class="select w-full"
               >
                 <option value="" selected={oauth_pool_selected?(@oauth_link_form, "")}>
                   Select Pool
@@ -398,104 +433,59 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               </select>
             </div>
 
-            <div class="flex flex-wrap gap-2">
-              <AdminComponents.action_button
-                id="oauth-link-browser-start"
-                icon="hero-arrow-top-right-on-square"
-                label="Browser"
-                phx-click="start_oauth_browser"
-                variant={:primary}
-              />
-              <AdminComponents.action_button
-                id="oauth-link-device-start"
-                icon="hero-device-phone-mobile"
-                label="Device code"
-                phx-click="start_oauth_device"
-              />
-            </div>
+            <UpstreamOAuthDialogComponents.method_doors
+              id_prefix="oauth-link"
+              browser_event="start_oauth_browser"
+              device_event="start_oauth_device"
+            />
           </.form>
 
-          <section
-            :if={oauth_browser_flow?(@oauth_link_flow, @oauth_link_authorization_url)}
-            class="grid gap-4 rounded-lg border border-base-300 bg-base-200/40 p-4"
-          >
-            <a
-              id="oauth-link-authorization-url"
-              href={@oauth_link_authorization_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="btn btn-primary w-full justify-start gap-2 text-left"
-            >
-              <.icon name="hero-arrow-top-right-on-square" class="size-4 shrink-0" />
-              <span class="truncate">Open OpenAI authorization</span>
-            </a>
-
-            <.form
-              id="oauth-link-callback-form"
-              for={@oauth_link_form}
-              phx-submit="submit_oauth_callback"
-              autocomplete="off"
-              class="grid gap-3"
-            >
-              <div class="grid gap-2">
-                <label
-                  for="oauth-link-callback-url"
-                  class="text-xs font-semibold uppercase tracking-wide text-base-content/60"
-                >
-                  Callback URL
-                </label>
-                <input
-                  id="oauth-link-callback-url"
-                  name={@oauth_link_form[:callback_url].name}
-                  value=""
-                  type="url"
-                  autocomplete="off"
-                  class="input input-bordered w-full"
-                />
-              </div>
-
-              <AdminComponents.action_button
-                id="oauth-link-submit-callback"
-                icon="hero-check"
-                label={@oauth_callback_submit_label}
-                type="submit"
-                variant={:primary}
-              />
-            </.form>
+          <section :if={oauth_browser_flow?(@oauth_link_flow, @oauth_link_authorization_url)}>
+            <UpstreamOAuthDialogComponents.browser_authorization_step
+              id_prefix="oauth-link"
+              authorization_url={@oauth_link_authorization_url}
+              form={@oauth_link_form}
+              submit_event="submit_oauth_callback"
+              submit_label={@oauth_callback_submit_label}
+            />
           </section>
 
-          <section
+          <UpstreamOAuthDialogComponents.device_authorization_step
             :if={oauth_device_flow?(@oauth_link_flow)}
-            id="oauth-link-device-code"
-            class="grid gap-3 rounded-lg border border-base-300 bg-base-200/40 p-4"
-          >
-            <div class="grid gap-1">
-              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-                Device code
-              </p>
-              <p class="font-mono text-2xl font-bold tracking-widest text-base-content">
-                {@oauth_link_flow.device_user_code}
-              </p>
-            </div>
-            <a
-              :if={@oauth_link_flow.verification_uri}
-              href={@oauth_link_flow.verification_uri}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="link link-primary break-all text-sm"
-            >
-              {@oauth_link_flow.verification_uri}
-            </a>
-          </section>
+            id_prefix="oauth-link"
+            user_code={@oauth_link_flow.device_user_code}
+            verification_uri={@oauth_link_flow.verification_uri}
+            interval_seconds={Map.get(@oauth_link_flow, :interval_seconds)}
+            expires_at={Map.get(@oauth_link_flow, :expires_at)}
+            datetime_preferences={@datetime_preferences}
+            status={oauth_pending_status(@oauth_link_result, @oauth_link_flow)}
+          />
         </div>
 
         <AdminComponents.dialog_footer id="oauth-link-dialog-footer" docs_url={@oauth_docs_url}>
           <:actions>
             <AdminComponents.action_button
               id="oauth-link-cancel"
-              icon="hero-x-mark"
               label={oauth_dialog_dismiss_label(@oauth_link_flow)}
               phx-click="cancel_oauth_link"
+              variant={:ghost}
+            />
+            <AdminComponents.action_button
+              :if={oauth_browser_flow?(@oauth_link_flow, @oauth_link_authorization_url)}
+              id={UpstreamOAuthDialogComponents.callback_submit_id("oauth-link")}
+              icon="hero-check"
+              label={@oauth_callback_submit_label}
+              type="submit"
+              form={UpstreamOAuthDialogComponents.callback_form_id("oauth-link")}
+              variant={:primary}
+            />
+            <AdminComponents.action_button
+              :if={@oauth_cockpit_path}
+              id="oauth-link-open-cockpit"
+              icon="hero-cloud-arrow-up"
+              label="Open cockpit"
+              navigate={@oauth_cockpit_path}
+              variant={:primary}
             />
           </:actions>
         </AdminComponents.dialog_footer>
@@ -510,13 +500,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :account, :map, default: nil
   attr :form, :any, default: nil
 
-  defp rename_account_dialog(assigns) do
+  def rename_account_dialog(assigns) do
     assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
 
     ~H"""
-    <dialog :if={@account && @form} id="rename-upstream-account-dialog" class="modal" open>
-      <div class="modal-box max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+    <dialog
+      :if={@account && @form}
+      id="rename-upstream-account-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
             Upstream account
           </p>
@@ -532,7 +527,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           phx-change="validate_rename_account"
           phx-submit="rename_account"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input
             field={@form[:account_label]}
@@ -575,19 +570,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :account, :map, default: nil
   attr :form, :any, required: true
 
-  defp delete_account_dialog(assigns) do
+  def delete_account_dialog(assigns) do
     assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
 
     ~H"""
-    <dialog :if={@account} id="delete-upstream-account-dialog" class="modal" open>
-      <div class="modal-box max-w-xl border border-error/30 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-error/20 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-error">
-            Delete upstream account
-          </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Confirm upstream account deletion</h2>
+    <dialog
+      :if={@account}
+      id="delete-upstream-account-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">Upstream account</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete {@account.label}?</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Type the account label exactly to remove this upstream account from operator routing surfaces.
+            This permanently removes the account, credentials, quotas, Pool assignments, and account-specific statistics from the database.
+            Shared request accounting remains without an account association. This cannot be undone.
           </p>
         </div>
         <.form
@@ -595,19 +594,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           for={@form}
           phx-submit="confirm_delete_account"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@form[:id]} type="hidden" />
-          <p class="rounded-box border border-base-300 bg-base-200/60 p-3 text-sm text-base-content/70">
-            Confirmation label: <span class="font-semibold text-base-content">{@account.label}</span>
-          </p>
           <.input
             field={@form[:confirmation_label]}
             type="text"
-            label="Account label confirmation"
+            pattern={Regex.escape(@account.label)}
             placeholder={@account.label}
             required
-          />
+          >
+            <:label_content>
+              Type <span class="font-semibold text-base-content">{@account.label}</span> to confirm
+            </:label_content>
+          </.input>
         </.form>
 
         <AdminComponents.dialog_footer
@@ -641,20 +641,62 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   attr :account, :map, default: nil
   attr :form, :any, default: nil
+
+  def provider_credits_policy_dialog(assigns) do
+    ~H"""
+    <dialog :if={@account && @form} id="provider-credits-policy-dialog" class="modal modal-bottom overflow-x-hidden sm:modal-middle" aria-labelledby="provider-credits-policy-dialog-title" aria-modal="true" phx-window-keydown="cancel_provider_credits_policy" phx-key="escape" phx-remove={JS.pop_focus()} open>
+      <.focus_wrap id="provider-credits-policy-dialog-panel" class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl" phx-mounted={JS.focus(to: "#provider-credits-enabled")}>
+        <div class="border-b border-base-300 px-5 py-4">
+          <p class="text-xs font-semibold uppercase tracking-wide text-primary">Upstream account</p>
+          <h2 id="provider-credits-policy-dialog-title" class="mt-1 text-xl font-bold text-base-content">Provider credits</h2>
+          <p class="mt-1 text-xs leading-5 text-base-content/60">Balance and admission policy for every Pool using this upstream.</p>
+        </div>
+        <div class="grid gap-4 p-5">
+          <ProviderCreditsComponents.provider_credits_policy_form form={@form} />
+          <details :if={Map.has_key?(@account, :provider_credits_summary)} id="provider-credits-observation-details" class="group border-t border-base-300 pt-4" data-preserve-open>
+            <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-semibold text-base-content transition-colors hover:bg-base-200/50 [&::-webkit-details-marker]:hidden">
+              Balance and availability <.icon name="hero-chevron-right" class="size-4 text-base-content/50 transition-transform group-open:rotate-90" />
+            </summary>
+            <div class="pt-4">
+              <ProviderCreditsComponents.provider_credits_details summary={@account.provider_credits_summary} />
+            </div>
+          </details>
+        </div>
+        <AdminComponents.dialog_footer id="provider-credits-policy-dialog-footer">
+          <:actions>
+            <AdminComponents.action_button id="provider-credits-policy-cancel" label="Cancel" variant={:ghost} phx-click="cancel_provider_credits_policy" />
+            <AdminComponents.action_button id="provider-credits-save" label="Save policy" icon="hero-check" type="submit" form="provider-credits-policy-form" variant={:primary} phx-disable-with="Saving…" />
+          </:actions>
+        </AdminComponents.dialog_footer>
+      </.focus_wrap>
+      <form method="dialog" class="modal-backdrop">
+        <button id="provider-credits-policy-backdrop" type="button" phx-click="cancel_provider_credits_policy">close</button>
+      </form>
+    </dialog>
+    """
+  end
+
+  attr :account, :map, default: nil
+  attr :form, :any, default: nil
   attr :confirming_saved_reset_redemption, :map, default: nil
   attr :datetime_preferences, :map, required: true
 
-  defp saved_reset_policy_dialog(assigns) do
+  def saved_reset_policy_dialog(assigns) do
     assigns =
       assigns
       |> assign(:saved_reset_docs_url, @saved_reset_docs_url)
       |> assign_saved_reset_summary()
 
     ~H"""
-    <dialog :if={@account && @form} id="saved-reset-policy-dialog" class="modal" open>
+    <dialog
+      :if={@account && @form}
+      id="saved-reset-policy-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
       <div
         id="saved-reset-policy-dialog-panel"
-        class="modal-box max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl"
+        class="modal-box sm:max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl"
       >
         <div class="border-b border-base-300 px-5 py-4">
           <p class="text-xs font-semibold uppercase tracking-wide text-primary">
@@ -666,8 +708,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           </p>
         </div>
 
+        <AdminComponents.saved_reset_connection_notice id="saved-reset-connection-bank" class="border-b border-base-300 px-5 py-3" in_flight={saved_reset_open?(@account)} />
         <.form
           id="saved-reset-policy-form"
+          data-saved-reset-form
+          data-saved-reset-identity={@account.identity.id}
           for={@form}
           phx-change="validate_saved_reset_policy"
           phx-submit="save_saved_reset_policy"
@@ -740,6 +785,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                   }
                   id="saved-reset-redemption-action"
                   data-role="saved-reset-redemption-action"
+                  data-saved-reset-action="open-redemption"
+                  data-server-disabled={to_string(!@account.saved_reset_redemption_action.available?)}
                   type="button"
                   class="btn btn-secondary btn-sm gap-2"
                   phx-click="open_saved_reset_redemption_confirmation"
@@ -752,7 +799,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 </button>
               </span>
             </div>
-            <div
+            <AdminComponents.saved_reset_confirmation
               :if={
                 confirming_saved_reset_redemption?(
                   @confirming_saved_reset_redemption,
@@ -760,43 +807,35 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 )
               }
               id="saved-reset-redemption-confirmation"
-              data-role="saved-reset-redemption-confirmation"
-              class="flex flex-wrap items-center justify-between gap-2 rounded-box border border-warning/30 bg-warning/10 px-3 py-2"
-            >
-              <p class="text-xs leading-5 text-base-content/75">
-                Queue one account-level recovery attempt? Account state is checked again before a job runs.
-              </p>
-              <span class="flex items-center gap-2">
-                <button
-                  id="saved-reset-redemption-confirm"
-                  type="button"
-                  class="btn btn-primary btn-sm gap-2"
-                  phx-click="redeem_saved_reset"
-                  phx-value-id={@account.identity.id}
-                >
-                  <.icon name="hero-check" class="size-4" />
-                  <span>Queue redemption</span>
-                </button>
-                <button
-                  id="saved-reset-redemption-cancel"
-                  type="button"
-                  class="btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"
-                  phx-click="cancel_saved_reset_redemption"
-                >
-                  <span>Keep resets in bank</span>
-                </button>
-              </span>
-            </div>
+              identity_id={@account.identity.id}
+              surface={:bank}
+              confirm_id="saved-reset-redemption-confirm"
+              cancel_id="saved-reset-redemption-cancel"
+              disabled={!@account.saved_reset_redemption_action.available?}
+            />
+            <AdminComponents.saved_reset_operation
+              identity_id={@account.identity.id}
+              surface={:bank}
+              operation={@account.saved_reset_operation}
+              refreshing={Map.get(@account, :saved_reset_status_refreshing?, false)}
+            />
+            <%!-- A status hold is already explained by the receipt above; the
+            line names the account or bank reason the receipt cannot. --%>
             <p
               :if={
                 !@account.saved_reset_redemption_action.available? &&
-                  @account.saved_reset_redemption_action.reason
+                  @account.saved_reset_redemption_action.reason &&
+                  is_nil(SavedResetProjection.status_hold(@account.saved_reset_operation))
               }
               id="saved-reset-redemption-unavailable-reason"
               class="text-xs leading-5 text-base-content/55"
             >
               {@account.saved_reset_redemption_action.reason}
             </p>
+            <SavedResetComponents.saved_reset_last_auto_redemption_cause
+              id="saved-reset-last-auto-redemption-cause"
+              cause={@account.saved_resets.last_auto_redemption_cause}
+            />
           </div>
 
           <details
@@ -804,6 +843,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             id="saved-reset-expirations-disclosure"
             class="group border-t border-base-300/60"
             data-preserve-open
+            open
           >
             <summary class="flex cursor-pointer items-center justify-between gap-3 px-5 py-3 text-sm font-semibold text-base-content transition-colors hover:bg-base-200/50 [&::-webkit-details-marker]:hidden">
               <span>All expirations</span>
@@ -819,6 +859,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               <SavedResetComponents.saved_reset_expiration_table
                 id="saved-reset-expiration"
                 saved_resets={@account.saved_resets}
+                calendar_path={~p"/admin/upstreams/#{@account.identity.id}/saved-reset-expirations.ics"}
                 datetime_preferences={@datetime_preferences}
                 empty_label="No expiration dates reported for the available saved resets yet."
               />
@@ -853,12 +894,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <:actions>
             <AdminComponents.action_button
               id="saved-reset-policy-cancel"
-              label="Cancel"
+              label="Close"
               variant={:ghost}
               phx-click="cancel_saved_reset_policy"
             />
             <AdminComponents.action_button
               id="saved-reset-policy-submit"
+              data-saved-reset-action="save-policy"
+              data-server-disabled="false"
               icon="hero-check"
               label="Save policy"
               type="submit"
@@ -887,9 +930,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   end
 
   defp next_expires_in(%{next_expires_at: value}) do
+    now = DateTime.utc_now()
+
     with %DateTime{} = expires_at <- ResetFormatting.parse_datetime(value),
-         seconds when seconds > 0 <- DateTime.diff(expires_at, DateTime.utc_now(), :second) do
-      ResetFormatting.format_reset_duration(seconds)
+         :gt <- DateTime.compare(expires_at, now) do
+      expires_at
+      |> RelativeTime.seconds_until(now)
+      |> ResetFormatting.format_reset_duration()
     else
       _missing_or_expired -> nil
     end
@@ -899,6 +946,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   defp confirming_saved_reset_redemption?(%{identity_id: identity_id}, identity_id), do: true
   defp confirming_saved_reset_redemption?(_confirmation, _identity_id), do: false
+
+  defp saved_reset_open?(account), do: match?(%{saved_reset_operation: %{open?: true}}, account)
 
   defp saved_reset_redemption_title(%{available?: true}), do: "Queue manual redemption"
 
@@ -910,13 +959,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :accounts, :list, required: true
   attr :account_panel_views, :map, required: true
   attr :datetime_preferences, :map, required: true
+  attr :can_manage_pools?, :boolean, required: true
+  attr :filter_values, :map, required: true
 
   defp upstream_account_grid(assigns) do
     ~H"""
     <div
       :if={@accounts != []}
       id="upstream-account-grid"
-      class="grid min-w-0 items-start gap-3 lg:grid-cols-2 2xl:grid-cols-3 [@media(width>=112rem)]:grid-cols-4"
+      class="grid min-w-0 items-start gap-3 min-[700px]:grid-cols-2 2xl:grid-cols-3 [@media(width>=112rem)]:grid-cols-4"
     >
       <AccountCard.account_card
         :for={{account, account_index} <- Enum.with_index(@accounts)}
@@ -924,6 +975,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         account_index={account_index}
         panel_view={account_panel_view(@account_panel_views, account)}
         datetime_preferences={@datetime_preferences}
+        can_manage_pools?={@can_manage_pools?}
+        pool_editor_query_params={UpstreamFilterForm.query_params(@filter_values)}
       />
     </div>
     """
@@ -935,6 +988,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   end
 
   defp account_panel_view(_panel_views, _account), do: :usage
+
+  defp upstreams_dialog_path(filter_values, extra_params) do
+    params =
+      filter_values
+      |> UpstreamFilterForm.query_params()
+      |> Map.merge(extra_params)
+
+    ~p"/admin/upstreams?#{params}"
+  end
 
   defp oauth_start_form_visible?(nil), do: true
   defp oauth_start_form_visible?(%{status: "pending"}), do: false
@@ -954,24 +1016,99 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   defp oauth_device_flow?(%{flow_kind: "device", status: "pending"}), do: true
   defp oauth_device_flow?(_flow), do: false
 
+  defp oauth_pending_flow?(%{status: "pending"}), do: true
+  defp oauth_pending_flow?(_flow), do: false
+
   defp oauth_dialog_dismiss_label(%{status: "completed"}), do: "Close"
   defp oauth_dialog_dismiss_label(_flow), do: "Cancel"
 
-  defp oauth_dialog_title(:relink), do: "Relink OpenAI account"
-  defp oauth_dialog_title(_mode), do: "Link OpenAI account"
+  # The eyebrow already names the provider, so the title spends its words on the
+  # thing the operator cannot otherwise see once the flow starts: where this
+  # account is going. The Pool survives every step - `OAuthWorkflow` rebuilds the
+  # form from `oauth_link_pool_id` each time - so the title keeps answering
+  # "which Pool was this again?" long after the select is gone.
+  #
+  # Once the flow is done the header stops asking for anything. An imperative
+  # title standing over a success banner reads as a step still owed, so the
+  # completed screen gets the declarative twin of the same sentence: same
+  # subject, same Pool, stated as fact.
+  defp oauth_dialog_title(:relink, account, _form, _pool_options, %{status: "completed"}),
+    do: "#{oauth_target_label(account)} reauthorized"
 
-  defp oauth_dialog_description(:relink, account) do
-    "Finish the OpenAI authorization flow to relink #{oauth_target_label(account)}."
+  defp oauth_dialog_title(:relink, account, _form, _pool_options, _flow),
+    do: "Relink #{oauth_target_label(account)}"
+
+  defp oauth_dialog_title(_mode, _account, form, pool_options, %{status: "completed"}) do
+    case oauth_selected_pool_label(form, pool_options) do
+      nil -> "Account added"
+      pool -> "Added to #{pool}"
+    end
   end
 
-  defp oauth_dialog_description(_mode, _account),
-    do: "Choose a Pool and finish the OpenAI authorization flow."
+  defp oauth_dialog_title(_mode, _account, form, pool_options, _flow) do
+    case oauth_selected_pool_label(form, pool_options) do
+      nil -> "Link an account"
+      pool -> "Link an account to #{pool}"
+    end
+  end
+
+  defp oauth_selected_pool_label(form, pool_options) do
+    selected = to_string(form[:pool_id].value || "")
+
+    Enum.find_value(pool_options, fn {label, value} ->
+      to_string(value) == selected && selected != "" && label
+    end)
+  end
+
+  # The completed clause comes first: a finished relink would otherwise fall into
+  # the relink clause below and keep telling the operator to approve again.
+  defp oauth_dialog_description(_mode, _account, %{status: "completed"}) do
+    "Routing, quota, and health for this account live on its cockpit."
+  end
+
+  defp oauth_dialog_description(_mode, _account, %{flow_kind: "browser", status: "pending"}) do
+    "Approve in the tab that opened, then paste the callback URL back here."
+  end
+
+  defp oauth_dialog_description(_mode, _account, %{flow_kind: "device", status: "pending"}) do
+    "Enter the code below to approve. This dialog updates when the account is ready."
+  end
+
+  defp oauth_dialog_description(:relink, _account, _flow),
+    do: "Approve again to refresh this account's authorization."
+
+  defp oauth_dialog_description(_mode, _account, _flow),
+    do: "Choose a Pool, then approve the account."
 
   defp oauth_callback_submit_label(:relink), do: "Complete relink"
   defp oauth_callback_submit_label(_mode), do: "Complete link"
 
+  # A pending message describes the flow that is running, so it renders inside
+  # that flow's own section rather than floating above the dialog body.
+  defp oauth_pending_status(%{message: message}, %{status: "pending"})
+       when is_binary(message) and message != "",
+       do: message
+
+  defp oauth_pending_status(_result, _flow), do: nil
+
   defp oauth_relink_mode?(:relink), do: true
   defp oauth_relink_mode?(_mode), do: false
+
+  # `mark_oauth_flow_completed/4` stamps the linked identity onto the flow row, so
+  # the completed flow the LiveView already holds is enough to reach the cockpit -
+  # no extra assign, query, or reload lookup. `Map.get/2` because the dev showcase
+  # renders this dialog from plain fixture maps rather than `OAuthFlow` structs.
+  defp oauth_cockpit_path(%{status: "completed"} = flow) do
+    case Map.get(flow, :result_upstream_identity_id) do
+      identity_id when is_binary(identity_id) and identity_id != "" ->
+        ~p"/admin/upstreams/#{identity_id}"
+
+      _absent ->
+        nil
+    end
+  end
+
+  defp oauth_cockpit_path(_flow), do: nil
 
   defp form_checkbox_checked?(field) do
     Form.normalize_value("checkbox", field.value)

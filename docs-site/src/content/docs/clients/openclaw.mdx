@@ -1,38 +1,64 @@
 ---
-title: OpenClaw
+title: OpenClaw on Codex Pooler
+sidebar:
+  label: OpenClaw
 description: Configure OpenClaw with Codex Pooler's narrow OpenAI-compatible /v1 surface, current runtime id, model metadata, and optional operator MCP endpoint.
 ---
 
-![Codex Pooler OpenClaw integration](/codex-pooler-openclaw.png)
+OpenClaw is an open-source AI assistant that runs on your own devices and connects to the chat channels you use. It can carry out tasks with tools while keeping conversations available through its gateway. Connect it to Codex Pooler to use your Pool's models for the main assistant and background tasks.
 
-OpenClaw should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. Keep `openai/*` model names when you want OpenClaw and its tools to treat the model as the canonical OpenAI provider path. The optional MCP block is only for operator metadata tools.
+![Codex Pooler OpenClaw integration](/codex-pooler-openclaw.webp)
 
-For a deployed instance, use these URLs:
+## Before you start
 
-```text
-OpenAI-compatible base URL:
-https://codex-pooler.example.com/v1
+- Install [OpenClaw](https://docs.openclaw.ai/install) using the official instructions for your operating system.
+- Have a Codex Pooler URL reachable from the client.
+- Create a [Pool API key](/getting-started/quick-start/) and choose a model available to that Pool.
 
-Operator MCP URL:
-https://codex-pooler.example.com/mcp
+<a id="provider-shape"></a>
+
+## Configure the connection
+
+Use the commands for the terminal that starts the client. Environment-variable assignments below apply to that terminal; desktop apps and services need the variables in their own launch environment.
+
+### Config file paths
+
+| OS | Default config file |
+| --- | --- |
+| macOS | `~/.openclaw/openclaw.json` |
+| Linux | `~/.openclaw/openclaw.json` |
+| Windows | `%USERPROFILE%\.openclaw\openclaw.json` |
+
+If you set `OPENCLAW_CONFIG_PATH`, edit that file instead of the default shown below.
+
+These are the default locations. On Windows, paste the `%USERPROFILE%`, `%APPDATA%` or `%LOCALAPPDATA%` path into File Explorer's address bar. For a client installed inside WSL, use the Linux paths and commands inside WSL. Keep any custom configuration folder or profile you already use.
+
+Merge the following settings into `openclaw.json` at the path for your system, or the file selected by `OPENCLAW_CONFIG_PATH`. Make `CODEX_POOLER_API_KEY` available to the running OpenClaw process:
+
+**macOS / Linux / WSL**
+
+```bash
+export CODEX_POOLER_API_KEY="<pool-api-key>"
 ```
 
-For local setup, replace the host with `http://localhost:4000`.
+**Windows PowerShell**
 
-## Provider shape
+```powershell
+$env:CODEX_POOLER_API_KEY = "<pool-api-key>"
+```
 
 OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surface, use a Pool API key for model requests, and pin the agent runtime to `openclaw`. The older `pi` runtime id is a deprecated alias and should not be used in new Codex Pooler examples.
 
-```json5
+```json5 title="openclaw.json" frame="code"
 {
   agents: {
     defaults: {
       model: {
-        primary: "openai/gpt-5.6-terra",
+        primary: "openai/gpt-6.1-sol",
         list: [
           {
             id: "background",
-            model: "openai/gpt-5.6-luna",
+            model: "openai/gpt-6-luna",
           },
         ],
       },
@@ -47,33 +73,33 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
         apiKey: "${CODEX_POOLER_API_KEY}",
         api: "openai-responses",
         agentRuntime: { id: "openclaw" },
-        timeoutSeconds: 300,
+        timeoutSeconds: 120,
         models: [
           {
-            id: "gpt-5.6-luna",
-            name: "GPT-5.6 Luna via Codex Pooler",
+            id: "gpt-6-luna",
+            name: "GPT-6 Luna via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 372000,
-            contextTokens: 353400,
+            contextWindow: 872000,
+            contextTokens: 828400,
             maxTokens: 128000,
           },
           {
-            id: "gpt-5.6-terra",
-            name: "GPT-5.6 Terra via Codex Pooler",
+            id: "gpt-6.1-sol",
+            name: "GPT-6.1 Sol via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 372000,
-            contextTokens: 353400,
+            contextWindow: 872000,
+            contextTokens: 828400,
             maxTokens: 128000,
           },
           {
-            id: "gpt-5.6-sol",
-            name: "GPT-5.6 Sol via Codex Pooler",
+            id: "gpt-6-astra",
+            name: "GPT-6 Astra via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 372000,
-            contextTokens: 353400,
+            contextWindow: 872000,
+            contextTokens: 828400,
             maxTokens: 128000,
           },
         ],
@@ -85,13 +111,31 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
 
 Define only model ids your assigned Pool can serve. If you run Codex Pooler locally, set `baseUrl` to `http://localhost:4000/v1`.
 
-OpenClaw separates the provider/native `contextWindow` from the effective runtime `contextTokens` budget. Codex-served GPT-5.6 examples use the Codex raw 372k window, the 353400 effective budget, and a 128k output budget. The explicit compaction reserve keeps local prompt history under the remaining 225400-token budget before a long completion. Use `gpt-5.6-luna` for background routing, keep `gpt-5.6-terra` as the primary model, and switch a session to `gpt-5.6-sol` only for heavy reasoning.
+## Choose a model
 
-## Operator MCP server
+OpenClaw separates the configured `contextWindow` from the effective runtime `contextTokens` budget. The `872000` raw-context / `828400` effective-budget values above are long-profile examples. Provider accounts can temporarily report different ceilings for the same model; a selected 272000-token profile exposes `258400` effective tokens. Use each model's `/v1/models.context_length` for `contextWindow`; set `contextTokens` to `floor(0.95 * context_length)` and do not configure the raw ceiling as the effective budget. For the long-profile example, the 128000-token compaction reserve keeps output accounting explicit and starts local compaction at 700400 tokens. Use `gpt-6-luna` for background routing, keep `gpt-6.1-sol` as the primary model, and select `gpt-6-astra` only when its Pool assignment permits it.
+
+## Verify the connection
+
+Start a new OpenClaw conversation with the configured primary model and send a short request. In Codex Pooler's request logs, match the request time, API key, model, and final status to your test. A reply alone does not confirm that the client used your Pooler instance.
+
+If you configured a background model, check a background request as well: it must use a model available to the same Pool.
+
+## Advanced configuration
+
+### Custom provider option
+
+If you want to keep Codex Pooler separate from OpenClaw's built-in OpenAI provider behavior, you can use a custom provider id such as `codex-pooler/gpt-6.1-sol` instead.
+
+That follows OpenClaw's generic custom-provider shape, but tools that look specifically for `openai/gpt-*` model refs won't see it as canonical OpenAI. Prefer the `openai` provider shape above unless you need that separation.
+
+<a id="operator-mcp-server"></a>
+
+## Operator MCP (optional)
 
 Add Codex Pooler as a remote Streamable HTTP MCP server only when OpenClaw should inspect metadata that the operator can already see in the admin UI. Omit this block for normal model/runtime use.
 
-```json5
+```json5 title="openclaw.json" frame="code"
 {
   mcp: {
     servers: {
@@ -110,12 +154,6 @@ Add Codex Pooler as a remote Streamable HTTP MCP server only when OpenClaw shoul
 Use `http://localhost:4000/mcp` only for local setup.
 
 MCP uses an operator-owned MCP token, not a Pool API key. Don't reuse the Pool API key from the model provider block for `/mcp`.
-
-## Custom provider option
-
-If you want to keep Codex Pooler separate from OpenClaw's built-in OpenAI provider behavior, you can use a custom provider id such as `codex-pooler/gpt-5.6-terra` instead.
-
-That follows OpenClaw's generic custom-provider shape, but tools that look specifically for `openai/gpt-*` model refs won't see it as canonical OpenAI. Prefer the `openai` provider shape above unless you need that separation.
 
 ## Compatibility notes
 

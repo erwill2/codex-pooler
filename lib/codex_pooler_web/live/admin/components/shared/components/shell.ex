@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
   use CodexPoolerWeb, :html
 
   alias CodexPooler.Pools
+  alias CodexPooler.Status.Freshness
   alias CodexPoolerWeb.Admin.OperatorComponents.Identity
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: RelativeTime
 
@@ -65,6 +66,13 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
       icon: "hero-finger-print"
     },
     %{
+      key: :lens,
+      id: "admin-nav-lens",
+      label: "Lens",
+      path: "/admin/lens",
+      icon: "hero-magnifying-glass"
+    },
+    %{
       key: :jobs,
       id: "admin-nav-jobs",
       label: "System Jobs",
@@ -81,6 +89,13 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
   ]
 
   @admin_footer_nav_items [
+    %{
+      key: :incidents,
+      id: "admin-nav-incidents",
+      label: "OpenAI incidents",
+      path: "/admin/incidents",
+      icon: "hero-exclamation-triangle"
+    },
     %{
       key: :alerts,
       id: "admin-nav-alerts",
@@ -101,6 +116,8 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
   attr :current_scope, :any, required: true
   attr :active_nav, :atom, required: true
   attr :alert_notification_center, :map, required: true
+
+  attr :openai_status_aggregate, :map, default: %{incidents: [], last_success_at: nil, stale?: false}
 
   slot :inner_block, required: true
 
@@ -137,6 +154,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                 x_profile_url={@x_profile_url}
               />
               <.alert_notification_dropdown center={@alert_notification_center} />
+              <.live_updates_toggle />
               <details
                 id="topbar-connection-indicator"
                 class="dropdown dropdown-end"
@@ -198,17 +216,17 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
         </header>
 
         <aside
-          class="fixed left-0 top-12 z-40 flex h-[calc(100svh-3rem)] w-16 flex-col border-r border-base-300/70 bg-base-100 py-4 md:w-64"
+          class="admin-rail fixed left-0 top-12 z-40 flex h-[calc(100svh-3rem)] w-16 flex-col border-r border-base-300/70 bg-base-100 py-4 xl:w-64"
           aria-label="Admin navigation"
         >
-          <div class="mb-6 flex min-w-0 shrink-0 justify-center px-3 text-center md:flex-col md:items-start md:gap-1 md:px-4 md:text-left">
+          <div class="mb-6 flex min-w-0 shrink-0 justify-center px-3 text-center rail-open:flex-col rail-open:items-start rail-open:gap-1 rail-open:px-4 rail-open:text-left">
             <Identity.operator_avatar
               id="admin-sidebar-operator-avatar"
               operator={@current_scope.user}
               status={@current_scope.user.status}
-              class="md:hidden"
+              class="rail-open:hidden"
             />
-            <div id="admin-sidebar-operator-label" class="hidden min-w-0 md:block md:w-full">
+            <div id="admin-sidebar-operator-label" class="hidden w-full min-w-0 rail-open:block">
               <p class="text-sm font-semibold uppercase tracking-wide text-primary">
                 operator
               </p>
@@ -224,7 +242,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
           <nav
             id="admin-nav"
             aria-label="Admin workflow navigation"
-            class="scrollbar-none flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overscroll-contain"
+            class="scrollbar-none flex min-h-0 flex-1 flex-col gap-1 overflow-x-hidden overflow-y-auto overscroll-contain"
           >
             <.link
               :for={item <- @admin_nav_items}
@@ -242,7 +260,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                   item.key == @active_nav && "text-primary"
                 ]}
               />
-              <span class="hidden md:block">{item.label}</span>
+              <span class="hidden rail-open:block">{item.label}</span>
             </.link>
 
             <.link
@@ -250,15 +268,32 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
               href={~p"/observatory/login"}
               target="_blank"
               rel="noopener noreferrer"
-              aria-label="Observatory"
-              class={admin_nav_item_class(false)}
-              title="Observatory"
+              aria-label="Observatory — hold to open in a new tab"
+              class={[admin_nav_item_class(false), "admin-nav-hold select-none touch-none"]}
+              title="Observatory — hold to open in a new tab"
+              phx-hook="HoldToLaunch"
             >
-              <.icon
-                name="hero-sparkles"
-                class="size-5 shrink-0 transition-colors group-hover:text-primary"
-              />
-              <span class="hidden md:block">Observatory</span>
+              <span data-role="admin-nav-hold-ring" class="relative size-5 shrink-0">
+                <svg
+                  class="pointer-events-none absolute -inset-1 size-7 -rotate-90"
+                  viewBox="0 0 28 28"
+                  aria-hidden="true"
+                >
+                  <circle class="admin-nav-hold-track" cx="14" cy="14" r="12" />
+                  <circle
+                    class="admin-nav-hold-fill"
+                    data-role="admin-nav-hold-ring-fill"
+                    cx="14"
+                    cy="14"
+                    r="12"
+                  />
+                </svg>
+                <.icon
+                  name="hero-sparkles"
+                  class="size-5 shrink-0 transition-colors group-hover:text-primary"
+                />
+              </span>
+              <span class="hidden rail-open:block">Observatory</span>
             </.link>
           </nav>
 
@@ -279,7 +314,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                   item.key == @active_nav && "text-primary"
                 ]}
               />
-              <span class="hidden md:block">{item.label}</span>
+              <span class="hidden rail-open:block">{item.label}</span>
             </.link>
 
             <.link
@@ -294,16 +329,20 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                 name="hero-arrow-left-on-rectangle"
                 class="size-5 shrink-0 transition-colors group-hover:text-primary"
               />
-              <span class="hidden md:block">Log out</span>
+              <span class="hidden rail-open:block">Log out</span>
             </.link>
           </div>
         </aside>
 
         <main
           id="admin-shell-scroll-region"
-          class="relative ml-16 h-full min-h-0 overflow-x-hidden overflow-y-auto bg-base-200 pt-12 md:ml-64"
+          class="relative ml-16 h-full min-h-0 overflow-x-hidden overflow-y-auto bg-base-200 pt-12 xl:ml-64"
         >
           <div class="flex min-w-0 flex-col gap-6 p-4 sm:p-6 xl:p-8">
+            <.openai_status_banner
+              :if={@active_nav != :incidents and openai_status_banner_visible?(@openai_status_aggregate)}
+              aggregate={@openai_status_aggregate}
+            />
             {render_slot(@inner_block)}
           </div>
         </main>
@@ -312,11 +351,105 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
     """
   end
 
+  attr :aggregate, :map, required: true
+
+  defp openai_status_banner(assigns) do
+    titles = assigns.aggregate |> Map.get(:incidents, []) |> Enum.map(& &1.title) |> Enum.take(3)
+    assigns = assign(assigns, :titles, titles)
+
+    ~H"""
+    <section
+      id="admin-openai-status-banner"
+      role="status"
+      aria-live="polite"
+      class="grid gap-3 rounded-box border border-warning/40 bg-warning/15 p-4 text-base-content shadow-sm sm:flex sm:items-center sm:justify-between sm:gap-5"
+    >
+      <div class="min-w-0 grid gap-1">
+        <p class="font-semibold">Incidents reported on the status feed</p>
+        <p class="text-sm leading-5 text-base-content/80">
+          <span :for={{title, index} <- Enum.with_index(@titles)}>
+            {if index > 0, do: ", "}{title}
+          </span><span :if={length(@aggregate.incidents) > 3}> +{length(@aggregate.incidents) - 3} more</span>
+        </p>
+        <p
+          :if={@aggregate.stale? || !Map.get(@aggregate, :polling_enabled?, true)}
+          id="admin-openai-status-stale"
+          class="text-xs text-base-content/70"
+        >
+          {if Map.get(@aggregate, :polling_enabled?, true),
+            do: "The feed may be out of date. Automatic refresh continues every five minutes.",
+            else: "Status polling is disabled in System settings. Showing the last known incidents."}
+        </p>
+      </div>
+      <div class="flex shrink-0 flex-wrap items-center gap-2">
+        <.link
+          id="admin-openai-status-link"
+          navigate={~p"/admin/incidents"}
+          class="btn btn-warning btn-sm"
+        >
+          View incidents
+        </.link>
+        <button
+          id="admin-openai-status-dismiss"
+          type="button"
+          phx-click="dismiss_openai_status"
+          class="btn btn-ghost btn-sm text-base-content/75 hover:text-base-content"
+          aria-label="Dismiss current status incidents"
+        >
+          Dismiss
+        </button>
+      </div>
+    </section>
+    """
+  end
+
+  defp openai_status_banner_visible?(%{
+         incidents: incidents,
+         last_success_at: %DateTime{} = timestamp
+       })
+       when is_list(incidents) do
+    Freshness.banner_fresh?(timestamp) and incidents != []
+  end
+
+  defp openai_status_banner_visible?(_), do: false
+
   defp admin_nav_item_class(active?) do
     [
-      "group flex w-full items-center justify-center gap-3 border-l-[3px] border-transparent px-3 py-2.5 font-mono text-[0.58rem] font-semibold uppercase tracking-[0.12em] text-base-content/55 opacity-75 outline-none transition-all duration-200 hover:bg-base-300/70 hover:text-base-content hover:opacity-100 focus-visible:border-primary focus-visible:text-base-content md:justify-start md:px-4 md:text-xs",
+      "group flex w-full items-center justify-center gap-3 border-l-[3px] border-transparent px-3 py-2.5 font-mono text-[0.58rem] font-semibold uppercase tracking-[0.12em] text-base-content/55 opacity-75 outline-none transition-all duration-200 xl:transition-[background-color,border-color,color,opacity] hover:bg-base-300/70 hover:text-base-content hover:opacity-100 focus-visible:border-primary focus-visible:text-base-content rail-open:justify-start rail-open:px-4 rail-open:text-xs",
       active? && "!border-l-primary bg-base-300 text-base-content opacity-100"
     ]
+  end
+
+  # Whether the self-refreshing surfaces keep rebuilding is the operator's call:
+  # those pages are right to move while you watch and wrong to move while you
+  # read, and only the operator knows which they are doing. The state lives in
+  # the browser session (see live_updates_toggle.mjs), so the server renders the
+  # resting shape and the hook corrects it on mount and on rejoin.
+  #
+  # No phx-update="ignore": it would not protect data-paused anyway — LiveView
+  # merges data-* onto ignored elements — and the hook reasserts state on update.
+  # The name stays "Pause live updates" in both states, because with aria-pressed
+  # a name that flips announces a contradiction.
+  defp live_updates_toggle(assigns) do
+    ~H"""
+    <button
+      id="admin-live-updates-toggle"
+      type="button"
+      phx-hook="LiveUpdatesToggle"
+      data-paused="false"
+      class="btn btn-ghost btn-sm btn-square text-base-content/60 hover:text-base-content"
+      aria-pressed="false"
+      aria-label="Pause live updates"
+      title="Pause live updates"
+    >
+      <span data-role="live-updates-live">
+        <.icon name="hero-pause" class="size-5" />
+      </span>
+      <span data-role="live-updates-paused" class="text-warning">
+        <.icon name="hero-play" class="size-5" />
+      </span>
+    </button>
+    """
   end
 
   attr :app_version, :string, required: true
@@ -374,7 +507,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
               href={@docs_url}
               icon="hero-book-open"
               title="Documentation"
-              subtitle="docs.codex-pooler.com"
+              subtitle="www.codex-pooler.com/docs"
             />
             <.github_resource_row
               id="admin-github-x-profile"
@@ -752,7 +885,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
 
   defp repository_url, do: "https://github.com/icoretech/codex-pooler"
 
-  defp docs_url, do: "https://docs.codex-pooler.com/"
+  defp docs_url, do: "https://www.codex-pooler.com/docs/"
 
   defp x_profile_url, do: "https://x.com/icoretech_inc"
 end

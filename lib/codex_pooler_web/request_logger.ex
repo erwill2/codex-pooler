@@ -3,9 +3,11 @@ defmodule CodexPoolerWeb.RequestLogger do
 
   require Logger
 
+  alias CodexPoolerWeb.Plugs.TrustedProxyRemoteIp
   alias Plug.Conn.Status
 
   @event [:phoenix, :endpoint, :stop]
+  @usage_limit_private :codex_pooler_usage_limit
   @handler_id {__MODULE__, :endpoint_stop}
   @max_user_agent_bytes 160
 
@@ -32,17 +34,36 @@ defmodule CodexPoolerWeb.RequestLogger do
 
   @spec request_log_line(Plug.Conn.t(), integer()) :: String.t()
   def request_log_line(conn, duration) do
-    [
-      "request_completed",
-      "method=#{safe_token(conn.method)}",
-      "path=#{safe_token(conn.request_path)}",
-      "status=#{safe_status(conn.status)}",
-      "duration_ms=#{duration_ms(duration)}",
-      "remote_ip=#{safe_token(remote_ip(conn.remote_ip))}",
-      "user_agent=#{inspect(sanitize_user_agent(user_agent(conn)))}"
-    ]
+    ([
+       "request_completed",
+       "method=#{safe_token(conn.method)}",
+       "path=#{safe_token(conn.request_path)}",
+       "status=#{safe_status(conn.status)}",
+       "duration_ms=#{duration_ms(duration)}",
+       "remote_ip=#{safe_token(remote_ip(conn.remote_ip))}"
+     ] ++
+       peer_provenance_fields(conn) ++
+       usage_limit_fields(conn) ++
+       ["user_agent=#{inspect(sanitize_user_agent(user_agent(conn)))}"])
     |> Enum.join(" ")
   end
+
+  @doc """
+  Keeps the reset an all-exhausted Pool's terminal answer advised on the
+  connection, so the `request_completed` line names what the client was told
+  (findings#206 row 206-553). Integers only; anything else is not recorded.
+  """
+  @spec put_usage_limit(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def put_usage_limit(conn, %{"resets_at" => resets_at, "resets_in_seconds" => seconds})
+      when is_integer(resets_at) and is_integer(seconds),
+      do: Plug.Conn.put_private(conn, @usage_limit_private, {resets_at, seconds})
+
+  def put_usage_limit(conn, _record), do: conn
+
+  defp usage_limit_fields(%Plug.Conn{private: %{@usage_limit_private => {resets_at, seconds}}}),
+    do: ["resets_at=#{resets_at}", "resets_in_seconds=#{seconds}"]
+
+  defp usage_limit_fields(_conn), do: []
 
   @spec sanitize_user_agent(term()) :: String.t()
   def sanitize_user_agent(value) when is_binary(value) do
@@ -69,6 +90,24 @@ defmodule CodexPoolerWeb.RequestLogger do
   end
 
   defp remote_ip(ip), do: ip |> :inet.ntoa() |> to_string()
+
+  defp peer_provenance_fields(conn) do
+    case TrustedProxyRemoteIp.peer_provenance(conn) do
+      %{
+        immediate_peer_ip: peer_ip,
+        client_ip_source: source,
+        inspected_hops: inspected_hops
+      } ->
+        [
+          "immediate_peer_ip=#{safe_token(peer_ip)}",
+          "client_ip_source=#{safe_token(source)}",
+          "inspected_hops=#{inspected_hops}"
+        ]
+
+      _empty ->
+        []
+    end
+  end
 
   defp safe_token(value) when is_binary(value) do
     value

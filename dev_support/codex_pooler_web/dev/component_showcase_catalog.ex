@@ -29,7 +29,7 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseCatalog do
         :metric_strip,
         exports: [{AdminComponents, :metric_card, 1}],
         selectors:
-          ["#showcase-metric-strip", "#showcase-metric-breakdown"] ++
+          ["#showcase-metric-strip"] ++
             Enum.map(~w(neutral primary success warning error), &"#showcase-metric-#{&1}")
       ),
       entry(
@@ -120,8 +120,7 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseCatalog do
         "plan_badge/1",
         AdminBadges,
         :plan_badge,
-        selectors:
-          Enum.map(~w(free pro team enterprise generated unknown), &"#showcase-plan-#{&1}")
+        selectors: Enum.map(~w(free pro team enterprise generated unknown), &"#showcase-plan-#{&1}")
       ),
       entry(
         "5.10-dropdown-menu",

@@ -5,68 +5,199 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
 
   require Logger
 
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResets.Convergence
-  alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @max_event_buffer_bytes 16_384
+  @max_pending_events 32
+  @quota_scope_fields ~w(metered_limit_name metered_feature limit_id limit_name model model_id model_identifier)
+  @rate_limit_marker "codex.rate_limits"
   @event_supervisor CodexPooler.RateLimitEventSupervisor
 
   @type observer_result :: :ok
   @type observer_metadata :: keyword()
-  @type event_state :: %{required(:buffer) => binary()}
+  @type event_state :: %{
+          required(:buffer) => binary(),
+          required(:skip_leading_lf?) => boolean(),
+          optional(:pending_events) => [map()]
+        }
+  @type generation_authority :: %{
+          required(:request_id) => Ecto.UUID.t(),
+          required(:attempt_id) => Ecto.UUID.t(),
+          required(:replay_generation) => non_neg_integer()
+        }
 
   @spec record_headers(UpstreamIdentity.t(), Req.Response.t()) :: observer_result()
-  def record_headers(%UpstreamIdentity{} = identity, response) do
+  @spec record_headers(UpstreamIdentity.t(), Req.Response.t(), String.t() | nil) ::
+          observer_result()
+  @spec record_headers(UpstreamIdentity.t(), Req.Response.t(), String.t() | nil, String.t() | nil) ::
+          observer_result()
+  # `denial_code` is the provider's usage-limit refusal code on a `429`, so the
+  # windows the refusal's headers carry are recorded as its denial, as the
+  # websocket frame headers are (findings#206 row 206-594).
+  def record_headers(%UpstreamIdentity{} = identity, response, dispatched_model \\ nil, denial_code \\ nil) do
+    record_header_evidence(
+      identity,
+      response.headers,
+      "rate_limit_headers",
+      "runtime_headers",
+      dispatched_model,
+      denial_code
+    )
+  end
+
+  @spec record_websocket_upgrade_headers(UpstreamIdentity.t() | term(), term()) ::
+          observer_result()
+  @spec record_websocket_upgrade_headers(term(), term(), String.t() | nil) :: observer_result()
+  def record_websocket_upgrade_headers(identity, headers, dispatched_model \\ nil)
+
+  def record_websocket_upgrade_headers(%UpstreamIdentity{} = identity, headers, dispatched_model) do
+    record_header_evidence(
+      identity,
+      headers,
+      "rate_limit_websocket_upgrade_headers",
+      "runtime_websocket_upgrade_headers",
+      dispatched_model,
+      nil
+    )
+  end
+
+  def record_websocket_upgrade_headers(_identity, _headers, _dispatched_model), do: :ok
+
+  defp record_header_evidence(
+         %UpstreamIdentity{} = identity,
+         headers,
+         operation,
+         source,
+         dispatched_model,
+         denial_code
+       ) do
     case QuotaWindows.upsert_quota_windows_from_codex_headers(
            identity,
-           response.headers
+           headers,
+           DateTime.utc_now(),
+           dispatched_model,
+           denial_code
          ) do
       {:ok, windows} ->
-        maybe_converge_saved_reset(identity, windows)
+        maybe_converge_saved_reset(identity, windows, source)
 
       {:error, reason} ->
-        log_failure("rate_limit_headers", identity_metadata(identity), reason)
+        log_failure(operation, identity_metadata(identity), reason)
     end
   end
 
   @spec record_websocket_frame_headers(UpstreamIdentity.t() | term(), map() | term()) ::
           observer_result()
-  def record_websocket_frame_headers(%UpstreamIdentity{} = identity, headers)
+  @spec record_websocket_frame_headers(term(), term(), String.t() | nil) :: observer_result()
+  @spec record_websocket_frame_headers(term(), term(), String.t() | nil, String.t() | nil) ::
+          observer_result()
+  def record_websocket_frame_headers(
+        identity,
+        headers,
+        dispatched_model \\ nil,
+        denial_code \\ nil
+      )
+
+  def record_websocket_frame_headers(
+        %UpstreamIdentity{} = identity,
+        headers,
+        dispatched_model,
+        denial_code
+      )
       when is_map(headers) and map_size(headers) > 0 do
-    case QuotaWindows.upsert_quota_windows_from_codex_headers(identity, headers) do
+    case QuotaWindows.upsert_quota_windows_from_codex_headers(
+           identity,
+           headers,
+           DateTime.utc_now(),
+           dispatched_model,
+           denial_code
+         ) do
       {:ok, windows} ->
-        maybe_converge_saved_reset(identity, windows)
+        maybe_converge_saved_reset(identity, windows, "runtime_websocket_frame_headers")
 
       {:error, reason} ->
         log_failure("rate_limit_websocket_frame_headers", identity_metadata(identity), reason)
     end
   end
 
-  def record_websocket_frame_headers(_identity, _headers), do: :ok
+  def record_websocket_frame_headers(_identity, _headers, _dispatched_model, _denial_code),
+    do: :ok
 
   @spec event_state() :: event_state()
-  def event_state, do: %{buffer: ""}
+  def event_state, do: StreamProtocol.new_sse_block_state()
 
   @spec record_complete_events(UpstreamIdentity.t() | term(), binary() | term()) ::
           observer_result()
-  def record_complete_events(identity, data) do
-    _ignored = record_events(identity, data, event_state())
+  @spec record_complete_events(
+          UpstreamIdentity.t() | term(),
+          binary() | term(),
+          generation_authority() | nil
+        ) :: observer_result()
+  def record_complete_events(identity, data, authority \\ nil) do
+    with {:ok, state} <- collect_events(data, event_state()) do
+      persist_events_async(identity, Map.get(state, :pending_events, []), authority)
+    end
+
     :ok
   end
 
-  @spec record_events(UpstreamIdentity.t() | term(), binary() | term(), event_state()) ::
-          {:ok, event_state()}
-  def record_events(%UpstreamIdentity{} = identity, data, %{buffer: previous_buffer})
-      when is_binary(data) and is_binary(previous_buffer) do
-    {events, buffer} = rate_limit_event_payloads(data, previous_buffer)
+  @spec record_complete_event(
+          UpstreamIdentity.t() | term(),
+          map() | term(),
+          generation_authority() | nil
+        ) :: observer_result()
+  def record_complete_event(identity, event, authority \\ nil)
 
-    persist_events_async(identity, events)
-    {:ok, %{buffer: buffer}}
+  def record_complete_event(
+        %UpstreamIdentity{} = identity,
+        %{"type" => "codex.rate_limits"} = event,
+        authority
+      ) do
+    persist_events_async(identity, [event], authority)
   end
 
-  def record_events(_identity, _data, state), do: {:ok, normalize_event_state(state)}
+  def record_complete_event(_identity, _event, _authority), do: :ok
+
+  @spec record_events(UpstreamIdentity.t() | term(), binary() | term(), event_state()) ::
+          {:ok, event_state()}
+  def record_events(%UpstreamIdentity{} = identity, data, state) when is_binary(data) do
+    with {:ok, state} <- collect_events(data, state) do
+      persist_events_async(identity, Map.get(state, :pending_events, []), nil)
+      {:ok, Map.delete(state, :pending_events)}
+    end
+  end
+
+  def record_events(_identity, data, state), do: collect_events(data, state)
+
+  @spec collect_events(binary() | term(), event_state()) :: {:ok, event_state()}
+  def collect_events(data, state) when is_binary(data) do
+    {events, state} = rate_limit_event_payloads(data, normalize_event_state(state))
+
+    pending = Enum.reduce(events, Map.get(state, :pending_events, []), &retain_latest_event/2)
+    {:ok, Map.put(state, :pending_events, pending)}
+  end
+
+  def collect_events(_data, state), do: {:ok, normalize_event_state(state)}
+
+  @spec commit_events(UpstreamIdentity.t() | term(), event_state()) :: observer_result()
+  @spec commit_events(
+          UpstreamIdentity.t() | term(),
+          event_state(),
+          generation_authority() | nil
+        ) :: observer_result()
+  def commit_events(identity, state, authority \\ nil)
+
+  def commit_events(%UpstreamIdentity{} = identity, state, authority) do
+    persist_events(identity, Map.get(state, :pending_events, []), authority)
+  end
+
+  def commit_events(_identity, _state, _authority), do: :ok
 
   @spec clear_event_buffer(UpstreamIdentity.t()) :: observer_result()
   def clear_event_buffer(%UpstreamIdentity{}), do: :ok
@@ -90,7 +221,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
         end
       end)
 
-    maybe_converge_saved_reset(identity, persisted)
+    maybe_converge_saved_reset(identity, persisted, "runtime_error")
   end
 
   def record_error(_identity, _body), do: :ok
@@ -105,11 +236,17 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
     :ok
   end
 
-  defp persist_events_async(_identity, []), do: :ok
+  defp persist_events_async(_identity, [], _authority), do: :ok
 
-  defp persist_events_async(%UpstreamIdentity{} = identity, events) do
-    # Metadata rides along so the async task can run the cheap saved-reset
-    # convergence pre-filter without a reload.
+  defp persist_events_async(%UpstreamIdentity{} = identity, events, authority)
+       when not is_nil(authority) do
+    maybe_wait_for_test_persistence_barrier()
+    persist_events(identity, events, authority)
+  end
+
+  defp persist_events_async(%UpstreamIdentity{} = identity, events, authority) do
+    # Keep the async task input bounded. Saved-reset convergence reloads the
+    # authoritative lifecycle under its database lock after evidence commits.
     identity_snapshot = %UpstreamIdentity{
       id: identity.id,
       status: identity.status,
@@ -117,7 +254,8 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
     }
 
     case Task.Supervisor.start_child(@event_supervisor, fn ->
-           Enum.each(events, &persist_event(identity_snapshot, &1))
+           maybe_wait_for_test_persistence_barrier()
+           persist_events(identity_snapshot, events, authority)
          end) do
       {:ok, _pid} ->
         :ok
@@ -130,30 +268,92 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
       log_failure("rate_limit_event_task", identity_metadata(identity), reason)
   end
 
+  defp persist_events(%UpstreamIdentity{} = identity, events, nil) do
+    Enum.each(events, &persist_event(identity, &1))
+    :ok
+  end
+
+  defp persist_events(%UpstreamIdentity{} = identity, events, authority) do
+    with {:ok, request, attempt} <- load_generation_authority(authority),
+         {:ok, :ok} <-
+           Accounting.with_current_replay_generation(request, attempt, fn ->
+             maybe_wait_for_test_authority_barrier()
+             Enum.each(events, &persist_event(identity, &1))
+             :ok
+           end) do
+      :ok
+    else
+      _stale_or_invalid -> :ok
+    end
+  end
+
+  defp load_generation_authority(%{
+         request_id: request_id,
+         attempt_id: attempt_id,
+         replay_generation: generation
+       })
+       when is_binary(request_id) and is_binary(attempt_id) and is_integer(generation) and
+              generation >= 0 do
+    case {CodexPooler.Repo.get(Request, request_id), CodexPooler.Repo.get(Attempt, attempt_id)} do
+      {%Request{} = request, %Attempt{request_id: ^request_id, replay_generation: ^generation} = attempt} ->
+        {:ok, request, attempt}
+
+      _missing_or_mismatched ->
+        {:error, :invalid_authority}
+    end
+  end
+
+  defp load_generation_authority(_authority), do: {:error, :invalid_authority}
+
+  if Mix.env() == :test do
+    defp maybe_wait_for_test_persistence_barrier do
+      case Application.get_env(:codex_pooler, :rate_limit_persistence_test_barrier) do
+        {test_pid, barrier_ref} when is_pid(test_pid) and is_reference(barrier_ref) ->
+          send(test_pid, {:rate_limit_persistence_ready, self(), barrier_ref})
+
+          receive do
+            {:release_rate_limit_persistence, ^barrier_ref} -> :ok
+          end
+
+        _no_barrier ->
+          :ok
+      end
+    end
+
+    defp maybe_wait_for_test_authority_barrier do
+      case Application.get_env(:codex_pooler, :rate_limit_authority_test_barrier) do
+        {test_pid, barrier_ref} when is_pid(test_pid) and is_reference(barrier_ref) ->
+          send(test_pid, {:rate_limit_authority_ready, self(), barrier_ref})
+
+          receive do
+            {:release_rate_limit_authority, ^barrier_ref} -> :ok
+          end
+
+        _no_barrier ->
+          :ok
+      end
+    end
+  else
+    defp maybe_wait_for_test_persistence_barrier, do: :ok
+    defp maybe_wait_for_test_authority_barrier, do: :ok
+  end
+
   defp persist_event(%UpstreamIdentity{} = identity, event) do
     case QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
            identity,
            event
          ) do
       {:ok, windows} ->
-        maybe_converge_saved_reset(identity, windows)
+        maybe_converge_saved_reset(identity, windows, "runtime_event")
 
       {:error, reason} ->
         log_failure("rate_limit_event", identity_metadata(identity), reason)
     end
   end
 
-  # Runtime evidence is the transport-agnostic seam for probe outcomes: a
-  # confirmed quota-exhaustion error or exhausted headers reblock a pending
-  # saved-reset lifecycle immediately, and usable evidence confirms it, without
-  # waiting for the next reconciliation pass. Two cheap pre-filters keep the
-  # per-request hot path free of extra locking transactions: convergence runs
-  # only when this write actually persisted account evidence, and only for the
-  # short pre-confirmation phase — a probe-confirmed lifecycle settles to
-  # quota-confirmed on the reconciliation cadence instead of per response.
-  defp maybe_converge_saved_reset(%UpstreamIdentity{} = identity, persisted_windows) do
-    if persisted_account_evidence?(persisted_windows) and awaiting_probe?(identity) do
-      case Convergence.converge(identity) do
+  defp maybe_converge_saved_reset(%UpstreamIdentity{} = identity, persisted_windows, source) do
+    if persisted_account_evidence?(persisted_windows) do
+      case Convergence.converge(identity, DateTime.utc_now(), source) do
         {:ok, _outcome} ->
           :ok
 
@@ -172,16 +372,29 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   defp persisted_account_evidence?(windows),
     do: Enum.any?(windows, &(&1.quota_key == "account"))
 
-  defp awaiting_probe?(%UpstreamIdentity{metadata: metadata}) do
-    RedemptionLifecycle.phase((metadata || %{})["saved_reset_redemption"]) ==
-      RedemptionLifecycle.consumed_pending_probe()
-  end
+  defp normalize_event_state(%{
+         buffer: buffer,
+         skip_leading_lf?: skip_leading_lf?,
+         pending_events: pending_events
+       })
+       when is_binary(buffer) and is_boolean(skip_leading_lf?) and is_list(pending_events),
+       do: %{
+         buffer: buffer,
+         skip_leading_lf?: skip_leading_lf?,
+         pending_events: pending_events
+       }
 
-  defp normalize_event_state(%{buffer: buffer}) when is_binary(buffer), do: %{buffer: buffer}
+  defp normalize_event_state(%{buffer: buffer, skip_leading_lf?: skip_leading_lf?})
+       when is_binary(buffer) and is_boolean(skip_leading_lf?),
+       do: %{buffer: buffer, skip_leading_lf?: skip_leading_lf?, pending_events: []}
+
+  defp normalize_event_state(%{buffer: buffer}) when is_binary(buffer),
+    do: %{buffer: buffer, skip_leading_lf?: false, pending_events: []}
+
   defp normalize_event_state(_state), do: event_state()
 
   defp rate_limit_error_payloads(body) do
-    case Jason.decode(body) do
+    case CodexPooler.JSON.decode(body) do
       {:ok, %{} = decoded} ->
         [decoded, Map.get(decoded, "error")]
         |> Enum.filter(&is_map/1)
@@ -191,41 +404,75 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
     end
   end
 
-  defp rate_limit_event_payloads(data, previous_buffer) do
-    direct_events =
-      data
-      |> String.trim()
-      |> rate_limit_events_from_json()
+  defp rate_limit_event_payloads(data, state) do
+    scan = state.buffer <> data
+    pending_events = Map.get(state, :pending_events, [])
 
-    {complete_blocks, buffer} = complete_sse_blocks(previous_buffer <> data)
-    events = direct_events ++ rate_limit_events_from_sse_blocks(complete_blocks)
-    {events, buffer}
-  end
+    {complete_blocks, state} =
+      StreamProtocol.complete_sse_blocks(state, data, bounded?: false)
 
-  defp complete_sse_blocks(data) do
-    data = String.replace(data, "\r\n", "\n")
+    state = state |> Map.put(:pending_events, pending_events) |> bounded_event_state()
 
-    if String.contains?(data, "\n\n") do
-      parts = String.split(data, "\n\n")
-      ends_with_separator? = String.ends_with?(data, "\n\n")
-
-      {complete, buffer} =
-        if ends_with_separator? do
-          {parts, ""}
-        else
-          {Enum.drop(parts, -1), List.last(parts) || ""}
-        end
-
-      {Enum.reject(complete, &(&1 == "")), bounded_incomplete_sse_block(buffer)}
+    # Compatibility stance: the provider emits the event type as the literal
+    # `codex.rate_limits`, not as a JSON unicode escape. Scan retained+current
+    # bytes together so a transport split inside the literal cannot hide it.
+    if :binary.match(scan, @rate_limit_marker) != :nomatch do
+      direct_events = data |> String.trim() |> rate_limit_events_from_json()
+      events = direct_events ++ rate_limit_events_from_sse_blocks(complete_blocks)
+      {events, state}
     else
-      {[], bounded_incomplete_sse_block(data)}
+      {[], state}
     end
   end
 
-  defp bounded_incomplete_sse_block(buffer) when byte_size(buffer) > @max_event_buffer_bytes,
-    do: ""
+  defp bounded_event_state(%{buffer: buffer} = state)
+       when byte_size(buffer) > @max_event_buffer_bytes,
+       do: Map.merge(state, event_state())
 
-  defp bounded_incomplete_sse_block(buffer), do: buffer
+  defp bounded_event_state(state), do: state
+
+  # Keep the latest snapshot per provider scope, merging partial window updates.
+  # Both the count and each transient parsed event are bounded independently.
+  defp retain_latest_event(%{"rate_limits" => %{} = limits} = event, pending) do
+    if :erlang.external_size(event) <= @max_event_buffer_bytes do
+      limits = valid_event_windows(event, limits)
+      retain_valid_event(Map.put(event, "rate_limits", limits), pending)
+    else
+      pending
+    end
+  end
+
+  defp retain_latest_event(_event, pending), do: pending
+
+  defp valid_event_windows(event, limits) do
+    limits
+    |> Map.take(["primary", "secondary"])
+    |> Enum.filter(fn {kind, window} ->
+      Evidence.parse_codex_rate_limit_event(Map.put(event, "rate_limits", %{kind => window})) !=
+        []
+    end)
+    |> Map.new()
+  end
+
+  defp retain_valid_event(%{"rate_limits" => limits}, pending) when map_size(limits) == 0,
+    do: pending
+
+  defp retain_valid_event(event, pending) do
+    scope = Map.take(event, @quota_scope_fields)
+    {same, rest} = Enum.split_with(pending, &(Map.take(&1, @quota_scope_fields) == scope))
+
+    merged =
+      case same do
+        [previous | _] ->
+          Map.update!(event, "rate_limits", &Map.merge(previous["rate_limits"], &1))
+
+        [] ->
+          event
+      end
+
+    event = if :erlang.external_size(merged) <= @max_event_buffer_bytes, do: merged, else: event
+    Enum.take(rest ++ [event], @max_pending_events * -1)
+  end
 
   defp rate_limit_events_from_sse_blocks(blocks) do
     Enum.flat_map(blocks, fn block ->
@@ -259,7 +506,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   end
 
   defp rate_limit_events_from_json(payload) do
-    case Jason.decode(payload) do
+    case CodexPooler.JSON.decode(payload, strings: :copy) do
       {:ok, %{"type" => "codex.rate_limits"} = event} -> [event]
       {:ok, _decoded} -> []
       {:error, _reason} -> []

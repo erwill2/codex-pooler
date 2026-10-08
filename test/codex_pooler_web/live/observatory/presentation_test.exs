@@ -58,9 +58,9 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
              ] ++ List.duplicate(other, 7)
 
     chart = model.traffic.chart
-    assert Jason.decode!(chart.categories) == ["07-17 11:00", "07-17 12:00"]
+    assert CodexPooler.JSON.decode!(chart.categories) == ["07-17 11:00", "07-17 12:00"]
 
-    chart_series = Jason.decode!(chart.series)
+    chart_series = CodexPooler.JSON.decode!(chart.series)
 
     # Token columns broken down by model (top models plus a folded "Other" so
     # each stack sums to the bucket's total tokens) with a cost line.
@@ -72,12 +72,18 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
              %{"name" => "Cost", "type" => "line", "data" => [1.0, 0.5]}
            ]
 
-    assert Jason.decode!(chart.units) == ["tokens", "tokens", "tokens", "tokens", "USD"]
+    assert CodexPooler.JSON.decode!(chart.units) == [
+             "tokens",
+             "tokens",
+             "tokens",
+             "tokens",
+             "USD"
+           ]
 
-    assert Jason.decode!(chart.value_kinds) ==
+    assert CodexPooler.JSON.decode!(chart.value_kinds) ==
              ["tokens", "tokens", "tokens", "tokens", "usd"]
 
-    assert Jason.decode!(chart.yaxis) == [
+    assert CodexPooler.JSON.decode!(chart.yaxis) == [
              %{
                "seriesName" => ["model-1", "model-2", "model-3", "Other"],
                "title" => "tokens",
@@ -91,7 +97,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
              }
            ]
 
-    assert Jason.decode!(chart.colors) == [
+    assert CodexPooler.JSON.decode!(chart.colors) == [
              "var(--color-primary)",
              "var(--color-info)",
              "var(--color-warning)",
@@ -176,7 +182,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
       {"succeeded", "ok", :success, "Succeeded", nil},
       {"failed", "err", :error, "Failed · Rate limited", "rate_limited"},
       {"in_progress", "warn", :warning, "In progress", nil},
-      {"cancelled", "neutral", :neutral, "Cancelled", nil},
+      {"client_cancelled", "warn", :warning, "Client cancelled", nil},
       {"unexpected", "neutral", :neutral, "Unknown", nil}
     ]
 
@@ -310,7 +316,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
       timestamp: DateTime.add(~U[2026-07-17 11:59:00Z], -index, :second),
       model: "model-#{index}",
       endpoint_class: "responses",
-      status: if(index == 2, do: "failed", else: "cancelled"),
+      status: if(index == 2, do: "failed", else: "in_progress"),
       response_status_code: if(index == 2, do: 429, else: nil),
       code: if(index == 2, do: "rate_limited", else: nil),
       metadata: if(index == 2, do: %{"raw" => "raw-outcome-metadata"}, else: nil),

@@ -19,6 +19,7 @@ defmodule CodexPoolerWeb.ConnCase do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.AccountsFixtures
+  alias CodexPooler.Gateway.Transports.WebsocketRolloutDrainSupport
   alias Phoenix.ConnTest
 
   using do
@@ -35,9 +36,15 @@ defmodule CodexPoolerWeb.ConnCase do
     end
   end
 
+  # Runs before the using module's own `setup_all`, so rows that one commits belong to the module
+  # and are compared again once every module-level callback has run.
+  setup_all tags do
+    CodexPooler.CommittedWriteGuard.guard_module!(tags)
+  end
+
   setup tags do
-    CodexPooler.DataCase.setup_sandbox(tags)
-    {:ok, conn: ConnTest.build_conn()}
+    sandbox = CodexPooler.DataCase.setup_sandbox(tags)
+    {:ok, Map.put(sandbox, :conn, ConnTest.build_conn())}
   end
 
   @doc """
@@ -68,5 +75,16 @@ defmodule CodexPoolerWeb.ConnCase do
       :live_socket_id,
       CodexPoolerWeb.UserAuth.live_socket_id_for_token(token)
     )
+  end
+
+  @spec start_rollout_drain_harness(keyword()) :: %{
+          activity_registry: atom(),
+          deadline: pid(),
+          name: atom(),
+          stream_registry: atom(),
+          worker_tracker: pid()
+        }
+  def start_rollout_drain_harness(opts \\ []) do
+    WebsocketRolloutDrainSupport.start_rollout_drain_harness(self(), opts)
   end
 end

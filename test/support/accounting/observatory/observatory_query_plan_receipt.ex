@@ -29,10 +29,10 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanReceipt do
   end
 
   def write_if_requested!(receipt) do
-    case System.get_env("TODO9_QUERY_PLAN_RECEIPT") do
+    case System.get_env("OBSERVATORY_QUERY_PLAN_RECEIPT") do
       path when is_binary(path) and path != "" ->
         File.mkdir_p!(Path.dirname(path))
-        File.write!(path, [Jason.encode_to_iodata!(receipt, pretty: true), "\n"])
+        File.write!(path, [CodexPooler.JSON.encode_to_iodata!(receipt, pretty: true), "\n"])
 
       _unset ->
         :ok
@@ -74,12 +74,10 @@ defmodule CodexPooler.Accounting.ObservatoryQueryPlanReceipt do
   defp relation_summary(root, relation, candidates) do
     %{
       "filter_fields" => Support.condition_fields(root, relation, "Filter", candidates),
-      "index_condition_fields" =>
-        Support.condition_fields(root, relation, "Index Cond", candidates),
+      "index_condition_fields" => Support.condition_fields(root, relation, "Index Cond", candidates),
       "indexed_access" => Support.indexed_access?(root, relation),
       "maximum_actual_rows_per_loop" => Support.maximum_actual_rows(root, relation),
-      "recheck_condition_fields" =>
-        Support.condition_fields(root, relation, "Recheck Cond", candidates),
+      "recheck_condition_fields" => Support.condition_fields(root, relation, "Recheck Cond", candidates),
       "relation_work" => Support.relation_work(root, relation),
       "scope_predicates_present" => Support.predicates_present?(root, relation, candidates)
     }

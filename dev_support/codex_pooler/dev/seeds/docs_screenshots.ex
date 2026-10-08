@@ -2,8 +2,10 @@ defmodule CodexPooler.Dev.Seeds.DocsScreenshots do
   @moduledoc false
 
   alias CodexPooler.Access.APIKey
+  alias CodexPooler.Catalog.{Model, SyncRun}
+  alias CodexPooler.Dev.Seeds.DocsScreenshots.{Inventory, Traffic}
   alias CodexPooler.Dev.Seeds.Full
-  alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.{ModelServingOverride, Pool}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
@@ -22,7 +24,9 @@ defmodule CodexPooler.Dev.Seeds.DocsScreenshots do
     {"sample-account-03", "Example Quota Exhausted"},
     {"sample-account-04", "Example Refresh Due"},
     {"sample-account-05", "Example Reauthentication"},
-    {"sample-account-06", "Example Paused Account"}
+    {"sample-account-06", "Example Paused Account"},
+    {"sample-account-07", "Example Circuit Clear"},
+    {"sample-account-08", "Example Circuit Absent"}
   ]
 
   @assignment_labels [
@@ -32,16 +36,31 @@ defmodule CodexPooler.Dev.Seeds.DocsScreenshots do
     "Example Cooldown Assignment",
     "Example Reauthentication Assignment",
     "Example Paused Assignment",
-    "Example Secondary Assignment"
+    "Example Secondary Assignment",
+    "Example Circuit Clear Assignment",
+    "Example Circuit Absent Assignment"
   ]
 
   @spec run(map()) :: map()
   def run(context) do
-    result = Full.run(context)
+    :ok = Inventory.reset!()
+    # Full updates instance settings and synchronously refreshes their cache.
+    # Finish that shared-process work before opening the fixture transaction.
+    base = Full.run(context)
+    {:ok, result} = Repo.transaction(fn -> seed!(base) end)
+    result
+  end
+
+  defp seed!(result) do
     pools = update_pools!(result.pools)
     api_keys = update_api_keys!(result.api_keys)
-    upstream_identities = update_identities!(result.upstream_identities)
-    assignments = update_assignments!(result.assignments)
+    {screenshot_identities, extra_identities} = Enum.split(result.upstream_identities, 8)
+    {screenshot_assignments, extra_assignments} = split_assignments(result.assignments)
+    upstream_identities = update_identities!(screenshot_identities)
+    assignments = update_assignments!(screenshot_assignments)
+    remove_extra_rows!(extra_assignments, extra_identities)
+    models = update_models!(result.models, pools)
+    model_serving_overrides = seed_model_serving_overrides!(pools)
 
     request_logs =
       update_request_logs!(
@@ -52,13 +71,22 @@ defmodule CodexPooler.Dev.Seeds.DocsScreenshots do
 
     audit_events = update_audit_events!(result.audit_events, List.first(api_keys))
 
+    result =
+      Map.merge(result, %{
+        pools: pools,
+        api_keys: api_keys,
+        upstream_identities: upstream_identities,
+        assignments: assignments,
+        models: models,
+        model_serving_overrides: model_serving_overrides,
+        request_logs: request_logs,
+        audit_events: audit_events
+      })
+      |> Inventory.expand!()
+
     Map.merge(result, %{
-      pools: pools,
-      api_keys: api_keys,
-      upstream_identities: upstream_identities,
-      assignments: assignments,
-      request_logs: request_logs,
-      audit_events: audit_events
+      request_logs: Traffic.seed!(result),
+      catalog_sync_runs: seed_catalog_sync_runs!(result.pools, result.models)
     })
   end
 
@@ -107,6 +135,87 @@ defmodule CodexPooler.Dev.Seeds.DocsScreenshots do
       |> PoolUpstreamAssignment.changeset(%{assignment_label: label})
       |> Repo.update!()
     end)
+  end
+
+  defp split_assignments(assignments) do
+    screenshot_assignments = Enum.take(assignments, 9)
+    extra_assignments = Enum.drop(assignments, 9)
+    {screenshot_assignments, extra_assignments}
+  end
+
+  defp remove_extra_rows!(assignments, identities) do
+    Enum.each(assignments, &Repo.delete!/1)
+    Enum.each(identities, &Repo.delete!/1)
+  end
+
+  defp update_models!(models, pools) do
+    primary_pool = pool_by_name!(pools, "Example Production")
+
+    Enum.map(models, fn model ->
+      if model.pool_id == primary_pool.id and model.exposed_model_id == "gpt-6-luna",
+        do: mark_sources_lite!(model),
+        else: model
+    end)
+  end
+
+  defp mark_sources_lite!(model) do
+    source_models =
+      model.metadata
+      |> Map.fetch!("source_assignment_models")
+      |> Map.new(fn {assignment_id, source_metadata} -> {assignment_id, Map.put(source_metadata, "use_responses_lite", true)} end)
+
+    model
+    |> Model.changeset(%{metadata: Map.put(model.metadata, "source_assignment_models", source_models)})
+    |> Repo.update!()
+  end
+
+  defp seed_catalog_sync_runs!(pools, models) do
+    finished_at = DateTime.utc_now()
+
+    Enum.map(pools, fn pool ->
+      model_count = Enum.count(models, &(&1.pool_id == pool.id))
+
+      %SyncRun{}
+      |> SyncRun.changeset(%{
+        pool_id: pool.id,
+        trigger_kind: "bootstrap",
+        status: "succeeded",
+        started_at: DateTime.add(finished_at, -1, :second),
+        finished_at: finished_at,
+        discovered_model_count: model_count,
+        upserted_model_count: model_count,
+        stale_marked_count: 0,
+        stats: %{"seed" => "docs_screenshots"}
+      })
+      |> Repo.insert!()
+    end)
+  end
+
+  defp seed_model_serving_overrides!(pools) do
+    primary_pool = pool_by_name!(pools, "Example Production")
+    timestamp = DateTime.utc_now()
+
+    [
+      {"gpt-6-sol", "full"},
+      {"gpt-5.5-pro", "lite"}
+    ]
+    |> Enum.map(fn {exposed_model_id, mode} ->
+      %ModelServingOverride{
+        pool_id: primary_pool.id,
+        created_at: timestamp,
+        updated_at: timestamp
+      }
+      |> ModelServingOverride.changeset(%{
+        exposed_model_id: exposed_model_id,
+        mode: mode
+      })
+      |> Repo.insert!()
+    end)
+  end
+
+  defp pool_by_name!(pools, name) do
+    Enum.find(pools, &(&1.name == name)) ||
+      raise "documentation screenshot seed is missing #{name}"
   end
 
   defp update_request_logs!(request_logs, original_identities, identities) do

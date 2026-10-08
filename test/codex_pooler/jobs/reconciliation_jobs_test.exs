@@ -1,6 +1,7 @@
 defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Accounting.Request
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Accounts.User
   alias CodexPooler.Catalog
@@ -11,21 +12,37 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.Jobs
-  alias CodexPooler.Jobs.AccountReconciliationEnqueueWorker
-  alias CodexPooler.Jobs.AccountReconciliationWorker
+
+  alias CodexPooler.Jobs.{
+    AccountReconciliationEnqueueWorker,
+    AccountReconciliationWorker,
+    CatalogSyncWorker
+  }
+
+  alias CodexPooler.Jobs.SavedResetRedemptionWorker
   alias CodexPooler.Jobs.TokenRefreshWorker
+  alias CodexPooler.Jobs.UpstreamEnqueue
   alias CodexPooler.Pools.Membership
+  alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.TokenRefresh
+  alias CodexPooler.Upstreams.Auth.TokenRefreshMetadata
   alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Reconciliation.AccountReconciliation
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.Reconciliation.UsageProbe
+  alias CodexPooler.Upstreams.SavedResetRedemption
+  alias CodexPooler.Upstreams.SavedResets
+  alias CodexPooler.Upstreams.SavedResets.AutoEligibility
+  alias CodexPooler.Upstreams.SavedResets.Convergence
+  alias CodexPooler.Upstreams.SavedResets.PostResetEvidence
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPooler.Upstreams.TokenLinking
@@ -33,6 +50,14 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
   import CodexPooler.PoolerFixtures
   import CodexPooler.AccountsFixtures
+
+  # Identities per stale-consuming recovery cohort; enough to prove that
+  # per-identity recovery decisions do not leak across identities.
+  @stale_consuming_cohort_size 5
+
+  # Failure-detection budget for an expected message, task result or lock wait:
+  # a green run returns as soon as it is observed.
+  @detection_timeout_ms 15_000
 
   setup do
     Repo.delete_all(Oban.Job)
@@ -50,6 +75,18 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   end
 
   describe "reconciliation jobs" do
+    @tag :committed_cleanup_jobs
+    test "metadata fixture teardown removes owned jobs and preserves a shared identity job" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+
+      CodexPooler.CommittedJobCleanupSupport.assert_cleanup_jobs!(
+        pool,
+        identity,
+        assignment,
+        fn -> cleanup_committed_metadata_reconciliation_fixture(pool, identity) end
+      )
+    end
+
     test "completes partial reconciliation when only catalog sync fails" do
       future_reset = DateTime.add(DateTime.utc_now(), 300, :second)
 
@@ -133,9 +170,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
     test "does not sync catalog when upstream reconciliation fails" do
       upstream =
-        start_upstream(
-          FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-unexpected-reconcile"}]})
-        )
+        start_upstream(FakeUpstream.json_response(%{"data" => [%{"id" => "gpt-unexpected-reconcile"}]}))
 
       {pool, _assignment} =
         active_assignment_fixture(%{
@@ -370,8 +405,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         active_assignment_fixture(
           %{"base_url" => FakeUpstream.url(upstream)},
           identity_metadata: %{
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
           }
         )
 
@@ -421,8 +455,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         active_assignment_fixture(
           %{"base_url" => FakeUpstream.url(upstream)},
           identity_metadata: %{
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
           }
         )
 
@@ -472,6 +505,76 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                "/backend-api/wham/usage",
                "/backend-api/codex/usage"
              ]
+    end
+
+    test "persisted quota reuse owns one historical timestamp across freshness boundaries" do
+      as_of = ~U[2026-07-25 12:00:00.000000Z]
+      ttl = Evidence.freshness_ttl_seconds()
+
+      for {label, age_seconds, expected_code} <- [
+            {"TTL-1s", ttl - 1, "quota_reused_fresh"},
+            {"TTL", ttl, "quota_reused_fresh"},
+            {"TTL+1s", ttl + 1, "quota_refresh_unavailable"}
+          ] do
+        upstream = start_upstream(unavailable_usage_paths())
+
+        {pool, assignment} =
+          active_assignment_fixture(
+            %{"base_url" => FakeUpstream.url(upstream)},
+            identity_metadata: %{
+              "base_url" => FakeUpstream.url(upstream),
+              "access_token_expires_at" => "2026-07-27T23:59:59Z"
+            }
+          )
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+        persist_quota_windows!(identity, [
+          persisted_account_primary_window_attrs(
+            DateTime.add(as_of, -age_seconds, :second),
+            %{reset_at: DateTime.add(as_of, 4, :hour)}
+          )
+        ])
+
+        assert {:ok, result} =
+                 PoolReconciliation.reconcile_pool_account(pool, assignment, as_of: as_of)
+
+        assert result.quota.code == expected_code, label
+      end
+    end
+
+    test "persisted quota reuse treats reset_at less than or equal to as_of as expired" do
+      as_of = ~U[2026-07-25 12:00:00.000000Z]
+
+      for {label, reset_offset_seconds, expected_code} <- [
+            {"before", -1, "quota_refresh_unavailable"},
+            {"equal", 0, "quota_refresh_unavailable"},
+            {"after", 1, "quota_reused_fresh"}
+          ] do
+        upstream = start_upstream(unavailable_usage_paths())
+
+        {pool, assignment} =
+          active_assignment_fixture(
+            %{"base_url" => FakeUpstream.url(upstream)},
+            identity_metadata: %{
+              "base_url" => FakeUpstream.url(upstream),
+              "access_token_expires_at" => "2026-07-27T23:59:59Z"
+            }
+          )
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+        persist_quota_windows!(identity, [
+          persisted_account_primary_window_attrs(as_of, %{
+            reset_at: DateTime.add(as_of, reset_offset_seconds, :second)
+          })
+        ])
+
+        assert {:ok, result} =
+                 PoolReconciliation.reconcile_pool_account(pool, assignment, as_of: as_of)
+
+        assert result.quota.code == expected_code, label
+      end
     end
 
     test "reuses fresh persisted monthly account primary quota when live usage is unavailable" do
@@ -831,8 +934,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           %{"base_url" => FakeUpstream.url(upstream)},
           identity_metadata: %{
             "base_url" => FakeUpstream.url(upstream),
-            "access_token_expires_at" =>
-              observed_at |> DateTime.add(10, :day) |> DateTime.to_iso8601(),
+            "access_token_expires_at" => observed_at |> DateTime.add(10, :day) |> DateTime.to_iso8601(),
             "saved_resets" => %{"usage_path" => "/api/codex/usage"}
           }
         )
@@ -918,8 +1020,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
            reset_at: DateTime.add(now, -60, :second)
          })},
         {"resetless", persisted_account_primary_window_attrs(now, %{reset_at: nil})},
-        {"exhausted",
-         persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})},
+        {"exhausted", persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})},
         {"weekly_stale",
          weekly_window.(DateTime.add(now, -3_600, :second), %{
            reset_at: DateTime.add(now, 3_600, :second)
@@ -949,8 +1050,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
       scenarios = [
-        {"unknown_duration",
-         persisted_account_primary_window_attrs(observed_at, %{window_minutes: 60})},
+        {"unknown_duration", persisted_account_primary_window_attrs(observed_at, %{window_minutes: 60})},
         {"model_scoped",
          persisted_account_primary_window_attrs(observed_at, %{
            quota_key: "sample-codex-spark",
@@ -983,9 +1083,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       for status <- [401, 403] do
         upstream =
-          start_upstream(
-            {:path_json, %{"/backend-api/wham/usage" => {status, %{"error" => "rejected"}}}}
-          )
+          start_upstream({:path_json, %{"/backend-api/wham/usage" => {status, %{"error" => "rejected"}}}})
 
         {pool, assignment} =
           active_assignment_fixture(
@@ -1146,8 +1244,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
             "saved_resets" => %{"usage_path" => "/api/codex/usage"}
           },
           identity_metadata: %{
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
           }
         )
 
@@ -1167,15 +1264,28 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       upstream =
         start_upstream(
-          {:sequence,
-           [
-             FakeUpstream.json_response(%{"error" => "expired"}, 401),
-             FakeUpstream.json_response(%{
-               "access_token" => refreshed_access_token,
-               "expires_in" => 3_600
-             }),
-             FakeUpstream.json_response(usage_payload())
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond: FakeUpstream.json_response(%{"error" => "expired"}, 401)
+            ),
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/oauth/token",
+              respond:
+                FakeUpstream.json_response(%{
+                  "access_token" => refreshed_access_token,
+                  "expires_in" => 3_600
+                })
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              headers: [required: %{"authorization" => "Bearer " <> refreshed_access_token}],
+              respond: FakeUpstream.json_response(usage_payload())
+            )
+          ])
         )
 
       {pool, assignment} =
@@ -1206,6 +1316,95 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       assert {"authorization", "Bearer " <> ^refreshed_access_token} =
                List.keyfind(retried_usage_request.headers, "authorization", 0)
+
+      assert :ok = FakeUpstream.verify!(upstream)
+    end
+
+    test "successful token refresh persists the retried probe observation timestamp" do
+      refreshed_access_token = "rotated-observation-access-token-do-not-leak"
+      refresh_token = "observation-refresh-token-do-not-leak"
+      initial_observed_at = ~U[2026-08-30 10:00:00.000000Z]
+      retry_observed_at = ~U[2026-08-30 10:00:05.000000Z]
+
+      upstream =
+        start_upstream(
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond: FakeUpstream.json_response(%{"error" => "expired"}, 401)
+            ),
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/oauth/token",
+              respond:
+                FakeUpstream.json_response(%{
+                  "access_token" => refreshed_access_token,
+                  "expires_in" => 3_600
+                })
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              headers: [required: %{"authorization" => "Bearer " <> refreshed_access_token}],
+              respond:
+                FakeUpstream.json_response(%{
+                  "plan_type" => "plus",
+                  "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+                })
+            ),
+            # A window-less payload does not halt the multi-path probe, so the
+            # rotated token is also carried to the second ChatGPT usage path.
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/usage",
+              headers: [required: %{"authorization" => "Bearer " <> refreshed_access_token}],
+              respond:
+                FakeUpstream.json_response(%{
+                  "plan_type" => "plus",
+                  "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+                })
+            )
+          ])
+        )
+
+      {pool, assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata: %{"base_url" => FakeUpstream.url(upstream)}
+        )
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, _secret} =
+               Upstreams.store_encrypted_secret(identity, %{
+                 secret_kind: "refresh_token",
+                 plaintext: refresh_token
+               })
+
+      assert {:ok, result} =
+               Upstreams.reconcile_pool_account(pool, assignment,
+                 observed_at: initial_observed_at,
+                 retry_observed_at: retry_observed_at
+               )
+
+      assert result.status == :succeeded
+
+      snapshot =
+        identity
+        |> Repo.reload!()
+        |> Map.fetch!(:metadata)
+        |> Map.fetch!(AccountAvailabilityStore.metadata_key())
+
+      assert snapshot ==
+               AccountAvailabilityStore.encode!(
+                 :available,
+                 retry_observed_at,
+                 snapshot["credential_epoch"]
+               )
+
+      refute snapshot["observed_at"] == DateTime.to_iso8601(initial_observed_at)
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "definitive provider usage auth rejection disables the identity assignment" do
@@ -1218,8 +1417,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           %{"base_url" => FakeUpstream.url(upstream)},
           identity_metadata: %{
             "base_url" => FakeUpstream.url(upstream),
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
           }
         )
 
@@ -1270,8 +1468,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         active_assignment_fixture(
           %{"base_url" => FakeUpstream.url(upstream)},
           identity_metadata: %{
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
           }
         )
 
@@ -1460,8 +1657,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           },
           identity_metadata: %{
             "base_url" => FakeUpstream.url(upstream),
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(60, :second) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(60, :second) |> DateTime.to_iso8601()
           }
         )
 
@@ -1589,9 +1785,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       timeout_ref = make_ref()
 
       timeout_upstream =
-        start_upstream(
-          FakeUpstream.timeout_before_headers(notify: self(), release_ref: timeout_ref)
-        )
+        start_upstream(FakeUpstream.timeout_before_headers(notify: self(), release_ref: timeout_ref))
 
       {timeout_pool, timeout_assignment} = active_usage_probe_assignment(timeout_upstream)
 
@@ -1615,9 +1809,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         )
 
       assert {:ok, transport_result} =
-               Upstreams.reconcile_pool_account(transport_pool, transport_assignment,
-                 receive_timeout: 100
-               )
+               Upstreams.reconcile_pool_account(transport_pool, transport_assignment, receive_timeout: 100)
 
       assert transport_result.identity.status == "active"
       assert transport_result.quota.code == "quota_refresh_unavailable"
@@ -1640,16 +1832,34 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       upstream =
         start_upstream(
-          {:sequence,
-           [
-             FakeUpstream.json_response(%{"error" => "expired"}, 401),
-             FakeUpstream.json_response(%{
-               "access_token" => refreshed_access_token,
-               "expires_in" => 3_600
-             }),
-             FakeUpstream.json_response(%{"error" => "rejected"}, 401),
-             FakeUpstream.json_response(%{"error" => "rejected"}, 403)
-           ]}
+          FakeUpstream.strict_sequence([
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              respond: FakeUpstream.json_response(%{"error" => "expired"}, 401)
+            ),
+            FakeUpstream.expect_request(
+              method: "POST",
+              path: "/oauth/token",
+              respond:
+                FakeUpstream.json_response(%{
+                  "access_token" => refreshed_access_token,
+                  "expires_in" => 3_600
+                })
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/wham/usage",
+              headers: [required: %{"authorization" => "Bearer " <> refreshed_access_token}],
+              respond: FakeUpstream.json_response(%{"error" => "rejected"}, 401)
+            ),
+            FakeUpstream.expect_request(
+              method: "GET",
+              path: "/backend-api/codex/usage",
+              headers: [required: %{"authorization" => "Bearer " <> refreshed_access_token}],
+              respond: FakeUpstream.json_response(%{"error" => "rejected"}, 403)
+            )
+          ])
         )
 
       {pool, assignment} =
@@ -1676,6 +1886,8 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                "/backend-api/wham/usage",
                "/backend-api/codex/usage"
              ]
+
+      assert :ok = FakeUpstream.verify!(upstream)
     end
 
     test "provider usage failures short of definitive auth rejection preserve active state" do
@@ -1709,8 +1921,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           active_assignment_fixture(
             %{"base_url" => FakeUpstream.url(upstream)},
             identity_metadata: %{
-              "access_token_expires_at" =>
-                DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+              "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
             }
           )
 
@@ -1731,8 +1942,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         active_assignment_fixture(
           %{"base_url" => FakeUpstream.url(upstream)},
           identity_metadata: %{
-            "access_token_expires_at" =>
-              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
           }
         )
 
@@ -2057,7 +2267,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert lifecycle_backend != reconciliation_backend
       release_upstream_barrier(first_barrier, release_ref)
 
-      assert {:ok, _result} = Task.await(reconciliation, 10_000)
+      assert {:ok, _result} = Task.await(reconciliation, @detection_timeout_ms)
 
       current_assignment =
         Sandbox.unboxed_run(Repo, fn ->
@@ -2152,8 +2362,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
               "window_minutes" => 300,
               "active_limit" => 100,
               "credits" => 75,
-              "reset_at" =>
-                DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_iso8601(),
+              "reset_at" => DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_iso8601(),
               "source" => "local_reconciliation",
               "freshness_state" => "fresh"
             }
@@ -2224,7 +2433,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           end)
         end)
 
-      assert_receive {:stale_cleanup_connection_ready, ^release_ref, cleanup_backend}
+      assert_receive {:stale_cleanup_connection_ready, ^release_ref, cleanup_backend}, @detection_timeout_ms
       assert_backend_waiting_on_db_lock!(cleanup_backend)
 
       send(query_pid, {:release_assignment_update, release_ref})
@@ -2274,8 +2483,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           end)
         end)
 
-      assert_receive {:terminal_reconciliation_connection_ready, ^release_ref,
-                      reconciliation_backend}
+      assert_receive {:terminal_reconciliation_connection_ready, ^release_ref, reconciliation_backend}
 
       assert_backend_waiting_on_db_lock!(reconciliation_backend)
 
@@ -2534,8 +2742,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           end)
         end)
 
-      assert_receive {:unfenced_outer_transaction_ready, ^release_ref, transaction_pid,
-                      {:ok, %{quota: %{code: "quota_refreshed"}}}}
+      assert_receive {:unfenced_outer_transaction_ready, ^release_ref, transaction_pid, {:ok, %{quota: %{code: "quota_refreshed"}}}}
 
       refute_received {Events, %{reason: "upstream_quota_windows_updated"}}
       send(transaction_pid, {:commit_unfenced_outer_transaction, release_ref})
@@ -2576,8 +2783,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
           end)
         end)
 
-      assert_receive {:account_outer_transaction_ready, ^release_ref, transaction_pid,
-                      {:ok, %{quota: %{code: "quota_refreshed"}}}}
+      assert_receive {:account_outer_transaction_ready, ^release_ref, transaction_pid, {:ok, %{quota: %{code: "quota_refreshed"}}}}
 
       refute_received {Events, _event}
       send(transaction_pid, {:commit_account_outer_transaction, release_ref})
@@ -2739,9 +2945,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       reconciliation =
         Task.async(fn ->
           Sandbox.unboxed_run(Repo, fn ->
-            Upstreams.reconcile_pool_account(pool, assignment,
-              quota_windows: assignment.metadata["quota_windows"]
-            )
+            Upstreams.reconcile_pool_account(pool, assignment, quota_windows: assignment.metadata["quota_windows"])
           end)
         end)
 
@@ -3493,9 +3697,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert sibling_before.eligibility_status == "ineligible"
 
       assert {:ok, unfenced_result} =
-               Upstreams.reconcile_pool_account(recovery.source_pool, recovery.linked_assignment,
-                 quota_windows: [persisted_account_primary_window_attrs(DateTime.utc_now())]
-               )
+               Upstreams.reconcile_pool_account(recovery.source_pool, recovery.linked_assignment, quota_windows: [persisted_account_primary_window_attrs(DateTime.utc_now())])
 
       assert unfenced_result.quota.code == "quota_refreshed"
 
@@ -3741,9 +3943,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         applied_sequence = recovered_identity.metadata["usage_probe_applied_sequence"]
 
         assert :ok =
-                 AccountReconciliationWorker.perform(
-                   reconciliation_job(success_assignment, recovery_epoch)
-                 )
+                 AccountReconciliationWorker.perform(reconciliation_job(success_assignment, recovery_epoch))
 
         assert length(FakeUpstream.requests(success_upstream)) == request_count
 
@@ -3751,9 +3951,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         assert duplicate_identity.metadata["usage_probe_applied_sequence"] == applied_sequence
 
         assert :ok =
-                 AccountReconciliationWorker.perform(
-                   reconciliation_job(success_assignment, recovery_epoch - 1)
-                 )
+                 AccountReconciliationWorker.perform(reconciliation_job(success_assignment, recovery_epoch - 1))
 
         assert length(FakeUpstream.requests(success_upstream)) == request_count
         assert_identity_assignments_recovered!(recovery)
@@ -3771,23 +3969,37 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
         upstream =
           start_upstream(
-            {:sequence,
-             [
-               FakeUpstream.barrier_json_response(usage_payload(),
-                 notify: self(),
-                 release_ref: success_release_ref
-               ),
-               FakeUpstream.barrier_json_response(%{"error" => "rejected"},
-                 status: 401,
-                 notify: self(),
-                 release_ref: rejection_release_ref
-               ),
-               FakeUpstream.barrier_json_response(%{"error" => "rejected"},
-                 status: 401,
-                 notify: self(),
-                 release_ref: rejection_release_ref
-               )
-             ]}
+            FakeUpstream.strict_sequence([
+              FakeUpstream.expect_request(
+                method: "GET",
+                path: "/backend-api/wham/usage",
+                respond:
+                  FakeUpstream.barrier_json_response(usage_payload(),
+                    notify: self(),
+                    release_ref: success_release_ref
+                  )
+              ),
+              FakeUpstream.expect_request(
+                method: "GET",
+                path: "/backend-api/wham/usage",
+                respond:
+                  FakeUpstream.barrier_json_response(%{"error" => "rejected"},
+                    status: 401,
+                    notify: self(),
+                    release_ref: rejection_release_ref
+                  )
+              ),
+              FakeUpstream.expect_request(
+                method: "GET",
+                path: "/backend-api/codex/usage",
+                respond:
+                  FakeUpstream.barrier_json_response(%{"error" => "rejected"},
+                    status: 401,
+                    notify: self(),
+                    release_ref: rejection_release_ref
+                  )
+              )
+            ])
           )
 
         {_pool, assignment} = active_usage_probe_assignment(upstream)
@@ -3843,6 +4055,8 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
             rejection_windows: rejection_windows
           }
         )
+
+        assert :ok = FakeUpstream.verify!(upstream)
       end
     end
 
@@ -4153,6 +4367,1387 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert is_nil(sibling_assignment.metadata["last_reconciliation"])
     end
 
+    @tag :stale_consuming_recovery
+    test "enqueues one canonical stale-consuming recovery across assignments and replicas" do
+      upstream = start_upstream(successful_usage_response())
+      {canonical_pool, canonical_assignment} = active_usage_probe_assignment(upstream)
+      identity = Repo.get!(UpstreamIdentity, canonical_assignment.upstream_identity_id)
+
+      {later_pool, later_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Later stale recovery assignment",
+          created_at: DateTime.add(canonical_assignment.created_at, 60, :second),
+          metadata: %{"base_url" => FakeUpstream.url(upstream)}
+        )
+
+      attempt_id = Ecto.UUID.generate()
+      put_stale_consuming_redemption!(identity, attempt_id, 9)
+
+      for {pool, assignment} <- [
+            {later_pool, later_assignment},
+            {canonical_pool, canonical_assignment},
+            {canonical_pool, canonical_assignment}
+          ] do
+        assert :ok =
+                 perform_job(
+                   AccountReconciliationWorker,
+                   scheduled_identity_reconciliation_args(pool, assignment, identity)
+                 )
+      end
+
+      assert [job] = stale_consuming_recovery_jobs()
+
+      assert job.args == %{
+               "pool_upstream_assignment_id" => canonical_assignment.id,
+               "upstream_identity_id" => identity.id,
+               "attempt_id" => attempt_id,
+               "generation" => 9,
+               "recovery_kind" => "stale_consuming"
+             }
+
+      assert job.max_attempts == 1
+      assert FakeUpstream.requests(upstream) |> Enum.all?(&(&1.method == "GET"))
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    for first <- [:sibling, :canonical] do
+      @tag :stale_consuming_recovery
+      @tag settles_first: first
+      test "simultaneous canonical and sibling reconcilers enqueue one recovery job (#{first} settles first)", %{settles_first: first} do
+        release_ref = make_ref()
+
+        response =
+          FakeUpstream.barrier_json_response(usage_payload(),
+            notify: self(),
+            release_ref: release_ref
+          )
+
+        upstream =
+          start_upstream({:path_json, %{"/backend-api/wham/usage" => response}})
+
+        {canonical_pool, canonical_assignment} = active_usage_probe_assignment(upstream)
+        identity = Repo.get!(UpstreamIdentity, canonical_assignment.upstream_identity_id)
+
+        {sibling_pool, sibling_assignment} =
+          active_assignment_for_identity_fixture(identity,
+            assignment_label: "Concurrent stale recovery sibling",
+            created_at: DateTime.add(canonical_assignment.created_at, 60, :second),
+            metadata: %{"base_url" => FakeUpstream.url(upstream)}
+          )
+
+        attempt_id = Ecto.UUID.generate()
+        put_stale_consuming_redemption!(identity, attempt_id, 11)
+
+        # Both reconcilers are in flight at once, each parked on its usage request
+        # before either writes. Their writes then settle one after the other in a
+        # fixed order, the only order two tasks on one shared sandbox connection
+        # have: letting both write at once only queued each behind the other's
+        # transaction until a checkout was dropped under load.
+        in_flight =
+          Map.new([sibling: {sibling_pool, sibling_assignment}, canonical: {canonical_pool, canonical_assignment}], fn {role, {pool, assignment}} ->
+            task =
+              start_allowed_task(fn ->
+                perform_job(
+                  AccountReconciliationWorker,
+                  scheduled_identity_reconciliation_args(pool, assignment, identity)
+                )
+              end)
+
+            {role, {task, await_upstream_barrier(release_ref)}}
+          end)
+
+        for role <- if(first == :sibling, do: [:sibling, :canonical], else: [:canonical, :sibling]) do
+          {task, barrier} = Map.fetch!(in_flight, role)
+          release_upstream_barrier(barrier, release_ref)
+          assert Task.await(task, @detection_timeout_ms) == :ok
+        end
+
+        assert [job] = stale_consuming_recovery_jobs()
+        assert job.args["pool_upstream_assignment_id"] == canonical_assignment.id
+        assert job.args["attempt_id"] == attempt_id
+        assert Repo.aggregate(Request, :count) == 0
+        assert scheduled_consume_count(upstream) == 0
+      end
+    end
+
+    @tag :stale_consuming_recovery
+    test "recovery uniqueness spans incomplete states without assignment identity" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+
+      {_sibling_pool, sibling_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Stale recovery uniqueness sibling",
+          created_at: DateTime.add(assignment.created_at, 60, :second)
+        )
+
+      attempt_id = Ecto.UUID.generate()
+
+      for incomplete_state <- ~w(suspended available scheduled executing retryable) do
+        Repo.delete_all(Oban.Job)
+
+        assert {:ok, first_job} =
+                 Jobs.enqueue_stale_consuming_saved_reset_recovery(
+                   assignment,
+                   identity,
+                   attempt_id,
+                   4
+                 )
+
+        old_inserted_at = DateTime.utc_now() |> DateTime.add(-30, :day)
+
+        {1, _rows} =
+          from(job in Oban.Job, where: job.id == ^first_job.id)
+          |> Repo.update_all(set: [state: incomplete_state, inserted_at: old_inserted_at])
+
+        assert {:ok, conflict_job} =
+                 Jobs.enqueue_stale_consuming_saved_reset_recovery(
+                   sibling_assignment,
+                   identity,
+                   attempt_id,
+                   4
+                 )
+
+        assert conflict_job.conflict?
+        assert conflict_job.id == first_job.id
+      end
+
+      Repo.delete_all(Oban.Job)
+
+      assert {:ok, first_job} =
+               Jobs.enqueue_stale_consuming_saved_reset_recovery(
+                 assignment,
+                 identity,
+                 attempt_id,
+                 4
+               )
+
+      assert {:ok, next_generation_job} =
+               Jobs.enqueue_stale_consuming_saved_reset_recovery(
+                 sibling_assignment,
+                 identity,
+                 attempt_id,
+                 5
+               )
+
+      assert {:ok, next_attempt_job} =
+               Jobs.enqueue_stale_consuming_saved_reset_recovery(
+                 sibling_assignment,
+                 identity,
+                 Ecto.UUID.generate(),
+                 4
+               )
+
+      refute next_generation_job.conflict?
+      refute next_attempt_job.conflict?
+
+      assert MapSet.size(MapSet.new([first_job.id, next_generation_job.id, next_attempt_job.id])) ==
+               3
+    end
+
+    # Recovery enqueue is a per-identity decision with no batching or paging
+    # boundary, so a handful of identities proves the same property as a large
+    # cohort; the count below is scenario size, not a contract.
+    @tag :stale_consuming_recovery
+    test "several clean scheduled reconciliations create no recovery jobs" do
+      upstream = start_upstream(successful_usage_response())
+
+      fixtures =
+        Enum.map(1..@stale_consuming_cohort_size, fn _index ->
+          {pool, assignment} = active_usage_probe_assignment(upstream)
+          identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+          {pool, assignment, identity}
+        end)
+
+      Enum.each(fixtures, fn {pool, assignment, identity} ->
+        assert :ok =
+                 perform_job(
+                   AccountReconciliationWorker,
+                   scheduled_identity_reconciliation_args(pool, assignment, identity)
+                 )
+      end)
+
+      assert stale_consuming_recovery_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+      assert FakeUpstream.count(upstream) == @stale_consuming_cohort_size
+      assert FakeUpstream.requests(upstream) |> Enum.all?(&(&1.method == "GET"))
+    end
+
+    @tag :stale_consuming_recovery
+    test "clean and not-due reconciliations skip the canonical recovery query" do
+      for recovery_state <- [:clean, :not_due] do
+        upstream = start_upstream(unavailable_usage_paths())
+        {pool, assignment} = active_usage_probe_assignment(upstream)
+        identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+
+        persist_quota_windows!(identity, [
+          persisted_account_primary_window_attrs(DateTime.utc_now())
+        ])
+
+        if recovery_state == :not_due do
+          put_stale_consuming_redemption!(identity, Ecto.UUID.generate(), 3,
+            mode: "observe_only",
+            next_action_at: DateTime.add(DateTime.utc_now(), 1, :hour)
+          )
+        end
+
+        args = scheduled_identity_reconciliation_args(pool, assignment, identity)
+
+        assert {:ok, :ok, 0} =
+                 capture_canonical_assignment_queries(fn ->
+                   perform_job(AccountReconciliationWorker, args)
+                 end)
+
+        assert stale_consuming_recovery_jobs() == []
+      end
+    end
+
+    @tag :stale_consuming_recovery
+    test "several not-due identities stay quiet while one due identity enqueues once" do
+      upstream = start_upstream(successful_usage_response())
+      next_action_at = DateTime.add(DateTime.utc_now(), 1, :hour)
+
+      not_due_fixtures =
+        Enum.map(1..@stale_consuming_cohort_size, fn _index ->
+          {pool, assignment} = active_usage_probe_assignment(upstream)
+          identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+
+          put_stale_consuming_redemption!(identity, Ecto.UUID.generate(), 6,
+            mode: "observe_only",
+            next_action_at: next_action_at
+          )
+
+          {pool, assignment, identity}
+        end)
+
+      Enum.each(not_due_fixtures, fn {pool, assignment, identity} ->
+        assert :ok =
+                 perform_job(
+                   AccountReconciliationWorker,
+                   scheduled_identity_reconciliation_args(pool, assignment, identity)
+                 )
+      end)
+
+      assert stale_consuming_recovery_jobs() == []
+
+      {due_pool, due_assignment} = active_usage_probe_assignment(upstream)
+      due_identity = Repo.get!(UpstreamIdentity, due_assignment.upstream_identity_id)
+      due_attempt_id = Ecto.UUID.generate()
+      put_stale_consuming_redemption!(due_identity, due_attempt_id, 7)
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   due_pool,
+                   due_assignment,
+                   due_identity
+                 )
+               )
+
+      assert [job] = stale_consuming_recovery_jobs()
+      assert job.args["upstream_identity_id"] == due_identity.id
+      assert job.args["attempt_id"] == due_attempt_id
+      assert job.args["generation"] == 7
+      assert Repo.aggregate(Request, :count) == 0
+      assert scheduled_consume_count(upstream) == 0
+    end
+
+    @tag :stale_consuming_recovery
+    test "several due observe-only identities retain one incomplete recovery job each" do
+      upstream = start_upstream(successful_usage_response())
+      next_action_at = DateTime.add(DateTime.utc_now(), -1, :minute)
+
+      fixtures =
+        Enum.map(1..@stale_consuming_cohort_size, fn _index ->
+          {pool, assignment} = active_usage_probe_assignment(upstream)
+          identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+          attempt_id = Ecto.UUID.generate()
+
+          identity =
+            put_stale_consuming_redemption!(identity, attempt_id, 8,
+              mode: "observe_only",
+              next_action_at: next_action_at
+            )
+
+          {pool, assignment, identity, attempt_id}
+        end)
+
+      reconcile = fn ->
+        Enum.each(fixtures, fn {pool, assignment, identity, _attempt_id} ->
+          assert :ok =
+                   perform_job(
+                     AccountReconciliationWorker,
+                     scheduled_identity_reconciliation_args(pool, assignment, identity)
+                   )
+        end)
+      end
+
+      reconcile.()
+      reconcile.()
+
+      jobs = stale_consuming_recovery_jobs()
+
+      expected_identity_ids =
+        MapSet.new(fixtures, fn {_pool, _assignment, identity, _attempt_id} -> identity.id end)
+
+      expected_attempt_ids =
+        MapSet.new(fixtures, fn {_pool, _assignment, _identity, attempt_id} -> attempt_id end)
+
+      assert length(jobs) == @stale_consuming_cohort_size
+      assert MapSet.new(jobs, & &1.args["upstream_identity_id"]) == expected_identity_ids
+      assert MapSet.new(jobs, & &1.args["attempt_id"]) == expected_attempt_ids
+      assert Enum.all?(jobs, &(&1.state in ~w(available scheduled executing retryable suspended)))
+      assert Repo.aggregate(Request, :count) == 0
+      assert scheduled_consume_count(upstream) == 0
+      assert FakeUpstream.count(upstream) == 2 * @stale_consuming_cohort_size
+      assert FakeUpstream.requests(upstream) |> Enum.all?(&(&1.method == "GET"))
+    end
+
+    @tag :stale_consuming_recovery
+    test "equal creation timestamps choose the lowest assignment id regardless of order" do
+      upstream = start_upstream(successful_usage_response())
+      {first_pool, first_assignment} = active_usage_probe_assignment(upstream)
+      identity = Repo.get!(UpstreamIdentity, first_assignment.upstream_identity_id)
+
+      {second_pool, second_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Equal-time stale recovery assignment",
+          metadata: %{"base_url" => FakeUpstream.url(upstream)}
+        )
+
+      created_at =
+        DateTime.utc_now() |> DateTime.add(-1, :hour) |> DateTime.truncate(:microsecond)
+
+      assignment_ids = [first_assignment.id, second_assignment.id]
+
+      {2, _rows} =
+        from(assignment in PoolUpstreamAssignment, where: assignment.id in ^assignment_ids)
+        |> Repo.update_all(set: [created_at: created_at])
+
+      fixtures = [{first_pool, first_assignment}, {second_pool, second_assignment}]
+
+      {_canonical_pool, canonical_assignment} =
+        Enum.min_by(fixtures, fn {_pool, assignment} -> assignment.id end)
+
+      attempt_id = Ecto.UUID.generate()
+      put_stale_consuming_redemption!(identity, attempt_id, 8)
+
+      fixtures
+      |> Enum.sort_by(fn {_pool, assignment} -> assignment.id end, :desc)
+      |> Enum.each(fn {pool, assignment} ->
+        assert {:ok, :ok, canonical_query_count} =
+                 capture_canonical_assignment_queries(fn ->
+                   perform_job(
+                     AccountReconciliationWorker,
+                     scheduled_identity_reconciliation_args(pool, assignment, identity)
+                   )
+                 end)
+
+        assert canonical_query_count > 0
+      end)
+
+      assert [job] = stale_consuming_recovery_jobs()
+      assert job.args["pool_upstream_assignment_id"] == canonical_assignment.id
+      assert job.args["attempt_id"] == attempt_id
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    @tag :stale_consuming_recovery
+    test "ignores an older inactive-pool assignment when choosing stale recovery canonical" do
+      upstream = start_upstream(successful_usage_response())
+      {inactive_pool, inactive_assignment} = active_usage_probe_assignment(upstream)
+      identity = Repo.get!(UpstreamIdentity, inactive_assignment.upstream_identity_id)
+
+      {active_pool, active_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Active stale recovery assignment",
+          created_at: DateTime.add(inactive_assignment.created_at, 60, :second),
+          metadata: %{"base_url" => FakeUpstream.url(upstream)}
+        )
+
+      inactive_pool
+      |> Ecto.Changeset.change(%{status: "disabled", disabled_at: DateTime.utc_now()})
+      |> Repo.update!()
+
+      attempt_id = Ecto.UUID.generate()
+      put_stale_consuming_redemption!(identity, attempt_id, 2)
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(active_pool, active_assignment, identity)
+               )
+
+      assert [job] = stale_consuming_recovery_jobs()
+      assert job.args["pool_upstream_assignment_id"] == active_assignment.id
+      refute job.args["pool_upstream_assignment_id"] == inactive_assignment.id
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    @tag :stale_consuming_recovery
+    test "re-enqueues after job loss and canonical change while settled metadata stays quiet" do
+      upstream = start_upstream(successful_usage_response())
+      {first_pool, first_assignment} = active_usage_probe_assignment(upstream)
+      identity = Repo.get!(UpstreamIdentity, first_assignment.upstream_identity_id)
+
+      {replacement_pool, replacement_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Replacement stale recovery assignment",
+          created_at: DateTime.add(first_assignment.created_at, 60, :second),
+          metadata: %{"base_url" => FakeUpstream.url(upstream)}
+        )
+
+      attempt_id = Ecto.UUID.generate()
+      put_stale_consuming_redemption!(identity, attempt_id, 5)
+
+      first_args = scheduled_identity_reconciliation_args(first_pool, first_assignment, identity)
+      assert :ok = perform_job(AccountReconciliationWorker, first_args)
+      assert [first_job] = stale_consuming_recovery_jobs()
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^first_job.id)
+        |> Repo.update_all(set: [state: "discarded", discarded_at: DateTime.utc_now()])
+
+      assert :ok = perform_job(AccountReconciliationWorker, first_args)
+      assert [discarded_first_job, replacement_after_loss] = stale_consuming_recovery_jobs()
+      assert discarded_first_job.id == first_job.id
+      assert discarded_first_job.state == "discarded"
+      assert replacement_after_loss.args["pool_upstream_assignment_id"] == first_assignment.id
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^replacement_after_loss.id)
+        |> Repo.update_all(set: [state: "completed", completed_at: DateTime.utc_now()])
+
+      assert {:ok, _disabled_assignment} =
+               PoolAssignments.disable_pool_assignment(first_assignment)
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   replacement_pool,
+                   replacement_assignment,
+                   identity
+                 )
+               )
+
+      assert [discarded_first_job, completed_replacement_after_loss, canonical_replacement] =
+               stale_consuming_recovery_jobs()
+
+      assert discarded_first_job.id == first_job.id
+      assert completed_replacement_after_loss.id == replacement_after_loss.id
+      assert completed_replacement_after_loss.state == "completed"
+
+      assert canonical_replacement.args["pool_upstream_assignment_id"] ==
+               replacement_assignment.id
+
+      settle_stale_consuming_redemption!(identity)
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^canonical_replacement.id)
+        |> Repo.update_all(set: [state: "completed", completed_at: DateTime.utc_now()])
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   replacement_pool,
+                   replacement_assignment,
+                   identity
+                 )
+               )
+
+      assert length(stale_consuming_recovery_jobs()) == 3
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    @tag :scheduled_expiry_enqueue
+    test "concurrent sibling assignments enqueue one incomplete saved-reset job per identity" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      {_second_pool, second_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Scheduled saved-reset sibling",
+          created_at: DateTime.add(assignment.created_at, 60, :second)
+        )
+
+      parent = self()
+
+      tasks =
+        Enum.map([assignment, second_assignment], fn target_assignment ->
+          start_allowed_task(fn ->
+            send(parent, {:scheduled_enqueue_ready, self()})
+
+            receive do
+              :enqueue_scheduled_saved_reset ->
+                Jobs.enqueue_scheduled_saved_reset_redemption(target_assignment)
+            end
+          end)
+        end)
+
+      task_pids =
+        Enum.map(tasks, fn _task ->
+          assert_receive {:scheduled_enqueue_ready, task_pid}
+          task_pid
+        end)
+
+      Enum.each(task_pids, &send(&1, :enqueue_scheduled_saved_reset))
+      results = Enum.map(tasks, &Task.await/1)
+
+      assert Enum.count(results, &match?({:ok, %{conflict?: false}}, &1)) == 1
+      assert Enum.count(results, &match?({:ok, %{conflict?: true}}, &1)) == 1
+
+      assert [persisted_job] =
+               Repo.all(
+                 from(job in Oban.Job,
+                   where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+                 )
+               )
+
+      assert persisted_job.state in ~w(suspended available scheduled executing retryable)
+      assert persisted_job.args["upstream_identity_id"] == identity.id
+    end
+
+    @tag :scheduled_expiry_enqueue
+    test "scheduled saved-reset uniqueness covers every incomplete state without a time limit" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      {_second_pool, second_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Scheduled saved-reset uniqueness sibling",
+          created_at: DateTime.add(assignment.created_at, 60, :second)
+        )
+
+      for incomplete_state <- ~w(suspended available scheduled executing retryable) do
+        Repo.delete_all(Oban.Job)
+
+        assert {:ok, first_job} =
+                 Jobs.enqueue_scheduled_saved_reset_redemption(assignment)
+
+        old_inserted_at =
+          DateTime.utc_now()
+          |> DateTime.add(-30, :day)
+          |> DateTime.truncate(:microsecond)
+
+        {1, _rows} =
+          from(job in Oban.Job, where: job.id == ^first_job.id)
+          |> Repo.update_all(set: [state: incomplete_state, inserted_at: old_inserted_at])
+
+        assert {:ok, conflict_job} =
+                 Jobs.enqueue_scheduled_saved_reset_redemption(second_assignment)
+
+        assert conflict_job.conflict?
+        assert conflict_job.id == first_job.id
+      end
+
+      Repo.delete_all(Oban.Job)
+
+      assert {:ok, completed_job} =
+               Jobs.enqueue_scheduled_saved_reset_redemption(assignment)
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^completed_job.id)
+        |> Repo.update_all(set: [state: "completed", completed_at: DateTime.utc_now()])
+
+      assert {:ok, replacement_job} =
+               Jobs.enqueue_scheduled_saved_reset_redemption(second_assignment)
+
+      refute replacement_job.conflict?
+      refute replacement_job.id == completed_job.id
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "fresh canonical scheduled identity reconciliation enqueues B1, B2, and B3" do
+      scenarios = [
+        {:b1, [weekly_used_percent: 100], "exhausted"},
+        {:b2,
+         [
+           weekly_used_percent: 95,
+           policy_attrs: %{saved_reset_auto_redeem_trigger_mode: "threshold"}
+         ], "threshold"},
+        {:b3, [weekly_used_percent: 25], "last_call"}
+      ]
+
+      for {scenario, opts, expected_detail} <- scenarios do
+        Repo.delete_all(Oban.Job)
+
+        %{pool: pool, assignment: assignment, identity: identity, upstream: upstream} =
+          scheduled_expiry_reconciliation_fixture(opts)
+
+        assert :ok =
+                 perform_job(
+                   AccountReconciliationWorker,
+                   scheduled_identity_reconciliation_args(pool, assignment, identity)
+                 )
+
+        persisted_identity = Repo.get!(UpstreamIdentity, identity.id)
+
+        assert {:ok, observed_at, _offset} =
+                 persisted_identity.metadata["saved_resets"]["observed_at"]
+                 |> DateTime.from_iso8601()
+
+        assert AutoEligibility.scheduled_expiry_candidate?(persisted_identity, DateTime.utc_now())
+        assert [job] = scheduled_saved_reset_redemption_jobs()
+
+        assert job.args == %{
+                 "pool_upstream_assignment_id" => assignment.id,
+                 "upstream_identity_id" => identity.id,
+                 "target_kind" => "upstream_identity",
+                 "trigger_kind" => "scheduled_expiry_rescue"
+               }
+
+        windows = QuotaWindows.list_evidence(persisted_identity)
+        policy = SavedResets.auto_policy(persisted_identity)
+        snapshot = SavedResets.snapshot(persisted_identity, observed_at)
+
+        assert {:burn, %{trigger_detail: ^expected_detail}} =
+                 AutoEligibility.scheduled_burn_condition(
+                   windows,
+                   policy,
+                   snapshot,
+                   observed_at
+                 ),
+               Atom.to_string(scenario)
+
+        assert DateTime.compare(observed_at, DateTime.add(DateTime.utc_now(), -60, :second)) !=
+                 :lt
+
+        assert Repo.aggregate(Request, :count) == 0
+
+        provider_requests = FakeUpstream.requests(upstream)
+
+        assert Enum.any?(
+                 provider_requests,
+                 &(&1.method == "GET" and &1.path == "/backend-api/wham/usage")
+               )
+
+        assert Enum.all?(provider_requests, &(&1.method == "GET"))
+        refute Enum.any?(provider_requests, &String.contains?(&1.path, "/consume"))
+
+        post_consume_payload =
+          observed_at
+          |> scheduled_expiry_usage_payload(expiration?: false, weekly_used_percent: 0)
+          |> put_in(["rate_limit_reset_credits", "available_count"], 0)
+
+        FakeUpstream.set_mode(
+          upstream,
+          {:path_json,
+           %{
+             "/backend-api/wham/rate-limit-reset-credits" =>
+               {200,
+                %{
+                  "credits" => [%{"id" => "synthetic-credit", "status" => "available"}],
+                  "available_count" => 1
+                }},
+             "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/backend-api/wham/usage" => {200, post_consume_payload}
+           }}
+        )
+
+        assert %{success: 1, failure: 0, discard: 0} = Oban.drain_queue(queue: :jobs)
+        assert Repo.get!(Oban.Job, job.id).state == "completed"
+        assert scheduled_consume_count(upstream) == 1
+        assert Repo.aggregate(Request, :count) == 0
+
+        redemption = Repo.get!(UpstreamIdentity, identity.id).metadata["saved_reset_redemption"]
+        assert redemption["result"]["applied"] == true
+        assert redemption["trigger_detail"] == expected_detail
+        refute Map.has_key?(redemption, "probe")
+        assert scheduled_saved_reset_redemption_jobs() == [Repo.get!(Oban.Job, job.id)]
+
+        assert Repo.all(from(current_job in Oban.Job, select: {current_job.worker, current_job.queue})) ==
+                 [{worker_name(SavedResetRedemptionWorker), "jobs"}]
+      end
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "queued B2 condition flip completes as noop without provider consume" do
+      %{pool: pool, assignment: assignment, identity: identity, upstream: upstream} =
+        scheduled_expiry_reconciliation_fixture(
+          weekly_used_percent: 95,
+          policy_attrs: %{saved_reset_auto_redeem_trigger_mode: "threshold"}
+        )
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(pool, assignment, identity)
+               )
+
+      assert [job] = scheduled_saved_reset_redemption_jobs()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      identity
+      |> QuotaWindows.list_evidence()
+      |> Enum.each(fn window ->
+        window
+        |> AccountQuotaWindow.changeset(%{
+          used_percent: Decimal.new("0"),
+          observed_at: observed_at,
+          last_sync_at: observed_at
+        })
+        |> Repo.update!()
+      end)
+
+      persisted_identity = Repo.get!(UpstreamIdentity, identity.id)
+      persisted_windows = QuotaWindows.list_evidence(persisted_identity)
+      snapshot = SavedResets.snapshot(persisted_identity, observed_at)
+      policy = SavedResets.auto_policy(persisted_identity)
+
+      assert {:not_ready, :burn_condition_absent} =
+               AutoEligibility.scheduled_burn_condition(
+                 persisted_windows,
+                 policy,
+                 snapshot,
+                 observed_at
+               ),
+             inspect(
+               Enum.map(
+                 persisted_windows,
+                 &Map.take(&1, [:quota_key, :source, :used_percent, :reset_at, :observed_at])
+               )
+             )
+
+      refute AutoEligibility.scheduled_expiry_candidate?(persisted_identity, observed_at)
+
+      consume_count_before = scheduled_consume_count(upstream)
+
+      drain_result = Oban.drain_queue(queue: :jobs)
+      drained_job = Repo.get!(Oban.Job, job.id)
+
+      assert drain_result ==
+               %{cancelled: 0, discard: 0, failure: 0, snoozed: 0, success: 1},
+             inspect(%{drain_result: drain_result, job: drained_job})
+
+      assert drained_job.state == "completed"
+      assert scheduled_consume_count(upstream) == consume_count_before
+      assert Repo.aggregate(Request, :count) == 0
+
+      persisted_identity = Repo.get!(UpstreamIdentity, identity.id)
+      refute Map.has_key?(persisted_identity.metadata || %{}, "saved_reset_redemption")
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "scheduled B2 is evaluated per identity" do
+      %{pool: pool, assignment: assignment, identity: identity} =
+        scheduled_expiry_reconciliation_fixture(
+          weekly_used_percent: 95,
+          policy_attrs: %{saved_reset_auto_redeem_trigger_mode: "threshold"}
+        )
+
+      %{identity: sibling_identity} =
+        active_upstream_assignment_fixture(pool, %{
+          account_label: "Scheduled threshold sibling",
+          assignment_label: "Scheduled threshold sibling assignment"
+        })
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(sibling_identity, [
+                 scheduled_weekly_window_attrs(
+                   DateTime.utc_now() |> DateTime.truncate(:microsecond),
+                   Decimal.new("10"),
+                   2 * 60 * 60
+                 )
+               ])
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(pool, assignment, identity)
+               )
+
+      assert [job] = scheduled_saved_reset_redemption_jobs()
+      assert job.args["upstream_identity_id"] == identity.id
+      assert job.args["pool_upstream_assignment_id"] == assignment.id
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    @tag slow: "holds an assignment row lock across actual saved-reset expiration"
+    test "scheduled redemption resolves its decision time after the assignment lock" do
+      fixture =
+        Sandbox.unboxed_run(Repo, fn ->
+          %{pool: pool, assignment: assignment, identity: identity, upstream: upstream} =
+            scheduled_expiry_reconciliation_fixture()
+
+          assert :ok =
+                   perform_job(
+                     AccountReconciliationWorker,
+                     scheduled_identity_reconciliation_args(pool, assignment, identity)
+                   )
+
+          {pool, assignment, Repo.reload!(identity), upstream}
+        end)
+
+      {pool, assignment, identity, upstream} = fixture
+
+      on_exit(fn -> cleanup_committed_reconciliation_fixture(identity.id, [pool.id]) end)
+
+      expires_at =
+        DateTime.utc_now() |> DateTime.add(1, :second) |> DateTime.truncate(:microsecond)
+
+      Sandbox.unboxed_run(Repo, fn ->
+        persisted = Repo.reload!(identity)
+        saved_resets = persisted.metadata["saved_resets"]
+        expires_at_iso = DateTime.to_iso8601(expires_at)
+
+        persisted
+        |> UpstreamIdentity.changeset(%{
+          metadata:
+            put_in(persisted.metadata, ["saved_resets"], %{
+              saved_resets
+              | "available_expires_at" => [expires_at_iso],
+                "available_expirations" => [
+                  %{
+                    "expires_at" => expires_at_iso,
+                    "first_seen_at" => saved_resets["observed_at"]
+                  }
+                ],
+                "next_expires_at" => expires_at_iso
+            })
+        })
+        |> Repo.update!()
+      end)
+
+      parent = self()
+      release_ref = make_ref()
+
+      lock_holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.one!(
+                from(current_assignment in PoolUpstreamAssignment,
+                  where: current_assignment.id == ^assignment.id,
+                  lock: "FOR UPDATE"
+                )
+              )
+
+              send(parent, {:scheduled_assignment_locked, release_ref})
+
+              receive do
+                ^release_ref -> :ok
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:scheduled_assignment_locked, ^release_ref}
+
+      redemption =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:scheduled_redemption_connection, release_ref, backend_pid})
+            SavedResetRedemption.redeem_scheduled_expiry(assignment.id, identity.id)
+          end)
+        end)
+
+      assert_receive {:scheduled_redemption_connection, ^release_ref, backend_pid}
+      assert_backend_waiting_on_db_lock!(backend_pid)
+
+      receive do
+      after
+        max(
+          DateTime.diff(DateTime.add(expires_at, 1, :second), DateTime.utc_now(), :millisecond) +
+              50,
+          0
+        ) ->
+          :ok
+      end
+
+      send(lock_holder.pid, release_ref)
+      assert {:ok, :ok} = Task.await(lock_holder)
+
+      assert {:ok, %{status: :noop, code: "scheduled_expiry_not_expiring"}} =
+               Task.await(redemption)
+
+      persisted = Sandbox.unboxed_run(Repo, fn -> Repo.reload!(identity) end)
+      refute Map.has_key?(persisted.metadata || %{}, "saved_reset_redemption")
+      assert scheduled_consume_count(upstream) == 0
+    end
+
+    @tag :scheduled_expiry_zero_traffic
+    @tag :reconciliation_runtime
+    test "scheduled pending redemption converges from later reconciliation without a request probe" do
+      %{pool: pool, assignment: assignment, identity: identity, upstream: upstream} =
+        scheduled_expiry_reconciliation_fixture()
+
+      reconciliation_args = scheduled_identity_reconciliation_args(pool, assignment, identity)
+
+      assert :ok = perform_job(AccountReconciliationWorker, reconciliation_args)
+      assert [job] = scheduled_saved_reset_redemption_jobs()
+
+      FakeUpstream.set_mode(
+        upstream,
+        {:path_json,
+         %{
+           "/backend-api/wham/rate-limit-reset-credits" =>
+             {200,
+              %{
+                "credits" => [%{"id" => "synthetic-credit", "status" => "available"}],
+                "available_count" => 1
+              }},
+           "/backend-api/wham/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+           "/api/codex/usage" => {500, %{"error" => "synthetic usage failure"}},
+           "/backend-api/codex/usage" => {500, %{"error" => "synthetic usage failure"}},
+           "/wham/usage" => {500, %{"error" => "synthetic usage failure"}},
+           "/backend-api/wham/usage" => {500, %{"error" => "synthetic usage failure"}}
+         }}
+      )
+
+      assert :ok = perform_job(SavedResetRedemptionWorker, job.args)
+
+      pending =
+        Repo.get!(UpstreamIdentity, identity.id).metadata["saved_reset_redemption"]
+
+      assert pending["phase"] == "consumed_pending_probe"
+      assert pending["status"] == "redeeming"
+      refute Map.has_key?(pending, "probe")
+      assert Repo.aggregate(Request, :count) == 0
+      assert scheduled_consume_count(upstream) == 1
+
+      fresh_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      fresh_payload =
+        fresh_at
+        |> scheduled_expiry_usage_payload(expiration?: false, weekly_used_percent: 100)
+        |> put_in(["rate_limit_reset_credits", "available_count"], 0)
+
+      FakeUpstream.set_mode(
+        upstream,
+        {:path_json, %{"/backend-api/wham/usage" => {200, fresh_payload}}}
+      )
+
+      Repo.delete_all(Oban.Job)
+
+      convergence_event = [:codex_pooler, :saved_reset, :convergence]
+      convergence_handler = {__MODULE__, :reconciliation_convergence, self()}
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          convergence_handler,
+          convergence_event,
+          fn ^convergence_event, measurements, metadata, ^test_pid ->
+            send(test_pid, {convergence_handler, measurements, metadata})
+          end,
+          test_pid
+        )
+
+      on_exit(fn -> :telemetry.detach(convergence_handler) end)
+
+      assert {:ok, second_reconciliation} =
+               AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+
+      assert second_reconciliation.status == :succeeded, inspect(second_reconciliation)
+      assert second_reconciliation.quota.code == "quota_refreshed", inspect(second_reconciliation)
+
+      assert_receive {^convergence_handler, %{count: 1}, %{source: "reconciliation", outcome: "reblocked"}}
+
+      converged =
+        Repo.get!(UpstreamIdentity, identity.id).metadata["saved_reset_redemption"]
+
+      assert {:ok, consumed_at, _offset} = DateTime.from_iso8601(pending["consumed_at"])
+
+      fresh_windows = QuotaWindows.list_evidence(identity)
+
+      assert Enum.any?(fresh_windows, &(&1.quota_key == "account")),
+             inspect(
+               Enum.map(
+                 fresh_windows,
+                 &Map.take(&1, [:quota_key, :used_percent, :observed_at, :source_precision])
+               )
+             )
+
+      assert Enum.any?(
+               fresh_windows,
+               &(is_struct(&1.observed_at, DateTime) and
+                   DateTime.compare(&1.observed_at, consumed_at) != :lt)
+             ),
+             inspect(
+               Enum.map(
+                 fresh_windows,
+                 &Map.take(&1, [:quota_key, :used_percent, :observed_at, :source_precision])
+               )
+             )
+
+      assert PostResetEvidence.classify(
+               fresh_windows,
+               consumed_at,
+               DateTime.utc_now()
+             ) == :reblocked
+
+      assert converged["phase"] == "reblocked"
+      assert converged["convergence_source"] == "reconciliation"
+      assert converged["convergence_outcome"] == "reblocked"
+      refute Map.has_key?(converged, "probe")
+      assert Repo.aggregate(Request, :count) == 0
+      assert scheduled_consume_count(upstream) == 1
+      assert scheduled_saved_reset_redemption_jobs() == []
+
+      preserved_fields =
+        Map.take(converged, [
+          "attempt_id",
+          "generation",
+          "started_at",
+          "consumed_at",
+          "deadline_at",
+          "result",
+          "trigger_kind",
+          "trigger_detail",
+          "provider_replay"
+        ])
+
+      later_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      later_reset_at = DateTime.add(later_at, 2, :day)
+
+      later_window_attrs = %{
+        quota_key: "account",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        used_percent: Decimal.new("4"),
+        reset_at: later_reset_at,
+        observed_at: later_at,
+        last_sync_at: later_at,
+        source: "codex_usage_api",
+        source_precision: "observed",
+        quota_scope: "account",
+        quota_family: "account",
+        freshness_state: "fresh"
+      }
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [later_window_attrs])
+
+      assert {:ok, :unchanged} = Convergence.converge(identity, later_at)
+
+      confirmed_at = DateTime.add(later_at, 1, :second)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   later_window_attrs
+                   | observed_at: confirmed_at,
+                     last_sync_at: confirmed_at
+                 }
+               ])
+
+      assert {:ok, :confirmed_by_quota} = Convergence.converge(identity, confirmed_at)
+
+      recovered =
+        Repo.get!(UpstreamIdentity, identity.id).metadata["saved_reset_redemption"]
+
+      assert recovered["phase"] == "confirmed_by_quota"
+
+      assert recovered["status"] == "succeeded"
+      assert recovered["terminal_reason"] == "converged_confirmed_by_quota"
+      assert Map.take(recovered, Map.keys(preserved_fields)) == preserved_fields
+      assert Repo.aggregate(Request, :count) == 0
+      assert scheduled_consume_count(upstream) == 1
+      assert scheduled_saved_reset_redemption_jobs() == []
+
+      if System.get_env("RECONCILIATION_MANUAL_QA") == "1" do
+        CodexPooler.TestDiagnostics.puts(
+          "RECONCILIATION_ZERO_TRAFFIC pending_phase=#{pending["phase"]} " <>
+            "probe_present=#{Map.has_key?(pending, "probe")} " <>
+            "accounting_count=#{Repo.aggregate(Request, :count)} " <>
+            "converged_phase=#{converged["phase"]} " <>
+            "consume_count=#{scheduled_consume_count(upstream)}"
+        )
+      end
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "scheduled reconciliation policy and expiry negatives enqueue nothing" do
+      scenarios = [
+        {:policy_disabled, [policy_enabled?: false], :ok},
+        {:no_weekly_usage, [weekly_used_percent: nil], :ok},
+        {:natural_reset_buffer, [weekly_reset_after_seconds: 30 * 60], :ok},
+        {:blocked_only, [expiration?: false, weekly_used_percent: 100], :ok},
+        {:threshold_only,
+         [
+           expiration?: false,
+           weekly_used_percent: 70,
+           policy_attrs: %{saved_reset_auto_redeem_trigger_mode: "threshold"}
+         ], :ok}
+      ]
+
+      for {scenario, opts, expected_result} <- scenarios do
+        Repo.delete_all(Oban.Job)
+
+        %{pool: pool, assignment: assignment, identity: identity} =
+          scheduled_expiry_reconciliation_fixture(opts)
+
+        result =
+          perform_job(
+            AccountReconciliationWorker,
+            scheduled_identity_reconciliation_args(pool, assignment, identity)
+          )
+
+        case expected_result do
+          :ok -> assert result == :ok, Atom.to_string(scenario)
+          :error -> assert match?({:error, _reason}, result), Atom.to_string(scenario)
+        end
+
+        assert scheduled_saved_reset_redemption_jobs() == [], Atom.to_string(scenario)
+        assert Repo.aggregate(Request, :count) == 0, Atom.to_string(scenario)
+      end
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "scheduled-shaped direct, malformed, and noncanonical jobs enqueue nothing" do
+      malformed_args = [
+        direct_assignment: fn pool, assignment, _identity ->
+          %{
+            "pool_id" => pool.id,
+            "pool_upstream_assignment_id" => assignment.id,
+            "trigger_kind" => "scheduled"
+          }
+        end,
+        missing_identity: fn pool, assignment, _identity ->
+          %{
+            "pool_id" => pool.id,
+            "pool_upstream_assignment_id" => assignment.id,
+            "target_kind" => "upstream_identity",
+            "trigger_kind" => "scheduled"
+          }
+        end,
+        mismatched_identity: fn pool, assignment, _identity ->
+          %{
+            "pool_id" => pool.id,
+            "pool_upstream_assignment_id" => assignment.id,
+            "upstream_identity_id" => Ecto.UUID.generate(),
+            "target_kind" => "upstream_identity",
+            "trigger_kind" => "scheduled"
+          }
+        end
+      ]
+
+      for {scenario, args_builder} <- malformed_args do
+        Repo.delete_all(Oban.Job)
+
+        %{pool: pool, assignment: assignment, identity: identity} =
+          scheduled_expiry_reconciliation_fixture()
+
+        assert :ok =
+                 perform_job(
+                   AccountReconciliationWorker,
+                   args_builder.(pool, assignment, identity)
+                 )
+
+        assert scheduled_saved_reset_redemption_jobs() == [], Atom.to_string(scenario)
+        assert Repo.aggregate(Request, :count) == 0, Atom.to_string(scenario)
+      end
+
+      Repo.delete_all(Oban.Job)
+
+      %{assignment: canonical_assignment, identity: identity} =
+        scheduled_expiry_reconciliation_fixture()
+
+      {noncanonical_pool, noncanonical_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Noncanonical scheduled expiry assignment",
+          created_at: DateTime.add(canonical_assignment.created_at, 60, :second),
+          metadata: canonical_assignment.metadata
+        )
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   noncanonical_pool,
+                   noncanonical_assignment,
+                   identity
+                 )
+               )
+
+      assert scheduled_saved_reset_redemption_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "reused, failed, skipped, and stale saved-reset observations enqueue nothing" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      stale_observed_at = DateTime.add(now, -60, :second)
+      stale_saved_resets = scheduled_saved_reset_metadata(stale_observed_at, "codex_usage_api")
+      upstream = start_upstream(unavailable_usage_paths())
+
+      {reused_pool, reused_assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata:
+            fresh_access_token_metadata(FakeUpstream.url(upstream))
+            |> Map.put("saved_resets", stale_saved_resets)
+        )
+
+      reused_identity =
+        Repo.get!(UpstreamIdentity, reused_assignment.upstream_identity_id)
+        |> enable_scheduled_expiry_policy!()
+
+      persist_quota_windows!(reused_identity, [
+        scheduled_weekly_window_attrs(now, Decimal.new("25"), 2 * 60 * 60)
+      ])
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   reused_pool,
+                   reused_assignment,
+                   reused_identity
+                 )
+               )
+
+      assert scheduled_saved_reset_redemption_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+
+      Repo.delete_all(Oban.Job)
+
+      {failed_pool, failed_assignment} =
+        active_usage_probe_assignment(start_upstream(unavailable_usage_paths()))
+
+      failed_identity =
+        Repo.get!(UpstreamIdentity, failed_assignment.upstream_identity_id)
+        |> enable_scheduled_expiry_policy!()
+
+      assert {:error, error} =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   failed_pool,
+                   failed_assignment,
+                   failed_identity
+                 )
+               )
+
+      assert error =~ "quota_refresh_unavailable"
+      assert scheduled_saved_reset_redemption_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+
+      Repo.delete_all(Oban.Job)
+
+      %{pool: skipped_pool, assignment: skipped_assignment, identity: skipped_identity} =
+        scheduled_expiry_reconciliation_fixture()
+
+      assert {:ok, skipped_assignment} =
+               PoolAssignments.disable_pool_assignment(skipped_assignment)
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   skipped_pool,
+                   skipped_assignment,
+                   skipped_identity
+                 )
+               )
+
+      assert scheduled_saved_reset_redemption_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+
+      Repo.delete_all(Oban.Job)
+
+      local_saved_resets =
+        scheduled_saved_reset_metadata(stale_observed_at, "local_reconciliation")
+
+      {stale_pool, stale_assignment} =
+        active_assignment_fixture(
+          %{
+            "quota_windows" => [
+              %{
+                "quota_key" => "account",
+                "quota_scope" => "account",
+                "quota_family" => "account",
+                "window_kind" => "secondary",
+                "window_minutes" => 10_080,
+                "used_percent" => 25,
+                "reset_at" => DateTime.to_iso8601(DateTime.add(now, 2, :hour)),
+                "source" => "local_reconciliation",
+                "source_precision" => "observed",
+                "freshness_state" => "fresh"
+              }
+            ]
+          },
+          identity_metadata: %{"saved_resets" => local_saved_resets}
+        )
+
+      stale_identity =
+        Repo.get!(UpstreamIdentity, stale_assignment.upstream_identity_id)
+        |> enable_scheduled_expiry_policy!()
+
+      assert :ok =
+               perform_job(
+                 AccountReconciliationWorker,
+                 scheduled_identity_reconciliation_args(
+                   stale_pool,
+                   stale_assignment,
+                   stale_identity
+                 )
+               )
+
+      persisted_stale_identity = Repo.get!(UpstreamIdentity, stale_identity.id)
+      persisted_stale_assignment = Repo.get!(PoolUpstreamAssignment, stale_assignment.id)
+
+      assert Enum.any?(
+               persisted_stale_assignment.metadata["last_reconciliation"]["steps"],
+               &(&1["code"] == "quota_refreshed")
+             )
+
+      assert persisted_stale_identity.metadata["saved_resets"]["observed_at"] ==
+               DateTime.to_iso8601(stale_observed_at)
+
+      assert AutoEligibility.scheduled_expiry_candidate?(
+               persisted_stale_identity,
+               DateTime.utc_now()
+             )
+
+      assert scheduled_saved_reset_redemption_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    @tag :scheduled_expiry_reconciliation
+    test "superseded fresh provider reconciliation enqueues nothing" do
+      release_ref = make_ref()
+      payload = scheduled_expiry_usage_payload(DateTime.utc_now())
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/backend-api/wham/usage" =>
+               FakeUpstream.barrier_json_response(payload,
+                 notify: self(),
+                 release_ref: release_ref
+               )
+           }}
+        )
+
+      {pool, assignment} = active_usage_probe_assignment(upstream)
+
+      identity =
+        Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+        |> enable_scheduled_expiry_policy!()
+
+      reconciliation =
+        start_allowed_task(fn ->
+          perform_job(
+            AccountReconciliationWorker,
+            scheduled_identity_reconciliation_args(pool, assignment, identity)
+          )
+        end)
+
+      barrier = await_upstream_barrier(release_ref)
+      assert {:ok, _disabled_assignment} = PoolAssignments.disable_pool_assignment(assignment)
+      release_upstream_barrier(barrier, release_ref)
+
+      assert :ok = Task.await(reconciliation)
+      assert scheduled_saved_reset_redemption_jobs() == []
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
     @tag :scheduled_identity_reconciliation
     test "deduplicates incomplete scheduled reconciliation jobs by upstream identity" do
       {_pool, assignment} = active_assignment_fixture(%{})
@@ -4197,6 +5792,58 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert later_job.id != first_job.id
       assert later_job.args["upstream_identity_id"] == identity.id
       assert later_job.args["pool_upstream_assignment_id"] == assignment.id
+    end
+
+    test "scheduled reconciliation tolerates minute-boundary insertion jitter after completion" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+
+      assert :ok = perform_job(AccountReconciliationEnqueueWorker, %{})
+      assert [first_job] = all_enqueued(worker: AccountReconciliationWorker)
+
+      jittered_inserted_at =
+        DateTime.utc_now()
+        |> DateTime.add(-56, :second)
+        |> DateTime.truncate(:microsecond)
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^first_job.id)
+        |> Repo.update_all(
+          set: [
+            state: "completed",
+            attempt: 1,
+            inserted_at: jittered_inserted_at,
+            attempted_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+            completed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+          ]
+        )
+
+      assert :ok = perform_job(AccountReconciliationEnqueueWorker, %{})
+      assert [later_job] = all_enqueued(worker: AccountReconciliationWorker)
+
+      assert later_job.id != first_job.id
+      assert later_job.args["upstream_identity_id"] == assignment.upstream_identity_id
+    end
+
+    test "scheduled reconciliation keeps a cooldown inside the cron jitter margin" do
+      {_pool, _assignment} = active_assignment_fixture(%{})
+
+      assert {:ok, %{inserted: [first_job], conflicts: [], errors: []}} =
+               Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: "scheduled")
+
+      recent_inserted_at =
+        DateTime.utc_now()
+        |> DateTime.add(-54, :second)
+        |> DateTime.truncate(:microsecond)
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^first_job.id)
+        |> Repo.update_all(set: [state: "completed", inserted_at: recent_inserted_at])
+
+      assert {:ok, %{inserted: [], conflicts: [conflict_job], errors: []}} =
+               Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: "scheduled")
+
+      assert conflict_job.conflict?
+      assert conflict_job.id == first_job.id
     end
 
     test "malformed active-pool trigger kind falls back to manual assignment fanout" do
@@ -4252,6 +5899,59 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert :ok = perform_job(AccountReconciliationEnqueueWorker, %{})
 
       assert [] = all_enqueued(worker: AccountReconciliationWorker)
+    end
+
+    test "scheduled enqueue observes same-process pause updates after the cache was primed" do
+      {_pool, assignment} =
+        active_assignment_fixture(%{"quota_priming" => %{"status" => "known"}})
+
+      Application.put_env(:codex_pooler, :dev_features_enabled, true)
+
+      assert {:ok, _settings} =
+               InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+                 "development" => %{"account_reconciliation_paused" => false}
+               })
+
+      assert InstanceSettings.current().development.account_reconciliation_paused == false
+
+      assert {:ok, _settings} =
+               InstanceSettings.update_system_settings(InstanceSettings.get!(), %{
+                 "development" => %{"account_reconciliation_paused" => true}
+               })
+
+      assert :ok = perform_job(AccountReconciliationEnqueueWorker, %{})
+
+      reloaded_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert reloaded_assignment.metadata["quota_priming"]["status"] == "known"
+      assert [] = all_enqueued(worker: AccountReconciliationWorker, queue: :jobs)
+    end
+
+    test "scheduled enqueue observes an external pause update after the cache was primed" do
+      {_pool, assignment} =
+        active_assignment_fixture(%{"quota_priming" => %{"status" => "known"}})
+
+      Application.put_env(:codex_pooler, :dev_features_enabled, true)
+
+      assert {:ok, settings} =
+               InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
+                 "development" => %{"account_reconciliation_paused" => false}
+               })
+
+      assert InstanceSettings.current().development.account_reconciliation_paused == false
+
+      settings
+      |> Repo.reload!()
+      |> Settings.changeset(%{
+        "development" => %{"account_reconciliation_paused" => true}
+      })
+      |> Repo.update!()
+
+      assert Repo.get!(Settings, true).development.account_reconciliation_paused == true
+      assert :ok = perform_job(AccountReconciliationEnqueueWorker, %{})
+
+      reloaded_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert reloaded_assignment.metadata["quota_priming"]["status"] == "known"
+      assert [] = all_enqueued(worker: AccountReconciliationWorker, queue: :jobs)
     end
 
     test "account reconciliation worker no-ops when development reconciliation pause is enabled" do
@@ -4319,7 +6019,9 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                  }
                )
 
-      assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
+      assert [catalog_job] = all_enqueued(worker: CatalogSyncWorker)
+      assert catalog_job.args == %{"pool_id" => pool.id, "trigger_kind" => "manual"}
+      assert %{success: 2, discard: 0} = Oban.drain_queue(queue: :jobs)
 
       completed_job = Repo.get!(Oban.Job, job.id)
       assert completed_job.state == "completed"
@@ -4346,6 +6048,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert Repo.get!(PoolUpstreamAssignment, assignment.id) == disabled_before
     end
 
+    @tag slow: "performs real credential refresh failure and drains the already-queued Oban reconciliation"
     test "skips already queued account reconciliation jobs when upstream account requires reauth" do
       {pool, assignment} = active_assignment_fixture(%{})
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
@@ -4364,6 +6067,26 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
       assert is_nil(assignment.metadata["quota_priming"])
       assert is_nil(assignment.metadata["last_reconciliation"])
+    end
+
+    test "scheduled token refresh with a cold cache respects disabled proactive refresh" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      settings = InstanceSettings.ensure_singleton!()
+
+      assert {:ok, _settings} =
+               InstanceSettings.update_system_settings(settings, %{
+                 "gateway" => %{"upstream_token_refresh_proactive_enabled" => false}
+               })
+
+      :ok = InstanceSettings.reset_cache_for_test()
+
+      assert {:ok, %{status: :noop, retryable?: false, reason: "proactive refresh disabled"}} =
+               TokenRefresh.refresh_access_token(identity, trigger_kind: "scheduled")
+
+      assert Repo.reload!(identity) == identity
+      assert Repo.reload!(assignment) == assignment
+      refute InstanceSettings.current().gateway.upstream_token_refresh_proactive_enabled
     end
 
     test "gateway finalization reuses an incomplete scheduled identity reconciliation" do
@@ -4491,6 +6214,36 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                )
     end
 
+    test "gateway reconciliation gate admits one simultaneous claim per identity" do
+      identity_id = Ecto.UUID.generate()
+      parent = self()
+
+      on_exit(fn -> UpstreamEnqueue.release_gateway_reconciliation_gate(identity_id) end)
+
+      tasks =
+        for _index <- 1..32 do
+          Task.async(fn ->
+            send(parent, {:gate_claim_ready, self()})
+
+            receive do
+              :claim_gate -> UpstreamEnqueue.claim_gateway_reconciliation_gate(identity_id)
+            end
+          end)
+        end
+
+      task_pids =
+        for _index <- 1..32 do
+          assert_receive {:gate_claim_ready, task_pid}
+          task_pid
+        end
+
+      Enum.each(task_pids, &send(&1, :claim_gate))
+      results = Enum.map(tasks, &Task.await/1)
+
+      assert Enum.count(results, &(&1 == :ok)) == 1
+      assert Enum.count(results, &(&1 == :duplicate)) == 31
+    end
+
     test "automatic reconciliation blocks incomplete jobs older than the cooldown" do
       {pool, assignment} = active_assignment_fixture(%{})
 
@@ -4576,6 +6329,21 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       assert {:ok, first_job} = Jobs.enqueue_gateway_account_reconciliation(pool, assignment)
 
+      inside_cooldown_inserted_at =
+        DateTime.utc_now()
+        |> DateTime.add(-56, :second)
+        |> DateTime.truncate(:microsecond)
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^first_job.id)
+        |> Repo.update_all(set: [state: "completed", inserted_at: inside_cooldown_inserted_at])
+
+      assert {:ok, conflict_job} =
+               Jobs.enqueue_gateway_account_reconciliation(pool, assignment)
+
+      assert conflict_job.conflict?
+      assert conflict_job.id == first_job.id
+
       expired_inserted_at =
         DateTime.utc_now()
         |> DateTime.add(-61, :second)
@@ -4602,9 +6370,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         )
 
       assert {:ok, job} =
-               Jobs.enqueue_account_reconciliation(requested_pool, requested_assignment,
-                 trigger_kind: "manual"
-               )
+               Jobs.enqueue_account_reconciliation(requested_pool, requested_assignment, trigger_kind: "manual")
 
       assert job.args == %{
                "pool_id" => requested_pool.id,
@@ -4665,21 +6431,21 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
     {pool, identity, _assignment} = fixture
 
-    on_exit(fn ->
-      Sandbox.unboxed_run(Repo, fn ->
-        Repo.delete_all(
-          from(current_identity in UpstreamIdentity,
-            where: current_identity.id == ^identity.id
-          )
-        )
-
-        Repo.delete_all(
-          from(current_pool in CodexPooler.Pools.Pool, where: current_pool.id == ^pool.id)
-        )
-      end)
-    end)
+    on_exit(fn -> cleanup_committed_metadata_reconciliation_fixture(pool, identity) end)
 
     fixture
+  end
+
+  defp cleanup_committed_metadata_reconciliation_fixture(pool, identity) do
+    Sandbox.unboxed_run(Repo, fn ->
+      CodexPooler.PoolerFixtures.delete_committed_pools!([pool.id])
+
+      Repo.delete_all(
+        from(current_identity in UpstreamIdentity,
+          where: current_identity.id == ^identity.id
+        )
+      )
+    end)
   end
 
   defp committed_stale_priming_fixture do
@@ -4780,9 +6546,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
   defp cleanup_committed_owner(owner_id) do
     Sandbox.unboxed_run(Repo, fn ->
-      Repo.delete_all(
-        from(event in CodexPooler.Audit.AuditEvent, where: event.actor_user_id == ^owner_id)
-      )
+      Repo.delete_all(from(event in CodexPooler.Audit.AuditEvent, where: event.actor_user_id == ^owner_id))
 
       Repo.delete_all(from(membership in Membership, where: membership.user_id == ^owner_id))
       Repo.delete_all(from(user in User, where: user.id == ^owner_id))
@@ -4861,19 +6625,16 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
   defp cleanup_committed_reconciliation_fixture(identity_id, pool_ids) do
     Sandbox.unboxed_run(Repo, fn ->
-      Repo.delete_all(from(identity in UpstreamIdentity, where: identity.id == ^identity_id))
+      # Pools first: the helper finds jobs that name only an assignment before cascades remove it.
+      CodexPooler.PoolerFixtures.delete_committed_pools!(pool_ids)
 
-      Repo.delete_all(from(pool in CodexPooler.Pools.Pool, where: pool.id in ^pool_ids))
+      Repo.delete_all(from(identity in UpstreamIdentity, where: identity.id == ^identity_id))
     end)
   end
 
   defp cleanup_committed_pool(pool_id) do
     Sandbox.unboxed_run(Repo, fn ->
-      Repo.delete_all(
-        from(assignment in PoolUpstreamAssignment, where: assignment.pool_id == ^pool_id)
-      )
-
-      Repo.delete_all(from(pool in CodexPooler.Pools.Pool, where: pool.id == ^pool_id))
+      CodexPooler.PoolerFixtures.delete_committed_pools!([pool_id])
     end)
   end
 
@@ -4892,7 +6653,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   defp assert_backend_waiting_on_db_lock!(backend_pid) do
     assert_backend_waiting_on_db_lock!(
       backend_pid,
-      System.monotonic_time(:millisecond) + 5_000
+      System.monotonic_time(:millisecond) + @detection_timeout_ms
     )
   end
 
@@ -5058,7 +6819,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   end
 
   defp await_upstream_barrier(release_ref) do
-    assert_receive {:fake_upstream_timeout_barrier, :before_headers, pid, ^release_ref}, 5_000
+    assert_receive {:fake_upstream_timeout_barrier, :before_headers, pid, ^release_ref}, @detection_timeout_ms
     pid
   end
 
@@ -5141,6 +6902,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
     rejected_identity = Repo.get!(UpstreamIdentity, identity.id)
     initial_epoch = rejected_identity.metadata["credential_epoch"]
+    replacement_expires_at = DateTime.add(DateTime.utc_now(), 1, :day)
 
     assert {:ok, %{identity: linked_identity, assignment: linked_assignment}} =
              TokenLinking.link_tokens(
@@ -5149,10 +6911,14 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                %{
                  chatgpt_account_id: identity.chatgpt_account_id,
                  account_label: identity.account_label,
-                 token: "relinked-access-token"
+                 token: "relinked-access-token",
+                 access_token_expires_at: replacement_expires_at
                },
                target_identity_id: identity.id
              )
+
+    assert %{state: :known, source: :explicit, deadline: ^replacement_expires_at} =
+             TokenRefreshMetadata.project_access_token_expiry(linked_identity.metadata)
 
     %{
       source_pool: source_pool,
@@ -5225,6 +6991,21 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   def handle_assignment_update_event(_event, _measurements, metadata, {handler_id, test_pid}) do
     if metadata[:repo] == Repo and metadata[:source] == "pool_upstream_assignments" do
       send(test_pid, {handler_id, %{params: metadata[:params]}})
+    end
+  end
+
+  def handle_canonical_assignment_query_event(
+        _event,
+        _measurements,
+        metadata,
+        {handler_id, test_pid}
+      ) do
+    query = metadata[:query] |> to_string()
+
+    if metadata[:repo] == Repo and metadata[:source] == "pool_upstream_assignments" and
+         query |> String.trim_leading() |> String.starts_with?("SELECT") and
+         String.contains?(query, "upstream_identities") and String.contains?(query, "pools") do
+      send(test_pid, {handler_id, :canonical_assignment_query})
     end
   end
 
@@ -5317,7 +7098,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   end
 
   defp query_param_contains?(value, expected) when is_binary(value) do
-    value == expected or decoded_query_param_contains?(Jason.decode(value), expected)
+    value == expected or decoded_query_param_contains?(CodexPooler.JSON.decode(value), expected)
   end
 
   defp query_param_contains?(%{} = value, expected) when not is_struct(value) do
@@ -5341,6 +7122,9 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
     test_pid = self()
     handler_id = {__MODULE__, test_pid, System.unique_integer([:positive])}
 
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
     :ok =
       :telemetry.attach(
         handler_id,
@@ -5354,6 +7138,38 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       {result, drain_assignment_update_events(handler_id, [])}
     after
       :telemetry.detach(handler_id)
+    end
+  end
+
+  defp capture_canonical_assignment_queries(fun) when is_function(fun, 0) do
+    test_pid = self()
+    handler_id = {__MODULE__, :canonical_assignment_query, System.unique_integer([:positive])}
+
+    # Also on_exit: a linked crash or the ExUnit timeout kills the test before `after` runs.
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        &__MODULE__.handle_canonical_assignment_query_event/4,
+        {handler_id, test_pid}
+      )
+
+    try do
+      result = fun.()
+      {:ok, result, drain_canonical_assignment_queries(handler_id, 0)}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_canonical_assignment_queries(handler_id, count) do
+    receive do
+      {^handler_id, :canonical_assignment_query} ->
+        drain_canonical_assignment_queries(handler_id, count + 1)
+    after
+      10 -> count
     end
   end
 
@@ -5377,7 +7193,6 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       discovered_model_count: 0,
       upserted_model_count: 0,
       stale_marked_count: 0,
-      retired_count: 0,
       stats: %{}
     })
     |> Repo.insert!()
@@ -5396,27 +7211,253 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   end
 
   defp usage_payload do
+    reset_at = DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_unix()
+
     %{
       "rate_limit" => %{
         "primary_window" => %{
           "used_percent" => 25,
           "limit_window_seconds" => 18_000,
-          "reset_after_seconds" => 3_600
+          "reset_after_seconds" => 3_600,
+          "reset_at" => reset_at
         }
       }
     }
   end
 
+  defp successful_usage_response do
+    {:path_json,
+     %{
+       "/backend-api/wham/usage" => {200, usage_payload()}
+     }}
+  end
+
   defp weekly_usage_payload do
+    reset_at = DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_unix()
+
     %{
       "rate_limit" => %{
         "secondary_window" => %{
           "used_percent" => 25,
           "limit_window_seconds" => 604_800,
-          "reset_after_seconds" => 3_600
+          "reset_after_seconds" => 3_600,
+          "reset_at" => reset_at
         }
       }
     }
+  end
+
+  defp scheduled_expiry_reconciliation_fixture(opts \\ []) do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    payload = scheduled_expiry_usage_payload(observed_at, opts)
+
+    upstream =
+      start_upstream(
+        {:path_json,
+         %{
+           "/backend-api/wham/usage" => {200, payload}
+         }}
+      )
+
+    {pool, assignment} = active_usage_probe_assignment(upstream)
+    identity = Repo.get!(UpstreamIdentity, assignment.upstream_identity_id)
+
+    identity =
+      if Keyword.get(opts, :policy_enabled?, true) do
+        enable_scheduled_expiry_policy!(
+          identity,
+          Keyword.get(opts, :policy_attrs, %{})
+        )
+      else
+        identity
+      end
+
+    %{pool: pool, assignment: assignment, identity: identity, upstream: upstream}
+  end
+
+  defp scheduled_expiry_usage_payload(observed_at, opts \\ []) do
+    expires_at = observed_at |> DateTime.add(1, :hour) |> DateTime.to_iso8601()
+    granted_at = observed_at |> DateTime.add(-1, :day) |> DateTime.to_iso8601()
+
+    reset_credits =
+      if Keyword.get(opts, :expiration?, true) do
+        %{
+          "available_count" => 1,
+          "credits" => [
+            %{
+              "status" => "available",
+              "expires_at" => expires_at,
+              "granted_at" => granted_at
+            }
+          ]
+        }
+      else
+        %{"available_count" => 1}
+      end
+
+    rate_limit =
+      case Keyword.get(opts, :weekly_used_percent, 25) do
+        nil ->
+          %{}
+
+        used_percent ->
+          %{
+            "secondary_window" => %{
+              "used_percent" => used_percent,
+              "limit_window_seconds" => 604_800,
+              "reset_after_seconds" => Keyword.get(opts, :weekly_reset_after_seconds, 2 * 60 * 60),
+              "reset_at" =>
+                observed_at
+                |> DateTime.add(
+                  Keyword.get(opts, :weekly_reset_after_seconds, 2 * 60 * 60),
+                  :second
+                )
+                |> DateTime.to_unix()
+            }
+          }
+      end
+
+    %{
+      "plan_type" => "pro",
+      "rate_limit" => rate_limit,
+      "rate_limit_reset_credits" => reset_credits
+    }
+  end
+
+  defp scheduled_saved_reset_metadata(observed_at, source) do
+    observed_at_iso = DateTime.to_iso8601(observed_at)
+    expires_at = observed_at |> DateTime.add(1, :hour) |> DateTime.to_iso8601()
+
+    %{
+      "status" => "reported",
+      "available_count" => 1,
+      "source" => source,
+      "path_style" => "codex_api",
+      "observed_at" => observed_at_iso,
+      "usage_path" => "/api/codex/usage",
+      "available_expires_at" => [expires_at],
+      "available_expirations" => [
+        %{"expires_at" => expires_at, "first_seen_at" => observed_at_iso}
+      ],
+      "next_expires_at" => expires_at,
+      "expires_observed_at" => observed_at_iso,
+      "expires_refresh_attempted_at" => observed_at_iso,
+      "reason" => nil
+    }
+  end
+
+  defp scheduled_weekly_window_attrs(observed_at, used_percent, reset_after_seconds) do
+    %{
+      quota_key: "account",
+      quota_scope: "account",
+      quota_family: "account",
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      used_percent: used_percent,
+      reset_at: DateTime.add(observed_at, reset_after_seconds, :second),
+      source: "codex_usage_api",
+      source_precision: "observed",
+      freshness_state: "fresh",
+      observed_at: observed_at
+    }
+  end
+
+  defp enable_scheduled_expiry_policy!(identity, attrs \\ %{}) do
+    identity
+    |> UpstreamIdentity.changeset(
+      Map.merge(
+        %{
+          saved_reset_auto_redeem_enabled: true,
+          saved_reset_auto_redeem_min_blocked_minutes: 60,
+          saved_reset_auto_redeem_keep_credits: 0
+        },
+        attrs
+      )
+    )
+    |> Repo.update!()
+  end
+
+  defp scheduled_identity_reconciliation_args(pool, assignment, identity) do
+    %{
+      "pool_id" => pool.id,
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id,
+      "target_kind" => "upstream_identity",
+      "trigger_kind" => "scheduled"
+    }
+  end
+
+  defp scheduled_saved_reset_redemption_jobs do
+    Repo.all(
+      from(job in Oban.Job,
+        where: job.worker == ^worker_name(SavedResetRedemptionWorker),
+        order_by: [asc: job.id]
+      )
+    )
+  end
+
+  defp stale_consuming_recovery_jobs do
+    Repo.all(
+      from(job in Oban.Job,
+        where:
+          job.worker == ^worker_name(SavedResetRedemptionWorker) and
+            fragment("?->>'recovery_kind' = ?", job.args, "stale_consuming"),
+        order_by: [asc: job.id]
+      )
+    )
+  end
+
+  defp put_stale_consuming_redemption!(identity, attempt_id, generation, opts \\ []) do
+    started_at = DateTime.utc_now() |> DateTime.add(-2, :minute) |> DateTime.to_iso8601()
+    next_action_at = Keyword.get(opts, :next_action_at, started_at)
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata:
+        Map.put(identity.metadata || %{}, "saved_reset_redemption", %{
+          "status" => "redeeming",
+          "phase" => "consuming",
+          "attempt_id" => attempt_id,
+          "generation" => generation,
+          "trigger_kind" => "scheduled_expiry_rescue",
+          "started_at" => started_at,
+          "finished_at" => nil,
+          "result" => nil,
+          "provider_replay" => %{
+            "version" => 1,
+            "provider_dispatches" => 1,
+            "mode" => Keyword.get(opts, :mode, "replay"),
+            "next_action_at" => encode_datetime(next_action_at)
+          }
+        })
+    })
+    |> Repo.update!()
+  end
+
+  defp encode_datetime(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp encode_datetime(datetime) when is_binary(datetime), do: datetime
+
+  defp settle_stale_consuming_redemption!(identity) do
+    identity = Repo.reload!(identity)
+    redemption = identity.metadata["saved_reset_redemption"]
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata:
+        put_in(identity.metadata, ["saved_reset_redemption"], %{
+          redemption
+          | "status" => "failed",
+            "phase" => "reblocked",
+            "finished_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+    })
+    |> Repo.update!()
+  end
+
+  defp scheduled_consume_count(upstream) do
+    upstream
+    |> FakeUpstream.requests()
+    |> Enum.count(&String.contains?(&1.path, "/rate-limit-reset-credits/consume"))
   end
 
   defp usage_path_responses(paths, statuses, body) do
@@ -5436,8 +7477,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   defp fresh_access_token_metadata(base_url) do
     %{
       "base_url" => base_url,
-      "access_token_expires_at" =>
-        DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+      "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
     }
   end
 

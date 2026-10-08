@@ -1,0 +1,181 @@
+defmodule CodexPooler.Gateway.Metadata.CanonicalModelSource do
+  @moduledoc """
+  Pure projection boundary for a pristine per-assignment Codex model entry.
+
+  Catalog partition selection remains outside this module. A selected source may
+  only receive Pooler context-window and effective Responses Lite overlays.
+  """
+
+  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.Metadata.CodexCatalog
+  alias CodexPooler.Gateway.Routing.ModelMetadata
+
+  @forbidden_keys ~w[
+                    manual_smoke_provisioned
+                    source_assignment_ids
+                    source_assignment_missing_sync_run_ids
+                    source_assignment_models
+                    upstream_model
+                  ]
+
+  # Presentation and default-hint fields the upstream advertises per account.
+  # They drift freely between accounts on the same plan (phased rollouts,
+  # per-account experiments, copy edits) without changing how a turn executes,
+  # so they are excluded from the partition digest only. Cosmetic drift used to
+  # split a pool into partitions that routing then treats as mutually
+  # incompatible, which can strand every quota-healthy account outside the
+  # selected partition.
+  #
+  # This narrows grouping, never the payload: every field below is still served
+  # verbatim from the selected anchor source.
+  #
+  # `priority` is the model picker's sort order: the released Codex client
+  # reads it only to order its picker and to make the first visible entry
+  # its default model, and no request reads it (findings#305 row 498-6;
+  # accounts whose catalogs list the same model at another position used to
+  # be held back from every turn of it).
+  #
+  # Behavioral fields deliberately stay in the digest: `slug`, the
+  # context-window family, `use_responses_lite`, `service_tiers`,
+  # `supported_reasoning_levels`, `capabilities`, and any field not listed here.
+  @digest_excluded_keys ~w[
+                          default_reasoning_level
+                          default_service_tier
+                          description
+                          priority
+                          visibility
+                        ]
+
+  @reasoning_partition_keys ~w[
+                              reasoning_efforts
+                              supported_reasoning_levels
+                            ]
+
+  @shell_command_types ~w(default local shell_command unified_exec)
+
+  @type context_window_overrides :: ModelMetadata.context_window_overrides()
+  @type effective_model_serving_mode :: ModelMetadata.effective_model_serving_mode()
+  @type result :: {:ok, map()} | {:error, :invalid_model_metadata}
+  @type canonical_source :: %{
+          required(:digest) => String.t(),
+          required(:reasoning_agnostic_digest) => String.t(),
+          required(:source) => map()
+        }
+
+  @spec canonical_source(term()) :: {:ok, canonical_source()} | {:error, :invalid_model_metadata}
+  def canonical_source(source) when is_map(source) do
+    with {:ok, source} <- canonical_json_map(source) do
+      source = Map.drop(source, @forbidden_keys)
+
+      digest =
+        source
+        |> Map.drop(@digest_excluded_keys)
+        |> normalize_digest_shell_type()
+        |> canonical_digest()
+
+      reasoning_agnostic_digest =
+        source
+        |> Map.drop(@digest_excluded_keys ++ @reasoning_partition_keys)
+        |> normalize_digest_shell_type()
+        |> canonical_digest()
+
+      {:ok,
+       %{
+         digest: digest,
+         reasoning_agnostic_digest: reasoning_agnostic_digest,
+         source: source
+       }}
+    end
+  end
+
+  def canonical_source(_source), do: {:error, :invalid_model_metadata}
+
+  @doc "Compares tier variants without changing either advertised source. Other behavioral differences remain fenced."
+  @spec same_service_tier_family?(term(), term()) :: boolean()
+  def same_service_tier_family?(left, right) when is_map(left) and is_map(right) do
+    fields = ~w(service_tiers additional_speed_tiers)
+
+    with {:ok, left} <- canonical_source(Map.drop(left, fields)),
+         {:ok, right} <- canonical_source(Map.drop(right, fields)) do
+      left.reasoning_agnostic_digest == right.reasoning_agnostic_digest
+    else
+      _invalid -> false
+    end
+  end
+
+  def same_service_tier_family?(_left, _right), do: false
+
+  @spec project(
+          map(),
+          Model.t(),
+          context_window_overrides(),
+          effective_model_serving_mode()
+        ) :: result()
+  def project(
+        source,
+        %Model{} = model,
+        context_window_overrides,
+        effective_model_serving_mode
+      )
+      when is_map(source) and is_map(context_window_overrides) do
+    with {:ok, %{source: source}} <- canonical_source(source) do
+      payload =
+        source
+        |> ModelMetadata.apply_context_window_policy(
+          model,
+          context_window_overrides
+        )
+        |> Map.put("use_responses_lite", effective_model_serving_mode == "lite")
+        |> apply_visibility_overlay(model)
+
+      {:ok, payload}
+    end
+  end
+
+  def project(_source, %Model{}, _context_window_overrides, _mode),
+    do: {:error, :invalid_model_metadata}
+
+  defp apply_visibility_overlay(payload, %Model{} = model) do
+    identifiers = [model.exposed_model_id, model.upstream_model_id]
+
+    payload =
+      if Enum.any?(identifiers, &(&1 in ["gpt-6-astra", "astra", "gpt-reserve", "gpt_reserve"])),
+        do: Map.put(payload, "visibility", "list"),
+        else: payload
+
+    if Enum.any?(identifiers, &(&1 in ["gpt-reserve", "gpt_reserve"])) do
+      payload
+      |> Map.put("priority", 1)
+      |> Map.put("multi_agent_version", "v2")
+    else
+      payload
+    end
+  end
+
+  defp canonical_json_map(source) do
+    _etag = CodexCatalog.etag(source)
+    {:ok, stringify_keys(source)}
+  rescue
+    ArgumentError -> {:error, :invalid_model_metadata}
+  end
+
+  defp stringify_keys(value) when is_map(value) do
+    Map.new(value, fn {key, nested_value} -> {to_string(key), stringify_keys(nested_value)} end)
+  end
+
+  defp stringify_keys(value) when is_list(value), do: Enum.map(value, &stringify_keys/1)
+  defp stringify_keys(value), do: value
+
+  defp normalize_digest_shell_type(%{"shell_type" => shell_type} = source)
+       when shell_type in @shell_command_types,
+       do: Map.put(source, "shell_type", "shell_command")
+
+  defp normalize_digest_shell_type(source), do: source
+
+  defp canonical_digest(source) do
+    source
+    |> CodexCatalog.etag()
+    |> String.replace_prefix(~s(W/"cp-models-v1-), "")
+    |> String.trim_trailing(~s("))
+  end
+end

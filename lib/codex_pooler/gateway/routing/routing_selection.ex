@@ -9,6 +9,8 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
   alias CodexPooler.Gateway.Routing.{BridgeRing, CircuitState, RoutePlanInput}
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   defstruct [
@@ -20,7 +22,8 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
     :selected_metadata,
     :attempt_metadata,
     :route_metadata,
-    :circuit_state
+    :circuit_state,
+    :circuit_admission
   ]
 
   @type candidate :: {PoolUpstreamAssignment.t(), UpstreamIdentity.t()}
@@ -44,7 +47,8 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
           selected_metadata: map(),
           attempt_metadata: map(),
           route_metadata: map(),
-          circuit_state: RoutingCircuitState.t() | nil
+          circuit_state: RoutingCircuitState.t() | nil,
+          circuit_admission: CircuitState.admission() | nil
         }
 
   @spec select_and_begin_circuit(input()) :: {:ok, t()} | {:error, map()}
@@ -89,7 +93,7 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
 
         case begin_circuit(selection, auth, model, route_state) do
           {:ok, selection} ->
-            {:halt, {:ok, selection}}
+            {:halt, {:ok, put_quota_lane(selection, model, route_state)}}
 
           {:error, reason} ->
             {:cont,
@@ -100,6 +104,54 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
         end
     end)
     |> normalize_exclusions()
+  end
+
+  defp put_quota_lane(%__MODULE__{} = selection, _model, nil), do: selection
+
+  defp put_quota_lane(%__MODULE__{} = selection, %Model{} = model, %RouteState{} = route_state) do
+    snapshot = RouteState.quota_snapshot_for_identity(route_state, selection.identity)
+    eligibility = QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, model_scope_opts(model))
+
+    if gpt_reserve_selected?(snapshot, eligibility, model) do
+      %{selection | attempt_metadata: put_in(selection.attempt_metadata, ["routing", "quota_lane"], "gpt_reserve")}
+    else
+      selection
+    end
+  end
+
+  defp gpt_reserve_selected?(%RoutingQuotaSnapshot{} = _snapshot, %{selection: %{secondary: secondary}, routing_state: state}, _model)
+       when state in [:weekly_only_probe, :credit_backed_probe] and not is_nil(secondary) do
+    secondary.quota_key in ["gpt_reserve", "gpt-reserve"] or
+      secondary.model in ["gpt_reserve", "gpt-reserve"] or
+      secondary.quota_family == "codex_model" and secondary.quota_key == "gpt_reserve"
+  end
+
+  defp gpt_reserve_selected?(%RoutingQuotaSnapshot{} = snapshot, %{routing_state: state}, %Model{} = model)
+       when state in [:provider_available, "provider_available"] do
+    windows = RoutingQuotaSnapshot.time_visible_raw_windows(snapshot)
+    ordinary = QuotaWindows.quota_window_selection_data_from_windows(windows, model_scope_opts(model))
+    reserve = Enum.find(windows, &reserve_window?/1)
+
+    exhausted_weekly?(ordinary.secondary) and reserve_usable?(reserve, snapshot.as_of)
+  end
+
+  defp gpt_reserve_selected?(_, _, _), do: false
+
+  defp exhausted_weekly?(%{quota_key: "account", window_kind: "secondary", window_minutes: 10_080} = window) do
+    case window.used_percent do
+      %Decimal{} = percent -> Decimal.compare(percent, Decimal.new(100)) == :eq
+      _ -> false
+    end
+  end
+  defp exhausted_weekly?(_), do: false
+
+  defp reserve_window?(window), do: window.quota_key in ["gpt_reserve", "gpt-reserve"] or window.model in ["gpt_reserve", "gpt-reserve"]
+
+  defp reserve_usable?(nil, _), do: false
+  defp reserve_usable?(window, at), do: QuotaWindows.usable_window?(window, at)
+
+  defp model_scope_opts(%Model{} = model) do
+    [model: model.exposed_model_id, upstream_model: model.upstream_model_id]
   end
 
   @spec prepare_candidate(%{
@@ -144,8 +196,11 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
            selection.route_class,
            snapshot
          ) do
-      {:ok, circuit_state} -> {:ok, %{selection | circuit_state: circuit_state}}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{admission: admission, state: circuit_state}} ->
+        {:ok, %{selection | circuit_state: circuit_state, circuit_admission: admission}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

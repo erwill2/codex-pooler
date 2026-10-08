@@ -19,7 +19,7 @@ defmodule CodexPooler.MCP.RedactionTest do
 
   @safe_text "1 request for Sample Pool, operator op***@example.com, route /backend-api/codex/responses"
 
-  test "forbidden sentinel catalog covers every Task 5 category with synthetic values" do
+  test "forbidden sentinel catalog covers every redaction category with synthetic values" do
     categories = Redaction.forbidden_categories()
 
     for category <- [
@@ -64,7 +64,7 @@ defmodule CodexPooler.MCP.RedactionTest do
       assert category in categories
       sentinel = Redaction.forbidden_sentinel!(category)
       assert is_binary(sentinel)
-      assert sentinel =~ ~r/TASK[57]_/
+      assert sentinel =~ ~r/(?:REDACTION|RAW_TOOL)_/
     end
   end
 
@@ -130,10 +130,23 @@ defmodule CodexPooler.MCP.RedactionTest do
     end
 
     assert_raise ExUnit.AssertionError, ~r/upload_url/, fn ->
-      Redaction.assert_text_content_safe!(
-        "upload destination https://uploads.example.com/private/file"
-      )
+      Redaction.assert_text_content_safe!("upload destination https://uploads.example.com/private/file")
     end
+  end
+
+  test "structuredContent helper rejects raw IPv4 and IPv6 immediate peer addresses" do
+    for peer_ip <- ["192.0.2.91", "2001:db8::91"] do
+      assert_raise ExUnit.AssertionError, ~r/ip_address/, fn ->
+        Redaction.assert_structured_content_safe!(%{"immediate_peer_ip" => peer_ip})
+      end
+    end
+
+    assert :ok =
+             Redaction.assert_structured_content_safe!(%{
+               "immediate_peer_ip" => "[REDACTED]",
+               "client_ip_source" => "x_forwarded_for",
+               "inspected_hops" => 2
+             })
   end
 
   test "text compatibility does not mirror entire structured payload into text" do
@@ -150,7 +163,7 @@ defmodule CodexPooler.MCP.RedactionTest do
     assert_raise ExUnit.AssertionError, ~r/text content mirrors structuredContent/, fn ->
       Redaction.assert_mcp_output_safe!(%{
         structuredContent: structured,
-        content: [%{"type" => "text", "text" => Jason.encode!(structured)}]
+        content: [%{"type" => "text", "text" => CodexPooler.JSON.encode!(structured)}]
       })
     end
   end

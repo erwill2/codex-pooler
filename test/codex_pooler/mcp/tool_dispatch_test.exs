@@ -14,7 +14,15 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.InstanceSettings
   alias CodexPooler.MCP
-  alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings, Redaction, ToolDispatch}
+
+  alias CodexPooler.MCP.{
+    OperatorMCPKey,
+    OperatorMCPSettings,
+    ProtocolVersions,
+    Redaction,
+    ToolDispatch
+  }
+
   alias CodexPooler.MCP.Tools.{LogMetadata, OperatorMetadata, PoolMetadata, QuotaMetadata}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
@@ -93,7 +101,8 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     assert structured["actor"]["id"] == user.id
     assert structured["actor"]["display_name"] == "MCP Operator"
     assert structured["actor"]["email"] == "op***@example.com"
-    assert structured["protocolVersion"] == "2025-11-25"
+    assert structured["protocolVersion"] == ProtocolVersions.current()
+    assert structured["supportedProtocolVersions"] == ProtocolVersions.supported()
     assert structured["supportedToolCount"] == 17
 
     refute inspect(result) =~ raw_token
@@ -132,12 +141,10 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
                handler.(%{"id" => 123}, %{auth: auth})
     end
 
-    assert {:error,
-            %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}} =
+    assert {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}} =
              PoolMetadata.get_pool(%{"selector" => "missing"}, %{})
 
-    assert {:error,
-            %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}} =
+    assert {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}} =
              LogMetadata.get_request_log(%{"id" => Ecto.UUID.generate()}, %{})
   end
 
@@ -145,37 +152,37 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     auth: auth,
     user: user
   } do
-    pool = pool_fixture(%{name: "Task 6 Pool", slug: "task-6-pool"})
+    pool = pool_fixture(%{name: "MCP dispatch pool", slug: "mcp-dispatch-pool"})
 
     %{api_key: api_key, raw_key: raw_key} =
-      active_api_key_fixture(pool, %{display_name: "Task 6 API key"})
+      active_api_key_fixture(pool, %{display_name: "MCP dispatch API key"})
 
     %{assignment: assignment, identity: upstream_identity} =
-      active_upstream_assignment_fixture(pool, %{account_label: "Task 6 upstream"})
+      active_upstream_assignment_fixture(pool, %{account_label: "MCP dispatch upstream"})
 
     %{user: operator} =
       operator_fixture(auth.operator, %{
-        "display_name" => "Task 6 Operator",
-        "email" => "task-6-operator@example.com"
+        "display_name" => "MCP dispatch operator",
+        "email" => "mcp-dispatch-operator@example.com"
       })
 
     scope = Scope.for_user(user, Accounts.roles_for_user(user))
 
     assert {:ok, %{invite: invite}} =
-             Access.create_invite(scope, pool, %{invited_email: "task-6-invite@example.com"})
+             Access.create_invite(scope, pool, %{invited_email: "mcp-dispatch-invite@example.com"})
 
     request =
       request_fixture(%{pool: pool, api_key: api_key}, %{
-        requested_model: "gpt-task-6",
+        requested_model: "gpt-mcp-dispatch",
         endpoint: "/backend-api/codex/responses",
         transport: "http_sse",
         status: "succeeded",
         usage_status: "usage_known",
-        correlation_id: "task-6-request",
+        correlation_id: "mcp-dispatch-request",
         response_status_code: 202,
         retry_count: 2,
         upstream_account_label: upstream_identity.account_label,
-        upstream_account_email: "upstream.task6@example.com"
+        upstream_account_email: "upstream.mcp-dispatch@example.com"
       })
 
     _attempt = attempt_fixture(request, assignment, %{latency_ms: 321})
@@ -201,7 +208,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
         target_type: "user",
         target_id: user.id,
         outcome: "success",
-        correlation_id: "task-6-audit-correlation",
+        correlation_id: "mcp-dispatch-audit-correlation",
         details: %{"status" => "changed"}
       }
       |> Repo.insert!()
@@ -210,17 +217,23 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
       {
         "codex_pooler_list_pools",
         %{"query" => pool.slug, "limit" => 10},
-        ["name=Task 6 Pool", "slug=#{pool.slug}", "status=active", "upstreams=1", "api_keys=1"]
+        [
+          "name=MCP dispatch pool",
+          "slug=#{pool.slug}",
+          "status=active",
+          "upstreams=1",
+          "api_keys=1"
+        ]
       },
       {
         "codex_pooler_get_pool",
         %{"selector" => pool.slug},
-        ["id=#{pool.id}", "name=Task 6 Pool", "slug=#{pool.slug}", "status=active"]
+        ["id=#{pool.id}", "name=MCP dispatch pool", "slug=#{pool.slug}", "status=active"]
       },
       {
         "codex_pooler_list_upstreams",
         %{"pool_selector" => pool.slug, "limit" => 10},
-        ["label=Task 6 upstream", "status=active", "account=", "assignments="]
+        ["label=MCP dispatch upstream", "status=active", "account=", "assignments="]
       },
       {
         "codex_pooler_get_upstream",
@@ -231,7 +244,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
         "codex_pooler_list_pool_api_keys",
         %{"pool_selector" => pool.slug, "limit" => 10},
         [
-          "name=Task 6 API key",
+          "name=MCP dispatch API key",
           "status=active",
           "prefix=#{api_key.key_prefix}",
           "pool=#{pool.slug}"
@@ -242,7 +255,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
         %{"selector" => api_key.key_prefix},
         [
           "id=#{api_key.id}",
-          "name=Task 6 API key",
+          "name=MCP dispatch API key",
           "status=active",
           "prefix=#{api_key.key_prefix}"
         ]
@@ -251,7 +264,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
         "codex_pooler_list_upstream_quotas",
         %{"pool_id" => pool.id, "limit" => 10},
         [
-          "account Task 6 upstream",
+          "account MCP dispatch upstream",
           "status active",
           "account_primary",
           "42/100 remaining",
@@ -263,40 +276,51 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
         %{"selector" => upstream_identity.id},
         [
           "1 upstream quota metadata record returned",
-          "account Task 6 upstream",
+          "account MCP dispatch upstream",
           "account_primary",
           "42/100 remaining"
         ]
       },
       {
         "codex_pooler_list_operators",
-        %{"query" => "Task 6 Operator", "limit" => 10},
-        ["name=Task 6 Operator", "status=active", "email=ta***@example.com", "mcp="]
+        %{"query" => "MCP dispatch operator", "limit" => 10},
+        ["name=MCP dispatch operator", "status=active", "email=mc***@example.com", "mcp="]
       },
       {
         "codex_pooler_get_operator",
         %{"selector" => operator.id},
-        ["name=Task 6 Operator", "status=active", "email=ta***@example.com", "mcp="]
+        ["name=MCP dispatch operator", "status=active", "email=mc***@example.com", "mcp="]
       },
       {
         "codex_pooler_list_invites",
-        %{"email" => "task-6-invite@example.com", "limit" => 10},
-        ["status=active", "recipient=ta***@example.com", "pool=#{pool.slug}"]
+        %{"email" => "mcp-dispatch-invite@example.com", "limit" => 10},
+        ["status=active", "recipient=mc***@example.com", "pool=#{pool.slug}"]
       },
       {
         "codex_pooler_get_invite",
         %{"selector" => invite.id},
-        ["status=active", "recipient=ta***@example.com", "pool=#{pool.slug}"]
+        ["status=active", "recipient=mc***@example.com", "pool=#{pool.slug}"]
       },
       {
         "codex_pooler_list_request_logs",
-        %{"pool_id" => pool.id, "status" => "succeeded", "model" => "gpt-task-6", "limit" => 10},
-        ["pool=task-6-pool", "status=succeeded", "model=gpt-task-6", "retries=2"]
+        %{
+          "pool_id" => pool.id,
+          "status" => "succeeded",
+          "model" => "gpt-mcp-dispatch",
+          "limit" => 10
+        },
+        ["pool=mcp-dispatch-pool", "status=succeeded", "model=gpt-mcp-dispatch", "retries=2"]
       },
       {
         "codex_pooler_get_request_log",
         %{"id" => request.id},
-        ["pool=task-6-pool", "status=succeeded", "model=gpt-task-6", "retries=2", "response=202"]
+        [
+          "pool=mcp-dispatch-pool",
+          "status=succeeded",
+          "model=gpt-mcp-dispatch",
+          "retries=2",
+          "response=202"
+        ]
       },
       {
         "codex_pooler_list_audit_logs",
@@ -306,7 +330,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
           "outcome=success",
           "actor=user",
           "target=user",
-          "pool=task-6-pool"
+          "pool=mcp-dispatch-pool"
         ]
       },
       {
@@ -317,7 +341,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
           "outcome=success",
           "actor=user",
           "target=user",
-          "pool=task-6-pool"
+          "pool=mcp-dispatch-pool"
         ]
       }
     ]
@@ -331,8 +355,8 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
       assert [%{"type" => "text", "text" => text}] = result["content"]
       assert String.trim(text) != ""
       assert String.contains?(text, "\n- ")
-      refute text == Jason.encode!(result["structuredContent"])
-      refute String.contains?(text, Jason.encode!(result["structuredContent"]))
+      refute text == CodexPooler.JSON.encode!(result["structuredContent"])
+      refute String.contains?(text, CodexPooler.JSON.encode!(result["structuredContent"]))
       refute inspect(result) =~ raw_key
 
       for expectation <- expectations do
@@ -383,8 +407,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     crashing_tool = %{
       name: "codex_pooler_crashing_status",
       title: "Crashing status",
-      description:
-        "Use when testing. Raises while dispatching. Never returns secrets. Filters/limits: none.",
+      description: "Use when testing. Raises while dispatching. Never returns secrets. Filters/limits: none.",
       input_schema: %{
         "type" => "object",
         "properties" => %{},
@@ -428,8 +451,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     bad_tool = %{
       name: "codex_pooler_bad_status",
       title: "Bad status",
-      description:
-        "Use when testing. Returns invalid output. Never returns secrets. Filters/limits: none.",
+      description: "Use when testing. Returns invalid output. Never returns secrets. Filters/limits: none.",
       input_schema: %{
         "type" => "object",
         "properties" => %{},
@@ -458,14 +480,51 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     refute Map.has_key?(result, "structuredContent")
   end
 
+  test "output schema validation rejects values outside a declared enum", %{auth: auth} do
+    enum_tool = %{
+      name: "codex_pooler_enum_status",
+      title: "Enum status",
+      description: "Use when testing. Returns an invalid enum value. Never returns secrets. Filters/limits: none.",
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{},
+        "required" => [],
+        "additionalProperties" => false
+      },
+      output_schema: %{
+        "type" => "object",
+        "required" => ["result_transport"],
+        "properties" => %{
+          "result_transport" => %{
+            "type" => "string",
+            "enum" => ["buffered", "sse"]
+          }
+        },
+        "additionalProperties" => false
+      },
+      annotations: %{
+        "readOnlyHint" => true,
+        "destructiveHint" => false,
+        "idempotentHint" => true,
+        "openWorldHint" => false
+      },
+      handler: {__MODULE__, :invalid_enum_handler}
+    }
+
+    assert {:ok, result} = ToolDispatch.call(enum_tool, %{}, %{auth: auth})
+    assert result["isError"] == true
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text == "invalid_tool_output: MCP tool output failed schema validation"
+    refute Map.has_key?(result, "structuredContent")
+  end
+
   test "output schema validation rejects present null values unless explicitly nullable", %{
     auth: auth
   } do
     bad_tool = %{
       name: "codex_pooler_bad_nullable_status",
       title: "Bad nullable status",
-      description:
-        "Use when testing. Returns invalid null output. Never returns secrets. Filters/limits: none.",
+      description: "Use when testing. Returns invalid null output. Never returns secrets. Filters/limits: none.",
       input_schema: %{
         "type" => "object",
         "properties" => %{},
@@ -522,6 +581,10 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
   end
 
   def bad_handler(_arguments, _context), do: {:ok, %{"missing" => true}, "bad output"}
+
+  def invalid_enum_handler(_arguments, _context),
+    do: {:ok, %{"result_transport" => "unknown"}, "bad"}
+
   def null_item_handler(_arguments, _context), do: {:ok, %{"item" => nil}, "nullable output"}
   def crashing_handler(_arguments, _context), do: raise("PRIVATE_CONTEXT")
 end

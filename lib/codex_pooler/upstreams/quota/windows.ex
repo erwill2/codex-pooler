@@ -9,8 +9,11 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
 
   alias CodexPooler.Upstreams.{
     Quota,
+    Quota.RoutingQuotaSnapshot,
+    Quota.Windows.AccountDenial,
     Quota.Windows.Attributes,
     Quota.Windows.EvidenceStore,
+    Quota.Windows.ExpiredPruning,
     Quota.Windows.Routing,
     Quota.WindowSelector
   }
@@ -81,8 +84,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     window_keys = Enum.map(windows, &Evidence.identity_key/1)
 
     if Enum.uniq(window_keys) != window_keys do
-      {:error,
-       lifecycle_error(:duplicate_quota_window_kind, "quota window identities must be unique")}
+      {:error, lifecycle_error(:duplicate_quota_window_kind, "quota window identities must be unique")}
     else
       Enum.reduce(windows, Multi.new(), fn attrs, multi ->
         Multi.run(multi, {:quota_window, Evidence.identity_key(attrs)}, fn _repo, _changes ->
@@ -151,10 +153,19 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     EvidenceStore.list_evidence(identity_or_id)
   end
 
+  @doc """
+  Deletes evidence rows whose reset passed more than
+  `ExpiredPruning.retention_seconds/0` before `now`, except rows carrying the
+  saved-reset confirmation marker or locked by another transaction. Runs from
+  runtime state cleanup.
+  """
+  @spec prune_expired_windows(DateTime.t(), keyword()) :: {:ok, ExpiredPruning.summary()} | {:error, term()}
+  def prune_expired_windows(%DateTime{} = now, opts \\ []) do
+    ExpiredPruning.prune(now, opts)
+  end
+
   defp maybe_delete_missing_quota_windows(multi, _identity, _windows, false, _coverage),
     do: multi
-
-  defp maybe_delete_missing_quota_windows(multi, _identity, [], true, _coverage), do: multi
 
   defp maybe_delete_missing_quota_windows(multi, _identity, _windows, true, coverage)
        when not is_struct(coverage, MapSet),
@@ -229,8 +240,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   # timestamp so historical evaluations never rank against future rows.
   defp effective_windows(windows, %DateTime{} = as_of) do
     windows
-    |> WindowSelector.logical_windows(as_of)
     |> Routing.reject_superseded_primary_windows(as_of)
+    |> WindowSelector.logical_windows(as_of)
   end
 
   defp list_persisted_quota_windows(identity_or_id) do
@@ -259,6 +270,13 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     |> Map.new(fn {identity_id, identity_windows} ->
       {identity_id, effective_windows(identity_windows, as_of)}
     end)
+  end
+
+  @spec load_routing_quota_snapshots([Ecto.UUID.t()], DateTime.t()) ::
+          RoutingQuotaSnapshot.snapshot_map()
+  def load_routing_quota_snapshots(identity_ids, %DateTime{} = as_of)
+      when is_list(identity_ids) do
+    RoutingQuotaSnapshot.load_by_identity_ids(identity_ids, as_of)
   end
 
   @spec list_evidence_by_identity_ids([Ecto.UUID.t()]) :: %{
@@ -319,6 +337,18 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   def routing_quota_eligibility_from_windows(windows, opts \\ []) when is_list(windows) do
     Routing.eligibility_from_windows(windows, opts)
   end
+
+  @spec routing_quota_eligibility_from_snapshot(RoutingQuotaSnapshot.t(), keyword()) :: map()
+  def routing_quota_eligibility_from_snapshot(%RoutingQuotaSnapshot{} = snapshot, opts \\ []) do
+    Routing.eligibility_from_snapshot(snapshot, opts)
+  end
+
+  @doc """
+  The workspace-level provider denial in force for the snapshot's identity, or
+  nil. Deliberately separate from routing eligibility; see `AccountDenial`.
+  """
+  @spec routing_account_denial(RoutingQuotaSnapshot.t() | nil) :: AccountDenial.t() | nil
+  def routing_account_denial(snapshot), do: AccountDenial.active(snapshot)
 
   @spec reject_superseded_primary_windows([Quota.AccountQuotaWindow.t()], DateTime.t()) ::
           [Quota.AccountQuotaWindow.t()]
@@ -383,8 +413,30 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
 
   @spec upsert_quota_windows_from_codex_headers(identity_ref(), term(), DateTime.t()) ::
           {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
-  def upsert_quota_windows_from_codex_headers(identity_or_id, headers, synced_at \\ now()) do
-    with [_ | _] = windows <- quota_windows_from_codex_headers(headers, synced_at),
+  @spec upsert_quota_windows_from_codex_headers(
+          identity_ref(),
+          term(),
+          DateTime.t(),
+          String.t() | nil
+        ) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  @spec upsert_quota_windows_from_codex_headers(
+          identity_ref(),
+          term(),
+          DateTime.t(),
+          String.t() | nil,
+          String.t() | nil
+        ) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  def upsert_quota_windows_from_codex_headers(
+        identity_or_id,
+        headers,
+        synced_at \\ now(),
+        dispatched_model \\ nil,
+        denial_code \\ nil
+      ) do
+    with [_ | _] = windows <-
+           Quota.Evidence.codex_header_windows(headers, synced_at, dispatched_model, denial_code),
          %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id) do
       guarded_upsert_quota_windows(identity, windows, delete_missing?: false)
     else
@@ -448,10 +500,6 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   defp present_string(value) when is_binary(value) do
     value = String.trim(value)
     if value == "", do: nil, else: value
-  end
-
-  defp quota_windows_from_codex_headers(headers, synced_at) do
-    Quota.Evidence.codex_header_windows(headers, synced_at)
   end
 
   defp quota_windows_from_codex_rate_limit_event(event, synced_at) do

@@ -80,7 +80,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.FormControls do
 
   def settings_group(assigns) do
     ~H"""
-    <section id={@id} class="grid gap-4 rounded-box border border-base-300 bg-base-100 p-4 shadow-sm">
+    <section id={@id} class="grid gap-4 rounded-box border border-base-300 bg-base-100 p-4">
       <div class="grid gap-1 border-b border-base-300 pb-3">
         <p class="text-xs font-semibold uppercase tracking-wide text-base-content/45">{@eyebrow}</p>
         <h3 class="text-xl font-semibold text-base-content">{@title}</h3>
@@ -339,8 +339,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.FormControls do
       </label>
       <div class="flex flex-wrap items-center justify-between gap-3">
         <p id={"#{@id}-status"} class="text-xs leading-5 text-base-content/60">
-          {@status_label}:
-          <span class={secret_status_class(@status)}>{secret_status_label(@status)}</span>
+          {@status_label}: <span class={secret_status_class(@status)}>{secret_status_label(@status)}</span>
         </p>
         <input type="hidden" name={@action_name} value="preserve" />
         <label class="flex cursor-pointer items-center gap-2 text-xs font-medium text-base-content/70">

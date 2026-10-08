@@ -25,6 +25,95 @@ defmodule CodexPooler.PoolerFixtures do
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
+  @doc """
+  Deletes committed Pools and what a Pool delete leaves behind, on the calling connection.
+
+  Deleting a Pool cascades to its API keys, sessions, requests, models and assignments. It only
+  clears `audit_events.pool_id`, never removes the `oban_jobs` enqueued for the Pool, and leaves the
+  instance owner `api_key_fixture/2` commits when the instance has none. This also deletes the audit
+  rows naming the Pools, the jobs whose args name them, and, through
+  `CodexPooler.AccountsFixtures.delete_unreferenced_fixture_owners!/1`, a fixture owner no remaining
+  row references, with the `api_key.create` audit rows it authored.
+
+  A caller that deletes the Pools' API keys itself first passes the `owner_ids` it read with
+  `api_key_creator_ids/1` beforehand. Returns the number of Pools deleted. Upstream identities,
+  their secrets and pricing snapshots stay the caller's to remove.
+  """
+  @spec delete_committed_pools!([Ecto.UUID.t()], [Ecto.UUID.t()] | nil) :: non_neg_integer()
+  def delete_committed_pools!(pool_ids, owner_ids \\ nil) when is_list(pool_ids) do
+    owner_ids = owner_ids || api_key_creator_ids(pool_ids)
+    dumped_pool_ids = Enum.map(pool_ids, &Ecto.UUID.dump!/1)
+
+    assignment_ids =
+      Repo.all(
+        from assignment in PoolUpstreamAssignment,
+          where: assignment.pool_id in ^pool_ids,
+          select: assignment.id
+      )
+
+    identity_ids =
+      Repo.all(
+        from assignment in PoolUpstreamAssignment,
+          where: assignment.pool_id in ^pool_ids,
+          select: assignment.upstream_identity_id
+      )
+
+    shared_identity_ids =
+      Repo.all(
+        from assignment in PoolUpstreamAssignment,
+          where: assignment.pool_id not in ^pool_ids,
+          select: assignment.upstream_identity_id,
+          distinct: true
+      )
+
+    Repo.delete_all(from event in "audit_events", where: event.pool_id in ^dumped_pool_ids)
+
+    # Keyed by attempt without a foreign key, so the Pool's cascade misses them
+    # (findings#290).
+    Repo.delete_all(
+      from ending in CodexPooler.Platform.ForwardedGenerationEnd,
+        join: attempt in CodexPooler.Accounting.Attempt,
+        on: attempt.id == ending.attempt_id,
+        join: request in CodexPooler.Accounting.Request,
+        on: request.id == attempt.request_id,
+        where: request.pool_id in ^pool_ids
+    )
+
+    # Some workers name only the assignment, such as a saved-reset redemption.
+    Repo.delete_all(
+      from job in Oban.Job,
+        where:
+          fragment("?->>'pool_id'", job.args) in type(^pool_ids, {:array, :string}) or
+            fragment("?->>'pool_upstream_assignment_id'", job.args) in type(
+              ^assignment_ids,
+              {:array, :string}
+            ) or
+            (fragment("?->>'upstream_identity_id'", job.args) in type(
+               ^identity_ids,
+               {:array, :string}
+             ) and
+               fragment("?->>'upstream_identity_id'", job.args) not in type(
+                 ^shared_identity_ids,
+                 {:array, :string}
+               ))
+    )
+
+    {pool_count, _pools} = Repo.delete_all(from pool in Pool, where: pool.id in ^pool_ids)
+    CodexPooler.AccountsFixtures.delete_unreferenced_fixture_owners!(owner_ids)
+    pool_count
+  end
+
+  @doc "The users who created the API keys of `pool_ids`; a fixture owner is among them."
+  @spec api_key_creator_ids([Ecto.UUID.t()]) :: [Ecto.UUID.t()]
+  def api_key_creator_ids(pool_ids) when is_list(pool_ids) do
+    Repo.all(
+      from key in Access.APIKey,
+        where: key.pool_id in ^pool_ids and not is_nil(key.created_by_user_id),
+        distinct: true,
+        select: key.created_by_user_id
+    )
+  end
+
   def pool_fixture(attrs \\ %{}) do
     now = now()
     slug = Map.get(attrs, :slug, "pool-#{unique_suffix()}")
@@ -149,6 +238,9 @@ defmodule CodexPooler.PoolerFixtures do
              })
 
     identity
+    |> Ecto.Changeset.change()
+    |> UpstreamIdentity.put_credential_provenance(Map.get(attrs, :credential_provenance, :codex_chatgpt))
+    |> Repo.update!()
   end
 
   def active_upstream_identity_fixture(attrs \\ %{}) do
@@ -222,14 +314,7 @@ defmodule CodexPooler.PoolerFixtures do
 
     assert {:ok, assignment} =
              PoolAssignments.create_pool_assignment(pool, identity, %{
-               assignment_label:
-                 Map.get(attrs, :assignment_label, "Gateway assignment #{unique}"),
-               routing_priority:
-                 Map.get(
-                   attrs,
-                   :routing_priority,
-                   PoolUpstreamAssignment.default_routing_priority()
-                 ),
+               assignment_label: Map.get(attrs, :assignment_label, "Gateway assignment #{unique}"),
                metadata: metadata
              })
 
@@ -244,13 +329,14 @@ defmodule CodexPooler.PoolerFixtures do
 
   def model_fixture(pool \\ pool_fixture(), attrs \\ %{}) do
     now = now()
-    exposed_model_id = Map.get(attrs, :exposed_model_id, "gpt-5.4-mini")
+    exposed_model_id = Map.get(attrs, :exposed_model_id, "gpt-6-luna")
 
     %Model{
       pool_id: pool.id,
       upstream_model_id: Map.get(attrs, :upstream_model_id, "upstream-#{exposed_model_id}"),
       exposed_model_id: exposed_model_id,
-      display_name: Map.get(attrs, :display_name, "GPT 5.4 Mini"),
+      pricing_ref: Map.get(attrs, :pricing_ref),
+      display_name: Map.get(attrs, :display_name, "GPT 6 Luna"),
       status: Map.get(attrs, :status, "active"),
       supports_responses: Map.get(attrs, :supports_responses, true),
       supports_streaming: Map.get(attrs, :supports_streaming, true),
@@ -278,6 +364,7 @@ defmodule CodexPooler.PoolerFixtures do
       cooldown_minutes: Map.get(attrs, :cooldown_minutes, AlertRule.default_cooldown_minutes()),
       state: Map.get(attrs, :state, "active"),
       model: Map.get(attrs, :model),
+      route_class: Map.get(attrs, :route_class),
       min_usable_assignments: Map.get(attrs, :min_usable_assignments),
       target_state: Map.get(attrs, :target_state),
       window_selector: Map.get(attrs, :window_selector),
@@ -380,13 +467,12 @@ defmodule CodexPooler.PoolerFixtures do
         pool_id: pool.id,
         api_key_id: api_key.id,
         model_id: Map.get(attrs, :model_id),
-        requested_model: Map.get(attrs, :requested_model, "gpt-5.4-mini"),
+        requested_model: Map.get(attrs, :requested_model, "gpt-6-luna"),
         endpoint: Map.get(attrs, :endpoint, "/backend-api/codex/responses"),
         transport: Map.get(attrs, :transport, "http_json"),
         status: Map.get(attrs, :status, "succeeded"),
         usage_status: Map.get(attrs, :usage_status, "usage_known"),
-        correlation_id:
-          Map.get(attrs, :correlation_id, "corr-#{System.unique_integer([:positive])}"),
+        correlation_id: Map.get(attrs, :correlation_id, "corr-#{System.unique_integer([:positive])}"),
         user_agent: Map.get(attrs, :user_agent),
         request_metadata: Map.get(attrs, :request_metadata, %{}),
         admitted_at: now(),
@@ -443,7 +529,9 @@ defmodule CodexPooler.PoolerFixtures do
         attempt_number: Map.get(attrs, :attempt_number, 1),
         pool_upstream_assignment_id: assignment.id,
         upstream_identity_id: assignment.upstream_identity_id,
-        upstream_model_id: Map.get(attrs, :upstream_model_id, "upstream-gpt-5.4-mini"),
+        upstream_model_id: Map.get(attrs, :upstream_model_id, "upstream-gpt-6-luna"),
+        served_model: Map.get(attrs, :served_model),
+        model_observation: Map.get(attrs, :model_observation),
         transport: Map.get(attrs, :transport, request.transport),
         status: Map.get(attrs, :status, "succeeded"),
         started_at: now(),
@@ -551,14 +639,14 @@ defmodule CodexPooler.PoolerFixtures do
           })
           |> Repo.insert!()
 
-        ensure_fixture_owner!(user.id)
+        ensure_fixture_owner!(user)
         Scope.for_user(user, ["instance_owner"])
     end
   end
 
-  defp ensure_fixture_owner!(user_id) do
-    user = Repo.get!(User, user_id)
+  defp ensure_fixture_owner!(user_id) when is_binary(user_id), do: ensure_fixture_owner!(Repo.get!(User, user_id))
 
+  defp ensure_fixture_owner!(%User{} = user) do
     case Repo.get_by(Membership, user_id: user.id, role: "instance_owner", status: "active") do
       nil ->
         %Membership{}

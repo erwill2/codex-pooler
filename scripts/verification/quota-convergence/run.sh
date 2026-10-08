@@ -25,7 +25,7 @@ source_sha="$(docker buildx imagetools inspect "$immutable_ref" --format '{{json
 [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { printf 'trusted immutable image digest unavailable\n' >&2; exit 1; }
 
 if [[ -z "$receipt" ]]; then
-  receipt="$root_dir/.omo/evidence/task-11-local-${mode}.tsv"
+  receipt="$root_dir/.omo/evidence/quota-convergence-local-${mode}.tsv"
 fi
 
 mkdir -p "$(dirname "$receipt")"
@@ -37,8 +37,10 @@ database_name="quota_proof"
 database_user="quota_proof"
 database_credential="quota-proof-local-only"
 
+# postgres:18 declares its data directory a volume: without -v every run left
+# an anonymous volume of a few hundred megabytes on the host.
 cleanup() {
-  docker rm -f "$proof" "$database" >/dev/null 2>&1 || true
+  docker rm -f -v "$proof" "$database" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM

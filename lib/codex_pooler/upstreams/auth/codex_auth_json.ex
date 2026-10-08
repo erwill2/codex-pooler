@@ -1,6 +1,8 @@
 defmodule CodexPooler.Upstreams.Auth.CodexAuthJson do
   @moduledoc false
 
+  alias CodexPooler.Upstreams.Auth.JwtPayload
+
   @safe_onboarding_metadata %{
     "onboarding_method" => "auth_json_import",
     "auth_json_imported" => true
@@ -65,7 +67,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthJson do
   def parse(_content, _now), do: parse_error(:invalid_auth_json, "Codex auth.json is required")
 
   defp decode_json(content) do
-    case Jason.decode(content) do
+    case CodexPooler.JSON.decode(content) do
       {:ok, %{} = payload} -> {:ok, payload}
       {:ok, _value} -> parse_error(:invalid_auth_json, "Codex auth.json must be a JSON object")
       {:error, _reason} -> parse_error(:invalid_auth_json, "Codex auth.json is malformed")
@@ -136,13 +138,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthJson do
     do: parse_error(:missing_token, "Codex auth.json is missing #{token_name}")
 
   defp decode_jwt_payload(jwt) do
-    with [_header, payload, _signature] <- String.split(jwt, "."),
-         {:ok, json} <- Base.url_decode64(payload, padding: false),
-         {:ok, %{} = claims} <- Jason.decode(json) do
-      {:ok, claims}
-    else
-      _invalid -> {:error, :invalid_jwt}
-    end
+    JwtPayload.decode(jwt)
   end
 
   defp ensure_not_expired(claims, now) do

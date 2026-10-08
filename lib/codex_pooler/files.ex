@@ -107,8 +107,7 @@ defmodule CodexPooler.Files do
              create_file_request_opts(opts),
              %{
                "operation" => "create",
-               "error_code" =>
-                 bridge_error |> Map.get(:code, :upstream_file_bridge_failed) |> to_string()
+               "error_code" => bridge_error |> Map.get(:code, :upstream_file_bridge_failed) |> to_string()
              }
              |> Map.merge(RequestLog.bridge_route_metadata(bridge_error))
            ) do
@@ -167,6 +166,35 @@ defmodule CodexPooler.Files do
 
   def response_assignment_affinities(_auth, _file_ids, _opts),
     do: {:error, error(400, :invalid_request, "authenticated pool and api key are required")}
+
+  @doc """
+  Returns the ids among `file_ids` that this Pool and API key created through the
+  file bridge, whatever their lifecycle state, in the order given.
+
+  A Responses `input_image` may carry a `file_id` the Pool never bridged (an
+  app-server host can supply one from its own attachment store); only a bridged
+  id names an upstream account the request has to reach.
+  """
+  @spec bridged_file_ids(auth(), [file_id()]) :: [file_id()]
+  def bridged_file_ids(%{pool: pool, api_key: api_key}, file_ids) when is_list(file_ids) do
+    case file_ids |> Enum.filter(&is_binary/1) |> Enum.uniq() do
+      [] ->
+        []
+
+      ids ->
+        known =
+          from(file in FileRecord,
+            where: file.pool_id == ^pool.id and file.api_key_id == ^api_key.id and file.file_id in ^ids,
+            select: file.file_id
+          )
+          |> Repo.all()
+          |> MapSet.new()
+
+        Enum.filter(ids, &MapSet.member?(known, &1))
+    end
+  end
+
+  def bridged_file_ids(_auth, _file_ids), do: []
 
   @spec record_upload_failure(auth(), file_id(), map(), file_opts()) :: {:error, file_error()}
   defdelegate record_upload_failure(auth, file_id, upload_error, opts \\ %{}),
@@ -249,7 +277,7 @@ defmodule CodexPooler.Files do
   def record_unsupported_operation(auth, file_id, operation, opts \\ %{})
 
   def record_unsupported_operation(
-        %{pool: _pool, api_key: _api_key} = auth,
+        %{pool: pool, api_key: api_key} = auth,
         file_id,
         operation,
         opts
@@ -257,11 +285,24 @@ defmodule CodexPooler.Files do
       when is_binary(file_id) and is_binary(operation) do
     request_opts = RequestMetadata.build(opts, "/v1/files")
 
-    RequestLog.record_file_request(auth, "failed", 404, request_opts, %{
-      "file" => %{"id" => file_id},
-      "operation" => operation,
-      "error_code" => "unsupported_endpoint"
-    })
+    timestamp = now(opts)
+
+    Repo.transaction(fn ->
+      file = locked_owned_file(file_id, pool.id, api_key.id)
+
+      case FileState.classify(file, timestamp) do
+        state when state in [:uploaded, :local_pending, :upstream_pending] ->
+          record_file_request_or_rollback(auth, "failed", 404, request_opts, %{"file" => %{"id" => file_id}, "operation" => operation, "error_code" => "unsupported_endpoint"})
+
+        :expired ->
+          FileState.expire!(file, timestamp)
+          retrieve_file_not_found(auth, file_id, request_opts)
+
+        _missing ->
+          retrieve_file_not_found(auth, file_id, request_opts)
+      end
+    end)
+    |> unwrap_nested_transaction()
   end
 
   def record_unsupported_operation(_auth, _file_id, _operation, _opts),
@@ -462,8 +503,7 @@ defmodule CodexPooler.Files do
     records = Repo.all(response_assignment_affinity_record_query(pool_id, api_key_id, ids))
 
     if Enum.any?(records, &response_file_not_ready?(&1, now)) do
-      {:error,
-       error(409, :file_not_ready, "referenced file is not ready for responses use", "file_id")}
+      {:error, error(409, :file_not_ready, "referenced file is not ready for responses use", "file_id")}
     else
       {:error, error(404, :file_not_found, "file was not found", "file_id")}
     end

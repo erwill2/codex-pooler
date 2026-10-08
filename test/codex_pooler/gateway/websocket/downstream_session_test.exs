@@ -1,0 +1,614 @@
+defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
+  use CodexPooler.DataCase, async: false
+
+  import CodexPooler.AccountingTestSupport
+  import Ecto.Query
+
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
+  alias CodexPooler.Gateway.Websocket, as: Gateway
+  alias CodexPooler.Gateway.Websocket.DownstreamSession
+  alias CodexPooler.Repo
+
+  @remote_node :"codex_pooler@remote-detach-owner.example"
+
+  test "malformed JSON never retargets an attached downstream" do
+    state = %{websocket_owner_downstream: %{}}
+
+    for payload <- ["{", "{invalid}", ~S({"value":"\uD800"})] do
+      assert {:ok, ^state} = DownstreamSession.maybe_retarget_before_start(payload, state)
+    end
+  end
+
+  setup do
+    setup = accounting_setup()
+
+    assert {:ok, session} =
+             Gateway.start_codex_session(setup.auth, %{
+               accepted_turn_state: "remote-detach-#{System.unique_integer([:positive, :monotonic])}"
+             })
+
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    assert {:ok, owner_pid} =
+             WebsocketOwnerSession.start_owner(
+               codex_session_id: session.id,
+               owner_lease_token: session.owner_lease_token,
+               owner_instance_id: session.owner_instance_id,
+               owner_renewal_ms: 60_000,
+               upstream: upstream
+             )
+
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    assert {:ok, downstream} =
+             WebsocketOwnerSession.attach_downstream(owner_pid, %{
+               pid: self(),
+               correlation_id: "remote-detach-correlation",
+               epoch: 0
+             })
+
+    on_exit(fn ->
+      if Process.alive?(owner_pid) do
+        current = Repo.reload!(session)
+
+        reason =
+          if current.owner_lease_token == session.owner_lease_token,
+            do: :normal,
+            else: {:shutdown, :stale_owner}
+
+        GenServer.stop(owner_pid, reason)
+      end
+    end)
+
+    {:ok, setup: setup, session: session, owner_pid: owner_pid, owner_lease: active_owner_lease(session.id), state: remote_downstream_state(session, downstream)}
+  end
+
+  test "successful detach interrupts a genuinely in-progress websocket turn", fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+
+    assert :ok = DownstreamSession.cleanup(turn.state)
+
+    assert %Request{
+             status: "failed",
+             response_status_code: 499,
+             last_error_code: "client_disconnected"
+           } = Repo.get!(Request, turn.request.id)
+
+    assert %Attempt{
+             status: "failed",
+             upstream_status_code: 499,
+             network_error_code: "client_disconnected"
+           } = Repo.get!(Attempt, turn.attempt.id)
+
+    assert %CodexTurn{
+             status: "interrupted",
+             final_attempt_id: final_attempt_id,
+             error_code: "client_disconnected"
+           } = Repo.get!(CodexTurn, turn.turn.id)
+
+    assert final_attempt_id == turn.attempt.id
+    assert Repo.get!(CodexSession, fixture.session.id).status == "interrupted"
+    assert_lease_preserved!(fixture)
+  end
+
+  # The socket already pushed this turn's terminal (a provider refusal the
+  # client displayed; Codex closes the connection right after it) and its task
+  # only has the settlement left. The owner's detach leaves the turn to that
+  # task (findings#254 row 254-110); the post-detach interrupt used to settle it
+  # `499 client_disconnected` first whenever the settlement was slow, dropping
+  # the refusal's fields (row 254-140, measured through the listener with the
+  # settlement delayed 800 ms: 3/3 before, 0/3 after). The socket defers the
+  # interrupt and runs it only for a task it had to kill.
+  test "a detach whose socket already pushed its task's terminal leaves the turn to that task", fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+
+    assert :ok = DownstreamSession.cleanup(Map.put(turn.state, :websocket_owner_defer_turn_interrupt?, true))
+
+    assert %Request{status: "in_progress"} = Repo.get!(Request, turn.request.id)
+    assert %CodexTurn{status: "in_progress"} = Repo.get!(CodexTurn, turn.turn.id)
+
+    # The task was killed without settling: the deferred interrupt runs.
+    assert :ok = DownstreamSession.cleanup_detached(turn.state)
+    assert %Request{status: "failed", last_error_code: "client_disconnected"} = Repo.get!(Request, turn.request.id)
+    assert %CodexTurn{status: "interrupted"} = Repo.get!(CodexTurn, turn.turn.id)
+  end
+
+  test "explicit cancellation with no matching request leaves the active request and session untouched",
+       fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+
+    before =
+      {Repo.reload!(fixture.session), Repo.reload!(turn.request), Repo.reload!(turn.attempt), Repo.reload!(turn.turn),
+       Repo.all(
+         from entry in LedgerEntry,
+           where: entry.request_id == ^turn.request.id,
+           order_by: entry.id
+       )}
+
+    assert {:ok, %{interrupted_turn_count: 0}} =
+             Gateway.interrupt_codex_turn(fixture.session, %{request_id: "no-matching-request"})
+
+    after_cancel =
+      {Repo.reload!(fixture.session), Repo.reload!(turn.request), Repo.reload!(turn.attempt), Repo.reload!(turn.turn),
+       Repo.all(
+         from entry in LedgerEntry,
+           where: entry.request_id == ^turn.request.id,
+           order_by: entry.id
+       )}
+
+    assert after_cancel == before
+  end
+
+  test "typed runtime old-owner monitor cannot interrupt the replacement owner's request",
+       fixture do
+    state =
+      DownstreamSession.put_runtime(fixture.state, %{
+        codex_session: fixture.session,
+        websocket_owner_lease_token: fixture.session.owner_lease_token,
+        websocket_owner_downstream: fixture.state.websocket_owner_downstream
+      })
+
+    assert is_nil(state.opts.transport.websocket_owner.lease_token)
+    replacement_token = Ecto.UUID.generate()
+
+    fixture.session
+    |> Ecto.Changeset.change(owner_lease_token: replacement_token)
+    |> Repo.update!()
+
+    turn = active_turn_fixture(fixture, "websocket")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:stop, {1011, "websocket owner crashed"}, _state} =
+                 DownstreamSession.handle_monitor_down(state, fixture.owner_pid, :crashed)
+      end)
+
+    assert log =~ "websocket owner monitor lease release failed"
+    assert log =~ "failure_reason=stale_owner_cleanup"
+
+    assert Repo.get!(Request, turn.request.id).status == "in_progress"
+    assert Repo.get!(Attempt, turn.attempt.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, turn.turn.id).status == "in_progress"
+    assert Repo.get!(CodexSession, fixture.session.id).owner_lease_token == replacement_token
+  end
+
+  # The socket of an owner killed by a new socket's reuse check sees the crash
+  # after that socket's takeover released the owner's lease (findings#270 row
+  # 270-313). Its lease release answers `taken_over_owner_cleanup` and stands
+  # down without the warning a stale release keeps; the takeover's lease stays.
+  test "an old-owner monitor whose lease a takeover released releases nothing and stays quiet", fixture do
+    state =
+      DownstreamSession.put_runtime(fixture.state, %{
+        codex_session: fixture.session,
+        websocket_owner_lease_token: fixture.session.owner_lease_token,
+        websocket_owner_downstream: fixture.state.websocket_owner_downstream
+      })
+
+    assert {:ok, %CodexSession{owner_lease_token: replacement_token}} = SessionContinuity.replace_unavailable_owner_lease(fixture.session, RequestOptions.for_websocket(%{}))
+    assert Gateway.release_websocket_owner_lease(fixture.session, fixture.session.owner_lease_token, "owner_crashed") == {:error, :taken_over_owner_cleanup}
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:stop, {1011, "websocket owner crashed"}, _state} = DownstreamSession.handle_monitor_down(state, fixture.owner_pid, :crashed)
+      end)
+
+    refute log =~ "websocket owner monitor lease release failed"
+    refute log =~ "[warning]"
+    assert %BridgeOwnerLease{status: "released", metadata: %{"release_reason" => "owner_unavailable_takeover"}} = Repo.get!(BridgeOwnerLease, fixture.owner_lease.id)
+    assert %BridgeOwnerLease{lease_token: ^replacement_token} = active_owner_lease(fixture.session.id)
+  end
+
+  test "owner monitor recovery failure preserves the lease and unfinished turn", fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+
+    state =
+      turn.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:websocket_owner_pid, fixture.owner_pid)
+      |> Map.put(:websocket_owner_lease_token, Ecto.UUID.generate())
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:stop, {1011, "websocket owner crashed"}, _state} =
+                 DownstreamSession.handle_monitor_down(state, fixture.owner_pid, :crashed)
+      end)
+
+    assert log =~ "websocket owner monitor recovery failed"
+    assert log =~ "failure_reason=stale_owner_cleanup"
+    assert Repo.get!(Request, turn.request.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, turn.turn.id).status == "in_progress"
+    assert_lease_preserved!(fixture)
+  end
+
+  test "successful detach preserves accounting success that wins before turn completion",
+       fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+    finalize_turn(turn, "succeeded", nil, complete_turn?: false)
+    assert Repo.get!(CodexTurn, turn.turn.id).status == "in_progress"
+
+    assert :ok = DownstreamSession.cleanup(turn.state)
+
+    assert Repo.get!(CodexSession, fixture.session.id).status == "active"
+    assert Repo.get!(Request, turn.request.id).status == "succeeded"
+    assert Repo.get!(Attempt, turn.attempt.id).status == "succeeded"
+
+    assert %CodexTurn{status: "succeeded", final_attempt_id: final_attempt_id, error_code: nil} =
+             Repo.get!(CodexTurn, turn.turn.id)
+
+    assert final_attempt_id == turn.attempt.id
+    assert_lease_preserved!(fixture)
+  end
+
+  test "successful detach ignores a newer in-progress HTTP fallback turn", fixture do
+    websocket_turn = active_turn_fixture(fixture, "websocket")
+    finalize_turn(websocket_turn, "succeeded", nil)
+    http_turn = active_turn_fixture(fixture, "http_sse")
+
+    # Standing down for a newer turn of the session is the intended outcome,
+    # so it is logged as routine, with its path and cause, and never as a
+    # cleanup failure (findings#225).
+    log = capture_info_log(fn -> assert :ok = DownstreamSession.cleanup(websocket_turn.state) end)
+
+    refute log =~ "websocket interrupt cleanup failed"
+    refute log =~ "[warning]"
+    assert log =~ "[info] websocket interrupt cleanup superseded"
+    assert log =~ "codex_session_id=#{fixture.session.id} cleanup_path=owner_detach reason_code=replacement_turn_active"
+
+    assert Repo.get!(CodexSession, fixture.session.id).status == "active"
+    assert Repo.get!(CodexTurn, websocket_turn.turn.id).status == "succeeded"
+    assert Repo.get!(Request, http_turn.request.id).status == "in_progress"
+    assert Repo.get!(Attempt, http_turn.attempt.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, http_turn.turn.id).status == "in_progress"
+    assert_lease_preserved!(fixture)
+
+    owner_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = GenServer.stop(fixture.owner_pid)
+      end)
+
+    assert owner_log =~ "websocket owner exit persistence failed"
+    assert owner_log =~ "operation=interrupt_codex_session"
+    assert owner_log =~ "reason_class=stale_owner_cleanup"
+    assert Repo.get!(Request, http_turn.request.id).status == "in_progress"
+    assert Repo.get!(Attempt, http_turn.attempt.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, http_turn.turn.id).status == "in_progress"
+    assert Repo.get!(BridgeOwnerLease, fixture.owner_lease.id).status == "active"
+
+    assert Repo.get!(CodexSession, fixture.session.id).owner_lease_token ==
+             fixture.owner_lease.lease_token
+  end
+
+  # The owner exits (idle expiry, drain, crash) while an HTTP fallback turn it
+  # never held runs in the same session: its interrupt stands down on purpose
+  # and the lease stays with that turn. That is routine and logs at info; a
+  # genuinely stale witness (the test above) still warns (findings#225, row
+  # 225-85).
+  test "owner exit with a newer turn it never held logs the stand-down at info and keeps the lease", fixture do
+    websocket_turn = active_turn_fixture(fixture, "websocket")
+    finalize_turn(websocket_turn, "succeeded", nil)
+    http_turn = unowned_turn_fixture(fixture, "http_sse")
+
+    owner_log = capture_info_log(fn -> assert :ok = GenServer.stop(fixture.owner_pid) end)
+
+    assert owner_log =~ "[info] websocket owner exit persistence superseded"
+    assert owner_log =~ "codex_session_id=#{fixture.session.id} operation=interrupt_codex_session"
+    assert owner_log =~ "reason_code=replacement_turn_active"
+    refute owner_log =~ "[warning]"
+    refute owner_log =~ "websocket owner exit persistence failed"
+
+    assert Repo.get!(Request, http_turn.request.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, http_turn.turn.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, websocket_turn.turn.id).status == "succeeded"
+    assert Repo.get!(BridgeOwnerLease, fixture.owner_lease.id).status == "active"
+    assert Repo.get!(CodexSession, fixture.session.id).status == "active"
+  end
+
+  test "owner death recovery that stands down for a newer turn logs at info, not as failed recovery", fixture do
+    websocket_turn = active_turn_fixture(fixture, "websocket")
+    finalize_turn(websocket_turn, "succeeded", nil)
+    http_turn = unowned_turn_fixture(fixture, "http_sse")
+
+    state =
+      websocket_turn.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:websocket_owner_pid, fixture.owner_pid)
+
+    log =
+      capture_info_log(fn ->
+        assert {:stop, {1011, "websocket owner crashed"}, _state} =
+                 DownstreamSession.handle_monitor_down(state, fixture.owner_pid, :crashed)
+      end)
+
+    assert log =~ "[info] websocket owner lifecycle recovery superseded"
+    assert log =~ "codex_session_id=#{fixture.session.id} recovery_reason=owner_crashed reason_code=replacement_turn_active"
+    refute log =~ "[warning]"
+    refute log =~ "lifecycle recovery failed"
+    refute log =~ "monitor recovery failed"
+
+    assert Repo.get!(Request, http_turn.request.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, http_turn.turn.id).status == "in_progress"
+    assert_lease_preserved!(fixture)
+  end
+
+  test "detach from a gone owner whose recovery stands down for a newer turn is not logged as a failed detach", fixture do
+    websocket_turn = active_turn_fixture(fixture, "websocket")
+    finalize_turn(websocket_turn, "succeeded", nil)
+    http_turn = unowned_turn_fixture(fixture, "http_sse")
+
+    # The owner is gone before the socket detaches; its lease stays with the
+    # newer turn, so the detach fails and the leftover recovery stands down.
+    _owner_log = capture_info_log(fn -> assert :ok = GenServer.stop(fixture.owner_pid) end)
+
+    log = capture_info_log(fn -> assert :ok = DownstreamSession.cleanup(websocket_turn.state) end)
+
+    assert log =~ "[info] websocket owner lifecycle recovery superseded"
+    refute log =~ "[warning]"
+    refute log =~ "websocket owner detach failed"
+
+    assert Repo.get!(Request, http_turn.request.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, http_turn.turn.id).status == "in_progress"
+    assert Repo.get!(BridgeOwnerLease, fixture.owner_lease.id).status == "active"
+  end
+
+  # A client that reconnects while the owner still holds its interrupted
+  # predecessor gets a socket marked as an active-turn reconnect. When the owner
+  # refuses that socket's only frame and the client drops it, the socket never
+  # started a turn and holds no cleanup witness, so its owner-scoped interrupt
+  # can only roll back `stale_owner_cleanup`: routine, logged at info, the
+  # production shape of findings#225 row 225-95 (remote owner, successor
+  # refused `owner_unavailable`, predecessor already settled 499).
+  test "detach of a refused reconnect socket that never started a turn logs its no-op cleanup at info", fixture do
+    predecessor = active_turn_fixture(fixture, "websocket")
+    finalize_turn(predecessor, "failed", "client_disconnected")
+
+    successor_state =
+      fixture.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:websocket_owner_active_turn_reconnect?, true)
+
+    log = capture_info_log(fn -> assert :ok = DownstreamSession.cleanup(successor_state) end)
+
+    refute log =~ "[warning]"
+    refute log =~ "websocket interrupt cleanup failed"
+    assert log =~ "[info] websocket interrupt cleanup skipped"
+    assert log =~ "codex_session_id=#{fixture.session.id} cleanup_path=owner_detach reason_code=no_cleanup_witness"
+
+    assert Repo.get!(Request, predecessor.request.id).status == "failed"
+    assert Repo.get!(CodexSession, fixture.session.id).status == "active"
+    assert_lease_preserved!(fixture)
+  end
+
+  # A socket cut right after it sent its frame still tracks the response task
+  # for it, but the owner's cleanup witness never reached it: the turn was still
+  # being reserved or the owner had already refused it. The witness-scoped
+  # interrupt can only roll back as stale, and nothing is left for it to close
+  # (the task settles or never reserves; the owner settles a turn it started),
+  # so it is routine: production shape of findings#225 row 225-210, a
+  # pre-visible cut whose resend then succeeded.
+  test "detach of a socket cut before the owner's cleanup witness reached it logs its no-op cleanup at info", fixture do
+    predecessor = active_turn_fixture(fixture, "websocket")
+    finalize_turn(predecessor, "failed", "client_disconnected")
+
+    state =
+      fixture.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:tasks, MapSet.new([self()]))
+
+    log = capture_info_log(fn -> assert :ok = DownstreamSession.cleanup(state) end)
+
+    refute log =~ "[warning]"
+    refute log =~ "websocket interrupt cleanup failed"
+    assert log =~ "[info] websocket interrupt cleanup skipped"
+    assert log =~ "codex_session_id=#{fixture.session.id} cleanup_path=owner_detach reason_code=no_cleanup_witness"
+    assert Repo.get!(Request, predecessor.request.id).status == "failed"
+  end
+
+  test "successful detach preserves a failed terminal winner and its single settlement",
+       fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+    finalize_turn(turn, "failed", "upstream_error")
+
+    assert :ok = DownstreamSession.cleanup(turn.state)
+
+    assert Repo.get!(CodexSession, fixture.session.id).status == "interrupted"
+    assert Repo.get!(Request, turn.request.id).status == "failed"
+    assert Repo.get!(Request, turn.request.id).last_error_code == "upstream_error"
+    assert Repo.get!(Attempt, turn.attempt.id).status == "failed"
+    assert Repo.get!(Attempt, turn.attempt.id).network_error_code == "upstream_error"
+    assert Repo.get!(CodexTurn, turn.turn.id).status == "failed"
+    assert Repo.get!(CodexTurn, turn.turn.id).error_code == "upstream_error"
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry,
+               where: entry.request_id == ^turn.request.id and entry.entry_kind == "settlement"
+             ),
+             :count
+           ) == 1
+
+    assert_lease_preserved!(fixture)
+  end
+
+  # A turn the owner never held: an HTTP fallback of the same session runs
+  # outside the websocket owner, so nothing is submitted to it and the owner's
+  # own witness still names its last websocket turn.
+  defp unowned_turn_fixture(fixture, transport) do
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               fixture.setup.auth,
+               fixture.setup.model,
+               %{"model" => fixture.setup.model.exposed_model_id},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: transport,
+                 correlation_id: "unowned-#{System.unique_integer([:positive, :monotonic])}",
+                 request_metadata: %{"codex_session_id" => fixture.session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, fixture.setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(fixture.session, reserved.request)
+
+    on_exit(fn ->
+      current_request = Repo.reload!(reserved.request)
+
+      if current_request.status == "in_progress" do
+        assert {:ok, result} =
+                 Accounting.finalize_request(current_request, Repo.reload!(attempt), %{
+                   request_status: "failed",
+                   attempt_status: "failed",
+                   response_status_code: 499,
+                   last_error_code: "client_disconnected",
+                   usage: %{status: "usage_unknown", source: "fixture_cleanup"}
+                 })
+
+        SessionContinuity.complete_codex_turn({:ok, result}, "failed", "client_disconnected")
+      end
+    end)
+
+    %{request: reserved.request, attempt: attempt, turn: turn}
+  end
+
+  defp active_turn_fixture(fixture, transport) do
+    correlation_id = "remote-detach-#{System.unique_integer([:positive, :monotonic])}"
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               fixture.setup.auth,
+               fixture.setup.model,
+               %{"model" => fixture.setup.model.exposed_model_id},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: transport,
+                 correlation_id: correlation_id,
+                 request_metadata: %{
+                   "codex_session_id" => fixture.session.id,
+                   "websocket_owner_forwarding" => %{
+                     "enabled" => true,
+                     "owner_instance_id" => fixture.session.owner_instance_id,
+                     "downstream_epoch" => fixture.state.websocket_owner_downstream.epoch
+                   }
+                 }
+               }
+             )
+
+    assert {:ok, attempt} =
+             Accounting.create_attempt(reserved.request, fixture.setup.assignment)
+
+    assert {:ok, turn} = Gateway.start_codex_turn(fixture.session, reserved.request)
+
+    on_exit(fn ->
+      current_request = Repo.reload!(reserved.request)
+      current_attempt = Repo.reload!(attempt)
+
+      if current_request.status == "in_progress" do
+        assert {:ok, result} =
+                 Accounting.finalize_request(current_request, current_attempt, %{
+                   request_status: "failed",
+                   attempt_status: "failed",
+                   response_status_code: 499,
+                   last_error_code: "client_disconnected",
+                   usage: %{status: "usage_unknown", source: "fixture_cleanup"}
+                 })
+
+        SessionContinuity.complete_codex_turn({:ok, result}, "failed", "client_disconnected")
+      end
+    end)
+
+    downstream = Map.put(fixture.state.websocket_owner_downstream, :owner_turn_id, self())
+
+    assert :ok =
+             WebsocketOwnerSession.submit_request(
+               fixture.owner_pid,
+               downstream,
+               %UpstreamWebsocketSession.Request{
+                 request_id: reserved.request.id,
+                 attempt_id: attempt.id
+               }
+             )
+
+    assert_receive {:websocket_owner_cleanup_witness, _, _, _, _} = message, 15_000
+
+    state =
+      fixture.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:tasks, MapSet.new([self()]))
+      |> then(&DownstreamSession.accept_cleanup_witness(message, &1))
+
+    assert state.websocket_owner_cleanup_witness.request_id == reserved.request.id
+    %{request: reserved.request, attempt: attempt, turn: turn, state: state}
+  end
+
+  defp finalize_turn(turn, status, error_code, opts \\ []) do
+    response_status_code = if status == "succeeded", do: 200, else: 502
+
+    assert {:ok, %{request: request, attempt: attempt}} =
+             Accounting.finalize_request(turn.request, turn.attempt, %{
+               request_status: status,
+               attempt_status: status,
+               response_status_code: response_status_code,
+               last_error_code: error_code,
+               usage: %{status: "usage_unknown", source: error_code || "remote_detach_success"}
+             })
+
+    if Keyword.get(opts, :complete_turn?, true) do
+      SessionContinuity.complete_codex_turn(
+        {:ok, %{request: request, attempt: attempt}},
+        status,
+        error_code
+      )
+    end
+
+    :ok
+  end
+
+  defp remote_downstream_state(session, downstream) do
+    %{
+      codex_session: %{session | owner_instance_id: Atom.to_string(@remote_node)},
+      websocket_owner_lease_token: session.owner_lease_token,
+      websocket_owner_downstream: downstream,
+      opts:
+        RequestOptions.for_websocket(%{
+          request_id: "remote-detach-connection",
+          websocket_owner_forwarder_opts:
+            WebsocketOwnerNodeHarness.node_client_opts([@remote_node],
+              calls: %{@remote_node => :success}
+            )
+        })
+    }
+  end
+
+  defp active_owner_lease(session_id) do
+    Repo.one!(
+      from lease in BridgeOwnerLease,
+        where: lease.codex_session_id == ^session_id and lease.status == "active"
+    )
+  end
+
+  defp assert_lease_preserved!(fixture) do
+    assert Repo.get!(BridgeOwnerLease, fixture.owner_lease.id).status == "active"
+
+    assert Repo.get!(CodexSession, fixture.session.id).owner_lease_token ==
+             fixture.owner_lease.lease_token
+
+    assert Process.alive?(fixture.owner_pid)
+  end
+
+  defp capture_info_log(fun) do
+    previous_level = Logger.level()
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+    Logger.configure(level: :info)
+
+    try do
+      ExUnit.CaptureLog.capture_log([level: :info], fun)
+    after
+      Logger.configure(level: previous_level)
+    end
+  end
+end

@@ -17,16 +17,16 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Repo
 
-  @raw_prompt_sentinel "TASK5_OPENAI_RAW_PROMPT_SENTINEL"
-  @raw_multipart_sentinel "TASK5_MULTIPART_BODY_SENTINEL"
-  @raw_file_sentinel "TASK5_FILE_BYTES_SENTINEL"
-  @raw_audio_sentinel "TASK5_AUDIO_BYTES_SENTINEL"
-  @raw_image_sentinel "TASK5_IMAGE_BYTES_SENTINEL"
-  @raw_bearer_sentinel "Bearer TASK5_BEARER_TOKEN_SENTINEL"
-  @raw_upload_url_sentinel "https://upload.example.invalid/TASK5_UPLOAD_URL_SENTINEL"
-  @raw_websocket_sentinel "TASK5_WEBSOCKET_FRAME_SENTINEL"
-  @raw_idempotency_sentinel "TASK5_RAW_IDEMPOTENCY_KEY_SENTINEL"
-  @raw_secret_sentinel "TASK5_SECRET_SENTINEL"
+  @raw_prompt_sentinel "REDACTION_OPENAI_RAW_PROMPT_SENTINEL"
+  @raw_multipart_sentinel "REDACTION_MULTIPART_BODY_SENTINEL"
+  @raw_file_sentinel "REDACTION_FILE_BYTES_SENTINEL"
+  @raw_audio_sentinel "REDACTION_AUDIO_BYTES_SENTINEL"
+  @raw_image_sentinel "REDACTION_IMAGE_BYTES_SENTINEL"
+  @raw_bearer_sentinel "Bearer REDACTION_BEARER_TOKEN_SENTINEL"
+  @raw_upload_url_sentinel "https://upload.example.invalid/REDACTION_UPLOAD_URL_SENTINEL"
+  @raw_websocket_sentinel "REDACTION_WEBSOCKET_FRAME_SENTINEL"
+  @raw_idempotency_sentinel "REDACTION_RAW_IDEMPOTENCY_KEY_SENTINEL"
+  @raw_secret_sentinel "REDACTION_SECRET_SENTINEL"
 
   @tag :success_once
   test "Responses adapter gateway success records one request attempt and settlement", %{
@@ -36,7 +36,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
       upstream =
         start_upstream(
           FakeUpstream.json_response(%{
-            "id" => "resp_task5_success",
+            "id" => "resp_accounting_success",
             "object" => "response",
             "usage" => %{"input_tokens" => 5, "output_tokens" => 7, "total_tokens" => 12}
           })
@@ -47,9 +47,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
 
       assert {:ok, result} =
                Responses.coerce(success_payload(setup),
-                 request_id: "task5-success-once",
+                 request_id: "request-accounting-success-once",
                  idempotency_key: @raw_idempotency_sentinel,
-                 user_agent: "openai-task5-harness/1.0",
+                 user_agent: "openai-accounting-harness/1.0",
                  routing_attempt_metadata: sensitive_attempt_metadata()
                )
 
@@ -57,7 +57,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
                Gateway.execute(auth, result.endpoint, result.payload, result.request_options)
 
       assert response.status == 200
-      assert %{"id" => "resp_task5_success"} = Jason.decode!(response.raw_body)
+      assert %{"id" => "resp_accounting_success"} = CodexPooler.JSON.decode!(response.raw_body)
       assert FakeUpstream.count(upstream) == 1
 
       assert_exactly_once_accounting!(setup.pool.id,
@@ -136,8 +136,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
 
     assert {:ok, result} =
              Responses.coerce(success_payload(setup),
-               request_id: "task5-upstream-failure-once",
-               user_agent: "openai-task5-harness/1.0",
+               request_id: "request-accounting-upstream-failure-once",
+               user_agent: "openai-accounting-harness/1.0",
                routing_attempt_metadata: sensitive_attempt_metadata()
              )
 
@@ -168,10 +168,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
 
     cases = [
       {:get, "/v1/models", nil, [], 401, "api_key_missing"},
-      {:post, "/v1/responses", rejected_payload(setup), [{"authorization", "Bearer invalid"}],
-       401, "api_key_missing"},
-      {:get, "/v1/models", nil, [{"authorization", paused.authorization}], 401,
-       "api_key_disabled"}
+      {:post, "/v1/responses", rejected_payload(setup), [{"authorization", "Bearer invalid"}], 401, "api_key_missing"},
+      {:get, "/v1/models", nil, [{"authorization", paused.authorization}], 401, "api_key_disabled"}
     ]
 
     for {method, path, body, headers, status, code} <- cases do
@@ -204,14 +202,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
     cases = [
       {:post, "/v1/embeddings", rejected_payload(setup), 404, "unsupported_endpoint"},
       {:post, "/v1/images/variations", rejected_payload(setup), 404, "unsupported_endpoint"},
-      {:post, "/v1/responses", Map.put(rejected_payload(setup), "logprobs", true), 400,
-       "unsupported_parameter"},
-      {:post, "/v1/files",
-       %{"purpose" => "fine_tuning", "file" => %{"filename" => "upload", "bytes" => 12}}, 400,
-       "invalid_request"},
-      {:post, "/v1/images/generations",
-       %{"model" => "gpt-image-1", "prompt" => @raw_prompt_sentinel, "size" => "2048x2048"}, 400,
-       "invalid_request"}
+      {:post, "/v1/responses", Map.put(rejected_payload(setup), "logprobs", true), 400, "unsupported_parameter"},
+      {:post, "/v1/files", %{"purpose" => "fine_tuning", "file" => %{"filename" => "upload", "bytes" => 12}}, 400, "invalid_request"},
+      {:post, "/v1/images/generations", %{"model" => "gpt-image-2", "prompt" => @raw_prompt_sentinel, "size" => "2048x2048"}, 400, "invalid_request"}
     ]
 
     for {method, path, body, status, code} <- cases do
@@ -389,18 +382,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
   end
 
   defp with_gateway_debug(fun) do
-    previous_env = Application.get_env(:codex_pooler, OperationalSettings)
+    previous_env = Application.fetch_env(:codex_pooler, OperationalSettings)
 
-    Application.put_env(:codex_pooler, OperationalSettings,
-      settings: %OperationalSettings{gateway_debug?: true}
-    )
+    restore = fn ->
+      case previous_env do
+        {:ok, value} -> Application.put_env(:codex_pooler, OperationalSettings, value)
+        :error -> Application.delete_env(:codex_pooler, OperationalSettings)
+      end
+    end
+
+    # Also on_exit: the ExUnit timeout or a linked crash kills the test before `after` runs.
+    on_exit(restore)
+
+    Application.put_env(:codex_pooler, OperationalSettings, settings: %OperationalSettings{gateway_debug?: true})
 
     try do
       fun.()
     after
-      if previous_env,
-        do: Application.put_env(:codex_pooler, OperationalSettings, previous_env),
-        else: Application.delete_env(:codex_pooler, OperationalSettings)
+      restore.()
     end
   end
 end

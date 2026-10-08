@@ -8,7 +8,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.DateTimeDisplay
 
-  @api_key_docs_url "https://docs.codex-pooler.com/operators/api-keys/"
+  @api_key_docs_url "https://www.codex-pooler.com/docs/operators/api-keys/"
 
   attr :created_secret, :map, required: true
 
@@ -16,54 +16,30 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
     assigns = assign(assigns, :api_key_docs_url, @api_key_docs_url)
 
     ~H"""
-    <dialog id="api-key-created-secret-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
+    <dialog
+      id="api-key-created-secret-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
-            API key secret
+            API key
           </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Copy this API key now</h2>
-          <p class="mt-2 text-sm leading-6 text-base-content/70">
-            This raw key is shown once. Future views only show fingerprint {@created_secret.key_prefix}.
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Copy this key before closing</h2>
+          <p id="api-key-created-secret" class="mt-2 text-sm leading-6 text-base-content/70">
+            It is shown once. Afterwards only the fingerprint <span class="font-semibold text-base-content">{@created_secret.key_prefix}</span> identifies it.
           </p>
         </div>
 
-        <div class="grid gap-5 p-6">
-          <div id="api-key-created-secret" class="alert alert-success items-start">
-            <.icon name="hero-key" class="size-5" />
-            <div class="grid gap-1">
-              <p class="font-semibold">Copy this API key before closing the dialog.</p>
-              <p class="text-sm">It will not be shown again.</p>
-            </div>
-          </div>
-
-          <div class="grid gap-2 rounded-box border border-base-300 bg-base-200 p-4">
-            <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-              one-time api key
-            </p>
-            <div class="join w-full">
-              <code
-                id="api-key-created-secret-value"
-                class="join-item min-h-10 flex-1 break-all border border-base-300 bg-base-100 px-3 py-2.5 font-mono text-sm text-base-content"
-              >
-                {@created_secret.raw_key}
-              </code>
-              <button
-                id="api-key-copy-created-secret"
-                type="button"
-                class="btn btn-neutral join-item min-h-10"
-                phx-hook="ClipboardCopy"
-                phx-update="ignore"
-                data-copy-text={@created_secret.raw_key}
-                data-copy-label="Copy"
-                data-copied-label="Copied"
-                aria-label="Copy API key"
-              >
-                <.icon name="hero-clipboard-document" class="copy-icon size-4" />
-                <span data-copy-label>Copy</span>
-              </button>
-            </div>
-          </div>
+        <div class="grid gap-5 p-5 sm:p-6">
+          <AdminComponents.one_time_secret
+            value={@created_secret.raw_key}
+            value_id="api-key-created-secret-value"
+            copy_id="api-key-copy-created-secret"
+            copy_label="Copy key"
+            copy_aria_label="Copy API key"
+          />
         </div>
 
         <AdminComponents.dialog_footer
@@ -71,14 +47,13 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
           docs_url={@api_key_docs_url}
         >
           <:actions>
-            <button
+            <AdminComponents.action_button
               id="api-key-secret-dialog-close"
-              type="button"
-              class="btn btn-primary btn-sm"
+              icon="hero-check"
+              label="Done"
               phx-click="close_secret"
-            >
-              Close
-            </button>
+              variant={:primary}
+            />
           </:actions>
         </AdminComponents.dialog_footer>
       </div>
@@ -97,13 +72,20 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
     assigns = assign(assigns, :api_key_docs_url, @api_key_docs_url)
 
     ~H"""
-    <dialog id="api-key-delete-dialog" class="modal" open>
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <div class="border-b border-base-300 px-6 py-5">
-          <p class="text-sm font-semibold uppercase tracking-wide text-error">Hard delete</p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete API key</h2>
+    <dialog
+      id="api-key-delete-dialog"
+      class="modal modal-bottom overflow-x-hidden sm:modal-middle"
+      open
+    >
+      <div class="modal-box sm:max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-5 py-4 sm:px-6 sm:py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">API key</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">
+            Delete {@api_key.display_name}?
+          </h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            This permanently removes the API key and its related request history from this instance.
+            It stops working immediately. Request history is retained without a link to this key.
+            Deleting the key cannot be undone.
           </p>
         </div>
 
@@ -112,28 +94,21 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
           for={@form}
           phx-submit="confirm_delete_api_key"
           autocomplete="off"
-          class="grid gap-5 p-6"
+          class="grid gap-5 p-5 sm:p-6"
         >
           <.input field={@form[:id]} type="hidden" />
-          <div class="alert alert-warning items-start">
-            <.icon name="hero-exclamation-triangle" class="size-5" />
-            <div class="grid gap-1">
-              <p class="font-semibold">
-                This removes {@api_key.display_name} permanently.
-              </p>
-              <p class="text-sm">
-                Type <span class="break-all font-semibold">{@api_key.key_prefix}</span> to confirm.
-              </p>
-            </div>
-          </div>
           <.input
             field={@form[:confirmation_prefix]}
             id={"api_key_delete_confirmation_prefix_#{@form_version}"}
             type="text"
-            label="Confirm prefix"
             placeholder={@api_key.key_prefix}
+            pattern={Regex.escape(@api_key.key_prefix)}
             required
-          />
+          >
+            <:label_content>
+              Type <span class="font-semibold text-base-content">{@api_key.key_prefix}</span> to confirm
+            </:label_content>
+          </.input>
         </.form>
 
         <AdminComponents.dialog_footer
@@ -150,7 +125,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
             <AdminComponents.action_button
               id="api-key-delete-submit"
               icon="hero-trash"
-              label="Delete API key"
+              label="Delete"
               type="submit"
               form="api-key-delete-form"
               variant={:danger}
@@ -183,8 +158,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 pb-3 text-sm"
       >
         <span class="inline-flex min-w-0 items-center gap-2 text-base-content/70">
-          <.icon name="hero-funnel" class="size-4 shrink-0 text-primary" /> Showing
-          <span class="font-semibold text-base-content">{@selected_pool.name}</span>
+          <.icon name="hero-funnel" class="size-4 shrink-0 text-primary" /> Showing <span class="font-semibold text-base-content">{@selected_pool.name}</span>
         </span>
         <.link
           id="api-key-clear-pool-filter"
@@ -201,10 +175,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         class="flex flex-wrap items-center justify-between gap-3 border-b border-warning/30 pb-3 text-sm text-warning"
       >
         <span class="inline-flex items-center gap-2">
-          <.icon name="hero-exclamation-triangle" class="size-4" />
-          Unavailable model references: {ApiKeysReadModel.unavailable_model_policy_count_label(
-            @unavailable_model_policy_count
-          )}
+          <.icon name="hero-exclamation-triangle" class="size-4" /> Unavailable model references: {ApiKeysReadModel.unavailable_model_policy_count_label(@unavailable_model_policy_count)}
         </span>
         <.link
           id="api-key-clear-model-policy-filter"
@@ -221,10 +192,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         class="flex flex-wrap items-center justify-between gap-3 border-b border-warning/30 pb-3 text-sm"
       >
         <span class="inline-flex items-center gap-2 text-warning">
-          <.icon name="hero-exclamation-triangle" class="size-4" />
-          Model policy attention: {ApiKeysReadModel.unavailable_model_policy_count_label(
-            @unavailable_model_policy_count
-          )}
+          <.icon name="hero-exclamation-triangle" class="size-4" /> Model policy attention: {ApiKeysReadModel.unavailable_model_policy_count_label(@unavailable_model_policy_count)}
         </span>
         <.link
           id="api-key-filter-unavailable-model-policies"
@@ -273,11 +241,16 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         id={"api-key-pool-group-#{group.dom_id}"}
         class="grid min-w-0 overflow-visible rounded-box border border-base-300 bg-base-100 xl:grid-cols-[13rem_minmax(0,1fr)]"
       >
-        <header class="flex min-w-0 flex-wrap content-start items-center gap-3 rounded-t-[calc(var(--radius-box)-1px)] border-b border-base-300 bg-primary/5 p-4 xl:justify-between xl:rounded-l-[calc(var(--radius-box)-1px)] xl:rounded-tr-none xl:border-r xl:border-b-0">
+        <header class="flex min-w-0 flex-wrap content-start items-center justify-between gap-3 rounded-t-[calc(var(--radius-box)-1px)] border-b border-base-300 bg-primary/5 p-4 xl:rounded-l-[calc(var(--radius-box)-1px)] xl:rounded-tr-none xl:border-r xl:border-b-0">
           <span class="grid size-9 shrink-0 place-items-center rounded-field border border-primary/30 bg-primary/15 text-primary">
             <.icon name="hero-server-stack" class="size-4" />
           </span>
-          <div class="min-w-0 flex-1 xl:order-last xl:basis-full">
+          <%!-- Beside the icon wherever it fits, on its own line where it does
+          not. On a phone the icon and the count leave it around 78px, and a
+          Pool called "Production Europe West Failover Cluster" came out broken
+          mid-word — "Productio / n Europe" — so there it drops below them. At
+          `xl` the header is a 13rem column and it drops below again. --%>
+          <div class="min-w-0 order-last basis-full sm:order-none sm:flex-1 sm:basis-auto xl:order-last xl:flex-none xl:basis-full">
             <p class="text-xs font-medium text-base-content/55">Pool</p>
             <h2 class="break-words text-lg font-bold leading-6 text-base-content">{group.name}</h2>
           </div>
@@ -296,11 +269,15 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
           <article
             :for={api_key <- group.api_keys}
             id={"api-key-row-#{api_key.id}"}
-            class="relative grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 p-4 transition-colors last:rounded-b-[calc(var(--radius-box)-1px)] hover:bg-base-200/60 focus-within:z-30 xl:grid-cols-[minmax(12rem,0.9fr)_minmax(12rem,0.85fr)_minmax(14rem,1fr)_auto] xl:gap-4 xl:last:rounded-bl-none"
+            class="relative grid min-w-0 grid-cols-1 items-start gap-x-3 p-4 transition-colors last:rounded-b-[calc(var(--radius-box)-1px)] hover:bg-base-200/60 focus-within:z-30 xl:grid-cols-[minmax(12rem,0.9fr)_minmax(12rem,0.85fr)_minmax(14rem,1fr)_auto] xl:gap-4 xl:last:rounded-bl-none"
           >
             <div class="grid min-w-0 gap-2 xl:contents">
               <div id={"api-key-row-#{api_key.id}-key"} class="grid min-w-0 gap-1.5 xl:content-start">
-                <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+                <%!-- Only this line makes room for the chip and the menu, which
+                sit over it below `xl`. The status vocabulary is closed and
+                validated — active, paused, revoked — so the widest of them plus
+                the gap and the menu is what `pr-24` reserves. --%>
+                <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pr-24 xl:pr-0">
                   <span class="truncate font-semibold text-base-content">
                     {api_key.display_name}
                   </span>
@@ -327,17 +304,22 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                   />
                 </div>
               </div>
-              <div class="flex min-w-0 flex-wrap items-baseline gap-x-6 gap-y-1 text-sm text-base-content/70 xl:contents">
+              <%!-- Two by two below `xl`, on the vitals block the operator
+              cards already use: a label over its value never shares a line with
+              it, so it stops wrapping in a column this narrow. --%>
+              <div class="grid min-w-0 grid-cols-2 gap-x-3 gap-y-2.5 text-xs leading-5 text-base-content/65 xl:contents">
                 <dl class="contents xl:grid xl:content-start xl:gap-2">
                   <div
                     id={"api-key-row-#{api_key.id}-last-used"}
-                    class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
+                    class="min-w-0 xl:grid xl:gap-0.5"
                   >
-                    <dt class="text-xs font-medium text-base-content/50">Last used</dt>
-                    <dd>{last_used_label(api_key.last_used_at, @datetime_preferences)}</dd>
+                    <dt class={card_vital_label_class()}>Last used</dt>
+                    <dd class="truncate tabular-nums">
+                      {last_used_label(api_key.last_used_at, @datetime_preferences)}
+                    </dd>
                   </div>
-                  <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
-                    <dt class="text-xs font-medium text-base-content/50">Prefix</dt>
+                  <div class="min-w-0 xl:grid xl:gap-0.5">
+                    <dt class={card_vital_label_class()}>Prefix</dt>
                     <dd class="flex min-w-0 items-center gap-1">
                       <span class="min-w-0 truncate">{api_key.key_prefix}</span>
                       <button
@@ -356,15 +338,18 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                 <div class="contents xl:grid xl:content-start xl:gap-2">
                   <div
                     id={"api-key-row-#{api_key.id}-expires"}
-                    class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
+                    class="min-w-0 xl:grid xl:gap-0.5"
                   >
-                    <span class="text-xs font-medium text-base-content/50">Expires</span>
-                    <span class={expiry_label_class(api_key.expires_at)}>
+                    <span class={["block", card_vital_label_class()]}>Expires</span>
+                    <span class={[
+                      "block truncate tabular-nums",
+                      expiry_label_class(api_key.expires_at)
+                    ]}>
                       {expiry_label(api_key.expires_at, @datetime_preferences)}
                     </span>
                   </div>
-                  <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-1">
-                    <span class="text-xs font-medium text-base-content/50">Model access</span>
+                  <div class="min-w-0 xl:grid xl:gap-1">
+                    <span class={["block", card_vital_label_class()]}>Model access</span>
                     <div
                       id={"api-key-row-#{api_key.id}-models"}
                       class="flex min-w-0 flex-wrap items-center gap-1"
@@ -373,33 +358,46 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                     </div>
                   </div>
                   <span
-                    :if={
-                      ApiKeysReadModel.model_policy_warning_label(
-                        Map.get(@model_policy_summaries, api_key.id)
-                      )
-                    }
+                    :if={ApiKeysReadModel.model_policy_warning_label(Map.get(@model_policy_summaries, api_key.id))}
                     id={"api-key-row-#{api_key.id}-model-policy-warning"}
-                    class="inline-flex basis-full items-start gap-1.5 text-xs font-medium leading-5 text-warning xl:basis-auto"
+                    class="col-span-2 inline-flex basis-full items-start gap-1.5 text-xs font-medium leading-5 text-warning xl:col-span-1 xl:basis-auto"
                   >
                     <.icon name="hero-exclamation-triangle" class="mt-0.5 size-3.5 shrink-0" />
                     <span>
-                      {ApiKeysReadModel.model_policy_warning_label(
-                        Map.get(@model_policy_summaries, api_key.id)
-                      )}
+                      {ApiKeysReadModel.model_policy_warning_label(Map.get(@model_policy_summaries, api_key.id))}
                     </span>
                   </span>
                 </div>
               </div>
             </div>
+            <%!-- Out of flow below `xl`, where it was a full-height column
+            reserving a third of the card's width for a chip and a menu that
+            occupy one line of it. The name row reserves the width instead. --%>
             <div
               data-role="api-key-actions"
-              class="relative z-10 flex items-center gap-2 justify-self-end"
+              class="absolute right-4 top-4 z-10 flex h-6 items-center gap-2 xl:relative xl:inset-auto xl:h-auto xl:justify-self-end"
             >
               <span
                 id={"api-key-row-#{api_key.id}-status"}
                 class={[AdminBadges.lifecycle_chip_class(api_key.status), "shrink-0"]}
               >
                 {api_key.status}
+              </span>
+              <span
+                :if={Map.get(api_key, :deletion) == :in_progress}
+                id={"api-key-row-#{api_key.id}-deletion"}
+                class={[AdminBadges.lifecycle_chip_class("paused"), "shrink-0"]}
+                title="A background job is detaching this key's request history; the key disappears when it finishes"
+              >
+                deleting
+              </span>
+              <span
+                :if={Map.get(api_key, :deletion) == :failed}
+                id={"api-key-row-#{api_key.id}-deletion"}
+                class={[AdminBadges.lifecycle_chip_class("deleted"), "shrink-0"]}
+                title="The last deletion attempt gave up; delete the key again to resume"
+              >
+                deletion failed
               </span>
               <.api_key_actions_menu api_key={api_key} />
             </div>
@@ -516,12 +514,19 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
             variant={:danger}
             phx-click="delete_api_key"
             phx-value-id={@api_key.id}
+            disabled={Map.get(@api_key, :deletion) == :in_progress}
           />
         </li>
       </ul>
     </div>
     """
   end
+
+  # The same label the operator cards name a vital with, from the same
+  # definition — these rows sit two clicks apart and used to disagree about what
+  # a fact label is.
+  defp card_vital_label_class,
+    do: [AdminComponents.card_fact_label_class(), "text-base-content/35"]
 
   defp last_used_label(nil, _datetime_preferences), do: "Never used"
 
@@ -602,6 +607,5 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
   end
 
   defp model_chip_class,
-    do:
-      "inline-flex max-w-full items-center truncate rounded-full border border-base-300 bg-base-200 px-2 py-0.5 text-[0.7rem] font-medium leading-4 text-base-content/70"
+    do: "inline-flex max-w-full items-center truncate rounded-full border border-base-300 bg-base-200 px-2 py-0.5 text-[0.7rem] font-medium leading-4 text-base-content/70"
 end

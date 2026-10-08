@@ -24,9 +24,47 @@ defmodule CodexPooler.Access do
   @type dashboard_principal :: DashboardSessions.Principal.t()
   @type dashboard_session_handoff :: DashboardSessions.handoff()
 
+  @spec capture_api_key_runtime_epoch(APIKey.t() | Ecto.UUID.t()) ::
+          {:ok, APIKeys.RuntimeAuthorization.epoch()}
+          | {:error, APIKeys.RuntimeAuthorization.disposition()}
+  defdelegate capture_api_key_runtime_epoch(api_key_or_id),
+    to: APIKeys,
+    as: :capture_runtime_authorization_epoch
+
+  @spec authorize_api_key_runtime_turn(
+          APIKey.t() | Ecto.UUID.t(),
+          APIKeys.RuntimeAuthorization.epoch()
+        ) ::
+          {:ok, APIKeys.RuntimeAuthorization.authorization()}
+          | {:error, APIKeys.RuntimeAuthorization.disposition()}
+  defdelegate authorize_api_key_runtime_turn(api_key_or_id, captured_epoch),
+    to: APIKeys,
+    as: :authorize_runtime_turn
+
+  @spec authorize_api_key_runtime_turn_for_read(
+          APIKey.t() | Ecto.UUID.t(),
+          APIKeys.RuntimeAuthorization.epoch()
+        ) ::
+          {:ok, APIKeys.RuntimeAuthorization.authorization()}
+          | {:error, APIKeys.RuntimeAuthorization.disposition()}
+  defdelegate authorize_api_key_runtime_turn_for_read(api_key_or_id, captured_epoch),
+    to: APIKeys,
+    as: :authorize_runtime_turn_for_read
+
+  @spec lock_api_key_for_read(Ecto.UUID.t() | nil) :: APIKey.t() | nil
+  defdelegate lock_api_key_for_read(api_key_id),
+    to: APIKeys,
+    as: :lock_runtime_api_key_for_read
+
+  @spec api_key_runtime_epoch_for_status_change(APIKey.t(), String.t()) ::
+          APIKeys.RuntimeAuthorization.epoch()
+  defdelegate api_key_runtime_epoch_for_status_change(api_key, target_status),
+    to: APIKeys,
+    as: :runtime_epoch_for_status_change
+
   @spec resolve_reasoning_effort(
           APIKey.t(),
-          String.t() | nil,
+          String.t() | non_neg_integer() | nil,
           [String.t()] | nil,
           String.t() | nil
         ) :: APIKeys.ReasoningEffortPolicy.resolution()
@@ -41,7 +79,7 @@ defmodule CodexPooler.Access do
   defdelegate project_reasoning_effort_metadata(api_key, model_levels, model_default),
     to: APIKeys
 
-  @spec project_reasoning_effort_denial_metadata(APIKey.t(), String.t() | nil) ::
+  @spec project_reasoning_effort_denial_metadata(APIKey.t(), String.t() | non_neg_integer() | nil) ::
           APIKeys.ReasoningEffortPolicy.denial_metadata()
   defdelegate project_reasoning_effort_denial_metadata(api_key, requested_effort), to: APIKeys
 
@@ -144,8 +182,30 @@ defmodule CodexPooler.Access do
   defdelegate revoke_api_key(scope, api_key), to: APIKeys
 
   @spec delete_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
-          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+          {:ok, APIKey.t()} | {:deleting, APIKey.t()} | {:error, term()}
   defdelegate delete_api_key(scope, api_key), to: APIKeys
+
+  @doc "Continues a scheduled API key deletion for `CodexPooler.Jobs.APIKeyDeletionWorker`."
+  @spec continue_api_key_deletion(Ecto.UUID.t(), Ecto.UUID.t() | nil, integer()) ::
+          :more | :deleted | :gone | {:cancel, :api_key_not_revoked} | {:error, term()}
+  defdelegate continue_api_key_deletion(api_key_id, requested_by_user_id, deadline),
+    to: CodexPooler.Access.APIKeys.Deletion,
+    as: :continue
+
+  @doc "Deletion state (`:in_progress` or `:failed`) of each listed API key that has one."
+  @spec api_key_deletion_states([Ecto.UUID.t()]) :: %{Ecto.UUID.t() => :in_progress | :failed}
+  defdelegate api_key_deletion_states(api_key_ids), to: CodexPooler.Access.APIKeys.Deletion, as: :states
+
+  @doc "Tells open API key pages that a key's deletion job gave up; the key stays revoked."
+  @spec broadcast_api_key_deletion_failed(Ecto.UUID.t()) :: :ok
+  def broadcast_api_key_deletion_failed(api_key_id) when is_binary(api_key_id) do
+    case CodexPooler.Repo.get(APIKey, api_key_id) do
+      %APIKey{pool_id: pool_id} -> _ = CodexPooler.Events.broadcast_pools(pool_id, "api_key_deletion_failed", %{api_key_id: api_key_id})
+      nil -> :ok
+    end
+
+    :ok
+  end
 
   @spec authenticate_api_key(term()) :: {:ok, auth_context()} | {:error, access_error()}
   defdelegate authenticate_api_key(raw_key), to: APIKeys

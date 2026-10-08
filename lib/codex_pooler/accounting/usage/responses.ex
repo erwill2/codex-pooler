@@ -3,8 +3,35 @@ defmodule CodexPooler.Accounting.UsageResponses do
   Codex-compatible usage-limit response shaping for accounting reads.
   """
 
-  alias CodexPooler.Quotas.WindowClassifier
+  alias CodexPooler.Accounting.RequestLifecycle.WindowUsage
+  alias CodexPooler.Quotas.AdditionalMeterIdentity
+  alias CodexPooler.Quotas.{Evidence, WindowClassifier}
   alias CodexPooler.Upstreams.Quota
+
+  @type budget_window :: %{
+          known_total_tokens: non_neg_integer(),
+          provisional_total_tokens: non_neg_integer(),
+          pending_total_tokens: non_neg_integer(),
+          effective_total_tokens: non_neg_integer(),
+          admission_count: non_neg_integer()
+        }
+
+  @spec budget_usage(%{atom() => WindowUsage.window_usage()}) ::
+          %{daily: budget_window(), weekly: budget_window()}
+  def budget_usage(windows) do
+    Map.new([:daily, :weekly], fn name ->
+      window = Map.fetch!(windows, name)
+
+      {name,
+       %{
+         known_total_tokens: window.known_total_tokens,
+         provisional_total_tokens: window.provisional_total_tokens,
+         pending_total_tokens: window.pending_total_tokens,
+         effective_total_tokens: window.effective_total_tokens,
+         admission_count: window.effective_request_count
+       }}
+    end)
+  end
 
   @spec self_usage_limits([map()], integer(), integer(), integer(), DateTime.t()) :: [map()]
   def self_usage_limits(bindings, minute_requests, daily_tokens, weekly_tokens, as_of) do
@@ -81,11 +108,14 @@ defmodule CodexPooler.Accounting.UsageResponses do
 
   @spec codex_rate_limit(map() | nil, map() | nil) :: map()
   def codex_rate_limit(primary, secondary) do
-    preferred = secondary || primary
+    allowed =
+      [primary, secondary]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.all?(&codex_limit_allowed?/1)
 
     %{
-      allowed: is_nil(preferred) or codex_limit_allowed?(preferred),
-      limit_reached: not is_nil(preferred) and not codex_limit_allowed?(preferred),
+      allowed: allowed,
+      limit_reached: not allowed,
       primary_window: codex_window_snapshot(primary),
       secondary_window: codex_window_snapshot(secondary)
     }
@@ -107,11 +137,7 @@ defmodule CodexPooler.Accounting.UsageResponses do
         }
 
       true ->
-        %{
-          has_credits: codex_limit_allowed?(preferred),
-          unlimited: false,
-          balance: nil
-        }
+        nil
     end
   end
 
@@ -119,9 +145,15 @@ defmodule CodexPooler.Accounting.UsageResponses do
   def additional_codex_rate_limits(windows, as_of) do
     windows
     |> Quota.Windows.effective_quota_windows(as_of)
-    |> Enum.reject(&(&1.quota_key in [nil, "account"]))
+    |> Enum.reject(
+      &(&1.quota_key in [nil, "account"] or
+          Evidence.current_freshness_state(&1, as_of) == "stale")
+    )
     |> Enum.group_by(& &1.quota_key)
-    |> Enum.map(fn {quota_key, quota_windows} ->
+    |> AdditionalMeterIdentity.split_quota_groups()
+    |> Enum.map(fn {{quota_key, meter_token}, quota_windows} ->
+      quota_windows = Enum.sort_by(quota_windows, &{&1.window_kind, &1.window_minutes})
+
       primary =
         quota_windows
         |> Enum.find(&(&1.window_kind == "primary"))
@@ -138,10 +170,35 @@ defmodule CodexPooler.Accounting.UsageResponses do
         quota_key: quota_key,
         limit_name: representative.display_label || representative.limit_name || quota_key,
         display_label: representative.display_label || representative.limit_name || quota_key,
-        metered_feature: representative.metered_feature,
-        rate_limit: codex_rate_limit(primary, secondary)
+        metered_feature: meter_token || representative.metered_feature,
+        rate_limit: additional_rate_limit(primary, secondary, quota_windows, as_of)
       }
     end)
+  end
+
+  defp additional_rate_limit(primary, secondary, windows, as_of) do
+    rate_limit = codex_rate_limit(primary, secondary)
+
+    allowed =
+      Enum.all?(windows, fn window ->
+        metadata = window.metadata || %{}
+
+        case {Evidence.current_freshness_state(window, as_of), metadata, window} do
+          {"fresh", %{"rate_limit_allowed" => false}, _window} ->
+            false
+
+          {"fresh", %{"rate_limit_reached" => true}, _window} ->
+            false
+
+          {"fresh", %{"rate_limit_allowed" => true, "rate_limit_reached" => false}, %{source: "codex_usage_api", active_limit: nil, credits: nil}} ->
+            true
+
+          _other ->
+            window |> codex_limit_from_quota_window(as_of) |> codex_limit_allowed?()
+        end
+      end)
+
+    %{rate_limit | allowed: allowed, limit_reached: not allowed}
   end
 
   def codex_limit_allowed?(%{remaining_value: remaining}) when is_integer(remaining),
@@ -239,17 +296,22 @@ defmodule CodexPooler.Accounting.UsageResponses do
         end
 
     %{
-      used_percent:
-        if(is_integer(limit.max_value) and limit.max_value > 0,
-          do: div(limit.current_value * 100 + div(limit.max_value, 2), limit.max_value),
-          else: limit.used_percent || 0
-        ),
+      used_percent: snapshot_used_percent(limit),
       limit_window_seconds: window_seconds(limit.limit_window),
-      reset_after_seconds:
-        if(reset_at, do: max(DateTime.diff(reset_at, now(), :second), 0), else: nil),
+      reset_after_seconds: if(reset_at, do: max(DateTime.diff(reset_at, now(), :second), 0), else: nil),
       reset_at: if(reset_at, do: DateTime.to_unix(reset_at), else: nil)
     }
   end
+
+  @spec snapshot_used_percent(map()) :: non_neg_integer()
+  defp snapshot_used_percent(%{used_percent: used_percent}) when is_integer(used_percent),
+    do: used_percent
+
+  defp snapshot_used_percent(%{max_value: max_value, current_value: current_value})
+       when is_integer(max_value) and max_value > 0 and is_integer(current_value),
+       do: div(current_value * 100 + div(max_value, 2), max_value)
+
+  defp snapshot_used_percent(_limit), do: 0
 
   defp limit_window_label(%Quota.AccountQuotaWindow{} = window) do
     case WindowClassifier.classify(window) do

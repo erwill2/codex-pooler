@@ -1,180 +1,75 @@
 ---
-title: Monitoring and runtime triage
-description: Collect Prometheus metrics, use Grafana dashboards, and investigate Codex Pooler production runtime pressure without exposing request content.
+title: Monitoring guide moved
+description: Find the monitoring setup, dashboard, query and troubleshooting guides at their new locations.
+sidebar:
+  hidden: true
+pagefind: false
+tableOfContents: false
+prev: false
+next: false
+head:
+  - tag: meta
+    attrs:
+      name: robots
+      content: noindex,follow
 ---
 
-Codex Pooler exposes Prometheus metrics at `/metrics`. Metrics auth is managed from `/admin/system`; if a bearer token is configured, Prometheus must scrape with the matching Kubernetes Secret reference instead of putting the raw token in Helm values.
+Monitoring now has its [own documentation section](/monitoring/overview/). Choose a guide below, or follow the section matching your existing bookmark.
 
-Use monitoring for runtime evidence only. Dashboards, alerts, logs, tickets, and copied queries must not include prompts, response bodies, uploaded files, websocket frames, cookies, bearer tokens, upstream secrets, or raw Pool API keys.
+- [Metrics setup](/monitoring/metrics/)
+- [Grafana dashboards](/monitoring/grafana/)
+- [Runtime triage](/monitoring/runtime-triage/)
+- [PromQL recipes](/monitoring/promql/)
+- [Logs and memory](/monitoring/logs/)
+
+## Websocket control-path failures
+
+Continue to [websocket control-path failures](/monitoring/runtime-triage/#websocket-control-path-failures).
+
+## Metrics exposure states
+
+Continue to [metrics exposure states](/monitoring/metrics/#protect-the-metrics-endpoint).
+
+## Reachability
+
+Continue to [reachability](/monitoring/metrics/#protect-the-metrics-endpoint).
 
 ## Collector path
 
-The Helm chart can render a Prometheus Operator `ServiceMonitor` for the app service:
-
-```yaml
-monitoring:
-  serviceMonitor:
-    enabled: true
-    labels:
-      release: kube-prometheus-stack
-    interval: 10s
-    scrapeTimeout: 5s
-```
-
-The `release` label and scrape interval should match your own Prometheus Operator selectors and scrape budget. For fast OOM investigations, prefer a short interval for the app ServiceMonitor and keep broader Kubernetes collectors at their normal cadence. Worker and scheduler roles don't start the Prometheus reporter because they don't expose `/metrics`; use Kubernetes cgroup metrics and sampler logs for those pods.
+Continue to [collector path](/monitoring/metrics/#collect-metrics-with-the-helm-chart).
 
 ## Runtime triage dashboard
 
-Build your Grafana or Prometheus dashboard around the signals needed to correlate runtime pressure across memory, request handling, gateway admission, database access, and restarts:
+Continue to [runtime triage dashboard](/monitoring/grafana/).
 
-1. Kubernetes cgroup working set versus pod memory limit, RSS/cache split, and cgroup memory not explained by BEAM total
-2. BEAM memory total, processes, binary, ETS, code, atom, atom used, and system memory by pod
-3. BEAM process count, port count, total run queue, CPU run queue, and IO run queue
-4. app restarts, OOM events, and current pod last terminated reason
-5. request rate, HTTP status class rate, and p95 endpoint/router latency
-6. gateway admission accepted, queued, rejected, timed-out, and queue-time p95 signals
-7. stream-buffer oversized and truncated events
-8. Ecto query rate, queries per request, hot query sources by safe source and SQL command, unknown query rate, and DB queue p95
+## Fenced affinity writes
 
-Read the dashboard as a correlation view. If cgroup memory climbs while BEAM total stays flat, look outside normal BEAM heap attribution. If `vm_memory_binary_bytes` climbs with cgroup memory, inspect streaming response retention, file bodies, and upstream transport buffering. If process count, ports, or run queue climb, inspect stuck request processes, websocket ownership, and overloaded route classes.
+Continue to [fenced affinity writes](/monitoring/runtime-triage/#fenced-affinity-writes).
 
-![Codex Pooler Grafana runtime triage dashboard](/codex-pooler-grafana.png)
+## Duplicate-turn refusals
 
-[Download the starter Grafana dashboard JSON](/operators/monitoring/codex-pooler-runtime-triage.json)
+Continue to [duplicate-turn refusals](/monitoring/runtime-triage/#duplicate-turn-refusals).
+
+## Database unavailable before dispatch
+
+Continue to [database unavailable before dispatch](/monitoring/runtime-triage/#database-unavailable-before-dispatch).
+
+## Native compaction admission clears
+
+Continue to [native compaction admission clears](/monitoring/runtime-triage/#native-compaction-admission-clears).
+
+## Pre-attempt reservation releases
+
+Continue to [pre-attempt reservation releases](/monitoring/runtime-triage/#pre-attempt-reservation-releases).
+
+## Saved-reset post-consume convergence
+
+Continue to [saved-reset post-consume convergence](/monitoring/runtime-triage/#saved-reset-post-consume-convergence).
 
 ## Useful PromQL
 
-```text
-max by (pod) (
-  container_memory_working_set_bytes{namespace="codex-pooler", container="app", image!=""}
-)
-```
-
-```text
-vm_memory_total_bytes{namespace="codex-pooler", job="codex-pooler-app"}
-vm_memory_binary_bytes{namespace="codex-pooler", job="codex-pooler-app"}
-vm_memory_processes_bytes{namespace="codex-pooler", job="codex-pooler-app"}
-vm_memory_ets_bytes{namespace="codex-pooler", job="codex-pooler-app"}
-vm_memory_system_bytes{namespace="codex-pooler", job="codex-pooler-app"}
-```
-
-```text
-clamp_min(
-  max by (pod) (
-    container_memory_working_set_bytes{
-      namespace="codex-pooler",
-      container="app",
-      image!=""
-    }
-  )
-  - on (pod)
-  max by (pod) (
-    vm_memory_total_bytes{namespace="codex-pooler", job="codex-pooler-app"}
-  ),
-  0
-)
-```
-
-```text
-increase(kube_pod_container_status_restarts_total{
-  namespace="codex-pooler",
-  exported_container="app"
-}[15m])
-```
-
-```text
-rate(codex_pooler_gateway_stream_buffer_oversized_count_total[5m])
-rate(codex_pooler_gateway_stream_buffer_truncated_count_total[5m])
-```
-
-```text
-sum by (pod) (
-  rate(codex_pooler_repo_query_count{namespace="codex-pooler", job="codex-pooler-app"}[5m])
-)
-```
-
-```text
-topk(10,
-  sum by (source, command) (
-    rate(codex_pooler_repo_query_count{namespace="codex-pooler", job="codex-pooler-app"}[5m])
-  )
-)
-```
-
-```text
-sum by (pod, command) (
-  rate(codex_pooler_repo_query_count{
-    namespace="codex-pooler",
-    job="codex-pooler-app",
-    source="unknown"
-  }[5m])
-)
-```
-
-```text
-histogram_quantile(0.95,
-  sum by (le, source, command) (
-    rate(codex_pooler_repo_query_total_time_seconds_bucket{
-      namespace="codex-pooler",
-      job="codex-pooler-app"
-    }[5m])
-  )
-)
-```
-
-```text
-sum by (method, status_class) (
-  rate(codex_pooler_http_request_count{
-    namespace="codex-pooler",
-    job="codex-pooler-app"
-  }[5m])
-)
-```
-
-```text
-sum by (route_class, transport) (
-  rate(codex_pooler_gateway_admission_enqueued_count{
-    namespace="codex-pooler",
-    job="codex-pooler-app"
-  }[5m])
-)
-```
-
-```text
-histogram_quantile(0.95,
-  sum by (le, route_class, transport) (
-    rate(codex_pooler_gateway_admission_dequeued_time_seconds_bucket{
-      namespace="codex-pooler",
-      job="codex-pooler-app"
-    }[5m])
-  )
-)
-```
-
-```text
-histogram_quantile(0.95,
-  sum by (le, pod) (
-    rate(codex_pooler_repo_query_queue_time_seconds_bucket{
-      namespace="codex-pooler",
-      job="codex-pooler-app"
-    }[5m])
-  )
-)
-```
+Continue to [useful promql](/monitoring/promql/).
 
 ## Memory sampler logs
 
-The in-process memory sampler is enabled by default in every release role. When BEAM total memory or cgroup usage crosses the configured threshold, it logs a sanitized snapshot with role metadata, memory categories, cgroup memory stats, process and port counts, top processes by memory, top processes by message queue length, and top ETS tables by memory. It never logs ETS table contents, messages, request bodies, prompts, bearer tokens, websocket frames, or upstream payloads.
-
-Emergency tuning environment variables:
-
-```bash
-CODEX_POOLER_MEMORY_SAMPLER_ENABLED=true
-CODEX_POOLER_MEMORY_SAMPLER_THRESHOLD_RATIO=0.70
-CODEX_POOLER_MEMORY_SAMPLER_MIN_INTERVAL_MS=60000
-CODEX_POOLER_MEMORY_SAMPLER_TOP_PROCESSES=20
-CODEX_POOLER_MEMORY_SAMPLER_TOP_ETS_TABLES=20
-CODEX_POOLER_MEMORY_SAMPLER_LIMIT_BYTES=1073741824
-```
-
-Use a lower threshold or shorter interval only during active investigation, because logs are the only signal likely to capture a worker or scheduler spike that reaches OOM before the next Prometheus scrape. Worker and scheduler pods do not expose the app `/metrics` endpoint and do not start the Prometheus reporter, so combine their sampler logs with Kubernetes cgroup memory, restart, OOM, and memory-limit metrics.
+Continue to [memory sampler logs](/monitoring/logs/#memory-sampler).

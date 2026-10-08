@@ -223,8 +223,7 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
                @unknown
            ),
          phase: safe_label(header(conn, "x-codex-pooler-perf-phase") || @default_phase),
-         request_index:
-           header(conn, "x-codex-pooler-perf-request-index") |> parse_non_negative_integer(),
+         request_index: header(conn, "x-codex-pooler-perf-request-index") |> parse_non_negative_integer(),
          request_id: request_id(conn),
          started_at: now_iso8601()
        }}
@@ -344,12 +343,12 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
 
     File.write!(
       Path.join(run.dir, "query-summary.json"),
-      Jason.encode_to_iodata!(query_summary(run), pretty: true)
+      CodexPooler.JSON.encode_to_iodata!(query_summary(run), pretty: true)
     )
 
     File.write!(
       Path.join(run.dir, "request-summary.json"),
-      Jason.encode_to_iodata!(request_summary(run), pretty: true)
+      CodexPooler.JSON.encode_to_iodata!(request_summary(run), pretty: true)
     )
 
     File.write!(

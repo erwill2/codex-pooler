@@ -6,18 +6,57 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport,
     only: [auth: 2, gateway_setup: 1, start_upstream: 1]
 
-  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Access
+  alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Pools
   alias CodexPooler.Repo
 
-  test "image endpoints use the shared coerced v1 dispatch boundary" do
-    source = File.read!("lib/codex_pooler_web/controllers/v1/images_controller.ex")
+  test "image controller actions mark gateway execution for permission enforcement", %{conn: conn} do
+    upstream = start_upstream(image_success_stream("SHOULD_NOT_DISPATCH", nil))
+    setup = upstream |> gateway_setup() |> use_image_model!("gpt-image-1")
+    {:ok, auth_context} = Access.authenticate_authorization_header(setup.authorization)
 
-    assert source =~ "PublicGatewayDispatch.coerced("
-    refute source =~ "PublicGatewayDispatch.authenticated("
-    refute source =~ "Service.execute"
-    refute source =~ "RouteClass.proxy_stream"
-    refute source =~ "RequestOptions.route_class"
+    setup.pool
+    |> Pools.ensure_routing_settings()
+    |> Ecto.Changeset.change(allow_image_generation: false)
+    |> Repo.update!()
+
+    cases = [
+      {:generations, "/v1/images/generations",
+       %{
+         "model" => setup.model.exposed_model_id,
+         "prompt" => "synthetic direct generation"
+       }},
+      {:edits, "/v1/images/edits",
+       %{
+         "model" => setup.model.exposed_model_id,
+         "prompt" => "synthetic direct edit",
+         "image" =>
+           upload_fixture(
+             "direct-source.png",
+             "image/png",
+             <<137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2, 3>>
+           )
+       }}
+    ]
+
+    for {action, path, params} <- cases do
+      response =
+        conn
+        |> recycle()
+        |> Map.put(:method, "POST")
+        |> Map.put(:request_path, path)
+        |> Map.put(:body_params, params)
+        |> Plug.Conn.put_private(:runtime_api_auth, auth_context)
+        |> then(&apply(CodexPoolerWeb.V1.ImagesController, action, [&1, params]))
+
+      assert %{"error" => %{"code" => "image_generation_disabled"}} =
+               json_response(response, 403)
+    end
+
+    assert FakeUpstream.requests(upstream) == []
+    assert Repo.aggregate(Request, :count) == 0
   end
 
   @tag :image_generation_success
@@ -100,13 +139,13 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
     setup =
       upstream
       |> gateway_setup()
-      |> allow_models!(["gpt-image-2"])
+      |> allow_models!(["gpt-image-1"])
 
     conn =
       conn
       |> auth(setup)
       |> post("/v1/images/generations", %{
-        "model" => "gpt-image-2",
+        "model" => "gpt-image-1",
         "prompt" => "synthetic hidden image request",
         "size" => "1024x1024",
         "quality" => "low",
@@ -119,12 +158,27 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["model"] == setup.model.upstream_model_id
-    assert [%{"type" => "image_generation", "model" => "gpt-image-2"}] = captured.json["tools"]
+    assert [%{"type" => "image_generation", "model" => "gpt-image-1"}] = captured.json["tools"]
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "succeeded"
-    assert request.request_metadata["requested_model"] == "gpt-image-2"
-    assert request.request_metadata["effective_model"] == "gpt-image-2"
+    assert request.request_metadata["requested_model"] == "gpt-image-1"
+    assert request.request_metadata["effective_model"] == "gpt-image-1"
+
+    expected_mode_metadata = %{
+      "model_serving_mode_configured" => "auto",
+      "model_serving_mode" => "full",
+      "model_serving_mode_source" => "catalog"
+    }
+
+    assert Map.take(request.request_metadata["routing"], Map.keys(expected_mode_metadata)) ==
+             expected_mode_metadata
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+    assert Map.take(attempt.response_metadata["routing"], Map.keys(expected_mode_metadata)) ==
+             expected_mode_metadata
+
     refute inspect(request.request_metadata) =~ "synthetic hidden image request"
     refute inspect(request.request_metadata) =~ "B64_HIDDEN"
   end
@@ -141,7 +195,7 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
         "model" => setup.model.exposed_model_id,
         "prompt" => "synthetic edit request",
         "size" => "1024x1024",
-        "input_fidelity" => "high",
+        "mask" => upload_fixture("mask.png", "image/png", image_bytes),
         "image" => upload_fixture("source-private.png", "image/png", image_bytes)
       })
 
@@ -157,6 +211,9 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
                String.starts_with?(part["image_url"], "data:image/png;base64,")
            end)
 
+    assert [%{"input_image_mask" => %{"image_url" => mask_url}}] = captured.json["tools"]
+    assert String.starts_with?(mask_url, "data:image/png;base64,")
+    assert [%{"text" => "synthetic edit request"}, %{"type" => "input_image"}] = content
     refute captured.body =~ "source-private.png"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -184,6 +241,67 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
     assert Repo.aggregate(Request, :count) == 0
   end
 
+  test "failed image items return sanitized HTTP errors", %{conn: conn} do
+    item = %{
+      "type" => "image_generation_call",
+      "status" => "failed",
+      "error" => %{
+        "type" => "invalid_request_error",
+        "code" => "synthetic-private-code",
+        "message" => "synthetic-private-message",
+        "param" => "synthetic-private-param"
+      }
+    }
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{"status" => "completed", "output" => [item]}
+           }}
+        ])
+      )
+
+    setup = upstream |> gateway_setup() |> use_image_model!("gpt-image-1")
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/images/generations", %{"model" => "gpt-image-1", "prompt" => "synthetic"})
+
+    assert %{
+             "error" => %{
+               "code" => "image_generation_failed",
+               "message" => "upstream image generation failed"
+             }
+           } = json_response(response, 400)
+
+    refute response.resp_body =~ "synthetic-private"
+  end
+
+  @tag :image_truncated_eof
+  test "image output followed by clean EOF without completion is rejected", %{conn: conn} do
+    item = %{"type" => "image_generation_call", "status" => "completed", "result" => "SYNTHETIC"}
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.output_item.done", %{"type" => "response.output_item.done", "item" => item}}
+        ])
+      )
+
+    setup = upstream |> gateway_setup() |> use_image_model!("gpt-image-1")
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/images/generations", %{"model" => "gpt-image-1", "prompt" => "synthetic"})
+
+    assert %{"error" => %{"code" => "image_generation_failed"}} = json_response(response, 502)
+  end
+
   @tag :variations_unsupported
   test "POST /v1/images/variations returns deterministic unsupported error without admission side effects",
        %{
@@ -207,7 +325,18 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
         upstream_model_id: "provider-host-responses-model",
         supports_responses: true,
         supports_streaming: true,
-        metadata: %{"source_assignment_ids" => [setup.assignment.id]}
+        metadata:
+          setup.model.metadata
+          |> Map.put("input_modalities", ["text", "image"])
+          |> Map.put("source_assignment_ids", [setup.assignment.id])
+          |> put_in(
+            ["source_assignment_models", setup.assignment.id, "slug"],
+            model_id
+          )
+          |> put_in(
+            ["source_assignment_models", setup.assignment.id, "input_modalities"],
+            ["text", "image"]
+          )
       })
       |> Repo.update!()
 
@@ -246,6 +375,7 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
          "response" => %{
            "id" => "resp_image_fixture",
            "status" => "completed",
+           "output" => [image_item],
            "tool_usage" => %{"image_gen" => %{"input_tokens" => 7, "output_tokens" => 13}}
          }
        }}

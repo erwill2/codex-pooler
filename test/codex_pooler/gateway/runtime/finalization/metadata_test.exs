@@ -1,8 +1,145 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
   use ExUnit.Case, async: true
 
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
   alias CodexPooler.Gateway.Transports.BoundedResponseBody
+  alias CodexPooler.Gateway.Transports.RejectionBody
+
+  @tag :prompt_cache_adaptation
+  test "HTTP and every websocket metadata builder project only true prompt cache adaptation" do
+    response = %Req.Response{status: 200, headers: []}
+
+    false_options =
+      RequestOptions.build(
+        %{},
+        "/backend-api/codex/responses",
+        %{"model" => "example-model"}
+      )
+
+    true_options =
+      RequestOptions.put_runtime_context(false_options,
+        prompt_cache_controls_downgraded: true
+      )
+
+    refute Map.has_key?(
+             Metadata.response_metadata(response, nil, false_options),
+             "prompt_cache_controls_downgraded"
+           )
+
+    assert Metadata.response_metadata(response, nil, true_options)[
+             "prompt_cache_controls_downgraded"
+           ] == true
+
+    websocket_metadata = [
+      Metadata.websocket_response_metadata([], nil, true_options),
+      Metadata.websocket_response_metadata([], nil, true_options, %{}),
+      Metadata.websocket_response_metadata([], nil, true_options, %{}, %{
+        lifecycle_id: Ecto.UUID.generate(),
+        generation: 1,
+        reused: false,
+        reconnected: false
+      })
+    ]
+
+    assert Enum.all?(websocket_metadata, fn metadata ->
+             metadata["prompt_cache_controls_downgraded"] == true
+           end)
+
+    refute Map.has_key?(
+             Metadata.websocket_response_metadata([], nil, false_options),
+             "prompt_cache_controls_downgraded"
+           )
+  end
+
+  test "classifies an upstream status without reference to the serving mode" do
+    ordinary_endpoints = [
+      "/backend-api/codex/responses",
+      "/backend-api/codex/v1/responses",
+      "/backend-api/codex/v1/chat/completions",
+      "/v1/responses",
+      "/v1/chat/completions"
+    ]
+
+    for endpoint <- ordinary_endpoints do
+      options =
+        %{}
+        |> RequestOptions.build(endpoint, %{"model" => "example-model"})
+        |> RequestOptions.put_model_serving_mode(
+          configured_mode: "full",
+          effective_mode: "full",
+          source: "override"
+        )
+
+      # An explicit Full override no longer earns its own code: the same
+      # provider rejection is classified the same way whatever mode resolved
+      # (codex-pooler-findings#173), and the mode itself stays in the routing
+      # metadata this attempt already carries.
+      assert Metadata.upstream_status_error_code(400, options) == "upstream_status"
+
+      assert Metadata.upstream_status_error_code(429, options) ==
+               "upstream_rate_limited"
+    end
+
+    full_options =
+      %{}
+      |> RequestOptions.build("/backend-api/codex/responses", %{"model" => "example-model"})
+      |> RequestOptions.put_model_serving_mode(
+        configured_mode: "auto",
+        effective_mode: "full",
+        source: "catalog"
+      )
+
+    lite_options =
+      %{}
+      |> RequestOptions.build("/backend-api/codex/responses", %{"model" => "example-model"})
+      |> RequestOptions.put_model_serving_mode(
+        configured_mode: "auto",
+        effective_mode: "lite",
+        source: "catalog"
+      )
+
+    compact_full_options =
+      %{}
+      |> RequestOptions.build("/backend-api/codex/responses/compact", %{
+        "model" => "example-model"
+      })
+      |> RequestOptions.put_model_serving_mode(
+        configured_mode: "full",
+        effective_mode: "full",
+        source: "override"
+      )
+
+    translated_compact_full_options =
+      compact_full_options
+      |> RequestOptions.mark_openai_compatibility_origin(
+        "/v1/responses",
+        "/backend-api/codex/responses/compact"
+      )
+
+    unresolved_options =
+      RequestOptions.build(
+        %{},
+        "/backend-api/codex/responses",
+        %{"model" => "example-model"}
+      )
+
+    assert Metadata.upstream_status_error_code(400, lite_options) == "upstream_status"
+    assert Metadata.upstream_status_error_code(400, compact_full_options) == "upstream_status"
+
+    assert Metadata.upstream_status_error_code(400, translated_compact_full_options) ==
+             "upstream_status"
+
+    assert Metadata.upstream_status_error_code(400, unresolved_options) == "upstream_status"
+    assert Metadata.upstream_status_error_code(400, full_options) == "upstream_status"
+    assert Metadata.upstream_status_error_code(200, full_options) == "upstream_status"
+
+    assert Metadata.upstream_status_error_code(400, %{
+             transport: %{upstream_endpoint: "/backend-api/codex/responses"},
+             model_serving_mode: "full",
+             error: "untrusted upstream text"
+           }) == "upstream_status"
+  end
 
   test "characterization preserves existing websocket response metadata output" do
     frame_headers = %{
@@ -29,6 +166,33 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
            }
   end
 
+  test "characterization preserves bounded websocket terminal failure metadata" do
+    metadata =
+      []
+      |> Metadata.websocket_response_metadata("stream_incomplete", %{})
+      |> Metadata.maybe_put_masked_error_metadata(
+        "previous_response_not_found",
+        "stream_incomplete"
+      )
+      |> Metadata.maybe_put_upstream_error_param(%{
+        upstream_error_param: "previous_response_id",
+        message: "caller-controlled-message",
+        previous_response_id: "caller-controlled-response-id"
+      })
+
+    assert metadata == %{
+             "content_type" => "application/json",
+             "error_kind" => "stream_incomplete",
+             "masked_error_code" => "stream_incomplete",
+             "status_code" => 200,
+             "upstream_error_code" => "previous_response_not_found",
+             "upstream_error_param" => "previous_response_id",
+             "upstream_transport" => "websocket"
+           }
+
+    refute inspect(metadata) =~ "caller-controlled"
+  end
+
   test "three- and four-argument websocket metadata preserve legacy output byte for byte" do
     legacy_connection = %{"legacy_marker" => "preserved"}
 
@@ -52,9 +216,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
 
     frame_headers = %{"openai-request-id" => "frame-request-legacy"}
 
-    assert :erlang.term_to_binary(
-             Metadata.websocket_response_metadata([], nil, opts, frame_headers)
-           ) ==
+    assert :erlang.term_to_binary(Metadata.websocket_response_metadata([], nil, opts, frame_headers)) ==
              :erlang.term_to_binary(Map.put(expected, "websocket_frame_headers", frame_headers))
   end
 
@@ -276,6 +438,18 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
            }
   end
 
+  test "stream state metadata preserves only a boolean bridge commitment marker" do
+    assert Metadata.merge_stream_state_metadata(%{}, %{bridge_committed?: true}) == %{
+             "bridge_committed" => true
+           }
+
+    assert Metadata.merge_stream_state_metadata(%{}, %{bridge_committed?: false}) == %{
+             "bridge_committed" => false
+           }
+
+    assert Metadata.merge_stream_state_metadata(%{}, %{bridge_committed?: "true"}) == %{}
+  end
+
   test "first-event metadata ignores missing and unknown rate limit reached types" do
     failure = %{
       code: "usage_limit_exceeded",
@@ -321,11 +495,64 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
     assert metadata["upstream_error_code"] == "unsupported_parameter"
     assert metadata["masked_error_code"] == "invalid_request_error"
 
-    encoded = Jason.encode!(metadata)
+    encoded = CodexPooler.JSON.encode!(metadata)
     refute encoded =~ "raw-message-sentinel"
     refute encoded =~ "raw-value-sentinel"
     refute encoded =~ "raw-frame-sentinel"
     refute encoded =~ "raw-header-sentinel"
+  end
+
+  test "first-event metadata re-sanitizes directly constructed terminal failure params" do
+    safe_param = "input[0].content"
+
+    unsafe_params = [
+      "input[0].content?bearer=raw-param-sentinel",
+      "input[0].content\nraw-param-sentinel",
+      <<255>>,
+      "a" <> String.duplicate("b", 160),
+      7,
+      %{"param" => safe_param}
+    ]
+
+    valid_metadata =
+      Metadata.first_event_stream_metadata(
+        %Req.Response{status: 200},
+        %{
+          code: "invalid_compaction_response",
+          upstream_code: nil,
+          diagnostic_upstream_code: "context_length_exceeded",
+          upstream_error_param: safe_param,
+          event_type: "response.failed",
+          data_type: nil
+        },
+        "invalid_compaction_response",
+        %{}
+      )
+
+    assert valid_metadata["upstream_error_param"] == safe_param
+    refute Map.has_key?(valid_metadata, "upstream_error_code")
+    refute Map.has_key?(valid_metadata, "diagnostic_upstream_code")
+
+    for unsafe_param <- unsafe_params do
+      metadata =
+        Metadata.first_event_stream_metadata(
+          %Req.Response{status: 200},
+          %{
+            code: "invalid_compaction_response",
+            upstream_code: nil,
+            diagnostic_upstream_code: "context_length_exceeded",
+            upstream_error_param: unsafe_param,
+            event_type: "response.failed",
+            data_type: nil
+          },
+          "invalid_compaction_response",
+          %{}
+        )
+
+      refute Map.has_key?(metadata, "upstream_error_param")
+      refute Map.has_key?(metadata, "diagnostic_upstream_code")
+      refute inspect(metadata) =~ "raw-param-sentinel"
+    end
   end
 
   test "response metadata preserves known Codex rate limit reached type headers" do
@@ -345,6 +572,310 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
              "status_code" => 429,
              "upstream_request_id" => "req_123"
            }
+  end
+
+  test "response metadata extracts bounded rejection facts from private before the ordinary body" do
+    private_body =
+      CodexPooler.JSON.encode!(%{
+        "error" => %{
+          "code" => nil,
+          "message" => "synthetic rejection detail",
+          "param" => "input[0].content",
+          "type" => "invalid_request_error"
+        }
+      })
+
+    response =
+      %Req.Response{
+        status: 400,
+        body:
+          CodexPooler.JSON.encode!(%{
+            "error" => %{
+              "code" => "wrong_fallback",
+              "message" => "wrong fallback detail",
+              "param" => "wrong.path",
+              "type" => "wrong_fallback"
+            }
+          })
+      }
+      |> RejectionBody.put(private_body)
+
+    metadata = Metadata.response_metadata(response, "upstream_status", %{})
+
+    refute Map.has_key?(metadata, "rejection_error_code")
+    assert metadata["rejection_error_type"] == "invalid_request_error"
+    assert metadata["rejection_error_param"] == "input[0].content"
+    assert metadata["rejection_message_present"] == true
+    assert metadata["rejection_message_bytes"] == byte_size("synthetic rejection detail")
+    refute inspect(metadata) =~ "synthetic rejection detail"
+    refute inspect(metadata) =~ "wrong fallback detail"
+  end
+
+  test "response metadata emits the false zero message pair and independently validates fields" do
+    for message <- [nil, "", 42] do
+      response = %Req.Response{
+        status: 422,
+        body:
+          CodexPooler.JSON.encode!(%{
+            "error" => %{
+              "code" => "invalid_request",
+              "message" => message,
+              "param" => 123,
+              "type" => "invalid_request_error"
+            }
+          })
+      }
+
+      metadata = Metadata.response_metadata(response, "upstream_status", %{})
+
+      assert metadata["rejection_error_code"] == "invalid_request"
+      assert metadata["rejection_error_type"] == "invalid_request_error"
+      refute Map.has_key?(metadata, "rejection_error_param")
+      assert metadata["rejection_message_present"] == false
+      assert metadata["rejection_message_bytes"] == 0
+    end
+  end
+
+  test "response metadata clamps rejection message bytes and rejects invalid sources" do
+    long_message = String.duplicate("m", 1_100)
+
+    valid = %Req.Response{
+      status: 400,
+      body: CodexPooler.JSON.encode!(%{"error" => %{"message" => long_message}})
+    }
+
+    assert Metadata.response_metadata(valid, "upstream_status", %{})[
+             "rejection_message_bytes"
+           ] == 1_024
+
+    for response <- [
+          %Req.Response{status: 400, body: "not-json"},
+          %Req.Response{
+            status: 400,
+            body:
+              CodexPooler.JSON.encode!(%{
+                "error" => %{"message" => String.duplicate("x", 65_537)}
+              })
+          },
+          %Req.Response{
+            status: 429,
+            body: CodexPooler.JSON.encode!(%{"error" => %{"code" => "rate_limit_exceeded"}})
+          }
+        ] do
+      metadata = Metadata.response_metadata(response, "upstream_status", %{})
+      refute Enum.any?(Map.keys(metadata), &String.starts_with?(&1, "rejection_"))
+    end
+  end
+
+  test "an empty private rejection body is authoritative over a materialized fallback" do
+    response =
+      %Req.Response{
+        status: 400,
+        body: CodexPooler.JSON.encode!(%{"error" => %{"code" => "must_not_fall_through"}})
+      }
+      |> RejectionBody.put("")
+
+    metadata = Metadata.response_metadata(response, "upstream_status", %{})
+    refute Enum.any?(Map.keys(metadata), &String.starts_with?(&1, "rejection_"))
+  end
+
+  test "response metadata records a bounded class for provider detail rejection bodies" do
+    stream_detail = "Stream must be set to true"
+    free_text_detail = "Invalid value near: synthetic prompt sentinel"
+
+    detail_metadata = fn status, detail ->
+      %Req.Response{status: status, body: CodexPooler.JSON.encode!(%{"detail" => detail})}
+      |> Metadata.response_metadata("upstream_status", %{})
+    end
+
+    stream_metadata = detail_metadata.(400, stream_detail)
+    assert stream_metadata["rejection_detail_class"] == "stream_must_be_true"
+    assert stream_metadata["rejection_message_present"] == true
+    assert stream_metadata["rejection_message_bytes"] == byte_size(stream_detail)
+    refute Map.has_key?(stream_metadata, "rejection_error_code")
+    refute inspect(stream_metadata) =~ stream_detail
+
+    assert detail_metadata.(404, "Not_Found.v2")["rejection_detail_class"] == "Not_Found.v2"
+
+    free_text_metadata = detail_metadata.(400, free_text_detail)
+    assert "sha256_" <> fingerprint = free_text_metadata["rejection_detail_class"]
+    assert fingerprint =~ ~r/\A[0-9a-f]{12}\z/
+    assert free_text_metadata["rejection_message_bytes"] == byte_size(free_text_detail)
+    refute inspect(free_text_metadata) =~ "synthetic prompt sentinel"
+
+    for detail <- [[%{"loc" => ["body", "stream"], "msg" => "synthetic"}], %{"msg" => "x"}, nil] do
+      structured = detail_metadata.(422, detail)
+      assert structured["rejection_detail_class"] == "non_string_detail"
+      assert structured["rejection_message_present"] == false
+      assert structured["rejection_message_bytes"] == 0
+      refute inspect(structured) =~ "synthetic"
+    end
+
+    assert detail_metadata.(400, "")["rejection_detail_class"] == "empty_detail"
+
+    refute Enum.any?(
+             Map.keys(detail_metadata.(429, stream_detail)),
+             &String.starts_with?(&1, "rejection_")
+           )
+
+    error_precedence =
+      %Req.Response{
+        status: 400,
+        body:
+          CodexPooler.JSON.encode!(%{
+            "error" => %{"code" => "invalid_request", "type" => "invalid_request_error"},
+            "detail" => stream_detail
+          })
+      }
+      |> Metadata.response_metadata("upstream_status", %{})
+
+    assert error_precedence["rejection_error_code"] == "invalid_request"
+    refute Map.has_key?(error_precedence, "rejection_detail_class")
+  end
+
+  # provenance: observed findings#232 row 232-275 live probe (HTTP 400 detail
+  # body on an anchored HTTP request, 43-byte text); the other params are
+  # synthetic
+  test "response metadata names an unsupported-parameter detail body by fixed class and param" do
+    detail_response = fn detail -> %Req.Response{status: 400, body: CodexPooler.JSON.encode!(%{"detail" => detail})} end
+    anchored_detail = "Unsupported parameter: previous_response_id"
+
+    metadata = detail_response.(anchored_detail) |> Metadata.response_metadata("upstream_status", %{})
+
+    assert metadata["rejection_detail_class"] == "unsupported_parameter"
+    assert metadata["rejection_error_param"] == "previous_response_id"
+    assert metadata["rejection_message_bytes"] == 43
+    refute Map.has_key?(metadata, "rejection_error_code")
+    refute inspect(metadata) =~ anchored_detail
+
+    assert Metadata.rejection_error(detail_response.(anchored_detail)) == %{code: "unsupported_parameter", type: "invalid_request_error", param: "previous_response_id"}
+
+    unbounded = "Unsupported parameter: previous_response_id synthetic prompt sentinel"
+    unbounded_metadata = detail_response.(unbounded) |> Metadata.response_metadata("upstream_status", %{})
+    assert "sha256_" <> _fingerprint = unbounded_metadata["rejection_detail_class"]
+    refute Map.has_key?(unbounded_metadata, "rejection_error_param")
+    assert Metadata.rejection_error(detail_response.(unbounded)) == %{}
+  end
+
+  # provenance: observed findings#333 direct websocket probe (the codeless
+  # wrapped error object the provider's websocket sends for an unsupported
+  # top-level parameter: the HTTP detail's text, `code` and `param` null); the
+  # coded and paramed controls are synthetic
+  test "a codeless websocket error naming an unsupported parameter reads as the HTTP detail does" do
+    error_response = fn error -> %Req.Response{status: 400, body: CodexPooler.JSON.encode!(%{"error" => error})} end
+    codeless = %{"type" => "invalid_request_error", "code" => nil, "message" => "Unsupported parameter: metadata", "param" => nil}
+
+    assert Metadata.rejection_error(error_response.(codeless)) == %{code: "unsupported_parameter", type: "invalid_request_error", param: "metadata"}
+
+    metadata = error_response.(codeless) |> Metadata.response_metadata("upstream_status", %{})
+    assert metadata["rejection_message_class"] == "unsupported_parameter"
+    assert metadata["rejection_error_param"] == "metadata"
+    assert metadata["rejection_error_type"] == "invalid_request_error"
+    # The provider sent no code: none is recorded.
+    refute Map.has_key?(metadata, "rejection_error_code")
+
+    # A provider code or param is never overridden, and only the bounded template qualifies.
+    coded = %{codeless | "code" => "unknown_parameter"}
+    assert Metadata.rejection_error(error_response.(coded)) == %{code: "unknown_parameter", type: "invalid_request_error"}
+    paramed = %{codeless | "param" => "tools"}
+    assert Metadata.rejection_error(error_response.(paramed)) == %{type: "invalid_request_error", param: "tools"}
+    other_type = %{codeless | "type" => "server_error"}
+    assert Metadata.rejection_error(error_response.(other_type)) == %{type: "server_error"}
+    unbounded = %{codeless | "message" => "Unsupported parameter: metadata synthetic prompt sentinel"}
+    assert Metadata.rejection_error(error_response.(unbounded)) == %{type: "invalid_request_error"}
+    refute inspect(error_response.(unbounded) |> Metadata.response_metadata("upstream_status", %{})) =~ "synthetic prompt sentinel"
+  end
+
+  # provenance: observed findings#336 direct websocket and HTTP probes (2026-10-07, gpt-6-luna, Full and Lite): the
+  # wrapped error objects of the websocket carry the HTTP message as text in two wordings and no code and no param, where
+  # the HTTP error of the same fault has both; the request values are synthetic, the provider-code and provider-param
+  # controls are synthetic
+  describe "a codeless websocket error whose text reads as an HTTP validation code (findings#336)" do
+    @effort "Invalid value: 'zz_probe_effort'. Supported values are: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'."
+
+    defp error_response(error), do: %Req.Response{status: 400, body: CodexPooler.JSON.encode!(%{"error" => error})}
+    defp codeless(message), do: %{"type" => "invalid_request_error", "code" => nil, "message" => message, "param" => nil}
+
+    for {wording, message, relayed, recorded} <- [
+          {"payload", "Invalid response.create payload: " <> @effort, %{code: "invalid_value", type: "invalid_request_error"}, %{"rejection_message_class" => "invalid_value"}},
+          {"bracket", "[ReasoningEffortParam] [reasoning.effort] [invalid_enum_value] " <> @effort, %{code: "invalid_value", type: "invalid_request_error", param: "reasoning.effort"}, %{"rejection_message_class" => "invalid_value", "rejection_error_param" => "reasoning.effort"}},
+          {"payload", "Invalid response.create payload: Invalid type for 'parallel_tool_calls': expected a boolean, but got a string instead.", %{code: "invalid_type", type: "invalid_request_error", param: "parallel_tool_calls"}, %{"rejection_message_class" => "invalid_type", "rejection_error_param" => "parallel_tool_calls"}},
+          {"bracket", "[ObjectParam] [tools[0].zz_probe_unknown_key] [unknown_parameter] Unknown parameter: 'tools[0].zz_probe_unknown_key'.", %{code: "unknown_parameter", type: "invalid_request_error", param: "tools[0].zz_probe_unknown_key"}, %{"rejection_message_class" => "unknown_parameter", "rejection_error_param" => "tools[0].zz_probe_unknown_key"}},
+          {"payload", "Invalid response.create payload: Missing required parameter: 'tools[0].name'.", %{code: "missing_required_parameter", type: "invalid_request_error", param: "tools[0].name"}, %{"rejection_message_class" => "missing_required_parameter", "rejection_error_param" => "tools[0].name"}},
+          {"bracket", "[StringParam] [tools[0].name] [string_above_max_length] Invalid 'tools[0].name': string too long. Expected a string with maximum length 128, but got a string with length 200 instead.", %{code: "string_above_max_length", type: "invalid_request_error", param: "tools[0].name"}, %{"rejection_message_class" => "string_above_max_length", "rejection_error_param" => "tools[0].name"}}
+        ] do
+      test "the #{wording} wording #{String.slice(message, 0, 60)} reads as the HTTP code and field" do
+        response = error_response(codeless(unquote(message)))
+
+        assert Metadata.rejection_error(response) == unquote(Macro.escape(relayed))
+
+        metadata = Metadata.response_metadata(response, "upstream_status", %{})
+        assert metadata["rejection_error_type"] == "invalid_request_error"
+        assert metadata["rejection_message_present"] == true
+        for {key, value} <- unquote(Macro.escape(recorded)), do: assert(metadata[key] == value, key)
+        # The provider sent no code: none is recorded, and neither is its text.
+        refute Map.has_key?(metadata, "rejection_error_code")
+        refute inspect(metadata) =~ "zz_probe_effort"
+      end
+    end
+
+    test "a provider code, param or other type is never overridden by the text" do
+      message = "[ReasoningEffortParam] [reasoning.effort] [invalid_enum_value] " <> @effort
+
+      assert Metadata.rejection_error(error_response(%{codeless(message) | "code" => "unsupported_value"})) == %{code: "unsupported_value", type: "invalid_request_error"}
+      assert Metadata.rejection_error(error_response(%{codeless(message) | "param" => "tools"})) == %{type: "invalid_request_error", param: "tools"}
+      assert Metadata.rejection_error(error_response(%{codeless(message) | "type" => "server_error"})) == %{type: "server_error"}
+      refute Map.has_key?(Metadata.response_metadata(error_response(%{codeless(message) | "param" => "tools"}), "upstream_status", %{}), "rejection_message_class")
+    end
+
+    test "text outside the measured templates, or with a field outside the grammar, is not relayed whole" do
+      assert Metadata.rejection_error(error_response(codeless("Invalid response.create payload: private prompt sentinel"))) == %{type: "invalid_request_error"}
+      assert Metadata.rejection_error(error_response(codeless("[ObjectParam] [tools[0].x] [zz_new_kind] private prompt sentinel"))) == %{type: "invalid_request_error"}
+
+      unbounded = codeless("[ObjectParam] [tools[0].zz probe key] [unknown_parameter] Unknown parameter: 'tools[0].zz probe key'.")
+      assert Metadata.rejection_error(error_response(unbounded)) == %{code: "unknown_parameter", type: "invalid_request_error"}
+
+      metadata = Metadata.response_metadata(error_response(codeless("Invalid response.create payload: private prompt sentinel")), "upstream_status", %{})
+      refute Map.has_key?(metadata, "rejection_message_class")
+      refute inspect(metadata) =~ "private prompt sentinel"
+    end
+
+    test "an unsupported tool type is recorded by class and bounded type, and relays nothing beyond the type" do
+      codeless_tool = codeless("Unsupported tool type: web_search_preview")
+      response = error_response(Map.drop(codeless_tool, ["code", "param"]))
+
+      assert Metadata.rejection_error(response) == %{type: "invalid_request_error"}
+
+      metadata = Metadata.response_metadata(response, "upstream_status", %{})
+      assert metadata["rejection_message_class"] == "unsupported_tool_type"
+      assert metadata["rejection_message_value"] == "web_search_preview"
+      assert metadata["rejection_message_bytes"] == byte_size("Unsupported tool type: web_search_preview")
+      refute Map.has_key?(metadata, "rejection_error_code")
+      refute Map.has_key?(metadata, "rejection_error_param")
+      refute inspect(metadata) =~ "Unsupported tool type"
+
+      fingerprinted = Metadata.response_metadata(error_response(codeless("Unsupported tool type: zz probe tool private sentinel")), "upstream_status", %{})
+      assert "sha256_" <> fingerprint = fingerprinted["rejection_message_value"]
+      assert fingerprint =~ ~r/\A[0-9a-f]{12}\z/
+      refute inspect(fingerprinted) =~ "private sentinel"
+    end
+
+    test "an HTTP detail body names an unsupported tool type by fixed class and bounded type" do
+      detail_response = fn detail -> %Req.Response{status: 400, body: CodexPooler.JSON.encode!(%{"detail" => detail})} end
+
+      metadata = detail_response.("Unsupported tool type: programmatic_tool_calling") |> Metadata.response_metadata("upstream_status", %{})
+      assert metadata["rejection_detail_class"] == "unsupported_tool_type"
+      assert metadata["rejection_message_value"] == "programmatic_tool_calling"
+      refute Map.has_key?(metadata, "rejection_error_param")
+      refute inspect(metadata) =~ "Unsupported tool type"
+
+      assert Metadata.rejection_error(detail_response.("Unsupported tool type: programmatic_tool_calling")) == %{}
+
+      # An HTTP detail body is read for the detail texts only, never for the wrapped websocket wordings.
+      wrapped = detail_response.("Invalid response.create payload: " <> @effort) |> Metadata.response_metadata("upstream_status", %{})
+      assert "sha256_" <> _fingerprint = wrapped["rejection_detail_class"]
+      assert Metadata.rejection_error(detail_response.("Invalid response.create payload: " <> @effort)) == %{}
+    end
   end
 
   test "response metadata records response body limit evidence without retaining body bytes" do
