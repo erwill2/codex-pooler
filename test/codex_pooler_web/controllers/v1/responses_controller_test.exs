@@ -3256,7 +3256,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     refute Map.has_key?(captured.json, "tools")
     refute Map.has_key?(captured.json, "instructions")
-    refute Map.has_key?(captured.json, "max_output_tokens")
+    assert captured.json["max_output_tokens"] == 64_000
   end
 
   # `/v1/responses` goes through the same payload normalizer as the native route: a Full request that omits `instructions` is sent upstream
@@ -7361,15 +7361,19 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         |> put_request_headers(headers)
         |> post("/v1/responses", payload)
 
-      assert %{"error" => %{"code" => "previous_response_not_found"}} =
-               json_response(response, 400)
+      assert %{
+               "error" => %{
+                 "code" => "pinned_continuation_reauth_required",
+                 "recovery_kind" => "restart_with_full_context"
+               }
+             } = json_response(response, 503)
 
-      response_text = inspect(json_response(response, 400))
+      response_text = inspect(json_response(response, 503))
       assert_no_pinned_reauth_leakage!(response_text, setup, previous_response_id, label)
 
       assert FakeUpstream.count(pinned_upstream) == 0, label
       assert FakeUpstream.count(fallback_upstream) == 0, label
-      assert Repo.aggregate(Attempt, :count) == 1, label
+      assert Repo.aggregate(Attempt, :count) == 0, label
 
       denied_requests =
         Repo.all(
@@ -7381,8 +7385,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert length(denied_requests) == index + 1, label
       denied_request = List.last(denied_requests)
-      assert denied_request.status in ["failed", "rejected"], label
-      assert denied_request.last_error_code == "previous_response_not_found", label
+      assert denied_request.status == "rejected", label
+      assert denied_request.last_error_code == "pinned_continuation_reauth_required", label
 
       assert denied_request.endpoint == "/backend-api/codex/responses", label
 
@@ -7431,14 +7435,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"type" => "error", "status" => 400, "error" => %{"code" => "previous_response_not_found"}} =
+      assert %{"type" => "error", "status" => 503, "error" => %{"code" => "pinned_continuation_reauth_required"}} =
                CodexPooler.JSON.decode!(frame)
 
       assert_no_pinned_reauth_leakage!(frame, setup, previous_response_id)
 
       assert FakeUpstream.count(pinned_upstream) == 0
       assert FakeUpstream.count(fallback_upstream) == 0
-      assert Repo.aggregate(Attempt, :count) == 1
+      assert Repo.aggregate(Attempt, :count) == 0
 
       assert [denied_request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
 

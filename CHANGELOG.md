@@ -1,5 +1,65 @@
 # Changelog
 
+## [0.11.3](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.11.2...codex-pooler-v0.11.3) (2026-10-08)
+
+
+### Features
+
+* **admin:** halve the Observatory hold-to-open duration ([b8b65a8](https://github.com/icoretech/codex-pooler/commit/b8b65a8843e24c4dafcf5b28ad9a6cd417f101b9))
+* **admin:** redesign the OpenAI incidents page ([a94d018](https://github.com/icoretech/codex-pooler/commit/a94d018802f9d5cfadd6ea1914b0f3019197d1b5))
+* **admin:** redesign the OpenAI status banner ([63f3e54](https://github.com/icoretech/codex-pooler/commit/63f3e54428a5829b8100961a67a831c07402ba28))
+* **admin:** show request speed as three bolts under the model ([b32d88a](https://github.com/icoretech/codex-pooler/commit/b32d88ae73eefff4d673e5ec06045d61fdf326c5))
+* **observatory:** redesign the access key login page ([dc9047f](https://github.com/icoretech/codex-pooler/commit/dc9047fb2be00ba85530c922d2113724fc14f458))
+* **observatory:** rework the dashboard body ([4d44908](https://github.com/icoretech/codex-pooler/commit/4d449089f044ca4e5cd7b990ce1b133b081ef510))
+
+
+### Bug Fixes
+
+* **accounting:** render quota countdowns at the snapshot time ([d9c477c](https://github.com/icoretech/codex-pooler/commit/d9c477ce51ecce73d59e31257c310dcf0e156158))
+* **admin:** fit the request log table at 1440px so Cost is not clipped ([97e68dc](https://github.com/icoretech/codex-pooler/commit/97e68dc6abf2051c16ae122245b0e6f76711e214))
+* **admin:** show provider credit percentages with one decimal ([d9202d9](https://github.com/icoretech/codex-pooler/commit/d9202d90185bc0ffd90f5129088aa73da7000322))
+* **gateway:** forward client output token limits ([7206e9b](https://github.com/icoretech/codex-pooler/commit/7206e9bbecaac88df996ad3d816b13f8b07cde05))
+* **gateway:** reject SVG data URLs in typed tool outputs ([58b27a2](https://github.com/icoretech/codex-pooler/commit/58b27a2c4d80d6dccfadd0a7f2e094762a9b8c65))
+* **upstreams:** use indexed batches for account deletion ([330f195](https://github.com/icoretech/codex-pooler/commit/330f1958755a6dff4b4f57389db2269cc4b538fa))
+
+
+### Tests
+
+* **gateway:** use a valid output budget in resample fixtures ([2a250bf](https://github.com/icoretech/codex-pooler/commit/2a250bfbe972e23a6dd4576fc27b20026fa3b70a))
+* **routes:** include Decisions in runtime route contracts ([4c4c137](https://github.com/icoretech/codex-pooler/commit/4c4c13774bb3348a104938f625b42bb1e4b2b554))
+* **runtime:** isolate recovery socket database connections ([0b1274f](https://github.com/icoretech/codex-pooler/commit/0b1274ffe9d9e4c03b65c3135c0ef102e69e8290))
+
+
+### Miscellaneous Chores
+
+* **deps:** update helm release codex-pooler to v0.11.0 ([#508](https://github.com/icoretech/codex-pooler/issues/508)) ([fa36b9b](https://github.com/icoretech/codex-pooler/commit/fa36b9bb95925b09044f311edb637c17a5042c5a))
+* **web:** remove the unused page_html home template ([e2e476b](https://github.com/icoretech/codex-pooler/commit/e2e476b80c8ac7af875e52807e13410d8a54b272))
+
+## [0.11.2](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.11.1...codex-pooler-v0.11.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **deps:** update dependency astro to v7.3.6 ([65834d8](https://github.com/icoretech/codex-pooler/commit/65834d80905792d0c9df4306dba1b7284a3f30e5))
+* **deps:** update req to 0.7.5 ([8d2b4d1](https://github.com/icoretech/codex-pooler/commit/8d2b4d1de483ba0e235581f8b3bde4d771e232a8))
+* **gateway:** check the Codex catalog for decodable entries through 0.161.0 ([4873353](https://github.com/icoretech/codex-pooler/commit/4873353632cda80c3ecdb8fc827e486480b1933a))
+* **gateway:** support reasoning updates and native live steering ([100f1de](https://github.com/icoretech/codex-pooler/commit/100f1de976020c64d52716dd62d96c685651d742))
+* **upstreams:** keep a newer workspace denial when the earlier witness of it ends ([ab85417](https://github.com/icoretech/codex-pooler/commit/ab854174222c1c203665972d31ea5987d9dd253a))
+* **upstreams:** let a witness cover a newer denial only up to its own reset, and retain a replaced current denial ([8796c1d](https://github.com/icoretech/codex-pooler/commit/8796c1d300216c123d8829cb18d8378c88a91896))
+* **v1:** declare the Decisions API unsupported ([1258281](https://github.com/icoretech/codex-pooler/commit/12582810843692b052b69edf75b7ad34eb064426))
+
+
+### Tests
+
+* **dev:** drive Socket preparation before native drain barriers ([e5b12c5](https://github.com/icoretech/codex-pooler/commit/e5b12c5952884ac045bcd5641537efb4f8623ce6))
+
+
+### Miscellaneous Chores
+
+* **deps:** classify Renovate version updates as maintenance ([3022187](https://github.com/icoretech/codex-pooler/commit/30221872c89d328f3e6ce7030a7e099f9bfeda71))
+* **deps:** update dependency openai/codex to v0.161.0 ([d2ab577](https://github.com/icoretech/codex-pooler/commit/d2ab577b37d8f2bdd7d63dc9dd1bb027654122f3))
+* **deps:** update ghcr.io/icoretech/codex-docker docker tag to v0.161.0 ([#501](https://github.com/icoretech/codex-pooler/issues/501)) ([cc9de51](https://github.com/icoretech/codex-pooler/commit/cc9de51c42a2fe7b29c5f6a5bee15d5d29711efe))
+
 ## [0.11.1](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.11.0...codex-pooler-v0.11.1) (2026-10-07)
 
 

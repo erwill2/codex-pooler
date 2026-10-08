@@ -245,13 +245,14 @@ defmodule CodexPooler.Accounting.Usage.Observatory.QueryScope do
   end
 
   @doc """
-  The twelve most recent scoped outcomes.
+  The forty most recent scoped outcomes. The page shows twelve rows of them once
+  consecutive requests without a model have been folded into one row.
 
   This is a dedicated query rather than a slice of `scoped_facts/2` so the
-  endpoint/error-code regex classification runs over only the twelve rows the
+  endpoint/error-code regex classification runs over only the forty rows the
   limit keeps, not the whole window. `requests_api_key_pool_admitted_id_idx`
   yields the scoped rows in the requested deterministic order, so the limit
-  stops early and the fact/model joins are twelve primary-key lookups.
+  stops early and the fact/model joins are forty primary-key lookups.
   """
   def recent_outcomes(identity, window) do
     from(request in Request,
@@ -269,13 +270,20 @@ defmodule CodexPooler.Accounting.Usage.Observatory.QueryScope do
           ^window.ended_at
         ),
       order_by: [desc: request.admitted_at, desc: request.id],
-      limit: 12,
+      limit: 40,
       select: %{
         timestamp: request.admitted_at,
         model: model_label(model.exposed_model_id),
         endpoint_class: endpoint_class(request.endpoint),
         response_status_code: request.response_status_code,
         total_tokens: known_usage(fact.latest_settlement_usage_status, fact.latest_total_tokens),
+        input_tokens: known_usage(fact.latest_settlement_usage_status, fact.latest_input_tokens),
+        cached_input_tokens: known_usage(fact.latest_settlement_usage_status, fact.latest_cached_input_tokens),
+        output_tokens: known_usage(fact.latest_settlement_usage_status, fact.latest_output_tokens),
+        reasoning_effort: request.reasoning_effort,
+        service_tier: request.service_tier,
+        requested_service_tier: request.requested_service_tier,
+        actual_service_tier: request.actual_service_tier,
         settled_cost_micros:
           settled_cost(
             fact.latest_settlement_usage_status,
