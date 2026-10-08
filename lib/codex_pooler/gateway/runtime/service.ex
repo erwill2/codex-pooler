@@ -22,7 +22,9 @@ defmodule CodexPooler.Gateway.Runtime.Service do
   alias CodexPooler.Gateway.Persistence.SessionContinuity.OwnerWitness
   alias CodexPooler.Gateway.Routing.BridgeRing
   alias CodexPooler.Gateway.Routing.CandidateEligibility
+  alias CodexPooler.Gateway.Routing.CircuitState
   alias CodexPooler.Gateway.Routing.ModelMetadata
+  alias CodexPooler.Gateway.Routing.PartitionRoutability
   alias CodexPooler.Gateway.Routing.RouteFiltering
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
@@ -309,8 +311,25 @@ defmodule CodexPooler.Gateway.Runtime.Service do
          effective_model_name,
          validation
        ) do
-    case visible_model_context(auth.pool, effective_model_name, endpoint, request_options) do
+    context = visible_model_context(auth.pool, effective_model_name, endpoint, request_options)
+
+    context =
+      maybe_fallback_model_context(
+        context,
+        auth,
+        endpoint,
+        payload,
+        request_options,
+        validation
+      )
+
+    case context do
       %{visible_model: %Model{} = model} = visible_model_data ->
+        request_options =
+          RequestOptions.put_routing(request_options,
+            effective_model: visible_model_data.effective_model
+          )
+
         execute_visible_model(
           auth,
           endpoint,
@@ -328,6 +347,111 @@ defmodule CodexPooler.Gateway.Runtime.Service do
         reason = error(400, "invalid_model", "model is not available for this pool", "model")
 
         Denials.log_gateway(denial_context(auth, nil, reason, endpoint, payload, request_options))
+    end
+  end
+
+  defp maybe_fallback_model_context(
+         %{visible_model: %Model{} = requested_model} = context,
+         auth,
+         endpoint,
+         payload,
+         %RequestOptions{} = request_options,
+         validation
+       ) do
+    policy = request_options.routing.api_key_policy
+
+    cond do
+      match?(%RuntimeAdmissionProof{kind: :native_replay}, runtime_admission_proof(validation)) or
+        request_options.payload_context.masked_image_request? or
+        native_image_request?(endpoint, request_options) or
+        endpoint == "/backend-api/transcribe" or
+        SessionContinuity.hard_pinned_continuity?(request_options, requested_model) or
+        is_binary(policy.enforced_model_identifier) or
+          CandidateEligibility.policy_visible_models([requested_model], policy) == [] ->
+        context
+
+      available_model_candidates(context, requested_model, auth, endpoint, payload, request_options) != [] ->
+        context
+
+      true ->
+        context.visible_models
+        |> CandidateEligibility.policy_visible_models(policy)
+        |> Enum.reject(&(&1.id == requested_model.id))
+        |> Enum.map(fn model ->
+          {model, available_model_candidates(context, model, auth, endpoint, payload, request_options)}
+        end)
+        |> Enum.reject(fn {_model, candidates} -> candidates == [] end)
+        |> Enum.sort_by(fn {model, candidates} -> fallback_model_rank(model, candidates) end)
+        |> List.first()
+        |> case do
+          {%Model{} = fallback, _candidates} ->
+            %{context | visible_model: fallback, effective_model: fallback.exposed_model_id, candidate_snapshots: Map.get(context.candidates_by_model_id, fallback.id, [])}
+
+          nil ->
+            context
+        end
+    end
+  end
+
+  defp maybe_fallback_model_context(context, _auth, _endpoint, _payload, _request_options, _validation),
+    do: context
+
+  defp available_model_candidates(context, model, auth, endpoint, payload, request_options) do
+    candidates = Map.get(context.candidates_by_model_id, model.id, [])
+
+    if model.supports_responses and
+         (not RequestOptions.upstream_streaming?(request_options, payload) or
+            model.supports_streaming) and candidates != [] do
+      case CandidateEligibility.filter_runtime_compatible_candidates(
+             CandidateEligibility.FilterInput.new(%{
+               auth: auth,
+               model: model,
+               endpoint: endpoint,
+               payload: payload,
+               request_options: request_options,
+               candidates: candidates
+             })
+           ) do
+        {:ok, compatible} ->
+          quota_available_ids =
+            PartitionRoutability.routable_assignment_ids_by_model_id(
+              [model],
+              %{model.id => compatible},
+              request_options
+            )
+            |> Map.get(model.id, MapSet.new())
+
+          Enum.filter(compatible, fn {assignment, _identity} ->
+            MapSet.member?(quota_available_ids, assignment.id) and
+              CircuitState.eligible?(
+                auth,
+                model,
+                assignment,
+                RequestOptions.route_class(request_options)
+              )
+          end)
+
+        {:error, _reason} ->
+          []
+      end
+    else
+      []
+    end
+  end
+
+  defp fallback_model_rank(model, candidates) do
+    priorities =
+      Enum.map(candidates, fn {assignment, _identity} ->
+        case ModelMetadata.selected_assignment_metadata(model, assignment.id) do
+          %{} = metadata -> Map.get(metadata, "priority")
+          _invalid -> nil
+        end
+      end)
+      |> Enum.filter(&is_integer/1)
+
+    case priorities do
+      [] -> {1, model.exposed_model_id}
+      _ -> {0, Enum.min(priorities), model.exposed_model_id}
     end
   end
 

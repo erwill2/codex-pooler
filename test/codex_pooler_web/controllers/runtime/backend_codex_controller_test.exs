@@ -81,6 +81,175 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
   @preservation_model "gpt-4o"
   @reasoning_denial_message "reasoning effort is not available for this API key"
+
+  test "requested model routes only to the account that discovered it", %{conn: conn} do
+    first_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "wrong-account"}))
+    second_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "right-account"}))
+    setup = gateway_setup(first_upstream)
+    second = gateway_upstream(setup.pool, second_upstream, "account-model-right", compact?: false)
+    prime_routing_quota!(second.identity)
+
+    model_fixture(setup.pool, %{
+      exposed_model_id: "gpt-account-only",
+      upstream_model_id: "gpt-account-only",
+      display_name: "Account only",
+      supports_responses: true,
+      supports_streaming: true,
+      metadata: %{
+        "source_assignment_ids" => [second.assignment.id],
+        "source_assignment_models" => %{
+          second.assignment.id => %{"slug" => "gpt-account-only", "priority" => 1}
+        }
+      }
+    })
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => "gpt-account-only",
+        "input" => native_text_input("account catalog routing")
+      })
+
+    assert %{"id" => "right-account"} = json_response(response, 200)
+    assert FakeUpstream.count(first_upstream) == 0
+    assert FakeUpstream.count(second_upstream) == 1
+    assert Repo.one!(from(a in Attempt)).pool_upstream_assignment_id == second.assignment.id
+  end
+
+  test "unavailable requested model falls back to highest ranked available account model", %{
+    conn: conn
+  } do
+    unavailable_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "unavailable"}))
+    lower_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "lower"}))
+    higher_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "higher"}))
+    setup = gateway_setup(unavailable_upstream)
+    lower = gateway_upstream(setup.pool, lower_upstream, "account-model-lower", compact?: false)
+    higher = gateway_upstream(setup.pool, higher_upstream, "account-model-higher", compact?: false)
+    prime_routing_quota!(lower.identity)
+    prime_routing_quota!(higher.identity)
+
+    for {assignment, slug, priority} <- [
+          {lower.assignment, "gpt-lower-fallback", 20},
+          {higher.assignment, "gpt-higher-fallback", 2}
+        ] do
+      model_fixture(setup.pool, %{
+        exposed_model_id: slug,
+        upstream_model_id: slug,
+        display_name: slug,
+        supports_responses: true,
+        supports_streaming: true,
+        metadata: %{
+          "source_assignment_ids" => [assignment.id],
+          "source_assignment_models" => %{
+            assignment.id => %{"slug" => slug, "priority" => priority}
+          }
+        }
+      })
+    end
+
+    setup.assignment
+    |> Ecto.Changeset.change(health_status: "degraded")
+    |> Repo.update!()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("ranked model fallback")
+      })
+
+    assert %{"id" => "higher"} = json_response(response, 200)
+    assert FakeUpstream.count(unavailable_upstream) == 0
+    assert FakeUpstream.count(lower_upstream) == 0
+    assert FakeUpstream.count(higher_upstream) == 1
+    assert [sent] = FakeUpstream.requests(higher_upstream)
+    assert sent.json["model"] == "gpt-higher-fallback"
+    assert Repo.one!(from(a in Attempt)).pool_upstream_assignment_id == higher.assignment.id
+    assert Repo.one!(from(r in Request)).requested_model == setup.model.exposed_model_id
+
+    assert Repo.one!(from(r in Request)).request_metadata["effective_model"] ==
+             "gpt-higher-fallback"
+  end
+
+  test "model fallback respects API key model restrictions", %{conn: conn} do
+    unavailable_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "unavailable"}))
+    fallback_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "forbidden"}))
+    setup = gateway_setup(unavailable_upstream)
+    fallback = gateway_upstream(setup.pool, fallback_upstream, "account-model-forbidden", compact?: false)
+    prime_routing_quota!(fallback.identity)
+
+    model_fixture(setup.pool, %{
+      exposed_model_id: "gpt-forbidden-fallback",
+      upstream_model_id: "gpt-forbidden-fallback",
+      display_name: "Forbidden fallback",
+      supports_responses: true,
+      supports_streaming: true,
+      metadata: %{
+        "source_assignment_ids" => [fallback.assignment.id],
+        "source_assignment_models" => %{
+          fallback.assignment.id => %{"slug" => "gpt-forbidden-fallback", "priority" => 1}
+        }
+      }
+    })
+
+    setup.api_key
+    |> Ecto.Changeset.change(allowed_model_identifiers: [setup.model.exposed_model_id])
+    |> Repo.update!()
+
+    setup.assignment
+    |> Ecto.Changeset.change(health_status: "degraded")
+    |> Repo.update!()
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("restricted fallback")
+      })
+
+    assert %{"error" => %{"code" => "no_eligible_backend"}} = json_response(response, 503)
+    assert FakeUpstream.count(unavailable_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 0
+  end
+
+  test "exhausted requested account falls back to an account with quota", %{conn: conn} do
+    exhausted_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "exhausted"}))
+    available_upstream = start_upstream(FakeUpstream.json_response(%{"id" => "available"}))
+    setup = gateway_setup(exhausted_upstream, quota?: false)
+    available = gateway_upstream(setup.pool, available_upstream, "account-model-quota", compact?: false)
+    prime_exhausted_routing_quota!(setup.identity)
+    prime_routing_quota!(available.identity)
+
+    model_fixture(setup.pool, %{
+      exposed_model_id: "gpt-available-quota-fallback",
+      upstream_model_id: "gpt-available-quota-fallback",
+      display_name: "Available quota fallback",
+      supports_responses: true,
+      supports_streaming: true,
+      metadata: %{
+        "source_assignment_ids" => [available.assignment.id],
+        "source_assignment_models" => %{
+          available.assignment.id => %{"slug" => "gpt-available-quota-fallback", "priority" => 1}
+        }
+      }
+    })
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("quota model fallback")
+      })
+
+    assert %{"id" => "available"} = json_response(response, 200)
+    assert FakeUpstream.count(exhausted_upstream) == 0
+    assert FakeUpstream.count(available_upstream) == 1
+  end
+
   @native_response_control_headers [
     "openai-model",
     "x-reasoning-included",
