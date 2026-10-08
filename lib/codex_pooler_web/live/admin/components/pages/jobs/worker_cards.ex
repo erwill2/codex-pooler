@@ -98,6 +98,7 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
         class="btn btn-ghost btn-sm btn-square"
         tabindex="0"
         aria-label={"Actions for #{@card.title}"}
+        title={"Actions for #{@card.title}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>
@@ -270,6 +271,7 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
               type="button"
               data-role="failure-panel-close"
               aria-label="Close failure panel"
+              title="Close failure panel"
               phx-click="close_worker_failure"
               class="grid size-7 shrink-0 place-items-center rounded-full text-base-content/45 transition-colors hover:bg-error/10 hover:text-error focus:outline-none focus:ring-2 focus:ring-error/40"
             >

@@ -195,6 +195,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           class="grid size-6 shrink-0 place-items-center rounded-full text-base-content/50 transition-colors hover:bg-base-200 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary peer-placeholder-shown:hidden"
           phx-click="clear_pool_query_filter"
           aria-label="Clear pool search"
+          title="Clear pool search"
         >
           <.icon name="hero-x-mark" class="size-4" />
         </button>
@@ -695,6 +696,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         class="btn btn-ghost btn-sm btn-square"
         tabindex="0"
         aria-label={"Actions for #{@pool_row.pool.name}"}
+        title={"Actions for #{@pool_row.pool.name}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>

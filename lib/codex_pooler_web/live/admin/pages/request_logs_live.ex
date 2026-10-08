@@ -393,6 +393,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
           ]}
           phx-click="clear_request_id_filter"
           aria-label="Clear request id filter"
+          title="Clear request id filter"
         >
           <.icon name="hero-x-mark" class="size-4" />
         </button>

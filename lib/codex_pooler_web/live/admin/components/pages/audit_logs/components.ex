@@ -185,6 +185,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents do
                 type="button"
                 class="btn btn-ghost btn-sm btn-square"
                 aria-label="Close event details"
+                title="Close event details"
                 phx-click="close_audit_event"
               >
                 <.icon name="hero-x-mark" class="size-5" />

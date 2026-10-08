@@ -205,6 +205,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
         class="btn btn-ghost btn-sm btn-square"
         tabindex="0"
         aria-label={"Actions for invite to #{@invite.invited_email}"}
+        title={"Actions for invite to #{@invite.invited_email}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>
