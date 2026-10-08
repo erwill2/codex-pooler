@@ -567,8 +567,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       @limit_fields
       |> Enum.flat_map(fn field ->
         [
-          {"Default #{limit_field_label(field)}", normalized_limit_value(form[String.to_atom("default_#{field}")].value)},
-          {"Model #{limit_field_label(field)}", normalized_limit_value(form[String.to_atom("model_#{field}")].value)}
+          {"Default #{limit_field_label(field)}", normalized_limit_value(form[limit_field_atom("default", field)].value)},
+          {"Model #{limit_field_label(field)}", normalized_limit_value(form[limit_field_atom("model", field)].value)}
         ]
       end)
       |> Enum.reject(fn {_label, value} -> is_nil(value) end)
@@ -666,6 +666,17 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
 
   defp unavailable_suffix(%{selected_unavailable_chips: chips}),
     do: " · #{length(chips)} unavailable saved"
+
+  defp limit_field_atom("default", "max_requests_per_minute"), do: :default_max_requests_per_minute
+  defp limit_field_atom("default", "max_tokens_per_day"), do: :default_max_tokens_per_day
+  defp limit_field_atom("default", "max_tokens_per_week"), do: :default_max_tokens_per_week
+  defp limit_field_atom("default", "max_input_tokens_per_request"), do: :default_max_input_tokens_per_request
+  defp limit_field_atom("default", "max_output_tokens_per_request"), do: :default_max_output_tokens_per_request
+  defp limit_field_atom("model", "max_requests_per_minute"), do: :model_max_requests_per_minute
+  defp limit_field_atom("model", "max_tokens_per_day"), do: :model_max_tokens_per_day
+  defp limit_field_atom("model", "max_tokens_per_week"), do: :model_max_tokens_per_week
+  defp limit_field_atom("model", "max_input_tokens_per_request"), do: :model_max_input_tokens_per_request
+  defp limit_field_atom("model", "max_output_tokens_per_request"), do: :model_max_output_tokens_per_request
 
   defp limit_field_label("max_requests_per_minute"), do: "Requests per minute"
   defp limit_field_label("max_tokens_per_day"), do: "Tokens per day"

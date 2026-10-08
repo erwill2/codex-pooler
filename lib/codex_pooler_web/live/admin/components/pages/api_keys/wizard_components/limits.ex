@@ -151,7 +151,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Limits do
   attr :prefix, :string, required: true
 
   def limit_input(assigns) do
-    assigns = assign(assigns, :field_atom, String.to_atom("#{assigns.prefix}_#{assigns.field}"))
+    assigns = assign(assigns, :field_atom, limit_field_atom(assigns.prefix, assigns.field))
 
     ~H"""
     <.input
@@ -177,6 +177,17 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Limits do
       limits -> Enum.join(limits, " · ")
     end
   end
+
+  defp limit_field_atom("default", "max_requests_per_minute"), do: :default_max_requests_per_minute
+  defp limit_field_atom("default", "max_tokens_per_day"), do: :default_max_tokens_per_day
+  defp limit_field_atom("default", "max_tokens_per_week"), do: :default_max_tokens_per_week
+  defp limit_field_atom("default", "max_input_tokens_per_request"), do: :default_max_input_tokens_per_request
+  defp limit_field_atom("default", "max_output_tokens_per_request"), do: :default_max_output_tokens_per_request
+  defp limit_field_atom("model", "max_requests_per_minute"), do: :model_max_requests_per_minute
+  defp limit_field_atom("model", "max_tokens_per_day"), do: :model_max_tokens_per_day
+  defp limit_field_atom("model", "max_tokens_per_week"), do: :model_max_tokens_per_week
+  defp limit_field_atom("model", "max_input_tokens_per_request"), do: :model_max_input_tokens_per_request
+  defp limit_field_atom("model", "max_output_tokens_per_request"), do: :model_max_output_tokens_per_request
 
   def limit_field_label("max_requests_per_minute"), do: "Requests per minute"
   def limit_field_label("max_tokens_per_day"), do: "Tokens per day"
