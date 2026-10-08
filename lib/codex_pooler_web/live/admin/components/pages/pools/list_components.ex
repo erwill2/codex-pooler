@@ -464,6 +464,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             data_role="pool-upstream-count-cell"
             href={~p"/admin/upstreams?pool_id=#{@pool_row.pool.id}"}
             label="Upstreams"
+            pool_name={@pool_row.pool.name}
             value={@pool_row.upstream_count}
             value_id={"pool-row-#{@pool_row.pool.id}-upstream-account-count"}
             wrapper_class="min-w-0 pr-3"
@@ -473,6 +474,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             data_role="pool-api-key-count-cell"
             href={~p"/admin/api-keys?pool_id=#{@pool_row.pool.id}"}
             label="API keys"
+            pool_name={@pool_row.pool.name}
             value={@pool_row.api_key_count}
             value_id={"pool-row-#{@pool_row.pool.id}-api-key-count"}
             wrapper_class="min-w-0 pl-3 sm:px-3"
@@ -481,6 +483,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             data_role="pool-request-count-cell"
             href={~p"/admin/request-logs?pool_id=#{@pool_row.pool.id}"}
             label={"Req/TPS #{@pool_row.traffic_window_label}"}
+            pool_name={@pool_row.pool.name}
             value={
               PoolsReadModel.format_request_throughput(
                 @pool_row.request_count,
@@ -502,6 +505,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             data_role="pool-cost-cell"
             href={~p"/admin/stats?pool_id=#{@pool_row.pool.id}"}
             label={"Cost #{@pool_row.traffic_window_label}"}
+            pool_name={@pool_row.pool.name}
             value={PoolsReadModel.format_settled_cost_micros(@pool_row.settled_cost_micros)}
             value_id={"pool-row-#{@pool_row.pool.id}-settled-cost"}
             wrapper_class="min-w-0 pl-3"
@@ -516,6 +520,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   attr :data_role, :string, required: true
   attr :href, :string, required: true
   attr :label, :string, required: true
+  attr :pool_name, :string, required: true
   attr :value, :any, required: true
   attr :value_id, :string, required: true
   attr :wrapper_class, :string, required: true
@@ -529,7 +534,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         <.link
           navigate={@href}
           class={footer_metric_link_class(@position)}
-          aria-label={"Open #{@label}"}
+          aria-label={"Open #{@label} details for #{@pool_name}, current: #{@value}"}
         >
           <span class="sr-only">{@label}</span>
         </.link>

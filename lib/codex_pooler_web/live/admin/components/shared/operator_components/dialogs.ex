@@ -106,7 +106,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_create_operator">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_create_operator">close</button>
       </form>
     </dialog>
     """
@@ -184,7 +184,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_edit">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_edit">close</button>
       </form>
     </dialog>
     """
@@ -273,7 +273,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_reset">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_reset">close</button>
       </form>
     </dialog>
     """
@@ -308,14 +308,18 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
             placeholder={@placeholder}
             autocomplete="email"
             required={@required}
+            aria-invalid={if @errors != [], do: "true"}
+            aria-describedby={if @errors != [], do: "#{@id}-error"}
           />
         </span>
       </label>
       <div class="validator-hint hidden">Enter valid email address</div>
-      <p :for={msg <- @errors} class="mt-1.5 flex items-center gap-2 text-sm text-error">
-        <.icon name="hero-exclamation-circle" class="size-5" />
-        {msg}
-      </p>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <p :for={msg <- @errors} class="mt-1.5 flex items-center gap-2 text-sm text-error">
+          <.icon name="hero-exclamation-circle" class="size-5" />
+          {msg}
+        </p>
+      </div>
     </div>
     """
   end

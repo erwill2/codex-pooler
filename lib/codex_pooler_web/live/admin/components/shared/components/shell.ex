@@ -168,6 +168,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                   class="btn btn-ghost btn-sm btn-square relative list-none text-base-content/60 [&::-webkit-details-marker]:hidden"
                   role="button"
                   aria-label="Live updates: syncing"
+                  title="Live updates: syncing"
                   data-ws-button
                   phx-update="ignore"
                 >
@@ -471,6 +472,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
         class="btn btn-ghost btn-sm btn-square relative list-none text-base-content/60 [&::-webkit-details-marker]:hidden"
         role="button"
         aria-label="Codex Pooler project links"
+        title="Codex Pooler project links"
         data-role="admin-github-trigger"
       >
         <.github_icon class="size-5 fill-current" />
@@ -585,6 +587,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
         class="btn btn-ghost btn-sm btn-square relative list-none text-base-content/60 [&::-webkit-details-marker]:hidden"
         role="button"
         aria-label={notification_button_label(@center)}
+        title={notification_button_label(@center)}
         data-role="admin-notifications-trigger"
       >
         <.icon name="hero-bell" class="size-5" />
@@ -674,7 +677,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                     <button
                       id={"admin-notification-open-#{notification_row_value(row, :id)}"}
                       type="button"
-                      class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-primary"
+                      class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary"
                       data-role="admin-notification-primary-action"
                       title="View incident"
                       aria-label="View incident"
@@ -687,7 +690,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                       :if={notification_row_unread?(row)}
                       id={"admin-notification-mark-read-#{notification_row_value(row, :id)}"}
                       type="button"
-                      class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content"
+                      class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary"
                       data-role="admin-notification-mark-read"
                       title="Mark read"
                       aria-label="Mark read"
@@ -699,7 +702,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                     <button
                       id={"admin-notification-dismiss-#{notification_row_value(row, :id)}"}
                       type="button"
-                      class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-error"
+                      class="btn btn-ghost btn-xs btn-square text-base-content/50 hover:text-error focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-error"
                       data-role="admin-notification-dismiss"
                       title="Dismiss notification"
                       aria-label="Dismiss notification"
