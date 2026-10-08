@@ -27,21 +27,16 @@ defmodule CodexPooler.Quotas.WindowClassifier do
 
   @spec classify(raw_window()) :: descriptor()
   def classify(window) when is_map(window) do
-    cond do
-      account_primary_window?(window, @primary_5h_minutes) ->
-        :primary_5h
-
-      account_secondary_window?(window, @weekly_minutes) ->
-        :weekly_secondary
-
-      account_primary_window?(window, @monthly_minutes) ->
-        :monthly_primary
-
-      account_primary_window?(window) ->
-        :unknown_account_primary
-
-      true ->
-        :unknown
+    if account_window?(window) do
+      case {kind(window), window_minutes(window)} do
+        {@primary_kind, @primary_5h_minutes} -> :primary_5h
+        {@secondary_kind, @weekly_minutes} -> :weekly_secondary
+        {@primary_kind, @monthly_minutes} -> :monthly_primary
+        {@primary_kind, _minutes} -> :unknown_account_primary
+        _other -> :unknown
+      end
+    else
+      :unknown
     end
   end
 
@@ -62,18 +57,6 @@ defmodule CodexPooler.Quotas.WindowClassifier do
 
   @spec unknown_account_primary?(raw_window()) :: boolean()
   def unknown_account_primary?(window), do: classify(window) == :unknown_account_primary
-
-  defp account_primary_window?(window),
-    do: account_window?(window) and kind(window) == @primary_kind
-
-  defp account_primary_window?(window, minutes) do
-    account_primary_window?(window) and window_minutes(window) == minutes
-  end
-
-  defp account_secondary_window?(window, minutes) do
-    account_window?(window) and kind(window) == @secondary_kind and
-      window_minutes(window) == minutes
-  end
 
   defp account_window?(window) do
     token(window, :quota_key) == @account_quota_key and

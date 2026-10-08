@@ -487,6 +487,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp affinity_status(true, %BridgeAffinity{}), do: "hit"
   defp affinity_status(true, _affinity), do: "miss"
 
+  defp apply_affinity([], _affinity), do: []
+  defp apply_affinity([_] = candidates, _affinity), do: candidates
   defp apply_affinity(candidates, %{row: nil} = _affinity), do: candidates
 
   defp apply_affinity(candidates, %{row: %BridgeAffinity{} = affinity}) do
@@ -502,6 +504,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # `strategy_order/5` re-sorts the whole shortlist, so an ordering applied
   # before planning never survives to the selected candidate. It stays a
   # preference — quota tier and demotion ordering still run after it.
+  defp apply_codex_session_preference([], _preference), do: []
+  defp apply_codex_session_preference([_] = candidates, _preference), do: candidates
+
   defp apply_codex_session_preference(candidates, %{
          status: "applied",
          assignment_id: assignment_id
@@ -578,6 +583,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     matched ++ rest
   end
 
+  defp apply_prompt_cache_locality([], _locality), do: []
+  defp apply_prompt_cache_locality([_] = candidates, _locality), do: candidates
+
   defp apply_prompt_cache_locality(candidates, %{status: "applied", seed: seed}) do
     Enum.sort_by(candidates, fn {assignment, _identity} ->
       {-rendezvous_score(seed, assignment.id), assignment.id}
@@ -589,6 +597,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  defp apply_routing_priority([]), do: []
+  defp apply_routing_priority([_] = candidates), do: candidates
+
   defp apply_routing_priority(candidates) do
     candidates
     |> Enum.with_index()
@@ -1118,7 +1129,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp latest_success_sort_key(%DateTime{} = timestamp),
     do: DateTime.to_unix(timestamp, :microsecond)
 
-  defp rotate_candidates(candidates, _seed) when length(candidates) <= 1, do: candidates
+  defp rotate_candidates([], _seed), do: []
+  defp rotate_candidates([_] = candidates, _seed), do: candidates
 
   defp rotate_candidates(candidates, seed) do
     {head, tail} = Enum.split(candidates, :erlang.phash2(seed, length(candidates)))
