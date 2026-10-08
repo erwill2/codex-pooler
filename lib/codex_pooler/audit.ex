@@ -376,7 +376,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_actor(query, nil), do: query
 
   defp maybe_filter_actor(query, actor) do
-    pattern = "%#{actor}%"
+    pattern = CodexPooler.SearchPattern.contains(actor)
 
     from([event, user, _pool] in query,
       where:
@@ -395,7 +395,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_target(query, nil), do: query
 
   defp maybe_filter_target(query, target) do
-    pattern = "%#{target}%"
+    pattern = CodexPooler.SearchPattern.contains(target)
 
     from([event, ...] in query,
       where:
@@ -407,7 +407,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_request(query, nil), do: query
 
   defp maybe_filter_request(query, request) do
-    pattern = "%#{request}%"
+    pattern = CodexPooler.SearchPattern.contains(request)
 
     from([event, ...] in query,
       where:

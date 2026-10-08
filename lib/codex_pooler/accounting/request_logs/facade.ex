@@ -247,11 +247,13 @@ defmodule CodexPooler.Accounting.RequestLogs do
        ) do
     request_attempts = Map.get(attempts, request.id, [])
     turn = Map.get(turns_by_request, request.id)
+
     metadata =
       request.request_metadata
       |> Kernel.||(%{})
       |> safe_request_log_metadata()
       |> put_attempt_quota_lane(request_attempts)
+
     reasoning_metadata = latest_attempt_reasoning_metadata(request_attempts)
 
     %{
@@ -565,7 +567,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
   defp maybe_filter_request_log_model(query, nil), do: query
 
   defp maybe_filter_request_log_model(query, model) do
-    pattern = "%#{model}%"
+    pattern = CodexPooler.SearchPattern.contains(model)
 
     from([request, ...] in query,
       where: ilike(request.requested_model, ^pattern)
@@ -586,7 +588,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
         )
 
       :error ->
-        pattern = "%#{trimmed}%"
+        pattern = CodexPooler.SearchPattern.contains(trimmed)
 
         from([request, ...] in query,
           where:
