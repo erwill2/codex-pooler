@@ -162,11 +162,15 @@ defmodule CodexPoolerWeb.CoreComponents do
             value="true"
             checked={@checked}
             class={@class || "checkbox checkbox-sm"}
+            aria-invalid={if @errors != [], do: "true"}
+            aria-describedby={if @errors != [], do: "#{@id}-error"}
             {@rest}
           />{@label}
         </span>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -182,13 +186,17 @@ defmodule CodexPoolerWeb.CoreComponents do
           name={@name}
           class={[@class || "w-full select", @errors != [] && (@error_class || "select-error")]}
           multiple={@multiple}
+          aria-invalid={if @errors != [], do: "true"}
+          aria-describedby={if @errors != [], do: "#{@id}-error"}
           {@rest}
         >
           <option :if={@prompt} value="">{@prompt}</option>
           {Form.options_for_select(@options, @value)}
         </select>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -206,10 +214,14 @@ defmodule CodexPoolerWeb.CoreComponents do
             @class || "w-full textarea",
             @errors != [] && (@error_class || "textarea-error")
           ]}
+          aria-invalid={if @errors != [], do: "true"}
+          aria-describedby={if @errors != [], do: "#{@id}-error"}
           {@rest}
         >{Form.normalize_value("textarea", @value)}</textarea>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -229,10 +241,14 @@ defmodule CodexPoolerWeb.CoreComponents do
             @class || "w-full input",
             @errors != [] && (@error_class || "input-error")
           ]}
+          aria-invalid={if @errors != [], do: "true"}
+          aria-describedby={if @errors != [], do: "#{@id}-error"}
           {@rest}
         />
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
