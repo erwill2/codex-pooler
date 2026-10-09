@@ -571,6 +571,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         id={"#{@id}-button"}
         class="inline-flex w-fit cursor-pointer list-none items-center gap-1 text-xs font-medium text-base-content/55 transition-colors hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden"
         aria-label="Show API key notes"
+        title="Show API key notes"
       >
         <.icon name="hero-document-text" class="size-3.5" />
         <span>Notes</span>
