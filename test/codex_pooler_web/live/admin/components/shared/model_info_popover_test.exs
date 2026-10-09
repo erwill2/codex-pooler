@@ -51,5 +51,7 @@ defmodule CodexPoolerWeb.Admin.ModelInfoPopoverTest do
     assert html =~ "Catalog checked"
     assert html =~ "ago"
     assert html =~ ~s(title="Catalog checked 2026-08-22 01:00 UTC")
+    assert html =~ ~s(title="About gpt-example")
+    assert html =~ ~s(aria-label="About gpt-example")
   end
 end

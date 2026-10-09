@@ -694,6 +694,7 @@ defmodule CodexPoolerWeb.Admin.Components do
         class="btn btn-ghost btn-xs btn-circle text-warning transition-colors hover:bg-warning/10 hover:text-warning"
         tabindex="0"
         aria-label={@label}
+        title={@label}
         aria-describedby={"#{@id}-content"}
       >
         <.icon name="hero-exclamation-triangle" class="size-4" />
@@ -757,6 +758,7 @@ defmodule CodexPoolerWeb.Admin.Components do
           @trigger_class
         ]}
         aria-label={"About #{@model_id}"}
+        title={"About #{@model_id}"}
         aria-controls={"#{@id}-content"}
         aria-describedby={"#{@id}-content"}
         popovertarget={"#{@id}-content"}
