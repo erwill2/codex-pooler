@@ -11,7 +11,7 @@ defmodule CodexPoolerWeb.UserAuth do
 
   @session_key :user_token
   # Mirrors Phoenix's local-path validation because this session value is untrusted.
-  @unsafe_return_to_path_fragments ["\\", "/%09", "/\t", "\n", "\r"]
+  @unsafe_return_to_path_fragments ["\\", "/\t", "\n", "\r"]
 
   def log_in_user(conn, user, token) when is_binary(token) do
     user_return_to = get_session(conn, :user_return_to)
@@ -264,9 +264,12 @@ defmodule CodexPoolerWeb.UserAuth do
   defp maybe_store_return_to(conn), do: conn
 
   defp safe_return_to_path(return_to) when is_binary(return_to) do
+    decoded = URI.decode(return_to)
+
     if String.starts_with?(return_to, "/") and
          not String.starts_with?(return_to, "//") and
-         not String.contains?(return_to, @unsafe_return_to_path_fragments) do
+         not String.starts_with?(decoded, "//") and
+         not String.contains?(decoded, @unsafe_return_to_path_fragments) do
       return_to
     end
   end
