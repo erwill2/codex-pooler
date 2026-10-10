@@ -7,6 +7,8 @@ defmodule CodexPooler.Quotas.WindowClassifier do
   and exhaustion remain separate evidence predicates.
   """
 
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+
   @account_quota_key "account"
   @account_scope "account"
   @account_family "account"
@@ -25,7 +27,43 @@ defmodule CodexPooler.Quotas.WindowClassifier do
 
   @type raw_window :: struct() | %{optional(atom() | String.t()) => term()}
 
+  # Fast-path pattern matches for canonical AccountQuotaWindow struct instances
   @spec classify(raw_window()) :: descriptor()
+  def classify(%AccountQuotaWindow{
+        quota_key: "account",
+        quota_scope: "account",
+        quota_family: "account",
+        window_kind: "primary",
+        window_minutes: @primary_5h_minutes
+      }),
+      do: :primary_5h
+
+  def classify(%AccountQuotaWindow{
+        quota_key: "account",
+        quota_scope: "account",
+        quota_family: "account",
+        window_kind: "secondary",
+        window_minutes: @weekly_minutes
+      }),
+      do: :weekly_secondary
+
+  def classify(%AccountQuotaWindow{
+        quota_key: "account",
+        quota_scope: "account",
+        quota_family: "account",
+        window_kind: "primary",
+        window_minutes: @monthly_minutes
+      }),
+      do: :monthly_primary
+
+  def classify(%AccountQuotaWindow{
+        quota_key: "account",
+        quota_scope: "account",
+        quota_family: "account",
+        window_kind: "primary"
+      }),
+      do: :unknown_account_primary
+
   def classify(window) when is_map(window) do
     if account_window?(window) do
       case {kind(window), window_minutes(window)} do
@@ -59,12 +97,12 @@ defmodule CodexPooler.Quotas.WindowClassifier do
   def unknown_account_primary?(window), do: classify(window) == :unknown_account_primary
 
   defp account_window?(window) do
-    token(window, :quota_key) == @account_quota_key and
-      token(window, :quota_scope) == @account_scope and
-      token(window, :quota_family) == @account_family
+    match_token?(field(window, :quota_key), @account_quota_key) and
+      match_token?(field(window, :quota_scope), @account_scope) and
+      match_token?(field(window, :quota_family), @account_family)
   end
 
-  defp kind(window), do: token(window, :window_kind)
+  defp kind(window), do: token(field(window, :window_kind))
 
   defp window_minutes(window) do
     case field(window, :window_minutes) do
@@ -82,18 +120,32 @@ defmodule CodexPooler.Quotas.WindowClassifier do
     end
   end
 
-  defp token(window, field_name) do
-    case field(window, field_name) do
-      value when is_binary(value) ->
-        value |> String.trim() |> String.downcase()
+  defp match_token?(target, expected) when target == expected, do: true
 
-      value when is_atom(value) and not is_nil(value) ->
-        value |> Atom.to_string() |> String.downcase()
-
-      _value ->
-        nil
-    end
+  defp match_token?(value, expected) when is_binary(value) do
+    value |> String.trim() |> String.downcase() == expected
   end
+
+  defp match_token?(value, expected) when is_atom(value) and not is_nil(value) do
+    value |> Atom.to_string() |> String.downcase() == expected
+  end
+
+  defp match_token?(_value, _expected), do: false
+
+  defp token("primary"), do: "primary"
+  defp token(:primary), do: "primary"
+  defp token("secondary"), do: "secondary"
+  defp token(:secondary), do: "secondary"
+
+  defp token(value) when is_binary(value) do
+    value |> String.trim() |> String.downcase()
+  end
+
+  defp token(value) when is_atom(value) and not is_nil(value) do
+    value |> Atom.to_string() |> String.downcase()
+  end
+
+  defp token(_value), do: nil
 
   defp field(window, field_name) when is_map(window) do
     Map.get(window, field_name) || Map.get(window, Atom.to_string(field_name))
