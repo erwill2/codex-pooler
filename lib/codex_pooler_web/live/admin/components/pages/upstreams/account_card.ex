@@ -638,10 +638,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
         id={"upstream-account-actions-menu-#{@account.identity.id}"}
         type="button"
         class="btn btn-ghost btn-sm btn-square"
-        tabindex="0"
         aria-label={"Actions for #{@account.label}"}
-        title={"Actions for #{@account.label}"}
-        title={actions_menu_title(@account)}
+        title={actions_menu_title(@account) || "Actions for #{@account.label}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>
