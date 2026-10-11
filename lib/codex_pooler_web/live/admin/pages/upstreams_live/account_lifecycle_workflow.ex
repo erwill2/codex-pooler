@@ -67,8 +67,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
         message =
           if status == :already_queued,
             do: "Quota refresh is already queued",
-            else:
-              "Quota refresh queued; reset changes, if detected, are confirmed automatically after about 3 minutes"
+            else: "Quota refresh queued; reset changes, if detected, are confirmed automatically after about 3 minutes"
 
         socket
         |> put_flash(:info, message)

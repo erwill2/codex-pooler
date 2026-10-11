@@ -1,0 +1,3 @@
+## 2026-10-11 - Visual Required Indicators in Phoenix Forms
+**Learning:** Sighted users rely on visual required indicators (like a red asterisk) to know which form fields must be completed before submission, while screen reader users rely on the HTML `required` attribute. Adding `<span class="text-error ml-0.5" aria-hidden="true">*</span>` inside component label markup provides immediate visual clarity without double-announcing required status to assistive technology.
+**Action:** When building or extending shared `<.input>` component primitives, conditionally render a visual asterisk guarded by `@rest[:required]` and marked with `aria-hidden="true"`.

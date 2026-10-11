@@ -84,8 +84,7 @@ defmodule CodexPooler.Jobs.AccountQuotaConfirmationWorkerTest do
     candidate_metadata = %{
       "version" => 1,
       "used_percent" => "0",
-      "reset_at" =>
-        candidate_at |> DateTime.add(@weekly_seconds, :second) |> DateTime.to_iso8601(),
+      "reset_at" => candidate_at |> DateTime.add(@weekly_seconds, :second) |> DateTime.to_iso8601(),
       "observed_at" => DateTime.to_iso8601(candidate_at),
       "count" => 1
     }
@@ -240,8 +239,7 @@ defmodule CodexPooler.Jobs.AccountQuotaConfirmationWorkerTest do
     active_upstream_assignment_fixture(pool_fixture(), %{
       metadata: %{
         "base_url" => FakeUpstream.url(upstream),
-        "access_token_expires_at" =>
-          DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+        "access_token_expires_at" => DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
       }
     })
   end
