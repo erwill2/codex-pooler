@@ -97,7 +97,7 @@ defmodule CodexPoolerWeb.Admin.SharedLogPagination do
           >
             <span class="hidden sm:inline">Showing </span>{@page.range}
           </p>
-           {render_slot(@aside)}
+          {render_slot(@aside)}
         </div>
 
         <div class="join shrink-0">

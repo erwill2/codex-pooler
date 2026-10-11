@@ -1480,8 +1480,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodecTest do
                  )
 
         assert coerced.request_options.payload_context.compaction_result_transport == :sse
+
         assert coerced.request_options.transport.transport ==
                  if(previous_response_id, do: "websocket", else: "http_compact_json")
+
         assert coerced.payload["stream"] == true
       end
     end

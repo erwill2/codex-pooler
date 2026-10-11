@@ -58,8 +58,7 @@ defmodule CodexPooler.Upstreams.QuotaReconciliationEnqueue do
   end
 
   def enqueue_for_scope(_scope, _identity_or_id, _opts),
-    do:
-      {:error, CodexPooler.Upstreams.lifecycle_error(:invalid_request, "user scope is required")}
+    do: {:error, CodexPooler.Upstreams.lifecycle_error(:invalid_request, "user scope is required")}
 
   defp linked_assignments(identity) do
     identity.id
