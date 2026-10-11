@@ -1,0 +1,3 @@
+## 2026-10-11 - Short-circuiting candidate list set operations and single-element sorting in gateway routing
+**Learning:** In gateway candidate routing pipelines, the majority of requests pass through without candidate drop or re-ordering. Performing `MapSet.new` set differences when `classified_candidates == candidates` or sorting single-element candidate lists (`[_]`) in `Enum.sort_by` adds unnecessary map allocations, hashing, and tuple creation on the hot path. Short-circuiting equality and single-element list patterns before set operations eliminates O(N) map allocations.
+**Action:** When filtering or re-ordering candidate pipelines in Elixir, always guard set difference / sorting operations with fast-path pattern matches (`[]`, `[_]`, or `a == b`).
