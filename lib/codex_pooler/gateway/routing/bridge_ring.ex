@@ -604,8 +604,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     candidates
     |> Enum.with_index()
     |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
+      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(), strategy_index}
     end)
     |> Enum.map(&elem(&1, 0))
   end
@@ -755,6 +754,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     |> Enum.join(":")
   end
 
+  defp active_demotions(_auth, _model, []), do: %{}
+
   defp active_demotions(auth, model, candidates) do
     assignment_ids = Enum.map(candidates, fn {assignment, _identity} -> assignment.id end)
     active_status = BridgeDemotion.active_status()
@@ -774,6 +775,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   # Capacity basis is outermost; affinity, strategy and demotion never promote
   # a credit-dependent candidate above a compatible non-credit candidate.
+  defp apply_quota_tier_and_demotions([], _demotions, _model, _request_options, _route_state), do: []
+  defp apply_quota_tier_and_demotions([_] = candidates, _demotions, _model, _request_options, _route_state), do: candidates
+
   defp apply_quota_tier_and_demotions(candidates, demotions, %Model{} = model, request_options, route_state) do
     Enum.sort_by(candidates, fn {assignment, identity} = candidate ->
       reserve_tier =
