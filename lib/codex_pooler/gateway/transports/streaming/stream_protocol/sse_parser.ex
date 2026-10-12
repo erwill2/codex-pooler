@@ -40,7 +40,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
   """
   @spec data_lines(binary()) :: iodata()
   def data_lines(text) when is_binary(text) do
-    if String.contains?(text, ["\n", "\r"]) do
+    if String.contains?(text, "\n") or String.contains?(text, "\r") do
       text
       |> String.split(["\r\n", "\r", "\n"])
       |> Enum.map_intersperse("\n", &["data: ", &1])
@@ -86,7 +86,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
   defp appendable_without_scan?(%{buffer: buffer}, data) do
     not String.ends_with?(buffer, "\r") and
       not (String.ends_with?(buffer, "\n") and String.starts_with?(data, "\n")) and
-      not String.contains?(data, ["\r", "\n\n"])
+      not (String.contains?(data, "\r") or String.contains?(data, "\n\n"))
   end
 
   defp consume_optional_leading_lf("", true), do: {"", true}
@@ -175,19 +175,35 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
   def sse_field(block, name) do
     prefix = name <> ":"
 
-    block
-    |> String.split("\n")
-    |> Enum.map(&String.trim/1)
-    |> Enum.flat_map(fn line ->
-      if String.starts_with?(line, prefix) do
-        [line |> String.replace_prefix(prefix, "") |> String.trim_leading()]
-      else
-        []
-      end
-    end)
-    |> case do
-      [] -> nil
-      values -> Enum.join(values, "\n")
+    # Short-circuit if the prefix is not present at all in the block,
+    # avoiding String.split/Enum allocations for absent SSE fields.
+    if String.contains?(block, prefix) do
+      block
+      |> String.split("\n")
+      |> extract_sse_field_lines(prefix, byte_size(prefix), [])
+    else
+      nil
+    end
+  end
+
+  # Single-pass tail-recursive line extractor to avoid intermediate list allocations.
+  defp extract_sse_field_lines([], _prefix, _prefix_len, []), do: nil
+
+  defp extract_sse_field_lines([], _prefix, _prefix_len, acc) do
+    acc
+    |> Enum.reverse()
+    |> Enum.join("\n")
+  end
+
+  defp extract_sse_field_lines([line | rest], prefix, prefix_len, acc) do
+    trimmed = String.trim(line)
+
+    if String.starts_with?(trimmed, prefix) do
+      <<_::binary-size(^prefix_len), rest_line::binary>> = trimmed
+      val = String.trim_leading(rest_line)
+      extract_sse_field_lines(rest, prefix, prefix_len, [val | acc])
+    else
+      extract_sse_field_lines(rest, prefix, prefix_len, acc)
     end
   end
 
