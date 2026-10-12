@@ -36,6 +36,16 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     :ok
   end
 
+  test "browser security headers include standard secure headers alongside CSP", %{conn: conn} do
+    conn = get(conn, ~p"/login")
+
+    assert ["SAMEORIGIN"] = get_resp_header(conn, "x-frame-options")
+    assert ["nosniff"] = get_resp_header(conn, "x-content-type-options")
+    assert ["1; mode=block"] = get_resp_header(conn, "x-xss-protection")
+    assert ["noopen"] = get_resp_header(conn, "x-download-options")
+    assert ["none"] = get_resp_header(conn, "x-permitted-cross-domain-policies")
+  end
+
   test "browser CSP includes configured extra sources without allowing structural directives to expand",
        %{
          conn: conn
