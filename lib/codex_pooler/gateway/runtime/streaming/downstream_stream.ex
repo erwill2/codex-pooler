@@ -533,10 +533,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   defp public_openai_responses_stream?(_opts), do: false
 
   defp codex_responses_sse_chunk?(data) when is_binary(data) do
+    # Optimization: Using explicit `or` conditions with binary pattern literals instead of passing
+    # lists to `String.contains?/2` avoids dynamic runtime list pattern compilation on hot SSE chunk checks.
     String.starts_with?(data, "event: ") or String.starts_with?(data, "data: ") or
-      String.contains?(data, ["\nevent: ", "\revent: "]) or
-      String.contains?(data, ["\ndata: ", "\rdata: "]) or
-      String.contains?(data, ["\n\n", "\n\r", "\r\r"])
+      String.contains?(data, "\nevent: ") or String.contains?(data, "\revent: ") or
+      String.contains?(data, "\ndata: ") or String.contains?(data, "\rdata: ") or
+      String.contains?(data, "\n\n") or String.contains?(data, "\n\r") or String.contains?(data, "\r\r")
   end
 
   defp oversized_incomplete_sse_prefix?([], "", buffered_size),
