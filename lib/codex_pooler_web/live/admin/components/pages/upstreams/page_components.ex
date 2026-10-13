@@ -211,6 +211,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           class="grid size-6 shrink-0 place-items-center rounded-full text-base-content/50 transition-colors hover:bg-base-200 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary peer-placeholder-shown:hidden"
           phx-click="clear_upstream_query_filter"
           aria-label="Clear upstream search"
+          title="Clear upstream search"
         >
           <.icon name="hero-x-mark" class="size-4" />
         </button>
