@@ -1,7 +1,13 @@
 defmodule CodexPooler.SearchPattern do
   @moduledoc false
 
-  @spec contains(String.t()) :: String.t()
+  @doc """
+  Escapes SQL LIKE wildcards (`%`, `_`) and backslashes (`\\`) in search strings
+  and wraps the escaped result in `%` wildcards to prevent SQL LIKE wildcard injection.
+  """
+  @spec contains(term()) :: String.t()
+  def contains(nil), do: "%%"
+
   def contains(value) when is_binary(value) do
     escaped =
       value
@@ -11,4 +17,6 @@ defmodule CodexPooler.SearchPattern do
 
     "%" <> escaped <> "%"
   end
+
+  def contains(value), do: value |> to_string() |> contains()
 end
