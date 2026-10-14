@@ -58,7 +58,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="close_secret">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="close_secret">close</button>
       </form>
     </dialog>
     """
@@ -134,7 +134,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_delete_api_key">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_delete_api_key">close</button>
       </form>
     </dialog>
     """

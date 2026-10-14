@@ -1108,6 +1108,7 @@ defmodule CodexPoolerWeb.Admin.Components do
         copy_text={@value}
         label={@copy_label}
         aria_label={@copy_aria_label}
+        title={@copy_aria_label}
         class="btn btn-secondary btn-sm h-8 min-h-8 w-full shrink-0 gap-1.5 sm:w-auto"
         icon_class="size-3.5"
       />
@@ -1118,11 +1119,14 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :id, :string, required: true
   attr :copy_text, :string, required: true
   attr :aria_label, :string, required: true
+  attr :title, :string, default: nil
   attr :label, :string, default: "Copy"
   attr :class, :any, default: "btn btn-square size-10 shrink-0"
   attr :icon_class, :any, default: "size-4"
 
   def clipboard_button(assigns) do
+    assigns = assign(assigns, :title, assigns[:title] || assigns.aria_label)
+
     ~H"""
     <button
       id={@id}
@@ -1134,7 +1138,7 @@ defmodule CodexPoolerWeb.Admin.Components do
       data-copy-label={@label}
       data-copied-label="Copied"
       aria-label={@aria_label}
-      title={@aria_label}
+      title={@title}
     >
       <.icon name="hero-clipboard-document" class={["copy-icon", @icon_class]} />
       <span
