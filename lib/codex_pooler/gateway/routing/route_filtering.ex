@@ -93,8 +93,22 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
              request_options,
              candidates
            ) do
-      kept_ids = MapSet.new(candidates, fn {assignment, _identity} -> assignment.id end)
-      dropped = Enum.reject(classified_candidates, fn {assignment, _identity} -> MapSet.member?(kept_ids, assignment.id) end)
+      # Avoid MapSet allocations and list traversals when no candidates were dropped or candidate lists are empty.
+      dropped =
+        cond do
+          classified_candidates == candidates ->
+            []
+
+          classified_candidates == [] ->
+            []
+
+          candidates == [] ->
+            classified_candidates
+
+          true ->
+            kept_ids = MapSet.new(candidates, fn {assignment, _identity} -> assignment.id end)
+            Enum.reject(classified_candidates, fn {assignment, _identity} -> MapSet.member?(kept_ids, assignment.id) end)
+        end
 
       route_state =
         route_state
