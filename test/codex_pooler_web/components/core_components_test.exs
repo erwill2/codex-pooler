@@ -39,4 +39,27 @@ defmodule CodexPoolerWeb.CoreComponentsTest do
     refute html =~ ~s(aria-describedby="username-input-error")
     refute html =~ ~s(id="username-input-error")
   end
+
+  test "input component renders required visual indicator with aria-hidden when required attribute is present" do
+    html =
+      render_component(&CoreComponents.input/1,
+        id: "email-input",
+        name: "user[email]",
+        label: "Email address",
+        required: true
+      )
+
+    assert html =~ ~s(<span class="text-error ml-0.5" aria-hidden="true">*</span>)
+  end
+
+  test "input component does not render required visual indicator when required attribute is absent" do
+    html =
+      render_component(&CoreComponents.input/1,
+        id: "email-input",
+        name: "user[email]",
+        label: "Email address"
+      )
+
+    refute html =~ ~s(<span class="text-error ml-0.5" aria-hidden="true">*</span>)
+  end
 end
