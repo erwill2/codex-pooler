@@ -175,19 +175,26 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
   def sse_field(block, name) do
     prefix = name <> ":"
 
-    block
-    |> String.split("\n")
-    |> Enum.map(&String.trim/1)
-    |> Enum.flat_map(fn line ->
-      if String.starts_with?(line, prefix) do
-        [line |> String.replace_prefix(prefix, "") |> String.trim_leading()]
-      else
-        []
+    # Short-circuit when prefix is absent to avoid string line splitting
+    # and list allocations for missing optional SSE fields in streaming paths.
+    if String.contains?(block, prefix) do
+      block
+      |> String.split("\n")
+      |> Enum.reduce([], fn line, acc ->
+        trimmed = String.trim(line)
+
+        if String.starts_with?(trimmed, prefix) do
+          [trimmed |> String.replace_prefix(prefix, "") |> String.trim_leading() | acc]
+        else
+          acc
+        end
+      end)
+      |> case do
+        [] -> nil
+        values -> values |> Enum.reverse() |> Enum.join("\n")
       end
-    end)
-    |> case do
-      [] -> nil
-      values -> Enum.join(values, "\n")
+    else
+      nil
     end
   end
 

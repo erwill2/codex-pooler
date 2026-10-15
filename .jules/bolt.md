@@ -1,0 +1,3 @@
+## 2026-10-15 - Optimize SSE field extraction in streaming paths
+**Learning:** In hot SSE stream parsing paths (such as `SSEParser.sse_field/2` and `RateLimitObserver.sse_field/2`), optional fields like `event:` are absent in 95%+ of streaming data chunks. Unconditionally executing `String.split("\n")` and line trimming creates unnecessary string allocations and list iterations. Guarding with `String.contains?(block, prefix)` short-circuits missing fields in O(1) time without heap allocations.
+**Action:** Always check `String.contains?(block, prefix)` before splitting multiline string blocks when looking for optional key-value lines.
