@@ -23,7 +23,14 @@ defmodule CodexPoolerWeb.BrowserSecurity do
 
   @spec secure_headers(Plug.Conn.t() | nil) :: %{String.t() => String.t()}
   def secure_headers(conn) do
-    %{"content-security-policy" => content_security_policy(conn)}
+    # Explicitly include standard security headers alongside dynamic CSP to prevent
+    # default browser security headers from being overridden when custom headers are applied.
+    %{
+      "content-security-policy" => content_security_policy(conn),
+      "x-frame-options" => "SAMEORIGIN",
+      "x-content-type-options" => "nosniff",
+      "x-xss-protection" => "1; mode=block"
+    }
   end
 
   @spec codex_desktop_browser?(Plug.Conn.t()) :: boolean()

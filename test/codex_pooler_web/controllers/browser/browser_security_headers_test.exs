@@ -79,7 +79,7 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     assert directives["script-src"] == "'self' 'unsafe-inline' 'unsafe-eval' blob:"
   end
 
-  test "pre-normalization direct-loopback browser CSP preserves annotation script injection", %{
+  test "secure_headers returns standard browser security headers alongside CSP", %{
     conn: conn
   } do
     headers =
@@ -87,6 +87,10 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
       |> local_host()
       |> put_req_header("user-agent", @codex_desktop_user_agent)
       |> BrowserSecurity.secure_headers()
+
+    assert headers["x-frame-options"] == "SAMEORIGIN"
+    assert headers["x-content-type-options"] == "nosniff"
+    assert headers["x-xss-protection"] == "1; mode=block"
 
     directives = headers |> Map.fetch!("content-security-policy") |> csp_directives()
 
