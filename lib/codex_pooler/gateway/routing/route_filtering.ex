@@ -93,8 +93,9 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
              request_options,
              candidates
            ) do
-      kept_ids = MapSet.new(candidates, fn {assignment, _identity} -> assignment.id end)
-      dropped = Enum.reject(classified_candidates, fn {assignment, _identity} -> MapSet.member?(kept_ids, assignment.id) end)
+      # Short-circuit calculating dropped candidates on hot path routing when
+      # no candidates were removed or all candidates were filtered out.
+      dropped = dropped_candidates(classified_candidates, candidates)
 
       route_state =
         route_state
@@ -327,4 +328,20 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
   end
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  # Short-circuiting checks for identical lists or empty lists avoids MapSet
+  # allocations, hashing, and candidate traversals during request routing.
+  defp dropped_candidates(classified_candidates, candidates) do
+    cond do
+      classified_candidates == candidates ->
+        []
+
+      candidates == [] ->
+        classified_candidates
+
+      true ->
+        kept_ids = MapSet.new(candidates, fn {assignment, _identity} -> assignment.id end)
+        Enum.reject(classified_candidates, fn {assignment, _identity} -> MapSet.member?(kept_ids, assignment.id) end)
+    end
+  end
 end
