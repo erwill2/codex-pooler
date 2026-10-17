@@ -495,14 +495,21 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   end
 
   defp sse_field(block, name) do
-    prefix = name <> ": "
+    prefix = name <> ":"
 
-    block
-    |> String.split("\n")
-    |> Enum.map(&String.trim/1)
-    |> Enum.find_value(fn line ->
-      if String.starts_with?(line, prefix), do: String.replace_prefix(line, prefix, "")
-    end)
+    # Short-circuit string splitting and list allocations if the field prefix is missing.
+    if String.contains?(block, prefix) do
+      prefix_with_space = name <> ": "
+
+      block
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.find_value(fn line ->
+        if String.starts_with?(line, prefix_with_space), do: String.replace_prefix(line, prefix_with_space, "")
+      end)
+    else
+      nil
+    end
   end
 
   defp rate_limit_events_from_json(payload) do
