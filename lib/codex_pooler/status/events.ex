@@ -128,11 +128,11 @@ defmodule CodexPooler.Status.Events do
     end
   end
 
+  # Optimized O(1) map_size check and short-circuiting key lookup avoiding list allocations and sorting overhead.
   defp validate_keys(event, expected) do
-    keys = Map.keys(event)
-
-    if Enum.sort(keys) == Enum.sort(expected) or
-         Enum.sort(keys) == Enum.sort(Enum.map(expected, &Atom.to_string/1)) do
+    if map_size(event) == length(expected) and
+         (Enum.all?(expected, &Map.has_key?(event, &1)) or
+            Enum.all?(expected, fn key -> Map.has_key?(event, Atom.to_string(key)) end)) do
       :ok
     else
       :error
