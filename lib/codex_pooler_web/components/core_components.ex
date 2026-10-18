@@ -180,7 +180,10 @@ defmodule CodexPoolerWeb.CoreComponents do
     <div class="fieldset mb-2">
       <label for={@id}>
         <span :if={@label_content != []} class="label mb-1">{render_slot(@label_content)}</span>
-        <span :if={@label && @label_content == []} class="label mb-1">{@label}</span>
+        <span :if={@label && @label_content == []} class="label mb-1">
+          {@label}
+          <span :if={@rest[:required]} class="text-error ml-0.5" aria-hidden="true">*</span>
+        </span>
         <select
           id={@id}
           name={@name}
@@ -206,7 +209,10 @@ defmodule CodexPoolerWeb.CoreComponents do
     <div class="fieldset mb-2">
       <label for={@id}>
         <span :if={@label_content != []} class="label mb-1">{render_slot(@label_content)}</span>
-        <span :if={@label && @label_content == []} class="label mb-1">{@label}</span>
+        <span :if={@label && @label_content == []} class="label mb-1">
+          {@label}
+          <span :if={@rest[:required]} class="text-error ml-0.5" aria-hidden="true">*</span>
+        </span>
         <textarea
           id={@id}
           name={@name}
@@ -231,7 +237,10 @@ defmodule CodexPoolerWeb.CoreComponents do
     <div class="fieldset mb-2">
       <label for={@id}>
         <span :if={@label_content != []} class="label mb-1">{render_slot(@label_content)}</span>
-        <span :if={@label && @label_content == []} class="label mb-1">{@label}</span>
+        <span :if={@label && @label_content == []} class="label mb-1">
+          {@label}
+          <span :if={@rest[:required]} class="text-error ml-0.5" aria-hidden="true">*</span>
+        </span>
         <input
           type={@type}
           name={@name}
@@ -293,7 +302,10 @@ defmodule CodexPoolerWeb.CoreComponents do
 
     ~H"""
     <div class="fieldset mb-2">
-      <label :if={@label} id={"#{@id}_label"} class="label mb-1">{@label}</label>
+      <label :if={@label} id={"#{@id}_label"} class="label mb-1">
+        {@label}
+        <span :if={@rest[:required]} class="text-error ml-0.5" aria-hidden="true">*</span>
+      </label>
       <div
         id={"#{@id}_otp"}
         class={[@class || "grid gap-2", @errors != [] && "text-error"]}
