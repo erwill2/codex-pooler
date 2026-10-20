@@ -216,10 +216,8 @@ defmodule CodexPoolerWeb.Router do
     ObservatoryAuth.call(conn, opts)
   end
 
-  defp put_secure_browser_headers(conn, _baseline_headers) do
-    Phoenix.Controller.put_secure_browser_headers(
-      conn,
-      CodexPoolerWeb.BrowserSecurity.secure_headers(conn)
-    )
+  defp put_secure_browser_headers(conn, baseline_headers) do
+    headers = Map.merge(baseline_headers, CodexPoolerWeb.BrowserSecurity.secure_headers(conn))
+    Phoenix.Controller.put_secure_browser_headers(conn, headers)
   end
 end
