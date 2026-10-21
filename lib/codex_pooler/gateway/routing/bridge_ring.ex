@@ -604,8 +604,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     candidates
     |> Enum.with_index()
     |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
+      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(), strategy_index}
     end)
     |> Enum.map(&elem(&1, 0))
   end
