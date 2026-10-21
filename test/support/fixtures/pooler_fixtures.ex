@@ -205,8 +205,7 @@ defmodule CodexPooler.PoolerFixtures do
         pool_id: pool.id,
         upstream_identity_id: identity.id,
         assignment_label: Map.get(attrs, :assignment_label, "Primary upstream"),
-        routing_priority:
-          Map.get(attrs, :routing_priority, PoolUpstreamAssignment.default_routing_priority()),
+        routing_priority: Map.get(attrs, :routing_priority, PoolUpstreamAssignment.default_routing_priority()),
         status: Map.get(attrs, :assignment_status, "active"),
         health_status: Map.get(attrs, :health_status, "active"),
         eligibility_status: Map.get(attrs, :eligibility_status, "eligible"),

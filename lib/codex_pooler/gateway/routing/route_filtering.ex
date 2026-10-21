@@ -60,7 +60,9 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
 
     with {:ok, candidates} <-
            CandidateEligibility.filter_circuit_eligible_candidates(filter_input, route_state),
-         circuit_excluded? = length(candidates) < length(filter_input.candidates),
+         circuit_excluded? =
+           candidates != filter_input.candidates and
+             length(candidates) < length(filter_input.candidates),
          route_state = RouteState.put_candidates(route_state, candidates),
          filter_input = CandidateEligibility.FilterInput.put_candidates(filter_input, candidates),
          {:ok, candidates, quota_decision, route_state} <-
@@ -93,8 +95,7 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
              request_options,
              candidates
            ) do
-      kept_ids = MapSet.new(candidates, fn {assignment, _identity} -> assignment.id end)
-      dropped = Enum.reject(classified_candidates, fn {assignment, _identity} -> MapSet.member?(kept_ids, assignment.id) end)
+      dropped = compute_dropped_candidates(classified_candidates, candidates)
 
       route_state =
         route_state
@@ -317,6 +318,17 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
     opts
     |> Keyword.get_lazy(:saved_reset_scan_at, &now/0)
     |> DateTime.truncate(:microsecond)
+  end
+
+  defp compute_dropped_candidates(candidates, candidates), do: []
+  defp compute_dropped_candidates(classified_candidates, []), do: classified_candidates
+
+  defp compute_dropped_candidates(classified_candidates, candidates) do
+    kept_ids = MapSet.new(candidates, fn {assignment, _identity} -> assignment.id end)
+
+    Enum.reject(classified_candidates, fn {assignment, _identity} ->
+      MapSet.member?(kept_ids, assignment.id)
+    end)
   end
 
   defp saved_reset_options(opts) do

@@ -123,7 +123,7 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
        when state in [:weekly_only_probe, :credit_backed_probe] and not is_nil(secondary) do
     secondary.quota_key in ["gpt_reserve", "gpt-reserve"] or
       secondary.model in ["gpt_reserve", "gpt-reserve"] or
-      secondary.quota_family == "codex_model" and secondary.quota_key == "gpt_reserve"
+      (secondary.quota_family == "codex_model" and secondary.quota_key == "gpt_reserve")
   end
 
   defp gpt_reserve_selected?(%RoutingQuotaSnapshot{} = snapshot, %{routing_state: state}, %Model{} = model)
@@ -143,6 +143,7 @@ defmodule CodexPooler.Gateway.Routing.RoutingSelection do
       _ -> false
     end
   end
+
   defp exhausted_weekly?(_), do: false
 
   defp reserve_window?(window), do: window.quota_key in ["gpt_reserve", "gpt-reserve"] or window.model in ["gpt_reserve", "gpt-reserve"]

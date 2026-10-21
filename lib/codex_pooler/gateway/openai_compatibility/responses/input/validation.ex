@@ -512,9 +512,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_compaction_replay_item(_item),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-  defp validate_context_compaction_replay_item(
-         %{@metadata_passthrough_key => %{"turn_id" => turn_id} = metadata} = item
-       ) do
+  defp validate_context_compaction_replay_item(%{@metadata_passthrough_key => %{"turn_id" => turn_id} = metadata} = item) do
     with :ok <-
            validate_exact_item_keys(item, [
              "type",
@@ -640,9 +638,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     end
   end
 
-  defp validate_apply_patch_call_replay_item(
-         %{"call_id" => call_id, "operation" => operation} = item
-       )
+  defp validate_apply_patch_call_replay_item(%{"call_id" => call_id, "operation" => operation} = item)
        when is_binary(call_id) and is_map(operation) do
     with :ok <-
            validate_exact_item_keys(item, [
