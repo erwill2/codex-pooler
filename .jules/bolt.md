@@ -1,0 +1,3 @@
+## 2026-10-23 - Short-circuiting Candidate Difference Set Computations
+**Learning:** In hot request-routing candidate filtering paths, checking list structural equality (`classified_candidates == candidates`) and empty checks (`candidates == []`) before building a `MapSet` eliminates $O(N)$ `MapSet` allocation, hashing, and list filtering overhead on the common fast-path where no candidates were dropped or all candidates were dropped.
+**Action:** Always short-circuit list difference/membership calculations on candidate filtering pipelines when input and output candidate lists are structurally identical or empty.
