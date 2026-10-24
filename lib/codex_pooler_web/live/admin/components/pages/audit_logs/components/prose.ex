@@ -139,6 +139,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Prose do
       aria-haspopup="dialog"
       aria-controls="audit-event-details-sidebar"
       aria-label={"Inspect event details for #{Presentation.event_title(@event)}"}
+      title={"Inspect event details for #{Presentation.event_title(@event)}"}
       phx-click="show_audit_event"
       phx-value-id={@event.id}
     >
