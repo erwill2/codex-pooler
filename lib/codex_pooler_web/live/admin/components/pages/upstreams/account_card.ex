@@ -391,6 +391,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
               aria-controls={"upstream-account-#{@account.identity.id}-pools-panel"}
               aria-expanded={aria_bool(@panel_view == :pools)}
               aria-label={pools_panel_trigger_label(@panel_view, @account.assignments)}
+              title={pools_panel_trigger_label(@panel_view, @account.assignments)}
             >
               <span class="sr-only">Pools</span>
             </button>
@@ -424,6 +425,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
               aria-describedby={"upstream-account-#{@account.identity.id}-tokens-5m-value"}
               aria-expanded={aria_bool(@panel_view == :tokens)}
               aria-label={tokens_panel_trigger_label(@panel_view)}
+              title={tokens_panel_trigger_label(@panel_view)}
             >
               <span class="sr-only">Tokens/5m</span>
             </button>
