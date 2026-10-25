@@ -352,6 +352,10 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   @spec demotion_metadata(term()) :: map()
   defdelegate demotion_metadata(reason_code), to: Metadata
 
+  # Short-circuit empty or single-candidate lists to avoid O(N) sorting/hashing overhead
+  defp strategy_order(_strategy, [], _model, _seed, _route_state), do: []
+  defp strategy_order(_strategy, [_] = candidates, _model, _seed, _route_state), do: candidates
+
   defp strategy_order("deterministic_rotation", candidates, _model, seed, _route_state) do
     rotate_candidates(candidates, seed)
   end
@@ -774,6 +778,10 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   # Capacity basis is outermost; affinity, strategy and demotion never promote
   # a credit-dependent candidate above a compatible non-credit candidate.
+  # Short-circuit empty or single-candidate lists to skip tier calculations and sorting
+  defp apply_quota_tier_and_demotions([], _demotions, _model, _request_options, _route_state), do: []
+  defp apply_quota_tier_and_demotions([_] = candidates, _demotions, _model, _request_options, _route_state), do: candidates
+
   defp apply_quota_tier_and_demotions(candidates, demotions, %Model{} = model, request_options, route_state) do
     Enum.sort_by(candidates, fn {assignment, identity} = candidate ->
       reserve_tier =
