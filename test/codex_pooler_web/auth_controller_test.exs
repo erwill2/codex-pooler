@@ -389,7 +389,12 @@ defmodule CodexPoolerWeb.AuthControllerTest do
           "/\tevil.example",
           "/\nevil.example",
           "/\revil.example",
-          "/\\evil.example"
+          "/\\evil.example",
+          "/%2fexample.com",
+          "/%2f%2fexample.com",
+          "/%5cexample.com",
+          "/%0aexample.com",
+          "/%0dexample.com"
         ] do
       conn =
         build_conn()
