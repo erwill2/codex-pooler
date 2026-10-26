@@ -1,0 +1,3 @@
+## 2026-10-26 - Short-circuit candidate list diffing in route filtering
+**Learning:** In hot-path routing operations (`RouteFiltering.filter_candidates/6`), the list of candidates before and after filtering is identical when no candidates are dropped. Constructing a `MapSet` and iterating through `Enum.reject/2` in this common case adds unnecessary map allocations and key hashing.
+**Action:** When computing differences between lists in routing or pipeline filters, short-circuit equality (`classified_candidates == candidates`) and empty checks (`candidates == []`) before creating `MapSet` sets.
