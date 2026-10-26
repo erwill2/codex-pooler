@@ -39,4 +39,29 @@ defmodule CodexPoolerWeb.CoreComponentsTest do
     refute html =~ ~s(aria-describedby="username-input-error")
     refute html =~ ~s(id="username-input-error")
   end
+
+  test "input component renders visual required asterisk with aria-hidden when required is true" do
+    html =
+      render_component(&CoreComponents.input/1,
+        id: "email-input",
+        name: "user[email]",
+        value: "",
+        label: "Email address",
+        required: true
+      )
+
+    assert html =~ ~s(<span class="text-error ml-0.5" aria-hidden="true">*</span>)
+  end
+
+  test "input component does not render required asterisk when required is not specified" do
+    html =
+      render_component(&CoreComponents.input/1,
+        id: "email-input",
+        name: "user[email]",
+        value: "",
+        label: "Email address"
+      )
+
+    refute html =~ ~s(aria-hidden="true">*</span>)
+  end
 end
