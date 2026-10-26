@@ -1,0 +1,4 @@
+## 2026-10-26 - URL-encoded Backslash Bypass in Phoenix Return-To Path Validation
+**Vulnerability:** Open redirect vulnerability in `CodexPoolerWeb.UserAuth.safe_return_to_path/1` where URL-encoded backslashes (e.g. `/%5C/evil.example` or `/\\/evil.example`) bypassed path validation when checking `String.starts_with?(return_to, "//")` and `@unsafe_return_to_path_fragments`.
+**Learning:** Browsers normalize backslashes (`\`) and URL-encoded backslashes (`%5C`) to forward slashes (`/`), turning paths like `/%5C/evil.example` into `//evil.example` upon browser navigation and causing open redirects to external domains.
+**Prevention:** Always decode the target path via `URI.decode/1` prior to evaluating safety guards like `String.starts_with?(path, "//")`, `String.starts_with?(path, "/\\")`, or checking for forbidden fragment sequences.

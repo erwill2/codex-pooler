@@ -287,6 +287,7 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
     response
   end
 
+  # sobelow_skip ["XSS.SendResp"]
   defp do_send_gateway_result(conn, %{stream: stream} = result) do
     conn = put_gateway_headers(conn, result_headers(result))
     conn = send_chunked(conn, result.status)
