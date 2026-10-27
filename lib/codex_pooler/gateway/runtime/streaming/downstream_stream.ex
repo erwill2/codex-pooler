@@ -533,10 +533,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   defp public_openai_responses_stream?(_opts), do: false
 
   defp codex_responses_sse_chunk?(data) when is_binary(data) do
-    String.starts_with?(data, "event: ") or String.starts_with?(data, "data: ") or
-      String.contains?(data, ["\nevent: ", "\revent: "]) or
-      String.contains?(data, ["\ndata: ", "\rdata: "]) or
-      String.contains?(data, ["\n\n", "\n\r", "\r\r"])
+    if String.starts_with?(data, "event: ") or String.starts_with?(data, "data: ") do
+      true
+    else
+      # Short-circuit multi-pattern searches if chunk contains no line breaks
+      (String.contains?(data, "\n") or String.contains?(data, "\r")) and
+        (String.contains?(data, ["\nevent: ", "\revent: "]) or
+           String.contains?(data, ["\ndata: ", "\rdata: "]) or
+           String.contains?(data, ["\n\n", "\n\r", "\r\r"]))
+    end
   end
 
   defp oversized_incomplete_sse_prefix?([], "", buffered_size),
