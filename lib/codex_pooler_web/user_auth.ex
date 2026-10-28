@@ -264,9 +264,12 @@ defmodule CodexPoolerWeb.UserAuth do
   defp maybe_store_return_to(conn), do: conn
 
   defp safe_return_to_path(return_to) when is_binary(return_to) do
-    if String.starts_with?(return_to, "/") and
-         not String.starts_with?(return_to, "//") and
-         not String.contains?(return_to, @unsafe_return_to_path_fragments) do
+    decoded = URI.decode(return_to)
+
+    if String.starts_with?(decoded, "/") and
+         not String.starts_with?(decoded, "//") and
+         not String.starts_with?(decoded, "/\\") and
+         not String.contains?(decoded, @unsafe_return_to_path_fragments) do
       return_to
     end
   end
