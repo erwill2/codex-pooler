@@ -638,7 +638,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ExpiredOwnerGenerationCleanup
   defp valid_end?(%{"phase" => "ended"} = value), do: value["end_kind"] in ["serialized_connection_closed", "producer_process_dead", "producer_vm_superseded"] and timestamp?(value["observed_end_at"])
 
   defp identity?(value) when is_map(value) do
-    Enum.sort(Map.keys(value)) == Enum.sort(@identity_fields) and
+    # Check map_size and keys directly to avoid Enum.sort / Map.keys list allocations
+    map_size(value) == length(@identity_fields) and
+      Enum.all?(@identity_fields, &Map.has_key?(value, &1)) and
       bounded_identifier?(value["owner_instance_id"]) and bounded_identifier?(value["owner_instance_boot_id"]) and
       process_address?(value["owner_process_id"]) and uuid?(value["owner_execution_id"])
   end
