@@ -197,7 +197,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
       <.icon name={@icon} class="size-3.5" /><span class="sr-only">{@label}</span>
     </.link>
 
-    <span :if={!(@enabled && @path)} id={@id} data-role="pagination-link" class="btn btn-ghost btn-xs btn-square btn-disabled" aria-disabled="true" aria-label={@label}>
+    <span :if={!(@enabled && @path)} id={@id} data-role="pagination-link" class="btn btn-ghost btn-xs btn-square btn-disabled" aria-disabled="true" aria-label={@label} title={@label}>
       <.icon name={@icon} class="size-3.5" /><span class="sr-only">{@label}</span>
     </span>
     """

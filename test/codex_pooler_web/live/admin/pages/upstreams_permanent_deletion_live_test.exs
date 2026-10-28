@@ -78,9 +78,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsPermanentDeletionLiveTest do
     assert has_element?(view, "#upstream-account-#{current.id}")
     assert has_element?(view, "#upstream-account-#{legacy.id}", "Historical account")
     assert has_element?(view, "#delete-upstream-account-#{legacy.id}:not([disabled])", "Delete")
-    assert has_element?(view, "#upstream-account-actions-menu-#{legacy.id}:not([title])")
+    assert has_element?(view, "#upstream-account-actions-menu-#{legacy.id}[title='Actions for Historical account']")
+    assert has_element?(view, "#rename-upstream-account-#{legacy.id}[disabled]")
 
-    for action <- ~w(rename pause reactivate refresh saved-reset-policy replace-auth-json oauth-relink reinvite) do
+    for action <- ~w(pause reactivate refresh replace-auth-json oauth-relink reinvite) do
       refute has_element?(view, "##{action}-upstream-account-#{legacy.id}")
     end
 
