@@ -499,8 +499,22 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   defp observe_native_http_tool_blocks(state, _blocks, _oversized?), do: state
 
-  defp comment_block?(raw),
-    do: raw |> String.split(["\r\n", "\n", "\r"]) |> Enum.all?(&(&1 == "" or String.starts_with?(&1, ":")))
+  defp comment_block?(raw) do
+    # Short-circuit comment check if empty/whitespace or lacks colon
+    if String.trim(raw) == "" or (String.contains?(raw, ":") and check_comment_lines(raw)) do
+      true
+    else
+      false
+    end
+  end
+
+  defp check_comment_lines(raw) do
+    if String.contains?(raw, "\n") or String.contains?(raw, "\r") do
+      raw |> String.split(["\r\n", "\n", "\r"]) |> Enum.all?(&(&1 == "" or String.starts_with?(&1, ":")))
+    else
+      String.starts_with?(raw, ":")
+    end
+  end
 
   defp normalize_native_blocks(blocks, opts, %{target: target}) do
     private_details? = target != :websocket and MisalignmentPolicyViolation.details_allowed?(opts)
