@@ -85,18 +85,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
               >
                 {@flow.device.user_code}
               </code>
-              <button
+              <AdminComponents.clipboard_button
                 id="upstream-cockpit-relink-copy-code"
-                type="button"
+                copy_text={@flow.device.user_code}
+                aria_label="Copy device code"
                 class="btn btn-ghost btn-xs btn-square text-base-content/45 hover:text-base-content"
-                phx-hook="ClipboardCopy"
-                phx-update="ignore"
-                data-copy-text={@flow.device.user_code}
-                title="Copy device code"
-                aria-label="Copy device code"
-              >
-                <.icon name="hero-clipboard-document" class="copy-icon size-3.5" />
-              </button>
+                icon_class="size-3.5"
+              />
             </span>
             <div
               :if={@flow.device.verification_uri}
