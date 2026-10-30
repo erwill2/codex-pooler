@@ -577,7 +577,6 @@ defmodule CodexPoolerWeb.Admin.Components do
         type="button"
         class="input input-sm flex w-full items-center justify-between gap-2 text-left"
         aria-label={@label}
-        title={@label}
         title={"#{@label} (#{@timezone})"}
         popovertarget={"#{@id}-popover"}
         style={"anchor-name: #{@anchor_name};"}
