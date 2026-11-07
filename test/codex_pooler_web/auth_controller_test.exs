@@ -385,6 +385,9 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
     for unsafe_return_to <- [
           "https://example.com/evil",
+          "//evil.example",
+          "/%2fevil.example",
+          "/%5cevil.example",
           "/%09evil.example",
           "/\tevil.example",
           "/\nevil.example",

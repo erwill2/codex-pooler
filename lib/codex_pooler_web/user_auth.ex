@@ -11,7 +11,8 @@ defmodule CodexPoolerWeb.UserAuth do
 
   @session_key :user_token
   # Mirrors Phoenix's local-path validation because this session value is untrusted.
-  @unsafe_return_to_path_fragments ["\\", "/%09", "/\t", "\n", "\r"]
+  # Security: Leading sequences and fragments that could lead to open redirects or browser normalization.
+  @unsafe_leading_return_to_sequences ["//", "/\\", "/\t", "/\n", "/\r"]
 
   def log_in_user(conn, user, token) when is_binary(token) do
     user_return_to = get_session(conn, :user_return_to)
@@ -263,10 +264,14 @@ defmodule CodexPoolerWeb.UserAuth do
 
   defp maybe_store_return_to(conn), do: conn
 
+  # Decodes path before checking for unsafe leading sequences to prevent URL-encoded open redirects.
   defp safe_return_to_path(return_to) when is_binary(return_to) do
+    decoded = URI.decode(return_to)
+
     if String.starts_with?(return_to, "/") and
-         not String.starts_with?(return_to, "//") and
-         not String.contains?(return_to, @unsafe_return_to_path_fragments) do
+         String.starts_with?(decoded, "/") and
+         not Enum.any?(@unsafe_leading_return_to_sequences, &String.starts_with?(decoded, &1)) and
+         not String.contains?(decoded, ["\n", "\r", "\\"]) do
       return_to
     end
   end
