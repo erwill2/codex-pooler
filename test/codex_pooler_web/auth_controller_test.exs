@@ -385,11 +385,19 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
     for unsafe_return_to <- [
           "https://example.com/evil",
+          "//evil.example",
+          "/%2fevil.example",
+          "/%2Fevil.example",
+          "/\\evil.example",
+          "/%5cevil.example",
+          "/%5Cevil.example",
           "/%09evil.example",
           "/\tevil.example",
+          "/%0aevil.example",
           "/\nevil.example",
+          "/%0devil.example",
           "/\revil.example",
-          "/\\evil.example"
+          "/admin/pools%5cevil.example"
         ] do
       conn =
         build_conn()

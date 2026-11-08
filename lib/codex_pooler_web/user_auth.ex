@@ -10,8 +10,10 @@ defmodule CodexPoolerWeb.UserAuth do
   alias CodexPoolerWeb.Plugs.TrustedProxyRemoteIp
 
   @session_key :user_token
-  # Mirrors Phoenix's local-path validation because this session value is untrusted.
-  @unsafe_return_to_path_fragments ["\\", "/%09", "/\t", "\n", "\r"]
+  # Untrusted session return path validation: decode URL percent-encoding first so that
+  # browsers normalizing encoded characters (e.g. %2f -> /, %5c -> \) cannot trigger open redirects.
+  @unsafe_leading_sequences ["//", "/\\", "/\t", "/\n", "/\r"]
+  @disallowed_path_characters ["\\", "\t", "\n", "\r"]
 
   def log_in_user(conn, user, token) when is_binary(token) do
     user_return_to = get_session(conn, :user_return_to)
@@ -264,9 +266,11 @@ defmodule CodexPoolerWeb.UserAuth do
   defp maybe_store_return_to(conn), do: conn
 
   defp safe_return_to_path(return_to) when is_binary(return_to) do
+    decoded = URI.decode(return_to)
+
     if String.starts_with?(return_to, "/") and
-         not String.starts_with?(return_to, "//") and
-         not String.contains?(return_to, @unsafe_return_to_path_fragments) do
+         not String.starts_with?(decoded, @unsafe_leading_sequences) and
+         not String.contains?(decoded, @disallowed_path_characters) do
       return_to
     end
   end
